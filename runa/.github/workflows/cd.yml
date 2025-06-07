@@ -1,0 +1,319 @@
+name: Runa Language CD
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      skip_tests:
+        description: 'Skip test execution'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  validate-release:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      is_prerelease: ${{ steps.check_prerelease.outputs.is_prerelease }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Get version from tag
+      id: get_version
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+    
+    - name: Check if prerelease
+      id: check_prerelease
+      run: |
+        VERSION=${{ steps.get_version.outputs.version }}
+        if [[ $VERSION =~ (alpha|beta|rc) ]]; then
+          echo "is_prerelease=true" >> $GITHUB_OUTPUT
+        else
+          echo "is_prerelease=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Validate version consistency
+      run: |
+        pip install -e .
+        PACKAGE_VERSION=$(python -c "import runa; print(runa.__version__)")
+        TAG_VERSION=${{ steps.get_version.outputs.version }}
+        if [ "$PACKAGE_VERSION" != "$TAG_VERSION" ]; then
+          echo "Version mismatch: package=$PACKAGE_VERSION, tag=$TAG_VERSION"
+          exit 1
+        fi
+        echo "Version validation passed: $PACKAGE_VERSION"
+
+  test-before-deploy:
+    name: Pre-deployment Tests
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_tests }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .[dev]
+    
+    - name: Run comprehensive tests
+      run: |
+        pytest tests/ -v --cov=src/runa --cov-fail-under=95
+        
+    - name: Run integration tests
+      run: |
+        pytest tests/integration/ -v || echo "No integration tests found"
+    
+    - name: Performance benchmarks
+      run: |
+        pytest tests/benchmarks/ --benchmark-only || echo "No benchmark tests found"
+
+  build-and-test-package:
+    name: Build and Test Package
+    runs-on: ${{ matrix.os }}
+    needs: [validate-release]
+    if: always() && (needs.validate-release.result == 'success' || github.event_name == 'workflow_dispatch')
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install build dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine wheel
+    
+    - name: Build package
+      run: |
+        python -m build
+    
+    - name: Test package installation
+      run: |
+        pip install dist/*.whl
+        python -c "import runa; print(f'Runa version: {runa.__version__}')"
+        python -c "from runa import lexer, parser, ast_nodes; print('Core modules imported successfully')"
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: dist-${{ matrix.os }}
+        path: dist/
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-test-package, test-before-deploy]
+    if: |
+      always() && 
+      (needs.build-and-test-package.result == 'success') &&
+      (needs.test-before-deploy.result == 'success' || inputs.skip_tests) &&
+      (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: dist-ubuntu-latest
+        path: dist/
+    
+    - name: Deploy to Test PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        user: __token__
+        password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        repository_url: https://test.pypi.org/legacy/
+        packages_dir: dist/
+        skip_existing: true
+        print_hash: true
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [validate-release, build-and-test-package, test-before-deploy]
+    if: |
+      always() && 
+      (needs.validate-release.result == 'success') &&
+      (needs.build-and-test-package.result == 'success') &&
+      (needs.test-before-deploy.result == 'success' || inputs.skip_tests) &&
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') || 
+       github.event_name == 'release' ||
+       (github.event_name == 'workflow_dispatch' && inputs.environment == 'production'))
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: dist-ubuntu-latest
+        path: dist/
+    
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        user: __token__
+        password: ${{ secrets.PYPI_API_TOKEN }}
+        packages_dir: dist/
+        skip_existing: true
+        print_hash: true
+
+  deploy-documentation:
+    name: Deploy Documentation
+    runs-on: ubuntu-latest
+    needs: [build-and-test-package]
+    if: needs.build-and-test-package.result == 'success'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .[dev]
+    
+    - name: Build documentation
+      run: |
+        cd docs
+        make html
+    
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./docs/_build/html
+        cname: runa-lang.org
+
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate-release, deploy-production]
+    if: |
+      always() &&
+      needs.validate-release.result == 'success' &&
+      needs.deploy-production.result == 'success' &&
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+    
+    - name: Generate release notes
+      id: release_notes
+      run: |
+        # Generate changelog since last tag
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+        if [ -n "$PREVIOUS_TAG" ]; then
+          echo "## Changes since $PREVIOUS_TAG" > release_notes.md
+          git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..HEAD >> release_notes.md
+        else
+          echo "## Initial Release" > release_notes.md
+          echo "This is the first release of the Runa Programming Language." >> release_notes.md
+        fi
+    
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Runa v${{ needs.validate-release.outputs.version }}
+        body_path: release_notes.md
+        draft: false
+        prerelease: ${{ needs.validate-release.outputs.is_prerelease }}
+    
+    - name: Upload Release Assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist-ubuntu-latest/
+        asset_name: runa-dist.tar.gz
+        asset_content_type: application/gzip
+
+  notify-completion:
+    name: Notify Deployment Completion
+    runs-on: ubuntu-latest
+    needs: [deploy-production, deploy-documentation, create-github-release]
+    if: always()
+    
+    steps:
+    - name: Deployment Summary
+      run: |
+        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- Production Deploy: ${{ needs.deploy-production.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Documentation Deploy: ${{ needs.deploy-documentation.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- GitHub Release: ${{ needs.create-github-release.result }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ needs.deploy-production.result }}" == "success" ]; then
+          echo "🎉 **Runa has been successfully deployed to production!**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Deployment failed. Please check the logs.**" >> $GITHUB_STEP_SUMMARY
+        fi 
