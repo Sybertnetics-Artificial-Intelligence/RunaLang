@@ -1,84 +1,82 @@
 #!/usr/bin/env python3
 """
-Setup script for Runa Programming Language
+Setup script for the Runa programming language.
+
+This script defines the package metadata and dependencies required to install
+and run the Runa language.
 """
 
 from setuptools import setup, find_packages
 import os
+import sys
 
-# Read the contents of README file
-this_directory = os.path.abspath(os.path.dirname(__file__))
-with open(os.path.join(this_directory, '..', 'README.md'), encoding='utf-8') as f:
+# Read the version from the core module
+about = {}
+here = os.path.abspath(os.path.dirname(__file__))
+with open(os.path.join(here, "runa", "src", "core", "__init__.py"), encoding="utf-8") as f:
+    exec(f.read(), about)
+
+# Read the long description from README.md
+with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
     long_description = f.read()
 
-# Read version from version file
-def get_version():
-    version_file = os.path.join(this_directory, 'src', 'runa', '_version.py')
-    if os.path.exists(version_file):
-        with open(version_file, 'r') as f:
-            exec(f.read())
-            return locals()['__version__']
-    return '0.1.0'
+# Define the required dependencies
+install_requires = [
+    "typing-extensions>=4.0.0",
+    "colorama>=0.4.4",
+]
+
+# Define development dependencies
+dev_requires = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+    "sphinx>=6.0.0",
+    "sphinx-rtd-theme>=1.0.0",
+]
+
+# Define documentation dependencies
+docs_requires = [
+    "sphinx>=6.0.0",
+    "sphinx-rtd-theme>=1.0.0",
+    "sphinx-autodoc-typehints>=1.20.0",
+]
+
+# Check if we're running Python 3.11 or newer
+if sys.version_info < (3, 11):
+    sys.exit("Runa requires Python 3.11 or newer")
 
 setup(
-    name='runa-lang',
-    version=get_version(),
-    author='SyberSuite AI Development Team',
-    author_email='dev@sybersuite.ai',
-    description='Runa Programming Language - Natural language programming for AI agents',
+    name="runa-lang",
+    version=about["__version__"],
+    description="A natural language programming language for human-AI collaboration",
     long_description=long_description,
-    long_description_content_type='text/markdown',
-    url='https://github.com/sybersuite/runa',
-    packages=find_packages(where='src'),
-    package_dir={'': 'src'},
-    classifiers=[
-        'Development Status :: 3 - Alpha',
-        'Intended Audience :: Developers',
-        'License :: OSI Approved :: MIT License',
-        'Operating System :: OS Independent',
-        'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.11',
-        'Programming Language :: Python :: 3.12',
-        'Topic :: Software Development :: Compilers',
-        'Topic :: Software Development :: Interpreters',
-        'Topic :: Scientific/Engineering :: Artificial Intelligence',
-    ],
-    python_requires='>=3.11',
-    install_requires=[
-        'typing-extensions>=4.7.1',
-        'dataclasses>=0.8',
-        'enum34>=1.1.10; python_version<"3.4"',
-    ],
-    extras_require={
-        'dev': [
-            'pytest>=7.4.0',
-            'pytest-cov>=4.1.0',
-            'black>=23.7.0',
-            'flake8>=6.0.0',
-            'mypy>=1.5.1',
-            'sphinx>=7.1.2',
-        ],
-        'ai': [
-            'torch>=2.0.0',
-            'transformers>=4.30.0',
-            'neo4j>=5.10.0',
-        ],
-    },
+    long_description_content_type="text/markdown",
+    author="Sybertnetics",
+    author_email="info@sybertnetics.com",
+    url="https://github.com/sybertnetics/runa",
+    packages=find_packages(),
     entry_points={
-        'console_scripts': [
-            'runa=runa.cli:main',
-            'runa-repl=runa.repl:main',
-            'runa-compile=runa.compiler:main',
-            'runa-vm=runa.vm:main',
+        "console_scripts": [
+            "runa=runa.src.cli.main:main",
         ],
     },
-    include_package_data=True,
-    package_data={
-        'runa': [
-            'stdlib/*.runa',
-            'examples/*.runa',
-            'grammar/*.ebnf',
-        ],
+    python_requires=">=3.11",
+    install_requires=install_requires,
+    extras_require={
+        "dev": dev_requires,
+        "docs": docs_requires,
     },
-    zip_safe=False,
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Developers",
+        "License :: OSI Approved :: MIT License",
+        "Programming Language :: Python :: 3.11",
+        "Topic :: Software Development :: Compilers",
+        "Topic :: Software Development :: Interpreters",
+    ],
+    keywords="programming language, natural language, ai, compiler",
+    license="MIT",
 ) 
