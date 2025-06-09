@@ -1,12 +1,14 @@
 Language Reference
 =================
 
-This section provides a comprehensive reference for the Runa programming language.
+This section provides a detailed reference for the Runa programming language.
 
 .. toctree::
    :maxdepth: 2
-   
+   :caption: Contents:
+
    syntax
+   stdlib
    statements
    expressions
    types

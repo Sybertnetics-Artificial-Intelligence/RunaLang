@@ -6,9 +6,10 @@ Expressions are constructs that evaluate to a value.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any, Union, Set
 
-from runa.src.ast import ASTNode, ASTVisitor, NodeType, SourceLocation
+from runa.src.ast import ASTNode, ASTVisitor, NodeType, SourceLocation, TypeAnnotation
+from runa.src.ast.nodes import Expression, Block, Parameter
 
 
 @dataclass
@@ -362,4 +363,50 @@ class MemberAccess(Expression):
     
     def accept(self, visitor: ASTVisitor) -> Any:
         """Accept a visitor to process this node."""
-        return visitor.visit_member_access(self) 
+        return visitor.visit_member_access(self)
+
+
+@dataclass
+class FunctionExpression(Expression):
+    """
+    Represents an anonymous function expression (closure).
+    
+    Attributes:
+        parameters: The function parameters
+        body: The function body
+        return_type: The optional return type
+        captured_variables: The variables captured from the outer scope
+    """
+    
+    parameters: List[Parameter]
+    body: Block
+    return_type: Optional[TypeAnnotation] = None
+    captured_variables: Set[str] = field(default_factory=set)
+    
+    def __init__(
+        self,
+        parameters: List[Parameter],
+        body: Block,
+        return_type: Optional[TypeAnnotation] = None,
+        captured_variables: Optional[Set[str]] = None,
+        location: Optional[SourceLocation] = None
+    ):
+        """
+        Initialize a new FunctionExpression node.
+        
+        Args:
+            parameters: The function parameters
+            body: The function body
+            return_type: The optional return type
+            captured_variables: The variables captured from the outer scope
+            location: The source location of the node (optional)
+        """
+        super().__init__(NodeType.FUNCTION_EXPRESSION, location)
+        self.parameters = parameters
+        self.body = body
+        self.return_type = return_type
+        self.captured_variables = captured_variables or set()
+    
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        return visitor.visit_function_expression(self) 

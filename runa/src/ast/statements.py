@@ -7,6 +7,8 @@ Statements are constructs that represent actions and control flow.
 
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Union
+from abc import ABC, abstractmethod
+from enum import Enum, auto
 
 from runa.src.ast import ASTNode, ASTVisitor, NodeType, SourceLocation, TypeAnnotation
 from runa.src.ast.expressions import Expression, Identifier
@@ -304,6 +306,37 @@ class ImportStatement(Statement):
 
 
 @dataclass
+class ExportStatement(Statement):
+    """
+    Represents an export statement.
+    
+    Attributes:
+        items: The items to export from the module
+    """
+    
+    items: List[str] = field(default_factory=list)
+    
+    def __init__(
+        self,
+        items: Optional[List[str]] = None,
+        location: Optional[SourceLocation] = None
+    ):
+        """
+        Initialize a new ExportStatement node.
+        
+        Args:
+            items: The items to export from the module
+            location: The source location of the node (optional)
+        """
+        super().__init__(NodeType.EXPORT_STATEMENT, location)
+        self.items = items or []
+    
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        return visitor.visit_export_statement(self)
+
+
+@dataclass
 class TryCatchStatement(Statement):
     """
     Represents a try-catch statement.
@@ -342,6 +375,294 @@ class TryCatchStatement(Statement):
     def accept(self, visitor: ASTVisitor) -> Any:
         """Accept a visitor to process this node."""
         return visitor.visit_try_catch_statement(self)
+
+
+@dataclass
+class Pattern(ABC):
+    """
+    Base class for all pattern matching patterns.
+    
+    Attributes:
+        type: The type of the pattern
+        location: The source location of the node
+    """
+    
+    type: NodeType
+    location: Optional[SourceLocation] = None
+    
+    def __init__(self, type: NodeType, location: Optional[SourceLocation] = None):
+        """
+        Initialize a new Pattern node.
+        
+        Args:
+            type: The type of the pattern
+            location: The source location of the node (optional)
+        """
+        self.type = type
+        self.location = location
+    
+    @abstractmethod
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        pass
+
+
+@dataclass
+class LiteralPattern(Pattern):
+    """
+    Represents a literal pattern in a match statement.
+    
+    Attributes:
+        value: The literal value to match against
+    """
+    
+    value: Expression
+    
+    def __init__(
+        self,
+        value: Expression,
+        location: Optional[SourceLocation] = None
+    ):
+        """
+        Initialize a new LiteralPattern node.
+        
+        Args:
+            value: The literal value to match against
+            location: The source location of the node (optional)
+        """
+        super().__init__(NodeType.LITERAL_PATTERN, location)
+        self.value = value
+    
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        return visitor.visit_literal_pattern(self)
+
+
+@dataclass
+class VariablePattern(Pattern):
+    """
+    Represents a variable binding pattern in a match statement.
+    
+    Attributes:
+        name: The name of the variable to bind
+    """
+    
+    name: str
+    
+    def __init__(
+        self,
+        name: str,
+        location: Optional[SourceLocation] = None
+    ):
+        """
+        Initialize a new VariablePattern node.
+        
+        Args:
+            name: The name of the variable to bind
+            location: The source location of the node (optional)
+        """
+        super().__init__(NodeType.VARIABLE_PATTERN, location)
+        self.name = name
+    
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        return visitor.visit_variable_pattern(self)
+
+
+@dataclass
+class WildcardPattern(Pattern):
+    """
+    Represents a wildcard pattern (_) in a match statement.
+    """
+    
+    def __init__(
+        self,
+        location: Optional[SourceLocation] = None
+    ):
+        """
+        Initialize a new WildcardPattern node.
+        
+        Args:
+            location: The source location of the node (optional)
+        """
+        super().__init__(NodeType.WILDCARD_PATTERN, location)
+    
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        return visitor.visit_wildcard_pattern(self)
+
+
+@dataclass
+class ListPattern(Pattern):
+    """
+    Represents a list pattern in a match statement.
+    
+    Attributes:
+        elements: The patterns for list elements
+        rest_variable: The optional variable to bind the rest of the list
+    """
+    
+    elements: List[Pattern]
+    rest_variable: Optional[str] = None
+    
+    def __init__(
+        self,
+        elements: List[Pattern],
+        rest_variable: Optional[str] = None,
+        location: Optional[SourceLocation] = None
+    ):
+        """
+        Initialize a new ListPattern node.
+        
+        Args:
+            elements: The patterns for list elements
+            rest_variable: The optional variable to bind the rest of the list
+            location: The source location of the node (optional)
+        """
+        super().__init__(NodeType.LIST_PATTERN, location)
+        self.elements = elements
+        self.rest_variable = rest_variable
+    
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        return visitor.visit_list_pattern(self)
+
+
+@dataclass
+class DictionaryPattern(Pattern):
+    """
+    Represents a dictionary pattern in a match statement.
+    
+    Attributes:
+        pairs: The key-pattern pairs to match
+    """
+    
+    pairs: Dict[str, Pattern]
+    
+    def __init__(
+        self,
+        pairs: Dict[str, Pattern],
+        location: Optional[SourceLocation] = None
+    ):
+        """
+        Initialize a new DictionaryPattern node.
+        
+        Args:
+            pairs: The key-pattern pairs to match
+            location: The source location of the node (optional)
+        """
+        super().__init__(NodeType.DICTIONARY_PATTERN, location)
+        self.pairs = pairs
+    
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        return visitor.visit_dictionary_pattern(self)
+
+
+@dataclass
+class TypePattern(Pattern):
+    """
+    Represents a type pattern in a match statement.
+    
+    Attributes:
+        type_name: The name of the type to match against
+        variable: The optional variable to bind the value
+    """
+    
+    type_name: str
+    variable: Optional[str] = None
+    
+    def __init__(
+        self,
+        type_name: str,
+        variable: Optional[str] = None,
+        location: Optional[SourceLocation] = None
+    ):
+        """
+        Initialize a new TypePattern node.
+        
+        Args:
+            type_name: The name of the type to match against
+            variable: The optional variable to bind the value
+            location: The source location of the node (optional)
+        """
+        super().__init__(NodeType.TYPE_PATTERN, location)
+        self.type_name = type_name
+        self.variable = variable
+    
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        return visitor.visit_type_pattern(self)
+
+
+@dataclass
+class MatchCase:
+    """
+    Represents a case in a match statement.
+    
+    Attributes:
+        pattern: The pattern to match against
+        guard: The optional guard expression
+        body: The body to execute if the pattern matches
+    """
+    
+    pattern: Pattern
+    body: Block
+    guard: Optional[Expression] = None
+    
+    def __init__(
+        self,
+        pattern: Pattern,
+        body: Block,
+        guard: Optional[Expression] = None
+    ):
+        """
+        Initialize a new MatchCase node.
+        
+        Args:
+            pattern: The pattern to match against
+            body: The body to execute if the pattern matches
+            guard: The optional guard expression
+        """
+        self.pattern = pattern
+        self.body = body
+        self.guard = guard
+
+
+@dataclass
+class MatchStatement(Statement):
+    """
+    Represents a match statement.
+    
+    Attributes:
+        expression: The expression to match against
+        cases: The match cases
+    """
+    
+    expression: Expression
+    cases: List[MatchCase]
+    
+    def __init__(
+        self,
+        expression: Expression,
+        cases: List[MatchCase],
+        location: Optional[SourceLocation] = None
+    ):
+        """
+        Initialize a new MatchStatement node.
+        
+        Args:
+            expression: The expression to match against
+            cases: The match cases
+            location: The source location of the node (optional)
+        """
+        super().__init__(NodeType.MATCH_STATEMENT, location)
+        self.expression = expression
+        self.cases = cases
+    
+    def accept(self, visitor: ASTVisitor) -> Any:
+        """Accept a visitor to process this node."""
+        return visitor.visit_match_statement(self)
 
 
 # Import Block to resolve circular dependency

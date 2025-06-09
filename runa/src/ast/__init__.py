@@ -32,7 +32,9 @@ class NodeType(Enum):
     DISPLAY_STATEMENT = auto()
     BLOCK = auto()
     IMPORT_STATEMENT = auto()
+    EXPORT_STATEMENT = auto()
     TRY_CATCH_STATEMENT = auto()
+    MATCH_STATEMENT = auto()
     
     # Expressions
     EXPRESSION = auto()
@@ -48,9 +50,26 @@ class NodeType(Enum):
     DICTIONARY_EXPRESSION = auto()
     INDEX_ACCESS = auto()
     MEMBER_ACCESS = auto()
+    FUNCTION_EXPRESSION = auto()
     
     # Types
     TYPE_ANNOTATION = auto()
+    
+    # Patterns
+    PATTERN = auto()
+    LITERAL_PATTERN = auto()
+    VARIABLE_PATTERN = auto()
+    WILDCARD_PATTERN = auto()
+    LIST_PATTERN = auto()
+    DICTIONARY_PATTERN = auto()
+    TYPE_PATTERN = auto()
+    
+    # AI-specific nodes
+    MODEL_DEFINITION = auto()
+    MODEL_STATEMENT = auto()
+    TRAINING_CONFIG = auto()
+    TRAINING_STATEMENT = auto()
+    KNOWLEDGE_QUERY = auto()
 
 
 @dataclass
@@ -184,8 +203,48 @@ class ASTVisitor(ABC):
         pass
     
     @abstractmethod
+    def visit_export_statement(self, node: 'ExportStatement') -> Any:
+        """Visit an ExportStatement node."""
+        pass
+    
+    @abstractmethod
     def visit_try_catch_statement(self, node: 'TryCatchStatement') -> Any:
         """Visit a TryCatchStatement node."""
+        pass
+    
+    @abstractmethod
+    def visit_match_statement(self, node: 'MatchStatement') -> Any:
+        """Visit a MatchStatement node."""
+        pass
+    
+    @abstractmethod
+    def visit_literal_pattern(self, node: 'LiteralPattern') -> Any:
+        """Visit a LiteralPattern node."""
+        pass
+    
+    @abstractmethod
+    def visit_variable_pattern(self, node: 'VariablePattern') -> Any:
+        """Visit a VariablePattern node."""
+        pass
+    
+    @abstractmethod
+    def visit_wildcard_pattern(self, node: 'WildcardPattern') -> Any:
+        """Visit a WildcardPattern node."""
+        pass
+    
+    @abstractmethod
+    def visit_list_pattern(self, node: 'ListPattern') -> Any:
+        """Visit a ListPattern node."""
+        pass
+    
+    @abstractmethod
+    def visit_dictionary_pattern(self, node: 'DictionaryPattern') -> Any:
+        """Visit a DictionaryPattern node."""
+        pass
+    
+    @abstractmethod
+    def visit_type_pattern(self, node: 'TypePattern') -> Any:
+        """Visit a TypePattern node."""
         pass
     
     @abstractmethod
@@ -226,6 +285,11 @@ class ASTVisitor(ABC):
     @abstractmethod
     def visit_member_access(self, node: 'MemberAccess') -> Any:
         """Visit a MemberAccess node."""
+        pass
+    
+    @abstractmethod
+    def visit_function_expression(self, node: 'FunctionExpression') -> Any:
+        """Visit a FunctionExpression node."""
         pass
     
     @abstractmethod

@@ -1,1 +1,3 @@
-"""Tests for the Runa programming language.""" 
+"""
+Tests package for the Runa programming language.
+""" 

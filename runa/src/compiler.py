@@ -13,6 +13,8 @@ from runa.src.lexer.lexer import Lexer, LexerError
 from runa.src.parser.parser import Parser, ParseError
 from runa.src.ast import Program
 from runa.src.semantic.analyzer import SemanticAnalyzer, SemanticError
+from runa.src.semantic.types import TypeSystem
+from runa.src.semantic.inference import TypeInferenceEngine
 
 
 class CompilerError(Exception):
@@ -30,6 +32,7 @@ class CompilationResult:
         lexer_errors: List of lexer errors (if any)
         parser_errors: List of parser errors (if any)
         semantic_errors: List of semantic errors (if any)
+        inferred_types: Dictionary of inferred types (if successful)
     """
     
     def __init__(
@@ -38,7 +41,8 @@ class CompilationResult:
         program: Optional[Program] = None,
         lexer_errors: Optional[List[LexerError]] = None,
         parser_errors: Optional[List[ParseError]] = None,
-        semantic_errors: Optional[List[SemanticError]] = None
+        semantic_errors: Optional[List[SemanticError]] = None,
+        inferred_types: Optional[Dict[str, str]] = None
     ):
         """Initialize a new CompilationResult."""
         self.success = success
@@ -46,6 +50,7 @@ class CompilationResult:
         self.lexer_errors = lexer_errors or []
         self.parser_errors = parser_errors or []
         self.semantic_errors = semantic_errors or []
+        self.inferred_types = inferred_types or {}
     
     def has_errors(self) -> bool:
         """Check if there are any errors."""
@@ -77,11 +82,17 @@ class Compiler:
     
     This class orchestrates the compilation process, integrating the lexer,
     parser, and semantic analyzer.
+    
+    Attributes:
+        type_system: The type system used for type checking
+        inference_engine: The type inference engine
     """
     
     def __init__(self):
         """Initialize a new Compiler."""
         self.logger = logging.getLogger("runa.compiler")
+        self.type_system = TypeSystem()
+        self.inference_engine = TypeInferenceEngine(self.type_system)
     
     def compile_string(self, source: str) -> CompilationResult:
         """
@@ -117,6 +128,14 @@ class Compiler:
                     parser_errors=parser.errors
                 )
             
+            # Type inference
+            inferred_types = {}
+            try:
+                inferred_types = self.inference_engine.infer_program(program)
+                self.logger.info(f"Type inference completed, inferred {len(inferred_types)} types")
+            except Exception as e:
+                self.logger.warning(f"Type inference failed: {str(e)}")
+            
             # Semantic analysis
             analyzer = SemanticAnalyzer()
             semantic_errors = analyzer.analyze(program)
@@ -126,14 +145,16 @@ class Compiler:
                 return CompilationResult(
                     success=False,
                     program=program,
-                    semantic_errors=semantic_errors
+                    semantic_errors=semantic_errors,
+                    inferred_types=inferred_types
                 )
             
             # All stages successful
             self.logger.info("Compilation successful")
             return CompilationResult(
                 success=True,
-                program=program
+                program=program,
+                inferred_types=inferred_types
             )
         
         except Exception as e:
