@@ -161,13 +161,17 @@ class OpCode(Enum):
     NN_FORWARD = auto()    # Forward pass of neural network
     NN_BACKWARD = auto()   # Backward pass of neural network
     NN_UPDATE = auto()     # Update neural network weights
-
+    
+    # Knowledge graph operations
+    KG_QUERY = auto()      # Execute a knowledge graph query
+    KG_CREATE = auto()     # Create a node or relationship in the knowledge graph
+    
     # Error handling
     TRY_BEGIN = auto()      # Begin try block, with offset to catch block
     TRY_END = auto()        # End try block, with offset to end of catch block
     CATCH_BEGIN = auto()    # Begin catch block
     CATCH_END = auto()      # End catch block
-
+    
     # Closure support
     CREATE_CLOSURE = auto() # Create a closure
     CAPTURE_VAR = auto()    # Capture a variable in the closure
