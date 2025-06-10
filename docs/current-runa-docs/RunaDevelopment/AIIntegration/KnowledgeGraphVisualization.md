@@ -2,411 +2,394 @@
 
 ## Overview
 
-Runa provides powerful tools for visualizing knowledge graphs, allowing developers to create interactive, informative representations of complex graph data. These visualization capabilities help in data exploration, pattern recognition, and presenting insights from knowledge graphs.
+Runa provides powerful visualization capabilities for knowledge graphs, enabling developers to create interactive, customizable graph visualizations for exploring relationships, understanding data structure, and presenting insights. The visualization system integrates seamlessly with Runa's knowledge graph features.
 
-## Core Visualization Features
+## Core Features
 
 ### 1. Basic Graph Visualization
 
-Create simple visualizations with minimal configuration:
+Create simple visualizations of knowledge graphs:
 
-```runa
-# Import the visualization module
-Import KnowledgeGraph.Visualization
+```
+# Create a knowledge graph visualizer
+Let visualizer be KnowledgeGraphVisualizer.create with dictionary with:
+    "layout_algorithm" as "force_directed"  # Options: force_directed, hierarchical, circular, grid
+    "node_styling" as dictionary with:
+        "size_attribute" as "importance"
+        "color_attribute" as "type"
+        "label_attribute" as "name"
+    "edge_styling" as dictionary with:
+        "width_attribute" as "strength"
+        "color_attribute" as "relationship_type"
 
-# Create a simple visualization from a knowledge graph
-Let kg = KnowledgeGraph.connect("my_graph")
-Let viz = GraphVisualizer.create()
-Let visual = viz.render(kg)
+# Load and visualize a knowledge graph
+Let kg be KnowledgeGraph.load with "./data/project_knowledge.kg"
+Let visualization be visualizer.visualize with kg
 
 # Display the visualization
-visual.display()
+Call visualization.show
 ```
 
-### 2. Customizable Visualizations
+### 2. Interactive Visualization
 
-Fine-tune your visualizations with extensive configuration options:
+Create interactive visualizations with user controls:
 
-```runa
-Let viz = GraphVisualizer.create({
-    # Layout algorithms
-    "layout": "force_directed",  # Options: force_directed, circular, hierarchical, radial
-    
-    # Visual theme
-    "theme": "dark",  # Options: light, dark, custom
-    "custom_colors": {
-        "background": "#f5f5f5",
-        "nodes": ["#3366cc", "#dc3912", "#ff9900"],
-        "edges": ["#666666", "#333333"]
-    },
-    
-    # Node representation
-    "node_size_property": "importance",  # Scale nodes based on a property
-    "node_color_property": "category",   # Color nodes based on a property
-    "node_label_property": "name",       # Property to use for labels
-    
-    # Edge representation
-    "edge_width_property": "weight",     # Scale edges based on a property
-    "edge_color_property": "type",       # Color edges based on relationship type
-    "edge_arrow": true,                  # Show directional arrows
-    
-    # Interaction
-    "interactive": true,                 # Enable user interaction
-    "zoom_enabled": true,                # Allow zooming
-    "pan_enabled": true,                 # Allow panning
-    "tooltip_properties": ["name", "description", "created_date"]
-})
+```
+# Create an interactive visualizer
+Let interactive_viz be InteractiveKnowledgeGraphViz.create with dictionary with:
+    "enable_pan_zoom" as true
+    "enable_node_selection" as true
+    "enable_context_menu" as true
+    "enable_search" as true
+
+# Configure interaction behaviors
+Call interactive_viz.configure_interactions with dictionary with:
+    "node_click_action" as "show_details"
+    "node_hover_action" as "highlight_neighbors"
+    "edge_click_action" as "show_relationship_info"
+    "double_click_action" as "expand_subgraph"
+
+# Create the interactive visualization
+Let interactive_graph be interactive_viz.create_visualization with kg
+
+# Add custom controls
+Call interactive_graph.add_control with "node_filter" and dictionary with:
+    "filter_by" as "node_type"
+    "available_types" as kg.get_node_types
+    "default_selection" as "all"
+
+Call interactive_graph.add_control with "relationship_filter" and dictionary with:
+    "filter_by" as "relationship_type"
+    "available_types" as kg.get_relationship_types
 ```
 
-### 3. Subgraph Visualization
+### 3. Advanced Layout Algorithms
 
-Visualize specific parts of your knowledge graph:
+Use sophisticated layout algorithms for better visualization:
 
-```runa
-# Visualize results from a query
-Let results = kg.query("MATCH (p:Person)-[:KNOWS]->(friend) RETURN p, friend")
-Let subgraph_viz = viz.render(results)
+```
+# Create a hierarchical layout
+Let hierarchical_viz be HierarchicalGraphVisualizer.create with dictionary with:
+    "root_nodes" as kg.find_root_nodes
+    "hierarchy_attribute" as "level"
+    "direction" as "top_down"  # Options: top_down, bottom_up, left_right, right_left
 
-# Visualize specific entities and their relationships
-Let entities = kg.get_entities(["entity1", "entity2", "entity3"])
-Let neighborhood = kg.get_neighborhood(entities, {
-    "max_distance": 2,
-    "relationship_types": ["KNOWS", "WORKS_WITH"]
-})
-Let neighborhood_viz = viz.render(neighborhood)
+# Apply clustering before visualization
+Let clustered_viz be ClusteredGraphVisualizer.create with dictionary with:
+    "clustering_algorithm" as "community_detection"
+    "cluster_colors" as list containing "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7"
+    "show_cluster_boundaries" as true
+
+# Create a time-based layout for temporal graphs
+Let temporal_viz be TemporalGraphVisualizer.create with dictionary with:
+    "time_attribute" as "timestamp"
+    "animation_duration" as 5000  # milliseconds
+    "show_timeline_control" as true
 ```
 
-### 4. Dynamic and Interactive Visualizations
+### 4. Custom Node and Edge Styling
 
-Create visualizations that respond to user interactions:
+Customize the appearance of graph elements:
 
-```runa
-# Create an interactive visualization
-Let interactive_viz = GraphVisualizer.create({
-    "interactive": true,
-    "tooltip_enabled": true,
-    "highlight_neighbors": true,  # Highlight connected nodes on hover
-    "filter_panel": true,         # Add UI controls for filtering
-    "search_enabled": true        # Add search functionality
-})
+```
+# Define custom node styling based on attributes
+Let node_styler be NodeStyler.create
 
-# Add event handlers
-Let visualization = interactive_viz.render(kg)
-visualization.on_node_click(node => {
-    Console.log("Selected node:", node.properties.name)
-    # Fetch additional data about the node
-    Let details = kg.get_entity_details(node.id)
-    UI.panel("details").update(details)
-})
+Call node_styler.add_style_rule with dictionary with:
+    "condition" as "node.type == 'Person'"
+    "style" as dictionary with:
+        "shape" as "circle"
+        "color" as "#FF6B6B"
+        "size" as "node.importance * 10"
+        "label_font_size" as 12
 
-# Add interactive filtering
-visualization.add_filter("relationship_type", {
-    "type": "multiselect",
-    "options": ["KNOWS", "WORKS_WITH", "MANAGES"],
-    "default": ["KNOWS", "WORKS_WITH"]
-})
+Call node_styler.add_style_rule with dictionary with:
+    "condition" as "node.type == 'Project'"
+    "style" as dictionary with:
+        "shape" as "rectangle"
+        "color" as "#4ECDC4"
+        "size" as 20
+        "border_width" as 2
+
+# Define custom edge styling
+Let edge_styler be EdgeStyler.create
+
+Call edge_styler.add_style_rule with dictionary with:
+    "condition" as "edge.relationship_type == 'WORKS_ON'"
+    "style" as dictionary with:
+        "color" as "#45B7D1"
+        "width" as "edge.strength * 3"
+        "style" as "solid"
+
+# Apply custom styling to visualizer
+Call visualizer.apply_node_styler with node_styler
+Call visualizer.apply_edge_styler with edge_styler
 ```
 
-### 5. Time-Based Visualization
+### 5. Multi-layer and Subgraph Visualization
 
-Visualize how knowledge graphs evolve over time:
+Visualize complex graphs with multiple layers or focus on subgraphs:
 
-```runa
-# Create a time-series visualization
-Let time_viz = GraphVisualizer.create({
-    "time_based": true,
-    "time_property": "timestamp",
-    "time_interval": "months",
-    "animation_speed": 500,  # ms per frame
-    "show_timeline": true
-})
+```
+# Create a multi-layer visualization
+Let multi_layer_viz be MultiLayerGraphVisualizer.create
 
-# Render time-based visualization
-Let time_visual = time_viz.render(historical_kg)
+# Define layers based on relationship types
+Call multi_layer_viz.add_layer with "collaboration" and dictionary with:
+    "relationships" as list containing "WORKS_WITH", "COLLABORATES_ON"
+    "color_scheme" as "blue_theme"
+    "visible" as true
 
-# Add time controls
-time_visual.add_time_control({
-    "type": "slider",
-    "play_button": true,
-    "speed_control": true
-})
+Call multi_layer_viz.add_layer with "hierarchy" and dictionary with:
+    "relationships" as list containing "REPORTS_TO", "MANAGES"
+    "color_scheme" as "red_theme"
+    "visible" as false
+
+# Create subgraph visualization
+Let subgraph_viz be SubgraphVisualizer.create
+
+# Extract and visualize a neighborhood around a specific node
+Let neighborhood_graph be kg.extract_neighborhood with:
+    center_node as "Alice Smith"
+    max_distance as 2
+    relationship_types as list containing "WORKS_ON", "KNOWS", "COLLABORATES_WITH"
+
+Let neighborhood_viz be subgraph_viz.visualize_subgraph with neighborhood_graph
+```
+
+### 6. Export and Sharing
+
+Export visualizations in various formats:
+
+```
+# Export static images
+Call visualization.export_image with dictionary with:
+    "format" as "png"  # Options: png, svg, pdf, jpg
+    "filename" as "./exports/knowledge_graph.png"
+    "width" as 1920
+    "height" as 1080
+    "dpi" as 300
+
+# Export interactive HTML
+Call interactive_graph.export_html with dictionary with:
+    "filename" as "./exports/interactive_graph.html"
+    "include_controls" as true
+    "standalone" as true  # Include all dependencies
+
+# Export data for external tools
+Call visualization.export_data with dictionary with:
+    "format" as "graphml"  # Options: graphml, gexf, json, csv
+    "filename" as "./exports/graph_data.graphml"
+    "include_styling" as true
 ```
 
 ## Advanced Visualization Features
 
-### 1. Graph Analytics Visualization
+### 1. Dynamic and Animated Visualizations
 
-Visualize analytical insights from your knowledge graph:
+Create visualizations that change over time:
 
-```runa
-# Calculate metrics
-Let algorithms = GraphAlgorithms.create(kg)
-Let centrality = algorithms.page_rank()
-Let communities = algorithms.community_detection("louvain")
+```
+# Create an animated visualization showing graph evolution
+Let animator be GraphAnimator.create with dictionary with:
+    "frame_duration" as 1000  # milliseconds per frame
+    "transition_type" as "smooth"  # Options: smooth, discrete, bounce
 
-# Visualize with analytics
-Let analytics_viz = GraphVisualizer.create({
-    "node_size_property": "pagerank_score",
-    "node_color_property": "community_id",
-    "display_legend": true,
-    "legend_title": "Communities"
-})
+# Define animation keyframes
+Let keyframes be list containing:
+    dictionary with:
+        "timestamp" as 0
+        "graph_state" as kg.get_state_at_time with "2023-01-01"
+    dictionary with:
+        "timestamp" as 1000
+        "graph_state" as kg.get_state_at_time with "2023-06-01"
+    dictionary with:
+        "timestamp" as 2000
+        "graph_state" as kg.get_state_at_time with "2023-12-01"
 
-# Combine graph with analytics results
-Let enriched_graph = kg.enrich({
-    "pagerank_score": centrality.scores,
-    "community_id": communities.assignments
-})
-
-Let analytics_visual = analytics_viz.render(enriched_graph)
+Let animated_viz be animator.create_animation with:
+    keyframes as keyframes
+    animation_controls as true
 ```
 
-### 2. 3D Graph Visualization
+### 2. 3D Visualization
 
-Create three-dimensional visualizations for complex graphs:
+Create three-dimensional graph visualizations:
 
-```runa
-# Create a 3D visualization
-Let viz_3d = GraphVisualizer.create({
-    "dimensions": 3,
-    "layout": "force_directed_3d",
-    "camera_controls": true,
-    "node_geometry": "sphere",  # Options: sphere, cube, custom
-    "edge_geometry": "line"     # Options: line, tube, arrow
-})
+```
+# Create a 3D visualizer
+Let viz_3d be Graph3DVisualizer.create with dictionary with:
+    "layout_algorithm" as "force_directed_3d"
+    "camera_controls" as dictionary with:
+        "enable_rotation" as true
+        "enable_zoom" as true
+        "auto_rotate" as false
+    "lighting" as dictionary with:
+        "ambient_intensity" as 0.4
+        "directional_intensity" as 0.8
+        "shadows" as true
 
-Let visual_3d = viz_3d.render(kg)
+# Configure 3D-specific styling
+Let sphere_nodes be viz_3d.create_node_style with dictionary with:
+    "geometry" as "sphere"
+    "material" as "phong"
+    "size_multiplier" as 1.5
+
+Let cylinder_edges be viz_3d.create_edge_style with dictionary with:
+    "geometry" as "cylinder"
+    "material" as "basic"
+    "curve_factor" as 0.1
+
+# Create and display 3D visualization
+Let graph_3d be viz_3d.visualize with kg
+Call graph_3d.show_in_browser
 ```
 
-### 3. Geo-Spatial Graph Visualization
+### 3. Real-time Collaborative Visualization
 
-Visualize knowledge graphs with geographical components:
+Enable multiple users to explore graphs together:
 
-```runa
-# Create a geo-visualization
-Let geo_viz = GraphVisualizer.create({
-    "type": "geo",
-    "map_style": "light",  # Options: light, dark, satellite, streets
-    "lat_property": "latitude",
-    "lng_property": "longitude",
-    "region_property": "country",  # For choropleth maps
-    "value_property": "importance"
-})
+```
+# Create a collaborative visualization session
+Let collab_viz be CollaborativeGraphVisualizer.create with dictionary with:
+    "session_id" as "project_exploration_session"
+    "websocket_server" as "ws://localhost:8080/graph_session"
+    "sync_viewport" as true
+    "shared_selections" as true
 
-Let geo_visual = geo_viz.render(geo_enriched_kg)
+# Configure collaboration features
+Call collab_viz.enable_user_cursors with dictionary with:
+    "show_user_names" as true
+    "cursor_colors" as "auto_assign"
+
+Call collab_viz.enable_shared_annotations with dictionary with:
+    "allow_text_notes" as true
+    "allow_drawing" as true
+    "persist_annotations" as true
+
+# Start collaborative session
+Let session be collab_viz.start_session with kg
+Call session.invite_users with list containing "user1@example.com", "user2@example.com"
 ```
 
-### 4. Custom Rendering Functions
+## Integration with Runa Development Workflow
 
-Create custom visual representations for nodes and edges:
+### Code Dependency Visualization
 
-```runa
-Let custom_viz = GraphVisualizer.create()
+```
+# Visualize code dependencies and relationships
+Let code_viz be CodeDependencyVisualizer.create
 
-# Custom node renderer
-custom_viz.set_node_renderer(node => {
-    If node.type == "Person":
-        Return {
-            "shape": "circle",
-            "radius": 5 + (node.properties.influence * 3),
-            "color": gender_color_map[node.properties.gender],
-            "icon": "user"
-        }
-    Else If node.type == "Organization":
-        Return {
-            "shape": "rectangle",
-            "width": 20,
-            "height": 15,
-            "color": industry_color_map[node.properties.industry],
-            "icon": "building"
-        }
-})
+# Extract dependency graph from codebase
+Let dependency_graph be code_viz.extract_dependencies with:
+    source_path as "./src/"
+    include_patterns as list containing "*.runa"
+    dependency_types as list containing "imports", "function_calls", "class_inheritance"
 
-# Custom edge renderer
-custom_viz.set_edge_renderer(edge => {
-    Let thickness = Math.log(edge.properties.strength + 1)
-    Let dash_pattern = edge.properties.confirmed ? "solid" : "dashed"
-    
-    Return {
-        "width": thickness,
-        "style": dash_pattern,
-        "color": relationship_color_map[edge.type],
-        "arrow_size": thickness * 2
-    }
-})
+# Create hierarchical visualization of code structure
+Let code_visualization be code_viz.create_hierarchy_view with:
+    graph as dependency_graph
+    grouping_strategy as "by_module"
+    show_external_dependencies as false
+
+# Add interactivity for code exploration
+Call code_visualization.add_code_preview with dictionary with:
+    "show_on_hover" as true
+    "syntax_highlighting" as true
+    "max_lines" as 20
 ```
 
-## Integration with Web and UI Components
+### Documentation and Knowledge Mapping
 
-### 1. Web Integration
+```
+# Create a comprehensive knowledge map
+Let knowledge_mapper be KnowledgeMapper.create
 
-Embed visualizations in web applications:
+# Combine multiple knowledge sources
+Let knowledge_sources be list containing:
+    kg  # Main knowledge graph
+    dependency_graph  # Code dependencies
+    code_viz.extract_api_graph with "./api/"  # API relationships
 
-```runa
-# Create a web-embeddable visualization
-Let web_viz = GraphVisualizer.create({
-    "target": "div#graph-container",
-    "responsive": true,
-    "height": "500px",
-    "width": "100%"
-})
+Let comprehensive_graph be knowledge_mapper.merge_graphs with:
+    graphs as knowledge_sources
+    merge_strategy as "entity_matching"
+    confidence_threshold as 0.8
 
-# Export visualization for web embedding
-Let html_component = web_viz.render(kg).to_html_component()
-File.write("graph_component.html", html_component)
-
-# Or embed directly into a Runa web app
-UI.embed("graph-container", html_component)
+# Create an explorable knowledge map
+Let knowledge_map be knowledge_mapper.create_knowledge_map with:
+    graph as comprehensive_graph
+    map_type as "concept_map"
+    enable_search as true
+    enable_filtering as true
 ```
 
-### 2. Dashboard Integration
+## Example: Creating a Project Overview Dashboard
 
-Create dashboards with multiple visualizations:
-
-```runa
-# Create a dashboard with multiple views
-Let dashboard = Dashboard.create("Knowledge Graph Insights")
-
-# Add multiple visualizations
-dashboard.add_panel("Overview", overview_viz)
-dashboard.add_panel("Communities", community_viz)
-dashboard.add_panel("Important Entities", central_nodes_viz)
-dashboard.add_panel("Geo Distribution", geo_viz)
-
-# Configure layout
-dashboard.set_layout([
-    ["Overview", "Communities"],
-    ["Important Entities", "Geo Distribution"]
-])
-
-# Add controls
-dashboard.add_filter("Global Filter", {
-    "type": "date_range",
-    "affects": ["Overview", "Communities"]
-})
-
-# Display dashboard
-dashboard.display()
+```
+Process called "create_project_dashboard":
+    # Load project knowledge graph
+    Let project_kg be KnowledgeGraph.load with "./project_knowledge.kg"
+    
+    # Create dashboard layout
+    Let dashboard be GraphDashboard.create with dictionary with:
+        "layout" as "grid"
+        "columns" as 2
+        "responsive" as true
+    
+    # Add team structure visualization
+    Let team_subgraph be project_kg.filter_by_types with list containing "Person", "Team", "Role"
+    Let team_viz be dashboard.add_panel with "team_structure" and dictionary with:
+        "title" as "Team Structure"
+        "visualization_type" as "hierarchical"
+        "data" as team_subgraph
+    
+    # Add project timeline
+    Let timeline_data be project_kg.filter_by_attribute with "timestamp"
+    Let timeline_viz be dashboard.add_panel with "project_timeline" and dictionary with:
+        "title" as "Project Timeline"
+        "visualization_type" as "temporal"
+        "data" as timeline_data
+    
+    # Add technology stack overview
+    Let tech_subgraph be project_kg.filter_by_types with list containing "Technology", "Framework", "Tool"
+    Let tech_viz be dashboard.add_panel with "tech_stack" and dictionary with:
+        "title" as "Technology Stack"
+        "visualization_type" as "clustered"
+        "data" as tech_subgraph
+    
+    # Add real-time metrics
+    Let metrics_panel be dashboard.add_panel with "metrics" and dictionary with:
+        "title" as "Project Metrics"
+        "visualization_type" as "metrics_overlay"
+        "refresh_interval" as 30000  # 30 seconds
+    
+    # Configure interactivity between panels
+    Call dashboard.link_panels with dictionary with:
+        "selection_sync" as true
+        "filter_sync" as true
+        "highlight_sync" as true
+    
+    # Export dashboard
+    Call dashboard.export_html with "./project_dashboard.html"
+    
+    Return dashboard
 ```
 
-## Export and Sharing
+## Best Practices
 
-Export visualizations to various formats:
+1. **Performance Optimization**: For large graphs, use level-of-detail rendering and clustering to maintain performance.
 
-```runa
-# Export to image formats
-visual.export("graph.png")
-visual.export("graph.svg")
+2. **User Experience**: Provide clear navigation controls and context information to help users understand the visualization.
 
-# Export to interactive formats
-visual.export("graph.html")  # Self-contained HTML
-visual.export("graph.json")  # Data for custom rendering
+3. **Accessibility**: Ensure visualizations are accessible with proper color contrast and alternative text representations.
 
-# Print high-quality version
-visual.print({
-    "dpi": 300,
-    "size": "A4",
-    "orientation": "landscape"
-})
+4. **Responsiveness**: Design visualizations that work well on different screen sizes and devices.
 
-# Share visualization
-Let share_url = visual.share({
-    "public": true,
-    "editable": false,
-    "expiry": "30d"
-})
-```
-
-## Example: Building a Knowledge Graph Explorer Application
-
-```runa
-Process called "create_kg_explorer_app":
-    # Initialize knowledge graph
-    Let kg = KnowledgeGraph.connect("research_knowledge")
-    
-    # Create visualization components
-    Let main_view = GraphVisualizer.create({
-        "interactive": true,
-        "layout": "force_directed",
-        "node_size_property": "importance",
-        "node_color_property": "type",
-        "theme": "light"
-    })
-    
-    Let detail_view = GraphVisualizer.create({
-        "layout": "hierarchical",
-        "direction": "LR",
-        "node_label_property": "name",
-        "edge_label_property": "relationship"
-    })
-    
-    # Set up application UI
-    Let app = Application.create("Knowledge Explorer")
-    app.add_view("main", main_view.render(kg))
-    app.add_view("details", detail_view)
-    app.add_panel("info", Panel.create())
-    
-    # Add interaction handlers
-    app.get_view("main").on_node_click(node => {
-        Let neighborhood = kg.get_neighborhood(node.id, { "max_distance": 1 })
-        app.get_view("details").update(neighborhood)
-        
-        Let info = kg.get_entity_details(node.id)
-        app.get_panel("info").update(format_entity_info(info))
-    })
-    
-    # Add search functionality
-    app.add_search_box(query => {
-        Let results = kg.search(query)
-        app.get_view("main").highlight_nodes(results.map(r => r.id))
-        Return results.map(r => r.properties.name)
-    })
-    
-    # Start the application
-    app.start()
-    
-    Return app
-
-# Helper function for formatting entity information
-Process called "format_entity_info"(info):
-    Let formatted = "<div class='entity-info'>"
-    formatted += "<h2>" + info.name + "</h2>"
-    formatted += "<p class='entity-type'>" + info.type + "</p>"
-    
-    formatted += "<h3>Properties</h3>"
-    formatted += "<ul>"
-    For prop in info.properties:
-        formatted += "<li><strong>" + prop.key + ":</strong> " + prop.value + "</li>"
-    formatted += "</ul>"
-    
-    formatted += "<h3>Relationships</h3>"
-    formatted += "<ul>"
-    For rel in info.relationships:
-        formatted += "<li><strong>" + rel.type + ":</strong> " + rel.target_name + "</li>"
-    formatted += "</ul>"
-    
-    formatted += "</div>"
-    Return formatted
-```
-
-## Best Practices for Knowledge Graph Visualization
-
-1. **Focus on Clarity**: Limit the number of nodes and edges displayed at once to prevent visual overload.
-
-2. **Use Visual Hierarchy**: Size and color nodes based on importance to guide users' attention.
-
-3. **Interactive Filtering**: Provide ways for users to filter and focus on subsets of the graph.
-
-4. **Consistent Visual Language**: Maintain consistent visual encoding (colors, shapes) throughout your visualizations.
-
-5. **Context First**: Start with overview visualizations before diving into details.
-
-6. **Performance Consideration**: For large graphs, use techniques like clustering, sampling, or progressive loading.
+5. **Data Quality**: Ensure the underlying knowledge graph data is clean and well-structured for effective visualization.
 
 ## References
 
-- [Runa Visualization API Reference](https://runa-lang.org/docs/api/visualization)
-- [Knowledge Graph Visualization Guide](https://runa-lang.org/docs/guides/kg-visualization)
-- [Interactive Visualization Examples](https://runa-lang.org/examples/visualization-gallery)
-
-For complete visualization examples, see the [Knowledge Graph Visualization Examples](../../src/tests/examples/kg_visualization_examples.runa) in the Runa codebase. 
+- [Runa Visualization API Documentation](https://runa-lang.org/docs/api/visualization)
+- [Graph Visualization Examples](../../src/tests/examples/kg_visualization_examples.runa)
+- [Interactive Dashboard Templates](../../templates/visualization/) 

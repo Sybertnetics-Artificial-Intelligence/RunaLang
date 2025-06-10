@@ -10,9 +10,9 @@ Runa provides robust integration with Large Language Models (LLMs), enabling dev
 
 Runa's `runa.ai.llm` module provides straightforward API for connecting to and interacting with language models:
 
-```runa
-Let model = LLM.connect("model_name")
-Let response = model.complete("Your prompt here")
+```
+Let model be LLM.connect with "model_name"
+Let response be model.complete with "Your prompt here"
 ```
 
 The LLM integration supports various model providers and can be configured for both local and cloud-based models.
@@ -23,73 +23,69 @@ The LLM integration supports various model providers and can be configured for b
 
 Create reusable prompt templates with variable placeholders:
 
-```runa
-Let template = PromptTemplate.create(
+```
+Let template be PromptTemplate.create with:
     "Generate a {{language}} function that {{task}} with these requirements: {{requirements}}"
-)
 
-Let prompt = template.fill({
-    "language": "Runa",
-    "task": "sorts a list",
-    "requirements": "Must handle empty lists"
-})
+Let prompt be template.fill with dictionary with:
+    "language" as "Runa"
+    "task" as "sorts a list"
+    "requirements" as "Must handle empty lists"
 ```
 
 #### Few-Shot Learning
 
 Improve model performance by providing examples:
 
-```runa
-Let examples = [
-    {"input": "Sort [3, 1, 5, 2]", "output": "[1, 2, 3, 5]"},
-    {"input": "Find max: [7, 2, 9, 4]", "output": "9"}
-]
+```
+Let examples be list containing:
+    dictionary with "input" as "Sort [3, 1, 5, 2]" and "output" as "[1, 2, 3, 5]"
+    dictionary with "input" as "Find max: [7, 2, 9, 4]" and "output" as "9"
 
-Let few_shot_prompt = FewShotPrompt.create(
-    examples,
-    prefix="Solve this problem:",
-    suffix="{{input}}"
-)
+Let few shot prompt be FewShotPrompt.create with:
+    examples as examples
+    prefix as "Solve this problem:"
+    suffix as "{{input}}"
 ```
 
 #### Chain-of-Thought Reasoning
 
 Guide models through complex reasoning tasks:
 
-```runa
-Let response = model.complete_with_cot("Your complex problem here")
-Print(response.reasoning)  # See the step-by-step reasoning
-Print(response.answer)     # Get the final answer
+```
+Let response be model.complete with cot with "Your complex problem here"
+Display response.reasoning  # See the step-by-step reasoning
+Display response.answer     # Get the final answer
 ```
 
 ### 3. Code Generation and Execution
 
 Runa provides specialized methods for code generation and safe execution:
 
-```runa
+```
 # Generate code
-Let code = model.complete_as_code("Write a function to calculate factorial")
+Let code be model.complete as code with "Write a function to calculate factorial"
 
 # Safely execute generated code
-Let result = LLM.execute_safely(code, {"n": 5})
+Let result be LLM.execute safely with code as code and dictionary with "n" as 5
 ```
 
 The `CodeGenerator` class offers additional capabilities:
 
-```runa
-Let generator = CodeGenerator.create()
-Let generated_code = generator.generate("Description of desired code")
-Let validation_result = generator.validate(generated_code)
+```
+Let generator be CodeGenerator.create
+Let generated code be generator.generate with "Description of desired code"
+Let validation result be generator.validate with generated code
 ```
 
 ### 4. Model Evaluation
 
 Evaluate and compare LLM performance using Runa's built-in tools:
 
-```runa
-Let evaluator = ModelEvaluator.create()
-Let test_data = Dataset.load("benchmark_dataset")
-Let evaluation_results = evaluator.evaluate(model, test_data)
+```
+Let evaluator be ModelEvaluator.create
+Let test data be Dataset.load with "benchmark_dataset"
+Let evaluation results be evaluator.evaluate with model as model and test data as test data
 ```
 
 ## Configuration
@@ -98,30 +94,28 @@ Let evaluation_results = evaluator.evaluate(model, test_data)
 
 Configure LLM behavior with custom settings:
 
-```runa
-Let model = LLM.connect("model_name", {
-    "temperature": 0.7,
-    "max_tokens": 1000,
-    "top_p": 0.95,
-    "frequency_penalty": 0.5,
-    "presence_penalty": 0.5
-})
+```
+Let model be LLM.connect with "model_name" and dictionary with:
+    "temperature" as 0.7
+    "max_tokens" as 1000
+    "top_p" as 0.95
+    "frequency_penalty" as 0.5
+    "presence_penalty" as 0.5
 ```
 
 ### Provider Configuration
 
 Set up connections to different LLM providers:
 
-```runa
+```
 # Configure a provider
-LLM.configure_provider("provider_name", {
-    "api_key": "your_api_key",
-    "base_url": "https://api.provider.com/v1",
-    "default_model": "provider-model-name"
-})
+LLM.configure provider with "provider_name" and dictionary with:
+    "api_key" as "your_api_key"
+    "base_url" as "https://api.provider.com/v1"
+    "default_model" as "provider-model-name"
 
 # Then connect using that provider
-Let model = LLM.connect_with_provider("provider_name")
+Let model be LLM.connect with provider as "provider_name"
 ```
 
 ## Best Practices
@@ -134,28 +128,26 @@ Let model = LLM.connect_with_provider("provider_name")
 
 ## Example: Building an LLM-powered Assistant
 
-```runa
+```
 Process called "create_assistant":
     # Initialize assistant with specific capabilities
-    Let assistant = Assistant.create({
-        "name": "RunaHelper",
-        "description": "Coding assistant for Runa developers",
-        "capabilities": ["code_generation", "documentation", "debugging"]
-    })
+    Let assistant be Assistant.create with dictionary with:
+        "name" as "RunaHelper"
+        "description" as "Coding assistant for Runa developers"
+        "capabilities" as list containing "code_generation", "documentation", "debugging"
     
     # Connect to preferred LLM
-    Let model = LLM.connect("runa_assistant_model")
-    assistant.set_model(model)
+    Let model be LLM.connect with "runa_assistant_model"
+    Call assistant.set_model with model
     
     # Configure assistant behavior
-    assistant.configure({
-        "code_style": "idiomatic_runa",
-        "verbosity": "medium",
-        "include_explanations": true
-    })
+    Call assistant.configure with dictionary with:
+        "code_style" as "idiomatic_runa"
+        "verbosity" as "medium"
+        "include_explanations" as true
     
     # Start interactive session
-    Let session = assistant.start_session()
+    Let session be assistant.start_session
     
     Return assistant
 ```

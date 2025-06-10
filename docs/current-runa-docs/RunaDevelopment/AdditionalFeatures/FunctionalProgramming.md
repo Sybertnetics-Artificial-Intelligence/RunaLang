@@ -55,7 +55,7 @@ Let numbers be list containing 1, 2, 3, 4, 5
 Let double be Lambda x: x multiplied by 2
 
 Let doubled_numbers be Map over numbers using double
-# doubled_numbers is [2, 4, 6, 8, 10]
+# doubled_numbers is list containing 2, 4, 6, 8, 10
 ```
 
 ### Filter
@@ -67,7 +67,7 @@ Let numbers be list containing 1, 2, 3, 4, 5, 6
 Let is_even be Lambda x: x modulo 2 is equal to 0
 
 Let even_numbers be Filter over numbers using is_even
-# even_numbers is [2, 4, 6]
+# even_numbers is list containing 2, 4, 6
 ```
 
 ### Reduce
@@ -119,7 +119,7 @@ Let result be numbers
     |> Map using Lambda x: x multiplied by 3
     |> Reduce using Lambda a and b: a plus b with initial 0
 
-# Result is 36 (sum of [6, 12, 18])
+# Result is 36 (sum of list containing 6, 12, 18)
 ```
 
 ## Function Composition
@@ -194,12 +194,12 @@ Runa encourages the use of immutable data structures:
 Let numbers be immutable list containing 1, 2, 3, 4, 5
 
 # Operations on immutable lists return new lists
-Let with_added be numbers with 6 added      # Returns a new list [1, 2, 3, 4, 5, 6]
-Let with_removed be numbers without 3       # Returns a new list [1, 2, 4, 5]
-Let with_replaced be numbers with 2 replaced by 20  # Returns a new list [1, 20, 3, 4, 5]
+Let with_added be numbers with 6 added      # Returns a new list containing 1, 2, 3, 4, 5, 6
+Let with_removed be numbers without 3       # Returns a new list containing 1, 2, 4, 5
+Let with_replaced be numbers with 2 replaced by 20  # Returns a new list containing 1, 20, 3, 4, 5
 
 # Original list remains unchanged
-Display numbers  # Still [1, 2, 3, 4, 5]
+Display numbers  # Still list containing 1, 2, 3, 4, 5
 ```
 
 ## Pure Functions
@@ -274,7 +274,7 @@ Let numbers be lazy range from 1 to 1000000
 Let evens be numbers |> Filter using Lambda x: x modulo 2 is equal to 0
 Let first_10_evens be evens |> take with count as 10
 
-# first_10_evens is [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+# first_10_evens is list containing 2, 4, 6, 8, 10, 12, 14, 16, 18, 20
 # The full sequence is never generated
 ```
 

@@ -8,7 +8,8 @@
 
 The `FeedbackAnnotation` class extends the base `AnnotationNode` class and specifically represents feedback suggestions between AI components:
 
-```python
+```
+# Python implementation details (internal)
 @dataclass
 class FeedbackAnnotation(AnnotationNode):
     """Annotation for feedback between AI systems."""
@@ -35,7 +36,7 @@ Additionally, it inherits these parameters from `AnnotationNode`:
 
 Feedback annotations are typically added as comments in the Runa code:
 
-```python
+```
 # @feedback(area="performance", priority="high"): The recursive approach causes excessive memory usage
 ```
 
@@ -43,7 +44,8 @@ Feedback annotations are typically added as comments in the Runa code:
 
 While `FeedbackAnnotation` instances are typically created automatically by the parser, they can also be created manually:
 
-```python
+```
+# Python implementation details (internal)
 from runa.annotation_system import FeedbackAnnotation, AnnotationType
 
 feedback = FeedbackAnnotation(
@@ -65,13 +67,13 @@ The `FeedbackAnnotation` class is integrated with the rest of the annotation sys
 
 ## Example
 
-```python
+```
 # Original code with feedback annotation
 Process called "fibonacci" that takes n:
     # @feedback(area="performance", priority="high"): This recursive implementation has exponential time complexity
     If n is less than or equal to 1:
         Return n
-    Return fibonacci(n - 1) + fibonacci(n - 2)
+    Return fibonacci with n as n minus 1 plus fibonacci with n as n minus 2
 
 # Improved code based on feedback
 Process called "fibonacci" that takes n:
@@ -79,11 +81,11 @@ Process called "fibonacci" that takes n:
     Let a be 0
     Let b be 1
     
-    If n is 0:
+    If n is equal to 0:
         Return 0
     
     For i from 2 to n inclusive:
-        Let temp be a + b
+        Let temp be a plus b
         Set a to b
         Set b to temp
     
@@ -104,4 +106,4 @@ Process called "fibonacci" that takes n:
 - `AnnotationParser`: Parser that creates annotation instances from comments
 - `AnnotationAnalyzer`: Analyzes annotations and extracts insights
 - `AnnotationGenerator`: Generates annotation comments from annotation objects
-``` 
+```

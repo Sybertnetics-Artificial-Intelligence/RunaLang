@@ -507,8 +507,8 @@ Version history:
 This example shows the bytecode representation of a simple function:
 
 ```
-Process called add(a as Integer, b as Integer) returns Integer
-    Return a + b
+Process called add that takes a as Integer and b as Integer returns Integer
+Return a plus b
 End Process
 ```
 
@@ -532,7 +532,7 @@ Flags: 0
 # Bytecode
 LOAD_LOCAL 0     # Load parameter 'a'
 LOAD_LOCAL 1     # Load parameter 'b'
-ADD              # Add a + b
+ADD              # Add a plus b
 RETURN           # Return result
 ```
 
@@ -545,13 +545,13 @@ Class Person with
     Field name as Text
     Field age as Integer
     
-    Process called initialize(name as Text, age as Integer)
-        Self.name = name
-        Self.age = age
-    End Process
-    
-    Process called is_adult() returns Boolean
-        Return Self.age >= 18
+    Process called initialize that takes name as Text and age as Integer
+    Set Self.name to name
+    Set Self.age to age
+End Process
+
+Process called is_adult that returns Boolean
+    Return Self.age is greater than or equal to 18
     End Process
 End Class
 ```

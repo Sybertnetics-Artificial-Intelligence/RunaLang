@@ -8,13 +8,12 @@ Runa's Domain-Specific Extensions framework allows developers to create speciali
 
 ### Domain Extension Creation
 
-```runa
+```
 // Create a domain extension with appropriate configuration
-Process called CreateDomainExtension(domainName, configOptions)
-    Let extension = DomainExtension.create(domainName)
-    extension.setConfig(configOptions)
-    return extension
-End Process
+Process called "Create Domain Extension" that takes domain name and config options:
+    Let extension be DomainExtension.create with domain name as domain name
+    Set extension.config to config options
+    Return extension
 ```
 
 #### Configuration Options
@@ -26,14 +25,12 @@ End Process
 
 ### Domain Knowledge Integration
 
-```runa
+```
 // Register domain knowledge with the extension
-Process called RegisterDomainKnowledge(extension, knowledgeSources)
-    For each source in knowledgeSources
-        extension.registerKnowledgeSource(source.name, source.path, source.format)
-    End For
-    extension.buildKnowledgeIndex()
-End Process
+Process called "Register Domain Knowledge" that takes extension and knowledge sources:
+    For each source in knowledge sources:
+        Call extension.registerKnowledgeSource with name as source.name and path as source.path and format as source.format
+    Call extension.buildKnowledgeIndex
 ```
 
 - Import specialized knowledge bases, ontologies, and reference data
@@ -42,16 +39,14 @@ End Process
 
 ### Domain-Specific Models
 
-```runa
+```
 // Register and configure domain-optimized models
-Process called RegisterDomainModel(extension, modelInfo)
-    extension.registerModel(
-        modelInfo.name,
-        modelInfo.modelPath,
-        modelInfo.configOptions
-    )
-    return extension.getModel(modelInfo.name)
-End Process
+Process called "Register Domain Model" that takes extension and model info:
+    Call extension.registerModel with:
+        name as model info.name
+        model path as model info.model path
+        config options as model info.config options
+    Return extension.getModel with model info.name
 ```
 
 - Register pre-trained models for domain-specific tasks
@@ -60,13 +55,12 @@ End Process
 
 ### Domain Components
 
-```runa
+```
 // Create domain-specific components
-Process called CreateDomainComponent(extension, componentType, configOptions)
-    Let component = extension.createComponent(componentType, configOptions)
-    component.initialize()
-    return component
-End Process
+Process called "Create Domain Component" that takes extension and component type and config options:
+    Let component be extension.createComponent with component type as component type and config options as config options
+    Call component.initialize
+    Return component
 ```
 
 - Create specialized processing pipelines for domain workflows
@@ -75,16 +69,14 @@ End Process
 
 ### Domain Integration
 
-```runa
+```
 // Integrate multiple domain extensions
-Process called IntegrateDomains(primaryDomain, secondaryDomain, integrationOptions)
-    Let integrated = DomainExtension.integrate(
-        primaryDomain, 
-        secondaryDomain, 
-        integrationOptions
-    )
-    return integrated
-End Process
+Process called "Integrate Domains" that takes primary domain and secondary domain and integration options:
+    Let integrated be DomainExtension.integrate with:
+        primary domain as primary domain
+        secondary domain as secondary domain
+        integration options as integration options
+    Return integrated
 ```
 
 - Combine knowledge from multiple domains
@@ -95,66 +87,58 @@ End Process
 
 ### Healthcare Domain
 
-```runa
-Process called CreateHealthcareDomain()
-    Let healthcare = CreateDomainExtension("Healthcare", {
-        knowledgeSources: ["medical_ontology", "drug_interactions", "clinical_guidelines"],
-        modelTypes: ["diagnosis", "treatment_recommendation", "medical_ner"]
-    })
+```
+Process called "Create Healthcare Domain":
+    Let healthcare be Create Domain Extension with domain name as "Healthcare" and config options as dictionary with:
+        "knowledge sources" as list containing "medical_ontology", "drug_interactions", "clinical_guidelines"
+        "model types" as list containing "diagnosis", "treatment_recommendation", "medical_ner"
     
-    RegisterDomainKnowledge(healthcare, [
-        {name: "SNOMED-CT", path: "knowledge/snomed.kg", format: "owl"},
-        {name: "DrugInteractions", path: "knowledge/interactions.json", format: "json"}
-    ])
+    Register Domain Knowledge with extension as healthcare and knowledge sources as list containing:
+        dictionary with "name" as "SNOMED-CT" and "path" as "knowledge/snomed.kg" and "format" as "owl"
+        dictionary with "name" as "DrugInteractions" and "path" as "knowledge/interactions.json" and "format" as "json"
     
-    RegisterDomainModel(healthcare, {
-        name: "DiagnosisModel",
-        modelPath: "models/medical_diagnosis.model",
-        configOptions: {threshold: 0.85, specialties: ["general", "cardiology"]}
-    })
+    Register Domain Model with extension as healthcare and model info as dictionary with:
+        "name" as "DiagnosisModel"
+        "model path" as "models/medical_diagnosis.model"
+        "config options" as dictionary with "threshold" as 0.85 and "specialties" as list containing "general", "cardiology"
     
-    Let diagnosisComponent = CreateDomainComponent(healthcare, 
-        "DiagnosticAnalyzer", 
-        {includeExplanations: true, confidenceThreshold: 0.8}
-    )
+    Let diagnosis component be Create Domain Component with:
+        extension as healthcare
+        component type as "DiagnosticAnalyzer"
+        config options as dictionary with "include explanations" as true and "confidence threshold" as 0.8
     
-    return healthcare
-End Process
+    Return healthcare
 ```
 
 ### Financial Domain
 
-```runa
-Process called CreateFinancialDomain()
-    Let finance = CreateDomainExtension("Finance", {
-        knowledgeSources: ["financial_regulations", "market_indicators", "risk_models"],
-        modelTypes: ["fraud_detection", "risk_assessment", "market_prediction"]
-    })
+```
+Process called "Create Financial Domain":
+    Let finance be Create Domain Extension with domain name as "Finance" and config options as dictionary with:
+        "knowledge sources" as list containing "financial_regulations", "market_indicators", "risk_models"
+        "model types" as list containing "fraud_detection", "risk_assessment", "market_prediction"
     
-    RegisterDomainModel(finance, {
-        name: "FraudDetectionModel",
-        modelPath: "models/fraud_detection.model",
-        configOptions: {sensitivity: 0.9, falsePositiveRate: 0.05}
-    })
+    Register Domain Model with extension as finance and model info as dictionary with:
+        "name" as "FraudDetectionModel"
+        "model path" as "models/fraud_detection.model"
+        "config options" as dictionary with "sensitivity" as 0.9 and "false positive rate" as 0.05
     
-    Let transactionAnalyzer = CreateDomainComponent(finance, 
-        "TransactionAnalyzer", 
-        {batchSize: 1000, realTimeAlert: true}
-    )
+    Let transaction analyzer be Create Domain Component with:
+        extension as finance
+        component type as "TransactionAnalyzer"
+        config options as dictionary with "batch size" as 1000 and "real time alert" as true
     
-    return finance
-End Process
+    Return finance
 ```
 
 ## Advanced Features
 
 ### Domain Adaptation
 
-```runa
-Process called AdaptDomain(extension, targetContext, adaptationOptions)
-    Let adapted = extension.adaptToContext(targetContext, adaptationOptions)
-    return adapted
-End Process
+```
+Process called "Adapt Domain" that takes extension and target context and adaptation options:
+    Let adapted be extension.adaptToContext with target context as target context and adaptation options as adaptation options
+    Return adapted
 ```
 
 - Specialize a domain extension for a more specific context
@@ -163,15 +147,13 @@ End Process
 
 ### Performance Evaluation
 
-```runa
-Process called EvaluateDomainPerformance(extension, evaluationDataset, metrics)
-    Let results = extension.evaluate(evaluationDataset, metrics)
-    return {
-        overallScore: results.aggregateScore,
-        metricScores: results.detailedMetrics,
-        recommendations: results.improvementSuggestions
-    }
-End Process
+```
+Process called "Evaluate Domain Performance" that takes extension and evaluation dataset and metrics:
+    Let results be extension.evaluate with evaluation dataset as evaluation dataset and metrics as metrics
+    Return dictionary with:
+        "overall score" as results.aggregate score
+        "metric scores" as results.detailed metrics
+        "recommendations" as results.improvement suggestions
 ```
 
 - Evaluate domain extension performance on domain-specific tasks
@@ -180,11 +162,10 @@ End Process
 
 ### Domain Export and Sharing
 
-```runa
-Process called ExportDomainExtension(extension, exportOptions)
-    Let exportPath = extension.export(exportOptions)
-    return exportPath
-End Process
+```
+Process called "Export Domain Extension" that takes extension and export options:
+    Let export path be extension.export with export options as export options
+    Return export path
 ```
 
 - Package domain extensions for distribution
@@ -193,38 +174,41 @@ End Process
 
 ## Example: Building a Medical Research Assistant
 
-```runa
-Process called BuildMedicalResearchAssistant()
+```
+Process called "Build Medical Research Assistant":
     // Create the healthcare domain extension
-    Let healthcare = CreateHealthcareDomain()
+    Let healthcare be Create Healthcare Domain
     
     // Create a research domain extension
-    Let research = CreateDomainExtension("Research", {
-        knowledgeSources: ["pubmed", "clinical_trials", "research_methods"],
-        modelTypes: ["literature_analysis", "study_design", "evidence_evaluation"]
-    })
+    Let research be Create Domain Extension with domain name as "Research" and config options as dictionary with:
+        "knowledge sources" as list containing "pubmed", "clinical_trials", "research_methods"
+        "model types" as list containing "literature_analysis", "study_design", "evidence_evaluation"
     
     // Integrate the domains
-    Let medicalResearch = IntegrateDomains(healthcare, research, {
-        primaryFocus: "medical_evidence",
-        knowledgeIntegration: "federated"
-    })
+    Let medical research be Integrate Domains with:
+        primary domain as healthcare
+        secondary domain as research
+        integration options as dictionary with:
+            "primary focus" as "medical_evidence"
+            "knowledge integration" as "federated"
     
     // Register an integrated model
-    RegisterDomainModel(medicalResearch, {
-        name: "EvidenceEvaluator",
-        modelPath: "models/medical_evidence.model",
-        configOptions: {evidenceLevels: ["A", "B", "C", "D"], minConfidence: 0.75}
-    })
+    Register Domain Model with extension as medical research and model info as dictionary with:
+        "name" as "EvidenceEvaluator"
+        "model path" as "models/medical_evidence.model"
+        "config options" as dictionary with:
+            "evidence levels" as list containing "A", "B", "C", "D"
+            "min confidence" as 0.75
     
     // Create a research assistant component
-    Let assistant = CreateDomainComponent(medicalResearch,
-        "ResearchAssistant",
-        {interactiveMode: true, citationTracking: true}
-    )
+    Let assistant be Create Domain Component with:
+        extension as medical research
+        component type as "ResearchAssistant"
+        config options as dictionary with:
+            "interactive mode" as true
+            "citation tracking" as true
     
-    return assistant
-End Process
+    Return assistant
 ```
 
 ## Best Practices

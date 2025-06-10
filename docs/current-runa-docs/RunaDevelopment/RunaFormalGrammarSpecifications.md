@@ -36,6 +36,9 @@ Statement       ::= Declaration
                   | TryCatchStatement
                   | WhileLoop
                   | CommentLine
+                  | MatchStatement
+                  | TypeDefinition
+                  | AnnotationBlock
 ```
 
 ### Comments
@@ -53,10 +56,52 @@ Declaration     ::= "Let" Identifier OptionalType "be" Expression
                   | "Define" Identifier OptionalType "as" "list" "containing" ExpressionList
 
 /* Optional Type Annotation */
-OptionalType    ::= ("(" Identifier ")")? 
+OptionalType    ::= ("(" TypeExpression ")")? 
 
 /* Assignment */
 Assignment      ::= "Set" Identifier "to" Expression
+```
+
+### Type System
+
+```ebnf
+/* Type Definitions */
+TypeDefinition  ::= "Type" Identifier TypeParameters? "is" TypeExpression
+                  | "Type" Identifier TypeParameters? "is" "Interface" "with" ":" INDENT InterfaceMembers DEDENT
+                  | "Type" Identifier TypeParameters? "is" VariantDefinition
+
+TypeParameters  ::= "[" TypeParameter ("," TypeParameter)* "]"
+
+TypeParameter   ::= Identifier (":" TypeConstraint)?
+
+TypeConstraint  ::= Identifier ("+" Identifier)*
+
+TypeExpression  ::= BasicType
+                  | GenericType
+                  | UnionType
+                  | IntersectionType
+                  | FunctionType
+                  | OptionalType
+
+BasicType       ::= "Integer" | "Float" | "String" | "Boolean" | "Any" | "None"
+
+GenericType     ::= Identifier "[" TypeExpression ("," TypeExpression)* "]"
+
+UnionType       ::= TypeExpression ("OR" TypeExpression)+
+
+IntersectionType ::= TypeExpression ("AND" TypeExpression)+
+
+FunctionType    ::= "Function" "[" TypeExpression ("," TypeExpression)* "," TypeExpression "]"
+
+OptionalType    ::= "Optional" "[" TypeExpression "]"
+
+InterfaceMembers ::= InterfaceMember+
+
+InterfaceMember ::= Identifier "as" TypeExpression
+
+VariantDefinition ::= "|" VariantCase ("|" VariantCase)*
+
+VariantCase     ::= Identifier ("with" ParameterList)?
 ```
 
 ### Expressions
@@ -82,6 +127,11 @@ Expression      ::= Literal
                   | Expression "at" "index" Expression
                   | "index" "of" Expression "in" Expression
                   | "convert" "to" Identifier "(" Expression ")"
+                  | LambdaExpression
+                  | PipelineExpression
+                  | AsyncExpression
+                  | AwaitExpression
+                  | TypeAssertion
 
 /* Literals */
 Literal         ::= StringLiteral
@@ -107,6 +157,7 @@ Operator        ::= "is" "greater" "than"
                   | "and"
                   | "or"
                   | "contains"
+                  | "is" "of" "type"
 
 /* Collections */
 ListExpression  ::= "list" "containing" ExpressionList
@@ -123,6 +174,19 @@ KeyValuePair    ::= StringLiteral "as" Expression
 /* Access Operations */
 IndexAccess     ::= Identifier "[" Expression "]"
 MemberAccess    ::= Identifier "." Identifier
+
+/* Functional Programming */
+LambdaExpression ::= "lambda" ParameterList ":" Expression
+
+PipelineExpression ::= Expression "|>" Identifier
+
+/* Asynchronous Programming */
+AsyncExpression ::= "async" Expression
+
+AwaitExpression ::= "await" Expression
+
+/* Type Operations */
+TypeAssertion   ::= Expression "as" TypeExpression
 ```
 
 ### Control Structures
@@ -140,13 +204,48 @@ Block           ::= INDENT Statement+ DEDENT
 
 /* Error handling */
 TryCatchStatement ::= "Try" ":" Block "Catch" Identifier ":" Block
+
+/* Pattern Matching */
+MatchStatement  ::= "Match" Expression ":" INDENT MatchCase+ DEDENT
+
+MatchCase       ::= "When" Pattern ("If" Expression)? ":" Block
+
+Pattern         ::= LiteralPattern
+                  | IdentifierPattern
+                  | ListPattern
+                  | DictionaryPattern
+                  | VariantPattern
+                  | TypePattern
+                  | WildcardPattern
+
+LiteralPattern  ::= Literal
+
+IdentifierPattern ::= Identifier
+
+ListPattern     ::= "list" "containing" PatternList
+                  | "[" PatternList "]"
+
+PatternList     ::= Pattern ("," Pattern)* | ""
+
+DictionaryPattern ::= "dictionary" "with" ":" INDENT PatternKeyValuePair+ DEDENT
+                    | "{" PatternKeyValuePair ("," PatternKeyValuePair)* "}"
+
+PatternKeyValuePair ::= StringLiteral "as" Pattern
+
+VariantPattern  ::= Identifier ("with" PatternParameterList)?
+
+PatternParameterList ::= Identifier "as" Pattern ("and" Identifier "as" Pattern)*
+
+TypePattern     ::= Identifier "of" "type" TypeExpression
+
+WildcardPattern ::= "_"
 ```
 
 ### Functions
 
 ```ebnf
 /* Function definition and calls */
-ProcessDefinition ::= "Process" "called" StringLiteral "that" "takes" ParameterList ("returns" "(" Identifier ")")? ":" Block
+ProcessDefinition ::= ("Async")? "Process" "called" StringLiteral TypeParameters? "that" "takes" ParameterList ("returns" TypeExpression)? ":" Block
 
 ParameterList   ::= Identifier OptionalType ("and" Identifier OptionalType)* 
                   | Identifier OptionalType ("," Identifier OptionalType)*
@@ -154,9 +253,11 @@ ParameterList   ::= Identifier OptionalType ("and" Identifier OptionalType)*
 
 ReturnStatement ::= "Return" Expression
 
-FunctionCall    ::= Identifier "with" NamedArguments
-                  | Identifier "with" ":" INDENT NamedArguments DEDENT
+FunctionCall    ::= Identifier TypeArguments? "with" NamedArguments
+                  | Identifier TypeArguments? "with" ":" INDENT NamedArguments DEDENT
                   | Identifier "(" ExpressionList ")"
+
+TypeArguments   ::= "[" TypeExpression ("," TypeExpression)* "]"
 
 NamedArguments  ::= NamedArgument ("and" NamedArgument)*
                   | NamedArgument (NEWLINE NamedArgument)*
@@ -179,7 +280,7 @@ InputStatement  ::= "input" "with" "prompt" StringLiteral
 
 ```ebnf
 /* Import statements */
-ImportStatement ::= "Import" "module" StringLiteral
+ImportStatement ::= "Import" "module" StringLiteral ("as" StringLiteral)?
                   | "Import" Identifier "from" "module" StringLiteral
 ```
 
@@ -189,6 +290,82 @@ ImportStatement ::= "Import" "module" StringLiteral
 /* Identifiers */
 Identifier      ::= [a-zA-Z_][a-zA-Z0-9_]* ("." [a-zA-Z_][a-zA-Z0-9_]*)*
                   | [a-zA-Z_][a-zA-Z0-9_]* (" " [a-zA-Z_][a-zA-Z0-9_]*)+
+```
+
+## AI-to-AI Communication Annotations
+
+```ebnf
+/* Annotation System */
+AnnotationBlock ::= ReasoningBlock
+                  | ImplementationBlock
+                  | UncertaintyBlock
+                  | KnowledgeReferenceBlock
+                  | RequestClarificationBlock
+                  | ExplainabilityBlock
+                  | AbstractionLevelBlock
+                  | VerificationBlock
+                  | SymbolicBlock
+                  | TaskSpecificationBlock
+                  | ProgressTrackingBlock
+                  | TranslationBlock
+                  | ErrorHandlingProtocolBlock
+                  | NaturalToFormalBlock
+
+ReasoningBlock  ::= "@Reasoning" ":" INDENT FreeText DEDENT "@End_Reasoning"
+
+ImplementationBlock ::= "@Implementation" ":" INDENT Statement+ DEDENT "@End_Implementation"
+
+UncertaintyBlock ::= "@Uncertainty" ":" Expression ("with" "confidence" NumberLiteral)?
+
+KnowledgeReferenceBlock ::= "@KnowledgeReference" ":" INDENT KnowledgeFields DEDENT "@End_KnowledgeReference"
+
+KnowledgeFields ::= KnowledgeField+
+
+KnowledgeField  ::= Identifier ":" Expression
+
+RequestClarificationBlock ::= "@Request_Clarification" ":" INDENT FreeText DEDENT "@End_Request"
+
+ExplainabilityBlock ::= "@Why" ":" StringLiteral
+
+AbstractionLevelBlock ::= "@Abstraction_Level" ":" Identifier INDENT Statement+ DEDENT "@End_Abstraction_Level"
+
+VerificationBlock ::= "@Verify" ":" INDENT VerifyStatement+ DEDENT "@End_Verify"
+
+VerifyStatement ::= "Assert" Expression
+
+SymbolicBlock   ::= "@Symbolic" ":" INDENT FreeText DEDENT "@End_Symbolic"
+
+TaskSpecificationBlock ::= "@Task" ":" INDENT TaskFields DEDENT "@End_Task"
+
+TaskFields      ::= TaskField+
+
+TaskField       ::= Identifier ":" Expression
+
+ProgressTrackingBlock ::= "@Progress" ":" INDENT ProgressFields DEDENT "@End_Progress"
+
+ProgressFields  ::= ProgressField+
+
+ProgressField   ::= Identifier ":" Expression
+
+TranslationBlock ::= "@Translation_Note" ":" INDENT TranslationFields DEDENT "@End_Translation_Note"
+
+TranslationFields ::= TranslationField+
+
+TranslationField ::= Identifier ":" Expression
+
+ErrorHandlingProtocolBlock ::= "@Error_Handling" ":" INDENT ErrorFields DEDENT "@End_Error_Handling"
+
+ErrorFields     ::= ErrorField+
+
+ErrorField      ::= Identifier ":" Expression
+
+NaturalToFormalBlock ::= "@Natural_To_Formal" ":" INDENT NaturalFields DEDENT "@End_Natural_To_Formal"
+
+NaturalFields   ::= NaturalField+
+
+NaturalField    ::= Identifier ":" Expression
+
+FreeText        ::= [^@]*  /* Any text until next @ symbol */
 ```
 
 ## AI-Specific Grammar Extensions
@@ -268,4 +445,44 @@ For each color in colors:
     Display color
 ```
 
-This formal grammar specification provides a comprehensive definition of the Runa programming language syntax.
+### Pattern Matching
+```
+Match user status:
+    When "admin":
+        Display "Full access granted"
+    When "user":
+        Display "Limited access granted"
+    When _:
+        Display "Access denied"
+```
+
+### Type Definitions
+```
+Type Result[T] is T OR String
+
+Type Person is Dictionary with:
+    name as String
+    age as Integer
+    email as String
+```
+
+### Asynchronous Programming
+```
+Async Process called "Fetch Data" that takes url:
+    Let response be await http get with url as url
+    Return response
+```
+
+### AI-to-AI Annotations
+```
+@Reasoning:
+    Using quicksort because the dataset is small and partially ordered
+@End_Reasoning
+
+@Implementation:
+    Process called "Sort Data" that takes data:
+        # Implementation here
+@End_Implementation
+```
+
+This formal grammar specification provides a comprehensive definition of the Runa programming language syntax, including all core features, advanced language constructs, AI-specific extensions, and AI-to-AI communication annotations.

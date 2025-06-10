@@ -107,7 +107,7 @@ runa_vm_set_library_path(vm, "/usr/lib/runa:/app/lib");
 RunaStatus status = runa_vm_load_file(vm, "script.runa");
 
 // Load code from memory
-const char* code = "Process called greet() Return \"Hello\" End Process";
+const char* code = "Process called greet() that returns Text Return \"Hello\" End Process";
 status = runa_vm_load_string(vm, code, strlen(code));
 
 // Load pre-compiled bytecode
@@ -141,7 +141,7 @@ if (status == RUNA_SUCCESS) {
 
 ```c
 RunaValue result;
-status = runa_vm_eval(vm, "5 * 10 + 2", &result);
+status = runa_vm_eval(vm, "5 times 10 plus 2", &result);
 if (status == RUNA_SUCCESS) {
     printf("Result: %lld\n", runa_value_as_integer(result));
     runa_value_release(&result);
@@ -399,7 +399,7 @@ RunaStatus register_file_module(RunaVM* vm) {
 
 // Later, use the module in Runa code:
 // Import file from "file"
-// Let content = file.read("example.txt")
+// Let content be Call file with read as "example.txt"
 ```
 
 ## Type System
@@ -460,8 +460,8 @@ RunaValue person_get_name(RunaVM* vm, RunaValue* args, int arg_count) {
 runa_vm_register_method(vm, person_type, "get_name", person_get_name);
 
 // In Runa:
-// Let p = Person("Alice", 30)
-// Let name = p.get_name()  // "Alice"
+// Let p be Person with "Alice" and 30
+// Let name be Call p with get_name  // "Alice"
 ```
 
 ## Security Controls
@@ -601,9 +601,9 @@ int main() {
     
     // Load a script
     const char* script = 
-        "Process called hello(name as Text) returns Text\n"
-        "    print_message(\"Hello, \" + name)\n"
-        "    Return \"Greeting sent to \" + name\n"
+        "Process called hello that takes name as Text returns Text\n"
+        "    Call print_message with \"Hello, \" plus name\n"
+        "    Return \"Greeting sent to \" plus name\n"
         "End Process";
     
     RunaStatus status = runa_vm_load_string(vm, script, strlen(script));

@@ -2,623 +2,331 @@
 
 ## Overview
 
-Runa's AI Model Fine-tuning system provides a comprehensive framework for customizing and adapting pre-trained AI models to specific domains, tasks, or codebases. By fine-tuning models on domain-specific data, developers can significantly improve model performance for specialized use cases, while maintaining the generalization capabilities of the base models.
+Runa provides comprehensive capabilities for fine-tuning AI models to better understand and generate Runa code, adapt to specific domains, and integrate with existing codebases. This enables developers to create custom AI assistants tailored to their projects and coding patterns.
 
 ## Core Features
 
-### 1. Model Preparation
+### 1. Dataset Preparation for Fine-tuning
 
-Prepare pre-trained models for fine-tuning with Runa-specific adaptations:
+Prepare high-quality datasets for model training:
 
-```runa
-# Load a pre-trained model for fine-tuning
-Let model_loader = ModelLoader.create({
-    "model_type": "llm",             # Options: llm, embedding, classifier
-    "model_id": "runa-base-7b",      # Base model to fine-tune
-    "device": "auto",                # Options: cpu, gpu, auto
-    "quantization": "int8",          # Options: none, int8, int4
-    "precision": "float16"           # Options: float32, float16, bfloat16
-})
+```
+# Create a fine-tuning dataset builder
+Let dataset_builder be FineTuningDatasetBuilder.create with dictionary with:
+    "base_model" as "runa-code-model-v1"
+    "task_type" as "code_completion"  # Options: completion, generation, explanation, debugging
+    "data_sources" as list containing "./src/", "./docs/", "./examples/"
 
-# Prepare model for fine-tuning
-Let base_model = model_loader.load_for_fine_tuning({
-    "adapter_type": "lora",          # Options: lora, qlora, prefix_tuning, full
-    "trainable_components": ["attention", "mlp"],
-    "freeze_embeddings": true,
-    "rank": 8,                       # Only relevant for LoRA-based methods
-    "alpha": 16                      # Scaling factor for LoRA
-})
+# Build training dataset
+Let training_data be dataset_builder.build_dataset with dictionary with:
+    "include_patterns" as list containing "*.runa", "*.md"
+    "exclude_patterns" as list containing "**/test/**", "**/deprecated/**"
+    "max_examples" as 50000
+    "validation_split" as 0.1
 
-# Print model architecture summary
-Print("Model architecture:")
-Print(base_model.architecture_summary)
-
-# Check GPU utilization and requirements
-Let requirements = base_model.resource_requirements
-Print("Memory required: " + requirements.memory + " GB")
-Print("Recommended batch size: " + requirements.recommended_batch_size)
+# Add domain-specific examples
+Call training_data.add_domain_examples with dictionary with:
+    "domain" as "web_development"
+    "example_sources" as list containing "./web_examples/", "./api_patterns/"
+    "augmentation_factor" as 2
 ```
 
-### 2. Dataset Configuration
+### 2. Model Configuration and Setup
 
-Prepare and configure training data for model fine-tuning:
+Configure models for fine-tuning with specific requirements:
 
-```runa
-# Create a training dataset configurator
-Let dataset_config = DatasetConfigurator.create({
-    "format": "instruction",         # Options: instruction, completion, conversation, code
-    "validation_split": 0.1,         # Percentage of data to use for validation
-    "test_split": 0.05               # Percentage of data to use for testing
-})
+```
+# Create a fine-tuning configuration
+Let fine_tune_config be ModelFineTuneConfig.create with dictionary with:
+    "base_model" as "runa-code-model-v1"
+    "model_type" as "transformer"
+    "architecture_modifications" as dictionary with:
+        "add_domain_adapter" as true
+        "custom_attention_heads" as 8
+        "specialized_embeddings" as list containing "runa_syntax", "semantic_types"
 
-# Load training data from various sources
-dataset_config.add_data_source("./training_data/code_examples/", {
-    "format": "code",
-    "recursive": true,
-    "file_extensions": [".runa"]
-})
+# Configure training parameters
+Let training_config be TrainingConfig.create with dictionary with:
+    "learning_rate" as 1e-5
+    "batch_size" as 16
+    "epochs" as 3
+    "warmup_steps" as 1000
+    "gradient_accumulation_steps" as 4
+    "optimization_strategy" as "adamw_with_cosine_schedule"
 
-dataset_config.add_data_source("./training_data/instructions.jsonl", {
-    "format": "jsonl",
-    "keys": {
-        "input": "instruction",
-        "output": "response"
-    }
-})
-
-dataset_config.add_data_source("./training_data/conversations.json", {
-    "format": "json",
-    "keys": {
-        "conversations": "messages",
-        "user_key": "user",
-        "assistant_key": "assistant"
-    }
-})
-
-# Apply preprocessing steps
-dataset_config.add_preprocessing_step("tokenize", {
-    "tokenizer": base_model.tokenizer
-})
-
-dataset_config.add_preprocessing_step("filter_by_length", {
-    "min_tokens": 10,
-    "max_tokens": 2048
-})
-
-dataset_config.add_preprocessing_step("deduplicate", {
-    "similarity_threshold": 0.9
-})
-
-# Generate final training datasets
-Let datasets = dataset_config.prepare_datasets()
-Print("Training examples: " + datasets.train.count)
-Print("Validation examples: " + datasets.validation.count)
-Print("Test examples: " + datasets.test.count)
+# Set up distributed training if needed
+If available_gpus is greater than 1:
+    Call training_config.enable_distributed_training with dictionary with:
+        "strategy" as "data_parallel"
+        "num_gpus" as available_gpus
 ```
 
-### 3. Training Configuration
+### 3. Fine-tuning Execution
 
-Set up the training parameters and hyperparameters:
+Execute the fine-tuning process with monitoring:
 
-```runa
-# Create a training configurator
-Let training_config = TrainingConfigurator.create({
-    "training_objective": "supervised",  # Options: supervised, contrastive, reinforcement
-    "optimization": {
-        "optimizer": "adamw",
-        "learning_rate": 2e-5,
-        "weight_decay": 0.01,
-        "lr_scheduler": "cosine",
-        "warmup_steps": 100
-    },
-    "training_parameters": {
-        "batch_size": 4,
-        "gradient_accumulation_steps": 8,
-        "epochs": 3,
-        "max_steps": 1000,        # If specified, overrides epochs
-        "early_stopping": {
-            "patience": 3,
-            "metric": "validation_loss",
-            "min_delta": 0.01
-        }
-    },
-    "mixed_precision": "fp16",    # Options: no, fp16, bf16
-    "checkpointing": {
-        "save_steps": 100,
-        "keep_top_k": 3,
-        "metric": "validation_loss"
-    }
-})
+```
+# Create a fine-tuning trainer
+Let trainer be ModelTrainer.create with dictionary with:
+    "model_config" as fine_tune_config
+    "training_config" as training_config
+    "dataset" as training_data
 
-# Configure evaluation metrics
-training_config.add_evaluation_metric("loss")
-training_config.add_evaluation_metric("perplexity")
-training_config.add_evaluation_metric("exact_match", {
-    "normalize": true
-})
-training_config.add_evaluation_metric("code_evaluation", {
-    "execution": true,
-    "syntax_check": true
-})
+# Start fine-tuning with monitoring
+Let training_run be trainer.start_training with dictionary with:
+    "experiment_name" as "runa_web_dev_specialist"
+    "checkpoint_frequency" as 500
+    "evaluation_frequency" as 1000
+    "early_stopping_patience" as 3
 
-# Print training configuration summary
-Print("Training configuration:")
-Print(training_config.summary)
+# Monitor training progress
+Let progress_monitor be TrainingMonitor.create with training_run
+
+While training_run.is_running:
+    Let metrics be progress_monitor.get_current_metrics
+    Display "Epoch:" with message metrics.epoch
+    Display "Loss:" with message metrics.training_loss
+    Display "Validation accuracy:" with message metrics.validation_accuracy
+    
+    # Optionally adjust learning rate based on performance
+    If metrics.should_adjust_lr:
+        Call trainer.adjust_learning_rate with metrics.suggested_lr
 ```
 
-### 4. Model Fine-tuning Execution
+### 4. Model Evaluation and Validation
 
-Execute the fine-tuning process:
+Evaluate the fine-tuned model's performance:
 
-```runa
-# Create a fine-tuning engine
-Let fine_tuner = FineTuner.create({
-    "model": base_model,
-    "datasets": datasets,
-    "training_config": training_config,
-    "log_level": "info",        # Options: debug, info, warning, error
-    "log_to": ["console", "./logs/fine_tuning.log"]
-})
+```
+# Create an evaluation suite
+Let evaluator be ModelEvaluator.create with dictionary with:
+    "evaluation_tasks" as list containing:
+        "code_completion"
+        "syntax_correction"
+        "documentation_generation"
+        "code_explanation"
 
-# Run the fine-tuning process
-Print("Starting fine-tuning...")
-Let fine_tuning_result = fine_tuner.train({
-    "save_final_model": true,
-    "output_dir": "./models/fine_tuned_runa_model/",
-    "save_format": "auto"      # Options: auto, safetensors, pytorch
-})
+# Run comprehensive evaluation
+Let evaluation_results be evaluator.evaluate_model with:
+    model as training_run.best_model
+    test_dataset as training_data.test_split
+    evaluation_metrics as list containing "accuracy", "bleu_score", "code_similarity", "semantic_coherence"
 
-# Print training results
-Print("Fine-tuning completed!")
-Print("Final training loss: " + fine_tuning_result.metrics.final_training_loss)
-Print("Final validation loss: " + fine_tuning_result.metrics.final_validation_loss)
-Print("Training time: " + fine_tuning_result.training_time + " minutes")
-Print("Peak memory usage: " + fine_tuning_result.peak_memory_usage + " GB")
+# Generate evaluation report
+Let report be evaluator.generate_report with evaluation_results
+Call report.save_to with "./model_evaluation_report.html"
+
+# Compare with baseline models
+Let comparison be evaluator.compare_with_baselines with:
+    fine_tuned_model as training_run.best_model
+    baseline_models as list containing "runa-code-model-v1", "generic-code-model"
+    comparison_tasks as list containing "domain_specific_completion", "error_detection"
 ```
 
-### 5. Model Evaluation
+### 5. Model Deployment and Integration
 
-Evaluate the fine-tuned model on test datasets:
+Deploy the fine-tuned model for use in development:
 
-```runa
-# Create a model evaluator
-Let evaluator = ModelEvaluator.create({
-    "model": fine_tuning_result.model,
-    "datasets": {
-        "test": datasets.test,
-        "custom": "./evaluation_data/custom_test_cases.jsonl"
-    },
-    "metrics": ["loss", "perplexity", "exact_match", "code_execution_success"]
-})
+```
+# Package the model for deployment
+Let model_package be ModelPackager.create
 
-# Run evaluation
-Print("Evaluating fine-tuned model...")
-Let evaluation_results = evaluator.evaluate()
+Let packaged_model be model_package.package_model with:
+    model as training_run.best_model
+    metadata as dictionary with:
+        "model_name" as "runa_web_dev_specialist_v1"
+        "description" as "Fine-tuned for web development patterns in Runa"
+        "training_data_hash" as training_data.hash
+        "performance_metrics" as evaluation_results.summary
 
-# Print evaluation results
-Print("Evaluation results:")
-For dataset_name in evaluation_results.keys():
-    Print("Dataset: " + dataset_name)
-    Let dataset_results = evaluation_results[dataset_name]
-    For metric_name in dataset_results.keys():
-        Print("- " + metric_name + ": " + dataset_results[metric_name])
+# Deploy to inference server
+Let deployment be ModelDeployment.create with dictionary with:
+    "deployment_target" as "local_server"  # Options: local_server, cloud_endpoint, edge_device
+    "model_package" as packaged_model
+    "inference_config" as dictionary with:
+        "max_sequence_length" as 2048
+        "batch_size" as 8
+        "cache_size" as "1GB"
 
-# Generate confusion matrix for classification tasks
-If evaluation_results.contains("classification_metrics"):
-    Let confusion = evaluator.generate_confusion_matrix()
-    Print("Confusion matrix:")
-    Print(confusion)
+Let deployed_model be deployment.deploy
+
+# Test the deployed model
+Let test_queries be list containing:
+    "Create a web API endpoint for user authentication"
+    "Implement error handling for database connections"
+    "Generate a function that validates form input"
+
+For each query in test_queries:
+    Let response be deployed_model.generate with query
+    Display "Query:" with message query
+    Display "Response:" with message response.generated_code
 ```
 
-### 6. Model Export and Deployment
+## Advanced Fine-tuning Techniques
 
-Export and prepare the fine-tuned model for deployment:
+### 1. Multi-task Fine-tuning
 
-```runa
-# Create a model exporter
-Let exporter = ModelExporter.create({
-    "model": fine_tuning_result.model,
-    "output_format": "onnx",      # Options: onnx, pytorch, safetensors, runa_optimized
-    "optimization_level": "o2",   # Options: o0 (none), o1, o2, o3 (aggressive)
-    "quantization": "int8",       # Options: none, int8, int4, float16
-    "metadata": {
-        "name": "Runa-Specialized-7B",
-        "version": "1.0.0",
-        "description": "Fine-tuned Runa model for code generation",
-        "author": "Runa Team",
-        "license": "MIT"
-    }
-})
+Train models on multiple related tasks simultaneously:
 
-# Export the model
-Print("Exporting model...")
-Let export_result = exporter.export("./models/exported/runa_specialized/")
+```
+# Create a multi-task training setup
+Let multi_task_trainer be MultiTaskTrainer.create with dictionary with:
+    "base_model" as "runa-code-model-v1"
+    "tasks" as dictionary with:
+        "code_completion" as dictionary with:
+            "weight" as 0.4
+            "dataset" as completion_dataset
+        "code_generation" as dictionary with:
+            "weight" as 0.3
+            "dataset" as generation_dataset
+        "code_explanation" as dictionary with:
+            "weight" as 0.2
+            "dataset" as explanation_dataset
+        "error_correction" as dictionary with:
+            "weight" as 0.1
+            "dataset" as correction_dataset
 
-# Create a deployment package
-Let deployment = exporter.create_deployment_package({
-    "target": "api",           # Options: api, standalone, library, web
-    "include_tokenizer": true,
-    "include_sample_code": true,
-    "compression": "zip"       # Options: none, zip, tar.gz
-})
+# Configure task-specific heads
+Call multi_task_trainer.configure_task_heads with dictionary with:
+    "shared_encoder_layers" as 8
+    "task_specific_layers" as 2
+    "cross_task_attention" as true
 
-Print("Model exported successfully!")
-Print("Exported model size: " + export_result.size + " MB")
-Print("Deployment package created at: " + deployment.path)
+# Train the multi-task model
+Let multi_task_run be multi_task_trainer.start_training with training_config
 ```
 
-## Advanced Features
+### 2. Parameter-Efficient Fine-tuning
 
-### 1. Reinforcement Learning from Human Feedback (RLHF)
+Use techniques like LoRA for efficient adaptation:
 
-Fine-tune models based on human preferences and feedback:
+```
+# Configure LoRA (Low-Rank Adaptation)
+Let lora_config be LoRAConfig.create with dictionary with:
+    "rank" as 16
+    "alpha" as 32
+    "target_modules" as list containing "query", "key", "value", "output"
+    "dropout" as 0.1
 
-```runa
-# Create a RLHF configurator
-Let rlhf_config = RLHFConfigurator.create({
-    "supervised_model": fine_tuning_result.model,  # Already fine-tuned model
-    "reward_model_type": "auto_create",            # Options: auto_create, existing
-    "rl_algorithm": "ppo",                         # Options: ppo, dpo, kto
-    "training_parameters": {
-        "kl_penalty": 0.1,                         # KL divergence penalty coefficient
-        "reward_scale": 0.1,                       # Reward scaling factor
-        "ppo_epochs": 4,                           # Number of PPO epochs per batch
-        "max_steps": 2000                          # Total PPO optimization steps
-    }
-})
+# Create LoRA trainer
+Let lora_trainer be LoRATrainer.create with dictionary with:
+    "base_model" as "runa-code-model-v1"
+    "lora_config" as lora_config
+    "dataset" as training_data
 
-# Add comparison data for training the reward model
-rlhf_config.add_comparison_data("./feedback_data/comparisons.jsonl", {
-    "format": "jsonl",
-    "keys": {
-        "prompt": "instruction",
-        "better": "preferred_response",
-        "worse": "rejected_response"
-    }
-})
+# Train with LoRA
+Let lora_training_run be lora_trainer.start_training with training_config
 
-# Create an RLHF trainer
-Let rlhf_trainer = RLHFTrainer.create({
-    "config": rlhf_config,
-    "log_level": "info",
-    "output_dir": "./models/rlhf_tuned/"
-})
-
-# Run RLHF training
-Print("Starting RLHF training...")
-Let rlhf_result = rlhf_trainer.train()
-
-# Evaluate the RLHF-tuned model
-Let rlhf_eval = ModelEvaluator.create({
-    "model": rlhf_result.model,
-    "datasets": datasets.test,
-    "metrics": ["win_rate_vs_supervised", "human_eval"]
-})
-
-Let rlhf_eval_results = rlhf_eval.evaluate()
-Print("RLHF model win rate vs supervised: " + rlhf_eval_results.win_rate_vs_supervised)
+# The resulting model only stores the LoRA adapters, not the full model
+Let adapter_size be lora_training_run.final_model.adapter_size
+Display "Adapter size:" with message adapter_size  # Much smaller than full model
 ```
 
-### 2. Domain Adaptation
+### 3. Continual Learning
 
-Adapt models to specific programming domains or styles:
+Update models incrementally as new data becomes available:
 
-```runa
-# Create a domain adaptation configurator
-Let domain_config = DomainAdaptationConfigurator.create({
-    "base_model": base_model,
-    "domain": "systems_programming",    # Target domain
-    "adaptation_method": "continued_pretraining",  # Options: continued_pretraining, domain_expert_tuning
-    "training_parameters": {
-        "learning_rate": 5e-6,
-        "epochs": 1,
-        "batch_size": 2
-    }
-})
+```
+# Set up continual learning
+Let continual_learner be ContinualLearner.create with dictionary with:
+    "base_model" as deployed_model
+    "learning_strategy" as "elastic_weight_consolidation"  # Prevents catastrophic forgetting
+    "memory_buffer_size" as 10000
 
-# Add domain-specific data
-domain_config.add_domain_data("./domain_data/systems_code/", {
-    "recursive": true,
-    "file_extensions": [".runa", ".c", ".rs"]
-})
+# Add new training data as it becomes available
+Let new_data be load_new_training_examples with "./recent_code_changes/"
 
-domain_config.add_domain_data("./domain_data/systems_docs.jsonl", {
-    "format": "jsonl",
-    "weight": 0.3  # Weight relative to code data
-})
+# Update the model incrementally
+Let updated_model be continual_learner.update_with_new_data with:
+    new_data as new_data
+    update_config as dictionary with:
+        "learning_rate" as 1e-6  # Lower learning rate for stability
+        "epochs" as 1
+        "regularization_strength" as 0.001
 
-# Create a domain adaptation trainer
-Let domain_adapter = DomainAdapter.create({
-    "config": domain_config,
-    "output_dir": "./models/domain_adapted/"
-})
-
-# Run domain adaptation
-Print("Starting domain adaptation...")
-Let domain_result = domain_adapter.adapt()
-
-Print("Domain adaptation completed!")
-Print("Perplexity on domain data before: " + domain_result.metrics.initial_domain_perplexity)
-Print("Perplexity on domain data after: " + domain_result.metrics.final_domain_perplexity)
+# Validate that the model retains previous knowledge
+Let retention_test be continual_learner.test_knowledge_retention with original_test_data
+If retention_test.accuracy is less than 0.95:
+    Display "Warning: Significant knowledge degradation detected"
 ```
 
-### 3. Model Merging and Ensembling
+## Integration with Development Workflow
 
-Combine multiple fine-tuned models to create more capable models:
+### Code Completion Integration
 
-```runa
-# Load multiple fine-tuned models
-Let model_loader = ModelLoader.create()
+```
+# Create a code completion service
+Let completion_service be CodeCompletionService.create with dictionary with:
+    "model" as deployed_model
+    "context_window" as 2048
+    "suggestion_count" as 5
 
-Let models = {
-    "code_generation": model_loader.load("./models/code_gen_model/"),
-    "documentation": model_loader.load("./models/documentation_model/"),
-    "debugging": model_loader.load("./models/debugging_model/")
-}
-
-# Create a model merger
-Let merger = ModelMerger.create({
-    "base_model": "runa-base-7b",
-    "merge_method": "slerp",      # Options: average, slerp, ties, task_arithmetic
-    "merge_parameters": {
-        "interpolation_weights": {
-            "code_generation": 0.4,
-            "documentation": 0.3,
-            "debugging": 0.3
-        },
-        "merge_strategy": "layer_wise"  # Options: layer_wise, module_wise, task_wise
-    }
-})
-
-# Add models to merge
-For model_name in models.keys():
-    merger.add_model(model_name, models[model_name])
-
-# Execute the merge
-Print("Merging models...")
-Let merged_model = merger.merge()
-
-# Evaluate the merged model
-Let merged_eval = ModelEvaluator.create({
-    "model": merged_model,
-    "datasets": {
-        "code_gen": "./evaluation_data/code_gen_tests.jsonl",
-        "documentation": "./evaluation_data/documentation_tests.jsonl",
-        "debugging": "./evaluation_data/debugging_tests.jsonl"
-    }
-})
-
-Let merged_results = merged_eval.evaluate()
-Print("Merged model performance:")
-For dataset in merged_results.keys():
-    Print(dataset + " score: " + merged_results[dataset].overall_score)
+# Integrate with editor/IDE
+Process called "get_code_completions" that takes context and cursor_position:
+    Let completion_request be completion_service.prepare_request with:
+        code_context as context
+        cursor_position as cursor_position
+        user_preferences as dictionary with:
+            "style_preference" as "functional"
+            "verbosity" as "medium"
+            "include_comments" as true
+    
+    Let suggestions be completion_service.get_completions with completion_request
+    
+    # Rank suggestions by relevance
+    Let ranked_suggestions be completion_service.rank_suggestions with:
+        suggestions as suggestions
+        ranking_criteria as list containing "syntactic_correctness", "semantic_coherence", "style_consistency"
+    
+    Return ranked_suggestions
 ```
 
-### 4. Quantization and Optimization
+### Automated Code Review
 
-Optimize models for deployment with various quantization techniques:
+```
+# Create an AI-powered code review assistant
+Let review_assistant be CodeReviewAssistant.create with dictionary with:
+    "model" as deployed_model
+    "review_criteria" as list containing:
+        "code_quality"
+        "potential_bugs"
+        "style_consistency"
+        "performance_concerns"
+        "security_issues"
 
-```runa
-# Create a model optimizer
-Let optimizer = ModelOptimizer.create({
-    "model": fine_tuning_result.model,
-    "optimization_targets": ["size", "latency"],  # Options: size, latency, throughput
-    "target_hardware": "cpu"                     # Options: cpu, gpu, mobile, edge
-})
-
-# Analyze optimization potential
-Let analysis = optimizer.analyze_optimization_potential()
-Print("Optimization analysis:")
-Print("Estimated size reduction: " + analysis.size_reduction_potential + "%")
-Print("Estimated latency improvement: " + analysis.latency_improvement_potential + "%")
-Print("Recommended quantization: " + analysis.recommended_quantization)
-
-# Apply quantization
-Let quantized_model = optimizer.quantize({
-    "method": analysis.recommended_quantization,
-    "calibration_dataset": datasets.validation.sample(100)
-})
-
-# Benchmark the optimized model
-Let benchmark = optimizer.benchmark(quantized_model, {
-    "test_inputs": datasets.test.sample(10),
-    "iterations": 100,
-    "warmup_iterations": 10
-})
-
-Print("Optimization results:")
-Print("Original model size: " + benchmark.original_size + " MB")
-Print("Optimized model size: " + benchmark.optimized_size + " MB")
-Print("Size reduction: " + benchmark.size_reduction + "%")
-Print("Average latency improvement: " + benchmark.latency_improvement + "%")
-Print("Max accuracy loss: " + benchmark.accuracy_loss + "%")
+# Process code changes for review
+Process called "review_code_changes" that takes diff and file_context:
+    Let review_analysis be review_assistant.analyze_changes with:
+        code_diff as diff
+        file_context as file_context
+        severity_threshold as "medium"
+    
+    Let review_comments be review_assistant.generate_comments with review_analysis
+    
+    # Filter and prioritize comments
+    Let prioritized_comments be review_assistant.prioritize_comments with:
+        comments as review_comments
+        criteria as list containing "severity", "actionability", "learning_value"
+    
+    Return prioritized_comments
 ```
 
-## Example: Complete Fine-tuning Pipeline
+## Best Practices
 
-```runa
-Process called "fine_tune_runa_assistant":
-    # Step 1: Prepare data sources
-    Print("Preparing data sources...")
-    
-    # Initialize data sources
-    Let data_sources = DataSourceManager.create()
-    
-    # Add code examples
-    data_sources.add_code_repository("./src/", {
-        "file_extensions": [".runa"],
-        "exclude_patterns": ["**/test/**", "**/examples/**"],
-        "code_extraction": "function",  # Extract individual functions
-        "include_comments": true,
-        "min_tokens": 20,
-        "max_tokens": 1024
-    })
-    
-    # Add documentation
-    data_sources.add_documentation("./docs/", {
-        "file_extensions": [".md"],
-        "chunk_size": "section",
-        "min_tokens": 30,
-        "max_tokens": 1024
-    })
-    
-    # Add manual examples and human feedback
-    data_sources.add_instruction_data("./training_data/instructions.jsonl")
-    data_sources.add_conversation_data("./training_data/conversations.jsonl")
-    data_sources.add_preference_data("./training_data/preferences.jsonl")
-    
-    # Step 2: Process and prepare training data
-    Print("Processing training data...")
-    Let training_data_processor = TrainingDataProcessor.create({
-        "data_sources": data_sources,
-        "output_format": "instruction",
-        "deduplicate": true,
-        "validation_split": 0.1,
-        "test_split": 0.05
-    })
-    
-    # Process and prepare the data
-    Let processed_data = training_data_processor.process()
-    
-    Print("Training examples: " + processed_data.train.count)
-    Print("Validation examples: " + processed_data.validation.count)
-    Print("Test examples: " + processed_data.test.count)
-    
-    # Step 3: Prepare the base model
-    Print("Loading base model...")
-    Let model_loader = ModelLoader.create({
-        "model_type": "llm",
-        "model_id": "runa-base-7b"
-    })
-    
-    Let base_model = model_loader.load_for_fine_tuning({
-        "adapter_type": "lora",
-        "trainable_components": ["attention", "mlp"],
-        "freeze_embeddings": true
-    })
-    
-    # Step 4: Configure training parameters
-    Print("Configuring training parameters...")
-    Let training_config = TrainingConfigurator.create({
-        "training_objective": "supervised",
-        "optimization": {
-            "optimizer": "adamw",
-            "learning_rate": 2e-5,
-            "weight_decay": 0.01,
-            "lr_scheduler": "cosine",
-            "warmup_steps": 100
-        },
-        "training_parameters": {
-            "batch_size": 4,
-            "gradient_accumulation_steps": 8,
-            "epochs": 3,
-            "mixed_precision": "fp16"
-        },
-        "evaluation_metrics": ["loss", "perplexity", "exact_match"]
-    })
-    
-    # Step 5: Initial supervised fine-tuning
-    Print("Starting supervised fine-tuning...")
-    Let fine_tuner = FineTuner.create({
-        "model": base_model,
-        "datasets": processed_data,
-        "training_config": training_config,
-        "output_dir": "./models/supervised_stage/"
-    })
-    
-    Let supervised_result = fine_tuner.train()
-    
-    Print("Supervised fine-tuning completed!")
-    Print("Final validation loss: " + supervised_result.metrics.final_validation_loss)
-    
-    # Step 6: RLHF fine-tuning
-    Print("Starting RLHF fine-tuning...")
-    Let rlhf_config = RLHFConfigurator.create({
-        "supervised_model": supervised_result.model,
-        "reward_model_type": "auto_create",
-        "rl_algorithm": "ppo",
-        "comparison_data": processed_data.preferences
-    })
-    
-    Let rlhf_trainer = RLHFTrainer.create({
-        "config": rlhf_config,
-        "output_dir": "./models/rlhf_stage/"
-    })
-    
-    Let rlhf_result = rlhf_trainer.train()
-    
-    Print("RLHF fine-tuning completed!")
-    
-    # Step 7: Quantize and export the model
-    Print("Optimizing and exporting the model...")
-    Let exporter = ModelExporter.create({
-        "model": rlhf_result.model,
-        "output_format": "onnx",
-        "quantization": "int8",
-        "optimization_level": "o2"
-    })
-    
-    Let export_result = exporter.export("./models/final_runa_assistant/")
-    
-    # Step 8: Final evaluation
-    Print("Running final evaluation...")
-    Let evaluator = ModelEvaluator.create({
-        "models": {
-            "base": base_model,
-            "supervised": supervised_result.model,
-            "rlhf": rlhf_result.model
-        },
-        "datasets": {
-            "test": processed_data.test,
-            "held_out": "./evaluation_data/held_out_test.jsonl"
-        },
-        "metrics": ["win_rate", "exact_match", "code_execution_success"]
-    })
-    
-    Let final_results = evaluator.evaluate_all()
-    
-    # Print final results
-    Print("Final evaluation results:")
-    For model_name in final_results.keys():
-        Print("Model: " + model_name)
-        Let model_results = final_results[model_name]
-        For dataset_name in model_results.keys():
-            Print("- Dataset: " + dataset_name)
-            Let dataset_results = model_results[dataset_name]
-            For metric_name in dataset_results.keys():
-                Print("  - " + metric_name + ": " + dataset_results[metric_name])
-    
-    # Return final model and evaluation results
-    Return {
-        "final_model_path": export_result.path,
-        "evaluation_results": final_results,
-        "training_metrics": {
-            "supervised": supervised_result.metrics,
-            "rlhf": rlhf_result.metrics
-        }
-    }
-```
+1. **Data Quality**: Ensure training data is high-quality, diverse, and representative of target use cases.
 
-## Best Practices for Model Fine-tuning
+2. **Evaluation Metrics**: Use comprehensive evaluation metrics that capture both syntactic and semantic correctness.
 
-1. **Data Quality Over Quantity**: Focus on high-quality, diverse, and representative data rather than sheer volume.
+3. **Overfitting Prevention**: Monitor for overfitting and use techniques like early stopping and regularization.
 
-2. **Start Small**: Begin with smaller models and datasets to iterate quickly before scaling up to larger models.
+4. **Incremental Updates**: Plan for incremental model updates as new patterns and requirements emerge.
 
-3. **Incremental Approach**: Use a multi-stage fine-tuning process (supervised fine-tuning followed by RLHF) for best results.
+5. **Performance Monitoring**: Continuously monitor deployed models for performance degradation.
 
-4. **Continuous Evaluation**: Regularly evaluate models during training on diverse test sets to catch overfitting or other issues early.
-
-5. **Domain-Specific Adaptations**: For specialized applications, consider domain adaptation techniques before task-specific fine-tuning.
-
-6. **Quantization Validation**: Always validate quantized models thoroughly to ensure accuracy hasn't degraded unacceptably.
-
-7. **Version Control**: Maintain careful version control of both training data and model checkpoints to ensure reproducibility.
+6. **Version Control**: Maintain proper versioning for models, datasets, and training configurations.
 
 ## References
 
-- [Runa Model Fine-tuning API Reference](https://runa-lang.org/docs/api/model-fine-tuning)
-- [Fine-tuning Best Practices Guide](https://runa-lang.org/docs/guides/model-fine-tuning)
-- [RLHF Implementation Details](https://runa-lang.org/docs/guides/reinforcement-learning)
-
-For complete examples, see the [Model Fine-tuning Examples](../../src/tests/examples/model_fine_tuning_examples.runa) in the Runa codebase. 
+- [Runa Fine-tuning API Documentation](https://runa-lang.org/docs/api/fine-tuning)
+- [Model Training Best Practices](https://runa-lang.org/docs/guides/model-training)
+- [Fine-tuning Examples](../../src/tests/examples/model_fine_tuning_examples.runa) 

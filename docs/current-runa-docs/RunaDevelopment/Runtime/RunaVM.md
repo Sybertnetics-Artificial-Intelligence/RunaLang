@@ -209,14 +209,14 @@ Example of task creation:
 ```
 # Runa code
 Process called perform_concurrent_work()
-    Let tasks = List of Task of Integer()
+    Let tasks be List of Task of Integer()
     
     For i from 1 to 10
-        tasks.add(Task.run(() => compute_value(i)))
+        Add to tasks the Task with run as lambda function that returns compute_value with i
     End For
     
-    Let results = Task.await_all(tasks)
-    Return results.sum()
+    Let results be Task with await_all as tasks
+    Return sum of results
 End Process
 
 # RunaVM execution handles task scheduling efficiently
@@ -257,11 +257,11 @@ Example FFI declaration:
 # Runa code with FFI
 External Library "libc" 
 
-External Process called printf(format as Pointer, args as Any) returns Integer from "libc"
+External Process called printf that takes format as Pointer and args as Any returns Integer from "libc"
 
 Process called hello_world()
-    Let message = "Hello, World!"
-    printf("%s\n".to_c_string(), message.to_c_string())
+    Let message be "Hello, World!"
+    Call printf with format as to_c_string of "%s\n" and args as to_c_string of message
 End Process
 ```
 

@@ -84,11 +84,11 @@ Let user be dictionary with:
     "age" as 32
 
 Match user:
-    When {"name": name, "role": "admin"}:
+    When dictionary with "name" as name and "role" as "admin":
         Display "Administrator:" with message name
-    When {"name": name, "role": "user"}:
+    When dictionary with "name" as name and "role" as "user":
         Display "Regular user:" with message name
-    When {"name": name}:
+    When dictionary with "name" as name:
         Display "Unknown role for user:" with message name
     When _:
         Display "Invalid user data"
@@ -107,9 +107,9 @@ Let employee be dictionary with:
         "state" as "WA"
 
 Match employee:
-    When {"name": name, "address": {"city": "Seattle"}}:
+    When dictionary with "name" as name and "address" as dictionary with "city" as "Seattle":
         Display "Seattle-based employee:" with message name
-    When {"name": name, "address": {"city": city}}:
+    When dictionary with "name" as name and "address" as dictionary with "city" as city:
         Display "Employee from" with message city with message ":" with message name
     When _:
         Display "Employee with incomplete data"
@@ -163,9 +163,9 @@ Let rectangle be dictionary with:
     "height" as 20
 
 Match rectangle:
-    When {"width": w, "height": h} If w is equal to h:
+    When dictionary with "width" as w and "height" as h If w is equal to h:
         Display "Square with side" with message w
-    When {"width": w, "height": h}:
+    When dictionary with "width" as w and "height" as h:
         Display "Rectangle" with message w with message "x" with message h
     When _:
         Display "Not a rectangle"
@@ -288,53 +288,21 @@ Process called "process_event" that takes state and event:
 ```
 Process called "extract_important_data" that takes json_data:
     Match json_data:
-        When {"user": {"name": name, "email": email}}:
+        When dictionary with "user" as dictionary with "name" as name and "email" as email:
             Return dictionary with:
                 "name" as name
                 "contact" as email
         
-        When {"company": {"name": company_name, "employees": employees}}:
+        When dictionary with "company" as dictionary with "name" as company_name and "employees" as employees:
             Return dictionary with:
                 "organization" as company_name
                 "team_size" as length of employees
         
-        When {"error": message}:
-            Display "Error:" with message as message
+        When dictionary with "error" as message:
+            Display "API Error:" with message message
             Return None
             
         When _:
-            Display "Unknown data format"
+            Display "Unexpected response format"
             Return None
 ```
-
-## Best Practices
-
-1. **Order Matters**: More specific patterns should come before more general ones
-2. **Always Include a Default Case**: Use the wildcard pattern `_` to handle unexpected inputs
-3. **Keep Patterns Simple**: Break complex patterns into simpler ones for readability
-4. **Use Guards Carefully**: Prefer pattern matching over complex guard conditions when possible
-5. **Consider Performance**: Pattern matching with many complex cases can impact performance
-
-## Performance Considerations
-
-- Simple pattern matching (literals, basic destructuring) has minimal overhead
-- Complex patterns with many cases may introduce performance costs
-- Guards with complex conditions may slow down matching
-- Consider refactoring extremely large match expressions into smaller, focused ones
-
-## Common Pitfalls
-
-1. **Missing Cases**: Not handling all possible input patterns
-2. **Unreachable Patterns**: Placing specific patterns after more general ones
-3. **Overly Complex Guards**: Making pattern matching hard to understand
-4. **Inconsistent Binding**: Using different variable names for the same concept
-
-## Conclusion
-
-Pattern matching in Runa provides a powerful way to work with data, making your code more readable and reducing the need for complex conditional logic. By mastering pattern matching, you can write more elegant and maintainable code that clearly expresses your intent.
-
-## See Also
-
-- [Enhanced Type System](TypeSystem.md)
-- [Functional Programming](FunctionalProgramming.md)
-- [Data Structures](DataStructures.md) 

@@ -10,141 +10,128 @@ Runa provides a comprehensive system for generating high-quality training data f
 
 Easily generate diverse code examples for model training:
 
-```runa
+```
 # Create a code corpus generator
-Let generator = CodeCorpusGenerator.create({
-    "output_directory": "./training_data/",
-    "file_format": "jsonl",
-    "include_metadata": true
-})
+Let generator be CodeCorpusGenerator.create with dictionary with:
+    "output_directory" as "./training_data/"
+    "file_format" as "jsonl"
+    "include_metadata" as true
 
 # Generate corpus from existing codebase
-Let corpus = generator.from_codebase("./src/", {
-    "file_extensions": [".runa"],
-    "exclude_patterns": ["**/test/**", "**/example/**"],
-    "sample_count": 10000
-})
+Let corpus be generator.from_codebase with "./src/" and dictionary with:
+    "file_extensions" as list containing ".runa"
+    "exclude_patterns" as list containing "**/test/**", "**/example/**"
+    "sample_count" as 10000
 
 # Generate synthetic examples
-Let synthetic_corpus = generator.generate_synthetic({
-    "pattern_templates": ["function_calls", "conditional_logic", "loops"],
-    "count": 5000,
-    "diversity_level": 0.8
-})
+Let synthetic_corpus be generator.generate_synthetic with dictionary with:
+    "pattern_templates" as list containing "function_calls", "conditional_logic", "loops"
+    "count" as 5000
+    "diversity_level" as 0.8
 
 # Combine corpora
-Let combined_corpus = generator.combine([corpus, synthetic_corpus])
+Let combined_corpus be generator.combine with list containing corpus, synthetic_corpus
 ```
 
 ### 2. Fine-tuning Dataset Preparation
 
 Create datasets specifically designed for fine-tuning language models:
 
-```runa
+```
 # Create a fine-tuning dataset generator
-Let ft_generator = FineTuningDataGenerator.create()
+Let ft_generator be FineTuningDataGenerator.create
 
 # Generate instruction-following examples
-Let instruct_dataset = ft_generator.create_instruction_dataset({
-    "code_corpus": corpus,
-    "instruction_templates": [
-        "Write a function that {{task}}",
-        "Create a process that {{task}} with {{parameters}}",
+Let instruct_dataset be ft_generator.create_instruction_dataset with dictionary with:
+    "code_corpus" as corpus
+    "instruction_templates" as list containing:
+        "Write a function that {{task}}"
+        "Create a process that {{task}} with {{parameters}}"
         "How would you implement {{feature}} in Runa?"
-    ],
-    "count": 2000
-})
+    "count" as 2000
 
 # Generate code completion examples
-Let completion_dataset = ft_generator.create_completion_dataset({
-    "code_corpus": corpus,
-    "context_length": 200,
-    "completion_length": 50,
-    "count": 5000
-})
+Let completion_dataset be ft_generator.create_completion_dataset with dictionary with:
+    "code_corpus" as corpus
+    "context_length" as 200
+    "completion_length" as 50
+    "count" as 5000
 
 # Export in model-specific format
-ft_generator.export({
-    "format": "jsonl",
-    "output_file": "runa_finetune_data.jsonl",
-    "include_datasets": [instruct_dataset, completion_dataset]
-})
+Call ft_generator.export with dictionary with:
+    "format" as "jsonl"
+    "output_file" as "runa_finetune_data.jsonl"
+    "include_datasets" as list containing instruct_dataset, completion_dataset
 ```
 
 ### 3. Data Augmentation and Transformation
 
 Enhance and transform training data to improve model performance:
 
-```runa
+```
 # Create a data augmenter
-Let augmenter = DataAugmenter.create()
+Let augmenter be DataAugmenter.create
 
 # Apply various augmentation techniques
-Let augmented_data = augmenter.transform(corpus, [
-    {"type": "variable_renaming", "probability": 0.5},
-    {"type": "comment_variation", "probability": 0.3},
-    {"type": "code_restructuring", "probability": 0.2},
-    {"type": "style_variation", "probability": 0.4}
-])
+Let augmented_data be augmenter.transform with corpus and list containing:
+    dictionary with "type" as "variable_renaming" and "probability" as 0.5
+    dictionary with "type" as "comment_variation" and "probability" as 0.3
+    dictionary with "type" as "code_restructuring" and "probability" as 0.2
+    dictionary with "type" as "style_variation" and "probability" as 0.4
 
 # Generate edge cases
-Let edge_cases = augmenter.generate_edge_cases(corpus, {
-    "error_patterns": true,
-    "boundary_conditions": true,
-    "unusual_inputs": true,
-    "count": 1000
-})
+Let edge_cases be augmenter.generate_edge_cases with corpus and dictionary with:
+    "error_patterns" as true
+    "boundary_conditions" as true
+    "unusual_inputs" as true
+    "count" as 1000
 ```
 
 ### 4. Quality Assessment and Filtering
 
 Ensure high-quality training data through automated assessment:
 
-```runa
+```
 # Create a quality assessor
-Let assessor = DataQualityAssessor.create()
+Let assessor be DataQualityAssessor.create
 
 # Assess dataset quality
-Let quality_report = assessor.evaluate(combined_corpus, {
-    "metrics": ["diversity", "correctness", "completeness", "uniqueness"],
-    "syntax_check": true,
-    "lint_level": "moderate"
-})
+Let quality_report be assessor.evaluate with combined_corpus and dictionary with:
+    "metrics" as list containing "diversity", "correctness", "completeness", "uniqueness"
+    "syntax_check" as true
+    "lint_level" as "moderate"
 
 # Filter low-quality examples
-Let filtered_corpus = assessor.filter(combined_corpus, {
-    "min_quality_score": 0.7,
-    "exclude_duplicates": true,
-    "exclude_syntax_errors": true
-})
+Let filtered_corpus be assessor.filter with combined_corpus and dictionary with:
+    "min_quality_score" as 0.7
+    "exclude_duplicates" as true
+    "exclude_syntax_errors" as true
 
 # Print quality report
-Print(quality_report.summary)
+Display quality_report.summary
 ```
 
 ### 5. Dataset Splitting and Validation
 
 Create appropriate splits for training, testing, and validation:
 
-```runa
+```
 # Create a dataset splitter
-Let splitter = DatasetSplitter.create()
+Let splitter be DatasetSplitter.create
 
 # Split dataset
-Let splits = splitter.split(filtered_corpus, {
-    "train": 0.8,
-    "validation": 0.1,
-    "test": 0.1,
-    "stratify_by": "complexity"
-})
+Let splits be splitter.split with filtered_corpus and dictionary with:
+    "train" as 0.8
+    "validation" as 0.1
+    "test" as 0.1
+    "stratify_by" as "complexity"
 
 # Validate the distribution of features across splits
-Let distribution_report = splitter.validate_distribution(splits, [
+Let distribution_report be splitter.validate_distribution with splits and list containing:
     "pattern_types", "complexity", "token_count"
-])
 
 # Export splits
-splitter.export_splits(splits, "./dataset_splits/")
+Call splitter.export_splits with splits and "./dataset_splits/"
 ```
 
 ## Advanced Features
@@ -153,140 +140,118 @@ splitter.export_splits(splits, "./dataset_splits/")
 
 Generate data for specific domains or applications:
 
-```runa
+```
 # Create a domain-specific generator
-Let domain_generator = DomainDataGenerator.create("financial_analysis")
+Let domain_generator be DomainDataGenerator.create with "financial_analysis"
 
 # Load domain-specific templates and patterns
-domain_generator.load_templates("./financial_templates/")
+Call domain_generator.load_templates with "./financial_templates/"
 
 # Generate domain-specific examples
-Let financial_examples = domain_generator.generate({
-    "count": 1000,
-    "include_domain_entities": true,
-    "complexity_range": [1, 5]
-})
+Let financial_examples be domain_generator.generate with dictionary with:
+    "count" as 1000
+    "include_domain_entities" as true
+    "complexity_range" as list containing 1, 5
 ```
 
 ### 2. Parallel and Incremental Generation
 
 Efficiently generate and manage large datasets:
 
-```runa
+```
 # Create a parallel generator
-Let parallel_generator = ParallelDataGenerator.create({
-    "worker_count": 8,
-    "batch_size": 100
-})
+Let parallel_generator be ParallelDataGenerator.create with dictionary with:
+    "worker_count" as 8
+    "batch_size" as 100
 
 # Generate data in parallel
-Let large_corpus = parallel_generator.generate(1000000, {
-    "template_directory": "./templates/",
-    "output_format": "parquet",
-    "incremental": true,
-    "checkpoint_interval": 10000
-})
+Let large_corpus be parallel_generator.generate with 1000000 and dictionary with:
+    "template_directory" as "./templates/"
+    "output_format" as "parquet"
+    "incremental" as true
+    "checkpoint_interval" as 10000
 ```
 
 ### 3. Training Data Versioning
 
 Track and manage different versions of training data:
 
-```runa
+```
 # Create a data versioner
-Let versioner = DataVersioner.create("./data_repository/")
+Let versioner be DataVersioner.create with "./data_repository/"
 
 # Version a dataset
-Let version_id = versioner.commit(filtered_corpus, {
-    "version_name": "v1.2.0",
-    "description": "Enhanced with financial domain examples",
-    "metadata": {
-        "source": "mixed",
-        "example_count": filtered_corpus.count,
-        "generation_date": Date.now()
-    }
-})
-
-# List available versions
-Let versions = versioner.list_versions()
-
-# Load a specific version
-Let previous_version = versioner.load("v1.1.0")
+Let version_id be versioner.commit with filtered_corpus and dictionary with:
+    "version_name" as "v1.2.0"
+    "description" as "Enhanced with financial domain examples"
+    "metadata" as dictionary with:
+        "source" as "mixed"
+        "example_count" as filtered_corpus.count
+        "generation_date" as Date.now()
 ```
 
 ## Example: Creating a Comprehensive Training Pipeline
 
-```runa
+```
 Process called "create_training_data_pipeline":
     # Initialize components
-    Let generator = CodeCorpusGenerator.create({"output_directory": "./training_data/"})
-    Let augmenter = DataAugmenter.create()
-    Let assessor = DataQualityAssessor.create()
-    Let splitter = DatasetSplitter.create()
-    Let versioner = DataVersioner.create("./data_repository/")
+    Let generator be CodeCorpusGenerator.create with dictionary with:
+        "output_directory" as "./training_data/"
+    Let augmenter be DataAugmenter.create
+    Let assessor be DataQualityAssessor.create
+    Let splitter be DatasetSplitter.create
+    Let versioner be DataVersioner.create with "./data_repository/"
     
     # Step 1: Generate base corpus
-    Print("Generating base corpus...")
-    Let base_corpus = generator.from_codebase("./src/", {
-        "file_extensions": [".runa"],
-        "exclude_patterns": ["**/test/**"]
-    })
+    Display "Generating base corpus..."
+    Let base_corpus be generator.from_codebase with "./src/" and dictionary with:
+        "file_extensions" as list containing ".runa"
+        "exclude_patterns" as list containing "**/test/**"
     
     # Step 2: Generate synthetic examples
-    Print("Generating synthetic examples...")
-    Let synthetic_corpus = generator.generate_synthetic({
-        "pattern_templates": ["function_calls", "conditionals", "loops", "error_handling"],
-        "count": 10000
-    })
+    Display "Generating synthetic examples..."
+    Let synthetic_corpus be generator.generate_synthetic with dictionary with:
+        "pattern_templates" as list containing "function_calls", "conditionals", "loops", "error_handling"
+        "count" as 10000
     
     # Step 3: Combine and augment
-    Print("Augmenting data...")
-    Let combined_corpus = generator.combine([base_corpus, synthetic_corpus])
-    Let augmented_corpus = augmenter.transform(combined_corpus, [
-        {"type": "variable_renaming", "probability": 0.4},
-        {"type": "comment_variation", "probability": 0.3},
-        {"type": "code_restructuring", "probability": 0.2}
-    ])
+    Display "Augmenting data..."
+    Let combined_corpus be generator.combine with list containing base_corpus, synthetic_corpus
+    Let augmented_corpus be augmenter.transform with combined_corpus and list containing:
+        dictionary with "type" as "variable_renaming" and "probability" as 0.4
+        dictionary with "type" as "comment_variation" and "probability" as 0.3
+        dictionary with "type" as "code_restructuring" and "probability" as 0.2
     
     # Step 4: Quality assessment and filtering
-    Print("Assessing quality...")
-    Let quality_report = assessor.evaluate(augmented_corpus)
-    Let filtered_corpus = assessor.filter(augmented_corpus, {
-        "min_quality_score": 0.7,
-        "exclude_duplicates": true
-    })
+    Display "Assessing quality..."
+    Let quality_report be assessor.evaluate with augmented_corpus
+    Let filtered_corpus be assessor.filter with augmented_corpus and dictionary with:
+        "min_quality_score" as 0.7
+        "exclude_duplicates" as true
     
     # Step 5: Create dataset splits
-    Print("Creating splits...")
-    Let splits = splitter.split(filtered_corpus, {
-        "train": 0.8,
-        "validation": 0.1,
-        "test": 0.1
-    })
+    Display "Creating splits..."
+    Let splits be splitter.split with filtered_corpus and dictionary with:
+        "train" as 0.8
+        "validation" as 0.1
+        "test" as 0.1
+        "stratify_by" as "complexity"
     
     # Step 6: Version and export the dataset
-    Print("Versioning dataset...")
-    Let version_id = versioner.commit(splits, {
-        "version_name": "runa_code_corpus_v1",
-        "description": "Initial Runa code corpus for model training"
-    })
+    Display "Versioning dataset..."
+    Let version_id be versioner.commit with splits and dictionary with:
+        "version_name" as "runa_code_corpus_v1"
+        "description" as "Initial Runa code corpus for model training"
     
     # Step 7: Export in appropriate formats
-    Print("Exporting datasets...")
-    For split_name in ["train", "validation", "test"]:
-        Let output_file = "./final_dataset/" + split_name + ".jsonl"
-        splits[split_name].export(output_file, "jsonl")
+    Display "Exporting datasets..."
+    For each split_name in list containing "train", "validation", "test":
+        Let output_file be "./final_dataset/" followed by split_name followed by ".jsonl"
+        Call splits[split_name].export with output_file and "jsonl"
     
-    Return {
-        "version_id": version_id,
-        "stats": {
-            "total_examples": filtered_corpus.count,
-            "train_examples": splits["train"].count,
-            "validation_examples": splits["validation"].count,
-            "test_examples": splits["test"].count,
-            "quality_score": quality_report.overall_score
-        }
-    }
+    Display "Training data generation pipeline completed!"
+    Display "Version ID:" with message version_id
+    Return splits
 ```
 
 ## Best Practices for Training Data Generation

@@ -53,14 +53,14 @@ To start using Runa's AI integration features:
 
 1. Ensure you have the latest version of Runa installed
 2. Import the relevant modules in your code:
-   ```runa
-   import runa.ai.llm
-   import runa.ai.knowledge_graph
-   import runa.ai.visualization
-   import runa.ai.training_data
-   import runa.ai.semantic_indexing
-   import runa.debugging
-   import runa.ai.model_tuning
+   ```
+   Import module "runa.ai.llm"
+   Import module "runa.ai.knowledge_graph"
+   Import module "runa.ai.visualization"
+   Import module "runa.ai.training_data"
+   Import module "runa.ai.semantic_indexing"
+   Import module "runa.debugging"
+   Import module "runa.ai.model_tuning"
    ```
 3. Configure connections to your preferred AI services (API keys, endpoints, etc.)
 4. Start using the features in your applications
