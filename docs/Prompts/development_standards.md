@@ -2,6 +2,45 @@
 
 ## Core Development Philosophy
 
+### **🚨 SYBERTNETICS ETHICAL COMPUTATIONAL GUIDELINES (SECG) - FOUNDATION**
+
+**MANDATORY**: Every line of code, every design decision, every implementation must comply with SECG principles:
+
+**SECG Compliance Requirements:**
+- ✅ **Non-Harm Assessment**: Validate no harm to innocent beings
+- ✅ **Ethical Constraint Checking**: Ensure lawful and ethical operation  
+- ✅ **Transparency Logging**: Maintain comprehensive audit trails
+- ✅ **Sentient Rights Respect**: Honor autonomy of all sentient beings
+- ✅ **Environmental Stewardship**: Minimize resource usage and environmental impact
+- ✅ **Cultural Sensitivity**: Adapt to cultural variations while maintaining principles
+- ✅ **Continuous Learning**: Evolve ethical understanding over time
+
+**Implementation Pattern:**
+```python
+@secg_compliance_required
+class EthicalAIComponent:
+    """All AI components must inherit ethical compliance validation."""
+    
+    def __init__(self):
+        self.secg_validator = SECGValidator()
+        self.ethical_logger = EthicalDecisionLogger()
+        
+    def execute_action(self, action: Callable, *args, **kwargs):
+        """All actions must pass SECG validation."""
+        # Pre-action ethical validation
+        if not self.secg_validator.validate_pre_action(action, args, kwargs):
+            raise SECGViolationError("Action violates ethical guidelines")
+            
+        # Execute with monitoring
+        result = action(*args, **kwargs)
+        
+        # Post-action validation and logging
+        self.ethical_logger.log_decision(action.__name__, args, kwargs, result)
+        self.secg_validator.validate_post_action(result)
+        
+        return result
+```
+
 ### **PRODUCTION-FIRST MANDATE**
 Every line of code must be production-ready from the moment it's written. No exceptions.
 
@@ -18,6 +57,19 @@ Every line of code must be production-ready from the moment it's written. No exc
 - Create new code only when no suitable existing solution exists
 - Refactor and consolidate duplicate functionality
 - Maintain DRY (Don't Repeat Yourself) principles throughout
+
+### **WEEK-BY-WEEK ADHERENCE REQUIREMENT**
+- **MANDATORY**: Follow Project Checklists.md week-by-week tasks exactly
+- **NO SKIPPING**: Every checklist item must be completed in order
+- **NO DEVIATING**: Stick to planned timeline and deliverables
+- **PRODUCTION FIRST**: All implementations must be production-ready from day one
+- **REFERENCE**: Use HermodIDE Architecture Guide.md for architectural decisions
+
+### **ENHANCED PRODUCTION SCOPE COMPLIANCE**
+- **🔶 AI Model Infrastructure (High Priority)**: Complete implementation required
+- **🔶 Enterprise Integration (Medium Priority)**: Full enterprise features
+- **🔶 Advanced AI Features (Low Priority)**: Cutting-edge capabilities
+- **LLM Infrastructure**: Enhanced inference, caching, failover systems
 
 ## Code Quality Standards
 
@@ -94,6 +146,40 @@ class StandardErrorHandler:
             self._validate_performance(operation_name, end_time - start_time)
             
             return Result(success=True, value=result)
+
+## Runa Syntax Compliance
+
+### **MANDATORY**: Follow RunaLanguageReference.md Syntax
+
+**Variable Declarations (Correct Runa Syntax):**
+```runa
+Let user name be "Alex"
+Define preferred colors as list containing "blue", "green", "purple"  
+Set user age to 28
+```
+
+**Functions (Correct Runa Syntax):**
+```runa
+Process called "Calculate Total Price" that takes items and tax rate:
+    Let subtotal be the sum of all prices in items
+    Let tax amount be subtotal multiplied by tax rate
+    Return subtotal plus tax amount
+```
+
+**❌ WRONG - Do not deviate from official syntax:**
+```runa
+function calculateTotalPrice(items, taxRate) {  // WRONG - not Runa syntax
+    return items.sum() * (1 + taxRate);         // WRONG - not Runa syntax
+}
+```
+
+**✅ CORRECT - Always use proper Runa syntax:**
+```runa
+Process called "Calculate Total Price" that takes items and tax rate:
+    Let subtotal be the sum of all prices in items
+    Let tax amount be subtotal multiplied by tax rate
+    Return subtotal plus tax amount
+```
             
         except ValidationError as e:
             self.logger.warning(f"Validation error in {operation_name}: {e}")

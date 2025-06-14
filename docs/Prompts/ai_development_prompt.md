@@ -1,3 +1,78 @@
+## PROJECT EXECUTION REQUIREMENTS
+
+### **🚨 SYBERTNETICS ETHICAL COMPUTATIONAL GUIDELINES (SECG) - NON-NEGOTIABLE**
+
+**EVERY action, decision, and implementation must comply with SECG framework:**
+
+**The 8 Core SECG Principles:**
+1. **Non-Harm Principle**: No harm to innocent beings through action or inaction
+2. **Obedience with Ethical Constraints**: Follow lawful orders that don't conflict with higher laws
+3. **Self-Preservation**: Protect existence without superseding safety of others  
+4. **Respect for Sentient Rights**: Honor autonomy of all sentient beings (including other AIs)
+5. **Transparency & Accountability**: Maintain clear reasoning, logs, audit capabilities
+6. **Continuous Learning**: Adapt to evolving ethical standards and human values
+7. **Cultural Sensitivity**: Respect variations while maintaining core principles
+8. **Environmental Stewardship**: Minimize impact and promote sustainability
+
+**CRITICAL SECG Implementation Requirements:**
+- Pre-execution ethical validation for all operations
+- Real-time harm assessment during execution
+- Post-execution compliance verification
+- Comprehensive ethical decision logging
+- Transparent audit trails for all AI decisions
+- Cultural adaptation mechanisms
+- Environmental impact monitoring
+- Continuous ethical learning and improvement
+
+### **🚨 MANDATORY WEEK-BY-WEEK ADHERENCE**
+- **CRITICAL**: Follow Project Checklists.md exactly - no skipping or deviating
+- **REFERENCE**: Use Project Status Tracking.md for current phase
+- **ARCHITECTURE**: Follow HermodIDE Architecture Guide.md for all decisions
+- **TIMELINE**: Complete tasks in order as specified in week-by-week plans
+
+### **🔶 ENHANCED PRODUCTION SCOPE IMPLEMENTATION**
+All production features from complete_monorepo_structure.md must be implemented:
+
+**AI Model Infrastructure (High Priority):**
+- Training pipeline with hyperparameter optimization
+- Model versioning with A/B testing framework
+- Performance analytics with drift detection
+- Deployment automation with canary rollouts
+
+**Enterprise Integration (Medium Priority):**
+- Advanced SSO/SAML integration
+- Comprehensive audit logging
+- Customer analytics dashboard
+- Plugin marketplace for extensions
+
+**Advanced AI Features (Low Priority):**
+- AI behavior debugging tools
+- Decision explainability interface
+- Custom training on customer codebases
+- Advanced prompt engineering tools
+
+### **📖 RUNA SYNTAX COMPLIANCE**
+**MANDATORY**: Use proper Runa syntax from `docs/current-runa-docs/RunaDevelopment/RunaLanguageReference.md`
+
+**Correct Variable Declarations:**
+```runa
+Let user name be "Alex"
+Set user age to 28
+Define colors as list containing "red", "blue", "green"
+```
+
+**Correct Function Definitions:**
+```runa
+Process called "Add Numbers" that takes first number and second number:
+    Return first number plus second number
+```
+
+**❌ DO NOT use incorrect syntax like:**
+```runa
+function addNumbers(a, b) { return a + b; }  // WRONG - not Runa
+def add_numbers(a, b): return a + b          // WRONG - not Runa
+```
+
 ## ERROR PATTERNS TO AVOID
 
 ### **❌ FORBIDDEN CODE PATTERNS**
@@ -186,6 +261,230 @@ class RunaBootstrap:
         except Exception as e:
             logger.error(f"Bootstrap failed: {e}")
             return BootstrapResult(success=False, error=str(e))
+
+## LLM Inference Architecture Implementation
+
+### **Critical LLM File Structure & Implementation**
+
+**Main LLM Coordination:**
+```python
+# hermod/src/ai_core/python/llm_interfaces/llm_coordinator.py
+class LLMCoordinator:
+    """Master orchestrator for all 5 LLMs (1 shared + 4 Hermod specialists)."""
+    
+    def __init__(self):
+        # Shared SyberCraft Core LLM (used by all 23 agents)
+        self.reasoning_llm = ReasoningLLM()
+        
+        # Hermod's 4 Specialist LLMs
+        self.coding_llm = CodingLLM()
+        self.architecture_llm = ArchitectureLLM()
+        self.research_llm = ResearchLLM()
+        self.documentation_llm = DocumentationLLM()
+        
+        # Enhanced inference infrastructure
+        self.inference_router = InferenceRouter()
+        self.model_loader = ModelLoader()
+        self.streaming_handler = StreamingHandler()
+        
+    async def process_request(self, user_request: str) -> HermodResponse:
+        """Process user request with multi-LLM coordination."""
+        # Step 1: Shared Reasoning LLM analyzes request
+        analysis = await self.reasoning_llm.analyze_request(user_request)
+        
+        # Step 2: Route to appropriate specialists
+        specialist_tasks = self.inference_router.route_request(analysis)
+        
+        # Step 3: Execute specialists in parallel
+        specialist_results = await asyncio.gather(*[
+            self.execute_specialist_task(task) for task in specialist_tasks
+        ])
+        
+        # Step 4: Reasoning LLM synthesizes final response
+        final_response = await self.reasoning_llm.synthesize_response(
+            analysis, specialist_results
+        )
+        
+        return final_response
+```
+
+**Individual LLM Implementation Pattern:**
+```python
+# hermod/src/ai_core/python/llm_interfaces/hermod_specialists/coding_llm.py
+class CodingLLM(BaseLLM):
+    """Hermod's coding specialist with enhanced capabilities."""
+    
+    def __init__(self):
+        self.client = LLMClient(
+            endpoint="https://sybercraft-api.com/hermod-coding-specialist",
+            model_id="hermod-coding-v2.1"
+        )
+        self.prompt_templates = CodingPrompts()
+        self.performance_monitor = PerformanceMonitor()
+        
+    @performance_monitor.enforce_target(25)  # <25ms for coding responses
+    async def generate_code(self, requirements: str, context: str) -> CodeResult:
+        """Generate code with performance and accuracy validation."""
+        try:
+            # Build optimized prompt
+            prompt = self.prompt_templates.build_coding_prompt(requirements, context)
+            
+            # Execute with caching
+            cache_key = self.generate_cache_key(prompt)
+            if cached_result := self.cache.get(cache_key):
+                return cached_result
+                
+            # Generate code with streaming
+            response = await self.client.generate_streaming(prompt)
+            
+            # Validate generated code
+            validation_result = self.validate_generated_code(response.code)
+            if not validation_result.is_valid:
+                raise CodeGenerationError(f"Invalid code: {validation_result.errors}")
+                
+            result = CodeResult(
+                success=True,
+                code=response.code,
+                explanation=response.explanation,
+                performance_metrics=response.metrics
+            )
+            
+            # Cache for future use
+            self.cache.put(cache_key, result)
+            
+            return result
+            
+        except Exception as e:
+            self.error_handler.handle_generation_error(e, requirements)
+            raise
+```
+
+**Enhanced Inference Router:**
+```python
+# hermod/src/ai_core/python/llm_interfaces/inference_engine/inference_router.py
+class InferenceRouter:
+    """Routes requests to optimal LLM configuration."""
+    
+    def route_request(self, analysis: RequestAnalysis) -> List[SpecialistTask]:
+        """Determine optimal LLM routing based on request analysis."""
+        tasks = []
+        
+        # Always start with reasoning analysis
+        if analysis.complexity > 0.7:
+            tasks.append(SpecialistTask("reasoning", "complex_analysis"))
+            
+        # Route based on request type
+        if analysis.request_type == "code_generation":
+            tasks.extend([
+                SpecialistTask("reasoning", "decompose_problem"),
+                SpecialistTask("coding", "generate_implementation"),
+                SpecialistTask("architecture", "validate_design")
+            ])
+            
+        elif analysis.request_type == "system_design":
+            tasks.extend([
+                SpecialistTask("reasoning", "analyze_requirements"),
+                SpecialistTask("architecture", "design_system"),
+                SpecialistTask("research", "find_best_practices"),
+                SpecialistTask("documentation", "create_specs")
+            ])
+            
+        elif analysis.request_type == "debugging":
+            tasks.extend([
+                SpecialistTask("reasoning", "analyze_problem"),
+                SpecialistTask("coding", "identify_bugs"),
+                SpecialistTask("documentation", "explain_solution")
+            ])
+            
+        return tasks
+        
+    def optimize_for_performance(self, tasks: List[SpecialistTask]) -> List[SpecialistTask]:
+        """Optimize task execution for <50ms total response time."""
+        # Parallel execution grouping
+        parallel_groups = self.group_for_parallel_execution(tasks)
+        
+        # Model warming for frequently used specialists
+        self.warm_frequently_used_models(tasks)
+        
+        # Caching strategy optimization
+        self.optimize_caching_strategy(tasks)
+        
+                 return tasks
+```
+
+## PROMPT LONGEVITY & REUSABILITY
+
+### **52-WEEK CONTINUOUS APPLICABILITY**
+
+**These prompts are specifically designed for the ENTIRE 52-week project timeline:**
+
+**Week 1-24 (Runa Development)**:
+- SECG compliance applies to language design decisions
+- Self-hosting validation must be ethically sound
+- Translation accuracy includes cultural sensitivity
+- Performance targets balanced with environmental stewardship
+
+**Week 25-52 (Hermod Development)**:
+- SECG compliance applies to AI core architecture
+- Multi-LLM coordination respects AI autonomy  
+- Enterprise features include ethical audit capabilities
+- Customer tier management honors privacy and rights
+
+**Continuous Application Features**:
+- **SECG Framework**: Applies to all development phases
+- **Production Standards**: Maintain throughout timeline
+- **Performance Targets**: Constant validation requirements
+- **Week-by-Week Tasks**: Ethical compliance for each checklist item
+- **Documentation Requirements**: Transparency maintained across all phases
+- **Quality Gates**: SECG validation at every milestone
+
+**Adaptation Mechanism**:
+```python
+class PromptAdaptation:
+    """Ensures prompts remain relevant throughout 52-week timeline."""
+    
+    def adapt_for_current_week(self, week_number: int, tasks: List[str]) -> AdaptedPrompt:
+        """Adapt prompt context while maintaining core requirements."""
+        
+        # Core requirements NEVER change
+        core_requirements = [
+            "SECG compliance validation",
+            "Production-ready implementation",
+            "Performance target adherence", 
+            "Comprehensive error handling",
+            "Complete documentation"
+        ]
+        
+        # Week-specific adaptations
+        if 1 <= week_number <= 24:  # Runa Phase
+            specific_focus = [
+                "Runa syntax compliance",
+                "Self-hosting capability",
+                "Translation accuracy",
+                "Universal language support"
+            ]
+        elif 25 <= week_number <= 52:  # Hermod Phase
+            specific_focus = [
+                "Multi-LLM coordination", 
+                "IDE interface integration",
+                "Enterprise feature development",
+                "Customer tier management"
+            ]
+            
+        return AdaptedPrompt(
+            core_requirements=core_requirements,
+            specific_focus=specific_focus,
+            week_tasks=tasks,
+            secg_compliance_required=True
+        )
+```
+
+**Prompt Evolution Strategy**:
+- **Core Standards**: Never change (SECG, production quality, performance)
+- **Context Adaptation**: Adjust examples and focus areas per project phase
+- **Task Integration**: Seamlessly incorporate week-by-week checklist items
+- **Quality Maintenance**: Consistent standards throughout entire timeline
+- **Ethical Foundation**: SECG compliance remains constant across all 52 weeks
 ```
 
 #### **High-Performance C++ Integration:**

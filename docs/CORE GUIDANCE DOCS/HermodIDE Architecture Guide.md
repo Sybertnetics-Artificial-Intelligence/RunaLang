@@ -297,32 +297,48 @@ class HermodIDE:
 
 ## Development Guidelines
 
-### **Repository Structure**
+### **Repository Structure** (Updated for Production Features)
 ```
-hermod-ide/
-├── core/                      # Hermod's local brain
-│   ├── llm_interfaces/        # Connections to SyberCraft LLMs
-│   │   ├── reasoning_interface.py      # Shared Reasoning LLM connection
-│   │   ├── coding_llm.py              # Local Coding LLM
-│   │   ├── architecture_llm.py        # Local Architecture LLM
-│   │   ├── research_llm.py            # Local Research LLM
-│   │   └── documentation_llm.py       # Local Documentation LLM
-│   ├── runa_integration/      # Embedded Runa VM
-│   ├── learning/              # Pattern learning systems
-│   ├── memory/                # Context and decision memory
-│   └── coordination/          # Multi-LLM coordination logic
-├── interface/                 # Hermod's IDE body
-│   ├── editor/                # Code editing interface
-│   ├── explorer/              # Project navigation
-│   ├── terminal/              # Command execution
-│   ├── ai_panels/             # AI reasoning display
-│   └── communication/         # Brain-body communication
-├── integration/               # Brain-body integration layer
-│   ├── state_management/      # Shared consciousness
-│   ├── event_system/          # Internal communication
-│   └── synchronization/       # Keep brain and body in sync
-└── docs/
-    └── architecture/          # This guide and related docs
+hermod/                        # HermodIDE Agent (Complete Implementation)
+├── src/ai_core/              # Hermod's Brain
+│   ├── python/               # Python coordination layer
+│   │   ├── llm_interfaces/   # Enhanced LLM connections
+│   │   │   ├── base/         # Base LLM infrastructure
+│   │   │   ├── sybercraft_core/    # Shared Reasoning LLM
+│   │   │   ├── hermod_specialists/ # 4 Hermod-specific LLMs
+│   │   │   └── inference_engine/   # LLM inference management
+│   │   ├── ai_model_infrastructure/ # AI Model Infrastructure (HIGH PRIORITY)
+│   │   │   ├── training_pipeline/   # Model training/fine-tuning
+│   │   │   ├── model_versioning/   # A/B testing & rollback
+│   │   │   ├── performance_analytics/ # Advanced analytics
+│   │   │   └── deployment_automation/ # Automated deployment
+│   │   ├── enterprise_integration/  # Enterprise Integration (MEDIUM PRIORITY)
+│   │   │   ├── sso_saml/           # Advanced SSO/SAML
+│   │   │   ├── audit_logging/      # Enterprise audit trails
+│   │   │   ├── customer_analytics/ # Customer analytics dashboard
+│   │   │   └── marketplace/        # Plugin marketplace
+│   │   ├── advanced_ai_features/   # Advanced AI Features (LOW PRIORITY)
+│   │   │   ├── ai_debugging/       # AI behavior debugging
+│   │   │   ├── explainability/    # Decision explainability
+│   │   │   ├── custom_training/   # Customer codebase training
+│   │   │   └── prompt_engineering/ # Advanced prompt tools
+│   │   ├── runa_integration/      # Embedded Runa VM
+│   │   ├── learning/              # Adaptive learning systems
+│   │   ├── memory/                # Context and decision memory
+│   │   └── orchestration/         # Multi-LLM coordination
+│   └── cpp/                  # C++ performance modules
+│       ├── include/hermod/   # High-speed inference
+│       └── src/              # Native implementations
+├── src/ide_interface/        # Hermod's Body
+│   ├── frontend/             # React/TypeScript IDE
+│   ├── backend/              # Backend API services
+│   └── desktop/              # Desktop application (Electron)
+├── tests/                    # Comprehensive test suites
+├── config/                   # Configuration management
+├── scripts/                  # Build and deployment scripts
+├── docker/                   # Container configurations
+├── infrastructure/          # Infrastructure as code
+└── docs/                    # Complete documentation
 ```
 
 ### **Critical Development Rules**
@@ -354,32 +370,51 @@ When someone uses HermodIDE, they should feel like they're:
 - Talking to a chatbot that's separate from their development environment
 - Working with a tool that sometimes generates code
 
-## Implementation Strategy
+## Implementation Strategy (Updated for Complete Production Scope)
 
-### **Phase 1: Core Integration (Weeks 21-28)**
+### **Phase 1: Core Integration & Customer Tiers (Weeks 25-28)**
 - Build the fundamental brain-body integration
 - Embed Runa VM as Hermod's native language processor
+- **Implement customer tier architecture (Internal/Enterprise/Pro/Hobby)**
 - Create basic IDE interface with AI reasoning display
+- Set up enhanced LLM infrastructure with base classes and inference engine
 
-### **Phase 2: AI Capabilities (Weeks 29-36)**
+### **Phase 2: AI Capabilities & Model Infrastructure (Weeks 29-36)**
 - Implement learning and memory systems
 - Build autonomous code generation
 - Create transparent decision-making systems
+- **🔶 AI Model Infrastructure (High Priority):**
+  - Training pipeline with automated fine-tuning
+  - Model versioning with A/B testing framework
+  - Advanced performance analytics with drift detection
+  - Automated deployment with canary rollouts
 
-### **Phase 3: Advanced Integration (Weeks 37-44)**
+### **Phase 3: Advanced Integration & Enterprise Features (Weeks 37-44)**
 - Enhance AI-human collaboration features
 - Implement advanced learning and adaptation
 - Build multi-project and team collaboration features
+- **🔶 Enterprise Integration (Medium Priority):**
+  - Advanced SSO/SAML integration for enterprise customers
+  - Comprehensive audit logging and compliance reporting
+  - Customer analytics dashboard with churn prediction
+  - Plugin marketplace with security scanning
 
-### **Phase 4: Production Polish (Weeks 45-52)**
+### **Phase 4: Production Polish & Advanced AI (Weeks 45-52)**
 - Optimize performance and scalability
 - Implement security and safety systems
 - Prepare for production deployment
+- **🔶 Advanced AI Features (Low Priority):**
+  - AI behavior debugging tools with attention visualization
+  - Decision explainability interface with transparency dashboard
+  - Custom training on customer codebases (privacy-preserving)
+  - Advanced prompt engineering tools with A/B testing
 
-### **Phase 5: Advanced Features (Weeks 53-60)**
+### **Phase 5: Complete Production Deployment (Weeks 53-60)**
 - Build advanced AI reasoning displays
 - Implement collaborative development features
 - Create AI learning analytics and insights
+- **Complete production validation and enterprise deployment**
+- **All customer tiers operational with proper feature restrictions**
 
 ## Success Metrics
 

@@ -42,7 +42,7 @@
 - **Self-compiling system** (Runa written in Runa, compiled to native C++)
 - **Training data generator** for SyberCraft LLM ecosystem
 
-### **Project 2: HermodIDE Agent (Weeks 25-52)**
+### **Project 2: HermodIDE Agent (Weeks 25-52) - ENHANCED PRODUCTION SCOPE**
 
 **CORE MISSION**: AI agent embodied as an IDE where the IDE IS Hermod's physical manifestation, using hybrid Python+C++ architecture for performance and flexibility.
 
@@ -51,6 +51,12 @@
 - **IDE Interface** as Hermod's body (not a separate tool)
 - **Native Runa Integration** with C++ VM for real-time performance
 - **Multi-LLM Coordination** through shared SyberCraft Reasoning LLM
+
+**🔶 Enhanced Production Features**:
+- **AI Model Infrastructure (High Priority)**: Training pipeline, A/B testing, deployment automation
+- **Enterprise Integration (Medium Priority)**: Advanced SSO/SAML, audit logging, customer analytics, marketplace
+- **Advanced AI Features (Low Priority)**: AI debugging, explainability, custom training, prompt engineering
+- **Enhanced LLM Infrastructure**: Sophisticated inference routing, caching, failover systems
 
 ## Critical Success Factors
 
