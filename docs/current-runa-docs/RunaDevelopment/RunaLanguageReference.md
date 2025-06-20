@@ -441,6 +441,210 @@ Process called "Calculate Statistics" that takes data:
     # Statistical calculations with built-in verification
 ```
 
+## Resource and Security Traits
+
+Runa includes a comprehensive system for declaring resource constraints, security capabilities, and execution models to ensure safe and efficient AI system deployment.
+
+### Resource Constraint Declarations
+
+Resource constraints help control system resource usage and guide optimization:
+
+```
+@Resource_Constraints:
+    memory_limit: "256MB"
+    cpu_limit: "2 cores"
+    execution_timeout: "30 seconds"
+    optimize_for: "speed"
+    max_iterations: 10000
+@End_Resource_Constraints
+
+Process called "Process Large Dataset" that takes data:
+    # Compiler will enforce memory limits and optimize for speed
+    For each item in data:
+        Let result be Transform Item with item as item
+        Add result to results
+    Return results
+```
+
+### Security and Capability Scoping
+
+Security scoping defines what operations a process can perform:
+
+```
+@Security_Scope:
+    capabilities: ["file.read", "math.compute", "memory.local"]
+    forbidden: ["net.access", "file.write", "system.execute"]
+    sandbox_level: "strict"
+    data_access: "read_only"
+@End_Security_Scope
+
+Process called "Calculate Statistics" that takes data:
+    # Compiler will enforce capability restrictions
+    Let stats be Compute Stats with data as data
+    Return stats
+```
+
+### Execution Model Specifications
+
+Execution models guide how processes should be executed:
+
+```
+@Execution_Model:
+    mode: "batch"
+    concurrency: "sequential"
+    priority: "normal"
+    retry_policy: "exponential_backoff"
+@End_Execution_Model
+
+Process called "Process Images" that takes images:
+    # Compiler will optimize for batch processing
+    For each image in images:
+        Let processed be Apply Filters with image as image
+        Add processed to results
+    Return results
+```
+
+### Performance Optimization Hints
+
+Performance hints guide the compiler's optimization strategy:
+
+```
+@Performance_Hints:
+    cache_strategy: "aggressive"
+    vectorization: "enabled"
+    memory_layout: "contiguous"
+    parallel_threshold: 1000
+@End_Performance_Hints
+
+Process called "Matrix Multiplication" that takes matrix_a and matrix_b:
+    # Compiler will apply aggressive caching and vectorization
+    Let result be Multiply Matrices with a as matrix_a and b as matrix_b
+    Return result
+```
+
+### Error Handling and Recovery
+
+Error handling traits define how processes should handle failures:
+
+```
+@Error_Handling:
+    strategy: "graceful_degradation"
+    retry_attempts: 3
+    fallback_behavior: "return_default"
+    log_level: "detailed"
+@End_Error_Handling
+
+Process called "Fetch Data" that takes url:
+    # Will retry up to 3 times with graceful degradation
+    Let response be HTTP Get with url as url
+    Return response
+```
+
+### Data Flow and Validation
+
+Data flow traits specify input/output validation and transformation:
+
+```
+@Data_Flow:
+    input_validation: "strict"
+    output_sanitization: "enabled"
+    data_retention: "temporary"
+    encryption: "at_rest"
+@End_Data_Flow
+
+Process called "Process User Input" that takes user_data:
+    # Input will be strictly validated, output sanitized
+    Let processed be Validate and Transform with data as user_data
+    Return processed
+```
+
+### Integration and Communication
+
+Integration traits define how processes communicate with external systems:
+
+```
+@Integration:
+    protocol: "REST"
+    authentication: "bearer_token"
+    rate_limiting: "100 requests per minute"
+    timeout: "5 seconds"
+@End_Integration
+
+Process called "Call External API" that takes request_data:
+    # Will use REST protocol with bearer token authentication
+    Let response be API Request with data as request_data
+    Return response
+```
+
+### Compliance and Auditing
+
+Compliance traits ensure processes meet regulatory and audit requirements:
+
+```
+@Compliance:
+    standards: ["GDPR", "HIPAA", "SOC2"]
+    audit_trail: "enabled"
+    data_classification: "confidential"
+    retention_policy: "7 years"
+@End_Compliance
+
+Process called "Process Medical Data" that takes patient_data:
+    # Will maintain audit trail and follow HIPAA compliance
+    Let processed be Anonymize Data with data as patient_data
+    Return processed
+```
+
+### Trait Composition and Inheritance
+
+Traits can be composed and inherited across processes:
+
+```
+@Base_Traits:
+    @Resource_Constraints:
+        memory_limit: "128MB"
+        optimize_for: "memory"
+    @End_Resource_Constraints
+    
+    @Security_Scope:
+        capabilities: ["math.compute"]
+        sandbox_level: "strict"
+    @End_Security_Scope
+@End_Base_Traits
+
+# This process inherits base traits and adds specific ones
+@Execution_Model:
+    mode: "realtime"
+    priority: "high"
+@End_Execution_Model
+
+Process called "Real Time Calculator" that takes expression:
+    # Inherits memory and security constraints, adds real-time execution
+    Let result be Evaluate Expression with expr as expression
+    Return result
+```
+
+### Trait Validation and Conflict Resolution
+
+The compiler validates trait combinations and resolves conflicts:
+
+```
+@Resource_Constraints:
+    memory_limit: "1GB"
+    optimize_for: "speed"
+@End_Resource_Constraints
+
+@Security_Scope:
+    capabilities: ["file.read", "net.access"]
+    sandbox_level: "strict"
+@End_Security_Scope
+
+# Compiler will warn about potential conflicts between
+# high memory usage and strict sandboxing
+Process called "Data Processor" that takes data:
+    Let result be Process Data with data as data
+    Return result
+```
+
 ## Operator Precedence
 
 Operators in Runa follow this precedence (highest to lowest):

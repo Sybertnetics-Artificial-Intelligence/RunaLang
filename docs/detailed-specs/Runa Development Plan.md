@@ -388,14 +388,14 @@ Process called "write to file" that takes content as String and filename as Stri
 
 # collections.runa - Collection operations
 Process called "filter" that takes collection and condition:
-    Let filtered be empty list
+    Let filtered be list containing
     For each item in collection:
         If condition applies to item:
             Add item to filtered
     Return filtered
 
 Process called "map" that takes collection and transform:
-    Let transformed be empty list  
+    Let transformed be list containing
     For each item in collection:
         Let result be transform applied to item
         Add result to transformed
@@ -549,9 +549,395 @@ Configure training for ImageClassifier:
 - Semantic reasoning capabilities
 - Knowledge-based code completion
 
-## Phase 3: Advanced Features & Optimization (Weeks 9-12)
+### **Week 9: Resource and Security Traits Implementation**
 
-### **Week 9: Vector-Based Semantic Engine**
+#### **Trait System Architecture**
+**Objectives:**
+- Implement comprehensive trait validation system
+- Create trait-aware code generation for target languages
+- Establish security and resource constraint enforcement
+
+**Deliverables:**
+- Complete trait validation system with conflict detection
+- Trait translation to target language constructs
+- Security capability enforcement framework
+- Resource constraint monitoring and enforcement
+
+**Trait System Implementation:**
+```python
+class TraitSystem:
+    def __init__(self):
+        self.validators = {
+            'Resource_Constraints': ResourceConstraintValidator(),
+            'Security_Scope': SecurityScopeValidator(),
+            'Execution_Model': ExecutionModelValidator(),
+            'Performance_Hints': PerformanceHintValidator(),
+            'Error_Handling': ErrorHandlingValidator(),
+            'Data_Flow': DataFlowValidator(),
+            'Integration': IntegrationValidator(),
+            'Compliance': ComplianceValidator()
+        }
+        
+        self.translators = {
+            'python': PythonTraitTranslator(),
+            'rust': RustTraitTranslator(),
+            'cpp': CppTraitTranslator(),
+            'java': JavaTraitTranslator(),
+            'javascript': JavaScriptTraitTranslator(),
+            'go': GoTraitTranslator(),
+            'csharp': CSharpTraitTranslator()
+        }
+    
+    def validate_traits(self, traits):
+        """Validate trait configurations and detect conflicts"""
+        errors = []
+        warnings = []
+        
+        for trait_name, trait_config in traits.items():
+            if trait_name in self.validators:
+                validator = self.validators[trait_name]
+                trait_errors, trait_warnings = validator.validate(trait_config)
+                errors.extend(trait_errors)
+                warnings.extend(trait_warnings)
+        
+        # Check for cross-trait conflicts
+        conflict_errors, conflict_warnings = self._check_trait_conflicts(traits)
+        errors.extend(conflict_errors)
+        warnings.extend(conflict_warnings)
+        
+        return errors, warnings
+    
+    def translate_traits(self, traits, target_language):
+        """Translate Runa traits to target language constructs"""
+        if target_language not in self.translators:
+            raise ValueError(f"Unsupported target language: {target_language}")
+        
+        translator = self.translators[target_language]
+        return translator.translate(traits)
+```
+
+#### **Resource Constraint Enforcement**
+**Objectives:**
+- Implement memory and CPU limit enforcement
+- Create execution timeout mechanisms
+- Establish resource monitoring and reporting
+
+**Deliverables:**
+- Memory usage monitoring and enforcement
+- CPU limit enforcement with throttling
+- Execution timeout mechanisms
+- Resource usage reporting and analytics
+
+**Resource Management Implementation:**
+```python
+class ResourceManager:
+    def __init__(self, constraints):
+        self.memory_limit = self._parse_memory_limit(constraints.get('memory_limit'))
+        self.cpu_limit = self._parse_cpu_limit(constraints.get('cpu_limit'))
+        self.execution_timeout = self._parse_timeout(constraints.get('execution_timeout'))
+        self.optimize_for = constraints.get('optimize_for', 'speed')
+        
+        self.memory_monitor = MemoryMonitor(self.memory_limit)
+        self.cpu_monitor = CPUMonitor(self.cpu_limit)
+        self.timeout_monitor = TimeoutMonitor(self.execution_timeout)
+    
+    def check_constraints(self):
+        """Check if current resource usage exceeds constraints"""
+        violations = []
+        
+        if self.memory_monitor.is_limit_exceeded():
+            violations.append(f"Memory limit exceeded: {self.memory_monitor.current_usage()}")
+        
+        if self.cpu_monitor.is_limit_exceeded():
+            violations.append(f"CPU limit exceeded: {self.cpu_monitor.current_usage()}")
+        
+        if self.timeout_monitor.is_timeout_reached():
+            violations.append("Execution timeout reached")
+        
+        return violations
+    
+    def apply_optimizations(self, ast):
+        """Apply optimizations based on resource constraints"""
+        if self.optimize_for == 'memory':
+            return self._apply_memory_optimizations(ast)
+        elif self.optimize_for == 'speed':
+            return self._apply_speed_optimizations(ast)
+        elif self.optimize_for == 'throughput':
+            return self._apply_throughput_optimizations(ast)
+```
+
+#### **Security Capability Enforcement**
+**Objectives:**
+- Implement capability-based security system
+- Create sandboxing mechanisms for restricted operations
+- Establish audit trail and compliance reporting
+
+**Deliverables:**
+- Capability-based access control system
+- Sandboxing framework for restricted operations
+- Security violation detection and reporting
+- Audit trail generation and management
+
+**Security System Implementation:**
+```python
+class SecurityContext:
+    def __init__(self, security_scope):
+        self.allowed_capabilities = set(security_scope.get('capabilities', []))
+        self.forbidden_capabilities = set(security_scope.get('forbidden', []))
+        self.sandbox_level = security_scope.get('sandbox_level', 'moderate')
+        self.data_access = security_scope.get('data_access', 'read_write')
+        
+        self.audit_logger = AuditLogger()
+        self.capability_checker = CapabilityChecker(
+            self.allowed_capabilities, 
+            self.forbidden_capabilities
+        )
+    
+    def check_capability(self, capability, operation_context=None):
+        """Check if operation is allowed under current security scope"""
+        if capability in self.forbidden_capabilities:
+            self.audit_logger.log_violation(capability, operation_context)
+            raise SecurityViolation(f"Forbidden capability: {capability}")
+        
+        if capability not in self.allowed_capabilities:
+            self.audit_logger.log_violation(capability, operation_context)
+            raise SecurityViolation(f"Unauthorized capability: {capability}")
+        
+        self.audit_logger.log_operation(capability, operation_context)
+        return True
+    
+    def create_sandbox(self, process_node):
+        """Create sandboxed execution environment for process"""
+        sandbox_config = self._get_sandbox_config()
+        return SandboxedExecutor(process_node, sandbox_config, self)
+```
+
+### **Week 10: Execution Model and Performance Optimization**
+
+#### **Execution Model Implementation**
+**Objectives:**
+- Implement batch, realtime, and event-driven execution modes
+- Create concurrency control mechanisms
+- Establish priority and retry policy systems
+
+**Deliverables:**
+- Execution mode switching and optimization
+- Concurrency control with thread safety
+- Priority-based execution scheduling
+- Retry policy implementation with exponential backoff
+
+**Execution Model Implementation:**
+```python
+class ExecutionEngine:
+    def __init__(self, execution_model):
+        self.mode = execution_model.get('mode', 'batch')
+        self.concurrency = execution_model.get('concurrency', 'sequential')
+        self.priority = execution_model.get('priority', 'normal')
+        self.retry_policy = execution_model.get('retry_policy', 'none')
+        
+        self.scheduler = ExecutionScheduler(self.priority)
+        self.concurrency_manager = ConcurrencyManager(self.concurrency)
+        self.retry_manager = RetryManager(self.retry_policy)
+    
+    def execute_process(self, process_node, input_data):
+        """Execute process with appropriate execution model"""
+        if self.mode == 'batch':
+            return self._execute_batch(process_node, input_data)
+        elif self.mode == 'realtime':
+            return self._execute_realtime(process_node, input_data)
+        elif self.mode == 'event_driven':
+            return self._execute_event_driven(process_node, input_data)
+    
+    def _execute_batch(self, process_node, input_data):
+        """Execute in batch mode with optimizations"""
+        # Apply batch-specific optimizations
+        optimized_ast = self._apply_batch_optimizations(process_node)
+        
+        # Execute with batching
+        return self.concurrency_manager.execute_batch(optimized_ast, input_data)
+    
+    def _execute_realtime(self, process_node, input_data):
+        """Execute in realtime mode with low latency"""
+        # Apply realtime-specific optimizations
+        optimized_ast = self._apply_realtime_optimizations(process_node)
+        
+        # Execute with realtime constraints
+        return self.concurrency_manager.execute_realtime(optimized_ast, input_data)
+```
+
+#### **Performance Optimization System**
+**Objectives:**
+- Implement cache strategy management
+- Create vectorization and parallel processing
+- Establish performance monitoring and profiling
+
+**Deliverables:**
+- Configurable caching strategies (none, basic, aggressive)
+- Vectorization support for numerical operations
+- Parallel processing with threshold management
+- Performance profiling and optimization recommendations
+
+**Performance System Implementation:**
+```python
+class PerformanceOptimizer:
+    def __init__(self, performance_hints):
+        self.cache_strategy = performance_hints.get('cache_strategy', 'none')
+        self.vectorization = performance_hints.get('vectorization', 'disabled')
+        self.memory_layout = performance_hints.get('memory_layout', 'default')
+        self.parallel_threshold = performance_hints.get('parallel_threshold', 1000)
+        
+        self.cache_manager = CacheManager(self.cache_strategy)
+        self.vectorizer = Vectorizer(self.vectorization)
+        self.parallelizer = Parallelizer(self.parallel_threshold)
+        self.profiler = PerformanceProfiler()
+    
+    def optimize_ast(self, ast):
+        """Apply performance optimizations to AST"""
+        optimized_ast = ast
+        
+        # Apply caching optimizations
+        if self.cache_strategy != 'none':
+            optimized_ast = self.cache_manager.apply_caching(optimized_ast)
+        
+        # Apply vectorization
+        if self.vectorization == 'enabled':
+            optimized_ast = self.vectorizer.apply_vectorization(optimized_ast)
+        
+        # Apply parallelization
+        optimized_ast = self.parallelizer.apply_parallelization(optimized_ast)
+        
+        return optimized_ast
+    
+    def profile_execution(self, process_node, input_data):
+        """Profile process execution and provide optimization recommendations"""
+        profile_data = self.profiler.profile(process_node, input_data)
+        
+        recommendations = []
+        if profile_data['memory_usage'] > self.parallel_threshold:
+            recommendations.append("Consider enabling parallel processing")
+        
+        if profile_data['cache_miss_rate'] > 0.3:
+            recommendations.append("Consider enabling aggressive caching")
+        
+        if profile_data['vectorization_opportunity'] > 0.5:
+            recommendations.append("Consider enabling vectorization")
+        
+        return profile_data, recommendations
+```
+
+### **Week 11: Error Handling and Data Flow Management**
+
+#### **Error Handling System**
+**Objectives:**
+- Implement graceful degradation strategies
+- Create retry mechanisms with exponential backoff
+- Establish comprehensive error logging and reporting
+
+**Deliverables:**
+- Configurable error handling strategies
+- Retry mechanisms with configurable attempts
+- Fallback behavior implementation
+- Detailed error logging and reporting
+
+**Error Handling Implementation:**
+```python
+class ErrorHandler:
+    def __init__(self, error_handling_config):
+        self.strategy = error_handling_config.get('strategy', 'fail_fast')
+        self.retry_attempts = error_handling_config.get('retry_attempts', 0)
+        self.fallback_behavior = error_handling_config.get('fallback_behavior', 'return_error')
+        self.log_level = error_handling_config.get('log_level', 'normal')
+        
+        self.retry_manager = RetryManager(self.retry_attempts)
+        self.fallback_manager = FallbackManager(self.fallback_behavior)
+        self.logger = ErrorLogger(self.log_level)
+    
+    def handle_error(self, error, context, process_node):
+        """Handle error according to configured strategy"""
+        self.logger.log_error(error, context)
+        
+        if self.strategy == 'graceful_degradation':
+            return self._handle_graceful_degradation(error, context, process_node)
+        elif self.strategy == 'retry':
+            return self._handle_retry(error, context, process_node)
+        elif self.strategy == 'fail_fast':
+            return self._handle_fail_fast(error, context)
+    
+    def _handle_graceful_degradation(self, error, context, process_node):
+        """Handle error with graceful degradation"""
+        # Try to provide partial results
+        partial_result = self._extract_partial_result(process_node, context)
+        
+        if partial_result is not None:
+            self.logger.log_warning(f"Providing partial result due to error: {error}")
+            return partial_result
+        
+        # Fall back to default behavior
+        return self.fallback_manager.get_fallback_result(error, context)
+    
+    def _handle_retry(self, error, context, process_node):
+        """Handle error with retry mechanism"""
+        return self.retry_manager.retry_with_backoff(
+            lambda: self._execute_process(process_node, context),
+            error
+        )
+```
+
+#### **Data Flow Management**
+**Objectives:**
+- Implement input validation and output sanitization
+- Create data retention and encryption mechanisms
+- Establish data flow tracking and audit trails
+
+**Deliverables:**
+- Configurable input validation (none, basic, strict)
+- Output sanitization and validation
+- Data retention policy enforcement
+- Encryption support for data at rest and in transit
+
+**Data Flow Implementation:**
+```python
+class DataFlowManager:
+    def __init__(self, data_flow_config):
+        self.input_validation = data_flow_config.get('input_validation', 'basic')
+        self.output_sanitization = data_flow_config.get('output_sanitization', 'disabled')
+        self.data_retention = data_flow_config.get('data_retention', 'temporary')
+        self.encryption = data_flow_config.get('encryption', 'none')
+        
+        self.validator = InputValidator(self.input_validation)
+        self.sanitizer = OutputSanitizer(self.output_sanitization)
+        self.retention_manager = RetentionManager(self.data_retention)
+        self.encryption_manager = EncryptionManager(self.encryption)
+    
+    def process_input(self, input_data, expected_schema):
+        """Process and validate input data"""
+        # Apply input validation
+        validated_data = self.validator.validate(input_data, expected_schema)
+        
+        # Apply encryption if needed
+        if self.encryption in ['at_rest', 'both']:
+            validated_data = self.encryption_manager.encrypt(validated_data)
+        
+        return validated_data
+    
+    def process_output(self, output_data, output_schema):
+        """Process and sanitize output data"""
+        # Apply output sanitization
+        sanitized_data = self.sanitizer.sanitize(output_data, output_schema)
+        
+        # Apply retention policy
+        self.retention_manager.apply_retention_policy(sanitized_data)
+        
+        # Apply encryption if needed
+        if self.encryption in ['in_transit', 'both']:
+            sanitized_data = self.encryption_manager.encrypt(sanitized_data)
+        
+        return sanitized_data
+```
+
+## Phase 3: Advanced Features & Optimization (Weeks 12-16)
+
+### **Week 12: Vector-Based Semantic Engine**
 
 #### **Advanced Semantic Understanding**
 **Objectives:**
@@ -600,147 +986,6 @@ class SemanticEngine:
 - Context-aware code completion engine
 - Integration with domain knowledge for specialized suggestions
 - Code explanation and documentation generation
-
-### **Week 10: Performance Optimization**
-
-#### **Compiler Optimizations**
-**Objectives:**
-- Implement bytecode optimization passes
-- Create constant folding and dead code elimination
-- Optimize natural language construct compilation
-
-**Deliverables:**
-- Multi-pass bytecode optimizer
-- Constant folding and propagation
-- Dead code elimination
-- Loop optimization and unrolling
-
-**Optimization Pipeline:**
-```python
-class OptimizationPipeline:
-    def __init__(self):
-        self.passes = [
-            ConstantFoldingPass(),
-            DeadCodeEliminationPass(),
-            LoopOptimizationPass(),
-            NaturalLanguageOptimizationPass(),
-        ]
-    
-    def optimize(self, bytecode):
-        for pass_optimizer in self.passes:
-            bytecode = pass_optimizer.optimize(bytecode)
-        return bytecode
-
-class NaturalLanguageOptimizationPass:
-    def optimize(self, bytecode):
-        # Optimize common natural language patterns
-        # e.g., "x is greater than y" -> optimized comparison
-        optimized = []
-        for instruction in bytecode.instructions:
-            if self.is_natural_language_pattern(instruction):
-                optimized.extend(self.optimize_pattern(instruction))
-            else:
-                optimized.append(instruction)
-        return ByteCode(optimized)
-```
-
-#### **Runtime Performance Enhancements**
-**Objectives:**
-- Optimize VM execution performance
-- Implement JIT compilation for hot paths
-- Create efficient garbage collection strategies
-
-**Deliverables:**
-- VM performance improvements (2x+ speed increase)
-- Basic JIT compilation for frequently executed code
-- Generational garbage collection with low pause times
-- Memory usage optimization
-
-### **Week 11: Development Tools**
-
-#### **Language Server Protocol Implementation**
-**Objectives:**
-- Create complete LSP server for IDE integration
-- Implement syntax highlighting, code completion, and error reporting
-- Support for go-to-definition and find references
-
-**Deliverables:**
-- Full LSP server implementation
-- Syntax highlighting with semantic tokens
-- Intelligent code completion with natural language suggestions
-- Error diagnostics with natural language explanations
-- Refactoring support for Runa code
-
-**LSP Server Features:**
-```python
-class RunaLanguageServer:
-    def __init__(self):
-        self.parser = RunaParser()
-        self.semantic_analyzer = SemanticAnalyzer()
-        self.completion_engine = CompletionEngine()
-        
-    def handle_completion(self, params):
-        # Provide natural language code completion
-        document = self.get_document(params.text_document.uri)
-        position = params.position
-        
-        context = self.extract_context(document, position)
-        suggestions = self.completion_engine.get_suggestions(context)
-        
-        return [CompletionItem(
-            label=suggestion.text,
-            detail=suggestion.explanation,
-            documentation=suggestion.documentation
-        ) for suggestion in suggestions]
-        
-    def handle_hover(self, params):
-        # Provide explanations for Runa constructs
-        symbol = self.get_symbol_at_position(params)
-        if symbol:
-            return Hover(contents=symbol.get_natural_language_explanation())
-```
-
-#### **Interactive REPL & Debugger**
-**Objectives:**
-- Create interactive REPL with natural language support
-- Implement visual debugger with step-through capabilities
-- Support for live code modification and testing
-
-**Deliverables:**
-- Full-featured REPL with tab completion and history
-- Visual debugger with breakpoints and variable inspection
-- Live code editing and hot reloading
-- Interactive help system with natural language queries
-
-### **Week 12: Documentation & Examples**
-
-#### **Comprehensive Documentation System**
-**Objectives:**
-- Create complete language reference documentation
-- Generate API documentation from code
-- Build interactive tutorials and examples
-
-**Deliverables:**
-- Complete language reference manual
-- API documentation with examples
-- Interactive tutorial system
-- Example project gallery
-- Best practices guide
-
-#### **Example Projects & Use Cases**
-**Objectives:**
-- Create comprehensive example projects
-- Demonstrate AI-specific features
-- Show integration with various domains
-
-**Deliverables:**
-- 10+ example projects covering different domains
-- AI/ML project examples with neural networks
-- Web development examples
-- Data processing and analysis examples
-- Knowledge graph integration examples
-
-## Phase 4: Production Readiness & Ecosystem (Weeks 13-16)
 
 ### **Week 13: Testing & Quality Assurance**
 
@@ -964,7 +1209,7 @@ class UniversalCodeGenerator:
 - Build automation and task runner
 - Development server with hot reloading
 
-## Phase 5: LLM Integration & Training Data (Weeks 17-20)
+## Phase 4: Production Readiness & Ecosystem (Weeks 17-20)
 
 ### **Week 17: LLM Integration Framework**
 

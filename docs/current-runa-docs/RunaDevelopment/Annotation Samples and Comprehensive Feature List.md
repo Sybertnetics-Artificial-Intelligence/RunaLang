@@ -301,6 +301,278 @@ Process called "ProcessUserAction" that takes user_id and action:
     # Implementation that will be verified against the test cases
 ```
 
+## 12. Resource and Security Traits
+
+### Resource Constraint Declarations
+
+```
+@Resource_Constraints:
+    memory_limit: "512MB"
+    cpu_limit: "4 cores"
+    execution_timeout: "60 seconds"
+    optimize_for: "speed"
+    max_iterations: 50000
+@End_Resource_Constraints
+
+Process called "Process Large Dataset" that takes data:
+    # Compiler will enforce memory limits and optimize for speed
+    Let results be list containing
+    For each item in data:
+        Let result be Transform Item with item as item
+        Add result to results
+    Return results
+```
+
+### Security and Capability Scoping
+
+```
+@Security_Scope:
+    capabilities: ["file.read", "math.compute", "memory.local"]
+    forbidden: ["net.access", "file.write", "system.execute"]
+    sandbox_level: "strict"
+    data_access: "read_only"
+@End_Security_Scope
+
+Process called "Calculate Statistics" that takes data:
+    # Compiler will enforce capability restrictions
+    Let mean be sum of data divided by length of data
+    Let variance be 0
+    For each value in data:
+        Set variance to variance plus (value minus mean) multiplied by (value minus mean)
+    Set variance to variance divided by length of data
+    Return dictionary with:
+        "mean" as mean
+        "variance" as variance
+```
+
+### Execution Model Specifications
+
+```
+@Execution_Model:
+    mode: "batch"
+    concurrency: "parallel"
+    priority: "normal"
+    retry_policy: "exponential_backoff"
+@End_Execution_Model
+
+Process called "Process Images" that takes images:
+    # Compiler will optimize for batch processing with parallel execution
+    Let results be list containing
+    For each image in images:
+        Let processed be Apply Filters with image as image
+        Add processed to results
+    Return results
+```
+
+### Performance Optimization Hints
+
+```
+@Performance_Hints:
+    cache_strategy: "aggressive"
+    vectorization: "enabled"
+    memory_layout: "contiguous"
+    parallel_threshold: 1000
+@End_Performance_Hints
+
+Process called "Matrix Multiplication" that takes matrix_a and matrix_b:
+    # Compiler will apply aggressive caching and vectorization
+    Let rows_a be length of matrix_a
+    Let cols_a be length of matrix_a at index 0
+    Let cols_b be length of matrix_b at index 0
+    
+    Let result be list containing
+    For each i from 0 to rows_a minus 1:
+        Let row be list containing
+        For each j from 0 to cols_b minus 1:
+            Let sum be 0
+            For each k from 0 to cols_a minus 1:
+                Set sum to sum plus (matrix_a at index i at index k) multiplied by (matrix_b at index k at index j)
+            Add sum to row
+        Add row to result
+    Return result
+```
+
+### Error Handling and Recovery
+
+```
+@Error_Handling:
+    strategy: "graceful_degradation"
+    retry_attempts: 3
+    fallback_behavior: "return_default"
+    log_level: "detailed"
+@End_Error_Handling
+
+Process called "Fetch Data" that takes url:
+    # Will retry up to 3 times with graceful degradation
+    Let attempts be 0
+    While attempts is less than 3:
+        Try:
+            Let response be HTTP Get with url as url
+            Return response
+        Catch network error:
+            Set attempts to attempts plus 1
+            If attempts is equal to 3:
+                Return "Failed to fetch data after 3 attempts"
+            Otherwise:
+                Wait for (2 raised to power attempts) seconds
+```
+
+### Data Flow and Validation
+
+```
+@Data_Flow:
+    input_validation: "strict"
+    output_sanitization: "enabled"
+    data_retention: "temporary"
+    encryption: "at_rest"
+@End_Data_Flow
+
+Process called "Process User Input" that takes user_data:
+    # Input will be strictly validated, output sanitized
+    If user_data is not of type Dictionary:
+        Return "Invalid input: expected dictionary"
+    
+    If user_data does not contain key "name":
+        Return "Invalid input: missing name field"
+    
+    If user_data does not contain key "email":
+        Return "Invalid input: missing email field"
+    
+    Let processed be dictionary with:
+        "name" as user_data["name"]
+        "email" as user_data["email"]
+        "processed_at" as current timestamp
+    
+    Return processed
+```
+
+### Integration and Communication
+
+```
+@Integration:
+    protocol: "REST"
+    authentication: "bearer_token"
+    rate_limiting: "100 requests per minute"
+    timeout: "5 seconds"
+@End_Integration
+
+Process called "Call External API" that takes request_data:
+    # Will use REST protocol with bearer token authentication
+    Let headers be dictionary with:
+        "Authorization" as "Bearer " followed by api_token
+        "Content-Type" as "application/json"
+    
+    Let response be HTTP Post with:
+        url as api_endpoint
+        data as request_data
+        headers as headers
+        timeout as 5
+    
+    Return response
+```
+
+### Compliance and Auditing
+
+```
+@Compliance:
+    standards: ["GDPR", "HIPAA", "SOC2"]
+    audit_trail: "enabled"
+    data_classification: "confidential"
+    retention_policy: "7 years"
+@End_Compliance
+
+Process called "Process Medical Data" that takes patient_data:
+    # Will maintain audit trail and follow HIPAA compliance
+    Let audit_entry be dictionary with:
+        "timestamp" as current timestamp
+        "operation" as "process_medical_data"
+        "data_type" as "patient_information"
+        "user_id" as current_user_id
+    
+    Log audit entry with entry as audit_entry
+    
+    Let anonymized be Anonymize Data with data as patient_data
+    Let processed be Process Data with data as anonymized
+    
+    Return processed
+```
+
+### Trait Composition and Inheritance
+
+```
+@Base_Traits:
+    @Resource_Constraints:
+        memory_limit: "128MB"
+        optimize_for: "memory"
+    @End_Resource_Constraints
+    
+    @Security_Scope:
+        capabilities: ["math.compute"]
+        sandbox_level: "strict"
+    @End_Security_Scope
+@End_Base_Traits
+
+# This process inherits base traits and adds specific ones
+@Execution_Model:
+    mode: "realtime"
+    priority: "high"
+@End_Execution_Model
+
+Process called "Real Time Calculator" that takes expression:
+    # Inherits memory and security constraints, adds real-time execution
+    Let result be Evaluate Expression with expr as expression
+    Return result
+```
+
+### Trait Validation and Conflict Resolution
+
+```
+@Resource_Constraints:
+    memory_limit: "1GB"
+    optimize_for: "speed"
+@End_Resource_Constraints
+
+@Security_Scope:
+    capabilities: ["file.read", "net.access"]
+    sandbox_level: "strict"
+@End_Security_Scope
+
+# Compiler will warn about potential conflicts between
+# high memory usage and strict sandboxing
+Process called "Data Processor" that takes data:
+    Let result be Process Data with data as data
+    Return result
+```
+
+### Advanced Trait Combinations
+
+```
+@AI_Processing:
+    model_type: "transformer"
+    batch_size: 32
+    precision: "float16"
+    hardware_acceleration: "GPU"
+@End_AI_Processing
+
+@Resource_Constraints:
+    memory_limit: "2GB"
+    gpu_memory: "8GB"
+    optimize_for: "throughput"
+@End_Resource_Constraints
+
+@Security_Scope:
+    capabilities: ["ai.inference", "memory.local"]
+    forbidden: ["file.write", "net.access"]
+    model_validation: "enabled"
+@End_Security_Scope
+
+Process called "AI Inference" that takes input_data:
+    # Optimized for AI processing with GPU acceleration
+    Let model be Load Model with path as "models/transformer.model"
+    Let predictions be model.predict with data as input_data
+    Return predictions
+```
+
 ## Combined Example: A Complete AI-to-AI Communication Flow
 
 ```

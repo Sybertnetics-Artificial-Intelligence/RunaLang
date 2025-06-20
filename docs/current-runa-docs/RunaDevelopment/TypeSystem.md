@@ -48,10 +48,10 @@ Type Function[T1, T2, ..., R]  # Function taking arguments of types T1, T2, ... 
 You can explicitly declare the type of a variable:
 
 ```
-Let name be String "Alex"
-Let age be Integer 28
-Let is_active be Boolean true
-Let points be Float 75.5
+Let name (String) be "Alex"
+Let age (Integer) be 28
+Let is_active (Boolean) be true
+Let points (Float) be 75.5
 ```
 
 Runa can also infer types automatically:

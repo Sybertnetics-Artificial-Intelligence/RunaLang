@@ -1,5 +1,42 @@
 # SyberSuite AI: Technical Specifications
 
+## **Reference Documents**
+- **Production Validation**: `docs/CORE GUIDANCE DOCS/Production_Validation_Criteria.md`
+- **Production Readiness**: `docs/CORE GUIDANCE DOCS/Production_Readiness_Summary.md`
+- **Runa Language Reference**: `docs/current-runa-docs/RunaDevelopment/RunaLanguageReference.md`
+- **Hermod Architecture**: `docs/CORE GUIDANCE DOCS/HermodIDE Architecture Guide.md`
+
+## System Architecture Overview
+
+### **Hybrid Architecture Design**
+The SyberSuite AI ecosystem uses a hybrid Python+C++ architecture for optimal performance and flexibility:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SyberSuite AI Ecosystem                      │
+├─────────────────────────────────────────────────────────────────┤
+│  HermodIDE (TypeScript/React) - Hermod's Interface             │
+├─────────────────────────────────────────────────────────────────┤
+│  Hermod AI Core (Python) - Coordination & Learning             │
+├─────────────────────────────────────────────────────────────────┤
+│  C++ Performance Modules (pybind11) - Critical Operations      │
+├─────────────────────────────────────────────────────────────────┤
+│  Runa Language (Self-Hosting) - Universal Translation          │
+├─────────────────────────────────────────────────────────────────┤
+│  SyberCraft LLM Infrastructure - Multi-LLM Coordination        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### **Production Validation Requirements**
+All components must meet production validation criteria:
+- **Performance**: <100ms compilation (Runa), <50ms response (Hermod)
+- **Memory**: <500MB for large programs, <30% vs Python baseline
+- **Self-Hosting**: Bootstrap process working (Python → C++ → Native)
+- **Universal Translation**: 43 Tier 1 languages, 99.9% semantic accuracy
+- **Enterprise Features**: SSO/SAML, audit logging, RBAC, compliance
+- **Security**: Code sandboxing, encryption, access control
+- **Scalability**: 1000+ concurrent users, <1% error rate
+
 ## Sybertnetics Ethical Computational Guidelines (SECG) Compliance
 
 ### **🚨 MANDATORY ETHICAL FRAMEWORK**
@@ -50,7 +87,7 @@ class SECGComplianceFramework:
 // Performance constants that MUST be achieved
 constexpr int RUNA_COMPILATION_TARGET_MS = 100;     // 1000-line programs
 constexpr int RUNA_EXECUTION_TARGET_MS = 50;       // Complex program execution  
-constexpr int HERMOD_RESPONSE_TARGET_MS = 50;      // All IDE operations
+constexpr int HERMOD_RESPONSE_TARGET_MS = 50;      // All IDE operations (web & desktop)
 constexpr double TRANSLATION_ACCURACY_TARGET = 0.999; // 99.9% correctness
 constexpr int CONCURRENT_LLM_REQUESTS = 100;       // Simultaneous handling
 constexpr double TEST_COVERAGE_TARGET = 0.95;      // 95% test coverage
@@ -155,12 +192,236 @@ class TranslationValidator:
         return accuracy
 ```
 
-## Hermod Architecture Specifications
+## Hermod Architecture Specifications - Hybrid Deployment
+
+### **Hybrid Web/Desktop Architecture**
+
+```python
+class HermodDeploymentArchitecture:
+    """Manages tier-based hybrid deployment strategy."""
+    
+    def __init__(self):
+        self.deployment_configs = {
+            'hobby': WebOnlyDeployment(),
+            'professional': WebPrimaryOptionalDesktop(),
+            'enterprise': DesktopRecommendedWebAvailable(),
+            'internal': DesktopRequiredWebOptional()
+        }
+        
+    def get_deployment_strategy(self, customer_tier: str) -> DeploymentStrategy:
+        """Return appropriate deployment strategy for customer tier."""
+        return self.deployment_configs.get(customer_tier, WebOnlyDeployment())
+```
+
+### **Shared Core Architecture**
+
+```python
+class HermodSharedCore:
+    """Core functionality shared between web and desktop deployments."""
+    
+    def __init__(self):
+        # Platform-agnostic core components
+        self.ai_core = HermodAICore()
+        self.inference_engine = NativeInferenceEngine()
+        self.runa_vm = NativeRunaVM()
+        self.llm_coordinator = MultiLLMCoordinator()
+        
+        # Platform-specific adapters
+        self.platform_adapter = self._initialize_platform_adapter()
+        
+    def _initialize_platform_adapter(self) -> PlatformAdapter:
+        """Initialize appropriate platform adapter."""
+        if self.is_web_deployment():
+            return WebPlatformAdapter()
+        elif self.is_desktop_deployment():
+            return DesktopPlatformAdapter()
+        else:
+            raise PlatformError("Unknown deployment platform")
+            
+    @performance_monitor.enforce_target(50)  # <50ms for both platforms
+    def process_request(self, request: str) -> Response:
+        """Process request with platform-appropriate optimizations."""
+        # Fast C++ analysis (same for both platforms)
+        analysis = self.inference_engine.analyze_request(request)
+        
+        # Platform-specific optimizations
+        if self.platform_adapter.supports_local_execution():
+            # Desktop: Use local resources fully
+            result = self._process_locally(analysis)
+        else:
+            # Web: Use server resources with caching
+            result = self._process_cloud_optimized(analysis)
+            
+        return result
+```
+
+### **Web Platform Implementation**
+
+```typescript
+// Web-specific IDE interface implementation
+class HermodWebIDE {
+    private apiClient: APIClient;
+    private performanceMonitor: PerformanceMonitor;
+    private tierManager: CustomerTierManager;
+    
+    constructor() {
+        this.apiClient = new APIClient({
+            baseURL: process.env.REACT_APP_API_URL,
+            timeout: 5000,  // 5s timeout
+            retryPolicy: new ExponentialBackoffRetry()
+        });
+        
+        this.performanceMonitor = new PerformanceMonitor({
+            targetResponseTime: 50,  // <50ms target
+            reportViolations: true
+        });
+        
+        this.tierManager = new CustomerTierManager();
+    }
+    
+    async processUserAction(action: UserAction): Promise<ActionResult> {
+        const startTime = performance.now();
+        
+        try {
+            // Check tier restrictions
+            if (!this.tierManager.isActionAllowed(action)) {
+                return new ActionResult({
+                    success: false,
+                    error: "Action not available in your tier"
+                });
+            }
+            
+            // Server-side processing for web
+            const response = await this.apiClient.post('/api/process', {
+                action: action,
+                tier: this.tierManager.getCurrentTier(),
+                sessionId: this.getSessionId()
+            });
+            
+            const endTime = performance.now();
+            const responseTime = endTime - startTime;
+            
+            // Validate performance
+            if (responseTime > 50) {
+                this.performanceMonitor.logViolation(action, responseTime);
+            }
+            
+            return response.data;
+            
+        } catch (error) {
+            return this.handleError(error);
+        }
+    }
+}
+```
+
+### **Desktop Platform Implementation**
+
+```cpp
+// Desktop-specific high-performance modules
+class HermodDesktopCore {
+private:
+    std::unique_ptr<LocalRunaVM> local_vm;
+    std::unique_ptr<FileSystemManager> fs_manager;
+    std::unique_ptr<OfflineCapability> offline_mode;
+    CustomerTier current_tier;
+    
+public:
+    HermodDesktopCore(CustomerTier tier) 
+        : current_tier(tier),
+          local_vm(std::make_unique<LocalRunaVM>()),
+          fs_manager(std::make_unique<FileSystemManager>()),
+          offline_mode(std::make_unique<OfflineCapability>()) {
+        
+        // Initialize based on tier
+        if (tier == CustomerTier::ENTERPRISE || tier == CustomerTier::INTERNAL) {
+            offline_mode->enable_full_offline_mode();
+            
+            if (tier == CustomerTier::INTERNAL) {
+                // Internal tier gets unrestricted local AI
+                local_vm->enable_autonomous_mode();
+            }
+        }
+    }
+    
+    ProcessResult process_locally(const Request& request) {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        // Direct file system access for desktop
+        auto files = fs_manager->scan_project_files(request.project_path);
+        
+        // Local Runa VM execution
+        auto analysis = local_vm->analyze_code_base(files);
+        
+        // Process with full system resources
+        auto result = execute_with_full_resources(analysis);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        
+        // Performance validation
+        if (duration > 50) {
+            performance_monitor.log_violation("local_processing", duration);
+        }
+        
+        return result;
+    }
+};
+```
+
+### **Platform-Specific Features**
+
+```python
+class PlatformFeatureMatrix:
+    """Defines features available on each platform by tier."""
+    
+    features = {
+        'web': {
+            'hobby': [
+                'basic_code_completion',
+                'syntax_highlighting',
+                'simple_refactoring',
+                'cloud_compilation'
+            ],
+            'professional': [
+                'advanced_code_generation',
+                'ai_powered_debugging',
+                'team_collaboration',
+                'priority_processing'
+            ],
+            'enterprise': [
+                'full_ide_features',
+                'custom_ai_models',
+                'dedicated_instances',
+                'sso_integration'
+            ]
+        },
+        'desktop': {
+            'professional': [
+                'local_file_access',
+                'enhanced_performance',
+                'limited_offline_mode'
+            ],
+            'enterprise': [
+                'full_offline_capability',
+                'local_data_storage',
+                'system_integration',
+                'multi_project_management'
+            ],
+            'internal': [
+                'unrestricted_ai',
+                'local_model_execution',
+                'custom_deployments',
+                'autonomous_operation'
+            ]
+        }
+    }
+```
 
 ### **Hybrid Python+C++ Design**
 
 ```cpp
-// High-performance C++ modules for Hermod
+// High-performance C++ modules for Hermod (shared across platforms)
 class NativeInferenceEngine {
 private:
     ThreadPool thread_pool;
@@ -177,13 +438,16 @@ public:
         auto end = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         
-        // CRITICAL: Validate <50ms target
+        // CRITICAL: Validate <50ms target (both web and desktop)
         if (duration_ms > 50) {
             perf_monitor.log_performance_violation("analyze_request", duration_ms);
             throw PerformanceViolationError(f"Request took {duration_ms}ms (target: <50ms)");
         }
         
-        return result
+        return result;
+    }
+};
+```
 
 ## Runa Syntax Standards
 
@@ -383,9 +647,6 @@ class AdvancedAIFeatures:
         dashboard.enable_confidence_analysis()
         
         return dashboard
-```;
-    }
-};
 ```
 
 ### **Multi-LLM Coordination Protocol**
@@ -448,6 +709,69 @@ class HermodCore:
         self.learning_engine.process_learning_data(learning_data)
         
         return result
+```
+
+### **Deployment-Specific Optimization**
+
+```python
+class DeploymentOptimizer:
+    """Optimizes performance based on deployment platform."""
+    
+    def optimize_for_platform(self, platform: str, tier: str) -> OptimizationConfig:
+        """Return platform-specific optimizations."""
+        
+        if platform == "web":
+            return self._optimize_for_web(tier)
+        elif platform == "desktop":
+            return self._optimize_for_desktop(tier)
+        else:
+            raise PlatformError(f"Unknown platform: {platform}")
+    
+    def _optimize_for_web(self, tier: str) -> WebOptimizationConfig:
+        """Web-specific optimizations."""
+        config = WebOptimizationConfig()
+        
+        # Aggressive caching for web
+        config.enable_aggressive_caching()
+        config.set_cache_ttl(3600)  # 1 hour
+        
+        # CDN optimization
+        config.enable_cdn_delivery()
+        config.configure_edge_locations()
+        
+        # Tier-based resource allocation
+        if tier == "hobby":
+            config.set_resource_limits("minimal")
+        elif tier == "professional":
+            config.set_resource_limits("standard")
+        elif tier == "enterprise":
+            config.set_resource_limits("premium")
+            config.enable_dedicated_instances()
+            
+        return config
+    
+    def _optimize_for_desktop(self, tier: str) -> DesktopOptimizationConfig:
+        """Desktop-specific optimizations."""
+        config = DesktopOptimizationConfig()
+        
+        # Local resource utilization
+        config.enable_full_cpu_utilization()
+        config.enable_gpu_acceleration()
+        
+        # Memory management
+        config.set_memory_pool_size("adaptive")
+        config.enable_large_file_handling()
+        
+        # Tier-based features
+        if tier == "enterprise":
+            config.enable_offline_mode()
+            config.enable_local_model_caching()
+        elif tier == "internal":
+            config.enable_autonomous_operation()
+            config.enable_unrestricted_ai()
+            config.enable_local_model_execution()
+            
+        return config
 ```
 
 ### **Performance Monitoring Integration**
@@ -571,6 +895,57 @@ class RunaVM:
     def execute(self, bytecode):
         # TODO: Implement execution
         pass  # ❌ NEVER ALLOWED
+```
+
+### **Platform-Specific Testing Requirements**
+
+```python
+class PlatformSpecificTests:
+    """Test suite for platform-specific functionality."""
+    
+    def test_web_performance(self):
+        """Web platform must meet performance targets with network latency."""
+        # Simulate network conditions
+        with simulate_network_latency(50):  # 50ms latency
+            start_time = time.perf_counter()
+            response = self.web_client.process_request("analyze this code")
+            end_time = time.perf_counter()
+            
+            total_time_ms = (end_time - start_time) * 1000
+            
+            # Must meet target even with network overhead
+            assert total_time_ms < 100, f"Web response {total_time_ms}ms exceeds target"
+    
+    def test_desktop_performance(self):
+        """Desktop platform must leverage local resources."""
+        # Test large file handling
+        large_project = self.generate_large_project(files=1000, lines_per_file=500)
+        
+        start_time = time.perf_counter()
+        result = self.desktop_client.analyze_project(large_project)
+        end_time = time.perf_counter()
+        
+        analysis_time_ms = (end_time - start_time) * 1000
+        
+        # Desktop should handle large projects efficiently
+        assert analysis_time_ms < 5000, f"Large project analysis too slow: {analysis_time_ms}ms"
+    
+    def test_tier_restrictions(self):
+        """Verify tier-based feature restrictions."""
+        # Hobby tier restrictions
+        hobby_client = self.create_client(tier="hobby", platform="web")
+        with pytest.raises(TierRestrictionError):
+            hobby_client.use_advanced_ai_features()
+        
+        # Enterprise tier capabilities
+        enterprise_client = self.create_client(tier="enterprise", platform="desktop")
+        result = enterprise_client.use_offline_mode()
+        assert result.success, "Enterprise tier should support offline mode"
+        
+        # Internal tier autonomy
+        internal_client = self.create_client(tier="internal", platform="desktop")
+        result = internal_client.enable_autonomous_operation()
+        assert result.success, "Internal tier should support autonomous operation"
 ```
 
 ### **Error Handling Standards**
@@ -787,4 +1162,4 @@ class SECGFramework:
             self.security_monitor.flag_high_risk_decision(audit_entry)
 ```
 
-This technical specification ensures all components meet the rigorous performance, quality, and security requirements necessary for production deployment of the SyberSuite AI ecosystem.
+This technical specification ensures all components meet the rigorous performance, quality, and security requirements necessary for production deployment of the SyberSuite AI ecosystem with hybrid web/desktop strategy.

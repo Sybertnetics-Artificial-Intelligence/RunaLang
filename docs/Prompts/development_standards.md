@@ -1,5 +1,11 @@
 # SyberSuite AI: Development Standards & Guidelines
 
+## **Reference Documents**
+- **Production Validation**: `docs/CORE GUIDANCE DOCS/Production_Validation_Criteria.md`
+- **Production Readiness**: `docs/CORE GUIDANCE DOCS/Production_Readiness_Summary.md`
+- **Project Checklists**: `docs/CORE GUIDANCE DOCS/Project Checklists.md`
+- **Status Tracking**: `docs/CORE GUIDANCE DOCS/Project Status Tracking.md`
+
 ## Core Development Philosophy
 
 ### **🚨 SYBERTNETICS ETHICAL COMPUTATIONAL GUIDELINES (SECG) - FOUNDATION**
@@ -51,6 +57,7 @@ Every line of code must be production-ready from the moment it's written. No exc
 - ✅ **REQUIRED**: Complete, production-ready implementations only
 - ✅ **REQUIRED**: Enterprise-grade quality from first commit
 - ✅ **REQUIRED**: Performance validation for every component
+- ✅ **REQUIRED**: Production validation criteria compliance
 
 ### **ZERO REDUNDANCY PRINCIPLE**
 - Reuse existing functions and components whenever possible
