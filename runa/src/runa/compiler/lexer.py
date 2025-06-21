@@ -22,6 +22,8 @@ class TokenType(Enum):
     FLOAT = auto()
     STRING = auto()
     BOOLEAN = auto()
+    TRUE = auto()  # Added for parser compatibility
+    FALSE = auto()  # Added for parser compatibility
     NULL = auto()
     
     # Identifiers
@@ -53,6 +55,7 @@ class TokenType(Enum):
     FROM = auto()
     EXPORT = auto()
     DISPLAY = auto()
+    IN = auto()  # Added for 'in' keyword in for loops
     
     # Keywords - AI-Specific
     REASONING = auto()
@@ -75,6 +78,18 @@ class TokenType(Enum):
     SAFETY = auto()
     CONSTRAINT = auto()
     VALIDATION = auto()
+    
+    # AI Communication Keywords
+    ASK = auto()
+    TELL = auto()
+    QUERY = auto()
+    INSTRUCT = auto()
+    DELEGATE = auto()
+    WAIT = auto()
+    BROADCAST = auto()
+    COORDINATE = auto()
+    ABOUT = auto()
+    RELATIONSHIP = auto()
     
     # Keywords - Control Flow
     BREAK = auto()
@@ -150,7 +165,6 @@ class TokenType(Enum):
     
     # Knowledge Graph
     KNOWLEDGE = auto()
-    QUERY = auto()
     GRAPH = auto()
     
     # Neural Network
@@ -240,6 +254,8 @@ class RunaLexer:
             'Import': TokenType.IMPORT,
             'From': TokenType.FROM,
             'Export': TokenType.EXPORT,
+            'Display': TokenType.DISPLAY,
+            'In': TokenType.IN,  # Added for for loops
             'Break': TokenType.BREAK,
             'Continue': TokenType.CONTINUE,
             'Try': TokenType.TRY,
@@ -247,8 +263,8 @@ class RunaLexer:
             'Finally': TokenType.FINALLY,
             'Throw': TokenType.THROW,
             'Raise': TokenType.RAISE,
-            'True': TokenType.BOOLEAN,
-            'False': TokenType.BOOLEAN,
+            'True': TokenType.TRUE,
+            'False': TokenType.FALSE,
             'None': TokenType.NULL,
             'Void': TokenType.VOID_TYPE,
             'Integer': TokenType.INTEGER_TYPE,
@@ -258,7 +274,6 @@ class RunaLexer:
             'List': TokenType.LIST_TYPE,
             'Dictionary': TokenType.DICTIONARY_TYPE,
             'Function': TokenType.FUNCTION_TYPE,
-            'Display': TokenType.DISPLAY,
             # AI-specific keywords
             'Reasoning': TokenType.REASONING,
             'End_reasoning': TokenType.END_REASONING,
@@ -289,6 +304,16 @@ class RunaLexer:
             'Activation': TokenType.ACTIVATION,
             'Loss': TokenType.LOSS,
             'Optimizer': TokenType.OPTIMIZER,
+            # AI Communication keywords
+            'Ask': TokenType.ASK,
+            'Tell': TokenType.TELL,
+            'Instruct': TokenType.INSTRUCT,
+            'Delegate': TokenType.DELEGATE,
+            'Wait': TokenType.WAIT,
+            'Broadcast': TokenType.BROADCAST,
+            'Coordinate': TokenType.COORDINATE,
+            'About': TokenType.ABOUT,
+            'Relationship': TokenType.RELATIONSHIP,
         }
         
         # Regex patterns for performance
@@ -539,9 +564,9 @@ class RunaLexer:
         
         identifier = self.source[start_pos:self.position]
         
-        # Check if it's a keyword
-        if identifier.lower() in self.keywords:
-            token_type = self.keywords[identifier.lower()]
+        # Check if it's a keyword (case-sensitive)
+        if identifier in self.keywords:
+            token_type = self.keywords[identifier]
             # Special handling for boolean literals
             if token_type == TokenType.BOOLEAN:
                 self._add_token(token_type, identifier.lower())

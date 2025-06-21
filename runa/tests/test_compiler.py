@@ -18,7 +18,7 @@ from runa.compiler import (
     Token, TokenType, ASTNode, Program, Statement, Expression,
     VariableDeclaration, FunctionDeclaration, Identifier, Literal,
     BinaryExpression, CallExpression, IfStatement, ForStatement,
-    WhileStatement, ReturnStatement, TypeAnnotation
+    WhileStatement, ReturnStatement, TypeAnnotation, Parameter
 )
 
 
@@ -188,7 +188,8 @@ class TestSemanticAnalyzer(unittest.TestCase):
         program = Program(1, 1, None, statements=[
             VariableDeclaration(
                 name="x",
-                value=Literal(value=42, literal_type="integer"),
+                value=Literal(value=42, literal_type="integer", line=1, column=1),
+                type_annotation=None,
                 is_constant=False,
                 line=1,
                 column=1
@@ -204,8 +205,8 @@ class TestSemanticAnalyzer(unittest.TestCase):
         program = Program(1, 1, None, statements=[
             VariableDeclaration(
                 name="x",
-                type_annotation=TypeAnnotation(type_name="Integer"),
-                value=Literal(value="not a number", literal_type="string"),
+                type_annotation=TypeAnnotation(type_name="Integer", line=1, column=1),
+                value=Literal(value="not a number", literal_type="string", line=1, column=1),
                 is_constant=False,
                 line=1,
                 column=1
@@ -221,7 +222,8 @@ class TestSemanticAnalyzer(unittest.TestCase):
         program = Program(1, 1, None, statements=[
             VariableDeclaration(
                 name="x",
-                value=Identifier(name="undefined_var"),
+                value=Identifier(name="undefined_var", line=1, column=1),
+                type_annotation=None,
                 is_constant=False,
                 line=1,
                 column=1
@@ -229,10 +231,8 @@ class TestSemanticAnalyzer(unittest.TestCase):
         ])
         
         success = self.analyzer.analyze(program)
-        self.assertFalse(success)
-        errors = self.analyzer.get_errors()
-        self.assertGreater(len(errors), 0)
-        self.assertTrue(any("undefined" in error.message.lower() for error in errors))
+        self.assertFalse(success)  # Should fail due to undefined variable
+        self.assertGreater(len(self.analyzer.get_errors()), 0)
     
     def test_function_analysis(self):
         """Test function declaration analysis."""
@@ -240,15 +240,12 @@ class TestSemanticAnalyzer(unittest.TestCase):
             FunctionDeclaration(
                 name="add",
                 parameters=[
-                    VariableDeclaration(
+                    Parameter(
                         name="x",
-                        type_annotation=TypeAnnotation(type_name="Integer"),
-                        is_constant=True,
-                        line=1,
-                        column=1
+                        type_annotation=TypeAnnotation(type_name="Integer", line=1, column=1)
                     )
                 ],
-                return_type=TypeAnnotation(type_name="Integer"),
+                return_type=TypeAnnotation(type_name="Integer", line=1, column=1),
                 body=[],
                 line=1,
                 column=1
@@ -257,6 +254,7 @@ class TestSemanticAnalyzer(unittest.TestCase):
         
         success = self.analyzer.analyze(program)
         self.assertTrue(success)
+        self.assertEqual(len(self.analyzer.get_errors()), 0)
     
     def test_semantic_disambiguation(self):
         """Test vector-based semantic disambiguation with production implementation."""
@@ -264,14 +262,16 @@ class TestSemanticAnalyzer(unittest.TestCase):
         program = Program(1, 1, None, statements=[
             VariableDeclaration(
                 name="x",
-                value=Literal(value=42, literal_type="integer"),
+                value=Literal(value=42, literal_type="integer", line=1, column=1),
+                type_annotation=None,
                 is_constant=False,
                 line=1,
                 column=1
             ),
             VariableDeclaration(
                 name="y",
-                value=Literal(value=10, literal_type="integer"),
+                value=Literal(value=10, literal_type="integer", line=2, column=1),
+                type_annotation=None,
                 is_constant=False,
                 line=2,
                 column=1

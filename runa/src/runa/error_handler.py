@@ -695,4 +695,61 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
+
+
+class RunaRuntimeError(RunaError):
+    def __init__(self, message: str, context: ErrorContext, suggestions: List[str] = None):
+        super().__init__(
+            error_code=ErrorCode.RUNTIME,
+            category=ErrorCategory.RUNTIME,
+            severity=ErrorSeverity.ERROR,
+            message=message,
+            natural_language_message=message,
+            context=context,
+            suggestions=suggestions or [],
+            timestamp=datetime.now(),
+            error_id=f"runtime_{int(datetime.now().timestamp() * 1000)}"
+        )
+
+class RunaTypeError(RunaError):
+    def __init__(self, message: str, context: ErrorContext, suggestions: List[str] = None):
+        super().__init__(
+            error_code=ErrorCode.TYPE_MISMATCH,
+            category=ErrorCategory.TYPE,
+            severity=ErrorSeverity.ERROR,
+            message=message,
+            natural_language_message=message,
+            context=context,
+            suggestions=suggestions or [],
+            timestamp=datetime.now(),
+            error_id=f"type_{int(datetime.now().timestamp() * 1000)}"
+        )
+
+class RunaVMError(RunaError):
+    def __init__(self, message: str, context: ErrorContext, suggestions: List[str] = None):
+        super().__init__(
+            error_code=ErrorCode.STACK_OVERFLOW,
+            category=ErrorCategory.RUNTIME,
+            severity=ErrorSeverity.ERROR,
+            message=message,
+            natural_language_message=message,
+            context=context,
+            suggestions=suggestions or [],
+            timestamp=datetime.now(),
+            error_id=f"vm_{int(datetime.now().timestamp() * 1000)}"
+        )
+
+class RunaCompilationError(RunaError):
+    def __init__(self, message: str, context: ErrorContext, suggestions: List[str] = None):
+        super().__init__(
+            error_code=ErrorCode.COMPILATION_FAILED,
+            category=ErrorCategory.COMPILATION,
+            severity=ErrorSeverity.ERROR,
+            message=message,
+            natural_language_message=message,
+            context=context,
+            suggestions=suggestions or [],
+            timestamp=datetime.now(),
+            error_id=f"compilation_{int(datetime.now().timestamp() * 1000)}"
+        ) 

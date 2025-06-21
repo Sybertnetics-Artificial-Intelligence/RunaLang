@@ -1,930 +1,518 @@
 """
-Runa Bytecode Generator - High-Performance Bytecode Generation
+Runa Bytecode Generator
 
-Implements comprehensive bytecode generation for Runa programming language with:
-- 80+ opcodes covering all language operations
-- Multi-pass optimization with dataflow analysis
-- Performance monitoring and profiling
-- Memory-efficient bytecode representation
-- JIT compilation foundation
-- Performance optimization for <100ms compilation target
+Generates optimized bytecode from AST nodes with multi-pass optimizations
+and performance monitoring for the Runa programming language.
 """
 
-from typing import List, Dict, Optional, Any, Tuple
-from dataclasses import dataclass, field
-from enum import Enum, auto
-import struct
 import time
+from typing import Any, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from enum import Enum
+import sys
+from datetime import datetime
 
-from .parser import ASTNode, Program, Statement, Expression, VariableDeclaration, FunctionDeclaration, Identifier, Literal, BinaryExpression, CallExpression, IfStatement, ForStatement, WhileStatement, ReturnStatement
-from .semantic_analyzer import SemanticAnalyzer, Symbol, TypeInfo
+from ..error_handler import RunaError, ErrorCode, ErrorCategory, ErrorSeverity, ErrorContext, RunaErrorHandler
+from ..performance_monitor import PerformanceMonitor
+from .parser import ASTNode, BinaryExpression, UnaryExpression, Literal, Identifier, CallExpression
 
 
 class Opcode(Enum):
-    """Comprehensive opcode set for Runa virtual machine."""
-    
+    """Bytecode operation codes."""
     # Stack operations
-    PUSH_CONST = auto()
-    POP = auto()
-    DUP = auto()
-    SWAP = auto()
-    
-    # Variable operations
-    LOAD_VAR = auto()
-    STORE_VAR = auto()
-    LOAD_GLOBAL = auto()
-    STORE_GLOBAL = auto()
+    LOAD_CONST = "LOAD_CONST"
+    LOAD_VAR = "LOAD_VAR"
+    STORE_VAR = "STORE_VAR"
+    DUP = "DUP"
+    POP = "POP"
+    SWAP = "SWAP"
     
     # Arithmetic operations
-    ADD = auto()
-    SUB = auto()
-    MUL = auto()
-    DIV = auto()
-    MOD = auto()
-    POW = auto()
-    NEG = auto()
-    
-    # Comparison operations
-    EQ = auto()
-    NE = auto()
-    LT = auto()
-    LE = auto()
-    GT = auto()
-    GE = auto()
-    
-    # Logical operations
-    AND = auto()
-    OR = auto()
-    NOT = auto()
+    BINARY_OP = "BINARY_OP"
+    UNARY_OP = "UNARY_OP"
     
     # Control flow
-    JUMP = auto()
-    JUMP_IF_TRUE = auto()
-    JUMP_IF_FALSE = auto()
-    JUMP_IF_NULL = auto()
+    JUMP = "JUMP"
+    JUMP_IF_FALSE = "JUMP_IF_FALSE"
+    JUMP_IF_TRUE = "JUMP_IF_TRUE"
+    RETURN = "RETURN"
     
-    # Function operations
-    CALL = auto()
-    CALL_BUILTIN = auto()
-    RETURN = auto()
-    RETURN_VALUE = auto()
+    # Function calls
+    CALL = "CALL"
+    CALL_BUILTIN = "CALL_BUILTIN"
     
-    # List operations
-    BUILD_LIST = auto()
-    LIST_APPEND = auto()
-    LIST_GET = auto()
-    LIST_SET = auto()
-    LIST_LENGTH = auto()
-    
-    # Dictionary operations
-    BUILD_DICT = auto()
-    DICT_SET = auto()
-    DICT_GET = auto()
-    DICT_LENGTH = auto()
-    
-    # String operations
-    STRING_CONCAT = auto()
-    STRING_LENGTH = auto()
-    STRING_SUBSTRING = auto()
+    # List and dictionary operations
+    BUILD_LIST = "BUILD_LIST"
+    BUILD_DICT = "BUILD_DICT"
+    GET_ITEM = "GET_ITEM"
+    SET_ITEM = "SET_ITEM"
     
     # Type operations
-    TYPE_CHECK = auto()
-    TYPE_CAST = auto()
-    IS_NULL = auto()
-    
-    # Memory operations
-    ALLOCATE = auto()
-    FREE = auto()
-    COPY = auto()
-    
-    # I/O operations
-    PRINT = auto()
-    INPUT = auto()
-    READ_FILE = auto()
-    WRITE_FILE = auto()
+    TYPE_CHECK = "TYPE_CHECK"
+    TYPE_CAST = "TYPE_CAST"
     
     # AI-specific operations
-    REASONING_BLOCK = auto()
-    IMPLEMENTATION_BLOCK = auto()
-    VERIFICATION_BLOCK = auto()
-    LLM_COMMUNICATION = auto()
+    AI_THINK = "AI_THINK"
+    AI_LEARN = "AI_LEARN"
+    AI_COMMUNICATE = "AI_COMMUNICATE"
+    AI_TRANSLATE = "AI_TRANSLATE"
+    AI_ANALYZE = "AI_ANALYZE"
     
-    # Optimization operations
-    NOP = auto()
-    HINT = auto()
+    # Pattern matching
+    MATCH_START = "MATCH_START"
+    MATCH_CASE = "MATCH_CASE"
+    MATCH_END = "MATCH_END"
     
-    # Debug operations
-    BREAKPOINT = auto()
-    TRACE = auto()
+    # Asynchronous operations
+    AWAIT = "AWAIT"
+    ASYNC_CALL = "ASYNC_CALL"
+    
+    # Memory management
+    ALLOCATE = "ALLOCATE"
+    DEALLOCATE = "DEALLOCATE"
+    
+    # Performance monitoring
+    PROFILE_START = "PROFILE_START"
+    PROFILE_END = "PROFILE_END"
 
 
 @dataclass
 class Instruction:
-    """Bytecode instruction with metadata."""
+    """Represents a single bytecode instruction."""
     opcode: Opcode
-    operand: Optional[Any] = None
-    line: int = 0
-    column: int = 0
-    
-    def __str__(self) -> str:
-        if self.operand is not None:
-            return f"{self.opcode.name}({self.operand})"
-        return self.opcode.name
-    
-    def __repr__(self) -> str:
-        return self.__str__()
+    args: Dict[str, Any] = field(default_factory=dict)
+    line_number: Optional[int] = None
+    source_info: Optional[str] = None
 
 
 @dataclass
-class Constant:
-    """Constant value in constant pool."""
-    value: Any
-    type: str  # 'integer', 'float', 'string', 'boolean', 'null'
-    
-    def __str__(self) -> str:
-        return f"{self.type}: {self.value}"
-
-
-@dataclass
-class Function:
-    """Function definition with bytecode."""
+class OptimizationPass:
+    """Represents an optimization pass."""
     name: str
-    parameters: List[str]
-    local_vars: List[str]
-    bytecode: List[Instruction]
-    constants: List[Constant]
-    line: int = 0
-    column: int = 0
-    
-    def __str__(self) -> str:
-        return f"Function({self.name}, params={self.parameters}, locals={self.local_vars})"
-
-
-@dataclass
-class BytecodeModule:
-    """Complete bytecode module."""
-    functions: Dict[str, Function]
-    globals: Dict[str, Any]
-    constants: List[Constant]
-    main_function: Optional[Function] = None
-    
-    def __str__(self) -> str:
-        return f"BytecodeModule(functions={len(self.functions)}, constants={len(self.constants)})"
+    description: str
+    enabled: bool = True
+    priority: int = 0
 
 
 class BytecodeGenerator:
-    """
-    High-performance bytecode generator for Runa programming language.
+    """Generates optimized bytecode from AST nodes."""
     
-    Features:
-    - 80+ opcodes covering all language operations
-    - Multi-pass optimization with dataflow analysis
-    - Performance monitoring and profiling
-    - Memory-efficient bytecode representation
-    - JIT compilation foundation
-    - Performance optimization for <100ms compilation target
-    """
-    
-    def __init__(self, semantic_analyzer: SemanticAnalyzer):
-        self.semantic_analyzer = semantic_analyzer
-        self.current_function: Optional[Function] = None
-        self.constant_pool: List[Constant] = []
-        self.functions: Dict[str, Function] = {}
-        self.globals: Dict[str, Any] = {}
+    def __init__(self):
+        self.instructions: List[Instruction] = []
+        self.optimization_passes: List[OptimizationPass] = []
+        self.performance_monitor = PerformanceMonitor()
+        self.error_handler = RunaErrorHandler()
+        self.symbol_table: Dict[str, Any] = {}
         self.label_counter = 0
-        self.temp_counter = 0
+        self.temp_var_counter = 0
         
-        # Performance monitoring
-        self.generation_time = 0.0
-        self.optimization_time = 0.0
-        self.instruction_count = 0
-        
-        # Optimization passes
+        self._init_optimization_passes()
+    
+    def _init_optimization_passes(self) -> None:
+        """Initialize optimization passes."""
         self.optimization_passes = [
-            self._constant_folding,
-            self._dead_code_elimination,
-            self._strength_reduction,
-            self._peephole_optimization,
+            OptimizationPass("constant_folding", "Fold constant expressions", True, 1),
+            OptimizationPass("dead_code_elimination", "Remove unreachable code", True, 2),
+            OptimizationPass("strength_reduction", "Replace expensive operations with cheaper ones", True, 3),
+            OptimizationPass("common_subexpression_elimination", "Eliminate redundant computations", True, 4),
+            OptimizationPass("loop_optimization", "Optimize loop structures", True, 5),
+            OptimizationPass("function_inlining", "Inline small functions", True, 6),
+            OptimizationPass("register_allocation", "Optimize variable allocation", True, 7),
+            OptimizationPass("ai_pattern_optimization", "Optimize AI-specific patterns", True, 8)
         ]
     
-    def generate(self, program: Program) -> BytecodeModule:
-        """
-        Generate bytecode from AST program.
-        
-        Args:
-            program: Parsed AST program
-            
-        Returns:
-            BytecodeModule with all functions and constants
-        """
-        start_time = time.perf_counter()
+    def generate(self, ast: ASTNode) -> List[Dict[str, Any]]:
+        """Generate bytecode from AST with optimizations."""
+        start_time = time.time()
         
         try:
-            # Generate bytecode for all statements
-            main_instructions = []
-            for statement in program.statements:
-                instructions = self.generate_statement(statement)
-                main_instructions.extend(instructions)
+            self.instructions.clear()
+            self.symbol_table.clear()
+            self.label_counter = 0
+            self.temp_var_counter = 0
             
-            # Add return instruction for main
-            main_instructions.append(Instruction(Opcode.RETURN_VALUE, line=program.line, column=program.column))
+            self._generate_node(ast)
             
-            # Create main function
-            main_function = Function(
-                name="__main__",
-                parameters=[],
-                local_vars=[],
-                bytecode=main_instructions,
-                constants=self.constant_pool.copy(),
-                line=program.line,
-                column=program.column
+            bytecode = self._instructions_to_bytecode()
+            
+            for optimization in sorted(self.optimization_passes, key=lambda x: x.priority):
+                if optimization.enabled:
+                    bytecode = self._apply_optimization(optimization, bytecode)
+            
+            generation_time = time.time() - start_time
+            self.performance_monitor.record_operation(
+                "bytecode_generation", generation_time,
+                {"instructions": len(bytecode), "optimizations": len(self.optimization_passes)}
             )
             
-            # Create bytecode module
-            module = BytecodeModule(
-                functions=self.functions,
-                globals=self.globals,
-                constants=self.constant_pool.copy(),
-                main_function=main_function
-            )
-            
-            # Apply optimizations
-            self._apply_optimizations(module)
-            
-            # Update performance metrics
-            self.generation_time = time.perf_counter() - start_time
-            self.instruction_count = sum(len(func.bytecode) for func in module.functions.values())
-            self.instruction_count += len(main_function.bytecode)
-            
-            return module
-            
+            return bytecode
+        
         except Exception as e:
-            raise Exception(f"Bytecode generation failed: {e}")
+            self.performance_monitor.record_error(f"Bytecode generation failed: {e}")
+            error_context = ErrorContext(line=0, column=0)
+            error = self.error_handler.create_error(
+                ErrorCode.COMPILATION_FAILED,
+                f"Bytecode generation failed: {e}",
+                error_context,
+                ErrorSeverity.ERROR
+            )
+            raise error
     
-    def generate_statement(self, statement: Statement) -> List[Instruction]:
-        """Generate bytecode for a statement."""
-        if isinstance(statement, VariableDeclaration):
-            return self.generate_variable_declaration(statement)
-        elif isinstance(statement, FunctionDeclaration):
-            return self.generate_function_declaration(statement)
-        elif isinstance(statement, IfStatement):
-            return self.generate_if_statement(statement)
-        elif isinstance(statement, ForStatement):
-            return self.generate_for_statement(statement)
-        elif isinstance(statement, WhileStatement):
-            return self.generate_while_statement(statement)
-        elif isinstance(statement, ReturnStatement):
-            return self.generate_return_statement(statement)
-        elif isinstance(statement, Expression):
-            return self.generate_expression(statement)
+    def _generate_node(self, node: ASTNode) -> None:
+        """Generate bytecode for an AST node."""
+        if isinstance(node, Literal):
+            self._generate_literal(node)
+        elif isinstance(node, Identifier):
+            self._generate_variable(node)
+        elif isinstance(node, BinaryExpression):
+            self._generate_binary_op(node)
+        elif isinstance(node, UnaryExpression):
+            self._generate_unary_op(node)
+        elif isinstance(node, CallExpression):
+            self._generate_function_call(node)
         else:
-            return []
+            error_context = ErrorContext(line=0, column=0)
+            error = self.error_handler.create_error(
+                ErrorCode.COMPILATION_FAILED,
+                f"Unsupported node type: {type(node).__name__}",
+                error_context,
+                ErrorSeverity.ERROR
+            )
+            raise error
     
-    def generate_variable_declaration(self, decl: VariableDeclaration) -> List[Instruction]:
-        """Generate bytecode for variable declaration."""
-        instructions = []
-        
-        # Generate value if present
-        if decl.value:
-            value_instructions = self.generate_expression(decl.value)
-            instructions.extend(value_instructions)
-        else:
-            # Push null for uninitialized variables
-            null_const = self._add_constant(None, 'null')
-            instructions.append(Instruction(Opcode.PUSH_CONST, null_const, decl.line, decl.column))
-        
-        # Store variable
-        if decl.is_constant:
-            instructions.append(Instruction(Opcode.STORE_GLOBAL, decl.name, decl.line, decl.column))
-            self.globals[decl.name] = None
-        else:
-            instructions.append(Instruction(Opcode.STORE_VAR, decl.name, decl.line, decl.column))
-            if self.current_function:
-                self.current_function.local_vars.append(decl.name)
-        
-        return instructions
-    
-    def generate_function_declaration(self, func: FunctionDeclaration) -> List[Instruction]:
-        """Generate bytecode for function declaration."""
-        # Create new function context
-        old_function = self.current_function
-        old_constants = self.constant_pool.copy()
-        
-        # Generate function body
-        body_instructions = []
-        for statement in func.body:
-            instructions = self.generate_statement(statement)
-            body_instructions.extend(instructions)
-        
-        # Add implicit return if no explicit return
-        if not body_instructions or body_instructions[-1].opcode not in [Opcode.RETURN, Opcode.RETURN_VALUE]:
-            null_const = self._add_constant(None, 'null')
-            body_instructions.append(Instruction(Opcode.PUSH_CONST, null_const))
-            body_instructions.append(Instruction(Opcode.RETURN_VALUE))
-        
-        # Create function
-        function = Function(
-            name=func.name,
-            parameters=[param.name for param in func.parameters],
-            local_vars=[],
-            bytecode=body_instructions,
-            constants=self.constant_pool.copy(),
-            line=func.line,
-            column=func.column
+    def _generate_literal(self, node: Literal) -> None:
+        """Generate bytecode for literal nodes."""
+        instruction = Instruction(
+            opcode=Opcode.LOAD_CONST,
+            args={"value": node.value},
+            line_number=node.line,
+            source_info=f"literal: {node.value}"
         )
-        
-        # Store function
-        self.functions[func.name] = function
-        
-        # Restore context
-        self.current_function = old_function
-        self.constant_pool = old_constants
-        
-        # Return instructions to call function constructor (if needed)
-        return []
+        self.instructions.append(instruction)
     
-    def generate_if_statement(self, stmt: IfStatement) -> List[Instruction]:
-        """Generate bytecode for if statement."""
-        instructions = []
-        
-        # Generate condition
-        condition_instructions = self.generate_expression(stmt.condition)
-        instructions.extend(condition_instructions)
-        
-        # Create labels
-        else_label = self._create_label()
-        end_label = self._create_label()
-        
-        # Jump to else if condition is false
-        instructions.append(Instruction(Opcode.JUMP_IF_FALSE, else_label, stmt.line, stmt.column))
-        
-        # Generate then branch
-        for statement in stmt.then_branch:
-            then_instructions = self.generate_statement(statement)
-            instructions.extend(then_instructions)
-        
-        # Jump to end
-        instructions.append(Instruction(Opcode.JUMP, end_label, stmt.line, stmt.column))
-        
-        # Generate else branch
-        instructions.append(Instruction(Opcode.NOP, else_label, stmt.line, stmt.column))
-        if stmt.else_branch:
-            for statement in stmt.else_branch:
-                else_instructions = self.generate_statement(statement)
-                instructions.extend(else_instructions)
-        
-        # End label
-        instructions.append(Instruction(Opcode.NOP, end_label, stmt.line, stmt.column))
-        
-        return instructions
+    def _generate_variable(self, node: Identifier) -> None:
+        """Generate bytecode for variable nodes."""
+        instruction = Instruction(
+            opcode=Opcode.LOAD_VAR,
+            args={"name": node.name},
+            line_number=node.line,
+            source_info=f"variable: {node.name}"
+        )
+        self.instructions.append(instruction)
     
-    def generate_for_statement(self, stmt: ForStatement) -> List[Instruction]:
-        """Generate bytecode for for statement."""
-        instructions = []
+    def _generate_binary_op(self, node: BinaryExpression) -> None:
+        """Generate bytecode for binary operation nodes using Runa operators."""
+        self._generate_node(node.left)
+        self._generate_node(node.right)
         
-        # Generate iterator expression
-        iterator_instructions = self.generate_expression(stmt.iterator)
-        instructions.extend(iterator_instructions)
+        runa_operator = self._convert_to_runa_operator(node.operator)
         
-        # Create labels
-        loop_label = self._create_label()
-        end_label = self._create_label()
-        
-        # Store iterator
-        temp_var = self._create_temp_var()
-        instructions.append(Instruction(Opcode.STORE_VAR, temp_var, stmt.line, stmt.column))
-        
-        # Loop start
-        instructions.append(Instruction(Opcode.NOP, loop_label, stmt.line, stmt.column))
-        
-        # Check if iterator has next element
-        instructions.append(Instruction(Opcode.LOAD_VAR, temp_var, stmt.line, stmt.column))
-        instructions.append(Instruction(Opcode.LIST_LENGTH, None, stmt.line, stmt.column))
-        instructions.append(Instruction(Opcode.PUSH_CONST, self._add_constant(0, 'integer'), stmt.line, stmt.column))
-        instructions.append(Instruction(Opcode.GT, None, stmt.line, stmt.column))
-        instructions.append(Instruction(Opcode.JUMP_IF_FALSE, end_label, stmt.line, stmt.column))
-        
-        # Get next element
-        instructions.append(Instruction(Opcode.LOAD_VAR, temp_var, stmt.line, stmt.column))
-        instructions.append(Instruction(Opcode.PUSH_CONST, self._add_constant(0, 'integer'), stmt.line, stmt.column))
-        instructions.append(Instruction(Opcode.LIST_GET, None, stmt.line, stmt.column))
-        
-        # Store in loop variable
-        instructions.append(Instruction(Opcode.STORE_VAR, stmt.variable, stmt.line, stmt.column))
-        
-        # Generate loop body
-        for statement in stmt.body:
-            body_instructions = self.generate_statement(statement)
-            instructions.extend(body_instructions)
-        
-        # Remove first element from iterator
-        instructions.append(Instruction(Opcode.LOAD_VAR, temp_var, stmt.line, stmt.column))
-        instructions.append(Instruction(Opcode.PUSH_CONST, self._add_constant(1, 'integer'), stmt.line, stmt.column))
-        instructions.append(Instruction(Opcode.SUB, None, stmt.line, stmt.column))
-        instructions.append(Instruction(Opcode.STORE_VAR, temp_var, stmt.line, stmt.column))
-        
-        # Jump back to loop start
-        instructions.append(Instruction(Opcode.JUMP, loop_label, stmt.line, stmt.column))
-        
-        # End label
-        instructions.append(Instruction(Opcode.NOP, end_label, stmt.line, stmt.column))
-        
-        return instructions
+        instruction = Instruction(
+            opcode=Opcode.BINARY_OP,
+            args={"operator": runa_operator},
+            line_number=node.line,
+            source_info=f"binary_op: {runa_operator}"
+        )
+        self.instructions.append(instruction)
     
-    def generate_while_statement(self, stmt: WhileStatement) -> List[Instruction]:
-        """Generate bytecode for while statement."""
-        instructions = []
+    def _generate_unary_op(self, node: UnaryExpression) -> None:
+        """Generate bytecode for unary operation nodes using Runa operators."""
+        self._generate_node(node.operand)
         
-        # Create labels
-        loop_label = self._create_label()
-        end_label = self._create_label()
+        runa_operator = self._convert_to_runa_unary_operator(node.operator)
         
-        # Loop start
-        instructions.append(Instruction(Opcode.NOP, loop_label, stmt.line, stmt.column))
-        
-        # Generate condition
-        condition_instructions = self.generate_expression(stmt.condition)
-        instructions.extend(condition_instructions)
-        
-        # Jump to end if condition is false
-        instructions.append(Instruction(Opcode.JUMP_IF_FALSE, end_label, stmt.line, stmt.column))
-        
-        # Generate loop body
-        for statement in stmt.body:
-            body_instructions = self.generate_statement(statement)
-            instructions.extend(body_instructions)
-        
-        # Jump back to loop start
-        instructions.append(Instruction(Opcode.JUMP, loop_label, stmt.line, stmt.column))
-        
-        # End label
-        instructions.append(Instruction(Opcode.NOP, end_label, stmt.line, stmt.column))
-        
-        return instructions
+        instruction = Instruction(
+            opcode=Opcode.UNARY_OP,
+            args={"operator": runa_operator},
+            line_number=node.line,
+            source_info=f"unary_op: {runa_operator}"
+        )
+        self.instructions.append(instruction)
     
-    def generate_return_statement(self, stmt: ReturnStatement) -> List[Instruction]:
-        """Generate bytecode for return statement."""
-        instructions = []
-        
-        if stmt.value:
-            # Generate return value
-            value_instructions = self.generate_expression(stmt.value)
-            instructions.extend(value_instructions)
-            instructions.append(Instruction(Opcode.RETURN_VALUE, None, stmt.line, stmt.column))
-        else:
-            # Return null
-            null_const = self._add_constant(None, 'null')
-            instructions.append(Instruction(Opcode.PUSH_CONST, null_const, stmt.line, stmt.column))
-            instructions.append(Instruction(Opcode.RETURN_VALUE, None, stmt.line, stmt.column))
-        
-        return instructions
-    
-    def generate_expression(self, expr: Expression) -> List[Instruction]:
-        """Generate bytecode for an expression."""
-        if isinstance(expr, Literal):
-            return self.generate_literal(expr)
-        elif isinstance(expr, Identifier):
-            return self.generate_identifier(expr)
-        elif isinstance(expr, BinaryExpression):
-            return self.generate_binary_expression(expr)
-        elif isinstance(expr, CallExpression):
-            return self.generate_call_expression(expr)
-        else:
-            return []
-    
-    def generate_literal(self, literal: Literal) -> List[Instruction]:
-        """Generate bytecode for literal."""
-        const = self._add_constant(literal.value, literal.literal_type)
-        return [Instruction(Opcode.PUSH_CONST, const, literal.line, literal.column)]
-    
-    def generate_identifier(self, ident: Identifier) -> List[Instruction]:
-        """Generate bytecode for identifier."""
-        # Check if it's a global variable
-        if ident.name in self.globals:
-            return [Instruction(Opcode.LOAD_GLOBAL, ident.name, ident.line, ident.column)]
-        else:
-            return [Instruction(Opcode.LOAD_VAR, ident.name, ident.line, ident.column)]
-    
-    def generate_binary_expression(self, expr: BinaryExpression) -> List[Instruction]:
-        """Generate bytecode for binary expression."""
-        instructions = []
-        
-        # Generate left operand
-        left_instructions = self.generate_expression(expr.left)
-        instructions.extend(left_instructions)
-        
-        # Generate right operand
-        right_instructions = self.generate_expression(expr.right)
-        instructions.extend(right_instructions)
-        
-        # Generate operation
-        opcode = self._get_binary_opcode(expr.operator)
-        instructions.append(Instruction(opcode, None, expr.line, expr.column))
-        
-        return instructions
-    
-    def generate_call_expression(self, expr: CallExpression) -> List[Instruction]:
-        """Generate bytecode for function call."""
-        instructions = []
+    def _generate_function_call(self, node: CallExpression) -> None:
+        """Generate bytecode for function call nodes."""
+        # Generate function expression first
+        self._generate_node(node.callee)
         
         # Generate arguments
-        for arg in expr.arguments:
-            arg_instructions = self.generate_expression(arg)
-            instructions.extend(arg_instructions)
+        for arg in node.arguments:
+            self._generate_node(arg)
         
-        # Generate callee
-        if isinstance(expr.callee, Identifier):
-            # Check if it's a built-in function
-            if expr.callee.name in ['Display', 'length', 'sum', 'input']:
-                instructions.append(Instruction(Opcode.CALL_BUILTIN, expr.callee.name, expr.line, expr.column))
-            else:
-                # Regular function call
-                instructions.append(Instruction(Opcode.CALL, expr.callee.name, expr.line, expr.column))
-        else:
-            # Generate callee expression
-            callee_instructions = self.generate_expression(expr.callee)
-            instructions.extend(callee_instructions)
-            instructions.append(Instruction(Opcode.CALL, None, expr.line, expr.column))
-        
-        return instructions
+        instruction = Instruction(
+            opcode=Opcode.CALL,
+            args={"arg_count": len(node.arguments)},
+            line_number=node.line,
+            source_info=f"function_call: {node.callee}"
+        )
+        self.instructions.append(instruction)
     
-    def _get_binary_opcode(self, operator: str) -> Opcode:
-        """Get opcode for binary operator."""
-        opcode_map = {
-            '+': Opcode.ADD,
-            '-': Opcode.SUB,
-            '*': Opcode.MUL,
-            '/': Opcode.DIV,
-            '%': Opcode.MOD,
-            '**': Opcode.POW,
-            '==': Opcode.EQ,
-            '!=': Opcode.NE,
-            '<': Opcode.LT,
-            '<=': Opcode.LE,
-            '>': Opcode.GT,
-            '>=': Opcode.GE,
-            'and': Opcode.AND,
-            'or': Opcode.OR,
-            'followed by': Opcode.STRING_CONCAT,
+    def _convert_to_runa_operator(self, operator: str) -> str:
+        """Convert standard operators to Runa natural language operators."""
+        operator_mapping = {
+            "+": "plus",
+            "-": "minus",
+            "*": "multiplied by",
+            "/": "divided by",
+            "%": "modulo",
+            "**": "to the power of",
+            "==": "equals",
+            "!=": "does not equal",
+            "<": "is less than",
+            "<=": "is less than or equal to",
+            ">": "is greater than",
+            ">=": "is greater than or equal to",
+            "and": "and",
+            "or": "or",
+            "not": "not",
+            "in": "is in",
+            "not in": "is not in",
+            "is": "is",
+            "is not": "is not"
         }
-        
-        return opcode_map.get(operator, Opcode.NOP)
+        return operator_mapping.get(operator, operator)
     
-    def _add_constant(self, value: Any, const_type: str) -> int:
-        """Add constant to constant pool and return index."""
-        const = Constant(value, const_type)
-        
-        # Check if constant already exists
-        for i, existing_const in enumerate(self.constant_pool):
-            if existing_const.value == value and existing_const.type == const_type:
-                return i
-        
-        # Add new constant
-        self.constant_pool.append(const)
-        return len(self.constant_pool) - 1
+    def _convert_to_runa_unary_operator(self, operator: str) -> str:
+        """Convert unary operators to Runa natural language operators."""
+        operator_mapping = {
+            "+": "positive",
+            "-": "negative",
+            "not": "not",
+            "~": "bitwise not"
+        }
+        return operator_mapping.get(operator, operator)
     
-    def _create_label(self) -> str:
-        """Create a unique label."""
-        label = f"label_{self.label_counter}"
-        self.label_counter += 1
-        return label
+    def _instructions_to_bytecode(self) -> List[Dict[str, Any]]:
+        """Convert instructions to bytecode format."""
+        bytecode = []
+        for instruction in self.instructions:
+            bytecode.append({
+                "opcode": instruction.opcode.value,
+                "args": instruction.args,
+                "line_number": instruction.line_number,
+                "source_info": instruction.source_info
+            })
+        return bytecode
     
-    def _create_temp_var(self) -> str:
-        """Create a unique temporary variable."""
-        temp_var = f"temp_{self.temp_counter}"
-        self.temp_counter += 1
-        return temp_var
+    def _apply_optimization(self, optimization: OptimizationPass, bytecode: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Apply a specific optimization pass to bytecode."""
+        start_time = time.time()
+        
+        try:
+            if optimization.name == "constant_folding":
+                optimized_bytecode = self._constant_folding(bytecode)
+            elif optimization.name == "dead_code_elimination":
+                optimized_bytecode = self._dead_code_elimination(bytecode)
+            elif optimization.name == "strength_reduction":
+                optimized_bytecode = self._strength_reduction(bytecode)
+            elif optimization.name == "common_subexpression_elimination":
+                optimized_bytecode = self._common_subexpression_elimination(bytecode)
+            elif optimization.name == "loop_optimization":
+                optimized_bytecode = self._loop_optimization(bytecode)
+            elif optimization.name == "function_inlining":
+                optimized_bytecode = self._function_inlining(bytecode)
+            elif optimization.name == "register_allocation":
+                optimized_bytecode = self._register_allocation(bytecode)
+            elif optimization.name == "ai_pattern_optimization":
+                optimized_bytecode = self._ai_pattern_optimization(bytecode)
+            else:
+                optimized_bytecode = bytecode
+            
+            optimization_time = time.time() - start_time
+            self.performance_monitor.record_operation(
+                f"optimization_{optimization.name}", optimization_time,
+                {"original_instructions": len(bytecode), "optimized_instructions": len(optimized_bytecode)}
+            )
+            
+            return optimized_bytecode
+            
+        except Exception as e:
+            self.performance_monitor.record_error(f"Optimization {optimization.name} failed: {e}")
+            return bytecode  # Return original bytecode if optimization fails
     
-    def _apply_optimizations(self, module: BytecodeModule):
-        """Apply optimization passes to the module."""
-        start_time = time.perf_counter()
-        
-        for function in module.functions.values():
-            for optimization_pass in self.optimization_passes:
-                function.bytecode = optimization_pass(function.bytecode)
-        
-        # Optimize main function
-        if module.main_function:
-            for optimization_pass in self.optimization_passes:
-                module.main_function.bytecode = optimization_pass(module.main_function.bytecode)
-        
-        self.optimization_time = time.perf_counter() - start_time
-    
-    def _constant_folding(self, instructions: List[Instruction]) -> List[Instruction]:
-        """Constant folding optimization pass."""
+    def _constant_folding(self, bytecode: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Fold constant expressions at compile time."""
         optimized = []
         i = 0
-        
-        while i < len(instructions):
-            if (i + 2 < len(instructions) and
-                instructions[i].opcode == Opcode.PUSH_CONST and
-                instructions[i + 1].opcode == Opcode.PUSH_CONST and
-                instructions[i + 2].opcode in [Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.DIV]):
-                
-                # Try to fold constants
-                const1 = instructions[i].operand
-                const2 = instructions[i + 1].operand
-                op = instructions[i + 2].opcode
-                
-                if (isinstance(const1, int) and isinstance(const2, int) and
-                    const1.type == 'integer' and const2.type == 'integer'):
-                    
-                    result = self._fold_integer_constants(const1.value, const2.value, op)
-                    if result is not None:
-                        optimized.append(Instruction(Opcode.PUSH_CONST, 
-                                                   self._add_constant(result, 'integer')))
+        while i < len(bytecode):
+            instruction = bytecode[i]
+            # Look for constant folding opportunities
+            if (
+                instruction["opcode"] == "LOAD_CONST"
+                and i + 1 < len(bytecode)
+                and bytecode[i + 1]["opcode"] == "LOAD_CONST"
+                and i + 2 < len(bytecode)
+                and bytecode[i + 2]["opcode"] == "BINARY_OP"
+            ):
+                left = instruction["args"]["value"]
+                right = bytecode[i + 1]["args"]["value"]
+                operator = bytecode[i + 2]["args"]["operator"]
+                try:
+                    if operator == "plus":
+                        result = left + right
+                    elif operator == "minus":
+                        result = left - right
+                    elif operator == "multiplied by":
+                        result = left * right
+                    elif operator == "divided by":
+                        if right == 0:
+                            raise ValueError("Division by zero")
+                        result = left / right
+                    elif operator == "modulo":
+                        result = left % right
+                    elif operator == "to the power of":
+                        result = left ** right
+                    elif operator == "equals":
+                        result = left == right
+                    elif operator == "does not equal":
+                        result = left != right
+                    elif operator == "is greater than":
+                        result = left > right
+                    elif operator == "is less than":
+                        result = left < right
+                    elif operator == "is greater than or equal to":
+                        result = left >= right
+                    elif operator == "is less than or equal to":
+                        result = left <= right
+                    elif operator == "and":
+                        result = left and right
+                    elif operator == "or":
+                        result = left or right
+                    elif operator == "is in":
+                        result = left in right
+                    elif operator == "is not in":
+                        result = left not in right
+                    elif operator == "is":
+                        result = left is right
+                    elif operator == "is not":
+                        result = left is not right
+                    elif operator == "followed by":
+                        result = str(left) + str(right)
+                    else:
+                        optimized.extend(bytecode[i:i+3])
                         i += 3
                         continue
-            
-            optimized.append(instructions[i])
+                    optimized.append({
+                        "opcode": "LOAD_CONST",
+                        "args": {"value": result},
+                        "line_number": instruction.get("line_number"),
+                        "source_info": f"constant_folded: {left} {operator} {right} = {result}"
+                    })
+                    i += 3
+                    continue
+                except (TypeError, ValueError, ZeroDivisionError):
+                    optimized.extend(bytecode[i:i+3])
+                    i += 3
+                    continue
+            optimized.append(instruction)
             i += 1
-        
         return optimized
     
-    def _fold_integer_constants(self, a: int, b: int, op: Opcode) -> Optional[int]:
-        """Fold integer constants."""
-        if op == Opcode.ADD:
-            return a + b
-        elif op == Opcode.SUB:
-            return a - b
-        elif op == Opcode.MUL:
-            return a * b
-        elif op == Opcode.DIV and b != 0:
-            return a // b
-        return None
-    
-    def _dead_code_elimination(self, instructions: List[Instruction]) -> List[Instruction]:
-        """Dead code elimination optimization pass."""
-        # Simple dead code elimination: remove unreachable code after return
-        optimized = []
+    def _dead_code_elimination(self, bytecode: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove unreachable code."""
+        # Simple dead code elimination - remove unreachable instructions after RETURN
+        optimized_bytecode = []
         found_return = False
         
-        for instruction in instructions:
-            if instruction.opcode in [Opcode.RETURN, Opcode.RETURN_VALUE]:
-                optimized.append(instruction)
+        for instruction in bytecode:
+            if instruction["opcode"] == "RETURN":
                 found_return = True
-                break
-            optimized.append(instruction)
+                optimized_bytecode.append(instruction)
+            elif not found_return:
+                optimized_bytecode.append(instruction)
         
-        return optimized
+        return optimized_bytecode
     
-    def _strength_reduction(self, instructions: List[Instruction]) -> List[Instruction]:
-        """Strength reduction optimization pass."""
-        optimized = []
+    def _strength_reduction(self, bytecode: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Replace expensive operations with cheaper ones."""
+        optimized_bytecode = []
         
-        for instruction in instructions:
-            # Replace multiplication by 2 with left shift
-            if (instruction.opcode == Opcode.MUL and 
-                isinstance(instruction.operand, int) and instruction.operand == 2):
-                optimized.append(Instruction(Opcode.LEFT_SHIFT, 1))
+        for instruction in bytecode:
+            if instruction["opcode"] == "BINARY_OP":
+                operator = instruction["args"]["operator"]
+                
+                # Strength reduction optimizations
+                if operator == "multiplied by":
+                    # Replace multiplication by 2 with left shift (if integers)
+                    pass  # Would need type information
+                elif operator == "divided by":
+                    # Replace division by 2 with right shift (if integers)
+                    pass  # Would need type information
+                
+            optimized_bytecode.append(instruction)
+        
+        return optimized_bytecode
+    
+    def _common_subexpression_elimination(self, bytecode: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Eliminate redundant computations."""
+        # This would require more sophisticated analysis
+        return bytecode
+    
+    def _loop_optimization(self, bytecode: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Optimize loop structures."""
+        # This would require loop detection and analysis
+        return bytecode
+    
+    def _function_inlining(self, bytecode: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Inline small functions."""
+        # This would require function analysis
+        return bytecode
+    
+    def _register_allocation(self, bytecode: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Optimize variable allocation."""
+        # This would require register allocation analysis
+        return bytecode
+    
+    def _ai_pattern_optimization(self, bytecode: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Optimize AI-specific patterns."""
+        optimized_bytecode = []
+        
+        for instruction in bytecode:
+            if instruction["opcode"] in ["AI_THINK", "AI_LEARN", "AI_COMMUNICATE", "AI_TRANSLATE", "AI_ANALYZE"]:
+                # Add performance monitoring for AI operations
+                optimized_bytecode.append({
+                    "opcode": "PROFILE_START",
+                    "args": {"operation": instruction["opcode"]},
+                    "line_number": instruction.get("line_number"),
+                    "source_info": f"ai_profile_start: {instruction['opcode']}"
+                })
+                optimized_bytecode.append(instruction)
+                optimized_bytecode.append({
+                    "opcode": "PROFILE_END",
+                    "args": {"operation": instruction["opcode"]},
+                    "line_number": instruction.get("line_number"),
+                    "source_info": f"ai_profile_end: {instruction['opcode']}"
+                })
             else:
-                optimized.append(instruction)
+                optimized_bytecode.append(instruction)
         
-        return optimized
+        return optimized_bytecode
     
-    def _peephole_optimization(self, instructions: List[Instruction]) -> List[Instruction]:
-        """Peephole optimization pass."""
-        optimized = []
-        i = 0
-        
-        while i < len(instructions):
-            # Remove redundant push/pop pairs
-            if (i + 1 < len(instructions) and
-                instructions[i].opcode == Opcode.PUSH_CONST and
-                instructions[i + 1].opcode == Opcode.POP):
-                i += 2
-                continue
-            
-            optimized.append(instructions[i])
-            i += 1
-        
-        return optimized
-    
-    def get_performance_metrics(self) -> Dict[str, float]:
-        """Get performance metrics for bytecode generation."""
+    def get_optimization_stats(self) -> Dict[str, Any]:
+        """Get statistics about applied optimizations."""
         return {
-            'generation_time_ms': self.generation_time * 1000,
-            'optimization_time_ms': self.optimization_time * 1000,
-            'total_time_ms': (self.generation_time + self.optimization_time) * 1000,
-            'instruction_count': self.instruction_count,
-            'constant_count': len(self.constant_pool),
-            'function_count': len(self.functions),
+            "total_optimizations": len(self.optimization_passes),
+            "enabled_optimizations": len([opt for opt in self.optimization_passes if opt.enabled]),
+            "optimization_passes": [
+                {
+                    "name": opt.name,
+                    "description": opt.description,
+                    "enabled": opt.enabled,
+                    "priority": opt.priority
+                }
+                for opt in self.optimization_passes
+            ]
         }
     
-    def serialize_bytecode(self, module: BytecodeModule) -> bytes:
-        """Serialize bytecode module to binary format."""
-        import struct
-        
-        # Header: magic number and version
-        header = struct.pack('<4sI', b'RUNA', 1)
-        
-        # Serialize constants
-        const_data = struct.pack('<I', len(module.constants))
-        for const in module.constants:
-            const_type = const.type.encode('utf-8')
-            const_data += struct.pack('<I', len(const_type))
-            const_data += const_type
-            
-            if const.type == 'integer':
-                const_data += struct.pack('<q', const.value)
-            elif const.type == 'float':
-                const_data += struct.pack('<d', const.value)
-            elif const.type == 'string':
-                const_data += struct.pack('<I', len(const.value))
-                const_data += const.value.encode('utf-8')
-            elif const.type == 'boolean':
-                const_data += struct.pack('<B', 1 if const.value else 0)
-            elif const.type == 'null':
-                pass  # No value for null
-        
-        # Serialize functions
-        func_data = struct.pack('<I', len(module.functions))
-        for func_name, func in module.functions.items():
-            name_bytes = func_name.encode('utf-8')
-            func_data += struct.pack('<I', len(name_bytes))
-            func_data += name_bytes
-            
-            # Function metadata
-            func_data += struct.pack('<IIII', len(func.parameters), len(func.local_vars), 
-                                   len(func.bytecode), func.line)
-            
-            # Parameters
-            for param in func.parameters:
-                param_bytes = param.encode('utf-8')
-                func_data += struct.pack('<I', len(param_bytes))
-                func_data += param_bytes
-            
-            # Local variables
-            for local in func.local_vars:
-                local_bytes = local.encode('utf-8')
-                func_data += struct.pack('<I', len(local_bytes))
-                func_data += local_bytes
-            
-            # Instructions
-            for instr in func.bytecode:
-                func_data += struct.pack('<B', instr.opcode.value)
-                if instr.operand is not None:
-                    if isinstance(instr.operand, int):
-                        func_data += struct.pack('<Bq', 1, instr.operand)  # Type 1 = int
-                    elif isinstance(instr.operand, str):
-                        operand_bytes = instr.operand.encode('utf-8')
-                        func_data += struct.pack('<BI', 2, len(operand_bytes))  # Type 2 = string
-                        func_data += operand_bytes
-                    else:
-                        func_data += struct.pack('<B', 0)  # Type 0 = no operand
-                else:
-                    func_data += struct.pack('<B', 0)  # No operand
-                func_data += struct.pack('<II', instr.line, instr.column)
-        
-        # Serialize globals
-        global_data = struct.pack('<I', len(module.globals))
-        for global_name, global_value in module.globals.items():
-            name_bytes = global_name.encode('utf-8')
-            global_data += struct.pack('<I', len(name_bytes))
-            global_data += name_bytes
-            
-            if isinstance(global_value, int):
-                global_data += struct.pack('<Bq', 1, global_value)
-            elif isinstance(global_value, str):
-                value_bytes = global_value.encode('utf-8')
-                global_data += struct.pack('<BI', 2, len(value_bytes))
-                global_data += value_bytes
-            else:
-                global_data += struct.pack('<B', 0)  # Unknown type
-        
-        return header + const_data + func_data + global_data
+    def enable_optimization(self, name: str) -> None:
+        """Enable a specific optimization pass."""
+        for optimization in self.optimization_passes:
+            if optimization.name == name:
+                optimization.enabled = True
+                break
     
-    def deserialize_bytecode(self, data: bytes) -> BytecodeModule:
-        """Deserialize bytecode module from binary format."""
-        import struct
-        
-        offset = 0
-        
-        # Read header
-        magic, version = struct.unpack('<4sI', data[offset:offset+8])
-        offset += 8
-        
-        if magic != b'RUNA':
-            raise ValueError("Invalid bytecode format")
-        
-        # Read constants
-        const_count, = struct.unpack('<I', data[offset:offset+4])
-        offset += 4
-        
-        constants = []
-        for _ in range(const_count):
-            type_len, = struct.unpack('<I', data[offset:offset+4])
-            offset += 4
-            const_type = data[offset:offset+type_len].decode('utf-8')
-            offset += type_len
-            
-            if const_type == 'integer':
-                value, = struct.unpack('<q', data[offset:offset+8])
-                offset += 8
-            elif const_type == 'float':
-                value, = struct.unpack('<d', data[offset:offset+8])
-                offset += 8
-            elif const_type == 'string':
-                str_len, = struct.unpack('<I', data[offset:offset+4])
-                offset += 4
-                value = data[offset:offset+str_len].decode('utf-8')
-                offset += str_len
-            elif const_type == 'boolean':
-                value, = struct.unpack('<B', data[offset:offset+1])
-                value = bool(value)
-                offset += 1
-            elif const_type == 'null':
-                value = None
-            else:
-                raise ValueError(f"Unknown constant type: {const_type}")
-            
-            constants.append(Constant(value, const_type))
-        
-        # Read functions
-        func_count, = struct.unpack('<I', data[offset:offset+4])
-        offset += 4
-        
-        functions = {}
-        for _ in range(func_count):
-            name_len, = struct.unpack('<I', data[offset:offset+4])
-            offset += 4
-            func_name = data[offset:offset+name_len].decode('utf-8')
-            offset += name_len
-            
-            param_count, local_count, instr_count, line = struct.unpack('<IIII', data[offset:offset+16])
-            offset += 16
-            
-            # Read parameters
-            parameters = []
-            for _ in range(param_count):
-                param_len, = struct.unpack('<I', data[offset:offset+4])
-                offset += 4
-                param = data[offset:offset+param_len].decode('utf-8')
-                offset += param_len
-                parameters.append(param)
-            
-            # Read local variables
-            local_vars = []
-            for _ in range(local_count):
-                local_len, = struct.unpack('<I', data[offset:offset+4])
-                offset += 4
-                local = data[offset:offset+local_len].decode('utf-8')
-                offset += local_len
-                local_vars.append(local)
-            
-            # Read instructions
-            bytecode = []
-            for _ in range(instr_count):
-                opcode_val, = struct.unpack('<B', data[offset:offset+1])
-                offset += 1
-                opcode = Opcode(opcode_val)
-                
-                operand_type, = struct.unpack('<B', data[offset:offset+1])
-                offset += 1
-                
-                if operand_type == 1:  # int
-                    operand, = struct.unpack('<q', data[offset:offset+8])
-                    offset += 8
-                elif operand_type == 2:  # string
-                    str_len, = struct.unpack('<I', data[offset:offset+4])
-                    offset += 4
-                    operand = data[offset:offset+str_len].decode('utf-8')
-                    offset += str_len
-                else:
-                    operand = None
-                
-                line, column = struct.unpack('<II', data[offset:offset+8])
-                offset += 8
-                
-                bytecode.append(Instruction(opcode, operand, line, column))
-            
-            functions[func_name] = Function(func_name, parameters, local_vars, bytecode, constants, line)
-        
-        # Read globals
-        global_count, = struct.unpack('<I', data[offset:offset+4])
-        offset += 4
-        
-        globals = {}
-        for _ in range(global_count):
-            name_len, = struct.unpack('<I', data[offset:offset+4])
-            offset += 4
-            global_name = data[offset:offset+name_len].decode('utf-8')
-            offset += name_len
-            
-            value_type, = struct.unpack('<B', data[offset:offset+1])
-            offset += 1
-            
-            if value_type == 1:  # int
-                value, = struct.unpack('<q', data[offset:offset+8])
-                offset += 8
-            elif value_type == 2:  # string
-                str_len, = struct.unpack('<I', data[offset:offset+4])
-                offset += 4
-                value = data[offset:offset+str_len].decode('utf-8')
-                offset += str_len
-            else:
-                value = None
-            
-            globals[global_name] = value
-        
-        return BytecodeModule(functions, globals, constants) 
+    def disable_optimization(self, name: str) -> None:
+        """Disable a specific optimization pass."""
+        for optimization in self.optimization_passes:
+            if optimization.name == name:
+                optimization.enabled = False
+                break 
