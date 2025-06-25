@@ -12,7 +12,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from runa.compiler import Compiler
 from runa.runtime import get_runtime, reset_runtime
-from runa.vm import get_vm, reset_vm
+# NOTE: The VM is now implemented in Runa (vm.runa), not Python.
+# This test must be ported to use the Runa toolchain for VM execution.
+# import from runa.vm is no longer valid.
+# from runa.vm import get_vm, reset_vm  # <-- REMOVE or port to Runa
 
 
 def test_basic_compilation():

@@ -37,13 +37,13 @@ class TestLexer(unittest.TestCase):
             TokenType.LET,
             TokenType.IDENTIFIER,
             TokenType.BE,
-            TokenType.INTEGER_LITERAL,
+            TokenType.INTEGER,
             TokenType.EOF
         ]
         
         self.assertEqual(len(tokens), len(expected_types))
         for token, expected_type in zip(tokens, expected_types):
-            self.assertEqual(token.token_type, expected_type)
+            self.assertEqual(token.type, expected_type)
     
     def test_natural_language_operators(self):
         """Test natural language operator recognition."""
@@ -52,7 +52,8 @@ class TestLexer(unittest.TestCase):
         
         expected_types = [
             TokenType.IDENTIFIER,
-            TokenType.MULTIPLIED_BY,
+            TokenType.MULTIPLY,
+            TokenType.BY,
             TokenType.IDENTIFIER,
             TokenType.PLUS,
             TokenType.IDENTIFIER,
@@ -61,7 +62,7 @@ class TestLexer(unittest.TestCase):
         
         self.assertEqual(len(tokens), len(expected_types))
         for token, expected_type in zip(tokens, expected_types):
-            self.assertEqual(token.token_type, expected_type)
+            self.assertEqual(token.type, expected_type)
     
     def test_ai_blocks(self):
         """Test AI-specific block recognition."""
@@ -69,15 +70,19 @@ class TestLexer(unittest.TestCase):
         tokens = self.lexer.tokenize(source)
         
         expected_types = [
-            TokenType.REASONING_BLOCK_START,
-            TokenType.STRING_LITERAL,
-            TokenType.REASONING_BLOCK_END,
+            TokenType.REASONING,
+            TokenType.TYPE_IDENTIFIER,  # "This" - capitalized
+            TokenType.IS,
+            TokenType.TYPE_IDENTIFIER,  # "AI" - capitalized
+            TokenType.IDENTIFIER,  # "reasoning" - lowercase
+            TokenType.NEWLINE,
+            TokenType.END,
             TokenType.EOF
         ]
         
         self.assertEqual(len(tokens), len(expected_types))
         for token, expected_type in zip(tokens, expected_types):
-            self.assertEqual(token.token_type, expected_type)
+            self.assertEqual(token.type, expected_type)
     
     def test_indentation_handling(self):
         """Test indentation and whitespace handling."""
@@ -90,7 +95,7 @@ class TestLexer(unittest.TestCase):
         
         # Should handle indentation correctly
         self.assertGreater(len(tokens), 0)
-        self.assertEqual(tokens[-1].token_type, TokenType.EOF)
+        self.assertEqual(tokens[-1].type, TokenType.EOF)
     
     def test_error_recovery(self):
         """Test error recovery in lexer."""
@@ -99,7 +104,7 @@ class TestLexer(unittest.TestCase):
         
         # Should recover and continue parsing
         self.assertGreater(len(tokens), 0)
-        self.assertEqual(tokens[-1].token_type, TokenType.EOF)
+        self.assertEqual(tokens[-1].type, TokenType.EOF)
 
 
 class TestParser(unittest.TestCase):
@@ -131,11 +136,11 @@ class TestParser(unittest.TestCase):
             return result
         """
         tokens = self.parser.lexer.tokenize(source)
+        # Debug print: show all token types and values
+        print('TOKENS:', [(t.type.name, t.value) for t in tokens])
         ast = self.parser.parse(tokens)
-        
         self.assertIsInstance(ast, Program)
         self.assertEqual(len(ast.statements), 1)
-        
         stmt = ast.statements[0]
         self.assertIsInstance(stmt, FunctionDeclaration)
         self.assertEqual(stmt.name, "add")
@@ -298,14 +303,16 @@ class TestBytecodeGenerator(unittest.TestCase):
     
     def setUp(self):
         self.semantic_analyzer = SemanticAnalyzer()
-        self.generator = BytecodeGenerator(self.semantic_analyzer)
+        self.generator = BytecodeGenerator()
+        self.generator.set_semantic_analyzer(self.semantic_analyzer)
     
     def test_simple_program_generation(self):
         """Test bytecode generation for simple program."""
         program = Program(1, 1, None, statements=[
             VariableDeclaration(
                 name="x",
-                value=Literal(value=42, literal_type="integer"),
+                value=Literal(value=42, literal_type="integer", line=1, column=1),
+                type_annotation=None,
                 is_constant=False,
                 line=1,
                 column=1
@@ -328,18 +335,15 @@ class TestBytecodeGenerator(unittest.TestCase):
             FunctionDeclaration(
                 name="add",
                 parameters=[
-                    VariableDeclaration(
+                    Parameter(
                         name="x",
-                        type_annotation=TypeAnnotation(type_name="Integer"),
-                        is_constant=True,
-                        line=1,
-                        column=1
+                        type_annotation=TypeAnnotation(type_name="Integer", line=1, column=1)
                     )
                 ],
-                return_type=TypeAnnotation(type_name="Integer"),
+                return_type=TypeAnnotation(type_name="Integer", line=1, column=1),
                 body=[
                     ReturnStatement(
-                        value=Identifier(name="x"),
+                        value=Identifier(name="x", line=2, column=1),
                         line=2,
                         column=1
                     )
@@ -366,12 +370,13 @@ class TestBytecodeGenerator(unittest.TestCase):
             VariableDeclaration(
                 name="x",
                 value=BinaryExpression(
-                    left=Literal(value=2, literal_type="integer"),
+                    left=Literal(value=2, literal_type="integer", line=1, column=1),
                     operator="*",
-                    right=Literal(value=3, literal_type="integer"),
+                    right=Literal(value=3, literal_type="integer", line=1, column=1),
                     line=1,
                     column=1
                 ),
+                type_annotation=None,
                 is_constant=False,
                 line=1,
                 column=1
@@ -393,7 +398,8 @@ class TestBytecodeGenerator(unittest.TestCase):
         program = Program(1, 1, None, statements=[
             VariableDeclaration(
                 name="x",
-                value=Literal(value=42, literal_type="integer"),
+                value=Literal(value=42, literal_type="integer", line=1, column=1),
+                type_annotation=None,
                 is_constant=False,
                 line=1,
                 column=1

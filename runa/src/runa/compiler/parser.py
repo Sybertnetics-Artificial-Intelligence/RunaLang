@@ -9,15 +9,15 @@ Implements the foundation for parsing Runa programming language with:
 - Context-sensitive parsing with vector-based disambiguation
 """
 
-from typing import List, Optional, Any, Dict
-from dataclasses import dataclass
+from typing import List, Optional, Any, Dict, Set, Union
+from dataclasses import dataclass, field
 from enum import Enum, auto
 import logging
 
-from .lexer import Token, TokenType, LexerError
-from .context_manager import ContextManager, ContextType
-from .vector_engine import VectorEngine, VectorType
 from .ast_base import ASTNode, Statement, Expression, NodeType
+from .lexer import RunaLexer, Token, TokenType
+from .vector_engine import VectorEngine, VectorType
+from .context_manager import ContextManager, ContextType
 from .ai_constructs import (
     LLMCommunication, AgentCoordination, SelfModification, KnowledgeGraphOperation,
     LLMCommunicationStatement, AgentCoordinationStatement, SelfModificationStatement, 
@@ -189,6 +189,14 @@ class LLMCommunication(Statement):
         self.task = task
 
 
+class DisplayStatement(Statement):
+    """Display statement with optional message."""
+    def __init__(self, expression: Expression, message_expression: Optional[Expression], line: int, column: int, source_file: Optional[str] = None):
+        super().__init__(NodeType.DISPLAY_STATEMENT, line, column, source_file)
+        self.expression = expression
+        self.message_expression = message_expression
+
+
 class RunaParser:
     """
     Production-ready parser for Runa programming language.
@@ -201,10 +209,11 @@ class RunaParser:
     - Context-sensitive parsing with vector-based disambiguation
     """
     
-    def __init__(self, tokens: List[Token]):
-        self.tokens = tokens
+    def __init__(self, tokens: List[Token] = None):
+        self.tokens = tokens or []
         self.current = 0
         self.errors = []  # Track parsing errors
+        self.lexer = RunaLexer()  # Add lexer for backward compatibility
         
         # Context-sensitive parsing components
         self.context_manager = ContextManager()
@@ -214,34 +223,61 @@ class RunaParser:
         self.parse_start_time = None
         self.disambiguation_count = 0
     
-    def parse(self) -> Program:
-        """Parse the tokens into an AST."""
+    def set_tokens(self, tokens: List[Token]):
+        """Set tokens for parsing."""
+        self.tokens = tokens
+        self.current = 0
+        self.errors.clear()
+    
+    @classmethod
+    def create_for_testing(cls) -> 'RunaParser':
+        """Factory method for creating parser instances for testing."""
+        return cls()
+    
+    def parse(self, tokens: Optional[List[Token]] = None) -> Program:
+        """
+        Parse tokens into an AST.
+        
+        Args:
+            tokens: Optional list of tokens to parse. If not provided, uses tokens set via set_tokens().
+            
+        Returns:
+            Parsed program AST
+        """
+        if tokens is not None:
+            self.set_tokens(tokens)
+        
+        if not self.tokens:
+            raise ParserError("No tokens to parse", Token(TokenType.EOF, "", 0, 0))
+        
+        self.current = 0
+        self.errors = []
+        
         statements = []
-        error_count = 0
-        max_errors = 10  # Prevent infinite error loops
         
-        while not self.is_at_end() and error_count < max_errors:
-            try:
-                statement = self.parse_statement()
-                if statement:
-                    statements.append(statement)
-                else:
-                    # If no statement was parsed, advance to prevent infinite loops
-                    if not self.is_at_end():
-                        self.advance()
-                        error_count += 1
-            except Exception as e:
-                # Log the error and continue parsing
-                logger.warning(f"Parser error: {e}")
-                error_count += 1
-                # Synchronize to a safe state
-                self.synchronize()
+        while not self.is_at_end():
+            stmt = self.parse_statement()
+            if stmt is not None and not self._is_empty_statement(stmt):
+                statements.append(stmt)
+            elif not self.is_at_end():
+                self.synchronize()  # Skip to next likely statement start after error
         
-        # If we hit too many errors, return a minimal valid program
-        if error_count >= max_errors:
-            logger.warning(f"Too many parser errors ({error_count}), returning minimal program")
-        
-        return Program(1, 1, statements=statements)
+        return Program(
+            line=self.tokens[0].line if self.tokens else 1,
+            column=self.tokens[0].column if self.tokens else 1,
+            statements=statements
+        )
+    
+    def _is_empty_statement(self, stmt):
+        # Returns True if the statement is an empty or placeholder node
+        # (e.g., a statement with no meaningful content)
+        # Adjust this logic as needed for your AST node types
+        if hasattr(stmt, 'node_type') and stmt.node_type.name == 'EMPTY':
+            return True
+        # Optionally, filter out statements that are just NEWLINEs or similar
+        if hasattr(stmt, 'value') and stmt.value in (None, '', '\n'):
+            return True
+        return False
     
     def parse_with_context(self, context_type: ContextType, **metadata):
         """Parse with context tracking for disambiguation."""
@@ -269,49 +305,63 @@ class RunaParser:
     
     def parse_statement(self) -> Optional[Statement]:
         """Parse a statement."""
-        if self.match(TokenType.LET):
+        
+        if self.check(TokenType.LET):
+            self.advance()  # Consume LET token
             return self.parse_variable_declaration()
-        elif self.match(TokenType.DEFINE):
+        elif self.check(TokenType.DEFINE):
+            self.advance()  # Consume DEFINE token
             return self.parse_define_statement()
-        elif self.match(TokenType.SET):
+        elif self.check(TokenType.SET):
+            self.advance()  # Consume SET token
             return self.parse_set_statement()
-        elif self.match(TokenType.PROCESS):
+        elif self.check(TokenType.PROCESS):
             return self.parse_function_declaration()
-        elif self.match(TokenType.IF):
+        elif self.check(TokenType.IF):
+            self.advance()  # Consume IF token
             return self.parse_if_statement()
-        elif self.match(TokenType.FOR):
+        elif self.check(TokenType.FOR):
+            self.advance()  # Consume FOR token
             return self.parse_for_statement()
-        elif self.match(TokenType.WHILE):
+        elif self.check(TokenType.WHILE):
+            self.advance()  # Consume WHILE token
             return self.parse_while_statement()
-        elif self.match(TokenType.RETURN):
+        elif self.check(TokenType.RETURN):
+            self.advance()  # Consume RETURN token
             return self.parse_return_statement()
-        elif self.match(TokenType.REASONING):
+        elif self.check(TokenType.REASONING):
+            self.advance()  # Consume REASONING token
             return self.parse_reasoning_block()
-        elif self.match(TokenType.IMPLEMENTATION):
+        elif self.check(TokenType.IMPLEMENTATION):
+            self.advance()  # Consume IMPLEMENTATION token
             return self.parse_implementation_block()
-        elif self.match(TokenType.VERIFY):
+        elif self.check(TokenType.VERIFY):
+            self.advance()  # Consume VERIFY token
             return self.parse_verification_block()
-        elif self.match(TokenType.SEND):
+        elif self.check(TokenType.SEND):
+            self.advance()  # Consume SEND token
             return self.parse_llm_communication()
         # AI-specific constructs
-        elif self.match(TokenType.ASK):
+        elif self.check(TokenType.ASK):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.DELEGATE):
+        elif self.check(TokenType.DELEGATE):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.MODIFY):
+        elif self.check(TokenType.MODIFY):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.QUERY):
+        elif self.check(TokenType.QUERY):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.TELL):
+        elif self.check(TokenType.TELL):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.INSTRUCT):
+        elif self.check(TokenType.INSTRUCT):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.WAIT):
+        elif self.check(TokenType.WAIT):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.BROADCAST):
+        elif self.check(TokenType.BROADCAST):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.COORDINATE):
+        elif self.check(TokenType.COORDINATE):
             return self.parse_ai_communication_statement()
+        elif self.check(TokenType.DISPLAY):
+            return self.parse_display_statement()
         else:
             # Try to parse as expression statement
             expr = self.parse_expression()
@@ -330,16 +380,19 @@ class RunaParser:
         
         # Check for type annotation
         type_annotation = None
-        if self.match(TokenType.AS):
+        if self.check(TokenType.AS):
+            self.advance()  # Consume AS
             type_annotation = self.parse_type_annotation()
         
         # Expect 'be' or 'to'
-        if not self.match(TokenType.BE, TokenType.TO):
+        if not self.check_any(TokenType.BE, TokenType.TO):
             self.error("Expected 'be' or 'to' after variable name")
+        else:
+            self.advance()  # Consume BE or TO token
         
         # Parse value
         value = None
-        if not self.check(TokenType.NEWLINE):
+        if not self.check(TokenType.NEWLINE) and not self.is_at_end():
             value = self.parse_expression()
         
         return VariableDeclaration(name, value, type_annotation, False, line, column, value.source_file if value else None)
@@ -383,92 +436,127 @@ class RunaParser:
         return VariableDeclaration(name, value, None, False, line, column, value.source_file if value else None)
     
     def parse_function_declaration(self) -> FunctionDeclaration:
-        """Parse function declaration: 'Process called name that takes params: body'."""
+        """Parse function declaration with natural language syntax."""
         line, column = self.peek().line, self.peek().column
-        
-        # Expect 'called'
-        self.consume(TokenType.CALLED, "Expected 'called' after 'Process'")
-        
-        # Parse function name
-        name_token = self.consume(TokenType.STRING, "Expected function name in quotes")
-        name = name_token.value.strip('"')
-        
-        # Expect 'that takes'
+        self.consume(TokenType.PROCESS, "Expected 'Process'")
+        self.consume(TokenType.CALLED, "Expected 'called'")
+        # Accept STRING, IDENTIFIER, or TYPE_IDENTIFIER for function name
+        if self.check(TokenType.STRING):
+            name_token = self.consume(TokenType.STRING, "Expected function name as string literal")
+            name = name_token.value.strip('"')
+        elif self.check(TokenType.IDENTIFIER):
+            name_token = self.consume(TokenType.IDENTIFIER, "Expected function name")
+            name = name_token.value
+        elif self.check(TokenType.TYPE_IDENTIFIER):
+            name_token = self.consume(TokenType.TYPE_IDENTIFIER, "Expected function name")
+            name = name_token.value
+        else:
+            self.error("Expected function name (quoted or unquoted)")
+            return None
         self.consume(TokenType.THAT, "Expected 'that' after function name")
         self.consume(TokenType.TAKES, "Expected 'takes' after 'that'")
-        
-        # Parse parameters
         parameters = self.parse_parameters()
-        
-        # Expect colon
-        self.consume(TokenType.COLON, "Expected ':' after parameters")
-        
-        # Parse function body
+        return_type = None
+        if self.check(TokenType.RETURNING):
+            self.consume(TokenType.RETURNING, "Expected 'returns' or 'returning'")
+            return_type = self.parse_type_annotation()
+        self.consume(TokenType.COLON, "Expected ':' after function signature")
         body = self.parse_block()
-        
-        return FunctionDeclaration(name, parameters, None, body, line, column)
-    
-    def parse_parameters(self) -> List[Parameter]:
-        """Parse function parameters."""
+        return FunctionDeclaration(name, parameters, return_type, body, line, column)
+
+    def parse_parameters(self) -> list:
+        """Parse function parameters: IDENTIFIER (AS type)? (AND IDENTIFIER (AS type)?)* or 'nothing' (NULL)."""
         parameters = []
-        
+        if self.check(TokenType.NULL):
+            self.consume(TokenType.NULL, "Expected 'nothing' for no parameters")
+            return parameters
         if self.check(TokenType.IDENTIFIER):
             while True:
                 param_name = self.consume(TokenType.IDENTIFIER, "Expected parameter name").value
-                
-                # Check for type annotation
                 type_annotation = None
-                if self.match(TokenType.AS):
-                    type_annotation = self.parse_type_annotation()
-                
+                if self.check(TokenType.AS):
+                    self.consume(TokenType.AS, "Expected 'as' before type name")
+                    # Accept TYPE_IDENTIFIER, IDENTIFIER, INTEGER_TYPE, FLOAT_TYPE, STRING_TYPE, BOOLEAN_TYPE
+                    if self.check(TokenType.TYPE_IDENTIFIER):
+                        type_token = self.consume(TokenType.TYPE_IDENTIFIER, "Expected type name")
+                        type_annotation = TypeAnnotation(type_token.value, type_token.line, type_token.column)
+                    elif self.check(TokenType.IDENTIFIER):
+                        type_token = self.consume(TokenType.IDENTIFIER, "Expected type name")
+                        type_annotation = TypeAnnotation(type_token.value, type_token.line, type_token.column)
+                    elif self.check(TokenType.INTEGER_TYPE):
+                        type_token = self.consume(TokenType.INTEGER_TYPE, "Expected type name")
+                        type_annotation = TypeAnnotation("Integer", type_token.line, type_token.column)
+                    elif self.check(TokenType.FLOAT_TYPE):
+                        type_token = self.consume(TokenType.FLOAT_TYPE, "Expected type name")
+                        type_annotation = TypeAnnotation("Float", type_token.line, type_token.column)
+                    elif self.check(TokenType.STRING_TYPE):
+                        type_token = self.consume(TokenType.STRING_TYPE, "Expected type name")
+                        type_annotation = TypeAnnotation("String", type_token.line, type_token.column)
+                    elif self.check(TokenType.BOOLEAN_TYPE):
+                        type_token = self.consume(TokenType.BOOLEAN_TYPE, "Expected type name")
+                        type_annotation = TypeAnnotation("Boolean", type_token.line, type_token.column)
+                    else:
+                        self.error("Expected type name after 'as'")
                 parameters.append(Parameter(param_name, type_annotation))
-                
-                if not self.match(TokenType.AND):
+                if not self.check(TokenType.AND):
                     break
-        
+                self.consume(TokenType.AND, "Expected 'and' between parameters")
         return parameters
     
     def parse_type_annotation(self) -> TypeAnnotation:
         """Parse type annotation."""
         line, column = self.peek().line, self.peek().column
-        
+        # Accept TYPE_IDENTIFIER, IDENTIFIER, INTEGER_TYPE, FLOAT_TYPE, STRING_TYPE, BOOLEAN_TYPE
         if self.check(TokenType.TYPE_IDENTIFIER):
             type_name = self.consume(TokenType.TYPE_IDENTIFIER, "Expected type name").value
         elif self.check(TokenType.IDENTIFIER):
             type_name = self.consume(TokenType.IDENTIFIER, "Expected type name").value
+        elif self.check(TokenType.INTEGER_TYPE):
+            self.consume(TokenType.INTEGER_TYPE, "Expected type name")
+            type_name = "Integer"
+        elif self.check(TokenType.FLOAT_TYPE):
+            self.consume(TokenType.FLOAT_TYPE, "Expected type name")
+            type_name = "Float"
+        elif self.check(TokenType.STRING_TYPE):
+            self.consume(TokenType.STRING_TYPE, "Expected type name")
+            type_name = "String"
+        elif self.check(TokenType.BOOLEAN_TYPE):
+            self.consume(TokenType.BOOLEAN_TYPE, "Expected type name")
+            type_name = "Boolean"
         else:
             self.error("Expected type name")
             return None
-        
         # Check for generic arguments
         generic_arguments = None
-        if self.match(TokenType.LEFT_BRACKET):
+        if self.check_any(TokenType.LEFT_BRACKET):
             generic_arguments = []
             while not self.check(TokenType.RIGHT_BRACKET):
                 generic_arguments.append(self.parse_type_annotation())
-                if not self.match(TokenType.COMMA):
+                if not self.check_any(TokenType.COMMA):
                     break
             self.consume(TokenType.RIGHT_BRACKET, "Expected ']' after generic arguments")
-        
         return TypeAnnotation(type_name, line, column, generic_arguments=generic_arguments)
     
     def parse_if_statement(self) -> IfStatement:
-        """Parse if statement: 'If condition: then_branch Otherwise: else_branch'."""
+        """Parse if statement with flexible natural language syntax."""
         line, column = self.peek().line, self.peek().column
         
-        # Parse condition
+        # Parse condition - be flexible about natural language expressions
         condition = self.parse_expression()
         
         # Expect colon
-        self.consume(TokenType.COLON, "Expected ':' after condition")
+        if not self.check(TokenType.COLON):
+            self.error("Expected ':' after condition")
+            return None
         
         # Parse then branch
         then_branch = self.parse_block()
         
-        # Check for else branch
+        # Directly check for OTHERWISE after block
         else_branch = None
-        if self.match(TokenType.OTHERWISE):
-            self.consume(TokenType.COLON, "Expected ':' after 'Otherwise'")
+        if self.check(TokenType.OTHERWISE):
+            if not self.check(TokenType.COLON):
+                self.error("Expected ':' after 'Otherwise'")
             else_branch = self.parse_block()
         
         return IfStatement(condition, then_branch, else_branch, line, column)
@@ -521,6 +609,28 @@ class RunaParser:
             value = self.parse_expression()
         
         return ReturnStatement(value, line, column)
+    
+    def parse_display_statement(self) -> DisplayStatement:
+        """Parse display statement: 'Display expression' or 'Display expression with message variable'."""
+        line, column = self.peek().line, self.peek().column
+        self.consume(TokenType.DISPLAY, "Expected 'Display'")
+        
+        # Parse the main expression to display
+        expression = self.parse_expression()
+        
+        # Check for optional "with message" part
+        message_expression = None
+        if self.check(TokenType.WITH):
+            self.consume(TokenType.WITH, "Expected 'with'")
+            # Expect 'message' keyword - this could be tokenized as IDENTIFIER
+            if self.check(TokenType.IDENTIFIER) and self.peek().value == "message":
+                self.advance()  # consume "message"
+                # Parse the message expression
+                message_expression = self.parse_expression()
+            else:
+                self.error("Expected 'message' after 'with'")
+        
+        return DisplayStatement(expression, message_expression, line, column)
     
     def parse_reasoning_block(self) -> ReasoningBlock:
         """Parse reasoning block: '@Reasoning: content @End_Reasoning'."""
@@ -604,13 +714,20 @@ class RunaParser:
     
     def parse_expression(self) -> Expression:
         """Parse an expression."""
+        # Skip whitespace tokens before parsing expression
+        while (self.check(TokenType.NEWLINE) or 
+               self.check(TokenType.INDENT) or 
+               self.check(TokenType.DEDENT)):
+            self.advance()
+        
         return self.parse_assignment()
     
     def parse_assignment(self) -> Expression:
         """Parse assignment expression."""
         expr = self.parse_logical_or()
         
-        if self.match(TokenType.ASSIGN):
+        if self.check(TokenType.ASSIGN):
+            self.advance()  # Consume ASSIGN token
             equals = self.previous()
             value = self.parse_assignment()
             
@@ -626,7 +743,8 @@ class RunaParser:
         """Parse logical OR expression."""
         expr = self.parse_logical_and()
         
-        while self.match(TokenType.LOGICAL_OR):
+        while self.check(TokenType.LOGICAL_OR):
+            self.advance()  # Consume LOGICAL_OR token
             operator = self.previous().value
             right = self.parse_logical_and()
             expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
@@ -637,7 +755,8 @@ class RunaParser:
         """Parse logical AND expression."""
         expr = self.parse_equality()
         
-        while self.match(TokenType.LOGICAL_AND):
+        while self.check(TokenType.LOGICAL_AND):
+            self.advance()  # Consume LOGICAL_AND token
             operator = self.previous().value
             right = self.parse_equality()
             expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
@@ -648,7 +767,8 @@ class RunaParser:
         """Parse equality expressions."""
         expr = self.parse_comparison()
         
-        while self.match(TokenType.EQUALS, TokenType.NOT_EQUALS):
+        while self.check_any(TokenType.EQUALS, TokenType.NOT_EQUALS):
+            self.advance()  # Consume equality operator
             operator = self.previous().value
             right = self.parse_comparison()
             expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
@@ -656,11 +776,32 @@ class RunaParser:
         return expr
     
     def parse_comparison(self) -> Expression:
-        """Parse comparison expressions."""
+        """Parse comparison expressions including natural language operators."""
         expr = self.parse_term()
         
-        while self.match(TokenType.LESS_THAN, TokenType.LESS_EQUALS, 
+        # Handle natural language comparison operators
+        if self.check(TokenType.IS):
+            self.advance()  # Consume IS token
+            if self.check(TokenType.GREATER) or self.check(TokenType.LESS):
+                self.advance()  # Consume GREATER or LESS token
+                operator = self.previous().value
+                if self.check(TokenType.THAN):
+                    self.advance()  # Consume THAN token
+                    operator = f"is {operator} than"
+                    right = self.parse_term()
+                    expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+            elif self.check(TokenType.EQUAL):
+                self.advance()  # Consume EQUAL token
+                if self.check(TokenType.TO):
+                    self.advance()  # Consume TO token
+                    operator = "is equal to"
+                    right = self.parse_term()
+                    expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+        
+        # Handle traditional comparison operators
+        while self.check_any(TokenType.LESS_THAN, TokenType.LESS_EQUALS, 
                         TokenType.GREATER_THAN, TokenType.GREATER_EQUALS):
+            self.advance()  # Consume comparison operator
             operator = self.previous().value
             right = self.parse_term()
             expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
@@ -668,30 +809,73 @@ class RunaParser:
         return expr
     
     def parse_term(self) -> Expression:
-        """Parse addition and subtraction."""
+        """Parse addition and subtraction including natural language operators."""
         expr = self.parse_factor()
         
-        while self.match(TokenType.PLUS, TokenType.MINUS):
-            operator = self.previous().value
-            right = self.parse_factor()
-            expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+        # Handle natural language arithmetic operators
+        while True:
+            if self.check(TokenType.PLUS):
+                self.advance()  # Consume PLUS token
+                operator = "plus"
+                right = self.parse_factor()
+                expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+            elif self.check(TokenType.MINUS):
+                self.advance()  # Consume MINUS token
+                operator = "minus"
+                right = self.parse_factor()
+                expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+            elif self.check(TokenType.FOLLOWED):
+                self.advance()  # Consume FOLLOWED token
+                operator = "followed by"
+                right = self.parse_factor()
+                expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+            else:
+                break
         
         return expr
     
     def parse_factor(self) -> Expression:
-        """Parse multiplication and division."""
+        """Parse multiplication and division including natural language operators."""
         expr = self.parse_unary()
         
-        while self.match(TokenType.MULTIPLY, TokenType.DIVIDE, TokenType.MODULO):
-            operator = self.previous().value
-            right = self.parse_unary()
-            expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+        # Handle natural language arithmetic operators
+        while True:
+            if self.check(TokenType.MULTIPLY):
+                self.advance()  # Consume MULTIPLY token
+                if self.check(TokenType.BY):
+                    self.advance()  # Consume BY token
+                    operator = "multiplied by"
+                    right = self.parse_unary()
+                    expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+                else:
+                    # Put back the MULTIPLY token since we didn't find BY
+                    self.current -= 1
+                    break
+            elif self.check(TokenType.DIVIDE):
+                self.advance()  # Consume DIVIDE token
+                if self.check(TokenType.BY):
+                    self.advance()  # Consume BY token
+                    operator = "divided by"
+                    right = self.parse_unary()
+                    expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+                else:
+                    # Put back the DIVIDE token since we didn't find BY
+                    self.current -= 1
+                    break
+            elif self.check(TokenType.MODULO):
+                self.advance()  # Consume MODULO token
+                operator = "modulo"
+                right = self.parse_unary()
+                expr = BinaryExpression(operator, expr, right, expr.line, expr.column, expr.source_file)
+            else:
+                break
         
         return expr
     
     def parse_unary(self) -> Expression:
         """Parse unary expressions."""
-        if self.match(TokenType.LOGICAL_NOT, TokenType.MINUS, TokenType.BITWISE_NOT):
+        if self.check_any(TokenType.LOGICAL_NOT, TokenType.MINUS, TokenType.BITWISE_NOT):
+            self.advance()  # Consume unary operator
             operator = self.previous().value
             right = self.parse_unary()
             return UnaryExpression(operator, right, right.line, right.column, right.source_file)
@@ -703,9 +887,11 @@ class RunaParser:
         expr = self.parse_primary()
         
         while True:
-            if self.match(TokenType.LEFT_PAREN):
+            if self.check(TokenType.LEFT_PAREN):
+                self.advance()  # Consume LEFT_PAREN
                 expr = self.finish_call(expr)
-            elif self.match(TokenType.DOT):
+            elif self.check(TokenType.DOT):
+                self.advance()  # Consume DOT
                 name = self.consume(TokenType.IDENTIFIER, "Expected property name after '.'")
                 expr = MemberExpression(expr, name.value, expr.line, expr.column, expr.source_file)
             else:
@@ -720,37 +906,71 @@ class RunaParser:
         if not self.check(TokenType.RIGHT_PAREN):
             while True:
                 arguments.append(self.parse_expression())
-                if not self.match(TokenType.COMMA):
+                if not self.check(TokenType.COMMA):
                     break
+                self.advance()  # Consume COMMA
         
         paren = self.consume(TokenType.RIGHT_PAREN, "Expected ')' after arguments")
         return CallExpression(callee, arguments, callee.line, callee.column, callee.source_file)
     
     def parse_primary(self) -> Expression:
         """Parse primary expressions."""
-        if self.match(TokenType.TRUE):
+        if self.check(TokenType.TRUE):
+            self.advance()  # Consume TRUE
             return Literal(True, "boolean", self.previous().line, self.previous().column, self.previous().source_file)
-        if self.match(TokenType.FALSE):
+        if self.check(TokenType.FALSE):
+            self.advance()  # Consume FALSE
             return Literal(False, "boolean", self.previous().line, self.previous().column, self.previous().source_file)
-        if self.match(TokenType.NULL):
+        if self.check(TokenType.NULL):
+            self.advance()  # Consume NULL
             return Literal(None, "null", self.previous().line, self.previous().column, self.previous().source_file)
         
-        if self.match(TokenType.INTEGER):
+        if self.check(TokenType.INTEGER):
+            self.advance()  # Consume INTEGER
             value = int(self.previous().value)
             return Literal(value, "integer", self.previous().line, self.previous().column, self.previous().source_file)
         
-        if self.match(TokenType.FLOAT):
+        if self.check(TokenType.FLOAT):
+            self.advance()  # Consume FLOAT
             value = float(self.previous().value)
             return Literal(value, "float", self.previous().line, self.previous().column, self.previous().source_file)
         
-        if self.match(TokenType.STRING):
+        if self.check(TokenType.STRING):
+            self.advance()  # Consume STRING
             value = self.previous().value.strip('"')
             return Literal(value, "string", self.previous().line, self.previous().column, self.previous().source_file)
         
-        if self.match(TokenType.IDENTIFIER):
-            return Identifier(self.previous().value, self.previous().line, self.previous().column, self.previous().source_file)
+        if self.check(TokenType.IDENTIFIER):
+            # Check for active verb forms: multiply X by Y, divide X by Y
+            if self.peek().value in ["multiply", "divide"]:
+                verb_token = self.advance()  # Consume verb (multiply/divide)
+                verb = verb_token.value
+                line, column = verb_token.line, verb_token.column
+                
+                # Parse first operand
+                left = self.parse_unary()
+                
+                # Expect 'by'
+                if self.check(TokenType.BY):
+                    self.advance()  # Consume BY
+                    # Parse second operand
+                    right = self.parse_unary()
+                    # Create binary expression
+                    operator = f"{verb} by" if verb == "multiply" else f"{verb} by"
+                    return BinaryExpression(operator, left, right, line, column, verb_token.source_file)
+                else:
+                    # Not a valid active form, treat as regular identifier
+                    # Put back the verb token by decrementing current
+                    self.current -= 1
+                    self.advance()  # Re-consume as identifier
+                    return Identifier(self.previous().value, self.previous().line, self.previous().column, self.previous().source_file)
+            else:
+                # Regular identifier
+                self.advance()  # Consume IDENTIFIER
+                return Identifier(self.previous().value, self.previous().line, self.previous().column, self.previous().source_file)
         
-        if self.match(TokenType.LEFT_PAREN):
+        if self.check(TokenType.LEFT_PAREN):
+            self.advance()  # Consume LEFT_PAREN
             expr = self.parse_expression()
             self.consume(TokenType.RIGHT_PAREN, "Expected ')' after expression")
             return expr
@@ -769,21 +989,24 @@ class RunaParser:
         return Literal("error_placeholder", "string", self.previous().line, self.previous().column, self.previous().source_file)
     
     def parse_block(self) -> List[Statement]:
-        """Parse a block of statements."""
         statements = []
-        
-        # Expect indentation
-        self.consume(TokenType.INDENT, "Expected indentation")
-        
+        # Skip any leading NEWLINE, INDENT, or DEDENT tokens
+        while self.check(TokenType.NEWLINE) or self.check(TokenType.INDENT) or self.check(TokenType.DEDENT):
+            self.advance()
+        # Require and consume INDENT token for a block
+        if not self.check(TokenType.INDENT):
+            return statements
         while not self.check(TokenType.DEDENT) and not self.is_at_end():
-            statement = self.parse_statement()
-            if statement:
-                statements.append(statement)
-        
-        # Expect dedentation
+            # Skip any leading NEWLINE, INDENT, or DEDENT tokens inside the block
+            while self.check(TokenType.NEWLINE) or self.check(TokenType.INDENT) or self.check(TokenType.DEDENT):
+                self.advance()
+            if self.is_at_end() or self.check(TokenType.DEDENT):
+                break
+            stmt = self.parse_statement()
+            if stmt is not None and not self._is_empty_statement(stmt):
+                statements.append(stmt)
         if self.check(TokenType.DEDENT):
             self.advance()
-        
         return statements
     
     def parse_block_content(self) -> str:
@@ -791,7 +1014,8 @@ class RunaParser:
         content = []
         
         # Expect indentation
-        self.consume(TokenType.INDENT, "Expected indentation")
+        if self.check(TokenType.INDENT):
+            self.advance()  # Consume INDENT token
         
         while not self.check(TokenType.DEDENT) and not self.is_at_end():
             token = self.advance()
@@ -799,19 +1023,11 @@ class RunaParser:
         
         # Expect dedentation
         if self.check(TokenType.DEDENT):
-            self.advance()
+            self.advance()  # Consume DEDENT token
         
         return " ".join(content)
     
     # Parser utility methods
-    
-    def match(self, *types: TokenType) -> bool:
-        """Check if current token matches any of the given types."""
-        for type_ in types:
-            if self.check(type_):
-                self.advance()
-                return True
-        return False
     
     def check(self, type_: TokenType) -> bool:
         """Check if current token is of given type."""
@@ -880,23 +1096,23 @@ class RunaParser:
     def parse_statement_with_context(self) -> Optional[Statement]:
         """Parse statement with context-aware disambiguation."""
         # Check for AI-specific constructs first
-        if self.match(TokenType.ASK):
+        if self.check(TokenType.ASK):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.DELEGATE):
+        elif self.check(TokenType.DELEGATE):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.MODIFY):
+        elif self.check(TokenType.MODIFY):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.QUERY):
+        elif self.check(TokenType.QUERY):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.TELL):
+        elif self.check(TokenType.TELL):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.INSTRUCT):
+        elif self.check(TokenType.INSTRUCT):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.WAIT):
+        elif self.check(TokenType.WAIT):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.BROADCAST):
+        elif self.check(TokenType.BROADCAST):
             return self.parse_ai_communication_statement()
-        elif self.match(TokenType.COORDINATE):
+        elif self.check(TokenType.COORDINATE):
             return self.parse_ai_communication_statement()
         else:
             # Fall back to regular statement parsing
@@ -919,7 +1135,7 @@ class RunaParser:
             target_llm = target_token.value
         
         # Parse 'about' or 'to'
-        if self.match(TokenType.ABOUT):
+        if self.check(TokenType.ABOUT):
             # Parse content
             content = ""
             if self.check(TokenType.STRING):
@@ -945,14 +1161,14 @@ class RunaParser:
         
         # Parse task
         task = ""
-        if self.match(TokenType.TASK):
+        if self.check(TokenType.TASK):
             if self.check(TokenType.STRING):
                 task_token = self.consume(TokenType.STRING, "Expected task string")
                 task = task_token.value.strip('"')
         
         # Parse target agent
         target_agent = ""
-        if self.match(TokenType.TO):
+        if self.check(TokenType.TO):
             if self.check(TokenType.IDENTIFIER):
                 agent_token = self.consume(TokenType.IDENTIFIER, "Expected agent identifier")
                 target_agent = agent_token.value
@@ -977,7 +1193,7 @@ class RunaParser:
         
         # Parse modification
         modification = ""
-        if self.match(TokenType.TO):
+        if self.check(TokenType.TO):
             # Parse until end of statement
             while not self.is_at_end() and not self.check(TokenType.NEWLINE):
                 modification += self.advance().value + " "
@@ -997,7 +1213,7 @@ class RunaParser:
         
         # Parse entity
         entity = ""
-        if self.match(TokenType.KNOWLEDGE_GRAPH):
+        if self.check(TokenType.KNOWLEDGE_GRAPH):
             if self.check(TokenType.FOR):
                 self.advance()  # consume 'for'
                 if self.check(TokenType.STRING):
@@ -1012,6 +1228,9 @@ class RunaParser:
         
         return KnowledgeGraphStatement(operation, entity, relationship, line, column)
 
+    def check_any(self, *types) -> bool:
+        """Check if current token matches any of the given types."""
+        return any(self.check(t) for t in types)
 
 # Additional AST node classes for completeness
 
@@ -1035,225 +1254,4 @@ class MemberExpression(Expression):
     def __init__(self, object: Expression, property: str, line: int, column: int, source_file: Optional[str] = None):
         super().__init__(NodeType.MEMBER_EXPRESSION, line, column, source_file)
         self.object = object
-        self.property = property
-
-
-# Context-sensitive parsing methods for Week 2
-def parse_with_context(self, context_type: ContextType, **metadata):
-    """Parse with context tracking for disambiguation."""
-    frame = self.context_manager.push_context(context_type, **metadata)
-    try:
-        statements = []
-        
-        while not self.is_at_end():
-            statement = self.parse_statement_with_context()
-            if statement:
-                statements.append(statement)
-        
-        # Return a valid program even with errors for Week 2 validation
-        if self.errors:
-            logger.warning(f"Parser encountered {len(self.errors)} errors, but continuing for validation")
-        
-        return Program(1, 1, statements=statements)
-        
-    except Exception as e:
-        # For Week 2, catch all parsing errors and return a minimal valid program
-        logger.warning(f"Parser error: {e}, returning minimal program for validation")
-        return Program(1, 1, statements=[])
-    finally:
-        self.context_manager.pop_context()
-
-def parse_function_declaration_with_context(self) -> FunctionDeclaration:
-    """Parse function declaration with context-aware disambiguation."""
-    # Push function definition context
-    self.context_manager.push_context(ContextType.FUNCTION_DEFINITION)
-    
-    try:
-        line, column = self.peek().line, self.peek().column
-        
-        # Expect 'called'
-        self.consume(TokenType.CALLED, "Expected 'called' after 'Process'")
-        
-        # Parse function name with disambiguation
-        name_token = self.consume(TokenType.STRING, "Expected function name in quotes")
-        name = name_token.value.strip('"')
-        
-        # Add function to context
-        self.context_manager.add_function(name)
-        
-        # Expect 'that takes'
-        self.consume(TokenType.THAT, "Expected 'that' after function name")
-        self.consume(TokenType.TAKES, "Expected 'takes' after 'that'")
-        
-        # Parse parameters with context
-        parameters = self.parse_parameters_with_context()
-        
-        # Expect colon
-        self.consume(TokenType.COLON, "Expected ':' after parameters")
-        
-        # Parse function body with context
-        body = self.parse_block_with_context()
-        
-        return FunctionDeclaration(name, parameters, None, body, line, column)
-        
-    finally:
-        self.context_manager.pop_context()
-
-def parse_parameters_with_context(self) -> List[Parameter]:
-    """Parse function parameters with context tracking."""
-    parameters = []
-    
-    if self.check(TokenType.IDENTIFIER):
-        while True:
-            param_name = self.consume(TokenType.IDENTIFIER, "Expected parameter name").value
-            
-            # Add parameter to context
-            self.context_manager.add_variable(param_name)
-            
-            # Check for type annotation
-            type_annotation = None
-            if self.match(TokenType.AS):
-                type_annotation = self.parse_type_annotation()
-            
-            parameters.append(Parameter(param_name, type_annotation))
-            
-            if not self.match(TokenType.AND):
-                break
-    
-    return parameters
-
-def parse_block_with_context(self) -> List[Statement]:
-    """Parse block with context tracking."""
-    statements = []
-    
-    while not self.is_at_end() and not self.check(TokenType.NEWLINE):
-        statement = self.parse_statement_with_context()
-        if statement:
-            statements.append(statement)
-    
-    return statements
-
-def parse_statement_with_context(self) -> Optional[Statement]:
-    """Parse statement with context-aware disambiguation."""
-    # Check for AI-specific constructs first
-    if self.match(TokenType.ASK):
-        return self.parse_llm_communication_with_context()
-    elif self.match(TokenType.DELEGATE):
-        return self.parse_agent_coordination_with_context()
-    elif self.match(TokenType.MODIFY):
-        return self.parse_self_modification_with_context()
-    elif self.match(TokenType.QUERY):
-        return self.parse_knowledge_graph_with_context()
-    else:
-        # Fall back to regular statement parsing
-        return self.parse_statement()
-
-def parse_llm_communication_with_context(self) -> LLMCommunicationStatement:
-    """Parse LLM communication with context-aware disambiguation."""
-    line, column = self.peek().line, self.peek().column
-    
-    # Parse operation (ask, tell, query, instruct)
-    operation = "ask"  # Default
-    if self.check(TokenType.IDENTIFIER):
-        op_token = self.advance()
-        operation = op_token.value.lower()
-    
-    # Parse target LLM
-    target_llm = ""
-    if self.check(TokenType.IDENTIFIER):
-        target_token = self.consume(TokenType.IDENTIFIER, "Expected LLM identifier")
-        target_llm = target_token.value
-    
-    # Parse 'about' or 'to'
-    if self.match(TokenType.ABOUT):
-        # Parse content
-        content = ""
-        if self.check(TokenType.STRING):
-            content_token = self.consume(TokenType.STRING, "Expected content string")
-            content = content_token.value.strip('"')
-        else:
-            # Parse until end of statement
-            while not self.is_at_end() and not self.check(TokenType.NEWLINE):
-                content += self.advance().value + " "
-            content = content.strip()
-    
-    return LLMCommunicationStatement(operation, target_llm, content, line, column)
-
-def parse_agent_coordination_with_context(self) -> AgentCoordinationStatement:
-    """Parse agent coordination with context-aware disambiguation."""
-    line, column = self.peek().line, self.peek().column
-    
-    # Parse operation (delegate, wait, broadcast, coordinate)
-    operation = "delegate"  # Default
-    if self.check(TokenType.IDENTIFIER):
-        op_token = self.advance()
-        operation = op_token.value.lower()
-    
-    # Parse task
-    task = ""
-    if self.match(TokenType.TASK):
-        if self.check(TokenType.STRING):
-            task_token = self.consume(TokenType.STRING, "Expected task string")
-            task = task_token.value.strip('"')
-    
-    # Parse target agent
-    target_agent = ""
-    if self.match(TokenType.TO):
-        if self.check(TokenType.IDENTIFIER):
-            agent_token = self.consume(TokenType.IDENTIFIER, "Expected agent identifier")
-            target_agent = agent_token.value
-    
-    return AgentCoordinationStatement(operation, task, target_agent, line, column)
-
-def parse_self_modification_with_context(self) -> SelfModificationStatement:
-    """Parse self-modification with context-aware disambiguation."""
-    line, column = self.peek().line, self.peek().column
-    
-    # Parse operation (modify, add, update)
-    operation = "modify"  # Default
-    if self.check(TokenType.IDENTIFIER):
-        op_token = self.advance()
-        operation = op_token.value.lower()
-    
-    # Parse target
-    target = ""
-    if self.check(TokenType.IDENTIFIER):
-        target_token = self.consume(TokenType.IDENTIFIER, "Expected target identifier")
-        target = target_token.value
-    
-    # Parse modification
-    modification = ""
-    if self.match(TokenType.TO):
-        # Parse until end of statement
-        while not self.is_at_end() and not self.check(TokenType.NEWLINE):
-            modification += self.advance().value + " "
-        modification = modification.strip()
-    
-    return SelfModificationStatement(operation, target, modification, line, column)
-
-def parse_knowledge_graph_with_context(self) -> KnowledgeGraphStatement:
-    """Parse knowledge graph operations with context-aware disambiguation."""
-    line, column = self.peek().line, self.peek().column
-    
-    # Parse operation (query, add, update)
-    operation = "query"  # Default
-    if self.check(TokenType.IDENTIFIER):
-        op_token = self.advance()
-        operation = op_token.value.lower()
-    
-    # Parse entity
-    entity = ""
-    if self.match(TokenType.KNOWLEDGE_GRAPH):
-        if self.check(TokenType.FOR):
-            self.advance()  # consume 'for'
-            if self.check(TokenType.STRING):
-                entity_token = self.consume(TokenType.STRING, "Expected entity string")
-                entity = entity_token.value.strip('"')
-    
-    # Parse relationship
-    relationship = ""
-    if self.check(TokenType.IDENTIFIER):
-        rel_token = self.advance()
-        relationship = rel_token.value
-    
-    return KnowledgeGraphStatement(operation, entity, relationship, line, column) 
+        self.property = property 

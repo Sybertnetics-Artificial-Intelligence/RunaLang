@@ -16,6 +16,7 @@ from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass, asdict
 from enum import Enum
 import re
+from datetime import datetime
 
 
 class ComplexityLevel(Enum):
@@ -136,26 +137,26 @@ class RunaTrainingDataGenerator:
             "reasoning_block": [
                 ("Start reasoning about {topic} and consider {aspects}", 
                  "Reasoning about {topic} considering {aspects}"),
-                ("Begin logical analysis of {topic} focusing on {focus}", 
-                 "Reasoning about {topic} with focus on {focus}"),
-                ("Analyze {topic} by examining {examination}", 
-                 "Reasoning about {topic} examining {examination}")
+                ("Begin logical analysis of {topic} focusing on {aspects}", 
+                 "Reasoning about {topic} with focus on {aspects}"),
+                ("Analyze {topic} by examining {aspects}", 
+                 "Reasoning about {topic} examining {aspects}")
             ],
             "implementation_block": [
                 ("Implement the solution for {problem} using {approach}", 
                  "Implementation for {problem} using {approach}"),
-                ("Create implementation of {feature} with {method}", 
-                 "Implementation of {feature} with {method}"),
-                ("Build the implementation for {component} using {technique}", 
-                 "Implementation for {component} using {technique}")
+                ("Create implementation of {problem} with {approach}", 
+                 "Implementation of {problem} with {approach}"),
+                ("Build the implementation for {problem} using {approach}", 
+                 "Implementation for {problem} using {approach}")
             ],
             "verification_block": [
                 ("Verify that {condition} is satisfied by {verification_method}", 
                  "Verify {condition} using {verification_method}"),
-                ("Check that {requirement} is met through {check_method}", 
-                 "Verify {requirement} through {check_method}"),
-                ("Validate {assertion} by {validation_approach}", 
-                 "Verify {assertion} with {validation_approach}")
+                ("Check that {condition} is met through {verification_method}", 
+                 "Verify {condition} through {verification_method}"),
+                ("Validate {condition} by {verification_method}", 
+                 "Verify {condition} with {verification_method}")
             ]
         }
         
@@ -164,42 +165,42 @@ class RunaTrainingDataGenerator:
                 "neural_network": [
                     ("Create a neural network with {layers} layers for {task}", 
                      "Define neural network with {layers} layers for {task}"),
-                    ("Build a neural network model for {task} with {architecture}", 
-                     "Neural network for {task} with {architecture}")
+                    ("Build a neural network model for {task} with {layers} layers", 
+                     "Neural network for {task} with {layers} layers")
                 ],
                 "data_processing": [
                     ("Process {data_type} data using {method}", 
                      "Process {data_type} with {method}"),
-                    ("Transform {input_data} into {output_format}", 
-                     "Transform {input_data} to {output_format}")
+                    ("Transform {data_type} into processed format using {method}", 
+                     "Transform {data_type} to processed format using {method}")
                 ]
             },
             DomainType.WEB_DEVELOPMENT: {
                 "api_endpoint": [
                     ("Create an API endpoint for {resource} that handles {operations}", 
                      "Define API endpoint for {resource} handling {operations}"),
-                    ("Build a REST endpoint for {service} with {methods}", 
-                     "REST endpoint for {service} with {methods}")
+                    ("Build a REST endpoint for {resource} with {operations}", 
+                     "REST endpoint for {resource} with {operations}")
                 ],
                 "frontend_component": [
                     ("Create a React component for {ui_element} with {props}", 
                      "Define React component for {ui_element} with {props}"),
-                    ("Build a UI component for {feature} with {styling}", 
-                     "UI component for {feature} with {styling}")
+                    ("Build a UI component for {ui_element} with {props}", 
+                     "UI component for {ui_element} with {props}")
                 ]
             },
             DomainType.DATA_SCIENCE: {
                 "data_analysis": [
                     ("Analyze {dataset} to find {insights}", 
                      "Analyze {dataset} for {insights}"),
-                    ("Perform statistical analysis on {data} to {objective}", 
-                     "Statistical analysis of {data} for {objective}")
+                    ("Perform statistical analysis on {dataset} to find {insights}", 
+                     "Statistical analysis of {dataset} for {insights}")
                 ],
                 "visualization": [
                     ("Create a {chart_type} chart showing {data_relationship}", 
                      "Define {chart_type} chart for {data_relationship}"),
-                    ("Generate visualization of {data} using {plot_type}", 
-                     "Visualization of {data} using {plot_type}")
+                    ("Generate visualization of {data_relationship} using {chart_type}", 
+                     "Visualization of {data_relationship} using {chart_type}")
                 ]
             }
         }
@@ -737,6 +738,39 @@ class RunaTrainingDataGenerator:
         print(f"Saved to {pairs_filepath}")
         
         return translation_pairs
+
+    def to_json(self) -> str:
+        """Convert the complete dataset to JSON format."""
+        dataset_dict = {
+            "metadata": {
+                "total_examples": len(self.examples),
+                "generated_at": datetime.now().isoformat(),
+                "version": "1.0",
+                "complexity_distribution": {
+                    level.value: len([ex for ex in self.examples if ex.complexity == level])
+                    for level in ComplexityLevel
+                },
+                "domain_distribution": {
+                    domain.value: len([ex for ex in self.examples if ex.domain == domain])
+                    for domain in DomainType
+                }
+            },
+            "examples": [
+                {
+                    "id": ex.id,
+                    "natural_language": ex.natural_language,
+                    "runa_code": ex.runa_code,
+                    "complexity": ex.complexity.value,  # Convert enum to string
+                    "domain": ex.domain.value,  # Convert enum to string
+                    "tags": ex.tags,
+                    "description": ex.description,
+                    "validation_status": ex.validation_status,
+                    "generated_at": ex.generated_at.isoformat() if ex.generated_at else None
+                }
+                for ex in self.examples
+            ]
+        }
+        return json.dumps(dataset_dict, indent=2, ensure_ascii=False)
 
 
 def main():

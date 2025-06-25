@@ -35,6 +35,7 @@ class NodeType(Enum):
     CONTINUE_STATEMENT = auto()
     TRY_STATEMENT = auto()
     THROW_STATEMENT = auto()
+    DISPLAY_STATEMENT = auto()
     
     # Expressions
     BINARY_EXPRESSION = auto()

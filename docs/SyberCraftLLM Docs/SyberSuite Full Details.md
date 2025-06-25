@@ -376,3 +376,19 @@
 	-	Remote Sensing Analysis: Interprets Earth observation data
 	-	Exoplanet Research: Assists in the discovery and study of planets around other stars
 	-	Space Habitat Management: Maintains life support systems for space habitation
+# Entertainment AI
+## 24. Calliope - AI for Tabletop RPG Management & Collaborative Storytelling
+	- World Generation & Universe Integration: Generates complete worlds using standardized templates with internal consistency verification and seamless integration into shared universe frameworks
+	- Campaign Coordination & Multi-DM Support: Facilitates collaboration between multiple Dungeon Masters using shared worlds with real-time conflict resolution and timeline management
+	- Rules Adjudication & Cross-System Integration: Provides authoritative rulings across D&D 5e, Pathfinder 2e, and Starfinder with seamless character and content conversion between systems
+	- Dynamic Content Creation: Creates balanced encounters, complex NPCs, engaging plot hooks, and rich environmental storytelling tailored to specific campaigns and party compositions
+	- Universe Consistency Management: Maintains timeline coordination across multiple campaigns using Galactic Standard Calendar with cross-world event tracking and consequence propagation
+	- Community Quality Control: Evaluates world submissions against community standards while providing creator support and collaboration facilitation
+	- Homebrew Integration & Balance Assessment: Seamlessly incorporates approved custom content with real-time balance evaluation and compatibility analysis
+	- Campaign Intelligence & Consequence Modeling: Provides predictive campaign analysis, player behavior insights, and universe-scale consequence tracking for meaningful narrative development
+	- Educational Storytelling Support: Facilitates creative writing education, collaborative project management, and critical thinking development through structured worldbuilding exercises
+	- Platform Integration & Collaboration Tools: Enables real-time multi-user editing, version control management, and seamless integration with popular VTT platforms and character builders
+	- Creator Economy Support: Provides revenue opportunities for world creators through marketplace integration with quality enhancement tools and professional development pathways
+	- Cross-Campaign Character Management: Handles character transfers between different campaigns and rule systems with mechanical balance preservation and narrative justification
+	- Advanced AI-Powered Analysis: Offers consistency verification, realism assessment, gap identification, and improvement suggestions for submitted worlds and ongoing campaigns
+	- Legacy Story Integration: Incorporates concluded campaigns into ongoing world history while maintaining narrative significance and cross-campaign continuity

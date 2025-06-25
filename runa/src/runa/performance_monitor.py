@@ -572,11 +572,26 @@ class PerformanceMonitor:
     def get_current_metrics(self) -> Dict[str, float]:
         """Get current performance metrics."""
         return {
-            'memory_usage_mb': psutil.Process().memory_info().rss / 1024 / 1024,
-            'cpu_usage_percent': psutil.cpu_percent(),
-            'active_monitors': len(self.active_monitors),
-            'metrics_history_size': sum(len(history) for history in self.metrics_history.values())
+            MetricType.COMPILATION_TIME.value: self._get_latest_metric(MetricType.COMPILATION_TIME),
+            MetricType.MEMORY_USAGE.value: psutil.Process().memory_info().rss / 1024 / 1024,
+            MetricType.CPU_USAGE.value: psutil.cpu_percent(),
+            MetricType.TOKENIZATION_TIME.value: self._get_latest_metric(MetricType.TOKENIZATION_TIME),
+            MetricType.PARSING_TIME.value: self._get_latest_metric(MetricType.PARSING_TIME),
+            MetricType.SEMANTIC_ANALYSIS_TIME.value: self._get_latest_metric(MetricType.SEMANTIC_ANALYSIS_TIME),
+            MetricType.BYTECODE_GENERATION_TIME.value: self._get_latest_metric(MetricType.BYTECODE_GENERATION_TIME),
+            MetricType.ERROR_COUNT.value: self._get_latest_metric(MetricType.ERROR_COUNT),
+            MetricType.WARNING_COUNT.value: self._get_latest_metric(MetricType.WARNING_COUNT)
         }
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get performance statistics (alias for get_current_metrics for backward compatibility)."""
+        return self.get_current_metrics()
+    
+    def _get_latest_metric(self, metric_type: MetricType) -> float:
+        """Get the latest value for a specific metric type."""
+        if metric_type.value in self.metrics_history and self.metrics_history[metric_type.value]:
+            return self.metrics_history[metric_type.value][-1].value
+        return 0.0
     
     def record_operation(self, operation_name: str, duration: float, context: Dict[str, Any] = None):
         """Record a custom operation performance."""

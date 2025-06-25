@@ -51,11 +51,25 @@ class TokenType(Enum):
     EACH = auto()
     WHILE = auto()
     RETURN = auto()
+    RETURNING = auto()  # Added for function return type
     IMPORT = auto()
     FROM = auto()
     EXPORT = auto()
     DISPLAY = auto()
     IN = auto()  # Added for 'in' keyword in for loops
+    
+    # Natural Language Operators
+    BY = auto()
+    IS = auto()
+    EQUAL = auto()
+    GREATER = auto()
+    THAN = auto()
+    LESS = auto()
+    FOLLOWED = auto()
+    
+    # AI Block Tokens
+    AT_SYMBOL = auto()  # @ symbol for AI blocks
+    END = auto()  # @end for AI blocks
     
     # Keywords - AI-Specific
     REASONING = auto()
@@ -215,7 +229,7 @@ class RunaLexer:
     - Performance optimized for <100ms compilation target
     """
     
-    def __init__(self, source: str, source_file: Optional[str] = None):
+    def __init__(self, source: str = "", source_file: Optional[str] = None):
         self.source = source
         self.source_file = source_file
         self.position = 0
@@ -223,97 +237,141 @@ class RunaLexer:
         self.column = 1
         self.indent_stack = [0]
         self.tokens: List[Token] = []
+        self.errors: List[str] = []
         
         # Performance optimization: pre-compile regex patterns
         self._compile_patterns()
     
+    @classmethod
+    def create_for_testing(cls) -> 'RunaLexer':
+        """Factory method for creating lexer instances for testing."""
+        return cls()
+    
+    def set_source(self, source: str, source_file: Optional[str] = None):
+        """Set source code for tokenization."""
+        self.source = source
+        self.source_file = source_file
+        self.position = 0
+        self.line = 1
+        self.column = 1
+        self.indent_stack = [0]
+        self.tokens.clear()
+        self.errors.clear()  # Clear errors when setting new source
+    
     def _compile_patterns(self):
         """Pre-compile regex patterns for performance optimization."""
-        # Keywords mapping
+        # Keywords mapping (both capitalized and lowercase for flexibility)
         self.keywords = {
-            'Let': TokenType.LET,
-            'Define': TokenType.DEFINE,
-            'Set': TokenType.SET,
-            'To': TokenType.TO,
-            'As': TokenType.AS,
-            'Be': TokenType.BE,
-            'Containing': TokenType.CONTAINING,
-            'Process': TokenType.PROCESS,
-            'Called': TokenType.CALLED,
-            'That': TokenType.THAT,
-            'Takes': TokenType.TAKES,
-            'And': TokenType.AND,
-            'Or': TokenType.OR,
-            'Not': TokenType.NOT,
-            'If': TokenType.IF,
-            'Otherwise': TokenType.OTHERWISE,
-            'For': TokenType.FOR,
-            'Each': TokenType.EACH,
-            'While': TokenType.WHILE,
-            'Return': TokenType.RETURN,
-            'Import': TokenType.IMPORT,
-            'From': TokenType.FROM,
-            'Export': TokenType.EXPORT,
-            'Display': TokenType.DISPLAY,
-            'In': TokenType.IN,  # Added for for loops
-            'Break': TokenType.BREAK,
-            'Continue': TokenType.CONTINUE,
-            'Try': TokenType.TRY,
-            'Catch': TokenType.CATCH,
-            'Finally': TokenType.FINALLY,
-            'Throw': TokenType.THROW,
-            'Raise': TokenType.RAISE,
-            'True': TokenType.TRUE,
-            'False': TokenType.FALSE,
-            'None': TokenType.NULL,
-            'Void': TokenType.VOID_TYPE,
-            'Integer': TokenType.INTEGER_TYPE,
-            'Float': TokenType.FLOAT_TYPE,
-            'String': TokenType.STRING_TYPE,
-            'Boolean': TokenType.BOOLEAN_TYPE,
-            'List': TokenType.LIST_TYPE,
-            'Dictionary': TokenType.DICTIONARY_TYPE,
-            'Function': TokenType.FUNCTION_TYPE,
+            # Core Language - both cases
+            'Let': TokenType.LET, 'let': TokenType.LET,
+            'Define': TokenType.DEFINE, 'define': TokenType.DEFINE,
+            'Set': TokenType.SET, 'set': TokenType.SET,
+            'To': TokenType.TO, 'to': TokenType.TO,
+            'As': TokenType.AS, 'as': TokenType.AS,
+            'Be': TokenType.BE, 'be': TokenType.BE,
+            'Containing': TokenType.CONTAINING, 'containing': TokenType.CONTAINING,
+            'Process': TokenType.PROCESS, 'process': TokenType.PROCESS,
+            'Called': TokenType.CALLED, 'called': TokenType.CALLED,
+            'That': TokenType.THAT, 'that': TokenType.THAT,
+            'Takes': TokenType.TAKES, 'takes': TokenType.TAKES,
+            'Returns': TokenType.RETURNING, 'returns': TokenType.RETURNING,
+            'Nothing': TokenType.NULL, 'nothing': TokenType.NULL,
+            'And': TokenType.AND, 'and': TokenType.AND,
+            'Or': TokenType.OR, 'or': TokenType.OR,
+            'Not': TokenType.NOT, 'not': TokenType.NOT,
+            'If': TokenType.IF, 'if': TokenType.IF,
+            'Otherwise': TokenType.OTHERWISE, 'otherwise': TokenType.OTHERWISE,
+            'For': TokenType.FOR, 'for': TokenType.FOR,
+            'Each': TokenType.EACH, 'each': TokenType.EACH,
+            'While': TokenType.WHILE, 'while': TokenType.WHILE,
+            'Return': TokenType.RETURN, 'return': TokenType.RETURN,
+            'Returning': TokenType.RETURNING, 'returning': TokenType.RETURNING,
+            'Import': TokenType.IMPORT, 'import': TokenType.IMPORT,
+            'From': TokenType.FROM, 'from': TokenType.FROM,
+            'Export': TokenType.EXPORT, 'export': TokenType.EXPORT,
+            'Display': TokenType.DISPLAY, 'display': TokenType.DISPLAY,
+            'In': TokenType.IN, 'in': TokenType.IN,
+            
+            # Natural Language Operators
+            'multiplied': TokenType.MULTIPLY,
+            'by': TokenType.BY,
+            'plus': TokenType.PLUS,
+            'minus': TokenType.MINUS,
+            'divided': TokenType.DIVIDE,
+            'modulo': TokenType.MODULO,
+            'power': TokenType.POWER,
+            'is': TokenType.IS,
+            'equal': TokenType.EQUAL,
+            'to': TokenType.TO,
+            'greater': TokenType.GREATER,
+            'than': TokenType.THAN,
+            'less': TokenType.LESS,
+            'followed': TokenType.FOLLOWED,
+            
+            # Control Flow
+            'Break': TokenType.BREAK, 'break': TokenType.BREAK,
+            'Continue': TokenType.CONTINUE, 'continue': TokenType.CONTINUE,
+            'Try': TokenType.TRY, 'try': TokenType.TRY,
+            'Catch': TokenType.CATCH, 'catch': TokenType.CATCH,
+            'Finally': TokenType.FINALLY, 'finally': TokenType.FINALLY,
+            'Throw': TokenType.THROW, 'throw': TokenType.THROW,
+            'Raise': TokenType.RAISE, 'raise': TokenType.RAISE,
+            
+            # Literals
+            'True': TokenType.TRUE, 'true': TokenType.TRUE,
+            'False': TokenType.FALSE, 'false': TokenType.FALSE,
+            'None': TokenType.NULL, 'none': TokenType.NULL,
+            
+            # Types
+            'Void': TokenType.VOID_TYPE, 'void': TokenType.VOID_TYPE,
+            'Integer': TokenType.INTEGER_TYPE, 'integer': TokenType.INTEGER_TYPE,
+            'Float': TokenType.FLOAT_TYPE, 'float': TokenType.FLOAT_TYPE,
+            'String': TokenType.STRING_TYPE, 'string': TokenType.STRING_TYPE,
+            'Boolean': TokenType.BOOLEAN_TYPE, 'boolean': TokenType.BOOLEAN_TYPE,
+            'List': TokenType.LIST_TYPE, 'list': TokenType.LIST_TYPE,
+            'Dictionary': TokenType.DICTIONARY_TYPE, 'dictionary': TokenType.DICTIONARY_TYPE,
+            'Function': TokenType.FUNCTION_TYPE, 'function': TokenType.FUNCTION_TYPE,
+            
             # AI-specific keywords
-            'Reasoning': TokenType.REASONING,
-            'End_reasoning': TokenType.END_REASONING,
-            'Implementation': TokenType.IMPLEMENTATION,
-            'End_implementation': TokenType.END_IMPLEMENTATION,
-            'Verify': TokenType.VERIFY,
-            'End_verify': TokenType.END_VERIFY,
-            'Send': TokenType.SEND,
-            'With': TokenType.WITH,
-            'Context': TokenType.CONTEXT,
-            'Task': TokenType.TASK,
-            'Include': TokenType.INCLUDE,
-            'Request': TokenType.REQUEST,
-            'Define_ai': TokenType.DEFINE_AI,
-            'Agent': TokenType.AGENT,
-            'Purpose': TokenType.PURPOSE,
-            'Capability': TokenType.CAPABILITY,
-            'Modify': TokenType.MODIFY,
-            'Safety': TokenType.SAFETY,
-            'Constraint': TokenType.CONSTRAINT,
-            'Validation': TokenType.VALIDATION,
-            'Knowledge': TokenType.KNOWLEDGE,
-            'Query': TokenType.QUERY,
-            'Graph': TokenType.GRAPH,
-            'Neural': TokenType.NEURAL,
-            'Network': TokenType.NETWORK,
-            'Layer': TokenType.LAYER,
-            'Activation': TokenType.ACTIVATION,
-            'Loss': TokenType.LOSS,
-            'Optimizer': TokenType.OPTIMIZER,
+            'End_reasoning': TokenType.END_REASONING, 'end_reasoning': TokenType.END_REASONING,
+            'Implementation': TokenType.IMPLEMENTATION, 'implementation': TokenType.IMPLEMENTATION,
+            'End_implementation': TokenType.END_IMPLEMENTATION, 'end_implementation': TokenType.END_IMPLEMENTATION,
+            'Verify': TokenType.VERIFY, 'verify': TokenType.VERIFY,
+            'End_verify': TokenType.END_VERIFY, 'end_verify': TokenType.END_VERIFY,
+            'Send': TokenType.SEND, 'send': TokenType.SEND,
+            'With': TokenType.WITH, 'with': TokenType.WITH,
+            'Context': TokenType.CONTEXT, 'context': TokenType.CONTEXT,
+            'Task': TokenType.TASK, 'task': TokenType.TASK,
+            'Include': TokenType.INCLUDE, 'include': TokenType.INCLUDE,
+            'Request': TokenType.REQUEST, 'request': TokenType.REQUEST,
+            'Define_ai': TokenType.DEFINE_AI, 'define_ai': TokenType.DEFINE_AI,
+            'Agent': TokenType.AGENT, 'agent': TokenType.AGENT,
+            'Purpose': TokenType.PURPOSE, 'purpose': TokenType.PURPOSE,
+            'Capability': TokenType.CAPABILITY, 'capability': TokenType.CAPABILITY,
+            'Modify': TokenType.MODIFY, 'modify': TokenType.MODIFY,
+            'Safety': TokenType.SAFETY, 'safety': TokenType.SAFETY,
+            'Constraint': TokenType.CONSTRAINT, 'constraint': TokenType.CONSTRAINT,
+            'Validation': TokenType.VALIDATION, 'validation': TokenType.VALIDATION,
+            'Knowledge': TokenType.KNOWLEDGE, 'knowledge': TokenType.KNOWLEDGE,
+            'Query': TokenType.QUERY, 'query': TokenType.QUERY,
+            'Graph': TokenType.GRAPH, 'graph': TokenType.GRAPH,
+            'Neural': TokenType.NEURAL, 'neural': TokenType.NEURAL,
+            'Network': TokenType.NETWORK, 'network': TokenType.NETWORK,
+            'Layer': TokenType.LAYER, 'layer': TokenType.LAYER,
+            'Activation': TokenType.ACTIVATION, 'activation': TokenType.ACTIVATION,
+            'Loss': TokenType.LOSS, 'loss': TokenType.LOSS,
+            'Optimizer': TokenType.OPTIMIZER, 'optimizer': TokenType.OPTIMIZER,
+            
             # AI Communication keywords
-            'Ask': TokenType.ASK,
-            'Tell': TokenType.TELL,
-            'Instruct': TokenType.INSTRUCT,
-            'Delegate': TokenType.DELEGATE,
-            'Wait': TokenType.WAIT,
-            'Broadcast': TokenType.BROADCAST,
-            'Coordinate': TokenType.COORDINATE,
-            'About': TokenType.ABOUT,
-            'Relationship': TokenType.RELATIONSHIP,
+            'Ask': TokenType.ASK, 'ask': TokenType.ASK,
+            'Tell': TokenType.TELL, 'tell': TokenType.TELL,
+            'Instruct': TokenType.INSTRUCT, 'instruct': TokenType.INSTRUCT,
+            'Delegate': TokenType.DELEGATE, 'delegate': TokenType.DELEGATE,
+            'Wait': TokenType.WAIT, 'wait': TokenType.WAIT,
+            'Broadcast': TokenType.BROADCAST, 'broadcast': TokenType.BROADCAST,
+            'Coordinate': TokenType.COORDINATE, 'coordinate': TokenType.COORDINATE,
+            'About': TokenType.ABOUT, 'about': TokenType.ABOUT,
+            'Relationship': TokenType.RELATIONSHIP, 'relationship': TokenType.RELATIONSHIP,
         }
         
         # Regex patterns for performance
@@ -331,17 +389,28 @@ class RunaLexer:
             'pipe': re.compile(r'\|'),
         }
     
-    def tokenize(self) -> List[Token]:
+    def tokenize(self, source: Optional[str] = None) -> List[Token]:
         """
         Tokenize the source code into a list of tokens.
         
+        Args:
+            source: Optional source code to tokenize. If not provided, uses instance source.
+            
         Returns:
             List of tokens with comprehensive metadata
             
         Raises:
             LexerError: For lexical errors with detailed context
         """
+        if source is not None:
+            self.set_source(source)
+        
         self.tokens = []
+        
+        # Handle initial indentation if the file starts with spaces
+        if self.source and self.source[0].isspace():
+            indent_level = self._calculate_indent()
+            self._handle_indentation(indent_level)
         
         while self.position < len(self.source):
             char = self.source[self.position]
@@ -362,7 +431,7 @@ class RunaLexer:
                 continue
             
             # Handle strings
-            if char == '"':
+            if char == '"' or char == "'":
                 self._handle_string()
                 continue
             
@@ -381,6 +450,11 @@ class RunaLexer:
                 self._handle_operator_or_delimiter()
                 continue
             
+            # Handle @ symbols for AI blocks
+            if char == '@':
+                self._handle_at_symbol()
+                continue
+            
             # Handle arrows and pipes
             if char == '-' and self._peek(1) == '>':
                 self._add_token(TokenType.ARROW, '->')
@@ -396,6 +470,11 @@ class RunaLexer:
             
             # Unknown character
             self._error(f"Unexpected character: '{char}'")
+        
+        # Add final dedent tokens for any remaining indentation levels
+        while len(self.indent_stack) > 1:
+            self.indent_stack.pop()
+            self._add_token(TokenType.DEDENT, '')
         
         # Add EOF token
         self._add_token(TokenType.EOF, '')
@@ -416,15 +495,15 @@ class RunaLexer:
                 self._add_token(TokenType.NEWLINE, '\n')
                 self.line += 1
                 self.column = 1
+                self.position += 1
                 
                 # Handle indentation on next line
-                if self.position + 1 < len(self.source):
+                if self.position < len(self.source):
                     indent_level = self._calculate_indent()
                     self._handle_indentation(indent_level)
             else:
                 self.column += 1
-            
-            self.position += 1
+                self.position += 1
     
     def _calculate_indent(self) -> int:
         """Calculate indentation level for current line."""
@@ -501,6 +580,7 @@ class RunaLexer:
         """Handle string literals."""
         start_pos = self.position
         start_column = self.column
+        quote_char = self.source[self.position]  # Get the quote character (' or ")
         
         # Skip opening quote
         self.position += 1
@@ -508,7 +588,7 @@ class RunaLexer:
         
         # Find closing quote
         while (self.position < len(self.source) and 
-               self.source[self.position] != '"'):
+               self.source[self.position] != quote_char):
             char = self.source[self.position]
             if char == '\n':
                 self.line += 1
@@ -563,6 +643,15 @@ class RunaLexer:
             self.column += 1
         
         identifier = self.source[start_pos:self.position]
+        
+        # Check for multi-word natural language operators
+        if identifier == "followed":
+            # Look ahead for "by"
+            if self._peek(3) == " by":
+                self.position += 3
+                self.column += 3
+                self._add_token(TokenType.FOLLOWED, "followed by")
+                return
         
         # Check if it's a keyword (case-sensitive)
         if identifier in self.keywords:
@@ -666,4 +755,35 @@ class RunaLexer:
     
     def _error(self, message: str):
         """Raise a lexer error with detailed context."""
-        raise LexerError(message, self.line, self.column, self.source_file) 
+        raise LexerError(message, self.line, self.column, self.source_file)
+    
+    def _handle_at_symbol(self):
+        """Handle @ symbols for AI blocks."""
+        start_pos = self.position
+        start_column = self.column
+        
+        # Skip the @ symbol
+        self.position += 1
+        self.column += 1
+        
+        # Read the identifier after @
+        while (self.position < len(self.source) and 
+               (self.source[self.position].isalnum() or 
+                self.source[self.position] == '_')):
+            self.position += 1
+            self.column += 1
+        
+        identifier = self.source[start_pos + 1:self.position]
+        
+        # Check for specific AI block keywords
+        if identifier == 'reasoning':
+            self._add_token(TokenType.REASONING, '@reasoning')
+        elif identifier == 'implementation':
+            self._add_token(TokenType.IMPLEMENTATION, '@implementation')
+        elif identifier == 'verify':
+            self._add_token(TokenType.VERIFY, '@verify')
+        elif identifier == 'end':
+            self._add_token(TokenType.END, '@end')
+        else:
+            # Generic @ symbol with identifier
+            self._add_token(TokenType.AT_SYMBOL, f"@{identifier}") 

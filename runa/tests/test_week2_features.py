@@ -355,7 +355,7 @@ Return result
     def test_performance_integration(self):
         """Test performance integration across all Week 2 components."""
         source = '''
-Process called "Complex Test" that takes data:
+Process called Complex_Test with data as Any:
     Let processed_data Be data
     Ask coding_llm about "How to optimize this"
     Delegate task "analyze performance" to performance_agent

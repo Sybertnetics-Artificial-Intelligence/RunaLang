@@ -48,18 +48,17 @@ All context-sensitive parsing, vector semantics, LLM/agent constructs, self-modi
 - [x] Create comprehensive type system test suite
 - [x] **VALIDATION**: Memory usage test - <500MB for complex type operations
 
-#### **Week 4: Dual Compilation System & Native VM**
-- [ ] Implement primary compilation path (Runa Bytecode → C++ VM)
-- [ ] Build secondary compilation path (Universal Translation → Target Languages)
-- [ ] Create native C++ VM with high-performance execution
-- [ ] Implement instruction set optimized for AI operations
-- [ ] Build memory management and garbage collection
-- [ ] Create Python bindings for interoperability
-- [ ] Implement bytecode optimization passes
-- [ ] Add performance monitoring and profiling
-- [ ] Create VM debugging capabilities
-- [ ] Build foundation for JIT compilation
-- [ ] **VALIDATION**: Bootstrap phase 1 - Python compiler generates C++
+#### **Week 4: Dual Compilation System & Runa VM**
+- [x] **Consolidate all VM development to runa/src/runa/vm.runa**
+- [x] Remove/merge any duplicate or legacy VM files
+- [x] All new VM features, optimizations, and debugging implemented in Runa syntax
+- [x] Python bootstrap runner (runa_bootstrap.py) is used for all execution and testing
+- [x] No new Python VM code—Python is only for bootstrapping
+- [ ] C++ VM work is paused until Runa VM/compiler are self-hosting and stable
+- [ ] Update documentation to reflect single Runa VM file and new development flow
+- [ ] Continue all new development in Runa syntax only; use the Python bootstrap runner for all execution/testing
+- [ ] All new features, optimizations, and debugging should be implemented in Runa syntax
+- [ ] C++ VM work resumes only after the Runa VM and compiler are stable and self-hosting
 
 ### **Weeks 5-8: Core Language Features & AI Integration**
 
@@ -194,6 +193,8 @@ All context-sensitive parsing, vector semantics, LLM/agent constructs, self-modi
 
 #### **Week 11-12: Self-Hosting Validation & Performance Optimization**
 - [ ] **CRITICAL: Implement and validate self-hosting capability**
+- [ ] **NEW BOOTSTRAP APPROACH**: Runa compiler written in Runa
+- [ ] **NEW BOOTSTRAP APPROACH**: Runa → C++ code generator
 - [ ] Test Runa compiler compiling itself with output equivalence
 - [ ] Validate 99.9% translation accuracy across all 43 Tier 1 languages
 - [ ] Achieve <100ms compilation performance for 1000-line programs

@@ -5,13 +5,17 @@ Simple test for Runa compiler pipeline.
 Tests basic compilation and execution of simple Runa programs.
 """
 
+# NOTE: The VM is now implemented in Runa (vm.runa), not Python.
+# This test must be ported to use the Runa toolchain for VM execution.
+# import from runa.vm is no longer valid.
+# from runa.vm import get_vm  # <-- REMOVE or port to Runa
+
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from runa.compiler import Compiler
 from runa.runtime import get_runtime
-from runa.vm import get_vm
 
 
 def test_simple_compilation():

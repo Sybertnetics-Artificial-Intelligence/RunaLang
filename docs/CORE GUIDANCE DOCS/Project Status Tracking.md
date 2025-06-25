@@ -8,12 +8,14 @@
 
 ## Runa Programming Language Status (Weeks 1-24) - WEEK 3 COMPLETE
 
-### Phase 1: Foundation & Core Language (Weeks 1-8) - WEEK 3 COMPLETE
+### Phase 1: Core Language Foundation (Weeks 1-4) - CURRENT PHASE
 
 | Component | Status | Progress | Dependencies | Notes |
 |-----------|--------|----------|--------------|-------|
-| **Project Setup & Architecture** | Complete | 100% | None | Monorepo structure, hybrid compilation architecture, CI/CD, training data, performance monitoring, and self-hosting validation complete |
-| - Monorepo Structure Creation | Complete | 100% | None | Structure supports both Runa and HermodIDE with all required directories, package.json files, and configuration |
+| **Project Setup & Architecture** | Complete | 100% | None | Monorepo structure, hybrid compilation architecture, CI/CD, training data, 
+performance monitoring, and self-hosting validation complete |
+| - Monorepo Structure Creation | Complete | 100% | None | Structure supports both Runa and HermodIDE with all required directories, 
+package.json files, and configuration |
 | - Hybrid Compilation Architecture | Complete | 100% | None | Runa Bytecode + Universal Translation implemented |
 | - CI/CD Pipeline | Complete | 100% | Environment | Separate workflows for Runa and Hermod with performance validation |
 | - Development Environment | Complete | 100% | Structure | Python 3.11+, C++, Node.js |
@@ -23,7 +25,8 @@
 | - **Training Data Generation Framework** | Complete | 100% | None | 100,000+ examples target ready |
 | - **Performance Monitoring** | Complete | 100% | None | <100ms compilation target tracking |
 | - **Self-Hosting Validation Framework** | Complete | 100% | None | Bootstrap process validated, all tests passing |
-| **Lexer & Grammar** | Complete | 100% | Project Setup | Production-ready implementation with 50+ tokens, AI constructs, natural language syntax |
+| **Lexer & Grammar** | Complete | 100% | Project Setup | Production-ready implementation with 50+ tokens, AI constructs, natural language 
+syntax |
 | - Token Definitions (50+ tokens) | Complete | 100% | None | All language constructs including AI-specific tokens |
 | - EBNF Grammar Specification | Complete | 100% | Tokens | Complete formal grammar implemented |
 | - Lexer Implementation | Complete | 100% | Grammar | Comprehensive error handling and performance optimization |
@@ -47,11 +50,39 @@
 | - Virtual Machine (Bootstrap) | Complete | 100% | Bytecode | Python-based foundation with optimization |
 | - Memory Management | Complete | 100% | VM | Basic heap/stack management implemented |
 | - **Bootstrap Phase 1 Validation** | Complete | 100% | VM | Python compiler generates C++ successfully |
+| **Week 1: Lexer & Parser Foundation** | ✅ COMPLETE | 100% | None | Natural language parsing |
+| **Week 2: Semantic Analysis & AST** | ✅ COMPLETE | 100% | Week 1 | Vector-based disambiguation |
+| **Week 3: Type System & Inference** | ✅ COMPLETE | 100% | Week 2 | Enhanced type system |
+| **Week 4: Dual Compilation System & Runa VM** | 🔄 IN PROGRESS | 25% | Week 3 | **NEW DIRECTION: Pure Runa VM** |
+| - **Runa VM Implementation** | 🔄 IN PROGRESS | 25% | Week 3 | **Written in Runa syntax from start** |
+| - **Python Bootstrap Runner** | Not Started | 0% | Runa VM | Python executes Runa VM |
+| - **Dual Compilation Paths** | Not Started | 0% | Runa VM | Primary: Runa→C++, Secondary: Universal Translation |
+| - **Bytecode Optimization** | Not Started | 0% | Runa VM | Multi-pass optimization |
+| - **Performance Monitoring** | Not Started | 0% | Runa VM | <100ms compilation target |
+| - **VM Debugging** | Not Started | 0% | Runa VM | Debug capabilities |
+| - **Bootstrap Validation** | Not Started | 0% | All Components | Python runs Runa VM successfully |
 
-### Phase 2: Core Language Features (Weeks 9-12) - AWAITING PHASE 1
+### Phase 2: Language Features & Universal Translation (Weeks 5-12)
 
 | Component | Status | Progress | Dependencies | Notes |
 |-----------|--------|----------|--------------|-------|
+| **Core Language Features** | Awaiting Phase 1 | 0% | Phase 1 Complete | Natural language constructs |
+| - Control Flow (if/else, loops) | Awaiting Phase 1 | 0% | VM | Iteration constructs |
+| - Pattern Matching | Awaiting Phase 1 | 0% | Type System | Advanced pattern support |
+| - Functions & Closures | Awaiting Phase 1 | 0% | VM | First-class functions |
+| **Universal Translation Engine** | Awaiting Phase 1 | 0% | Core Features | Rosetta Stone capability |
+| - **Tier 1 Language Generators** | Awaiting Phase 1 | 0% | Core Features | 43+ language support |
+| - **Semantic Equivalence Validation** | Awaiting Phase 1 | 0% | Generators | 99.9% accuracy requirement |
+| - **Translation Framework** | Awaiting Phase 1 | 0% | Core Features | AST → IR → Target |
+| **Performance Optimization** | Awaiting Phase 1 | 0% | Core Features | Optimization framework |
+| - Bytecode Optimizer | Awaiting Phase 1 | 0% | VM | Multi-pass optimization |
+| - JIT Compilation (Basic) | Awaiting Phase 1 | 0% | Optimizer | Hot path optimization |
+| - Memory Optimization | Awaiting Phase 1 | 0% | JIT | Efficient memory usage |
+| **Development Tools** | Awaiting Phase 1 | 0% | Optimization | Developer experience |
+| - LSP Server | Awaiting Phase 1 | 0% | Language Complete | Language Server Protocol |
+| - REPL | Awaiting Phase 1 | 0% | LSP | Interactive development |
+| - Visual Debugger | Awaiting Phase 1 | 0% | REPL | Graphical debugging |
+| - **LSP Performance Validation** | Awaiting Phase 1 | 0% | LSP Server | <50ms for all operations |
 | **Standard Library** | Awaiting Phase 1 | 0% | Phase 1 Complete | Core modules and utilities |
 | - core.runa | Awaiting Phase 1 | 0% | VM | Fundamental operations |
 | - io.runa | Awaiting Phase 1 | 0% | VM | File and network I/O |
@@ -68,37 +99,27 @@
 | **Control Flow & Advanced Features** | Awaiting Phase 1 | 0% | Error Handling | Language constructs |
 | - Conditionals (if-otherwise) | Awaiting Phase 1 | 0% | VM | Control flow statements |
 | - Loops (for-each, while) | Awaiting Phase 1 | 0% | VM | Iteration constructs |
-| - Pattern Matching | Awaiting Phase 1 | 0% | Type System | Advanced pattern support |
-| - Functions & Closures | Awaiting Phase 1 | 0% | VM | First-class functions |
-| **Performance Optimization** | Awaiting Phase 1 | 0% | Control Flow | Optimization framework |
-| - Bytecode Optimizer | Awaiting Phase 1 | 0% | VM | Multi-pass optimization |
-| - JIT Compilation (Basic) | Awaiting Phase 1 | 0% | Optimizer | Hot path optimization |
-| - Memory Optimization | Awaiting Phase 1 | 0% | JIT | Efficient memory usage |
-| **Development Tools** | Awaiting Phase 1 | 0% | Optimization | Developer experience |
-| - LSP Server | Awaiting Phase 1 | 0% | Language Complete | Language Server Protocol |
-| - REPL | Awaiting Phase 1 | 0% | LSP | Interactive development |
-| - Visual Debugger | Awaiting Phase 1 | 0% | REPL | Graphical debugging |
-| - **LSP Performance Validation** | Awaiting Phase 1 | 0% | LSP Server | <50ms for all operations |
 
 ### Phase 3: Self-Hosting & C++ Implementation (Weeks 13-18) - CRITICAL NEW PHASE
 
 | Component | Status | Progress | Dependencies | Notes |
 |-----------|--------|----------|--------------|-------|
-| **Runa Self-Compilation** | Awaiting Phase 2 | 0% | Phase 2 Complete | CRITICAL FOR CREDIBILITY |
-| - Runa → C++ Code Generator | Awaiting Phase 2 | 0% | Language Complete | Bootstrap compiler |
-| - Self-Hosting Validation | Awaiting Phase 2 | 0% | C++ Generator | Runa compiles itself |
-| - Performance Comparison | Awaiting Phase 2 | 0% | Self-Hosting | C++ vs Python metrics |
-| - **Complete Self-Hosting Validation** | Awaiting Phase 2 | 0% | Self-Hosting | Run `validate_self_hosting.py` |
-| **Native C++ VM Implementation** | Awaiting Self-Compilation | 0% | Self-Compilation | PERFORMANCE CRITICAL |
-| - C++ Bytecode VM | Awaiting Self-Compilation | 0% | Instruction Set | Native performance |
-| - JIT Compilation (Advanced) | Awaiting Self-Compilation | 0% | C++ VM | Machine code generation |
-| - SIMD Optimization | Awaiting Self-Compilation | 0% | JIT | Vector operations |
-| - Memory Management (C++) | Awaiting Self-Compilation | 0% | C++ VM | Efficient heap/stack |
-| **Universal Translation Core** | Awaiting C++ VM | 0% | C++ VM | FRAMEWORK FOUNDATION |
-| - Abstract Translation Framework | Awaiting C++ VM | 0% | C++ VM | AST → IR → Target |
-| - Plugin Architecture | Awaiting C++ VM | 0% | Framework | Language-specific generators |
-| - Validation Infrastructure | Awaiting C++ VM | 0% | Plugins | Accuracy measurement |
-| - **Translation Accuracy Validation** | Awaiting C++ VM | 0% | Validation Infrastructure | >99.9% for first 10 languages |
+| **Runa Self-Compilation** | Awaiting Phase 2 | 0% | Phase 2 Complete | **NEW BOOTSTRAP APPROACH** |
+| - **Runa Compiler (written in Runa)** | Awaiting Phase 2 | 0% | Language Complete | **Self-hosting compiler** |
+| - **Runa → C++ Code Generator** | Awaiting Phase 2 | 0% | Runa Compiler | **Bootstrap to C++** |
+| - **Self-Hosting Validation** | Awaiting Phase 2 | 0% | C++ Generator | **Runa compiles itself** |
+| - **Performance Comparison** | Awaiting Phase 2 | 0% | Self-Hosting | **C++ vs Python metrics** |
+| - **Complete Self-Hosting Validation** | Awaiting Phase 2 | 0% | Self-Hosting | **Run `validate_self_hosting.py`** |
+| **Native C++ VM Implementation** | Awaiting Self-Compilation | 0% | Self-Compilation | **PERFORMANCE CRITICAL** |
+| - C++ Bytecode VM | Awaiting Self-Compilation | 0% | Instruction Set | **Native performance** |
+| - JIT Compilation (Advanced) | Awaiting Self-Compilation | 0% | C++ VM | **Machine code generation** |
+| - SIMD Optimization | Awaiting Self-Compilation | 0% | JIT | **Vector operations** |
+| - Memory Management (C++) | Awaiting Self-Compilation | 0% | C++ VM | **Efficient heap/stack** |
+| **Universal Translation Core** | Awaiting C++ VM | 0% | C++ VM | **FRAMEWORK FOUNDATION** |
+| - Abstract Translation Framework | Awaiting C++ VM | 0% | C++ VM | **AST → IR → Target** |
+| - Plugin Architecture | Awaiting C++ VM | 0% | Framework | **Language-specific generators** |
+| - Validation Infrastructure | Awaiting C++ VM | 0% | Plugins | **Accuracy measurement** |
+| - **Translation Accuracy Validation** | Awaiting C++ VM | 0% | Validation Infrastructure | **>99.9% for first 10 languages** |
 
 ### Phase 4: Universal Translation (Weeks 19-24) - COMPREHENSIVE LANGUAGE SUPPORT
 

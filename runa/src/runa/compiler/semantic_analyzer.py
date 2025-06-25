@@ -445,6 +445,7 @@ class SemanticAnalyzer:
         self.warnings: List[SemanticError] = []
         self.type_checker = TypeChecker()
         self.vector_semantic_engine = VectorSemanticEngine()
+        self.vector_engine = VectorEngine()
         self.context_manager = ContextManager()
         
         # Performance tracking
@@ -498,9 +499,13 @@ class SemanticAnalyzer:
             # Check for undefined symbols
             self._check_undefined_symbols()
             
+            # Return False if there are errors, True otherwise
             return len(self.errors) == 0
             
         except Exception as e:
+            if isinstance(e, SemanticError):
+                self.errors.append(e)
+                return False
             self.errors.append(SemanticError(f"Unexpected error during analysis: {e}", program))
             return False
     
