@@ -1,488 +1,328 @@
-# Runa Formal Grammar Specification
+# Runa Comprehensive Grammar Rules
+# Complete EBNF grammar for universal language translation
+
+# =============================================================================
+# Top-Level Structure
+# =============================================================================
+
+program                 ::= (statement | declaration | ai_annotation)* EOF
+
+# =============================================================================
+# Statements
+# =============================================================================
+
+statement              ::= simple_statement
+                        | compound_statement
+                        | flow_control_statement
+                        | error_handling_statement
+                        | concurrency_statement
+                        | memory_statement
 
-This document defines the formal grammar for the Runa programming language using Extended Backus-Naur Form (EBNF).
+simple_statement       ::= let_statement
+                        | define_statement  
+                        | set_statement
+                        | expression_statement
+                        | return_statement
+                        | yield_statement
+                        | break_statement
+                        | continue_statement
+                        | throw_statement
+                        | assert_statement
+                        | display_statement
+                        | delete_statement
+                        | await_statement
+                        | send_statement
 
-## Notation
+compound_statement     ::= if_statement
+                        | unless_statement
+                        | when_statement
+                        | match_statement
+                        | switch_statement
+                        | for_loop
+                        | while_loop
+                        | do_while_loop
+                        | repeat_loop
+                        | infinite_loop
+                        | async_block
+                        | atomic_block
+                        | lock_statement
+                        | with_statement
 
-The grammar uses the following notation:
-- `::=` means "is defined as"
-- `|` means "or"
-- `+` means "one or more occurrences"
-- `*` means "zero or more occurrences"
-- `?` means "zero or one occurrence"
-- `( )` groups items together
-- `[ ]` represents a character class
-- `" "` encloses terminal strings
-- `/* */` indicates comments
+# =============================================================================
+# Variable Declarations and Assignments
+# =============================================================================
 
-## Core Grammar
+let_statement          ::= "Let" identifier type_annotation? "be" expression
+                        | "Let" pattern "be" expression
 
-### Program Structure
+define_statement       ::= "Define" identifier type_annotation? "as" expression
+                        | "Define" "constant" identifier type_annotation? "as" expression
 
-```ebnf
-/* Top-level program structure */
-Program         ::= Statement+
+set_statement          ::= "Set" assignable "to" expression
 
-/* Statements */
-Statement       ::= Declaration
-                  | Assignment
-                  | Conditional
-                  | Loop
-                  | ProcessDefinition
-                  | ReturnStatement
-                  | DisplayStatement
-                  | Block
-                  | ImportStatement
-                  | TryCatchStatement
-                  | WhileLoop
-                  | CommentLine
-                  | MatchStatement
-                  | TypeDefinition
-                  | AnnotationBlock
-```
-
-### Comments
-
-```ebnf
-CommentLine     ::= "#" [^\n]* "\n"
-```
-
-### Declarations and Assignments
-
-```ebnf
-/* Declarations */
-Declaration     ::= "Let" Identifier OptionalType "be" Expression
-                  | "Define" Identifier OptionalType "as" Expression
-                  | "Define" Identifier OptionalType "as" "list" "containing" ExpressionList
-
-/* Optional Type Annotation */
-OptionalType    ::= ("(" TypeExpression ")")? 
-
-/* Assignment */
-Assignment      ::= "Set" Identifier "to" Expression
-```
-
-### Type System
-
-```ebnf
-/* Type Definitions */
-TypeDefinition  ::= "Type" Identifier TypeParameters? "is" TypeExpression
-                  | "Type" Identifier TypeParameters? "is" "Interface" "with" ":" INDENT InterfaceMembers DEDENT
-                  | "Type" Identifier TypeParameters? "is" VariantDefinition
-
-TypeParameters  ::= "[" TypeParameter ("," TypeParameter)* "]"
-
-TypeParameter   ::= Identifier (":" TypeConstraint)?
-
-TypeConstraint  ::= Identifier ("+" Identifier)*
-
-TypeExpression  ::= BasicType
-                  | GenericType
-                  | UnionType
-                  | IntersectionType
-                  | FunctionType
-                  | OptionalType
-
-BasicType       ::= "Integer" | "Float" | "String" | "Boolean" | "Any" | "None"
-
-GenericType     ::= Identifier "[" TypeExpression ("," TypeExpression)* "]"
-
-UnionType       ::= TypeExpression ("OR" TypeExpression)+
-
-IntersectionType ::= TypeExpression ("AND" TypeExpression)+
-
-FunctionType    ::= "Function" "[" TypeExpression ("," TypeExpression)* "," TypeExpression "]"
-
-OptionalType    ::= "Optional" "[" TypeExpression "]"
-
-InterfaceMembers ::= InterfaceMember+
-
-InterfaceMember ::= Identifier "as" TypeExpression
-
-VariantDefinition ::= "|" VariantCase ("|" VariantCase)*
-
-VariantCase     ::= Identifier ("with" ParameterList)?
-```
-
-### Expressions
-
-```ebnf
-/* Basic expressions */
-Expression      ::= Literal
-                  | Identifier
-                  | BinaryExpression
-                  | FunctionCall
-                  | ListExpression
-                  | DictionaryExpression
-                  | IndexAccess
-                  | MemberAccess
-                  | "(" Expression ")"
-                  | "the" "sum" "of" "all" Identifier "in" Identifier
-                  | "length" "of" Expression
-                  | Expression "multiplied" "by" Expression
-                  | Expression "plus" Expression
-                  | Expression "minus" Expression
-                  | Expression "divided" "by" Expression
-                  | Expression "followed" "by" Expression
-                  | Expression "at" "index" Expression
-                  | "index" "of" Expression "in" Expression
-                  | "convert" "to" Identifier "(" Expression ")"
-                  | LambdaExpression
-                  | PipelineExpression
-                  | AsyncExpression
-                  | AwaitExpression
-                  | TypeAssertion
+assignable             ::= identifier
+                        | member_access
+                        | index_access
 
-/* Literals */
-Literal         ::= StringLiteral
-                  | NumberLiteral
-                  | BooleanLiteral
-                  | NullLiteral
+type_annotation        ::= "(" type_expression ")"
 
-StringLiteral   ::= '"' [^"]* '"'
-                  | "'" [^']* "'"
-NumberLiteral   ::= [0-9]+ ('.' [0-9]+)?
-BooleanLiteral  ::= "true" | "false"
-NullLiteral     ::= "null" | "none"
+# =============================================================================
+# Type Expressions
+# =============================================================================
 
-/* Binary expressions */
-BinaryExpression ::= Expression Operator Expression
+type_expression        ::= basic_type
+                        | generic_type
+                        | union_type
+                        | intersection_type
+                        | function_type
+                        | optional_type
+                        | array_type
+                        | tuple_type
+                        | record_type
+                        | type_identifier
 
-Operator        ::= "is" "greater" "than"
-                  | "is" "less" "than"
-                  | "is" "equal" "to"
-                  | "is" "not" "equal" "to"
-                  | "is" "greater" "than" "or" "equal" "to"
-                  | "is" "less" "than" "or" "equal" "to"
-                  | "and"
-                  | "or"
-                  | "contains"
-                  | "is" "of" "type"
+basic_type             ::= "Integer" | "Float" | "String" | "Boolean" 
+                        | "Character" | "Byte" | "Any" | "Void" | "Never"
 
-/* Collections */
-ListExpression  ::= "list" "containing" ExpressionList
-                  | "[" ExpressionList "]"
+generic_type           ::= type_identifier "[" type_list "]"
 
-ExpressionList  ::= Expression ("," Expression)* | ""
+union_type             ::= type_expression ("OR" type_expression)+
 
-DictionaryExpression ::= "dictionary" "with" ":" INDENT KeyValuePair+ DEDENT
-                      | "{" KeyValuePair ("," KeyValuePair)* "}"
+intersection_type      ::= type_expression ("AND" type_expression)+
 
-KeyValuePair    ::= StringLiteral "as" Expression
-                  | Identifier "as" Expression
+function_type          ::= "Function" "[" type_list "," type_expression "]"
 
-/* Access Operations */
-IndexAccess     ::= Identifier "[" Expression "]"
-MemberAccess    ::= Identifier "." Identifier
+optional_type          ::= "Optional" "[" type_expression "]"
 
-/* Functional Programming */
-LambdaExpression ::= "lambda" ParameterList ":" Expression
+array_type             ::= "Array" "[" type_expression ("," expression)? "]"
 
-PipelineExpression ::= Expression "|>" Identifier
+tuple_type             ::= "Tuple" "[" type_list "]"
 
-/* Asynchronous Programming */
-AsyncExpression ::= "async" Expression
+record_type            ::= "Record" "with" ":" INDENT record_fields DEDENT
 
-AwaitExpression ::= "await" Expression
+record_fields          ::= (identifier "as" type_expression)+
 
-/* Type Operations */
-TypeAssertion   ::= Expression "as" TypeExpression
-```
+type_list              ::= type_expression ("," type_expression)*
 
-### Control Structures
+# =============================================================================
+# Control Flow Statements
+# =============================================================================
 
-```ebnf
-/* Control structures */
-Conditional     ::= "If" Expression ":" Block ("Otherwise" "if" Expression ":" Block)* ("Otherwise" ":" Block)?
+if_statement           ::= "If" expression ":" block 
+                          ("Otherwise" "if" expression ":" block)*
+                          ("Otherwise" ":" block)?
 
-Loop            ::= "For" "each" Identifier "in" Expression ":" Block
+unless_statement       ::= "Unless" expression ":" block
 
-WhileLoop       ::= "While" Expression ":" Block
+when_statement         ::= "When" expression ":" block
 
-Block           ::= INDENT Statement+ DEDENT
-                  | "{" Statement+ "}"
+match_statement        ::= "Match" expression ":" INDENT match_cases DEDENT
 
-/* Error handling */
-TryCatchStatement ::= "Try" ":" Block "Catch" Identifier ":" Block
+match_cases            ::= match_case+
 
-/* Pattern Matching */
-MatchStatement  ::= "Match" Expression ":" INDENT MatchCase+ DEDENT
+match_case             ::= "When" pattern guard? ":" block
 
-MatchCase       ::= "When" Pattern ("If" Expression)? ":" Block
+guard                  ::= "where" expression
 
-Pattern         ::= LiteralPattern
-                  | IdentifierPattern
-                  | ListPattern
-                  | DictionaryPattern
-                  | VariantPattern
-                  | TypePattern
-                  | WildcardPattern
+switch_statement       ::= "Switch" expression ":" INDENT switch_cases DEDENT
 
-LiteralPattern  ::= Literal
+switch_cases           ::= switch_case+ default_case?
 
-IdentifierPattern ::= Identifier
+switch_case            ::= "Case" expression ":" block fallthrough?
 
-ListPattern     ::= "list" "containing" PatternList
-                  | "[" PatternList "]"
+default_case           ::= "Default" ":" block
 
-PatternList     ::= Pattern ("," Pattern)* | ""
+fallthrough            ::= "Fallthrough"
 
-DictionaryPattern ::= "dictionary" "with" ":" INDENT PatternKeyValuePair+ DEDENT
-                    | "{" PatternKeyValuePair ("," PatternKeyValuePair)* "}"
+# =============================================================================
+# Loop Statements
+# =============================================================================
 
-PatternKeyValuePair ::= StringLiteral "as" Pattern
+for_loop               ::= for_each_loop | for_range_loop
 
-VariantPattern  ::= Identifier ("with" PatternParameterList)?
+for_each_loop          ::= "For" "each" identifier "in" expression ":" block
 
-PatternParameterList ::= Identifier "as" Pattern ("and" Identifier "as" Pattern)*
+for_range_loop         ::= "For" identifier "from" expression "to" expression 
+                          ("by" expression)? ":" block
 
-TypePattern     ::= Identifier "of" "type" TypeExpression
+while_loop             ::= "While" expression ":" block
 
-WildcardPattern ::= "_"
-```
+do_while_loop          ::= "Do" ":" block "While" expression
 
-### Functions
+repeat_loop            ::= "Repeat" expression "times" ":" block
 
-```ebnf
-/* Function definition and calls */
-ProcessDefinition ::= ("Async")? "Process" "called" StringLiteral TypeParameters? "that" "takes" ParameterList ("returns" TypeExpression)? ":" Block
+infinite_loop          ::= "Loop" "forever" ":" block
 
-ParameterList   ::= Identifier OptionalType ("and" Identifier OptionalType)* 
-                  | Identifier OptionalType ("," Identifier OptionalType)*
-                  | ""
+# =============================================================================
+# Pattern Matching
+# =============================================================================
 
-ReturnStatement ::= "Return" Expression
+pattern                ::= literal_pattern
+                        | identifier_pattern
+                        | wildcard_pattern
+                        | list_pattern
+                        | tuple_pattern
+                        | record_pattern
+                        | type_pattern
+                        | or_pattern
+                        | as_pattern
 
-FunctionCall    ::= Identifier TypeArguments? "with" NamedArguments
-                  | Identifier TypeArguments? "with" ":" INDENT NamedArguments DEDENT
-                  | Identifier "(" ExpressionList ")"
+literal_pattern        ::= literal
 
-TypeArguments   ::= "[" TypeExpression ("," TypeExpression)* "]"
+identifier_pattern     ::= identifier
 
-NamedArguments  ::= NamedArgument ("and" NamedArgument)*
-                  | NamedArgument (NEWLINE NamedArgument)*
-                  | ""
+wildcard_pattern       ::= "_"
 
-NamedArgument   ::= Identifier "as" Expression
-```
+list_pattern           ::= "[" pattern_list "]"
+                        | "[" pattern_list "," "..." identifier? "]"
+                        | "list" "containing" pattern_list
 
-### Input/Output Operations
+tuple_pattern          ::= "(" pattern_list ")"
 
-```ebnf
-/* Display statement */
-DisplayStatement ::= "Display" Expression ("with" "message" Expression)?
+record_pattern         ::= "{" record_pattern_fields "}"
+                        | "dictionary" "with" ":" INDENT record_pattern_fields DEDENT
 
-/* Input statement */
-InputStatement  ::= "input" "with" "prompt" StringLiteral
-```
+record_pattern_fields  ::= (identifier "as" pattern ("," | NEWLINE))*
 
-### Modules
+type_pattern           ::= pattern "of" "type" type_expression
 
-```ebnf
-/* Import statements */
-ImportStatement ::= "Import" "module" StringLiteral ("as" StringLiteral)?
-                  | "Import" Identifier "from" "module" StringLiteral
-```
+or_pattern             ::= pattern ("|" pattern)+
 
-### Identifiers
+as_pattern             ::= pattern "as" identifier
 
-```ebnf
-/* Identifiers */
-Identifier      ::= [a-zA-Z_][a-zA-Z0-9_]* ("." [a-zA-Z_][a-zA-Z0-9_]*)*
-                  | [a-zA-Z_][a-zA-Z0-9_]* (" " [a-zA-Z_][a-zA-Z0-9_]*)+
-```
+pattern_list           ::= pattern ("," pattern)*
 
-## AI-to-AI Communication Annotations
+# =============================================================================
+# Expressions
+# =============================================================================
 
-```ebnf
-/* Annotation System */
-AnnotationBlock ::= ReasoningBlock
-                  | ImplementationBlock
-                  | UncertaintyBlock
-                  | KnowledgeReferenceBlock
-                  | RequestClarificationBlock
-                  | ExplainabilityBlock
-                  | AbstractionLevelBlock
-                  | VerificationBlock
-                  | SymbolicBlock
-                  | TaskSpecificationBlock
-                  | ProgressTrackingBlock
-                  | TranslationBlock
-                  | ErrorHandlingProtocolBlock
-                  | NaturalToFormalBlock
+expression             ::= ternary_expression
 
-ReasoningBlock  ::= "@Reasoning" ":" INDENT FreeText DEDENT "@End_Reasoning"
+ternary_expression     ::= or_expression ("if" or_expression "else" or_expression)?
 
-ImplementationBlock ::= "@Implementation" ":" INDENT Statement+ DEDENT "@End_Implementation"
+or_expression          ::= and_expression ("or" and_expression)*
 
-UncertaintyBlock ::= "@Uncertainty" ":" Expression ("with" "confidence" NumberLiteral)?
+and_expression         ::= not_expression ("and" not_expression)*
 
-KnowledgeReferenceBlock ::= "@KnowledgeReference" ":" INDENT KnowledgeFields DEDENT "@End_KnowledgeReference"
+not_expression         ::= "not" not_expression | comparison_expression
 
-KnowledgeFields ::= KnowledgeField+
+comparison_expression  ::= additive_expression (comparison_op additive_expression)*
 
-KnowledgeField  ::= Identifier ":" Expression
+comparison_op          ::= "is" "equal" "to"
+                        | "is" "not" "equal" "to"
+                        | "is" "greater" "than"
+                        | "is" "less" "than"
+                        | "is" "greater" "than" "or" "equal" "to"
+                        | "is" "less" "than" "or" "equal" "to"
+                        | "contains"
+                        | "is" "in"
+                        | "is" "of" "type"
 
-RequestClarificationBlock ::= "@Request_Clarification" ":" INDENT FreeText DEDENT "@End_Request"
+additive_expression    ::= multiplicative_expression (additive_op multiplicative_expression)*
 
-ExplainabilityBlock ::= "@Why" ":" StringLiteral
+additive_op            ::= "plus" | "minus" | "concatenated" "with"
 
-AbstractionLevelBlock ::= "@Abstraction_Level" ":" Identifier INDENT Statement+ DEDENT "@End_Abstraction_Level"
+multiplicative_expression ::= unary_expression (multiplicative_op unary_expression)*
 
-VerificationBlock ::= "@Verify" ":" INDENT VerifyStatement+ DEDENT "@End_Verify"
+multiplicative_op      ::= "multiplied" "by" | "divided" "by" | "modulo"
 
-VerifyStatement ::= "Assert" Expression
+unary_expression       ::= unary_op unary_expression | power_expression
 
-SymbolicBlock   ::= "@Symbolic" ":" INDENT FreeText DEDENT "@End_Symbolic"
+unary_op               ::= "negative" | "positive" | "bitwise" "not"
 
-TaskSpecificationBlock ::= "@Task" ":" INDENT TaskFields DEDENT "@End_Task"
+power_expression       ::= postfix_expression ("to" "the" "power" "of" postfix_expression)*
 
-TaskFields      ::= TaskField+
+postfix_expression     ::= primary_expression postfix_op*
 
-TaskField       ::= Identifier ":" Expression
+postfix_op             ::= member_access
+                        | index_access  
+                        | slice_access
+                        | function_call
+                        | type_cast
 
-ProgressTrackingBlock ::= "@Progress" ":" INDENT ProgressFields DEDENT "@End_Progress"
+primary_expression     ::= literal
+                        | identifier
+                        | "(" expression ")"
+                        | lambda_expression
+                        | list_comprehension
+                        | new_expression
+                        | await_expression
+                        | receive_expression
+                        | spawn_expression
+                        | typeof_expression
+                        | sizeof_expression
 
-ProgressFields  ::= ProgressField+
+# =============================================================================
+# Access Operations
+# =============================================================================
 
-ProgressField   ::= Identifier ":" Expression
+member_access          ::= "." identifier
 
-TranslationBlock ::= "@Translation_Note" ":" INDENT TranslationFields DEDENT "@End_Translation_Note"
+index_access           ::= "[" expression "]"
+                        | "at" "index" expression
 
-TranslationFields ::= TranslationField+
+slice_access           ::= "[" expression? ":" expression? (":" expression)? "]"
 
-TranslationField ::= Identifier ":" Expression
+# =============================================================================
+# Function Calls
+# =============================================================================
 
-ErrorHandlingProtocolBlock ::= "@Error_Handling" ":" INDENT ErrorFields DEDENT "@End_Error_Handling"
+function_call          ::= "(" argument_list ")"
+                        | "with" named_arguments
 
-ErrorFields     ::= ErrorField+
+argument_list          ::= (argument ("," argument)*)?
 
-ErrorField      ::= Identifier ":" Expression
+argument               ::= expression
+                        | "..." expression
 
-NaturalToFormalBlock ::= "@Natural_To_Formal" ":" INDENT NaturalFields DEDENT "@End_Natural_To_Formal"
+named_arguments        ::= named_argument (("and" | ",") named_argument)*
+                        | ":" INDENT (named_argument NEWLINE)* DEDENT
 
-NaturalFields   ::= NaturalField+
+named_argument         ::= identifier "as" expression
 
-NaturalField    ::= Identifier ":" Expression
+# =============================================================================
+# Type Operations
+# =============================================================================
 
-FreeText        ::= [^@]*  /* Any text until next @ symbol */
-```
+type_cast              ::= "as" type_expression
 
-## AI-Specific Grammar Extensions
+typeof_expression      ::= "type" "of" expression
 
-```ebnf
-/* AI Model Definition */
-ModelDefinition ::= "Define" "neural" "network" StringLiteral ":" ModelBlock
+sizeof_expression      ::= "size" "of" type_expression
 
-ModelBlock      ::= INDENT ModelStatement+ DEDENT
+new_expression         ::= "New" type_expression ("with" named_arguments)?
 
-ModelStatement  ::= "Input" "layer" "accepts" Expression
-                  | "Use" "convolutional" "layers" "starting" "with" NumberLiteral "filters"
-                  | "Double" "filters" "at" "each" "downsampling"
-                  | "Include" "residual" "connections"
-                  | "Output" "layer" "has" NumberLiteral "classes" "with" Identifier "activation"
+# =============================================================================
+# Literals
+# =============================================================================
 
-/* Training Configuration */
-TrainingConfig  ::= "Configure" "training" "for" Identifier ":" TrainingBlock
+literal                ::= number_literal
+                        | string_literal
+                        | boolean_literal
+                        | null_literal
+                        | list_literal
+                        | dictionary_literal
+                        | tuple_literal
+                        | set_literal
 
-TrainingBlock   ::= INDENT TrainingStatement+ DEDENT
+number_literal         ::= integer_literal | float_literal
 
-TrainingStatement ::= "Use" "dataset" StringLiteral "with" Expression
-                    | "Apply" Expression "for" "augmentation"
-                    | "Use" Identifier "optimizer" "with" "learning" "rate" NumberLiteral
-                    | "Train" "for" NumberLiteral "epochs" "or" "until" Expression
-                    | "Save" "best" "model" "based" "on" Expression
-```
+integer_literal        ::= DIGIT+ type_suffix?
 
-## Knowledge Integration Extensions
+float_literal          ::= DIGIT+ "." DIGIT+ type_suffix?
 
-```ebnf
-/* Knowledge Query */
-KnowledgeQuery  ::= "knowledge" "." "query" "(" StringLiteral ")"
-                  | "knowledge" "." Identifier "(" ExpressionList ")"
-```
+type_suffix            ::= "L" | "U" | "F" | "D"
 
-## Special Productions
+string_literal         ::= string_prefix? (QUOTE string_content QUOTE | APOSTROPHE string_content APOSTROPHE)
 
-```ebnf
-/* Whitespace handling */
-INDENT          ::= /* increase of indentation level */
-DEDENT          ::= /* decrease of indentation level */
-NEWLINE         ::= /* newline character with consistent indentation */
-```
+string_prefix          ::= "r" | "u" | "b" | "f"
 
-## Examples
+boolean_literal        ::= "true" | "false"
 
-Here are some examples of Runa code that follows this grammar:
+null_literal           ::= "null" | "none" | "nil" | "undefined"
 
-### Variable Declaration and Assignment
-```
-Let user name be "Alex"
-Let user age be 28
-Set user name to user name followed by " Smith"
-```
+list_literal           ::= "[" expression_list "]"
+                        | "list" "containing" expression_list
 
-### Control Flow
-```
-If user age is greater than 21:
-    Display "Adult user"
-Otherwise:
-    Display "Minor user"
-```
-
-### Function Definition and Call
-```
-Process called "Calculate Area" that takes width and height:
-    Return width multiplied by height
-
-Let rectangle area be Calculate Area with width as 5 and height as 10
-```
-
-### List Operations
-```
-Let colors be list containing "red", "green", "blue"
-For each color in colors:
-    Display color
-```
-
-### Pattern Matching
-```
-Match user status:
-    When "admin":
-        Display "Full access granted"
-    When "user":
-        Display "Limited access granted"
-    When _:
-        Display "Access denied"
-```
-
-### Type Definitions
-```
-Type Result[T] is T OR String
-
-Type Person is Dictionary with:
-    name as String
-    age as Integer
-    email as String
-```
-
-### Asynchronous Programming
-```
-Async Process called "Fetch Data" that takes url:
-    Let response be await http get with url as url
-    Return response
-```
-
-### AI-to-AI Annotations
-```
-@Reasoning:
-    Using quicksort because the dataset is small and partially ordered
-@End_Reasoning
-
-@Implementation:
-    Process called "Sort Data" that takes data:
-        # Implementation here
-@End_Implementation
-```
-
-This formal grammar specification provides a comprehensive definition of the Runa programming language syntax, including all core features, advanced language constructs, AI-specific extensions, and AI-to-AI communication annotations.
+dictionary_literal     ::= "{" key_value_pairs "}"
+                        | "dictionary" "with" ":" INDENT dict_

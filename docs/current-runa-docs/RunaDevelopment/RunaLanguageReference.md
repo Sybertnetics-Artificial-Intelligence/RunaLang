@@ -10,6 +10,23 @@ Runa is a revolutionary programming language designed to bridge human thought pa
 
 A Runa program consists of a series of statements. Each statement typically occupies a single line, though complex statements may span multiple lines with proper indentation.
 
+### Comments
+
+Runa uses natural language comments for clarity and universality. To write a comment, use:
+
+```
+Note: This is a comment explaining the code below
+```
+
+Comments can be placed on their own line or after code for explanation. Comments are ignored by the compiler/interpreter.
+
+Example:
+
+```
+Let user name be "Alex"
+Note: The user's name is set above
+```
+
 ### Declarations and Assignments
 
 Variables are declared using natural language constructs:
@@ -502,253 +519,4 @@ Process called "Process Images" that takes images:
         Let processed be Apply Filters with image as image
         Add processed to results
     Return results
-```
-
-### Performance Optimization Hints
-
-Performance hints guide the compiler's optimization strategy:
-
-```
-@Performance_Hints:
-    cache_strategy: "aggressive"
-    vectorization: "enabled"
-    memory_layout: "contiguous"
-    parallel_threshold: 1000
-@End_Performance_Hints
-
-Process called "Matrix Multiplication" that takes matrix_a and matrix_b:
-    # Compiler will apply aggressive caching and vectorization
-    Let result be Multiply Matrices with a as matrix_a and b as matrix_b
-    Return result
-```
-
-### Error Handling and Recovery
-
-Error handling traits define how processes should handle failures:
-
-```
-@Error_Handling:
-    strategy: "graceful_degradation"
-    retry_attempts: 3
-    fallback_behavior: "return_default"
-    log_level: "detailed"
-@End_Error_Handling
-
-Process called "Fetch Data" that takes url:
-    # Will retry up to 3 times with graceful degradation
-    Let response be HTTP Get with url as url
-    Return response
-```
-
-### Data Flow and Validation
-
-Data flow traits specify input/output validation and transformation:
-
-```
-@Data_Flow:
-    input_validation: "strict"
-    output_sanitization: "enabled"
-    data_retention: "temporary"
-    encryption: "at_rest"
-@End_Data_Flow
-
-Process called "Process User Input" that takes user_data:
-    # Input will be strictly validated, output sanitized
-    Let processed be Validate and Transform with data as user_data
-    Return processed
-```
-
-### Integration and Communication
-
-Integration traits define how processes communicate with external systems:
-
-```
-@Integration:
-    protocol: "REST"
-    authentication: "bearer_token"
-    rate_limiting: "100 requests per minute"
-    timeout: "5 seconds"
-@End_Integration
-
-Process called "Call External API" that takes request_data:
-    # Will use REST protocol with bearer token authentication
-    Let response be API Request with data as request_data
-    Return response
-```
-
-### Compliance and Auditing
-
-Compliance traits ensure processes meet regulatory and audit requirements:
-
-```
-@Compliance:
-    standards: ["GDPR", "HIPAA", "SOC2"]
-    audit_trail: "enabled"
-    data_classification: "confidential"
-    retention_policy: "7 years"
-@End_Compliance
-
-Process called "Process Medical Data" that takes patient_data:
-    # Will maintain audit trail and follow HIPAA compliance
-    Let processed be Anonymize Data with data as patient_data
-    Return processed
-```
-
-### Trait Composition and Inheritance
-
-Traits can be composed and inherited across processes:
-
-```
-@Base_Traits:
-    @Resource_Constraints:
-        memory_limit: "128MB"
-        optimize_for: "memory"
-    @End_Resource_Constraints
-    
-    @Security_Scope:
-        capabilities: ["math.compute"]
-        sandbox_level: "strict"
-    @End_Security_Scope
-@End_Base_Traits
-
-# This process inherits base traits and adds specific ones
-@Execution_Model:
-    mode: "realtime"
-    priority: "high"
-@End_Execution_Model
-
-Process called "Real Time Calculator" that takes expression:
-    # Inherits memory and security constraints, adds real-time execution
-    Let result be Evaluate Expression with expr as expression
-    Return result
-```
-
-### Trait Validation and Conflict Resolution
-
-The compiler validates trait combinations and resolves conflicts:
-
-```
-@Resource_Constraints:
-    memory_limit: "1GB"
-    optimize_for: "speed"
-@End_Resource_Constraints
-
-@Security_Scope:
-    capabilities: ["file.read", "net.access"]
-    sandbox_level: "strict"
-@End_Security_Scope
-
-# Compiler will warn about potential conflicts between
-# high memory usage and strict sandboxing
-Process called "Data Processor" that takes data:
-    Let result be Process Data with data as data
-    Return result
-```
-
-## Operator Precedence
-
-Operators in Runa follow this precedence (highest to lowest):
-1. Function calls and member access
-2. Type assertions and conversions
-3. Unary operators (not, negation)
-4. Multiplication and division
-5. Addition and subtraction
-6. Comparison operators (is greater than, is equal to, etc.)
-7. Type checking (is of type)
-8. Logical AND
-9. Logical OR
-10. Pipeline operator (|>)
-
-## Scoping Rules
-
-1. **Block-level scoping**: Variables declared within a block are only accessible within that block and its nested blocks
-2. **Function-level scoping**: Parameters are accessible throughout the function body
-3. **Global scope**: Top-level declarations are accessible throughout the program
-4. **No variable shadowing**: Inner scopes cannot redefine variables from outer scopes
-5. **Lexical scoping**: Inner functions can access variables from their containing function
-6. **Type scope**: Generic type parameters are scoped to their definition
-
-## Memory Management
-
-Runa uses automatic memory management:
-- Garbage collection handles memory cleanup
-- Reference counting for immediate cleanup of large objects
-- No manual memory management required
-- Deterministic cleanup for resources (files, network connections)
-
-## Concurrency Model
-
-Runa's concurrency is built on the async/await model:
-- Cooperative multitasking
-- Event loop for I/O operations
-- No shared mutable state between async tasks
-- Message passing for communication between tasks
-
-## Performance Considerations
-
-- Type annotations can improve performance
-- Generic types have no runtime overhead
-- Pattern matching is optimized by the compiler
-- Functional constructs are optimized for performance
-- AI-specific operations can utilize hardware acceleration
-
-## Best Practices
-
-1. **Use type annotations for complex functions**
-2. **Prefer pattern matching over multiple if-else chains**
-3. **Use async/await for I/O-bound operations**
-4. **Leverage the type system for domain modeling**
-5. **Use annotations for AI-to-AI communication**
-6. **Structure code with clear separation of concerns**
-7. **Prefer functional constructs where appropriate**
-
----
-
-This document serves as a comprehensive reference for the Runa programming language, covering all core features, advanced language constructs, AI-specific capabilities, and the AI-to-AI communication system. For practical examples and tutorials, please refer to the "Getting Started with Runa" guide.
-
-## Quick Reference Examples
-
-### Variable Declaration and Basic Operations
-```
-Let user name be "Alex"
-Let user age be 28
-Set user name to user name followed by " Smith"
-```
-
-### Control Flow
-```
-If user age is greater than 21:
-    Display "Access granted"
-Otherwise:
-    Display "Access denied"
-    Display "Come back in" with message (21 minus user age) followed by " years"
-```
-
-### Function Definition
-```
-Process called "Calculate Area" that takes width and height returns Float:
-    Return width multiplied by height
-```
-
-### Pattern Matching
-```
-Match response status:
-    When 200:
-        Display "Success"
-    When 404:
-        Display "Not found"
-    When status If status is greater than or equal to 500:
-        Display "Server error"
-    When _:
-        Display "Unknown status"
-```
-
-### Asynchronous Operations
-```
-Async Process called "Fetch User Data" that takes user_id:
-    Let user be await database.get_user with id as user_id
-    Let permissions be await database.get_permissions with user as user
-    Return dictionary with:
-        "user" as user
-        "permissions" as permissions
 ```
