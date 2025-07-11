@@ -129,6 +129,7 @@ class ASTNode(ABC):
     def clone(self) -> 'ASTNode':
         """Create a deep copy of this node with new IDs."""
         # This will be implemented by subclasses as needed
+        # Clone functionality would be implemented here
         raise NotImplementedError(f"Clone not implemented for {type(self).__name__}")
     
     def get_path_to_root(self) -> List['ASTNode']:
@@ -320,7 +321,7 @@ class UnaryExpression(Expression):
 class FunctionCall(Expression):
     """Function call like Calculate Total Price with items as cart."""
     function_name: str = ""
-    arguments: List[tuple[str, Expression]]  # List of (param_name, value) pairs = field(default_factory=list)
+    arguments: List[tuple[str, Expression]] = field(default_factory=list)  # List of (param_name, value) pairs
     def accept(self, visitor):
         return visitor.visit_function_call(self)
 
@@ -395,7 +396,7 @@ class LiteralPattern(Pattern):
 @dataclass
 class IdentifierPattern(Pattern):
     """Identifier pattern like x."""
-    name: str
+    name: str = ""
     
     def accept(self, visitor):
         return visitor.visit_identifier_pattern(self)
@@ -410,7 +411,7 @@ class WildcardPattern(Pattern):
 @dataclass
 class ListPattern(Pattern):
     """List pattern like [head, tail...]."""
-    elements: List[Pattern]
+    elements: List[Pattern] = field(default_factory=list)
     rest: Optional[str] = None  # Variable name for rest elements
     
     def accept(self, visitor):
@@ -419,9 +420,9 @@ class ListPattern(Pattern):
 @dataclass
 class MatchCase:
     """A single case in a match statement."""
-    pattern: Pattern
-    guard: Optional[Expression]
-    block: List[Statement]
+    pattern: Optional[Pattern] = None
+    guard: Optional[Expression] = None
+    block: List[Statement] = field(default_factory=list)
 
 @dataclass
 class MatchStatement(Statement):
@@ -480,7 +481,7 @@ class RepeatLoop(Statement):
 @dataclass
 class Parameter:
     """Function parameter with optional type annotation."""
-    name: str
+    name: str = ""
     type_annotation: Optional[TypeExpression] = None
 
 @dataclass
@@ -490,6 +491,25 @@ class ProcessDefinition(Declaration):
     parameters: List[Parameter] = field(default_factory=list)
     return_type: Optional[TypeExpression] = None
     body: List[Statement] = field(default_factory=list)
+    
+    # Inheritance support
+    base_classes: List[TypeExpression] = field(default_factory=list)  # For classes that extend/inherit from others
+    interfaces: List[TypeExpression] = field(default_factory=list)    # For interfaces/protocols implemented
+    
+    # Class/process modifiers
+    is_abstract: bool = False      # Abstract class/interface
+    is_final: bool = False         # Final/sealed class (cannot be inherited)
+    is_static: bool = False        # Static class
+    is_interface: bool = False     # Is this an interface definition
+    is_struct: bool = False        # Is this a struct/value type
+    is_enum: bool = False          # Is this an enumeration
+    
+    # Access modifiers
+    access_modifier: str = "public"  # public, private, protected, internal, etc.
+    
+    # Generic/template parameters
+    type_parameters: List[str] = field(default_factory=list)  # Generic type parameters like <T, U>
+    
     def accept(self, visitor):
         return visitor.visit_process_definition(self)
 
@@ -517,9 +537,9 @@ class ContinueStatement(Statement):
 @dataclass
 class CatchClause:
     """A catch clause in a try statement."""
-    exception_type: Optional[TypeExpression]
-    exception_name: Optional[str] 
-    block: List[Statement]
+    exception_type: Optional[TypeExpression] = field(default=None)
+    exception_name: Optional[str] = field(default=None)
+    block: List[Statement] = field(default_factory=list)
 
 @dataclass
 class TryStatement(Statement):
@@ -619,6 +639,25 @@ class AsyncProcessDefinition(Declaration):
     parameters: List[Parameter] = field(default_factory=list)
     return_type: Optional[TypeExpression] = None
     body: List[Statement] = field(default_factory=list)
+    
+    # Inheritance support (same as ProcessDefinition)
+    base_classes: List[TypeExpression] = field(default_factory=list)  # For classes that extend/inherit from others
+    interfaces: List[TypeExpression] = field(default_factory=list)    # For interfaces/protocols implemented
+    
+    # Class/process modifiers
+    is_abstract: bool = False      # Abstract class/interface
+    is_final: bool = False         # Final/sealed class (cannot be inherited)
+    is_static: bool = False        # Static class
+    is_interface: bool = False     # Is this an interface definition
+    is_struct: bool = False        # Is this a struct/value type
+    is_enum: bool = False          # Is this an enumeration
+    
+    # Access modifiers
+    access_modifier: str = "public"  # public, private, protected, internal, etc.
+    
+    # Generic/template parameters
+    type_parameters: List[str] = field(default_factory=list)  # Generic type parameters like <T, U>
+    
     def accept(self, visitor):
         return visitor.visit_async_process_definition(self)
 
@@ -649,7 +688,7 @@ class LockStatement(Statement):
 @dataclass
 class MemoryAnnotation:
     """Base class for memory annotations."""
-    annotation_type: str
+    annotation_type: str = ""
     
 @dataclass
 class OwnershipAnnotation(MemoryAnnotation):
@@ -660,7 +699,7 @@ class OwnershipAnnotation(MemoryAnnotation):
 @dataclass
 class LifetimeAnnotation(MemoryAnnotation):
     """Lifetime annotation like @lifetime('a)."""
-    lifetime_name: str
+    lifetime_name: str = ""
     
     def __init__(self, lifetime_name: str):
         super().__init__("lifetime")
@@ -679,4 +718,304 @@ class AnnotatedVariableDeclaration(Declaration):
     base_declaration: Union[LetStatement, DefineStatement] = None
     memory_annotations: List[MemoryAnnotation] = field(default_factory=list)
     def accept(self, visitor):
-        return visitor.visit_annotated_variable_declaration(self) 
+        return visitor.visit_annotated_variable_declaration(self)
+
+# Object-oriented constructs for universal translation
+
+@dataclass
+class ThisExpression(Expression):
+    """This/self reference expression."""
+    def accept(self, visitor):
+        return visitor.visit_this_expression(self)
+
+@dataclass
+class SuperExpression(Expression):
+    """Super/parent class reference expression."""
+    def accept(self, visitor):
+        return visitor.visit_super_expression(self)
+
+@dataclass
+class NewExpression(Expression):
+    """Object instantiation expression."""
+    type_expression: TypeExpression = None
+    arguments: List[Expression] = field(default_factory=list)
+    def accept(self, visitor):
+        return visitor.visit_new_expression(self)
+
+@dataclass
+class CastExpression(Expression):
+    """Type casting expression."""
+    expression: Expression = None
+    target_type: TypeExpression = None
+    def accept(self, visitor):
+        return visitor.visit_cast_expression(self)
+
+@dataclass
+class InstanceofExpression(Expression):
+    """Type checking expression (instanceof, is, etc.)."""
+    expression: Expression = None
+    type_expression: TypeExpression = None
+    def accept(self, visitor):
+        return visitor.visit_instanceof_expression(self)
+
+@dataclass
+class TupleExpression(Expression):
+    """Tuple expression for multiple values."""
+    elements: List[Expression] = field(default_factory=list)
+    def accept(self, visitor):
+        return visitor.visit_tuple_expression(self)
+
+@dataclass
+class InterpolatedStringExpression(Expression):
+    """String interpolation expression."""
+    parts: List[Union[str, Expression]] = field(default_factory=list)
+    def accept(self, visitor):
+        return visitor.visit_interpolated_string_expression(self)
+
+@dataclass
+class TryCatchExpression(Expression):
+    """Try-catch as expression (for functional languages)."""
+    try_expression: Expression = None
+    catch_clauses: List['CatchClause'] = field(default_factory=list)
+    finally_expression: Optional[Expression] = None
+    def accept(self, visitor):
+        return visitor.visit_try_catch_expression(self)
+
+@dataclass
+class LambdaExpression(Expression):
+    """Lambda/anonymous function expression."""
+    parameters: List[str] = field(default_factory=list)
+    body: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_lambda_expression(self)
+
+@dataclass
+class QueryExpression(Expression):
+    """LINQ-style query expression."""
+    source: Expression = None
+    clauses: List['QueryClause'] = field(default_factory=list)
+    def accept(self, visitor):
+        return visitor.visit_query_expression(self)
+
+@dataclass
+class QueryClause(ASTNode):
+    """Base class for query clauses."""
+    pass
+
+@dataclass
+class WhereClause(QueryClause):
+    """Where clause in query expression."""
+    condition: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_where_clause(self)
+
+@dataclass
+class SelectClause(QueryClause):
+    """Select clause in query expression."""
+    expression: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_select_clause(self)
+
+@dataclass
+class CatchClause(ASTNode):
+    """Catch clause for exception handling."""
+    exception_type: Optional[TypeExpression] = None
+    variable_name: Optional[str] = None
+    body: List[Statement] = field(default_factory=list)
+    def accept(self, visitor):
+        return visitor.visit_catch_clause(self)
+
+@dataclass
+class ThrowExpression(Expression):
+    """Throw expression for exceptions."""
+    expression: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_throw_expression(self)
+
+@dataclass
+class DefaultExpression(Expression):
+    """Default value expression."""
+    type_expression: Optional[TypeExpression] = None
+    def accept(self, visitor):
+        return visitor.visit_default_expression(self)
+
+@dataclass
+class SizeofExpression(Expression):
+    """Sizeof expression for memory size queries."""
+    type_expression: TypeExpression = None
+    def accept(self, visitor):
+        return visitor.visit_sizeof_expression(self)
+
+@dataclass
+class TypeofExpression(Expression):
+    """Typeof expression for runtime type information."""
+    expression: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_typeof_expression(self)
+
+@dataclass
+class NameofExpression(Expression):
+    """Nameof expression for getting string name of identifier."""
+    expression: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_nameof_expression(self)
+
+# === ADDITIONAL CLASSES FOR C# CONVERTER SUPPORT ===
+
+@dataclass
+class QualifiedName(Expression):
+    """Qualified name expression like System.Console.WriteLine."""
+    left: Expression = None
+    right: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_qualified_name(self)
+
+@dataclass
+class ConditionalExpression(Expression):
+    """Conditional (ternary) expression like condition ? true_value : false_value."""
+    condition: Expression = None
+    when_true: Expression = None
+    when_false: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_conditional_expression(self)
+
+@dataclass
+class AssignmentExpression(Expression):
+    """Assignment expression that returns a value like (x = 5)."""
+    left: Expression = None
+    operator: str = ""
+    right: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_assignment_expression(self)
+
+@dataclass
+class ListLiteralAccess(Expression):
+    """Array/list access expression like array[index]."""
+    array: Expression = None
+    index: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_list_literal_access(self)
+
+@dataclass
+class ListLiteralCreation(Expression):
+    """Array/list creation expression like new Array[Integer](10)."""
+    element_type: str = ""
+    dimensions: List[Expression] = field(default_factory=list)
+    def accept(self, visitor):
+        return visitor.visit_list_literal_creation(self)
+
+@dataclass
+class BasicTypeofExpression(Expression):
+    """Basic typeof expression for primitive types."""
+    target_type: str = ""
+    def accept(self, visitor):
+        return visitor.visit_basic_typeof_expression(self)
+
+@dataclass
+class RangeExpression(Expression):
+    """Range expression like 1..10 or start..end."""
+    start: Optional[Expression] = None
+    end: Optional[Expression] = None
+    def accept(self, visitor):
+        return visitor.visit_range_expression(self)
+
+@dataclass
+class IndexExpression(Expression):
+    """Index expression like ^1 (from end)."""
+    operand: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_index_expression(self)
+
+@dataclass
+class SwitchArm(ASTNode):
+    """A single arm in a switch expression."""
+    pattern: Expression = None
+    when_clause: Optional[Expression] = None
+    expression: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_switch_arm(self)
+
+@dataclass
+class SwitchExpression(Expression):
+    """Switch expression like value switch { pattern => result }."""
+    governing_expression: Expression = None
+    arms: List[SwitchArm] = field(default_factory=list)
+    def accept(self, visitor):
+        return visitor.visit_switch_expression(self)
+
+@dataclass
+class SwitchCase(ASTNode):
+    """A single case in a switch statement."""
+    labels: List[Expression] = field(default_factory=list)
+    statements: List[Statement] = field(default_factory=list)
+    def accept(self, visitor):
+        return visitor.visit_switch_case(self)
+
+@dataclass
+class SwitchStatement(Statement):
+    """Switch statement with multiple cases."""
+    expression: Expression = None
+    cases: List[SwitchCase] = field(default_factory=list)
+    def accept(self, visitor):
+        return visitor.visit_switch_statement(self)
+
+@dataclass
+class CatchBlock(ASTNode):
+    """A catch block in a try statement (alternative to CatchClause)."""
+    exception_type: Optional[str] = None
+    body: Statement = None
+    def accept(self, visitor):
+        return visitor.visit_catch_block(self)
+
+@dataclass
+class SynchronizedStatement(Statement):
+    """Synchronized/lock statement for thread safety."""
+    expression: Expression = None
+    body: Statement = None
+    def accept(self, visitor):
+        return visitor.visit_synchronized_statement(self)
+
+@dataclass
+class TryWithResourcesStatement(Statement):
+    """Try-with-resources statement for automatic resource management."""
+    resource: Statement = None
+    body: Statement = None
+    def accept(self, visitor):
+        return visitor.visit_try_with_resources_statement(self)
+
+@dataclass
+class YieldStatement(Statement):
+    """Yield statement for generators."""
+    expression: Expression = None
+    def accept(self, visitor):
+        return visitor.visit_yield_statement(self)
+
+@dataclass
+class YieldBreakStatement(Statement):
+    """Yield break statement to end generator."""
+    def accept(self, visitor):
+        return visitor.visit_yield_break_statement(self)
+
+@dataclass
+class WithExpression(Expression):
+    """
+    Object update/copy expression.
+    Example: new_obj = original_obj with { field1 = value1, field2 = value2 }
+    """
+    base_expression: Expression = None
+    updates: List[AssignmentExpression] = field(default_factory=list)  # Field assignments
+    
+    def accept(self, visitor):
+        return visitor.visit_with_expression(self)
+
+
+@dataclass
+class SetStatementExpression(Expression):
+    """
+    Set statement that returns a value (for use in expressions).
+    Example: Set x = 5 (returns the value 5)
+    """
+    statement: SetStatement = None
+    
+    def accept(self, visitor):
+        return visitor.visit_set_statement_expression(self) 

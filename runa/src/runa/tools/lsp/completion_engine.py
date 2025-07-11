@@ -9,9 +9,11 @@ from typing import List, Dict, Optional, Tuple, Set
 from dataclasses import dataclass
 from enum import Enum
 
-from .compiler.lexer import RunaLexer
-from .compiler.parser import RunaParser
-from .compiler.ast_nodes import *
+# Import from new architecture
+from ...languages.runa.lexer import RunaLexer
+from ...languages.runa.runa_parser import RunaParser
+from ...core.runa_ast import *
+from ...core.translation_result import TranslationStatus
 
 
 class CompletionItemKind(Enum):
@@ -393,9 +395,11 @@ class RunaCompletionEngine:
             # Reset scope context
             self.scope_context = ScopeContext()
             
-            # Parse and extract symbols
-            tokens = self.lexer.tokenize(text)
-            ast = self.parser.parse(tokens)
+            # Parse using new architecture
+            parse_result = self.parser.parse(text)
+            if parse_result.status != TranslationStatus.SUCCESS:
+                return  # Exit if parsing fails
+            ast = parse_result.result
             
             # Simple symbol extraction (would need more sophisticated AST walking)
             self._extract_symbols_from_ast(ast)

@@ -7,7 +7,7 @@ A natural syntax programming language designed as an AI-First Universal Translat
 __version__ = "0.1.0"
 __author__ = "Sybertnetics"
 
-from .compiler import RunaLexer
+from .src.runa.languages.runa.lexer import RunaLexer
 
 __all__ = [
     'RunaLexer'

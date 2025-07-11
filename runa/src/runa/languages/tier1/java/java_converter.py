@@ -34,8 +34,8 @@ class JavaToRunaConverter:
             self.package_name = package_name
             
             # Add package as comment
-            statements.append(RunaExpressionStatement(
-                RunaLiteral(f"package {package_name}", "comment")
+            statements.append(ExpressionStatement(
+                StringLiteral(f"package {package_name}", "comment")
             ))
         
         # Handle imports
@@ -50,8 +50,8 @@ class JavaToRunaConverter:
             if import_decl.is_on_demand:
                 import_str += ".*"
             
-            statements.append(RunaExpressionStatement(
-                RunaLiteral(import_str, "comment")
+            statements.append(ExpressionStatement(
+                StringLiteral(import_str, "comment")
             ))
         
         # Handle type declarations
@@ -70,7 +70,7 @@ class JavaToRunaConverter:
         
         return Program(statements)
     
-    def convert_declaration(self, decl: JavaDeclaration) -> Union[RunaStatement, List[RunaStatement], None]:
+    def convert_declaration(self, decl: JavaDeclaration) -> Union[Statement, List[Statement], None]:
         """Convert Java declaration to Runa statement(s)."""
         if isinstance(decl, JavaClassDeclaration):
             return self._convert_class_declaration(decl)
@@ -91,7 +91,7 @@ class JavaToRunaConverter:
         
         return None
     
-    def convert_statement(self, stmt: JavaStatement) -> Union[RunaStatement, List[RunaStatement], None]:
+    def convert_statement(self, stmt: JavaStatement) -> Union[Statement, List[Statement], None]:
         """Convert Java statement to Runa statement(s)."""
         if isinstance(stmt, JavaExpressionStatement):
             return self._convert_expression_statement(stmt)
@@ -112,9 +112,9 @@ class JavaToRunaConverter:
         elif isinstance(stmt, JavaReturnStatement):
             return self._convert_return_statement(stmt)
         elif isinstance(stmt, JavaBreakStatement):
-            return RunaBreak()
+            return BreakStatement()
         elif isinstance(stmt, JavaContinueStatement):
-            return RunaContinue()
+            return ContinueStatement()
         elif isinstance(stmt, JavaThrowStatement):
             return self._convert_throw_statement(stmt)
         elif isinstance(stmt, JavaTryStatement):
@@ -124,7 +124,7 @@ class JavaToRunaConverter:
         elif isinstance(stmt, JavaAssertStatement):
             return self._convert_assert_statement(stmt)
         elif isinstance(stmt, JavaEmptyStatement):
-            return RunaExpressionStatement(RunaLiteral("", "string"))
+            return ExpressionStatement(StringLiteral(value=""))
         elif isinstance(stmt, JavaLabeledStatement):
             return self._convert_labeled_statement(stmt)
         elif isinstance(stmt, JavaYieldStatement):
@@ -132,24 +132,24 @@ class JavaToRunaConverter:
         
         return None
     
-    def convert_expression(self, expr: JavaExpression) -> RunaExpression:
+    def convert_expression(self, expr: JavaExpression) -> Expression:
         """Convert Java expression to Runa expression."""
         if isinstance(expr, JavaIntegerLiteral):
-            return RunaLiteral(expr.value, "integer")
+            return IntegerLiteral(value=expr.value)
         elif isinstance(expr, JavaFloatingLiteral):
-            return RunaLiteral(expr.value, "float")
+            return FloatLiteral(value=expr.value)
         elif isinstance(expr, JavaStringLiteral):
-            return RunaLiteral(expr.value.strip('"'), "string")
+            return StringLiteral(value=expr.value.strip('"'))
         elif isinstance(expr, JavaCharacterLiteral):
-            return RunaLiteral(expr.value.strip("'"), "character")
+            return StringLiteral(expr.value.strip("'"), "character")
         elif isinstance(expr, JavaBooleanLiteral):
-            return RunaLiteral(expr.value, "boolean")
+            return BooleanLiteral(value=expr.value)
         elif isinstance(expr, JavaNullLiteral):
-            return RunaLiteral(None, "null")
+            return StringLiteral(value="null")
         elif isinstance(expr, JavaTextBlock):
-            return RunaLiteral(expr.value.strip('"""'), "string")
+            return StringLiteral(value=expr.value.strip('"""'))
         elif isinstance(expr, JavaSimpleName):
-            return RunaIdentifier(expr.identifier)
+            return Identifier(expr.identifier)
         elif isinstance(expr, JavaQualifiedName):
             return self._convert_qualified_name(expr)
         elif isinstance(expr, JavaBinaryExpression):
@@ -171,9 +171,9 @@ class JavaToRunaConverter:
         elif isinstance(expr, JavaInstanceofExpression):
             return self._convert_instanceof_expression(expr)
         elif isinstance(expr, JavaThisExpression):
-            return RunaIdentifier("this")
+            return Identifier("this")
         elif isinstance(expr, JavaSuperExpression):
-            return RunaIdentifier("super")
+            return Identifier("super")
         elif isinstance(expr, JavaClassLiteral):
             return self._convert_class_literal(expr)
         elif isinstance(expr, JavaArrayCreation):
@@ -186,154 +186,279 @@ class JavaToRunaConverter:
             return self._convert_method_reference(expr)
         
         # Fallback
-        return RunaLiteral("unknown_expression", "string")
+        return StringLiteral(value="unknown_expression")
     
-    def _convert_class_declaration(self, decl: JavaClassDeclaration) -> RunaClassDeclaration:
-        """Convert Java class declaration."""
-        # Convert fields
-        fields = []
-        methods = []
+    def _convert_class_declaration(self, decl: JavaClassDeclaration) -> ProcessDefinition:
+        """Convert Java class declaration to Runa process definition."""
+        # Convert Java class to a Runa process that represents the class structure
         
+        # Create body statements for the class process
+        body_statements = []
+        
+        # Add field declarations as let statements
         for body_decl in decl.body_declarations:
             if isinstance(body_decl, JavaFieldDeclaration):
                 field_vars = self._convert_field_declaration(body_decl)
                 if isinstance(field_vars, list):
-                    fields.extend(field_vars)
+                    body_statements.extend(field_vars)
                 else:
-                    fields.append(field_vars)
+                    body_statements.append(field_vars)
             elif isinstance(body_decl, JavaMethodDeclaration):
                 method = self._convert_method_declaration(body_decl)
-                methods.append(method)
+                body_statements.append(method)
         
-        # Handle inheritance
+        # Create parameters for constructor-like behavior
+        parameters = []
+        
+        # Handle inheritance with new Runa AST support
         base_classes = []
+        interfaces = []
+        
         if decl.superclass:
-            base_classes.append(self._type_to_string(decl.superclass))
+            base_classes.append(self._convert_type(decl.superclass))
         
         for interface in decl.super_interfaces:
-            base_classes.append(self._type_to_string(interface))
+            interfaces.append(self._convert_type(interface))
         
-        return RunaClassDeclaration(
-            decl.name,
-            fields,
-            methods,
-            base_classes
+        # Set class modifiers based on Java class type
+        is_abstract = any(mod == JavaModifier.ABSTRACT for mod in decl.modifiers)
+        is_final = any(mod == JavaModifier.FINAL for mod in decl.modifiers)
+        is_static = any(mod == JavaModifier.STATIC for mod in decl.modifiers)
+        access_modifier = "public"  # Default
+        for mod in decl.modifiers:
+            if mod in [JavaModifier.PUBLIC, JavaModifier.PRIVATE, JavaModifier.PROTECTED]:
+                access_modifier = mod.value
+        
+        return ProcessDefinition(
+            name=decl.name,
+            parameters=[],  # Classes don't have parameters
+            return_type=None,
+            body=body_statements,
+            base_classes=base_classes,
+            interfaces=interfaces,
+            is_abstract=is_abstract,
+            is_final=is_final,
+            is_static=is_static,
+            is_interface=False,
+            access_modifier=access_modifier,
+            type_parameters=[tp.name for tp in decl.type_parameters]
         )
     
-    def _convert_interface_declaration(self, decl: JavaInterfaceDeclaration) -> RunaClassDeclaration:
-        """Convert Java interface declaration."""
-        # Treat interface as abstract class
-        fields = []
-        methods = []
+    def _convert_interface_declaration(self, decl: JavaInterfaceDeclaration) -> ProcessDefinition:
+        """Convert Java interface declaration to Runa process definition."""
+        # Convert interface to a Runa process representing the interface contract
         
+        body_statements = []
+        
+        # Add interface members as process definitions
         for body_decl in decl.body_declarations:
             if isinstance(body_decl, JavaFieldDeclaration):
                 field_vars = self._convert_field_declaration(body_decl)
                 if isinstance(field_vars, list):
-                    fields.extend(field_vars)
+                    body_statements.extend(field_vars)
                 else:
-                    fields.append(field_vars)
+                    body_statements.append(field_vars)
             elif isinstance(body_decl, JavaMethodDeclaration):
                 method = self._convert_method_declaration(body_decl)
-                methods.append(method)
+                body_statements.append(method)
         
-        # Handle extended interfaces
-        base_classes = []
-        for interface in decl.extended_interfaces:
-            base_classes.append(self._type_to_string(interface))
+        # Handle super interfaces
+        interfaces = []
+        if hasattr(decl, 'super_interfaces'):
+            for super_interface in decl.super_interfaces:
+                interfaces.append(self._convert_type(super_interface))
         
-        return RunaClassDeclaration(
-            decl.name,
-            fields,
-            methods,
-            base_classes
+        # Apply access modifiers
+        access_modifier = "public"  # Default for interfaces
+        if hasattr(decl, 'modifiers'):
+            for mod in decl.modifiers:
+                if mod in [JavaModifier.PUBLIC, JavaModifier.PRIVATE, JavaModifier.PROTECTED]:
+                    access_modifier = mod.value
+        
+        # Handle type parameters
+        type_parameters = []
+        if hasattr(decl, 'type_parameters'):
+            type_parameters = [tp.name for tp in decl.type_parameters]
+        
+        return ProcessDefinition(
+            name=decl.name,
+            parameters=[],
+            return_type=None,
+            body=body_statements,
+            base_classes=[],
+            interfaces=interfaces,
+            is_abstract=True,  # Interfaces are inherently abstract
+            is_final=False,
+            is_static=False,
+            is_interface=True,  # Mark as interface
+            access_modifier=access_modifier,
+            type_parameters=type_parameters
         )
     
-    def _convert_enum_declaration(self, decl: JavaEnumDeclaration) -> RunaClassDeclaration:
-        """Convert Java enum declaration."""
-        fields = []
-        methods = []
+    def _convert_enum_declaration(self, decl: JavaEnumDeclaration) -> ProcessDefinition:
+        """Convert Java enum declaration to Runa process definition."""
+        body_statements = []
         
-        # Convert enum constants as static fields
+        # Convert enum constants as let statements with proper values
         for enum_const in decl.enum_constants:
-            fields.append(RunaVariableDeclaration(
-                enum_const.name,
-                RunaType(decl.name),
-                RunaLiteral(enum_const.name, "string")
+            # Handle enum constant arguments if present
+            init_value = StringLiteral(value=enum_const.name)
+            if hasattr(enum_const, 'arguments') and enum_const.arguments:
+                # Enum constant with arguments - convert to function call
+                args = [self.convert_expression(arg) for arg in enum_const.arguments]
+                init_value = FunctionCall(
+                    function_name="create_enum_instance",
+                    arguments=[
+                        ("name", StringLiteral(value=enum_const.name)),
+                        ("args", ListLiteral(elements=args))
+                    ]
+                )
+            
+            body_statements.append(DefineStatement(
+                identifier=enum_const.name,
+                type_annotation=BasicType(decl.name),
+                value=init_value,
+                is_constant=True
             ))
         
-        # Convert body declarations
+        # Convert body declarations (fields and methods)
         for body_decl in decl.body_declarations:
             if isinstance(body_decl, JavaFieldDeclaration):
                 field_vars = self._convert_field_declaration(body_decl)
                 if isinstance(field_vars, list):
-                    fields.extend(field_vars)
+                    body_statements.extend(field_vars)
                 else:
-                    fields.append(field_vars)
+                    body_statements.append(field_vars)
             elif isinstance(body_decl, JavaMethodDeclaration):
                 method = self._convert_method_declaration(body_decl)
-                methods.append(method)
+                body_statements.append(method)
         
-        return RunaClassDeclaration(
-            decl.name,
-            fields,
-            methods,
-            []
+        # Handle super interfaces for enums
+        interfaces = []
+        if hasattr(decl, 'super_interfaces'):
+            for super_interface in decl.super_interfaces:
+                interfaces.append(self._convert_type(super_interface))
+        
+        # Apply access modifiers
+        access_modifier = "public"  # Default
+        if hasattr(decl, 'modifiers'):
+            for mod in decl.modifiers:
+                if mod in [JavaModifier.PUBLIC, JavaModifier.PRIVATE, JavaModifier.PROTECTED]:
+                    access_modifier = mod.value
+        
+        return ProcessDefinition(
+            name=decl.name,
+            parameters=[],
+            return_type=None,
+            body=body_statements,
+            base_classes=[],
+            interfaces=interfaces,
+            is_abstract=False,
+            is_final=True,  # Enums are final
+            is_static=False,
+            is_interface=False,
+            is_enum=True,  # Mark as enum
+            access_modifier=access_modifier
         )
     
-    def _convert_record_declaration(self, decl: JavaRecordDeclaration) -> RunaClassDeclaration:
-        """Convert Java record declaration."""
-        fields = []
-        methods = []
+    def _convert_record_declaration(self, decl: JavaRecordDeclaration) -> ProcessDefinition:
+        """Convert Java record declaration to Runa process definition."""
+        body_statements = []
         
-        # Convert record parameters as fields
+        # Convert record parameters as let statements with automatic getters
         for param in decl.parameters:
-            fields.append(RunaVariableDeclaration(
-                param.name,
-                self._convert_type(param.parameter_type),
-                None
+            # Add field declaration
+            body_statements.append(LetStatement(
+                identifier=param.name,
+                type_annotation=self._convert_type(param.parameter_type),
+                value=None
+            ))
+            
+            # Add automatic getter method
+            getter_body = [ReturnStatement(value=Identifier(param.name))]
+            body_statements.append(ProcessDefinition(
+                name=param.name,  # Getter method with same name as field
+                parameters=[],
+                return_type=self._convert_type(param.parameter_type),
+                body=getter_body
             ))
         
-        # Convert body declarations
+        # Convert body declarations (additional methods)
         for body_decl in decl.body_declarations:
             if isinstance(body_decl, JavaFieldDeclaration):
                 field_vars = self._convert_field_declaration(body_decl)
                 if isinstance(field_vars, list):
-                    fields.extend(field_vars)
+                    body_statements.extend(field_vars)
                 else:
-                    fields.append(field_vars)
+                    body_statements.append(field_vars)
             elif isinstance(body_decl, JavaMethodDeclaration):
                 method = self._convert_method_declaration(body_decl)
-                methods.append(method)
+                body_statements.append(method)
         
-        return RunaClassDeclaration(
-            decl.name,
-            fields,
-            methods,
-            []
+        # Convert record parameters to process parameters
+        parameters = []
+        for param in decl.parameters:
+            runa_param = Parameter(
+                name=param.name,
+                type_annotation=self._convert_type(param.parameter_type)
+            )
+            parameters.append(runa_param)
+        
+        # Handle super interfaces for records
+        interfaces = []
+        if hasattr(decl, 'super_interfaces'):
+            for super_interface in decl.super_interfaces:
+                interfaces.append(self._convert_type(super_interface))
+        
+        # Apply access modifiers
+        access_modifier = "public"  # Default
+        if hasattr(decl, 'modifiers'):
+            for mod in decl.modifiers:
+                if mod in [JavaModifier.PUBLIC, JavaModifier.PRIVATE, JavaModifier.PROTECTED]:
+                    access_modifier = mod.value
+        
+        # Handle type parameters
+        type_parameters = []
+        if hasattr(decl, 'type_parameters'):
+            type_parameters = [tp.name for tp in decl.type_parameters]
+        
+        return ProcessDefinition(
+            name=decl.name,
+            parameters=parameters,
+            return_type=None,
+            body=body_statements,
+            base_classes=[],
+            interfaces=interfaces,
+            is_abstract=False,
+            is_final=True,  # Records are final
+            is_static=False,
+            is_interface=False,
+            is_struct=True,  # Mark as struct/record
+            access_modifier=access_modifier,
+            type_parameters=type_parameters
         )
     
-    def _convert_annotation_declaration(self, decl: JavaAnnotationDeclaration) -> RunaClassDeclaration:
-        """Convert Java annotation declaration."""
-        # Treat annotation as interface
-        return RunaClassDeclaration(
-            decl.name,
-            [],
-            [],
-            []
+    def _convert_annotation_declaration(self, decl: JavaAnnotationDeclaration) -> ProcessDefinition:
+        """Convert Java annotation declaration to Runa process definition."""
+        # Convert annotation to a process representing metadata
+        return ProcessDefinition(
+            name=f"{decl.name}_Annotation",
+            parameters=[],
+            return_type=BasicType("Annotation"),
+            body=[]
         )
     
-    def _convert_method_declaration(self, decl: JavaMethodDeclaration) -> RunaFunctionDeclaration:
+    def _convert_method_declaration(self, decl: JavaMethodDeclaration) -> ProcessDefinition:
         """Convert Java method declaration."""
         # Convert parameters
         parameters = []
         for param in decl.parameters:
             param_type = self._convert_type(param.parameter_type)
-            runa_param = RunaParameter(param.name, param_type)
+            runa_param = Parameter(param.name, param_type)
             parameters.append(runa_param)
         
         # Convert return type
-        return_type = RunaType("Void")
+        return_type = BasicType("Void")
         if decl.return_type:
             return_type = self._convert_type(decl.return_type)
         
@@ -346,14 +471,14 @@ class JavaToRunaConverter:
             elif converted_body:
                 body = [converted_body]
         
-        return RunaFunctionDeclaration(
+        return ProcessDefinition(
             decl.name,
             parameters,
             return_type,
             body
         )
     
-    def _convert_field_declaration(self, decl: JavaFieldDeclaration) -> List[RunaVariableDeclaration]:
+    def _convert_field_declaration(self, decl: JavaFieldDeclaration) -> List[LetStatement]:
         """Convert Java field declaration."""
         variables = []
         
@@ -363,13 +488,13 @@ class JavaToRunaConverter:
             # Handle array dimensions
             if fragment.extra_dimensions > 0:
                 for _ in range(fragment.extra_dimensions):
-                    var_type = RunaType(f"Array[{var_type.name}]")
+                    var_type = BasicType(f"Array[{var_type.name}]")
             
             initial_value = None
             if fragment.initializer:
                 initial_value = self.convert_expression(fragment.initializer)
             
-            variables.append(RunaVariableDeclaration(
+            variables.append(LetStatement(
                 fragment.name,
                 var_type,
                 initial_value
@@ -377,7 +502,7 @@ class JavaToRunaConverter:
         
         return variables
     
-    def _convert_variable_declaration(self, decl: JavaVariableDeclaration) -> List[RunaVariableDeclaration]:
+    def _convert_variable_declaration(self, decl: JavaVariableDeclaration) -> List[LetStatement]:
         """Convert Java variable declaration."""
         variables = []
         
@@ -387,13 +512,13 @@ class JavaToRunaConverter:
             # Handle array dimensions
             if fragment.extra_dimensions > 0:
                 for _ in range(fragment.extra_dimensions):
-                    var_type = RunaType(f"Array[{var_type.name}]")
+                    var_type = BasicType(f"Array[{var_type.name}]")
             
             initial_value = None
             if fragment.initializer:
                 initial_value = self.convert_expression(fragment.initializer)
             
-            variables.append(RunaVariableDeclaration(
+            variables.append(LetStatement(
                 fragment.name,
                 var_type,
                 initial_value
@@ -401,38 +526,84 @@ class JavaToRunaConverter:
         
         return variables
     
-    def _convert_module_declaration(self, decl: JavaModuleDeclaration) -> List[RunaStatement]:
+    def _convert_module_declaration(self, decl: JavaModuleDeclaration) -> List[Statement]:
         """Convert Java module declaration."""
         statements = []
         
         # Module name
         module_name = self._expression_to_string(decl.name)
-        statements.append(RunaExpressionStatement(
-            RunaLiteral(f"module {module_name}", "comment")
+        statements.append(ExpressionStatement(
+            StringLiteral(f"module {module_name}", "comment")
         ))
         
         # Module statements
         for stmt in decl.module_statements:
             if isinstance(stmt, JavaRequiresDirective):
                 req_name = self._expression_to_string(stmt.module_name)
-                statements.append(RunaExpressionStatement(
-                    RunaLiteral(f"requires {req_name}", "comment")
+                # Handle requires modifiers
+                modifiers = []
+                if hasattr(stmt, 'modifiers'):
+                    modifiers = [mod.value for mod in stmt.modifiers if hasattr(mod, 'value')]
+                
+                req_str = f"requires {' '.join(modifiers) + ' ' if modifiers else ''}{req_name}"
+                statements.append(ImportStatement(
+                    module_path=req_name,
+                    alias=None,
+                    imported_names=None
                 ))
+                
             elif isinstance(stmt, JavaExportsDirective):
                 pkg_name = self._expression_to_string(stmt.package_name)
-                statements.append(RunaExpressionStatement(
-                    RunaLiteral(f"exports {pkg_name}", "comment")
+                # Handle target modules
+                if stmt.target_modules:
+                    target_names = [self._expression_to_string(target) for target in stmt.target_modules]
+                    export_str = f"exports {pkg_name} to {', '.join(target_names)}"
+                else:
+                    export_str = f"exports {pkg_name}"
+                
+                statements.append(ExportStatement(
+                    exported_names=[pkg_name]
                 ))
-            # Add other module statements as needed
+                
+            elif isinstance(stmt, JavaOpensDirective):
+                pkg_name = self._expression_to_string(stmt.package_name)
+                # Handle target modules for opens directive
+                if stmt.target_modules:
+                    target_names = [self._expression_to_string(target) for target in stmt.target_modules]
+                    opens_str = f"opens {pkg_name} to {', '.join(target_names)}"
+                else:
+                    opens_str = f"opens {pkg_name}"
+                
+                # Convert opens to a special export with metadata
+                statements.append(ExpressionStatement(
+                    StringLiteral(opens_str, "module_directive")
+                ))
+                
+            elif isinstance(stmt, JavaUsesDirective):
+                service_name = self._expression_to_string(stmt.service_name)
+                statements.append(ImportStatement(
+                    module_path=service_name,
+                    alias=None,
+                    imported_names=["service"]
+                ))
+                
+            elif isinstance(stmt, JavaProvidesDirective):
+                service_name = self._expression_to_string(stmt.service_name)
+                impl_names = [self._expression_to_string(impl) for impl in stmt.implementation_names]
+                
+                # Convert provides to export statement with service metadata
+                statements.append(ExpressionStatement(
+                    StringLiteral(f"provides {service_name} with {', '.join(impl_names)}", "module_directive")
+                ))
         
         return statements
     
-    def _convert_expression_statement(self, stmt: JavaExpressionStatement) -> RunaExpressionStatement:
+    def _convert_expression_statement(self, stmt: JavaExpressionStatement) -> ExpressionStatement:
         """Convert Java expression statement."""
         expr = self.convert_expression(stmt.expression)
-        return RunaExpressionStatement(expr)
+        return ExpressionStatement(expr)
     
-    def _convert_block_statement(self, stmt: JavaBlockStatement) -> List[RunaStatement]:
+    def _convert_block_statement(self, stmt: JavaBlockStatement) -> List[Statement]:
         """Convert Java block statement."""
         statements = []
         
@@ -446,7 +617,7 @@ class JavaToRunaConverter:
         
         return statements
     
-    def _convert_if_statement(self, stmt: JavaIfStatement) -> RunaConditional:
+    def _convert_if_statement(self, stmt: JavaIfStatement) -> IfStatement:
         """Convert Java if statement."""
         condition = self.convert_expression(stmt.condition)
         
@@ -465,9 +636,9 @@ class JavaToRunaConverter:
             elif converted_else:
                 else_body = [converted_else]
         
-        return RunaConditional(condition, then_body, else_body)
+        return IfStatement(condition, then_body, else_body)
     
-    def _convert_while_statement(self, stmt: JavaWhileStatement) -> RunaLoop:
+    def _convert_while_statement(self, stmt: JavaWhileStatement) -> WhileLoop:
         """Convert Java while statement."""
         condition = self.convert_expression(stmt.condition)
         
@@ -478,19 +649,19 @@ class JavaToRunaConverter:
         elif converted_body:
             body = [converted_body]
         
-        return RunaLoop("while", condition, body)
+        return WhileLoop("while", condition, body)
     
-    def _convert_for_statement(self, stmt: JavaForStatement) -> List[RunaStatement]:
+    def _convert_for_statement(self, stmt: JavaForStatement) -> List[Statement]:
         """Convert Java for statement."""
         statements = []
         
         # Initializers
         for init in stmt.initializers:
             init_expr = self.convert_expression(init)
-            statements.append(RunaExpressionStatement(init_expr))
+            statements.append(ExpressionStatement(init_expr))
         
         # Condition
-        condition = RunaLiteral(True, "boolean")
+        condition = BooleanLiteral(value=True)
         if stmt.condition:
             condition = self.convert_expression(stmt.condition)
         
@@ -505,46 +676,36 @@ class JavaToRunaConverter:
         # Add updaters to end of body
         for updater in stmt.updaters:
             updater_expr = self.convert_expression(updater)
-            body.append(RunaExpressionStatement(updater_expr))
+            body.append(ExpressionStatement(updater_expr))
         
-        loop = RunaLoop("while", condition, body)
+        loop = WhileLoop("while", condition, body)
         statements.append(loop)
         
         return statements
     
-    def _convert_enhanced_for_statement(self, stmt: JavaEnhancedForStatement) -> RunaLoop:
+    def _convert_enhanced_for_statement(self, stmt: JavaEnhancedForStatement) -> ForEachLoop:
         """Convert Java enhanced for statement (for-each)."""
-        # Convert to iterator-based loop
-        iterator_var = f"_iterator_{self.variable_counter}"
-        self.variable_counter += 1
-        
+        # Convert directly to Runa ForEachLoop which is more appropriate
         iterable = self.convert_expression(stmt.expression)
         
         # Loop variable
         loop_var = stmt.parameter.name
-        loop_var_type = self._convert_type(stmt.parameter.parameter_type)
         
-        # Create loop condition and body
-        condition = RunaLiteral(True, "boolean")  # Simplified
-        
+        # Convert body
         body = []
-        # Add variable declaration for loop variable
-        body.append(RunaVariableDeclaration(
-            loop_var,
-            loop_var_type,
-            RunaIdentifier(iterator_var)
-        ))
-        
-        # Add original body
         converted_body = self.convert_statement(stmt.body)
         if isinstance(converted_body, list):
             body.extend(converted_body)
         elif converted_body:
             body.append(converted_body)
         
-        return RunaLoop("for_each", condition, body)
+        return ForEachLoop(
+            variable=loop_var,
+            iterable=iterable,
+            block=body
+        )
     
-    def _convert_do_statement(self, stmt: JavaDoStatement) -> RunaLoop:
+    def _convert_do_statement(self, stmt: JavaDoStatement) -> WhileLoop:
         """Convert Java do-while statement."""
         condition = self.convert_expression(stmt.condition)
         
@@ -555,44 +716,86 @@ class JavaToRunaConverter:
         elif converted_body:
             body = [converted_body]
         
-        return RunaLoop("do_while", condition, body)
+        return WhileLoop("do_while", condition, body)
     
-    def _convert_switch_statement(self, stmt: JavaSwitchStatement) -> RunaConditional:
-        """Convert Java switch statement."""
-        # Convert to if-else chain
+    def _convert_switch_statement(self, stmt: JavaSwitchStatement) -> MatchStatement:
+        """Convert Java switch statement to Runa match statement."""
         switch_expr = self.convert_expression(stmt.expression)
         
-        # Simplified conversion - just treat as conditional
-        return RunaConditional(
-            switch_expr,
-            [RunaExpressionStatement(RunaLiteral("switch_body", "string"))],
-            []
+        cases = []
+        default_case = None
+        
+        for java_case in stmt.statements:
+            if hasattr(java_case, 'expressions') and java_case.expressions:
+                # Regular case with one or more expressions
+                for case_expr in java_case.expressions:
+                    pattern = LiteralPattern(value=self.convert_expression(case_expr))
+                    
+                    # Convert case body
+                    case_body = []
+                    if hasattr(java_case, 'statements'):
+                        for case_stmt in java_case.statements:
+                            converted_stmt = self.convert_statement(case_stmt)
+                            if converted_stmt:
+                                if isinstance(converted_stmt, list):
+                                    case_body.extend(converted_stmt)
+                                else:
+                                    case_body.append(converted_stmt)
+                    
+                    cases.append(MatchCase(
+                        pattern=pattern,
+                        guard=None,
+                        block=case_body
+                    ))
+            else:
+                # Default case
+                case_body = []
+                if hasattr(java_case, 'statements'):
+                    for case_stmt in java_case.statements:
+                        converted_stmt = self.convert_statement(case_stmt)
+                        if converted_stmt:
+                            if isinstance(converted_stmt, list):
+                                case_body.extend(converted_stmt)
+                            else:
+                                case_body.append(converted_stmt)
+                
+                default_case = MatchCase(
+                    pattern=WildcardPattern(),
+                    guard=None,
+                    block=case_body
+                )
+        
+        # Add default case if it exists
+        if default_case:
+            cases.append(default_case)
+        
+        return MatchStatement(
+            value=switch_expr,
+            cases=cases
         )
     
-    def _convert_return_statement(self, stmt: JavaReturnStatement) -> RunaReturn:
+    def _convert_return_statement(self, stmt: JavaReturnStatement) -> ReturnStatement:
         """Convert Java return statement."""
         value = None
         if stmt.expression:
             value = self.convert_expression(stmt.expression)
         
-        return RunaReturn(value)
+        return ReturnStatement(value)
     
-    def _convert_throw_statement(self, stmt: JavaThrowStatement) -> RunaExpressionStatement:
+    def _convert_throw_statement(self, stmt: JavaThrowStatement) -> ExpressionStatement:
         """Convert Java throw statement."""
         exception_expr = self.convert_expression(stmt.expression)
         
         # Convert to function call
-        throw_call = RunaFunctionCall(
-            RunaIdentifier("throw"),
+        throw_call = FunctionCall(
+            Identifier("throw"),
             [exception_expr]
         )
         
-        return RunaExpressionStatement(throw_call)
+        return ExpressionStatement(throw_call)
     
-    def _convert_try_statement(self, stmt: JavaTryStatement) -> List[RunaStatement]:
-        """Convert Java try statement."""
-        statements = []
-        
+    def _convert_try_statement(self, stmt: JavaTryStatement) -> TryStatement:
+        """Convert Java try statement to Runa try statement."""
         # Try block
         try_body = []
         converted_try = self.convert_statement(stmt.body)
@@ -601,33 +804,55 @@ class JavaToRunaConverter:
         elif converted_try:
             try_body = [converted_try]
         
-        # Simplified try-catch conversion
-        statements.extend(try_body)
-        
-        # Add catch handlers as comments
-        for catch_clause in stmt.catch_clauses:
-            exception_type = self._type_to_string(catch_clause.exception.parameter_type)
-            statements.append(RunaExpressionStatement(
-                RunaLiteral(f"catch {exception_type}", "comment")
+        # Convert catch clauses
+        catch_clauses = []
+        for java_catch in stmt.catch_clauses:
+            exception_type = None
+            exception_name = None
+            
+            if java_catch.exception:
+                if java_catch.exception.parameter_type:
+                    exception_type = self._convert_type(java_catch.exception.parameter_type)
+                if java_catch.exception.name:
+                    exception_name = java_catch.exception.name
+            
+            # Convert catch body
+            catch_body = []
+            if java_catch.body:
+                converted_catch = self.convert_statement(java_catch.body)
+                if isinstance(converted_catch, list):
+                    catch_body = converted_catch
+                elif converted_catch:
+                    catch_body = [converted_catch]
+            
+            catch_clauses.append(CatchClause(
+                exception_type=exception_type,
+                exception_name=exception_name,
+                block=catch_body
             ))
         
         # Finally block
+        finally_body = None
         if stmt.finally_block:
-            finally_body = self.convert_statement(stmt.finally_block)
-            if isinstance(finally_body, list):
-                statements.extend(finally_body)
-            elif finally_body:
-                statements.append(finally_body)
+            converted_finally = self.convert_statement(stmt.finally_block)
+            if isinstance(converted_finally, list):
+                finally_body = converted_finally
+            elif converted_finally:
+                finally_body = [converted_finally]
         
-        return statements
+        return TryStatement(
+            try_block=try_body,
+            catch_clauses=catch_clauses,
+            finally_block=finally_body
+        )
     
-    def _convert_synchronized_statement(self, stmt: JavaSynchronizedStatement) -> List[RunaStatement]:
+    def _convert_synchronized_statement(self, stmt: JavaSynchronizedStatement) -> List[Statement]:
         """Convert Java synchronized statement."""
         sync_expr = self.convert_expression(stmt.expression)
         
         # Add synchronization as comment
-        statements = [RunaExpressionStatement(
-            RunaLiteral(f"synchronized", "comment")
+        statements = [ExpressionStatement(
+            StringLiteral(f"synchronized", "comment")
         )]
         
         # Add body
@@ -639,25 +864,25 @@ class JavaToRunaConverter:
         
         return statements
     
-    def _convert_assert_statement(self, stmt: JavaAssertStatement) -> RunaExpressionStatement:
+    def _convert_assert_statement(self, stmt: JavaAssertStatement) -> ExpressionStatement:
         """Convert Java assert statement."""
         condition = self.convert_expression(stmt.condition)
         
         # Convert to function call
-        assert_call = RunaFunctionCall(
-            RunaIdentifier("assert"),
+        assert_call = FunctionCall(
+            Identifier("assert"),
             [condition]
         )
         
-        return RunaExpressionStatement(assert_call)
+        return ExpressionStatement(assert_call)
     
-    def _convert_labeled_statement(self, stmt: JavaLabeledStatement) -> List[RunaStatement]:
+    def _convert_labeled_statement(self, stmt: JavaLabeledStatement) -> List[Statement]:
         """Convert Java labeled statement."""
         statements = []
         
         # Add label as comment
-        statements.append(RunaExpressionStatement(
-            RunaLiteral(f"label {stmt.label}", "comment")
+        statements.append(ExpressionStatement(
+            StringLiteral(f"label {stmt.label}", "comment")
         ))
         
         # Add body
@@ -669,20 +894,20 @@ class JavaToRunaConverter:
         
         return statements
     
-    def _convert_yield_statement(self, stmt: JavaYieldStatement) -> RunaReturn:
+    def _convert_yield_statement(self, stmt: JavaYieldStatement) -> ReturnStatement:
         """Convert Java yield statement."""
         value = None
         if stmt.expression:
             value = self.convert_expression(stmt.expression)
         
-        return RunaReturn(value)
+        return ReturnStatement(value)
     
-    def _convert_qualified_name(self, expr: JavaQualifiedName) -> RunaIdentifier:
+    def _convert_qualified_name(self, expr: JavaQualifiedName) -> Identifier:
         """Convert Java qualified name."""
         qualifier = self._expression_to_string(expr.qualifier)
-        return RunaIdentifier(f"{qualifier}.{expr.name.identifier}")
+        return Identifier(f"{qualifier}.{expr.name.identifier}")
     
-    def _convert_binary_expression(self, expr: JavaBinaryExpression) -> RunaBinaryOperation:
+    def _convert_binary_expression(self, expr: JavaBinaryExpression) -> BinaryExpression:
         """Convert Java binary expression."""
         left = self.convert_expression(expr.left)
         right = self.convert_expression(expr.right)
@@ -711,9 +936,9 @@ class JavaToRunaConverter:
         }
         
         runa_op = operator_map.get(expr.operator, "unknown_op")
-        return RunaBinaryOperation(left, runa_op, right)
+        return BinaryExpression(left, runa_op, right)
     
-    def _convert_unary_expression(self, expr: JavaUnaryExpression) -> RunaUnaryOperation:
+    def _convert_unary_expression(self, expr: JavaUnaryExpression) -> UnaryExpression:
         """Convert Java unary expression."""
         operand = self.convert_expression(expr.operand)
         
@@ -730,24 +955,28 @@ class JavaToRunaConverter:
         }
         
         runa_op = operator_map.get(expr.operator, "unknown_unary_op")
-        return RunaUnaryOperation(runa_op, operand)
+        return UnaryExpression(runa_op, operand)
     
-    def _convert_conditional_expression(self, expr: JavaConditionalExpression) -> RunaConditionalExpression:
-        """Convert Java conditional expression."""
+    def _convert_conditional_expression(self, expr: JavaConditionalExpression) -> FunctionCall:
+        """Convert Java conditional expression to Runa function call."""
         condition = self.convert_expression(expr.condition)
         true_expr = self.convert_expression(expr.then_expression)
         false_expr = self.convert_expression(expr.else_expression)
         
-        return RunaConditionalExpression(condition, true_expr, false_expr)
+        # Convert ternary to a conditional function call
+        return FunctionCall(
+            Identifier("conditional"),
+            [condition, true_expr, false_expr]
+        )
     
-    def _convert_assignment_expression(self, expr: JavaAssignmentExpression) -> RunaAssignment:
+    def _convert_assignment_expression(self, expr: JavaAssignmentExpression) -> SetStatement:
         """Convert Java assignment expression."""
         target = self.convert_expression(expr.left)
         value = self.convert_expression(expr.right)
         
         # Handle compound assignment operators
         if expr.operator == JavaOperator.ASSIGN:
-            return RunaAssignment(target, value)
+            return SetStatement(target, value)
         else:
             # Convert compound assignment to regular assignment with binary op
             operator_map = {
@@ -759,106 +988,131 @@ class JavaToRunaConverter:
             }
             
             if expr.operator in operator_map:
-                binary_op = RunaBinaryOperation(target, operator_map[expr.operator], value)
-                return RunaAssignment(target, binary_op)
+                binary_op = BinaryExpression(target, operator_map[expr.operator], value)
+                return SetStatement(target, binary_op)
             
-            return RunaAssignment(target, value)
+            return SetStatement(target, value)
     
-    def _convert_method_invocation(self, expr: JavaMethodInvocation) -> RunaFunctionCall:
+    def _convert_method_invocation(self, expr: JavaMethodInvocation) -> FunctionCall:
         """Convert Java method invocation."""
         # Handle method calls
         if expr.expression:
             # Instance method call
             obj = self.convert_expression(expr.expression)
-            method_access = RunaMemberAccess(obj, expr.method_name)
+            method_access = MemberAccess(obj, expr.method_name)
             function = method_access
         else:
             # Static method call or local method call
-            function = RunaIdentifier(expr.method_name)
+            function = Identifier(expr.method_name)
         
         arguments = [self.convert_expression(arg) for arg in expr.arguments]
         
-        return RunaFunctionCall(function, arguments)
+        return FunctionCall(function, arguments)
     
-    def _convert_field_access(self, expr: JavaFieldAccess) -> RunaMemberAccess:
+    def _convert_field_access(self, expr: JavaFieldAccess) -> MemberAccess:
         """Convert Java field access."""
         obj = self.convert_expression(expr.expression)
-        return RunaMemberAccess(obj, expr.field_name)
+        return MemberAccess(obj, expr.field_name)
     
-    def _convert_array_access(self, expr: JavaArrayAccess) -> RunaIndexAccess:
+    def _convert_array_access(self, expr: JavaArrayAccess) -> IndexAccess:
         """Convert Java array access."""
         array = self.convert_expression(expr.array)
         index = self.convert_expression(expr.index)
         
-        return RunaIndexAccess(array, index)
+        return IndexAccess(array, index)
     
-    def _convert_cast_expression(self, expr: JavaCastExpression) -> RunaFunctionCall:
+    def _convert_cast_expression(self, expr: JavaCastExpression) -> FunctionCall:
         """Convert Java cast expression."""
         operand = self.convert_expression(expr.expression)
         target_type = self._convert_type(expr.target_type)
         
         # Convert cast to function call
-        cast_function = RunaIdentifier(f"cast_to_{target_type.name}")
-        return RunaFunctionCall(cast_function, [operand])
+        cast_function = Identifier(f"cast_to_{target_type.name}")
+        return FunctionCall(cast_function, [operand])
     
-    def _convert_instanceof_expression(self, expr: JavaInstanceofExpression) -> RunaBinaryOperation:
+    def _convert_instanceof_expression(self, expr: JavaInstanceofExpression) -> BinaryExpression:
         """Convert Java instanceof expression."""
         left = self.convert_expression(expr.expression)
-        right = RunaLiteral(self._type_to_string(expr.target_type), "string")
+        right = StringLiteral(value=self._type_to_string(expr.target_type))
         
-        return RunaBinaryOperation(left, "instanceof", right)
+        return BinaryExpression(left, "instanceof", right)
     
-    def _convert_class_literal(self, expr: JavaClassLiteral) -> RunaFunctionCall:
+    def _convert_class_literal(self, expr: JavaClassLiteral) -> FunctionCall:
         """Convert Java class literal."""
         type_name = self._type_to_string(expr.target_type)
-        return RunaFunctionCall(
-            RunaIdentifier("get_class"),
-            [RunaLiteral(type_name, "string")]
+        return FunctionCall(
+            Identifier("get_class"),
+            [StringLiteral(value=type_name)]
         )
     
-    def _convert_array_creation(self, expr: JavaArrayCreation) -> RunaFunctionCall:
+    def _convert_array_creation(self, expr: JavaArrayCreation) -> FunctionCall:
         """Convert Java array creation."""
         element_type = self._type_to_string(expr.element_type)
         
         # Handle array dimensions
         if expr.dimensions:
-            # Array with size
-            size_expr = RunaLiteral(1, "integer")  # Simplified
-            return RunaFunctionCall(
-                RunaIdentifier(f"create_array_{element_type}"),
-                [size_expr]
-            )
+            # Array with explicit dimensions
+            dimension_args = []
+            for dimension in expr.dimensions:
+                if dimension:  # Non-empty dimension
+                    dimension_args.append(self.convert_expression(dimension))
+                else:
+                    # Empty dimension - use default size
+                    dimension_args.append(IntegerLiteral(value=0))
+            
+            if len(dimension_args) == 1:
+                # Single dimension array
+                return FunctionCall(
+                    function_name="create_array",
+                    arguments=[
+                        ("type", StringLiteral(value=element_type)),
+                        ("size", dimension_args[0])
+                    ]
+                )
+            else:
+                # Multi-dimensional array
+                return FunctionCall(
+                    function_name="create_multidimensional_array",
+                    arguments=[
+                        ("type", StringLiteral(value=element_type)),
+                        ("dimensions", ListLiteral(elements=dimension_args))
+                    ]
+                )
         elif expr.initializer:
             # Array with initializer
             init_expr = self.convert_expression(expr.initializer)
-            return RunaFunctionCall(
-                RunaIdentifier(f"create_array_{element_type}"),
-                [init_expr]
+            return FunctionCall(
+                function_name="create_array_from_initializer",
+                arguments=[
+                    ("type", StringLiteral(value=element_type)),
+                    ("initializer", init_expr)
+                ]
             )
         
-        return RunaFunctionCall(
-            RunaIdentifier(f"create_array_{element_type}"),
-            []
+        # Empty array creation
+        return FunctionCall(
+            function_name="create_empty_array",
+            arguments=[("type", StringLiteral(value=element_type))]
         )
     
-    def _convert_array_initializer(self, expr: JavaArrayInitializer) -> RunaList:
+    def _convert_array_initializer(self, expr: JavaArrayInitializer) -> ListLiteral:
         """Convert Java array initializer."""
         elements = [self.convert_expression(elem) for elem in expr.expressions]
-        return RunaList(elements)
+        return ListLiteral(elements)
     
-    def _convert_lambda_expression(self, expr: JavaLambdaExpression) -> RunaLambda:
+    def _convert_lambda_expression(self, expr: JavaLambdaExpression) -> ProcessDefinition:
         """Convert Java lambda expression."""
         parameters = []
         for param in expr.parameters:
             param_type = self._convert_type(param.parameter_type)
-            runa_param = RunaParameter(param.name, param_type)
+            runa_param = Parameter(name=param.name, param_type=param_type)
             parameters.append(runa_param)
         
         body = []
         if isinstance(expr.body, JavaExpression):
             # Expression body
             body_expr = self.convert_expression(expr.body)
-            body = [RunaReturn(body_expr)]
+            body = [ReturnStatement(body_expr)]
         else:
             # Block body
             converted_body = self.convert_statement(expr.body)
@@ -867,19 +1121,28 @@ class JavaToRunaConverter:
             elif converted_body:
                 body = [converted_body]
         
-        return RunaLambda(parameters, None, body)
+        # Generate a unique name for the lambda
+        lambda_name = f"lambda_{self.function_counter}"
+        self.function_counter += 1
+        
+        return ProcessDefinition(
+            name=lambda_name,
+            parameters=parameters, 
+            return_type=BasicType("Auto"),  # Inferred return type
+            body=body
+        )
     
-    def _convert_method_reference(self, expr: JavaMethodReference) -> RunaIdentifier:
+    def _convert_method_reference(self, expr: JavaMethodReference) -> Identifier:
         """Convert Java method reference."""
         if expr.expression:
             # Instance method reference
             obj_name = self._expression_to_string(expr.expression)
-            return RunaIdentifier(f"{obj_name}::{expr.method_name}")
+            return Identifier(f"{obj_name}::{expr.method_name}")
         else:
             # Static method reference
-            return RunaIdentifier(f"::{expr.method_name}")
+            return Identifier(f"::{expr.method_name}")
     
-    def _convert_type(self, java_type: JavaType) -> RunaType:
+    def _convert_type(self, java_type: JavaType) -> BasicType:
         """Convert Java type to Runa type."""
         if isinstance(java_type, JavaPrimitiveType):
             # Map Java primitive types to Runa types
@@ -895,12 +1158,12 @@ class JavaToRunaConverter:
                 "void": "Void",
             }
             runa_name = type_map.get(java_type.primitive_type, java_type.primitive_type)
-            return RunaType(runa_name)
+            return BasicType(runa_name)
         
         elif isinstance(java_type, JavaArrayType):
             # Convert array type
             component = self._convert_type(java_type.component_type)
-            return RunaType(f"Array[{component.name}]")
+            return BasicType(f"Array[{component.name}]")
         
         elif isinstance(java_type, JavaParameterizedType):
             # Convert generic type
@@ -909,7 +1172,7 @@ class JavaToRunaConverter:
             
             if type_args:
                 type_arg_names = ", ".join(arg.name for arg in type_args)
-                return RunaType(f"{raw_type.name}[{type_arg_names}]")
+                return BasicType(f"{raw_type.name}[{type_arg_names}]")
             else:
                 return raw_type
         
@@ -918,24 +1181,24 @@ class JavaToRunaConverter:
             if java_type.bound:
                 bound_type = self._convert_type(java_type.bound)
                 if java_type.is_upper_bound:
-                    return RunaType(f"? extends {bound_type.name}")
+                    return BasicType(f"? extends {bound_type.name}")
                 else:
-                    return RunaType(f"? super {bound_type.name}")
+                    return BasicType(f"? super {bound_type.name}")
             else:
-                return RunaType("?")
+                return BasicType("?")
         
         elif isinstance(java_type, JavaVarType):
-            return RunaType("Auto")
+            return BasicType("Auto")
         
         elif isinstance(java_type, JavaSimpleName):
-            return RunaType(java_type.identifier)
+            return BasicType(java_type.identifier)
         
         elif isinstance(java_type, JavaQualifiedName):
-            return RunaType(self._expression_to_string(java_type))
+            return BasicType(self._expression_to_string(java_type))
         
         else:
             # Default fallback
-            return RunaType("Object")
+            return BasicType("Object")
     
     def _type_to_string(self, java_type: JavaType) -> str:
         """Convert Java type to string representation."""
@@ -993,64 +1256,64 @@ class RunaToJavaConverter:
         
         return JavaCompilationUnit(type_declarations=type_declarations)
     
-    def convert_statement(self, stmt: RunaStatement) -> Union[JavaDeclaration, JavaStatement, List[Union[JavaDeclaration, JavaStatement]], None]:
+    def convert_statement(self, stmt: Statement) -> Union[JavaDeclaration, JavaStatement, List[Union[JavaDeclaration, JavaStatement]], None]:
         """Convert Runa statement to Java declaration or statement."""
-        if isinstance(stmt, RunaVariableDeclaration):
+        if isinstance(stmt, LetStatement):
             return self._convert_variable_declaration(stmt)
-        elif isinstance(stmt, RunaFunctionDeclaration):
+        elif isinstance(stmt, ProcessDefinition):
             return self._convert_function_declaration(stmt)
-        elif isinstance(stmt, RunaClassDeclaration):
-            return self._convert_class_declaration(stmt)
-        elif isinstance(stmt, RunaAssignment):
+        elif isinstance(stmt, ProcessDefinition) and stmt.name.endswith('_Class'):
+            return self._convert_process_to_class_declaration(stmt)
+        elif isinstance(stmt, SetStatement):
             return self._convert_assignment(stmt)
-        elif isinstance(stmt, RunaConditional):
+        elif isinstance(stmt, IfStatement):
             return self._convert_conditional(stmt)
-        elif isinstance(stmt, RunaLoop):
+        elif isinstance(stmt, WhileLoop):
             return self._convert_loop(stmt)
-        elif isinstance(stmt, RunaReturn):
+        elif isinstance(stmt, ReturnStatement):
             return self._convert_return(stmt)
-        elif isinstance(stmt, RunaBreak):
+        elif isinstance(stmt, BreakStatement):
             return JavaBreakStatement()
-        elif isinstance(stmt, RunaContinue):
+        elif isinstance(stmt, ContinueStatement):
             return JavaContinueStatement()
-        elif isinstance(stmt, RunaExpressionStatement):
+        elif isinstance(stmt, ExpressionStatement):
             return self._convert_expression_statement(stmt)
         
         return None
     
-    def convert_expression(self, expr: RunaExpression) -> JavaExpression:
+    def convert_expression(self, expr: Expression) -> JavaExpression:
         """Convert Runa expression to Java expression."""
-        if isinstance(expr, RunaLiteral):
+        if isinstance(expr, StringLiteral):
             return self._convert_literal(expr)
-        elif isinstance(expr, RunaIdentifier):
+        elif isinstance(expr, Identifier):
             return self._convert_identifier(expr)
-        elif isinstance(expr, RunaBinaryOperation):
+        elif isinstance(expr, BinaryExpression):
             return self._convert_binary_operation(expr)
-        elif isinstance(expr, RunaUnaryOperation):
+        elif isinstance(expr, UnaryExpression):
             return self._convert_unary_operation(expr)
-        elif isinstance(expr, RunaFunctionCall):
+        elif isinstance(expr, FunctionCall):
             return self._convert_function_call(expr)
-        elif isinstance(expr, RunaMemberAccess):
+        elif isinstance(expr, MemberAccess):
             return self._convert_member_access(expr)
-        elif isinstance(expr, RunaIndexAccess):
+        elif isinstance(expr, IndexAccess):
             return self._convert_index_access(expr)
-        elif isinstance(expr, RunaConditionalExpression):
+        elif isinstance(expr, ConditionalExpression):
             return self._convert_conditional_expression(expr)
-        elif isinstance(expr, RunaLambda):
+        elif isinstance(expr, ProcessDefinition):
             return self._convert_lambda(expr)
-        elif isinstance(expr, RunaList):
+        elif isinstance(expr, ListLiteral):
             return self._convert_list(expr)
         
         # Fallback
         return JavaSimpleName("unknown_expression")
     
-    def _convert_variable_declaration(self, stmt: RunaVariableDeclaration) -> JavaVariableDeclaration:
+    def _convert_variable_declaration(self, stmt: LetStatement) -> JavaVariableDeclaration:
         """Convert Runa variable declaration."""
-        java_type = self._convert_type(stmt.var_type)
+        java_type = self._convert_type(stmt.type_annotation) if stmt.type_annotation else JavaPrimitiveType("object")
         
         initializer = None
-        if stmt.initial_value:
-            initializer = self.convert_expression(stmt.initial_value)
+        if stmt.value:
+            initializer = self.convert_expression(stmt.value)
         
         fragment = JavaVariableDeclarationFragment(stmt.name, 0, initializer)
         
@@ -1059,13 +1322,13 @@ class RunaToJavaConverter:
             fragments=[fragment]
         )
     
-    def _convert_function_declaration(self, stmt: RunaFunctionDeclaration) -> JavaMethodDeclaration:
+    def _convert_function_declaration(self, stmt: ProcessDefinition) -> JavaMethodDeclaration:
         """Convert Runa function declaration."""
-        return_type = self._convert_type(stmt.return_type)
+        return_type = self._convert_type(stmt.return_type) if stmt.return_type else JavaPrimitiveType("void")
         
         parameters = []
         for param in stmt.parameters:
-            java_type = self._convert_type(param.param_type)
+            java_type = self._convert_type(param.type_annotation) if param.type_annotation else JavaPrimitiveType("object")
             java_param = JavaParameter(
                 parameter_type=java_type,
                 name=param.name
@@ -1092,44 +1355,109 @@ class RunaToJavaConverter:
             body=body
         )
     
-    def _convert_class_declaration(self, stmt: RunaClassDeclaration) -> JavaClassDeclaration:
+    def _convert_process_to_class_declaration(self, stmt: ProcessDefinition) -> JavaClassDeclaration:
+        """Convert Runa process definition back to Java class declaration."""
+        # Extract class name (remove _Class suffix if present)
+        class_name = stmt.name
+        if class_name.endswith('_Class'):
+            class_name = class_name[:-6]
+        
+        body_declarations = []
+        
+        # Convert body statements back to Java declarations
+        for body_stmt in stmt.body:
+            if isinstance(body_stmt, LetStatement):
+                # Convert let statement to field declaration
+                java_type = self._convert_type(body_stmt.type_annotation) if body_stmt.type_annotation else JavaPrimitiveType("object")
+                initializer = None
+                if body_stmt.value:
+                    initializer = self.convert_expression(body_stmt.value)
+                
+                fragment = JavaVariableDeclarationFragment(body_stmt.name, 0, initializer)
+                field_decl = JavaFieldDeclaration(
+                    variable_type=java_type,
+                    fragments=[fragment]
+                )
+                body_declarations.append(field_decl)
+            elif isinstance(body_stmt, ProcessDefinition):
+                # Convert nested process to method
+                method_decl = self._convert_function_declaration(body_stmt)
+                body_declarations.append(method_decl)
+        
+        return JavaClassDeclaration(
+            name=class_name,
+            superclass=None,
+            super_interfaces=[],
+            body_declarations=body_declarations
+        )
+    
+    def _convert_class_declaration(self, stmt: ProcessDefinition) -> JavaClassDeclaration:
         """Convert Runa class declaration."""
         body_declarations = []
         
-        # Convert fields
-        for field in stmt.fields:
-            field_decl = self._convert_variable_declaration(field)
-            # Convert to field declaration
-            java_field = JavaFieldDeclaration(
-                variable_type=field_decl.variable_type,
-                fragments=field_decl.fragments
-            )
-            body_declarations.append(java_field)
+        # Convert body statements to field and method declarations
+        for body_stmt in stmt.body:
+            if isinstance(body_stmt, LetStatement):
+                # Convert let statement to field declaration
+                java_type = self._convert_type(body_stmt.type_annotation) if body_stmt.type_annotation else JavaPrimitiveType("object")
+                initializer = None
+                if body_stmt.value:
+                    initializer = self.convert_expression(body_stmt.value)
+                
+                fragment = JavaVariableDeclarationFragment(body_stmt.name, 0, initializer)
+                field_decl = JavaFieldDeclaration(
+                    variable_type=java_type,
+                    fragments=[fragment]
+                )
+                body_declarations.append(field_decl)
+            elif isinstance(body_stmt, ProcessDefinition):
+                # Convert nested process to method
+                method_decl = self._convert_function_declaration(body_stmt)
+                body_declarations.append(method_decl)
         
-        # Convert methods
-        for method in stmt.methods:
-            method_decl = self._convert_function_declaration(method)
-            body_declarations.append(method_decl)
-        
-        # Handle base classes
+        # Handle inheritance with Runa AST support
         superclass = None
         super_interfaces = []
         
-        for base_name in stmt.base_classes:
-            # Simplified - assume first is superclass, rest are interfaces
-            if not superclass:
-                superclass = JavaSimpleName(base_name)
-            else:
-                super_interfaces.append(JavaSimpleName(base_name))
+        if stmt.base_classes:
+            # Take the first base class as superclass (Java single inheritance)
+            superclass = self._convert_type(stmt.base_classes[0])
+        
+        if stmt.interfaces:
+            # Convert all interfaces
+            super_interfaces = [self._convert_type(interface) for interface in stmt.interfaces]
+        
+        # Apply modifiers based on ProcessDefinition flags
+        modifiers = []
+        if stmt.access_modifier == "public":
+            modifiers.append(JavaModifier.PUBLIC)
+        elif stmt.access_modifier == "private":
+            modifiers.append(JavaModifier.PRIVATE)
+        elif stmt.access_modifier == "protected":
+            modifiers.append(JavaModifier.PROTECTED)
+        
+        if stmt.is_abstract:
+            modifiers.append(JavaModifier.ABSTRACT)
+        if stmt.is_final:
+            modifiers.append(JavaModifier.FINAL)
+        if stmt.is_static:
+            modifiers.append(JavaModifier.STATIC)
+        
+        # Handle type parameters
+        type_parameters = []
+        for type_param in stmt.type_parameters:
+            type_parameters.append(JavaTypeParameter(name=type_param))
         
         return JavaClassDeclaration(
             name=stmt.name,
             superclass=superclass,
             super_interfaces=super_interfaces,
-            body_declarations=body_declarations
+            type_parameters=type_parameters,
+            body_declarations=body_declarations,
+            modifiers=modifiers
         )
     
-    def _convert_assignment(self, stmt: RunaAssignment) -> JavaExpressionStatement:
+    def _convert_assignment(self, stmt: SetStatement) -> JavaExpressionStatement:
         """Convert Runa assignment."""
         target = self.convert_expression(stmt.target)
         value = self.convert_expression(stmt.value)
@@ -1137,7 +1465,7 @@ class RunaToJavaConverter:
         assignment = JavaAssignmentExpression(target, JavaOperator.ASSIGN, value)
         return JavaExpressionStatement(assignment)
     
-    def _convert_conditional(self, stmt: RunaConditional) -> JavaIfStatement:
+    def _convert_conditional(self, stmt: IfStatement) -> JavaIfStatement:
         """Convert Runa conditional."""
         condition = self.convert_expression(stmt.condition)
         
@@ -1167,7 +1495,7 @@ class RunaToJavaConverter:
         
         return JavaIfStatement(condition, then_body, else_body)
     
-    def _convert_loop(self, stmt: RunaLoop) -> JavaStatement:
+    def _convert_loop(self, stmt: WhileLoop) -> JavaStatement:
         """Convert Runa loop."""
         condition = self.convert_expression(stmt.condition)
         
@@ -1190,7 +1518,7 @@ class RunaToJavaConverter:
             # Default to while loop
             return JavaWhileStatement(condition, body)
     
-    def _convert_return(self, stmt: RunaReturn) -> JavaReturnStatement:
+    def _convert_return(self, stmt: ReturnStatement) -> JavaReturnStatement:
         """Convert Runa return."""
         value = None
         if stmt.value:
@@ -1198,12 +1526,12 @@ class RunaToJavaConverter:
         
         return JavaReturnStatement(value)
     
-    def _convert_expression_statement(self, stmt: RunaExpressionStatement) -> JavaExpressionStatement:
+    def _convert_expression_statement(self, stmt: ExpressionStatement) -> JavaExpressionStatement:
         """Convert Runa expression statement."""
         expr = self.convert_expression(stmt.expression)
         return JavaExpressionStatement(expr)
     
-    def _convert_literal(self, expr: RunaLiteral) -> JavaExpression:
+    def _convert_literal(self, expr: StringLiteral) -> JavaExpression:
         """Convert Runa literal."""
         if expr.literal_type == "integer":
             return JavaIntegerLiteral(expr.value)
@@ -1220,11 +1548,11 @@ class RunaToJavaConverter:
         else:
             return JavaStringLiteral(f'"{expr.value}"')
     
-    def _convert_identifier(self, expr: RunaIdentifier) -> JavaSimpleName:
+    def _convert_identifier(self, expr: Identifier) -> JavaSimpleName:
         """Convert Runa identifier."""
         return JavaSimpleName(expr.name)
     
-    def _convert_binary_operation(self, expr: RunaBinaryOperation) -> JavaBinaryExpression:
+    def _convert_binary_operation(self, expr: BinaryExpression) -> JavaBinaryExpression:
         """Convert Runa binary operation."""
         left = self.convert_expression(expr.left)
         right = self.convert_expression(expr.right)
@@ -1249,7 +1577,7 @@ class RunaToJavaConverter:
         java_op = operator_map.get(expr.operator, JavaOperator.PLUS)
         return JavaBinaryExpression(left, java_op, right)
     
-    def _convert_unary_operation(self, expr: RunaUnaryOperation) -> JavaUnaryExpression:
+    def _convert_unary_operation(self, expr: UnaryExpression) -> JavaUnaryExpression:
         """Convert Runa unary operation."""
         operand = self.convert_expression(expr.operand)
         
@@ -1264,13 +1592,13 @@ class RunaToJavaConverter:
         java_op = operator_map.get(expr.operator, JavaOperator.LOGICAL_NOT)
         return JavaUnaryExpression(java_op, operand)
     
-    def _convert_function_call(self, expr: RunaFunctionCall) -> JavaMethodInvocation:
+    def _convert_function_call(self, expr: FunctionCall) -> JavaMethodInvocation:
         """Convert Runa function call."""
-        if isinstance(expr.function, RunaMemberAccess):
+        if isinstance(expr.function, MemberAccess):
             # Instance method call
             expression = self.convert_expression(expr.function.object)
             method_name = expr.function.member
-        elif isinstance(expr.function, RunaIdentifier):
+        elif isinstance(expr.function, Identifier):
             # Static method call or local method call
             expression = None
             method_name = expr.function.name
@@ -1287,31 +1615,31 @@ class RunaToJavaConverter:
             arguments=arguments
         )
     
-    def _convert_member_access(self, expr: RunaMemberAccess) -> JavaFieldAccess:
+    def _convert_member_access(self, expr: MemberAccess) -> JavaFieldAccess:
         """Convert Runa member access."""
         object_expr = self.convert_expression(expr.object)
         return JavaFieldAccess(object_expr, expr.member)
     
-    def _convert_index_access(self, expr: RunaIndexAccess) -> JavaArrayAccess:
+    def _convert_index_access(self, expr: IndexAccess) -> JavaArrayAccess:
         """Convert Runa index access."""
         array = self.convert_expression(expr.object)
         index = self.convert_expression(expr.index)
         
         return JavaArrayAccess(array, index)
     
-    def _convert_conditional_expression(self, expr: RunaConditionalExpression) -> JavaConditionalExpression:
+    def _convert_conditional_expression(self, expr: ConditionalExpression) -> JavaConditionalExpression:
         """Convert Runa conditional expression."""
         condition = self.convert_expression(expr.condition)
-        true_expr = self.convert_expression(expr.true_value)
-        false_expr = self.convert_expression(expr.false_value)
+        true_expr = self.convert_expression(expr.when_true)
+        false_expr = self.convert_expression(expr.when_false)
         
         return JavaConditionalExpression(condition, true_expr, false_expr)
     
-    def _convert_lambda(self, expr: RunaLambda) -> JavaLambdaExpression:
+    def _convert_lambda(self, expr: ProcessDefinition) -> JavaLambdaExpression:
         """Convert Runa lambda."""
         parameters = []
         for param in expr.parameters:
-            java_type = self._convert_type(param.param_type)
+            java_type = self._convert_type(param.type_annotation) if param.type_annotation else JavaPrimitiveType("object")
             java_param = JavaParameter(
                 parameter_type=java_type,
                 name=param.name
@@ -1338,12 +1666,12 @@ class RunaToJavaConverter:
         
         return JavaLambdaExpression(parameters, body)
     
-    def _convert_list(self, expr: RunaList) -> JavaArrayInitializer:
+    def _convert_list(self, expr: ListLiteral) -> JavaArrayInitializer:
         """Convert Runa list."""
         elements = [self.convert_expression(elem) for elem in expr.elements]
         return JavaArrayInitializer(elements)
     
-    def _convert_type(self, runa_type: RunaType) -> JavaType:
+    def _convert_type(self, runa_type: BasicType) -> JavaType:
         """Convert Runa type to Java type."""
         # Map Runa types to Java types
         type_map = {
@@ -1358,14 +1686,29 @@ class RunaToJavaConverter:
         # Handle array types
         if runa_type.name.startswith("Array[") and runa_type.name.endswith("]"):
             element_type_name = runa_type.name[6:-1]  # Remove "Array[" and "]"
-            element_type = self._convert_type(RunaType(element_type_name))
+            element_type = self._convert_type(BasicType(element_type_name))
             return JavaArrayType(element_type)
         
         # Handle generic types
         if "[" in runa_type.name and runa_type.name.endswith("]"):
             base_name = runa_type.name.split("[")[0]
-            # Simplified generic handling
-            return JavaSimpleName(base_name)
+            type_args_str = runa_type.name[runa_type.name.index("[")+1:-1]
+            
+            # Parse type arguments
+            type_args = []
+            if type_args_str.strip():
+                # Split by comma and handle nested generics
+                arg_parts = self._split_type_arguments(type_args_str)
+                for arg_part in arg_parts:
+                    arg_type = self._convert_type(BasicType(arg_part.strip()))
+                    type_args.append(arg_type)
+            
+            # Create parameterized type
+            raw_type = JavaSimpleName(base_name)
+            return JavaParameterizedType(
+                raw_type=raw_type,
+                type_arguments=type_args
+            )
         
         java_name = type_map.get(runa_type.name, runa_type.name)
         
@@ -1374,6 +1717,35 @@ class RunaToJavaConverter:
             return JavaPrimitiveType(java_name)
         else:
             return JavaSimpleName(java_name)
+    
+    def _split_type_arguments(self, type_args_str: str) -> List[str]:
+        """Split type arguments string, handling nested generics."""
+        if not type_args_str.strip():
+            return []
+        
+        args = []
+        current_arg = ""
+        bracket_depth = 0
+        
+        for char in type_args_str:
+            if char == '[':
+                bracket_depth += 1
+                current_arg += char
+            elif char == ']':
+                bracket_depth -= 1
+                current_arg += char
+            elif char == ',' and bracket_depth == 0:
+                # Split point
+                args.append(current_arg.strip())
+                current_arg = ""
+            else:
+                current_arg += char
+        
+        # Add the last argument
+        if current_arg.strip():
+            args.append(current_arg.strip())
+        
+        return args
 
 
 # Convenience functions

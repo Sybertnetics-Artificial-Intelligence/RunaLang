@@ -230,9 +230,9 @@ class JSModuleKind(Enum):
 @dataclass
 class JSNode(ABC):
     """Base class for all JavaScript AST nodes."""
-    type: JSNodeType = None
-    loc: Optional[Dict[str, Any]] = None
-    range: Optional[List[int]] = None
+    type: JSNodeType = field(default=None)
+    loc: Optional[Dict[str, Any]] = field(default=None)
+    range: Optional[List[int]] = field(default=None)
     
     @abstractmethod
     def accept(self, visitor):
@@ -241,11 +241,23 @@ class JSNode(ABC):
 
 
 @dataclass
-class JSLiteral(JSNode):
+class JSExpression(JSNode):
+    """Base class for all JavaScript expression nodes."""
+    pass
+
+
+@dataclass
+class JSStatement(JSNode):
+    """Base class for all JavaScript statement nodes."""
+    pass
+
+
+@dataclass
+class JSLiteral(JSExpression):
     """JavaScript literal node."""
-    value: Any
-    raw: str
-    literal_type: JSLiteralType
+    value: Any = field(default=None)
+    raw: str = field(default="")
+    literal_type: JSLiteralType = field(default=JSLiteralType.STRING)
     
     def __post_init__(self):
         self.type = JSNodeType.LITERAL
@@ -255,9 +267,9 @@ class JSLiteral(JSNode):
 
 
 @dataclass
-class JSIdentifier(JSNode):
+class JSIdentifier(JSExpression):
     """JavaScript identifier node."""
-    name: str
+    name: str = field(default="")
     
     def __post_init__(self):
         self.type = JSNodeType.IDENTIFIER
@@ -267,10 +279,10 @@ class JSIdentifier(JSNode):
 
 
 @dataclass
-class JSTemplateLiteral(JSNode):
+class JSTemplateLiteral(JSExpression):
     """JavaScript template literal node."""
-    quasis: List[JSNode]
-    expressions: List[JSNode]
+    quasis: List[JSNode] = field(default_factory=list)
+    expressions: List[JSNode] = field(default_factory=list)
     
     def __init__(self, quasis: List[JSNode], expressions: List[JSNode]):
         super().__init__(JSNodeType.TEMPLATE_LITERAL)
@@ -282,9 +294,9 @@ class JSTemplateLiteral(JSNode):
 
 
 @dataclass
-class JSArrayExpression(JSNode):
+class JSArrayExpression(JSExpression):
     """JavaScript array expression node."""
-    elements: List[Optional[JSNode]]
+    elements: List[Optional[JSNode]] = field(default_factory=list)
     
     def __init__(self, elements: List[Optional[JSNode]]):
         super().__init__(JSNodeType.ARRAY_EXPRESSION)
@@ -295,9 +307,9 @@ class JSArrayExpression(JSNode):
 
 
 @dataclass
-class JSObjectExpression(JSNode):
+class JSObjectExpression(JSExpression):
     """JavaScript object expression node."""
-    properties: List[JSNode]
+    properties: List[JSNode] = field(default_factory=list)
     
     def __init__(self, properties: List[JSNode]):
         super().__init__(JSNodeType.OBJECT_EXPRESSION)
@@ -310,9 +322,9 @@ class JSObjectExpression(JSNode):
 @dataclass
 class JSProperty(JSNode):
     """JavaScript property node."""
-    key: JSNode
-    value: JSNode
-    kind: JSPropertyKind
+    key: Optional[JSNode] = field(default=None)
+    value: Optional[JSNode] = field(default=None)
+    kind: JSPropertyKind = field(default=JSPropertyKind.INIT)
     computed: bool = False
     shorthand: bool = False
     method: bool = False
@@ -332,11 +344,11 @@ class JSProperty(JSNode):
 
 
 @dataclass
-class JSFunctionExpression(JSNode):
+class JSFunctionExpression(JSExpression):
     """JavaScript function expression node."""
-    id: Optional[JSIdentifier]
-    params: List[JSNode]
-    body: JSNode
+    id: Optional[JSIdentifier] = field(default=None)
+    params: List[JSNode] = field(default_factory=list)
+    body: Optional[JSNode] = field(default=None)
     generator: bool = False
     async_: bool = False
     
@@ -354,10 +366,10 @@ class JSFunctionExpression(JSNode):
 
 
 @dataclass
-class JSArrowFunctionExpression(JSNode):
+class JSArrowFunctionExpression(JSExpression):
     """JavaScript arrow function expression node."""
-    params: List[JSNode]
-    body: JSNode
+    params: List[JSNode] = field(default_factory=list)
+    body: Optional[JSNode] = field(default=None)
     expression: bool = False
     async_: bool = False
     
@@ -373,11 +385,11 @@ class JSArrowFunctionExpression(JSNode):
 
 
 @dataclass
-class JSBinaryExpression(JSNode):
+class JSBinaryExpression(JSExpression):
     """JavaScript binary expression node."""
-    left: JSNode
-    operator: JSOperator
-    right: JSNode
+    left: Optional[JSNode] = field(default=None)
+    operator: Optional[JSOperator] = field(default=None)
+    right: Optional[JSNode] = field(default=None)
     
     def __init__(self, left: JSNode, operator: JSOperator, right: JSNode):
         super().__init__(JSNodeType.BINARY_EXPRESSION)
@@ -390,10 +402,10 @@ class JSBinaryExpression(JSNode):
 
 
 @dataclass
-class JSUnaryExpression(JSNode):
+class JSUnaryExpression(JSExpression):
     """JavaScript unary expression node."""
-    operator: JSOperator
-    argument: JSNode
+    operator: Optional[JSOperator] = field(default=None)
+    argument: Optional[JSNode] = field(default=None)
     prefix: bool = True
     
     def __init__(self, operator: JSOperator, argument: JSNode, prefix: bool = True):
@@ -407,10 +419,10 @@ class JSUnaryExpression(JSNode):
 
 
 @dataclass
-class JSUpdateExpression(JSNode):
+class JSUpdateExpression(JSExpression):
     """JavaScript update expression node."""
-    operator: JSOperator
-    argument: JSNode
+    operator: Optional[JSOperator] = field(default=None)
+    argument: Optional[JSNode] = field(default=None)
     prefix: bool = True
     
     def __init__(self, operator: JSOperator, argument: JSNode, prefix: bool = True):
@@ -424,11 +436,11 @@ class JSUpdateExpression(JSNode):
 
 
 @dataclass
-class JSAssignmentExpression(JSNode):
+class JSAssignmentExpression(JSExpression):
     """JavaScript assignment expression node."""
-    left: JSNode
-    operator: JSOperator
-    right: JSNode
+    left: Optional[JSNode] = field(default=None)
+    operator: Optional[JSOperator] = field(default=None)
+    right: Optional[JSNode] = field(default=None)
     
     def __init__(self, left: JSNode, operator: JSOperator, right: JSNode):
         super().__init__(JSNodeType.ASSIGNMENT_EXPRESSION)
@@ -441,11 +453,11 @@ class JSAssignmentExpression(JSNode):
 
 
 @dataclass
-class JSLogicalExpression(JSNode):
+class JSLogicalExpression(JSExpression):
     """JavaScript logical expression node."""
-    left: JSNode
-    operator: JSOperator
-    right: JSNode
+    left: Optional[JSNode] = field(default=None)
+    operator: Optional[JSOperator] = field(default=None)
+    right: Optional[JSNode] = field(default=None)
     
     def __init__(self, left: JSNode, operator: JSOperator, right: JSNode):
         super().__init__(JSNodeType.LOGICAL_EXPRESSION)
@@ -458,11 +470,11 @@ class JSLogicalExpression(JSNode):
 
 
 @dataclass
-class JSConditionalExpression(JSNode):
+class JSConditionalExpression(JSExpression):
     """JavaScript conditional expression node."""
-    test: JSNode
-    consequent: JSNode
-    alternate: JSNode
+    test: Optional[JSNode] = field(default=None)
+    consequent: Optional[JSNode] = field(default=None)
+    alternate: Optional[JSNode] = field(default=None)
     
     def __init__(self, test: JSNode, consequent: JSNode, alternate: JSNode):
         super().__init__(JSNodeType.CONDITIONAL_EXPRESSION)
@@ -475,10 +487,10 @@ class JSConditionalExpression(JSNode):
 
 
 @dataclass
-class JSMemberExpression(JSNode):
+class JSMemberExpression(JSExpression):
     """JavaScript member expression node."""
-    object: JSNode
-    property: JSNode
+    object: Optional[JSNode] = field(default=None)
+    property: Optional[JSNode] = field(default=None)
     computed: bool = False
     optional: bool = False
     
@@ -494,10 +506,10 @@ class JSMemberExpression(JSNode):
 
 
 @dataclass
-class JSCallExpression(JSNode):
+class JSCallExpression(JSExpression):
     """JavaScript call expression node."""
-    callee: JSNode
-    arguments: List[JSNode]
+    callee: Optional[JSNode] = field(default=None)
+    arguments: List[JSNode] = field(default_factory=list)
     optional: bool = False
     
     def __init__(self, callee: JSNode, arguments: List[JSNode], optional: bool = False):
@@ -511,10 +523,10 @@ class JSCallExpression(JSNode):
 
 
 @dataclass
-class JSNewExpression(JSNode):
+class JSNewExpression(JSExpression):
     """JavaScript new expression node."""
-    callee: JSNode
-    arguments: List[JSNode]
+    callee: Optional[JSNode] = field(default=None)
+    arguments: List[JSNode] = field(default_factory=list)
     
     def __init__(self, callee: JSNode, arguments: List[JSNode]):
         super().__init__(JSNodeType.NEW_EXPRESSION)
@@ -526,7 +538,7 @@ class JSNewExpression(JSNode):
 
 
 @dataclass
-class JSThisExpression(JSNode):
+class JSThisExpression(JSExpression):
     """JavaScript this expression node."""
     
     def __init__(self):
@@ -537,7 +549,7 @@ class JSThisExpression(JSNode):
 
 
 @dataclass
-class JSSuper(JSNode):
+class JSSuper(JSExpression):
     """JavaScript super node."""
     
     def __init__(self):
@@ -548,9 +560,9 @@ class JSSuper(JSNode):
 
 
 @dataclass
-class JSSequenceExpression(JSNode):
+class JSSequenceExpression(JSExpression):
     """JavaScript sequence expression node."""
-    expressions: List[JSNode]
+    expressions: List[JSNode] = field(default_factory=list)
     
     def __init__(self, expressions: List[JSNode]):
         super().__init__(JSNodeType.SEQUENCE_EXPRESSION)
@@ -561,9 +573,9 @@ class JSSequenceExpression(JSNode):
 
 
 @dataclass
-class JSAwaitExpression(JSNode):
+class JSAwaitExpression(JSExpression):
     """JavaScript await expression node."""
-    argument: JSNode
+    argument: Optional[JSNode] = field(default=None)
     
     def __init__(self, argument: JSNode):
         super().__init__(JSNodeType.AWAIT_EXPRESSION)
@@ -574,9 +586,9 @@ class JSAwaitExpression(JSNode):
 
 
 @dataclass
-class JSYieldExpression(JSNode):
+class JSYieldExpression(JSExpression):
     """JavaScript yield expression node."""
-    argument: Optional[JSNode]
+    argument: Optional[JSNode] = field(default=None)
     delegate: bool = False
     
     def __init__(self, argument: Optional[JSNode], delegate: bool = False):
@@ -591,9 +603,9 @@ class JSYieldExpression(JSNode):
 # Statement nodes
 
 @dataclass
-class JSExpressionStatement(JSNode):
+class JSExpressionStatement(JSStatement):
     """JavaScript expression statement node."""
-    expression: JSNode
+    expression: Optional[JSNode] = field(default=None)
     
     def __init__(self, expression: JSNode):
         super().__init__(JSNodeType.EXPRESSION_STATEMENT)
@@ -604,9 +616,9 @@ class JSExpressionStatement(JSNode):
 
 
 @dataclass
-class JSBlockStatement(JSNode):
+class JSBlockStatement(JSStatement):
     """JavaScript block statement node."""
-    body: List[JSNode]
+    body: List[JSNode] = field(default_factory=list)
     
     def __init__(self, body: List[JSNode]):
         super().__init__(JSNodeType.BLOCK_STATEMENT)
@@ -617,7 +629,7 @@ class JSBlockStatement(JSNode):
 
 
 @dataclass
-class JSEmptyStatement(JSNode):
+class JSEmptyStatement(JSStatement):
     """JavaScript empty statement node."""
     
     def __init__(self):
@@ -628,7 +640,7 @@ class JSEmptyStatement(JSNode):
 
 
 @dataclass
-class JSDebuggerStatement(JSNode):
+class JSDebuggerStatement(JSStatement):
     """JavaScript debugger statement node."""
     
     def __init__(self):
@@ -639,10 +651,10 @@ class JSDebuggerStatement(JSNode):
 
 
 @dataclass
-class JSIfStatement(JSNode):
+class JSIfStatement(JSStatement):
     """JavaScript if statement node."""
-    test: JSNode
-    consequent: JSNode
+    test: Optional[JSNode] = field(default=None)
+    consequent: Optional[JSNode] = field(default=None)
     alternate: Optional[JSNode] = None
     
     def __init__(self, test: JSNode, consequent: JSNode, alternate: Optional[JSNode] = None):
@@ -656,10 +668,10 @@ class JSIfStatement(JSNode):
 
 
 @dataclass
-class JSWhileStatement(JSNode):
+class JSWhileStatement(JSStatement):
     """JavaScript while statement node."""
-    test: JSNode
-    body: JSNode
+    test: Optional[JSNode] = field(default=None)
+    body: Optional[JSNode] = field(default=None)
     
     def __init__(self, test: JSNode, body: JSNode):
         super().__init__(JSNodeType.WHILE_STATEMENT)
@@ -671,12 +683,12 @@ class JSWhileStatement(JSNode):
 
 
 @dataclass
-class JSForStatement(JSNode):
+class JSForStatement(JSStatement):
     """JavaScript for statement node."""
-    init: Optional[JSNode]
-    test: Optional[JSNode]
-    update: Optional[JSNode]
-    body: JSNode
+    init: Optional[JSNode] = field(default=None)
+    test: Optional[JSNode] = field(default=None)
+    update: Optional[JSNode] = field(default=None)
+    body: Optional[JSNode] = field(default=None)
     
     def __init__(self, init: Optional[JSNode], test: Optional[JSNode], 
                  update: Optional[JSNode], body: JSNode):
@@ -691,7 +703,7 @@ class JSForStatement(JSNode):
 
 
 @dataclass
-class JSReturnStatement(JSNode):
+class JSReturnStatement(JSStatement):
     """JavaScript return statement node."""
     argument: Optional[JSNode] = None
     
@@ -704,7 +716,7 @@ class JSReturnStatement(JSNode):
 
 
 @dataclass
-class JSBreakStatement(JSNode):
+class JSBreakStatement(JSStatement):
     """JavaScript break statement node."""
     label: Optional[JSIdentifier] = None
     
@@ -717,7 +729,7 @@ class JSBreakStatement(JSNode):
 
 
 @dataclass
-class JSContinueStatement(JSNode):
+class JSContinueStatement(JSStatement):
     """JavaScript continue statement node."""
     label: Optional[JSIdentifier] = None
     
@@ -730,9 +742,9 @@ class JSContinueStatement(JSNode):
 
 
 @dataclass
-class JSThrowStatement(JSNode):
+class JSThrowStatement(JSStatement):
     """JavaScript throw statement node."""
-    argument: JSNode
+    argument: Optional[JSNode] = field(default=None)
     
     def __init__(self, argument: JSNode):
         super().__init__(JSNodeType.THROW_STATEMENT)
@@ -743,9 +755,9 @@ class JSThrowStatement(JSNode):
 
 
 @dataclass
-class JSTryStatement(JSNode):
+class JSTryStatement(JSStatement):
     """JavaScript try statement node."""
-    block: JSNode
+    block: Optional[JSNode] = field(default=None)
     handler: Optional[JSNode] = None
     finalizer: Optional[JSNode] = None
     
@@ -763,8 +775,8 @@ class JSTryStatement(JSNode):
 @dataclass
 class JSCatchClause(JSNode):
     """JavaScript catch clause node."""
-    param: Optional[JSNode]
-    body: JSNode
+    param: Optional[JSNode] = field(default=None)
+    body: Optional[JSNode] = field(default=None)
     
     def __init__(self, param: Optional[JSNode], body: JSNode):
         super().__init__(JSNodeType.CATCH_CLAUSE)
@@ -776,10 +788,10 @@ class JSCatchClause(JSNode):
 
 
 @dataclass
-class JSVariableDeclaration(JSNode):
+class JSVariableDeclaration(JSStatement):
     """JavaScript variable declaration node."""
-    declarations: List[JSNode]
-    kind: JSVariableKind
+    declarations: List[JSNode] = field(default_factory=list)
+    kind: JSVariableKind = field(default=JSVariableKind.VAR)
     
     def __init__(self, declarations: List[JSNode], kind: JSVariableKind):
         super().__init__(JSNodeType.VARIABLE_DECLARATION)
@@ -793,7 +805,7 @@ class JSVariableDeclaration(JSNode):
 @dataclass
 class JSVariableDeclarator(JSNode):
     """JavaScript variable declarator node."""
-    id: JSNode
+    id: Optional[JSNode] = field(default=None)
     init: Optional[JSNode] = None
     
     def __init__(self, id: JSNode, init: Optional[JSNode] = None):
@@ -806,11 +818,11 @@ class JSVariableDeclarator(JSNode):
 
 
 @dataclass
-class JSFunctionDeclaration(JSNode):
+class JSFunctionDeclaration(JSStatement):
     """JavaScript function declaration node."""
-    id: JSIdentifier
-    params: List[JSNode]
-    body: JSNode
+    id: Optional[JSIdentifier] = field(default=None)
+    params: List[JSNode] = field(default_factory=list)
+    body: Optional[JSNode] = field(default=None)
     generator: bool = False
     async_: bool = False
     
@@ -830,7 +842,7 @@ class JSFunctionDeclaration(JSNode):
 @dataclass
 class JSProgram(JSNode):
     """JavaScript program node."""
-    body: List[JSNode]
+    body: List[JSNode] = field(default_factory=list)
     source_type: str = "script"  # "script" or "module"
     
     def __init__(self, body: List[JSNode], source_type: str = "script"):

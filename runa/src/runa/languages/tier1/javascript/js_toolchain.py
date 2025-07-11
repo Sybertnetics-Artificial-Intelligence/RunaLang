@@ -20,7 +20,7 @@ from .js_generator import JSCodeGenerator
 from .js_ast import JSNode, JSProgram
 from ....core.runa_ast import Program
 from ...shared.base_toolchain import BaseLanguageToolchain, LanguageMetadata, ToolchainResult
-from ...core.translation_result import TranslationResult, TranslationError
+from ....core.translation_result import TranslationResult, TranslationError
 
 
 class JavaScriptToolchain(BaseLanguageToolchain):

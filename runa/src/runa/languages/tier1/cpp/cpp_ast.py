@@ -223,6 +223,7 @@ class CppTypeQualifier(Enum):
     RESTRICT = "restrict"
 
 
+
 @dataclass
 class CppNode(ABC):
     """Base class for all C++ AST nodes."""
@@ -264,7 +265,7 @@ class CppType(CppNode):
 @dataclass
 class CppLiteral(CppExpression):
     """Base class for C++ literals."""
-    value: Any
+    value: Any = None
     suffix: Optional[str] = None
 
 
@@ -342,7 +343,7 @@ class CppNullptrLiteral(CppLiteral):
 @dataclass
 class CppIdentifier(CppExpression):
     """C++ identifier."""
-    name: str
+    name: str = ""
     
     def __post_init__(self):
         self.type = CppNodeType.IDENTIFIER
@@ -354,8 +355,8 @@ class CppIdentifier(CppExpression):
 @dataclass
 class CppQualifiedName(CppExpression):
     """C++ qualified name (e.g., std::vector)."""
-    scope: Optional[CppExpression]  # Can be nested
-    name: str
+    scope: Optional[CppExpression] = None  # Can be nested
+    name: str = ""
     
     def __post_init__(self):
         self.type = CppNodeType.QUALIFIED_NAME
@@ -368,9 +369,9 @@ class CppQualifiedName(CppExpression):
 @dataclass
 class CppBinaryOp(CppExpression):
     """C++ binary operation."""
-    left: CppExpression
-    operator: CppOperator
-    right: CppExpression
+    left: Optional[CppExpression] = None
+    operator: Optional[CppOperator] = None
+    right: Optional[CppExpression] = None
     
     def __post_init__(self):
         self.type = CppNodeType.BINARY_OP
@@ -382,8 +383,8 @@ class CppBinaryOp(CppExpression):
 @dataclass
 class CppUnaryOp(CppExpression):
     """C++ unary operation."""
-    operator: CppOperator
-    operand: CppExpression
+    operator: Optional[CppOperator] = None
+    operand: Optional[CppExpression] = None
     is_postfix: bool = False
     
     def __post_init__(self):
@@ -396,9 +397,9 @@ class CppUnaryOp(CppExpression):
 @dataclass
 class CppConditionalOp(CppExpression):
     """C++ ternary conditional operator."""
-    condition: CppExpression
-    true_expr: CppExpression
-    false_expr: CppExpression
+    condition: Optional[CppExpression] = None
+    true_expr: Optional[CppExpression] = None
+    false_expr: Optional[CppExpression] = None
     
     def __post_init__(self):
         self.type = CppNodeType.CONDITIONAL
@@ -410,9 +411,9 @@ class CppConditionalOp(CppExpression):
 @dataclass
 class CppAssignment(CppExpression):
     """C++ assignment expression."""
-    left: CppExpression
-    operator: CppOperator
-    right: CppExpression
+    left: Optional[CppExpression] = None
+    operator: Optional[CppOperator] = None
+    right: Optional[CppExpression] = None
     
     def __post_init__(self):
         self.type = CppNodeType.ASSIGNMENT
@@ -424,8 +425,8 @@ class CppAssignment(CppExpression):
 @dataclass
 class CppCall(CppExpression):
     """C++ function call."""
-    function: CppExpression
-    arguments: List[CppExpression]
+    function: Optional[CppExpression] = None
+    arguments: List[CppExpression] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = CppNodeType.CALL
@@ -437,8 +438,8 @@ class CppCall(CppExpression):
 @dataclass
 class CppMemberAccess(CppExpression):
     """C++ member access (. or ->)."""
-    object: CppExpression
-    member: str
+    object: Optional[CppExpression] = None
+    member: str = ""
     is_arrow: bool = False
     
     def __post_init__(self):
@@ -451,8 +452,8 @@ class CppMemberAccess(CppExpression):
 @dataclass
 class CppArraySubscript(CppExpression):
     """C++ array subscript."""
-    array: CppExpression
-    index: CppExpression
+    array: Optional[CppExpression] = None
+    index: Optional[CppExpression] = None
     
     def __post_init__(self):
         self.type = CppNodeType.ARRAY_SUBSCRIPT
@@ -464,8 +465,8 @@ class CppArraySubscript(CppExpression):
 @dataclass
 class CppCast(CppExpression):
     """C++ cast expression."""
-    target_type: CppType
-    operand: CppExpression
+    target_type: Optional[CppType] = None
+    operand: Optional[CppExpression] = None
     cast_kind: str = "c_style"  # c_style, static, dynamic, const, reinterpret
     
     def __post_init__(self):
@@ -478,7 +479,7 @@ class CppCast(CppExpression):
 @dataclass
 class CppSizeofExpr(CppExpression):
     """C++ sizeof expression."""
-    operand: Union[CppExpression, CppType]
+    operand: Union[CppExpression, CppType] = None
     is_type: bool = False
     
     def __post_init__(self):
@@ -491,7 +492,7 @@ class CppSizeofExpr(CppExpression):
 @dataclass
 class CppNewExpr(CppExpression):
     """C++ new expression."""
-    target_type: CppType
+    target_type: Optional[CppType] = None
     placement_args: List[CppExpression] = field(default_factory=list)
     initializer: Optional[CppExpression] = None
     is_array: bool = False
@@ -507,7 +508,7 @@ class CppNewExpr(CppExpression):
 @dataclass
 class CppDeleteExpr(CppExpression):
     """C++ delete expression."""
-    operand: CppExpression
+    operand: Optional[CppExpression] = None
     is_array: bool = False
     
     def __post_init__(self):
@@ -520,10 +521,10 @@ class CppDeleteExpr(CppExpression):
 @dataclass
 class CppLambda(CppExpression):
     """C++ lambda expression (C++11)."""
-    captures: List['CppLambdaCapture']
+    captures: List['CppLambdaCapture'] = field(default_factory=list)
     parameters: Optional['CppParameterList'] = None
     return_type: Optional[CppType] = None
-    body: 'CppStatement'
+    body: Optional['CppStatement'] = None
     is_mutable: bool = False
     exception_spec: Optional[str] = None
     
@@ -550,7 +551,7 @@ class CppLambdaCapture(CppNode):
 @dataclass
 class CppInitializerList(CppExpression):
     """C++ initializer list (C++11)."""
-    elements: List[CppExpression]
+    elements: List[CppExpression] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = CppNodeType.INITIALIZER_LIST
@@ -563,7 +564,7 @@ class CppInitializerList(CppExpression):
 @dataclass
 class CppExpressionStmt(CppStatement):
     """C++ expression statement."""
-    expression: Optional[CppExpression]
+    expression: Optional[CppExpression] = None
     
     def __post_init__(self):
         self.type = CppNodeType.EXPRESSION_STMT
@@ -575,7 +576,7 @@ class CppExpressionStmt(CppStatement):
 @dataclass
 class CppCompoundStmt(CppStatement):
     """C++ compound statement (block)."""
-    statements: List[CppStatement]
+    statements: List[CppStatement] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = CppNodeType.COMPOUND_STMT
@@ -587,8 +588,8 @@ class CppCompoundStmt(CppStatement):
 @dataclass
 class CppIfStmt(CppStatement):
     """C++ if statement."""
-    condition: CppExpression
-    then_stmt: CppStatement
+    condition: Optional[CppExpression] = None
+    then_stmt: Optional[CppStatement] = None
     else_stmt: Optional[CppStatement] = None
     init_stmt: Optional[CppStatement] = None  # C++17
     
@@ -602,8 +603,8 @@ class CppIfStmt(CppStatement):
 @dataclass
 class CppWhileStmt(CppStatement):
     """C++ while statement."""
-    condition: CppExpression
-    body: CppStatement
+    condition: Optional[CppExpression] = None
+    body: Optional[CppStatement] = None
     
     def __post_init__(self):
         self.type = CppNodeType.WHILE_STMT
@@ -615,10 +616,10 @@ class CppWhileStmt(CppStatement):
 @dataclass
 class CppForStmt(CppStatement):
     """C++ for statement."""
-    init: Optional[CppStatement]
-    condition: Optional[CppExpression]
-    increment: Optional[CppExpression]
-    body: CppStatement
+    init: Optional[CppStatement] = None
+    condition: Optional[CppExpression] = None
+    increment: Optional[CppExpression] = None
+    body: Optional[CppStatement] = None
     
     def __post_init__(self):
         self.type = CppNodeType.FOR_STMT
@@ -630,9 +631,9 @@ class CppForStmt(CppStatement):
 @dataclass
 class CppRangeForStmt(CppStatement):
     """C++ range-based for statement (C++11)."""
-    variable: 'CppVariableDecl'
-    range: CppExpression
-    body: CppStatement
+    variable: Optional['CppVariableDecl'] = None
+    range: Optional[CppExpression] = None
+    body: Optional[CppStatement] = None
     
     def __post_init__(self):
         self.type = CppNodeType.RANGE_FOR_STMT
@@ -679,8 +680,8 @@ class CppContinueStmt(CppStatement):
 @dataclass
 class CppVariableDecl(CppDeclaration):
     """C++ variable declaration."""
-    name: str
-    var_type: CppType
+    name: str = ""
+    var_type: Optional[CppType] = None
     initializer: Optional[CppExpression] = None
     storage_class: Optional[CppStorageClass] = None
     is_constexpr: bool = False
@@ -697,9 +698,9 @@ class CppVariableDecl(CppDeclaration):
 @dataclass
 class CppFunctionDecl(CppDeclaration):
     """C++ function declaration."""
-    name: str
-    return_type: CppType
-    parameters: 'CppParameterList'
+    name: str = ""
+    return_type: Optional[CppType] = None
+    parameters: Optional['CppParameterList'] = None
     body: Optional[CppStatement] = None
     storage_class: Optional[CppStorageClass] = None
     is_virtual: bool = False
@@ -724,7 +725,7 @@ class CppFunctionDecl(CppDeclaration):
 @dataclass
 class CppParameterList(CppNode):
     """C++ parameter list."""
-    parameters: List['CppParameter']
+    parameters: List['CppParameter'] = field(default_factory=list)
     is_variadic: bool = False
     
     def accept(self, visitor):
@@ -734,8 +735,8 @@ class CppParameterList(CppNode):
 @dataclass
 class CppParameter(CppNode):
     """C++ function parameter."""
-    name: Optional[str]
-    param_type: CppType
+    name: Optional[str] = None
+    param_type: Optional[CppType] = None
     default_value: Optional[CppExpression] = None
     is_pack_expansion: bool = False
     
@@ -746,7 +747,7 @@ class CppParameter(CppNode):
 @dataclass
 class CppClassDecl(CppDeclaration):
     """C++ class declaration."""
-    name: str
+    name: str = ""
     base_classes: List['CppBaseSpecifier'] = field(default_factory=list)
     members: List[CppDeclaration] = field(default_factory=list)
     template_params: Optional['CppTemplateParameterList'] = None
@@ -764,7 +765,7 @@ class CppClassDecl(CppDeclaration):
 @dataclass
 class CppBaseSpecifier(CppNode):
     """C++ base class specifier."""
-    base_type: CppType
+    base_type: Optional[CppType] = None
     access: CppAccessSpecifier = CppAccessSpecifier.PUBLIC
     is_virtual: bool = False
     
@@ -775,8 +776,8 @@ class CppBaseSpecifier(CppNode):
 @dataclass
 class CppNamespaceDecl(CppDeclaration):
     """C++ namespace declaration."""
-    name: Optional[str]  # None for anonymous namespace
-    declarations: List[CppDeclaration]
+    name: Optional[str] = None  # None for anonymous namespace
+    declarations: List[CppDeclaration] = field(default_factory=list)
     is_inline: bool = False  # C++11
     
     def __post_init__(self):
@@ -789,8 +790,8 @@ class CppNamespaceDecl(CppDeclaration):
 @dataclass
 class CppTemplateDecl(CppDeclaration):
     """C++ template declaration."""
-    template_params: 'CppTemplateParameterList'
-    declaration: CppDeclaration
+    template_params: Optional['CppTemplateParameterList'] = None
+    declaration: Optional[CppDeclaration] = None
     
     def __post_init__(self):
         self.type = CppNodeType.TEMPLATE_DECL
@@ -802,7 +803,7 @@ class CppTemplateDecl(CppDeclaration):
 @dataclass
 class CppTemplateParameterList(CppNode):
     """C++ template parameter list."""
-    parameters: List['CppTemplateParameter']
+    parameters: List['CppTemplateParameter'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_template_parameter_list(self)
@@ -811,8 +812,8 @@ class CppTemplateParameterList(CppNode):
 @dataclass
 class CppTemplateParameter(CppNode):
     """C++ template parameter."""
-    name: Optional[str]
-    kind: str  # "type", "non_type", "template"
+    name: Optional[str] = None
+    kind: str = ""  # "type", "non_type", "template"
     default_value: Optional[Union[CppType, CppExpression]] = None
     is_pack: bool = False
     
@@ -827,7 +828,7 @@ class CppTemplateParameter(CppNode):
 @dataclass
 class CppBuiltinType(CppType):
     """C++ builtin type."""
-    name: str  # int, char, float, double, void, etc.
+    name: str = ""  # int, char, float, double, void, etc.
     
     def __post_init__(self):
         self.type = CppNodeType.BUILTIN_TYPE
@@ -839,7 +840,7 @@ class CppBuiltinType(CppType):
 @dataclass
 class CppPointerType(CppType):
     """C++ pointer type."""
-    pointee_type: CppType
+    pointee_type: Optional[CppType] = None
     
     def __post_init__(self):
         self.type = CppNodeType.POINTER_TYPE
@@ -851,7 +852,7 @@ class CppPointerType(CppType):
 @dataclass
 class CppReferenceType(CppType):
     """C++ reference type."""
-    referenced_type: CppType
+    referenced_type: Optional[CppType] = None
     is_rvalue_reference: bool = False  # C++11
     
     def __post_init__(self):
@@ -864,7 +865,7 @@ class CppReferenceType(CppType):
 @dataclass
 class CppArrayType(CppType):
     """C++ array type."""
-    element_type: CppType
+    element_type: Optional[CppType] = None
     size: Optional[CppExpression] = None
     
     def __post_init__(self):
@@ -877,8 +878,8 @@ class CppArrayType(CppType):
 @dataclass
 class CppFunctionType(CppType):
     """C++ function type."""
-    return_type: CppType
-    parameter_types: List[CppType]
+    return_type: Optional[CppType] = None
+    parameter_types: List[CppType] = field(default_factory=list)
     is_variadic: bool = False
     
     def __post_init__(self):
@@ -902,7 +903,7 @@ class CppAutoType(CppType):
 @dataclass
 class CppDecltypeType(CppType):
     """C++ decltype type (C++11)."""
-    expression: CppExpression
+    expression: Optional[CppExpression] = None
     
     def __post_init__(self):
         self.type = CppNodeType.DECLTYPE_TYPE
@@ -915,13 +916,165 @@ class CppDecltypeType(CppType):
 @dataclass
 class CppTranslationUnit(CppNode):
     """C++ translation unit (source file)."""
-    declarations: List[CppDeclaration]
+    declarations: List[CppDeclaration] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = CppNodeType.TRANSLATION_UNIT
     
     def accept(self, visitor):
         return visitor.visit_translation_unit(self)
+
+
+# Additional statement and declaration nodes needed by parser
+@dataclass
+class CppDoWhileStmt(CppStatement):
+    """C++ do-while statement."""
+    body: Optional[CppStatement] = None
+    condition: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.DO_WHILE_STMT
+    
+    def accept(self, visitor):
+        return visitor.visit_do_while_stmt(self)
+
+
+@dataclass
+class CppSwitchStmt(CppStatement):
+    """C++ switch statement."""
+    condition: Optional[CppExpression] = None
+    body: Optional[CppStatement] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.SWITCH_STMT
+    
+    def accept(self, visitor):
+        return visitor.visit_switch_stmt(self)
+
+
+@dataclass
+class CppCaseStmt(CppStatement):
+    """C++ case statement."""
+    value: Optional[CppExpression] = None
+    statement: Optional[CppStatement] = None
+    
+    def accept(self, visitor):
+        return visitor.visit_case_stmt(self)
+
+
+@dataclass
+class CppDefaultStmt(CppStatement):
+    """C++ default statement."""
+    statement: Optional[CppStatement] = None
+    
+    def accept(self, visitor):
+        return visitor.visit_default_stmt(self)
+
+
+@dataclass
+class CppGotoStmt(CppStatement):
+    """C++ goto statement."""
+    label: str = ""
+    
+    def __post_init__(self):
+        self.type = CppNodeType.GOTO_STMT
+    
+    def accept(self, visitor):
+        return visitor.visit_goto_stmt(self)
+
+
+@dataclass
+class CppEmptyStmt(CppStatement):
+    """C++ empty statement."""
+    
+    def accept(self, visitor):
+        return visitor.visit_empty_stmt(self)
+
+
+@dataclass
+class CppDeclarationStmt(CppStatement):
+    """C++ declaration statement."""
+    declaration: Optional[CppDeclaration] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.DECLARATION_STMT
+    
+    def accept(self, visitor):
+        return visitor.visit_declaration_stmt(self)
+
+
+@dataclass
+class CppThrowStmt(CppStatement):
+    """C++ throw statement."""
+    expression: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.THROW_STMT
+    
+    def accept(self, visitor):
+        return visitor.visit_throw_stmt(self)
+
+
+@dataclass
+class CppTryStmt(CppStatement):
+    """C++ try statement."""
+    body: Optional[CppStatement] = None
+    catch_blocks: List['CppCatchBlock'] = field(default_factory=list)
+    
+    def __post_init__(self):
+        self.type = CppNodeType.TRY_STMT
+    
+    def accept(self, visitor):
+        return visitor.visit_try_stmt(self)
+
+
+@dataclass
+class CppCatchBlock(CppNode):
+    """C++ catch block."""
+    exception_type: Optional[CppType] = None
+    exception_name: Optional[str] = None
+    body: Optional[CppStatement] = None
+    
+    def accept(self, visitor):
+        return visitor.visit_catch_block(self)
+
+
+@dataclass
+class CppEnumDecl(CppDeclaration):
+    """C++ enum declaration."""
+    name: str = ""
+    enumerators: List['CppEnumerator'] = field(default_factory=list)
+    underlying_type: Optional[CppType] = None
+    is_scoped: bool = False  # enum class
+    
+    def __post_init__(self):
+        self.type = CppNodeType.ENUM_DECL
+    
+    def accept(self, visitor):
+        return visitor.visit_enum_decl(self)
+
+
+@dataclass
+class CppEnumerator(CppNode):
+    """C++ enumerator."""
+    name: str = ""
+    value: Optional[CppExpression] = None
+    
+    def accept(self, visitor):
+        return visitor.visit_enumerator(self)
+
+
+@dataclass
+class CppTypedefDecl(CppDeclaration):
+    """C++ typedef declaration."""
+    name: str = ""
+    aliased_type: Optional[CppType] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.TYPEDEF_DECL
+    
+    def accept(self, visitor):
+        return visitor.visit_typedef_decl(self)
 
 
 class CppNodeVisitor(ABC):

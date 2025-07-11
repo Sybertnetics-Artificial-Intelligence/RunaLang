@@ -647,6 +647,8 @@ class JavaParser:
         self.tokens = tokens
         self.position = 0
         self.errors = []
+        self.class_name_stack = []  # Stack to track nested class names
+        self.current_class_name = None  # Current class being parsed
     
     def parse(self) -> JavaCompilationUnit:
         """Parse Java compilation unit."""
@@ -836,25 +838,33 @@ class JavaParser:
         self._consume_keyword('class')
         name = self._consume(JavaTokenType.IDENTIFIER).value
         
-        # Type parameters
-        type_parameters = []
-        if self._match(JavaTokenType.LESS_THAN):
-            type_parameters = self._parse_type_parameters()
+        # Push current class name onto stack and set as current
+        self._push_class_context(name)
         
-        # Superclass
-        superclass = None
-        if self._match_keyword('extends'):
-            self._advance()
-            superclass = self._parse_type()
+        try:
+            # Type parameters
+            type_parameters = []
+            if self._match(JavaTokenType.LESS_THAN):
+                type_parameters = self._parse_type_parameters()
+            
+            # Superclass
+            superclass = None
+            if self._match_keyword('extends'):
+                self._advance()
+                superclass = self._parse_type()
+            
+            # Interfaces
+            super_interfaces = []
+            if self._match_keyword('implements'):
+                self._advance()
+                super_interfaces = self._parse_type_list()
+            
+            # Body
+            body_declarations = self._parse_class_body()
         
-        # Interfaces
-        super_interfaces = []
-        if self._match_keyword('implements'):
-            self._advance()
-            super_interfaces = self._parse_type_list()
-        
-        # Body
-        body_declarations = self._parse_class_body()
+        finally:
+            # Always pop the class context when done
+            self._pop_class_context()
         
         return JavaClassDeclaration(
             modifiers=modifiers,
@@ -871,19 +881,27 @@ class JavaParser:
         self._consume_keyword('interface')
         name = self._consume(JavaTokenType.IDENTIFIER).value
         
-        # Type parameters
-        type_parameters = []
-        if self._match(JavaTokenType.LESS_THAN):
-            type_parameters = self._parse_type_parameters()
+        # Push current interface name onto stack and set as current
+        self._push_class_context(name)
         
-        # Extended interfaces
-        extended_interfaces = []
-        if self._match_keyword('extends'):
-            self._advance()
-            extended_interfaces = self._parse_type_list()
+        try:
+            # Type parameters
+            type_parameters = []
+            if self._match(JavaTokenType.LESS_THAN):
+                type_parameters = self._parse_type_parameters()
+            
+            # Extended interfaces
+            extended_interfaces = []
+            if self._match_keyword('extends'):
+                self._advance()
+                extended_interfaces = self._parse_type_list()
+            
+            # Body
+            body_declarations = self._parse_class_body()
         
-        # Body
-        body_declarations = self._parse_class_body()
+        finally:
+            # Always pop the class context when done
+            self._pop_class_context()
         
         return JavaInterfaceDeclaration(
             modifiers=modifiers,
@@ -899,32 +917,40 @@ class JavaParser:
         self._consume_keyword('enum')
         name = self._consume(JavaTokenType.IDENTIFIER).value
         
-        # Interfaces
-        super_interfaces = []
-        if self._match_keyword('implements'):
-            self._advance()
-            super_interfaces = self._parse_type_list()
+        # Push current enum name onto stack and set as current
+        self._push_class_context(name)
         
-        self._consume(JavaTokenType.LEFT_BRACE)
-        
-        # Enum constants
-        enum_constants = []
-        if not self._match(JavaTokenType.RIGHT_BRACE):
-            enum_constants.append(self._parse_enum_constant())
-            
-            while self._match(JavaTokenType.COMMA):
+        try:
+            # Interfaces
+            super_interfaces = []
+            if self._match_keyword('implements'):
                 self._advance()
-                if self._match(JavaTokenType.RIGHT_BRACE):
-                    break
+                super_interfaces = self._parse_type_list()
+            
+            self._consume(JavaTokenType.LEFT_BRACE)
+            
+            # Enum constants
+            enum_constants = []
+            if not self._match(JavaTokenType.RIGHT_BRACE):
                 enum_constants.append(self._parse_enum_constant())
+                
+                while self._match(JavaTokenType.COMMA):
+                    self._advance()
+                    if self._match(JavaTokenType.RIGHT_BRACE):
+                        break
+                    enum_constants.append(self._parse_enum_constant())
+            
+            # Body declarations
+            body_declarations = []
+            if self._match(JavaTokenType.SEMICOLON):
+                self._advance()
+                body_declarations = self._parse_class_body_declarations()
+            
+            self._consume(JavaTokenType.RIGHT_BRACE)
         
-        # Body declarations
-        body_declarations = []
-        if self._match(JavaTokenType.SEMICOLON):
-            self._advance()
-            body_declarations = self._parse_class_body_declarations()
-        
-        self._consume(JavaTokenType.RIGHT_BRACE)
+        finally:
+            # Always pop the class context when done
+            self._pop_class_context()
         
         return JavaEnumDeclaration(
             modifiers=modifiers,
@@ -940,29 +966,37 @@ class JavaParser:
         self._consume_keyword('record')
         name = self._consume(JavaTokenType.IDENTIFIER).value
         
-        # Type parameters
-        type_parameters = []
-        if self._match(JavaTokenType.LESS_THAN):
-            type_parameters = self._parse_type_parameters()
+        # Push current record name onto stack and set as current
+        self._push_class_context(name)
         
-        # Parameters
-        self._consume(JavaTokenType.LEFT_PAREN)
-        parameters = []
-        if not self._match(JavaTokenType.RIGHT_PAREN):
-            parameters.append(self._parse_parameter())
-            while self._match(JavaTokenType.COMMA):
-                self._advance()
+        try:
+            # Type parameters
+            type_parameters = []
+            if self._match(JavaTokenType.LESS_THAN):
+                type_parameters = self._parse_type_parameters()
+            
+            # Parameters
+            self._consume(JavaTokenType.LEFT_PAREN)
+            parameters = []
+            if not self._match(JavaTokenType.RIGHT_PAREN):
                 parameters.append(self._parse_parameter())
-        self._consume(JavaTokenType.RIGHT_PAREN)
+                while self._match(JavaTokenType.COMMA):
+                    self._advance()
+                    parameters.append(self._parse_parameter())
+            self._consume(JavaTokenType.RIGHT_PAREN)
+            
+            # Interfaces
+            super_interfaces = []
+            if self._match_keyword('implements'):
+                self._advance()
+                super_interfaces = self._parse_type_list()
+            
+            # Body
+            body_declarations = self._parse_class_body()
         
-        # Interfaces
-        super_interfaces = []
-        if self._match_keyword('implements'):
-            self._advance()
-            super_interfaces = self._parse_type_list()
-        
-        # Body
-        body_declarations = self._parse_class_body()
+        finally:
+            # Always pop the class context when done
+            self._pop_class_context()
         
         return JavaRecordDeclaration(
             modifiers=modifiers,
@@ -1283,48 +1317,263 @@ class JavaParser:
         )
     
     def _parse_method_or_field_declaration(self, modifiers: List[JavaModifier], annotations: List[JavaAnnotation]) -> JavaDeclaration:
-        """Parse method or field declaration."""
-        # This is a simplified version - in practice, you'd need more lookahead
-        variable_type = self._parse_type()
+        """Parse method or field declaration with proper lookahead."""
+        try:
+            # Handle special cases first
+            if self._is_constructor_declaration():
+                return self._parse_constructor_declaration(modifiers, annotations)
+            
+            # Parse type parameters for generic methods
+            type_parameters = []
+            if self._match(JavaTokenType.LESS):
+                type_parameters = self._parse_type_parameter_list()
+            
+            # Parse return type (or field type)
+            return_type = None
+            if not self._is_constructor_name():
+                return_type = self._parse_type()
+            
+            # Parse name
+            name = self._consume(JavaTokenType.IDENTIFIER).value
+            
+            # Use lookahead to distinguish method from field
+            if self._is_method_declaration():
+                return self._parse_method_declaration_rest(
+                    modifiers, annotations, type_parameters, return_type, name
+                )
+            else:
+                return self._parse_field_declaration_rest(
+                    modifiers, annotations, return_type, name
+                )
+                
+        except Exception as e:
+            self._log_error(f"Error parsing method/field declaration: {e}")
+            self._synchronize()
+            return None
+    
+    def _push_class_context(self, class_name: str):
+        """Push a class name onto the context stack."""
+        self.class_name_stack.append(self.current_class_name)
+        self.current_class_name = class_name
+    
+    def _pop_class_context(self):
+        """Pop the current class context from the stack."""
+        if self.class_name_stack:
+            self.current_class_name = self.class_name_stack.pop()
+        else:
+            self.current_class_name = None
+    
+    def _is_constructor_declaration(self) -> bool:
+        """Check if this is a constructor declaration."""
+        if not self._match(JavaTokenType.IDENTIFIER):
+            return False
+        
+        # Get the identifier name
+        identifier_name = self._peek().value
+        
+        # Check if identifier name matches current class name
+        if self.current_class_name and identifier_name == self.current_class_name:
+            # Look ahead to see if next token after identifier is left paren
+            current_pos = self._position
+            self._advance()  # consume identifier
+            is_constructor = self._match(JavaTokenType.LEFT_PAREN)
+            self._position = current_pos  # reset
+            return is_constructor
+        
+        return False
+    
+    def _is_constructor_name(self) -> bool:
+        """Check if current identifier is constructor name."""
+        if not self._match(JavaTokenType.IDENTIFIER):
+            return False
+        
+        identifier_name = self._peek().value
+        return self.current_class_name and identifier_name == self.current_class_name
+    
+    def _is_method_declaration(self) -> bool:
+        """Use lookahead to determine if this is a method declaration."""
+        # Save current position
+        current_pos = self._position
+        
+        try:
+            # Skip array dimensions if any
+            while self._match(JavaTokenType.LEFT_BRACKET):
+                self._advance()
+                if not self._match(JavaTokenType.RIGHT_BRACKET):
+                    break
+                self._advance()
+            
+            # If we see a left parenthesis, it's a method
+            is_method = self._match(JavaTokenType.LEFT_PAREN)
+            return is_method
+            
+        except:
+            return False
+        finally:
+            # Restore position
+            self._position = current_pos
+    
+    def _parse_constructor_declaration(self, modifiers: List[JavaModifier], annotations: List[JavaAnnotation]) -> JavaMethodDeclaration:
+        """Parse constructor declaration."""
+        # Constructor name
         name = self._consume(JavaTokenType.IDENTIFIER).value
         
-        if self._match(JavaTokenType.LEFT_PAREN):
-            # Method
-            # Parameters
-            self._consume(JavaTokenType.LEFT_PAREN)
-            parameters = []
-            if not self._match(JavaTokenType.RIGHT_PAREN):
-                parameters.append(self._parse_parameter())
-                while self._match(JavaTokenType.COMMA):
-                    self._advance()
-                    parameters.append(self._parse_parameter())
-            self._consume(JavaTokenType.RIGHT_PAREN)
-            
-            # Throws clause
-            thrown_exceptions = []
-            if self._match_keyword('throws'):
+        # Parameters
+        self._consume(JavaTokenType.LEFT_PAREN)
+        parameters = []
+        if not self._match(JavaTokenType.RIGHT_PAREN):
+            parameters.append(self._parse_parameter())
+            while self._match(JavaTokenType.COMMA):
                 self._advance()
-                thrown_exceptions = self._parse_type_list()
-            
-            # Body
-            body = None
-            if self._match(JavaTokenType.LEFT_BRACE):
-                body = self._parse_block_statement()
-            else:
-                self._consume(JavaTokenType.SEMICOLON)
-            
-            return JavaMethodDeclaration(
-                modifiers=modifiers,
-                annotations=annotations,
-                name=name,
-                return_type=variable_type,
-                parameters=parameters,
-                thrown_exceptions=thrown_exceptions,
-                body=body
-            )
+                parameters.append(self._parse_parameter())
+        self._consume(JavaTokenType.RIGHT_PAREN)
+        
+        # Throws clause
+        thrown_exceptions = []
+        if self._match_keyword('throws'):
+            self._advance()
+            thrown_exceptions = self._parse_type_list()
+        
+        # Constructor body
+        body = self._parse_block_statement()
+        
+        return JavaMethodDeclaration(
+            modifiers=modifiers,
+            annotations=annotations,
+            name=name,
+            return_type=None,  # Constructors have no return type
+            parameters=parameters,
+            thrown_exceptions=thrown_exceptions,
+            body=body
+        )
+    
+    def _parse_method_declaration_rest(self, modifiers: List[JavaModifier], annotations: List[JavaAnnotation], 
+                                     type_parameters: List, return_type: JavaType, name: str) -> JavaMethodDeclaration:
+        """Parse the rest of a method declaration after type and name."""
+        # Parameters
+        self._consume(JavaTokenType.LEFT_PAREN)
+        parameters = []
+        if not self._match(JavaTokenType.RIGHT_PAREN):
+            parameters.append(self._parse_parameter())
+            while self._match(JavaTokenType.COMMA):
+                self._advance()
+                parameters.append(self._parse_parameter())
+        self._consume(JavaTokenType.RIGHT_PAREN)
+        
+        # Array dimensions for return type (e.g., int[] method())
+        array_dimensions = 0
+        while self._match(JavaTokenType.LEFT_BRACKET):
+            self._advance()
+            self._consume(JavaTokenType.RIGHT_BRACKET)
+            array_dimensions += 1
+        
+        # Adjust return type for array dimensions
+        actual_return_type = return_type
+        for _ in range(array_dimensions):
+            actual_return_type = JavaArrayType(component_type=actual_return_type)
+        
+        # Throws clause
+        thrown_exceptions = []
+        if self._match_keyword('throws'):
+            self._advance()
+            thrown_exceptions = self._parse_type_list()
+        
+        # Default value for annotation methods
+        default_value = None
+        if self._match_keyword('default'):
+            self._advance()
+            default_value = self._parse_expression()
+        
+        # Method body (or semicolon for abstract/interface methods)
+        body = None
+        if self._match(JavaTokenType.LEFT_BRACE):
+            body = self._parse_block_statement()
         else:
-            # Field
-            return self._parse_field_declaration_rest(modifiers, annotations, variable_type, name)
+            self._consume(JavaTokenType.SEMICOLON)
+        
+        return JavaMethodDeclaration(
+            modifiers=modifiers,
+            annotations=annotations,
+            type_parameters=type_parameters,
+            name=name,
+            return_type=actual_return_type,
+            parameters=parameters,
+            thrown_exceptions=thrown_exceptions,
+            body=body,
+            default_value=default_value
+        )
+    
+    def _parse_field_declaration_rest(self, modifiers: List[JavaModifier], annotations: List[JavaAnnotation], 
+                                    field_type: JavaType, first_name: str) -> JavaFieldDeclaration:
+        """Parse the rest of a field declaration after type and first name."""
+        fragments = []
+        
+        # Parse first declarator
+        fragments.append(self._parse_variable_declarator_rest(first_name))
+        
+        # Parse additional declarators
+        while self._match(JavaTokenType.COMMA):
+            self._advance()
+            name = self._consume(JavaTokenType.IDENTIFIER).value
+            fragments.append(self._parse_variable_declarator_rest(name))
+        
+        self._consume(JavaTokenType.SEMICOLON)
+        
+        return JavaFieldDeclaration(
+            modifiers=modifiers,
+            annotations=annotations,
+            variable_type=field_type,
+            fragments=fragments
+        )
+    
+    def _parse_variable_declarator_rest(self, name: str) -> JavaVariableDeclarationFragment:
+        """Parse the rest of a variable declarator after the name."""
+        # Array dimensions
+        extra_dimensions = 0
+        while self._match(JavaTokenType.LEFT_BRACKET):
+            self._advance()
+            self._consume(JavaTokenType.RIGHT_BRACKET)
+            extra_dimensions += 1
+        
+        # Initializer
+        initializer = None
+        if self._match(JavaTokenType.ASSIGN):
+            self._advance()
+            initializer = self._parse_expression()
+        
+        return JavaVariableDeclarationFragment(
+            name=name,
+            extra_dimensions=extra_dimensions,
+            initializer=initializer
+        )
+    
+    def _parse_type_parameter_list(self) -> List:
+        """Parse generic type parameter list."""
+        type_parameters = []
+        self._consume(JavaTokenType.LESS)
+        
+        if not self._match(JavaTokenType.GREATER):
+            type_parameters.append(self._parse_type_parameter())
+            while self._match(JavaTokenType.COMMA):
+                self._advance()
+                type_parameters.append(self._parse_type_parameter())
+        
+        self._consume(JavaTokenType.GREATER)
+        return type_parameters
+    
+    def _parse_type_parameter(self) -> JavaTypeParameter:
+        """Parse a single type parameter."""
+        name = self._consume(JavaTokenType.IDENTIFIER).value
+        
+        bounds = []
+        if self._match_keyword('extends'):
+            self._advance()
+            bounds.append(self._parse_type())
+            while self._match(JavaTokenType.BIT_AND):
+                self._advance()
+                bounds.append(self._parse_type())
+        
+        return JavaTypeParameter(name=name, bounds=bounds)
     
     def _parse_field_declaration(self, modifiers: List[JavaModifier], annotations: List[JavaAnnotation]) -> JavaFieldDeclaration:
         """Parse field declaration."""
@@ -1682,25 +1931,457 @@ class JavaParser:
         return JavaBlockStatement(statements)
     
     def _parse_statement(self) -> Optional[JavaStatement]:
-        """Parse statement (simplified)."""
-        # This is a very simplified statement parser
-        # A full implementation would handle all statement types
+        """Parse comprehensive Java statement."""
+        try:
+            # Handle labeled statements first
+            if self._match(JavaTokenType.IDENTIFIER) and self._peek().type == JavaTokenType.COLON:
+                return self._parse_labeled_statement()
+            
+            # Block statement
+            if self._match(JavaTokenType.LEFT_BRACE):
+                return self._parse_block_statement()
+            
+            # Empty statement
+            if self._match(JavaTokenType.SEMICOLON):
+                self._advance()
+                return JavaEmptyStatement()
+            
+            # Keyword-based statements
+            if self._match(JavaTokenType.KEYWORD):
+                keyword = self._current_token().value
+                
+                if keyword == "if":
+                    return self._parse_if_statement()
+                elif keyword == "while":
+                    return self._parse_while_statement()
+                elif keyword == "for":
+                    return self._parse_for_statement()
+                elif keyword == "do":
+                    return self._parse_do_statement()
+                elif keyword == "switch":
+                    return self._parse_switch_statement()
+                elif keyword == "try":
+                    return self._parse_try_statement()
+                elif keyword == "synchronized":
+                    return self._parse_synchronized_statement()
+                elif keyword == "return":
+                    return self._parse_return_statement()
+                elif keyword == "throw":
+                    return self._parse_throw_statement()
+                elif keyword == "break":
+                    return self._parse_break_statement()
+                elif keyword == "continue":
+                    return self._parse_continue_statement()
+                elif keyword == "assert":
+                    return self._parse_assert_statement()
+                elif keyword == "yield":
+                    return self._parse_yield_statement()
+                elif keyword in ["var", "final"] or self._is_type_keyword(keyword):
+                    return self._parse_local_variable_declaration()
+            
+            # Check for local variable declaration (type name)
+            if self._is_type_start():
+                return self._parse_local_variable_declaration()
+            
+            # Default to expression statement
+            expr = self._parse_expression()
+            self._consume(JavaTokenType.SEMICOLON)
+            return JavaExpressionStatement(expr)
+            
+        except Exception as e:
+            self._log_error(f"Error parsing statement: {e}")
+            # Skip to next semicolon or brace for error recovery
+            self._synchronize()
+            return None
+    
+    def _parse_labeled_statement(self) -> JavaLabeledStatement:
+        """Parse labeled statement."""
+        label = self._consume(JavaTokenType.IDENTIFIER).value
+        self._consume(JavaTokenType.COLON)
+        body = self._parse_statement()
+        return JavaLabeledStatement(label=label, body=body)
+    
+    def _parse_if_statement(self) -> JavaIfStatement:
+        """Parse if statement."""
+        self._consume(JavaTokenType.KEYWORD)  # if
+        self._consume(JavaTokenType.LEFT_PAREN)
+        condition = self._parse_expression()
+        self._consume(JavaTokenType.RIGHT_PAREN)
+        then_statement = self._parse_statement()
         
-        if self._match(JavaTokenType.LEFT_BRACE):
-            return self._parse_block_statement()
-        
-        if self._match(JavaTokenType.SEMICOLON):
+        else_statement = None
+        if self._match(JavaTokenType.KEYWORD) and self._current_token().value == "else":
             self._advance()
-            return JavaEmptyStatement()
+            else_statement = self._parse_statement()
         
-        # Expression statement
-        expr = self._parse_expression()
+        return JavaIfStatement(
+            condition=condition,
+            then_statement=then_statement,
+            else_statement=else_statement
+        )
+    
+    def _parse_while_statement(self) -> JavaWhileStatement:
+        """Parse while statement."""
+        self._consume(JavaTokenType.KEYWORD)  # while
+        self._consume(JavaTokenType.LEFT_PAREN)
+        condition = self._parse_expression()
+        self._consume(JavaTokenType.RIGHT_PAREN)
+        body = self._parse_statement()
+        
+        return JavaWhileStatement(condition=condition, body=body)
+    
+    def _parse_for_statement(self) -> Union[JavaForStatement, JavaEnhancedForStatement]:
+        """Parse for statement (traditional or enhanced)."""
+        self._consume(JavaTokenType.KEYWORD)  # for
+        self._consume(JavaTokenType.LEFT_PAREN)
+        
+        # Try to determine if this is an enhanced for loop
+        # Look ahead for the colon to distinguish enhanced for from traditional for
+        checkpoint = self._position
+        try:
+            # Try parsing as enhanced for (for variable : iterable)
+            variable_type = self._parse_type()
+            variable_name = self._consume(JavaTokenType.IDENTIFIER).value
+            if self._match(JavaTokenType.COLON):
+                self._advance()  # consume :
+                iterable = self._parse_expression()
+                self._consume(JavaTokenType.RIGHT_PAREN)
+                body = self._parse_statement()
+                
+                parameter = JavaParameter(
+                    parameter_type=variable_type,
+                    name=variable_name
+                )
+                return JavaEnhancedForStatement(
+                    parameter=parameter,
+                    expression=iterable,
+                    body=body
+                )
+        except:
+            pass
+        
+        # Reset and parse as traditional for loop
+        self._position = checkpoint
+        
+        # Traditional for loop: for (init; condition; update)
+        initializers = []
+        if not self._match(JavaTokenType.SEMICOLON):
+            initializers.append(self._parse_expression())
+            while self._match(JavaTokenType.COMMA):
+                self._advance()
+                initializers.append(self._parse_expression())
         self._consume(JavaTokenType.SEMICOLON)
-        return JavaExpressionStatement(expr)
+        
+        condition = None
+        if not self._match(JavaTokenType.SEMICOLON):
+            condition = self._parse_expression()
+        self._consume(JavaTokenType.SEMICOLON)
+        
+        updaters = []
+        if not self._match(JavaTokenType.RIGHT_PAREN):
+            updaters.append(self._parse_expression())
+            while self._match(JavaTokenType.COMMA):
+                self._advance()
+                updaters.append(self._parse_expression())
+        self._consume(JavaTokenType.RIGHT_PAREN)
+        
+        body = self._parse_statement()
+        
+        return JavaForStatement(
+            initializers=initializers,
+            condition=condition,
+            updaters=updaters,
+            body=body
+        )
+    
+    def _parse_do_statement(self) -> JavaDoStatement:
+        """Parse do-while statement."""
+        self._consume(JavaTokenType.KEYWORD)  # do
+        body = self._parse_statement()
+        self._consume(JavaTokenType.KEYWORD)  # while
+        self._consume(JavaTokenType.LEFT_PAREN)
+        condition = self._parse_expression()
+        self._consume(JavaTokenType.RIGHT_PAREN)
+        self._consume(JavaTokenType.SEMICOLON)
+        
+        return JavaDoStatement(body=body, condition=condition)
+    
+    def _parse_switch_statement(self) -> JavaSwitchStatement:
+        """Parse switch statement."""
+        self._consume(JavaTokenType.KEYWORD)  # switch
+        self._consume(JavaTokenType.LEFT_PAREN)
+        expression = self._parse_expression()
+        self._consume(JavaTokenType.RIGHT_PAREN)
+        self._consume(JavaTokenType.LEFT_BRACE)
+        
+        statements = []
+        while not self._match(JavaTokenType.RIGHT_BRACE) and not self._at_end():
+            if self._match(JavaTokenType.KEYWORD):
+                keyword = self._current_token().value
+                if keyword == "case":
+                    self._advance()
+                    case_expr = self._parse_expression()
+                    self._consume(JavaTokenType.COLON)
+                    case_statements = []
+                    
+                    # Parse statements until next case/default/end
+                    while (not self._match(JavaTokenType.RIGHT_BRACE) and 
+                           not (self._match(JavaTokenType.KEYWORD) and 
+                                self._current_token().value in ["case", "default"]) and 
+                           not self._at_end()):
+                        stmt = self._parse_statement()
+                        if stmt:
+                            case_statements.append(stmt)
+                    
+                    statements.append(JavaSwitchCase(
+                        expressions=[case_expr],
+                        statements=case_statements
+                    ))
+                    
+                elif keyword == "default":
+                    self._advance()
+                    self._consume(JavaTokenType.COLON)
+                    default_statements = []
+                    
+                    # Parse statements until end
+                    while (not self._match(JavaTokenType.RIGHT_BRACE) and 
+                           not (self._match(JavaTokenType.KEYWORD) and 
+                                self._current_token().value in ["case", "default"]) and 
+                           not self._at_end()):
+                        stmt = self._parse_statement()
+                        if stmt:
+                            default_statements.append(stmt)
+                    
+                    statements.append(JavaSwitchCase(
+                        expressions=[],  # Empty for default
+                        statements=default_statements
+                    ))
+                else:
+                    break
+            else:
+                break
+        
+        self._consume(JavaTokenType.RIGHT_BRACE)
+        return JavaSwitchStatement(expression=expression, statements=statements)
+    
+    def _parse_try_statement(self) -> JavaTryStatement:
+        """Parse try statement."""
+        self._consume(JavaTokenType.KEYWORD)  # try
+        
+        # Try-with-resources
+        resources = []
+        if self._match(JavaTokenType.LEFT_PAREN):
+            self._advance()
+            # Parse resource declarations
+            while not self._match(JavaTokenType.RIGHT_PAREN) and not self._at_end():
+                resource = self._parse_local_variable_declaration()
+                resources.append(resource)
+                if self._match(JavaTokenType.SEMICOLON):
+                    self._advance()
+                if not self._match(JavaTokenType.RIGHT_PAREN):
+                    break
+            self._consume(JavaTokenType.RIGHT_PAREN)
+        
+        body = self._parse_block_statement()
+        
+        # Catch clauses
+        catch_clauses = []
+        while (self._match(JavaTokenType.KEYWORD) and 
+               self._current_token().value == "catch"):
+            self._advance()
+            self._consume(JavaTokenType.LEFT_PAREN)
+            
+            # Parse exception parameter
+            exception_type = self._parse_type()
+            exception_name = self._consume(JavaTokenType.IDENTIFIER).value
+            exception_param = JavaParameter(
+                parameter_type=exception_type,
+                name=exception_name
+            )
+            
+            self._consume(JavaTokenType.RIGHT_PAREN)
+            catch_body = self._parse_block_statement()
+            
+            catch_clauses.append(JavaCatchClause(
+                exception=exception_param,
+                body=catch_body
+            ))
+        
+        # Finally clause
+        finally_block = None
+        if (self._match(JavaTokenType.KEYWORD) and 
+            self._current_token().value == "finally"):
+            self._advance()
+            finally_block = self._parse_block_statement()
+        
+        return JavaTryStatement(
+            resources=resources,
+            body=body,
+            catch_clauses=catch_clauses,
+            finally_block=finally_block
+        )
+    
+    def _parse_synchronized_statement(self) -> JavaSynchronizedStatement:
+        """Parse synchronized statement."""
+        self._consume(JavaTokenType.KEYWORD)  # synchronized
+        self._consume(JavaTokenType.LEFT_PAREN)
+        expression = self._parse_expression()
+        self._consume(JavaTokenType.RIGHT_PAREN)
+        body = self._parse_block_statement()
+        
+        return JavaSynchronizedStatement(expression=expression, body=body)
+    
+    def _parse_return_statement(self) -> JavaReturnStatement:
+        """Parse return statement."""
+        self._consume(JavaTokenType.KEYWORD)  # return
+        
+        expression = None
+        if not self._match(JavaTokenType.SEMICOLON):
+            expression = self._parse_expression()
+        
+        self._consume(JavaTokenType.SEMICOLON)
+        return JavaReturnStatement(expression=expression)
+    
+    def _parse_throw_statement(self) -> JavaThrowStatement:
+        """Parse throw statement."""
+        self._consume(JavaTokenType.KEYWORD)  # throw
+        expression = self._parse_expression()
+        self._consume(JavaTokenType.SEMICOLON)
+        
+        return JavaThrowStatement(expression=expression)
+    
+    def _parse_break_statement(self) -> JavaBreakStatement:
+        """Parse break statement."""
+        self._consume(JavaTokenType.KEYWORD)  # break
+        
+        label = None
+        if self._match(JavaTokenType.IDENTIFIER):
+            label = self._current_token().value
+            self._advance()
+        
+        self._consume(JavaTokenType.SEMICOLON)
+        return JavaBreakStatement(label=label)
+    
+    def _parse_continue_statement(self) -> JavaContinueStatement:
+        """Parse continue statement."""
+        self._consume(JavaTokenType.KEYWORD)  # continue
+        
+        label = None
+        if self._match(JavaTokenType.IDENTIFIER):
+            label = self._current_token().value
+            self._advance()
+        
+        self._consume(JavaTokenType.SEMICOLON)
+        return JavaContinueStatement(label=label)
+    
+    def _parse_assert_statement(self) -> JavaAssertStatement:
+        """Parse assert statement."""
+        self._consume(JavaTokenType.KEYWORD)  # assert
+        condition = self._parse_expression()
+        
+        message = None
+        if self._match(JavaTokenType.COLON):
+            self._advance()
+            message = self._parse_expression()
+        
+        self._consume(JavaTokenType.SEMICOLON)
+        return JavaAssertStatement(condition=condition, message=message)
+    
+    def _parse_yield_statement(self) -> JavaYieldStatement:
+        """Parse yield statement (Java 14+)."""
+        self._consume(JavaTokenType.KEYWORD)  # yield
+        expression = self._parse_expression()
+        self._consume(JavaTokenType.SEMICOLON)
+        
+        return JavaYieldStatement(expression=expression)
+    
+    def _parse_local_variable_declaration(self) -> JavaLocalVariableDeclaration:
+        """Parse local variable declaration."""
+        modifiers = []
+        
+        # Parse modifiers
+        while (self._match(JavaTokenType.KEYWORD) and 
+               self._current_token().value in ["final", "var"]):
+            modifier_name = self._current_token().value
+            if modifier_name == "final":
+                modifiers.append(JavaModifier.FINAL)
+            self._advance()
+        
+        # Parse type
+        variable_type = self._parse_type()
+        
+        # Parse variable declarators
+        declarators = []
+        while True:
+            name = self._consume(JavaTokenType.IDENTIFIER).value
+            
+            # Handle array dimensions
+            extra_dimensions = 0
+            while self._match(JavaTokenType.LEFT_BRACKET):
+                self._advance()
+                self._consume(JavaTokenType.RIGHT_BRACKET)
+                extra_dimensions += 1
+            
+            # Handle initializer
+            initializer = None
+            if self._match(JavaTokenType.ASSIGN):
+                self._advance()
+                initializer = self._parse_expression()
+            
+            declarators.append(JavaVariableDeclarationFragment(
+                name=name,
+                extra_dimensions=extra_dimensions,
+                initializer=initializer
+            ))
+            
+            if not self._match(JavaTokenType.COMMA):
+                break
+            self._advance()
+        
+        self._consume(JavaTokenType.SEMICOLON)
+        
+        return JavaLocalVariableDeclaration(
+            modifiers=modifiers,
+            variable_type=variable_type,
+            fragments=declarators
+        )
+    
+    def _is_type_keyword(self, keyword: str) -> bool:
+        """Check if keyword is a type keyword."""
+        return keyword in [
+            "boolean", "byte", "char", "double", "float", "int", "long", "short", "void"
+        ]
+    
+    def _is_type_start(self) -> bool:
+        """Check if current token could start a type."""
+        if self._match(JavaTokenType.IDENTIFIER):
+            return True
+        if self._match(JavaTokenType.KEYWORD):
+            return self._is_type_keyword(self._current_token().value)
+        return False
+    
+    def _synchronize(self):
+        """Synchronize parser after error for recovery."""
+        self._advance()
+        
+        while not self._at_end():
+            if self._previous().type == JavaTokenType.SEMICOLON:
+                return
+            
+            if self._match(JavaTokenType.KEYWORD):
+                keyword = self._current_token().value
+                if keyword in ["class", "fun", "var", "for", "if", "while", "return"]:
+                    return
+            
+            self._advance()
+    
+    def _log_error(self, message: str):
+        """Log parser error."""
+        print(f"Parser Error: {message}")
     
     def _parse_expression(self) -> JavaExpression:
-        """Parse expression (simplified)."""
-        return self._parse_primary()
+        """Parse complete Java expression with operator precedence."""
+        return self._parse_conditional_expression()
     
     def _parse_primary(self) -> JavaExpression:
         """Parse primary expression."""
@@ -1745,8 +2426,403 @@ class JavaParser:
             self._consume(JavaTokenType.RIGHT_PAREN)
             return expr
         
-        # Default fallback
+        # Handle 'this' and 'super' keywords
+        if self._match_keyword('this'):
+            self._advance()
+            return JavaThisExpression()
+        
+        if self._match_keyword('super'):
+            self._advance()
+            return JavaSuperExpression()
+        
+        # Handle 'new' expressions
+        if self._match_keyword('new'):
+            return self._parse_creation_expression()
+        
+        # Handle lambda expressions (Java 8+)
+        if self._is_lambda_expression():
+            return self._parse_lambda_expression()
+        
+        # Class literals (e.g., String.class)
+        if self._match(JavaTokenType.KEYWORD) and self._peek().value in ['class', 'void', 'int', 'boolean', 'char', 'byte', 'short', 'long', 'float', 'double']:
+            return self._parse_class_literal()
+        
+        # Default fallback for unrecognized tokens
+        self._log_error(f"Unexpected token in expression: {self._peek()}")
         return JavaSimpleName("unknown")
+    
+    def _parse_conditional_expression(self) -> JavaExpression:
+        """Parse conditional (ternary) expression: expr ? expr : expr"""
+        expr = self._parse_logical_or_expression()
+        
+        if self._match(JavaTokenType.QUESTION):
+            self._advance()
+            then_expr = self._parse_expression()
+            self._consume(JavaTokenType.COLON)
+            else_expr = self._parse_conditional_expression()
+            return JavaConditionalExpression(condition=expr, then_expression=then_expr, else_expression=else_expr)
+        
+        return expr
+    
+    def _parse_logical_or_expression(self) -> JavaExpression:
+        """Parse logical OR expression: expr || expr"""
+        expr = self._parse_logical_and_expression()
+        
+        while self._match(JavaTokenType.LOGICAL_OR):
+            operator = self._advance().value
+            right = self._parse_logical_and_expression()
+            expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+        
+        return expr
+    
+    def _parse_logical_and_expression(self) -> JavaExpression:
+        """Parse logical AND expression: expr && expr"""
+        expr = self._parse_bitwise_or_expression()
+        
+        while self._match(JavaTokenType.LOGICAL_AND):
+            operator = self._advance().value
+            right = self._parse_bitwise_or_expression()
+            expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+        
+        return expr
+    
+    def _parse_bitwise_or_expression(self) -> JavaExpression:
+        """Parse bitwise OR expression: expr | expr"""
+        expr = self._parse_bitwise_xor_expression()
+        
+        while self._match(JavaTokenType.BIT_OR):
+            operator = self._advance().value
+            right = self._parse_bitwise_xor_expression()
+            expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+        
+        return expr
+    
+    def _parse_bitwise_xor_expression(self) -> JavaExpression:
+        """Parse bitwise XOR expression: expr ^ expr"""
+        expr = self._parse_bitwise_and_expression()
+        
+        while self._match(JavaTokenType.BIT_XOR):
+            operator = self._advance().value
+            right = self._parse_bitwise_and_expression()
+            expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+        
+        return expr
+    
+    def _parse_bitwise_and_expression(self) -> JavaExpression:
+        """Parse bitwise AND expression: expr & expr"""
+        expr = self._parse_equality_expression()
+        
+        while self._match(JavaTokenType.BIT_AND):
+            operator = self._advance().value
+            right = self._parse_equality_expression()
+            expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+        
+        return expr
+    
+    def _parse_equality_expression(self) -> JavaExpression:
+        """Parse equality expression: expr == expr | expr != expr"""
+        expr = self._parse_relational_expression()
+        
+        while self._match(JavaTokenType.EQUAL, JavaTokenType.NOT_EQUAL):
+            operator = self._advance().value
+            right = self._parse_relational_expression()
+            expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+        
+        return expr
+    
+    def _parse_relational_expression(self) -> JavaExpression:
+        """Parse relational expression: expr < expr | expr > expr | expr <= expr | expr >= expr | instanceof"""
+        expr = self._parse_shift_expression()
+        
+        while True:
+            if self._match(JavaTokenType.LESS, JavaTokenType.GREATER, JavaTokenType.LESS_EQUAL, JavaTokenType.GREATER_EQUAL):
+                operator = self._advance().value
+                right = self._parse_shift_expression()
+                expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+            elif self._match_keyword('instanceof'):
+                self._advance()
+                type_expr = self._parse_type()
+                expr = JavaInstanceofExpression(expression=expr, type=type_expr)
+            else:
+                break
+        
+        return expr
+    
+    def _parse_shift_expression(self) -> JavaExpression:
+        """Parse shift expression: expr << expr | expr >> expr | expr >>> expr"""
+        expr = self._parse_additive_expression()
+        
+        while self._match(JavaTokenType.LEFT_SHIFT, JavaTokenType.RIGHT_SHIFT, JavaTokenType.UNSIGNED_RIGHT_SHIFT):
+            operator = self._advance().value
+            right = self._parse_additive_expression()
+            expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+        
+        return expr
+    
+    def _parse_additive_expression(self) -> JavaExpression:
+        """Parse additive expression: expr + expr | expr - expr"""
+        expr = self._parse_multiplicative_expression()
+        
+        while self._match(JavaTokenType.PLUS, JavaTokenType.MINUS):
+            operator = self._advance().value
+            right = self._parse_multiplicative_expression()
+            expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+        
+        return expr
+    
+    def _parse_multiplicative_expression(self) -> JavaExpression:
+        """Parse multiplicative expression: expr * expr | expr / expr | expr % expr"""
+        expr = self._parse_unary_expression()
+        
+        while self._match(JavaTokenType.MULTIPLY, JavaTokenType.DIVIDE, JavaTokenType.MODULO):
+            operator = self._advance().value
+            right = self._parse_unary_expression()
+            expr = JavaBinaryExpression(left=expr, operator=operator, right=right)
+        
+        return expr
+    
+    def _parse_unary_expression(self) -> JavaExpression:
+        """Parse unary expression: +expr | -expr | !expr | ~expr | ++expr | --expr | (type)expr"""
+        # Prefix unary operators
+        if self._match(JavaTokenType.PLUS, JavaTokenType.MINUS, JavaTokenType.LOGICAL_NOT, JavaTokenType.BIT_NOT):
+            operator = self._advance().value
+            operand = self._parse_unary_expression()
+            return JavaUnaryExpression(operator=operator, operand=operand, prefix=True)
+        
+        # Prefix increment/decrement
+        if self._match(JavaTokenType.INCREMENT, JavaTokenType.DECREMENT):
+            operator = self._advance().value
+            operand = self._parse_postfix_expression()
+            return JavaUnaryExpression(operator=operator, operand=operand, prefix=True)
+        
+        # Cast expression
+        if self._match(JavaTokenType.LEFT_PAREN) and self._is_cast_expression():
+            return self._parse_cast_expression()
+        
+        return self._parse_postfix_expression()
+    
+    def _parse_postfix_expression(self) -> JavaExpression:
+        """Parse postfix expression: expr++ | expr-- | expr[index] | expr.member | expr(args)"""
+        expr = self._parse_primary()
+        
+        while True:
+            if self._match(JavaTokenType.INCREMENT, JavaTokenType.DECREMENT):
+                operator = self._advance().value
+                expr = JavaUnaryExpression(operator=operator, operand=expr, prefix=False)
+            elif self._match(JavaTokenType.LEFT_BRACKET):
+                self._advance()
+                index = self._parse_expression()
+                self._consume(JavaTokenType.RIGHT_BRACKET)
+                expr = JavaArrayAccess(array=expr, index=index)
+            elif self._match(JavaTokenType.DOT):
+                self._advance()
+                if self._match(JavaTokenType.IDENTIFIER):
+                    member = self._advance().value
+                    if self._match(JavaTokenType.LEFT_PAREN):
+                        # Method call
+                        self._advance()
+                        arguments = []
+                        if not self._match(JavaTokenType.RIGHT_PAREN):
+                            arguments.append(self._parse_expression())
+                            while self._match(JavaTokenType.COMMA):
+                                self._advance()
+                                arguments.append(self._parse_expression())
+                        self._consume(JavaTokenType.RIGHT_PAREN)
+                        expr = JavaMethodInvocation(expression=expr, name=member, arguments=arguments)
+                    else:
+                        # Field access
+                        expr = JavaFieldAccess(expression=expr, name=member)
+                else:
+                    self._log_error("Expected identifier after dot")
+                    break
+            elif self._match(JavaTokenType.LEFT_PAREN):
+                # Method call without explicit object (should be parsed in primary)
+                self._advance()
+                arguments = []
+                if not self._match(JavaTokenType.RIGHT_PAREN):
+                    arguments.append(self._parse_expression())
+                    while self._match(JavaTokenType.COMMA):
+                        self._advance()
+                        arguments.append(self._parse_expression())
+                self._consume(JavaTokenType.RIGHT_PAREN)
+                expr = JavaMethodInvocation(expression=None, name=str(expr), arguments=arguments)
+            else:
+                break
+        
+        return expr
+    
+    def _is_cast_expression(self) -> bool:
+        """Determine if parentheses contain a cast expression."""
+        # Save current position
+        saved_pos = self._position
+        
+        try:
+            self._advance()  # consume '('
+            
+            # Check if this looks like a type
+            if self._match(JavaTokenType.KEYWORD) and self._peek().value in ['byte', 'short', 'int', 'long', 'char', 'float', 'double', 'boolean']:
+                # Primitive type cast
+                return True
+            elif self._match(JavaTokenType.IDENTIFIER):
+                # Could be reference type cast
+                return True
+            
+            return False
+        except:
+            return False
+        finally:
+            self._position = saved_pos
+    
+    def _parse_cast_expression(self) -> JavaExpression:
+        """Parse cast expression: (type)expr"""
+        self._consume(JavaTokenType.LEFT_PAREN)
+        cast_type = self._parse_type()
+        self._consume(JavaTokenType.RIGHT_PAREN)
+        operand = self._parse_unary_expression()
+        return JavaCastExpression(type=cast_type, expression=operand)
+    
+    def _parse_creation_expression(self) -> JavaExpression:
+        """Parse object creation expression: new Type(args) or new Type[size]"""
+        self._consume_keyword('new')
+        
+        # Parse type
+        creation_type = self._parse_type()
+        
+        if self._match(JavaTokenType.LEFT_BRACKET):
+            # Array creation
+            dimensions = []
+            while self._match(JavaTokenType.LEFT_BRACKET):
+                self._advance()
+                if self._match(JavaTokenType.RIGHT_BRACKET):
+                    # Empty dimension []
+                    dimensions.append(None)
+                    self._advance()
+                else:
+                    # Dimension with size [expr]
+                    size = self._parse_expression()
+                    dimensions.append(size)
+                    self._consume(JavaTokenType.RIGHT_BRACKET)
+            
+            # Array initializer
+            initializer = None
+            if self._match(JavaTokenType.LEFT_BRACE):
+                initializer = self._parse_array_initializer()
+            
+            return JavaArrayCreation(type=creation_type, dimensions=dimensions, initializer=initializer)
+        else:
+            # Object creation
+            self._consume(JavaTokenType.LEFT_PAREN)
+            arguments = []
+            if not self._match(JavaTokenType.RIGHT_PAREN):
+                arguments.append(self._parse_expression())
+                while self._match(JavaTokenType.COMMA):
+                    self._advance()
+                    arguments.append(self._parse_expression())
+            self._consume(JavaTokenType.RIGHT_PAREN)
+            
+            # Anonymous class body (optional)
+            body = None
+            if self._match(JavaTokenType.LEFT_BRACE):
+                body = self._parse_class_body()
+            
+            return JavaClassInstanceCreation(type=creation_type, arguments=arguments, anonymous_class_body=body)
+    
+    def _parse_lambda_expression(self) -> JavaExpression:
+        """Parse lambda expression: (params) -> body or param -> body"""
+        parameters = []
+        
+        if self._match(JavaTokenType.LEFT_PAREN):
+            # Multiple parameters or no parameters: (a, b) -> ... or () -> ...
+            self._advance()
+            if not self._match(JavaTokenType.RIGHT_PAREN):
+                parameters.append(self._parse_lambda_parameter())
+                while self._match(JavaTokenType.COMMA):
+                    self._advance()
+                    parameters.append(self._parse_lambda_parameter())
+            self._consume(JavaTokenType.RIGHT_PAREN)
+        else:
+            # Single parameter without parentheses: a -> ...
+            parameters.append(self._parse_lambda_parameter())
+        
+        self._consume(JavaTokenType.ARROW)
+        
+        # Lambda body
+        if self._match(JavaTokenType.LEFT_BRACE):
+            # Block body
+            body = self._parse_block_statement()
+        else:
+            # Expression body
+            body = self._parse_expression()
+        
+        return JavaLambdaExpression(parameters=parameters, body=body)
+    
+    def _parse_lambda_parameter(self) -> JavaLambdaParameter:
+        """Parse lambda parameter."""
+        # Type is optional in lambda parameters
+        param_type = None
+        if not self._match(JavaTokenType.IDENTIFIER) or self._is_type_name():
+            param_type = self._parse_type()
+        
+        name = self._consume(JavaTokenType.IDENTIFIER).value
+        return JavaLambdaParameter(type=param_type, name=name)
+    
+    def _is_lambda_expression(self) -> bool:
+        """Check if this is the start of a lambda expression."""
+        saved_pos = self._position
+        
+        try:
+            if self._match(JavaTokenType.IDENTIFIER):
+                self._advance()
+                return self._match(JavaTokenType.ARROW)
+            elif self._match(JavaTokenType.LEFT_PAREN):
+                self._advance()
+                # Skip parameter list
+                paren_count = 1
+                while paren_count > 0 and not self._is_at_end():
+                    if self._match(JavaTokenType.LEFT_PAREN):
+                        paren_count += 1
+                    elif self._match(JavaTokenType.RIGHT_PAREN):
+                        paren_count -= 1
+                    self._advance()
+                return self._match(JavaTokenType.ARROW)
+            
+            return False
+        except:
+            return False
+        finally:
+            self._position = saved_pos
+    
+    def _parse_class_literal(self) -> JavaExpression:
+        """Parse class literal: Type.class"""
+        type_expr = self._parse_type()
+        self._consume(JavaTokenType.DOT)
+        self._consume_keyword('class')
+        return JavaClassLiteral(type=type_expr)
+    
+    def _parse_array_initializer(self) -> JavaArrayInitializer:
+        """Parse array initializer: {expr1, expr2, ...}"""
+        self._consume(JavaTokenType.LEFT_BRACE)
+        
+        expressions = []
+        if not self._match(JavaTokenType.RIGHT_BRACE):
+            expressions.append(self._parse_expression())
+            while self._match(JavaTokenType.COMMA):
+                self._advance()
+                if self._match(JavaTokenType.RIGHT_BRACE):  # Trailing comma
+                    break
+                expressions.append(self._parse_expression())
+        
+        self._consume(JavaTokenType.RIGHT_BRACE)
+        return JavaArrayInitializer(expressions=expressions)
+    
+    def _is_type_name(self) -> bool:
+        """Check if current identifier is likely a type name."""
+        if not self._match(JavaTokenType.IDENTIFIER):
+            return False
+        
+        # Simple heuristic: type names typically start with uppercase
+        name = self._peek().value
+        return name[0].isupper() if name else False
 
 
 def parse_java(source: str, file_name: Optional[str] = None) -> JavaCompilationUnit:

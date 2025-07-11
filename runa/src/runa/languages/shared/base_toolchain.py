@@ -13,7 +13,7 @@ from pathlib import Path
 import time
 import hashlib
 
-from ..core.runa_ast import Program
+from ...core.runa_ast import Program
 from ...core.translation_result import TranslationResult, TranslationError
 
 

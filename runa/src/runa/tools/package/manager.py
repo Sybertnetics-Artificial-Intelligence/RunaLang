@@ -208,7 +208,7 @@ class PackageRegistry:
             1: ["javascript", "typescript", "python", "cpp", "java", "csharp", "sql"],
             2: ["rust", "go", "swift", "kotlin", "php", "webassembly"],
             3: ["html", "css", "shell", "hcl", "yaml", "json", "xml"],
-            4: ["r", "matlab", "julia", "solidity", "graphql"],
+            4: ["r", "matlab", "julia", "solidity", "graphql", "vyper", "move", "michelson", "scilla", "smartpy", "ligo", "plutus", "pact", "scrypto"],
             5: ["lisp", "haskell", "erlang", "elixir", "llvm_ir", "assembly"],
             6: ["objective_c", "visual_basic", "cobol", "ada", "perl", "fortran"]
         }
@@ -244,7 +244,8 @@ class PackageRegistry:
         elif method == 'POST':
             if files:
                 # For file uploads, we'd use a proper multipart library in production
-                raise NotImplementedError("File upload not implemented in basic urllib version")
+                # TODO: Implement File upload not implemented in basic urllib version
+            return StringLiteral(value="File upload not implemented in basic urllib version_placeholder")
             
             json_data = json.dumps(data).encode() if data else b''
             headers['Content-Type'] = 'application/json'

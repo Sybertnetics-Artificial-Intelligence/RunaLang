@@ -37,7 +37,7 @@ class CppToRunaConverter:
         
         return Program(statements)
     
-    def convert_declaration(self, decl: CppDeclaration) -> Union[RunaStatement, List[RunaStatement], None]:
+    def convert_declaration(self, decl: CppDeclaration) -> Union[Statement, List[Statement], None]:
         """Convert C++ declaration to Runa statement(s)."""
         if isinstance(decl, CppVariableDecl):
             return self._convert_variable_decl(decl)
@@ -52,7 +52,7 @@ class CppToRunaConverter:
         
         return None
     
-    def convert_statement(self, stmt: CppStatement) -> Union[RunaStatement, List[RunaStatement], None]:
+    def convert_statement(self, stmt: CppStatement) -> Union[Statement, List[Statement], None]:
         """Convert C++ statement to Runa statement(s)."""
         if isinstance(stmt, CppExpressionStmt):
             return self._convert_expression_stmt(stmt)
@@ -69,13 +69,13 @@ class CppToRunaConverter:
         elif isinstance(stmt, CppReturnStmt):
             return self._convert_return_stmt(stmt)
         elif isinstance(stmt, CppBreakStmt):
-            return RunaBreak()
+            return BreakStatement()
         elif isinstance(stmt, CppContinueStmt):
-            return RunaContinue()
+            return ContinueStatement()
         
         return None
     
-    def convert_expression(self, expr: CppExpression) -> RunaExpression:
+    def convert_expression(self, expr: CppExpression) -> Expression:
         """Convert C++ expression to Runa expression."""
         if isinstance(expr, CppIntegerLiteral):
             return self._convert_integer_literal(expr)
@@ -119,9 +119,9 @@ class CppToRunaConverter:
             return self._convert_initializer_list(expr)
         
         # Fallback for unknown expressions
-        return RunaLiteral("unknown_expression", "string")
+        return StringLiteral("unknown_expression")
     
-    def _convert_variable_decl(self, decl: CppVariableDecl) -> RunaVariableDeclaration:
+    def _convert_variable_decl(self, decl: CppVariableDecl) -> LetStatement:
         """Convert C++ variable declaration."""
         runa_type = self._convert_type(decl.var_type)
         initial_value = None
@@ -129,13 +129,13 @@ class CppToRunaConverter:
         if decl.initializer:
             initial_value = self.convert_expression(decl.initializer)
         
-        return RunaVariableDeclaration(
-            decl.name,
-            runa_type,
-            initial_value
+        return LetStatement(
+            identifier=decl.name,
+            value=initial_value,
+            type_annotation=runa_type
         )
     
-    def _convert_function_decl(self, decl: CppFunctionDecl) -> RunaFunctionDeclaration:
+    def _convert_function_decl(self, decl: CppFunctionDecl) -> ProcessDefinition:
         """Convert C++ function declaration."""
         parameters = []
         
@@ -143,12 +143,10 @@ class CppToRunaConverter:
             param_type = self._convert_type(param.param_type)
             param_name = param.name or f"param_{len(parameters)}"
             
-            # Handle default values
-            default_value = None
-            if param.default_value:
-                default_value = self.convert_expression(param.default_value)
-            
-            runa_param = RunaParameter(param_name, param_type, default_value)
+            runa_param = Parameter(
+                name=param_name,
+                type_annotation=param_type
+            )
             parameters.append(runa_param)
         
         return_type = self._convert_type(decl.return_type)
@@ -161,45 +159,389 @@ class CppToRunaConverter:
             elif converted_body:
                 body_statements = [converted_body]
         
-        return RunaFunctionDeclaration(
-            decl.name,
-            parameters,
-            return_type,
-            body_statements
+        return ProcessDefinition(
+            name=decl.name,
+            parameters=parameters,
+            return_type=return_type,
+            body=body_statements
         )
     
-    def _convert_class_decl(self, decl: CppClassDecl) -> RunaClassDeclaration:
-        """Convert C++ class declaration."""
-        methods = []
-        fields = []
-        
-        for member in decl.members:
-            if isinstance(member, CppFunctionDecl):
-                methods.append(self._convert_function_decl(member))
-            elif isinstance(member, CppVariableDecl):
-                fields.append(self._convert_variable_decl(member))
-        
-        # Handle base classes
-        base_classes = []
-        for base_spec in decl.base_classes:
-            base_name = self._type_to_string(base_spec.base_type)
-            base_classes.append(base_name)
-        
-        return RunaClassDeclaration(
-            decl.name,
-            fields,
-            methods,
-            base_classes
-        )
+    def _convert_class_decl(self, decl: CppClassDecl) -> TypeDefinition:
+        """Convert C++ class declaration to Runa type definition."""
+        try:
+            # Convert class name
+            class_name = decl.name if decl.name else "AnonymousClass"
+            
+            # Handle template classes
+            if hasattr(decl, 'template_params') and decl.template_params:
+                template_params = self._convert_template_parameters(decl.template_params)
+                class_name = f"{class_name}<{', '.join(template_params)}>"
+            
+            # Convert base classes (inheritance)
+            base_types = []
+            if decl.base_clause:
+                for base in decl.base_clause.bases:
+                    base_type = self._convert_type(base.type)
+                    if base_type:
+                        # Handle access specifiers
+                        access = base.access_specifier if hasattr(base, 'access_specifier') else "public"
+                        if access == "public":
+                            base_types.append(base_type)
+                        # For private/protected inheritance, we'll add metadata
+                        elif access in ["private", "protected"]:
+                            base_types.append(f"{access}_{base_type}")
+            
+            # Convert class members
+            members = []
+            if decl.members:
+                for member in decl.members:
+                    converted_member = self._convert_class_member(member)
+                    if converted_member:
+                        members.append(converted_member)
+            
+            # Create type definition with inheritance
+            if base_types:
+                # Create composite type with inheritance
+                base_type = base_types[0] if len(base_types) == 1 else f"Composite({', '.join(base_types)})"
+                # Create ProcessDefinition with class-like features for C++ classes
+                process_def = ProcessDefinition(
+                    name=class_name,
+                    parameters=[],
+                    return_type=BasicType("Object"),
+                    body=members,
+                    base_classes=[BasicType(base_type)] if base_types else []
+                )
+                type_def = process_def
+            else:
+                # Simple type definition
+                # Simple class definition as ProcessDefinition
+                process_def = ProcessDefinition(
+                    name=class_name,
+                    parameters=[],
+                    return_type=BasicType("Object"),
+                    body=members
+                )
+                type_def = process_def
+            
+            # Add class metadata
+            if hasattr(decl, 'storage_class') and decl.storage_class:
+                type_def.metadata = type_def.metadata or {}
+                type_def.metadata["storage_class"] = decl.storage_class
+            
+            # Handle virtual inheritance
+            if decl.base_clause and any(getattr(base, 'is_virtual', False) for base in decl.base_clause.bases):
+                type_def.metadata = type_def.metadata or {}
+                type_def.metadata["virtual_inheritance"] = True
+            
+            return type_def
+            
+        except Exception as e:
+            self._log_error(f"Error converting class declaration: {e}")
+            # Fallback to basic type
+            return ProcessDefinition(
+                name=decl.name or "UnknownClass",
+                parameters=[],
+                return_type=BasicType("Object"),
+                body=[]
+            )
     
-    def _convert_namespace_decl(self, decl: CppNamespaceDecl) -> List[RunaStatement]:
+    def _convert_class_member(self, member) -> Optional[Statement]:
+        """Convert individual class member."""
+        try:
+            if hasattr(member, 'kind'):
+                if member.kind == "field":
+                    return self._convert_field_declaration(member)
+                elif member.kind == "method":
+                    return self._convert_method_declaration(member)
+                elif member.kind == "constructor":
+                    return self._convert_constructor_declaration(member)
+                elif member.kind == "destructor":
+                    return self._convert_destructor_declaration(member)
+                elif member.kind == "operator":
+                    return self._convert_operator_declaration(member)
+                elif member.kind == "typedef":
+                    return self._convert_typedef_declaration(member)
+                elif member.kind == "enum":
+                    return self._convert_enum_declaration(member)
+                elif member.kind == "class":
+                    return self._convert_nested_class_declaration(member)
+                elif member.kind == "friend":
+                    return self._convert_friend_declaration(member)
+                elif member.kind == "using":
+                    return self._convert_using_declaration(member)
+            
+            # Fallback for unknown member types
+            return self.convert_declaration(member)
+            
+        except Exception as e:
+            self._log_error(f"Error converting class member: {e}")
+            return None
+    
+    def _convert_field_declaration(self, field) -> Statement:
+        """Convert class field declaration."""
+        field_name = field.name if hasattr(field, 'name') else "unknown_field"
+        field_type = self._convert_type(field.type) if hasattr(field, 'type') else "any"
+        
+        # Handle access specifier
+        access = getattr(field, 'access_specifier', 'private')
+        
+        # Handle static fields
+        is_static = getattr(field, 'storage_class', '') == 'static'
+        
+        # Handle const fields
+        is_const = getattr(field, 'is_const', False)
+        
+        # Handle reference fields
+        is_reference = getattr(field, 'is_reference', False)
+        
+        # Create field declaration
+        # Convert field to LetStatement with metadata
+        field_stmt = LetStatement(
+            identifier=field_name,
+            type_annotation=BasicType(field_type) if isinstance(field_type, str) else field_type,
+            value=None
+        )
+        
+        # Add metadata for access and modifiers
+        field_stmt.metadata = field_stmt.metadata or {}
+        field_stmt.metadata["access_specifier"] = access
+        field_stmt.metadata["is_static"] = is_static
+        field_stmt.metadata["is_const"] = is_const
+        field_stmt.metadata["is_reference"] = is_reference
+        
+        return field_stmt
+    
+    def _convert_method_declaration(self, method) -> Statement:
+        """Convert class method declaration."""
+        method_name = method.name if hasattr(method, 'name') else "unknown_method"
+        return_type = self._convert_type(method.return_type) if hasattr(method, 'return_type') else "void"
+        
+        # Convert parameters
+        parameters = []
+        if hasattr(method, 'parameters') and method.parameters:
+            for param in method.parameters:
+                param_name = param.name if hasattr(param, 'name') else "param"
+                param_type = self._convert_type(param.type) if hasattr(param, 'type') else "any"
+                default_value = None
+                if hasattr(param, 'default_value') and param.default_value:
+                    default_value = self.convert_expression(param.default_value)
+                
+                parameters.append(Parameter(
+                    name=param_name,
+                    type=param_type,
+                    default_value=default_value
+                ))
+        
+        # Handle access specifier
+        access = getattr(method, 'access_specifier', 'private')
+        
+        # Handle method modifiers
+        modifiers = []
+        if getattr(method, 'is_virtual', False):
+            modifiers.append("virtual")
+        if getattr(method, 'is_pure_virtual', False):
+            modifiers.append("pure_virtual")
+        if getattr(method, 'is_const', False):
+            modifiers.append("const")
+        if getattr(method, 'storage_class', '') == 'static':
+            modifiers.append("static")
+        if getattr(method, 'is_inline', False):
+            modifiers.append("inline")
+        
+        # Handle method body
+        body = None
+        if hasattr(method, 'body') and method.body:
+            body = self.convert_statement(method.body)
+        
+        method_def = ProcessDefinition(
+            name=method_name,
+            parameters=parameters,
+            return_type=BasicType(return_type) if isinstance(return_type, str) else return_type,
+            body=body if body else []
+        )
+        
+        # Add metadata for access and modifiers
+        method_def.metadata = method_def.metadata or {}
+        method_def.metadata["access_specifier"] = access
+        method_def.metadata["modifiers"] = modifiers
+        
+        return method_def
+    
+    def _convert_constructor_declaration(self, ctor) -> Statement:
+        """Convert constructor declaration."""
+        class_name = ctor.name if hasattr(ctor, 'name') else "UnknownClass"
+        
+        # Convert parameters
+        parameters = []
+        if hasattr(ctor, 'parameters') and ctor.parameters:
+            for param in ctor.parameters:
+                param_name = param.name if hasattr(param, 'name') else "param"
+                param_type = self._convert_type(param.type) if hasattr(param, 'type') else "any"
+                default_value = None
+                if hasattr(param, 'default_value') and param.default_value:
+                    default_value = self.convert_expression(param.default_value)
+                
+                parameters.append(Parameter(
+                    name=param_name,
+                    type=param_type,
+                    default_value=default_value
+                ))
+        
+        # Handle access specifier
+        access = getattr(ctor, 'access_specifier', 'public')
+        
+        # Handle constructor modifiers
+        modifiers = []
+        if getattr(ctor, 'is_explicit', False):
+            modifiers.append("explicit")
+        if getattr(ctor, 'storage_class', '') == 'static':
+            modifiers.append("static")
+        
+        # Handle constructor body
+        body = None
+        if hasattr(ctor, 'body') and ctor.body:
+            body = self.convert_statement(ctor.body)
+        
+        # Handle initializer list
+        initializers = []
+        if hasattr(ctor, 'initializer_list') and ctor.initializer_list:
+            for init in ctor.initializer_list:
+                member_name = init.member if hasattr(init, 'member') else "unknown"
+                init_value = self.convert_expression(init.value) if hasattr(init, 'value') else None
+                if init_value:
+                    initializers.append(f"{member_name} = {init_value}")
+        
+        # Constructor as special ProcessDefinition
+        ctor_def = ProcessDefinition(
+            name=f"__init__{class_name}",
+            parameters=parameters,
+            return_type=BasicType(class_name),
+            body=body if body else []
+        )
+        
+        # Add metadata for constructor specifics
+        ctor_def.metadata = ctor_def.metadata or {}
+        ctor_def.metadata["is_constructor"] = True
+        ctor_def.metadata["access_specifier"] = access
+        ctor_def.metadata["modifiers"] = modifiers
+        ctor_def.metadata["initializers"] = initializers
+        
+        return ctor_def
+    
+    def _convert_destructor_declaration(self, dtor) -> Statement:
+        """Convert destructor declaration."""
+        class_name = dtor.name if hasattr(dtor, 'name') else "UnknownClass"
+        
+        # Handle access specifier
+        access = getattr(dtor, 'access_specifier', 'public')
+        
+        # Handle destructor modifiers
+        modifiers = []
+        if getattr(dtor, 'is_virtual', False):
+            modifiers.append("virtual")
+        if getattr(dtor, 'is_pure_virtual', False):
+            modifiers.append("pure_virtual")
+        
+        # Handle destructor body
+        body = None
+        if hasattr(dtor, 'body') and dtor.body:
+            body = self.convert_statement(dtor.body)
+        
+        # Destructor as special ProcessDefinition
+        dtor_def = ProcessDefinition(
+            name=f"__del__{class_name}",
+            parameters=[],
+            return_type=BasicType("Void"),
+            body=body if body else []
+        )
+        
+        # Add metadata for destructor specifics
+        dtor_def.metadata = dtor_def.metadata or {}
+        dtor_def.metadata["is_destructor"] = True
+        dtor_def.metadata["access_specifier"] = access
+        dtor_def.metadata["modifiers"] = modifiers
+        
+        return dtor_def
+    
+    def _convert_operator_declaration(self, op) -> Statement:
+        """Convert operator overload declaration."""
+        operator_name = op.operator if hasattr(op, 'operator') else "unknown"
+        
+        # Convert parameters
+        parameters = []
+        if hasattr(op, 'parameters') and op.parameters:
+            for param in op.parameters:
+                param_name = param.name if hasattr(param, 'name') else "param"
+                param_type = self._convert_type(param.type) if hasattr(param, 'type') else "any"
+                parameters.append(Parameter(
+                    name=param_name,
+                    type=param_type
+                ))
+        
+        return_type = self._convert_type(op.return_type) if hasattr(op, 'return_type') else "any"
+        
+        # Handle access specifier
+        access = getattr(op, 'access_specifier', 'public')
+        
+        # Handle operator modifiers
+        modifiers = []
+        if getattr(op, 'is_const', False):
+            modifiers.append("const")
+        
+        # Handle operator body
+        body = None
+        if hasattr(op, 'body') and op.body:
+            body = self.convert_statement(op.body)
+        
+        # Operator as special ProcessDefinition
+        op_def = ProcessDefinition(
+            name=f"__operator_{operator_name}__",
+            parameters=parameters,
+            return_type=BasicType(return_type) if isinstance(return_type, str) else return_type,
+            body=body if body else []
+        )
+        
+        # Add metadata for operator specifics
+        op_def.metadata = op_def.metadata or {}
+        op_def.metadata["is_operator"] = True
+        op_def.metadata["operator_name"] = operator_name
+        op_def.metadata["access_specifier"] = access
+        op_def.metadata["modifiers"] = modifiers
+        
+        return op_def
+    
+    def _convert_template_parameters(self, template_params) -> List[str]:
+        """Convert template parameters to string representations."""
+        params = []
+        if hasattr(template_params, 'parameters'):
+            for param in template_params.parameters:
+                if hasattr(param, 'kind'):
+                    if param.kind == "type":
+                        param_name = param.name if hasattr(param, 'name') else "T"
+                        default_type = ""
+                        if hasattr(param, 'default_value') and param.default_value:
+                            default_type = f" = {self._convert_type(param.default_value)}"
+                        params.append(f"typename {param_name}{default_type}")
+                    elif param.kind == "non_type":
+                        param_name = param.name if hasattr(param, 'name') else "N"
+                        param_type = self._convert_type(param.type) if hasattr(param, 'type') else "int"
+                        default_value = ""
+                        if hasattr(param, 'default_value') and param.default_value:
+                            default_value = f" = {self.convert_expression(param.default_value)}"
+                        params.append(f"{param_type} {param_name}{default_value}")
+                    elif param.kind == "template":
+                        param_name = param.name if hasattr(param, 'name') else "T"
+                        params.append(f"template<typename> class {param_name}")
+        return params
+    
+    def _convert_namespace_decl(self, decl: CppNamespaceDecl) -> List[Statement]:
         """Convert C++ namespace declaration."""
         statements = []
         
         # Add namespace comment
         if decl.name:
-            comment = RunaExpressionStatement(
-                RunaLiteral(f"namespace {decl.name}", "comment")
+            comment = ExpressionStatement(
+                StringLiteral(f"namespace {decl.name}")
             )
             statements.append(comment)
         
@@ -214,30 +556,280 @@ class CppToRunaConverter:
         
         return statements
     
-    def _convert_template_decl(self, decl: CppTemplateDecl) -> RunaStatement:
-        """Convert C++ template declaration."""
-        # Simplified template handling - convert the templated declaration
-        # and add template parameters as comments
-        
-        converted_decl = self.convert_declaration(decl.declaration)
-        
-        # Add template parameter information as metadata
-        if isinstance(converted_decl, RunaFunctionDeclaration):
-            # Add template info to function name
-            template_info = f"template_{len(decl.template_params.parameters)}_params"
-            converted_decl.name = f"{converted_decl.name}_{template_info}"
-        
-        return converted_decl
+    def _convert_template_decl(self, decl: CppTemplateDecl) -> Statement:
+        """Convert C++ template declaration to Runa equivalent."""
+        try:
+            # Convert template parameters
+            template_params = []
+            if decl.template_params and hasattr(decl.template_params, 'parameters'):
+                for param in decl.template_params.parameters:
+                    converted_param = self._convert_template_parameter(param)
+                    if converted_param:
+                        template_params.append(converted_param)
+            
+            # Convert the templated declaration
+            converted_decl = self.convert_declaration(decl.declaration)
+            
+            # Handle different types of templated declarations
+            if isinstance(converted_decl, ProcessDefinition):
+                # Template function
+                return self._create_template_function(converted_decl, template_params)
+            elif isinstance(converted_decl, TypeDefinition):
+                # Template class
+                return self._create_template_class(converted_decl, template_params)
+            elif isinstance(converted_decl, (LetStatement, DefineStatement)):
+                # Template variable (C++17)
+                return self._create_template_variable(converted_decl, template_params)
+            else:
+                # Generic template declaration
+                return self._create_generic_template(converted_decl, template_params)
+                
+        except Exception as e:
+            self._log_error(f"Error converting template declaration: {e}")
+            # Fallback to basic conversion
+            converted_decl = self.convert_declaration(decl.declaration)
+            if isinstance(converted_decl, ProcessDefinition):
+                converted_decl.name = f"template_{converted_decl.name}"
+            return converted_decl
     
-    def _convert_expression_stmt(self, stmt: CppExpressionStmt) -> RunaExpressionStatement:
+    def _convert_template_parameter(self, param) -> Optional[str]:
+        """Convert individual template parameter."""
+        try:
+            if hasattr(param, 'kind'):
+                if param.kind == "type":
+                    # Type parameter: typename T
+                    param_name = param.name if hasattr(param, 'name') else "T"
+                    default_type = ""
+                    if hasattr(param, 'default_value') and param.default_value:
+                        default_type = f" = {self._convert_type(param.default_value)}"
+                    
+                    # Handle constraints (C++20 concepts)
+                    constraints = ""
+                    if hasattr(param, 'constraints') and param.constraints:
+                        constraint_list = []
+                        for constraint in param.constraints:
+                            if hasattr(constraint, 'name'):
+                                constraint_list.append(constraint.name)
+                        if constraint_list:
+                            constraints = f" requires {', '.join(constraint_list)}"
+                    
+                    return f"typename {param_name}{default_type}{constraints}"
+                
+                elif param.kind == "non_type":
+                    # Non-type parameter: int N
+                    param_name = param.name if hasattr(param, 'name') else "N"
+                    param_type = self._convert_type(param.type) if hasattr(param, 'type') else "int"
+                    default_value = ""
+                    if hasattr(param, 'default_value') and param.default_value:
+                        default_value = f" = {self._convert_expression(param.default_value)}"
+                    
+                    return f"{param_type} {param_name}{default_value}"
+                
+                elif param.kind == "template":
+                    # Template template parameter: template<typename> class Container
+                    param_name = param.name if hasattr(param, 'name') else "T"
+                    template_params = ""
+                    if hasattr(param, 'template_params') and param.template_params:
+                        param_list = []
+                        for tp in param.template_params.parameters:
+                            if hasattr(tp, 'kind') and tp.kind == "type":
+                                param_list.append("typename")
+                        if param_list:
+                            template_params = f"<{', '.join(param_list)}>"
+                    
+                    return f"template{template_params} class {param_name}"
+                
+                elif param.kind == "concept":
+                    # C++20 concept parameter
+                    param_name = param.name if hasattr(param, 'name') else "C"
+                    concept_name = param.concept_name if hasattr(param, 'concept_name') else "Concept"
+                    return f"{concept_name} {param_name}"
+            
+            return None
+            
+        except Exception as e:
+            self._log_error(f"Error converting template parameter: {e}")
+            return None
+    
+    def _create_template_function(self, func: ProcessDefinition, template_params: List[str]) -> ProcessDefinition:
+        """Create template function with proper parameter handling."""
+        # Add template parameters as metadata
+        func.metadata = func.metadata or {}
+        func.metadata["template_parameters"] = template_params
+        func.metadata["is_template"] = True
+        
+        # Modify function name to indicate it's a template
+        if template_params:
+            param_names = []
+            for param in template_params:
+                # Extract parameter name from template parameter string
+                try:
+                    if "typename" in param:
+                        parts = param.split("typename")
+                        if len(parts) > 1:
+                            name = parts[1].split()[0].split("=")[0].strip()
+                            param_names.append(name)
+                    elif "template" in param and "class" in param:
+                        parts = param.split("class")
+                        if len(parts) > 1:
+                            name = parts[1].strip().split()[0]
+                            param_names.append(name)
+                    else:
+                        parts = param.split()
+                        if len(parts) > 1:
+                            name = parts[1].split("=")[0].strip()
+                            param_names.append(name)
+                except (IndexError, AttributeError):
+                    # Fallback if parsing fails
+                    param_names.append("UnknownParam")
+            
+            func.name = f"{func.name}<{', '.join(param_names)}>"
+        
+        return func
+    
+    def _create_template_class(self, class_def: TypeDefinition, template_params: List[str]) -> TypeDefinition:
+        """Create template class with proper parameter handling."""
+        # Add template parameters as metadata
+        class_def.metadata = class_def.metadata or {}
+        class_def.metadata["template_parameters"] = template_params
+        class_def.metadata["is_template"] = True
+        
+        # Modify class name to indicate it's a template
+        if template_params:
+            param_names = []
+            for param in template_params:
+                # Extract parameter name from template parameter string
+                try:
+                    if "typename" in param:
+                        parts = param.split("typename")
+                        if len(parts) > 1:
+                            name = parts[1].split()[0].split("=")[0].strip()
+                            param_names.append(name)
+                    elif "template" in param and "class" in param:
+                        parts = param.split("class")
+                        if len(parts) > 1:
+                            name = parts[1].strip().split()[0]
+                            param_names.append(name)
+                    else:
+                        parts = param.split()
+                        if len(parts) > 1:
+                            name = parts[1].split("=")[0].strip()
+                            param_names.append(name)
+                except (IndexError, AttributeError):
+                    # Fallback if parsing fails
+                    param_names.append("UnknownParam")
+            
+            class_def.name = f"{class_def.name}<{', '.join(param_names)}>"
+        
+        return class_def
+    
+    def _create_template_variable(self, var: Union[LetStatement, DefineStatement], template_params: List[str]) -> Union[LetStatement, DefineStatement]:
+        """Create template variable (C++17 feature)."""
+        # Add template parameters as metadata
+        var.metadata = var.metadata or {}
+        var.metadata["template_parameters"] = template_params
+        var.metadata["is_template"] = True
+        
+        # Modify variable name to indicate it's a template
+        if template_params:
+            param_names = []
+            for param in template_params:
+                if "typename" in param:
+                    name = param.split("typename")[1].split()[0].split("=")[0].strip()
+                    param_names.append(name)
+                else:
+                    name = param.split()[1].split("=")[0].strip()
+                    param_names.append(name)
+            
+            var.name = f"{var.name}<{', '.join(param_names)}>"
+        
+        return var
+    
+    def _create_generic_template(self, decl: Statement, template_params: List[str]) -> Statement:
+        """Create generic template declaration."""
+        # Add template parameters as metadata
+        if hasattr(decl, 'metadata'):
+            decl.metadata = decl.metadata or {}
+            decl.metadata["template_parameters"] = template_params
+            decl.metadata["is_template"] = True
+        
+        return decl
+    
+    def _convert_template_specialization(self, spec) -> Statement:
+        """Convert template specialization."""
+        try:
+            # Convert the specialized declaration
+            converted_decl = self.convert_declaration(spec.declaration)
+            
+            # Add specialization metadata
+            if hasattr(converted_decl, 'metadata'):
+                converted_decl.metadata = converted_decl.metadata or {}
+                converted_decl.metadata["is_specialization"] = True
+                
+                # Add template arguments
+                if hasattr(spec, 'template_args') and spec.template_args:
+                    args = []
+                    for arg in spec.template_args:
+                        if hasattr(arg, 'kind'):
+                            if arg.kind == "type":
+                                args.append(self._convert_type(arg.type))
+                            elif arg.kind == "non_type":
+                                args.append(self.convert_expression(arg.value))
+                            elif arg.kind == "template":
+                                args.append("template")
+                    converted_decl.metadata["template_arguments"] = args
+            
+            return converted_decl
+            
+        except Exception as e:
+            self._log_error(f"Error converting template specialization: {e}")
+            return self.convert_declaration(spec.declaration)
+    
+    def _convert_concept_declaration(self, concept) -> Statement:
+        """Convert C++20 concept declaration."""
+        try:
+            concept_name = concept.name if hasattr(concept, 'name') else "UnknownConcept"
+            
+            # Convert concept parameters
+            parameters = []
+            if hasattr(concept, 'parameters') and concept.parameters:
+                for param in concept.parameters:
+                    param_name = param.name if hasattr(param, 'name') else "T"
+                    param_type = self._convert_type(param.type) if hasattr(param, 'type') else "any"
+                    parameters.append(Parameter(name=param_name, type=param_type))
+            
+            # Convert concept body (constraint expression)
+            body = None
+            if hasattr(concept, 'body') and concept.body:
+                body = self.convert_expression(concept.body)
+            
+            # Concept as special ProcessDefinition
+            concept_def = ProcessDefinition(
+                name=concept_name,
+                parameters=parameters,
+                return_type=BasicType("Boolean"),
+                body=[ExpressionStatement(body)] if body else []
+            )
+            
+            # Add metadata for concept specifics
+            concept_def.metadata = concept_def.metadata or {}
+            concept_def.metadata["is_concept"] = True
+            
+            return concept_def
+            
+        except Exception as e:
+            self._log_error(f"Error converting concept declaration: {e}")
+            return None
+    
+    def _convert_expression_stmt(self, stmt: CppExpressionStmt) -> ExpressionStatement:
         """Convert C++ expression statement."""
         if stmt.expression:
             expr = self.convert_expression(stmt.expression)
-            return RunaExpressionStatement(expr)
+            return ExpressionStatement(expression=expr)
         else:
-            return RunaExpressionStatement(RunaLiteral("", "string"))
+           return ExpressionStatement(expression=StringLiteral(value=""))
     
-    def _convert_compound_stmt(self, stmt: CppCompoundStmt) -> List[RunaStatement]:
+    def _convert_compound_stmt(self, stmt: CppCompoundStmt) -> List[Statement]:
         """Convert C++ compound statement."""
         statements = []
         
@@ -251,7 +843,7 @@ class CppToRunaConverter:
         
         return statements
     
-    def _convert_if_stmt(self, stmt: CppIfStmt) -> RunaConditional:
+    def _convert_if_stmt(self, stmt: CppIfStmt) -> IfStatement:
         """Convert C++ if statement."""
         condition = self.convert_expression(stmt.condition)
         
@@ -270,9 +862,13 @@ class CppToRunaConverter:
             elif converted_else:
                 else_body = [converted_else]
         
-        return RunaConditional(condition, then_body, else_body)
+        return IfStatement(
+            condition=condition,
+            then_block=then_body,
+            else_block=else_body if else_body else None
+        )
     
-    def _convert_while_stmt(self, stmt: CppWhileStmt) -> RunaLoop:
+    def _convert_while_stmt(self, stmt: CppWhileStmt) -> WhileLoop:
         """Convert C++ while statement."""
         condition = self.convert_expression(stmt.condition)
         
@@ -283,9 +879,12 @@ class CppToRunaConverter:
         elif converted_body:
             body = [converted_body]
         
-        return RunaLoop("while", condition, body)
+        return WhileLoop(
+            condition=condition,
+            block=body
+        )
     
-    def _convert_for_stmt(self, stmt: CppForStmt) -> RunaLoop:
+    def _convert_for_stmt(self, stmt: CppForStmt) -> List[Statement]:
         """Convert C++ for statement."""
         # Convert for loop to while loop equivalent
         statements = []
@@ -304,7 +903,7 @@ class CppToRunaConverter:
         if stmt.condition:
             condition = self.convert_expression(stmt.condition)
         else:
-            condition = RunaLiteral(True, "boolean")
+            condition = BooleanLiteral(value=True)
         
         # Body with increment
         body = []
@@ -317,14 +916,14 @@ class CppToRunaConverter:
         # Add increment to end of body
         if stmt.increment:
             increment_expr = self.convert_expression(stmt.increment)
-            body.append(RunaExpressionStatement(increment_expr))
+            body.append(ExpressionStatement(expression=increment_expr))
         
-        loop = RunaLoop("while", condition, body)
+        loop = WhileLoop(condition=condition, block=body)
         statements.append(loop)
         
         return statements
     
-    def _convert_range_for_stmt(self, stmt: CppRangeForStmt) -> RunaLoop:
+    def _convert_range_for_stmt(self, stmt: CppRangeForStmt) -> ForEachLoop:
         """Convert C++ range-based for statement."""
         # Convert range-for to iterator-based loop
         iterator_var = f"_iterator_{self.variable_counter}"
@@ -332,131 +931,112 @@ class CppToRunaConverter:
         
         range_expr = self.convert_expression(stmt.range)
         
-        # Create iterator initialization
-        iterator_init = RunaVariableDeclaration(
-            iterator_var,
-            RunaType("Iterator"),
-            RunaFunctionCall(
-                RunaIdentifier("begin"),
-                [range_expr]
-            )
-        )
-        
-        # Loop condition
-        condition = RunaBinaryOperation(
-            RunaIdentifier(iterator_var),
-            "is not equal to",
-            RunaFunctionCall(
-                RunaIdentifier("end"),
-                [range_expr]
-            )
-        )
-        
-        # Loop variable assignment
-        loop_var_assign = RunaVariableDeclaration(
-            stmt.variable.name,
-            self._convert_type(stmt.variable.var_type),
-            RunaUnaryOperation("dereference", RunaIdentifier(iterator_var))
-        )
-        
-        # Body
-        body = [loop_var_assign]
+        # Convert to a simple for-each loop
+        body = []
         converted_body = self.convert_statement(stmt.body)
         if isinstance(converted_body, list):
             body.extend(converted_body)
         elif converted_body:
             body.append(converted_body)
         
-        # Increment iterator
-        body.append(RunaExpressionStatement(
-            RunaUnaryOperation("increment", RunaIdentifier(iterator_var))
-        ))
+        # Extract variable name from declaration or use as string
+        if hasattr(stmt, 'variable'):
+            if hasattr(stmt.variable, 'name'):
+                var_name = stmt.variable.name
+            else:
+                var_name = str(stmt.variable)
+        else:
+            var_name = f"iter_var_{self.variable_counter}"
+            self.variable_counter += 1
         
-        return [iterator_init, RunaLoop("while", condition, body)]
+        return ForEachLoop(
+            variable=var_name,
+            iterable=range_expr,
+            block=body
+        )
     
-    def _convert_return_stmt(self, stmt: CppReturnStmt) -> RunaReturn:
+    def _convert_return_stmt(self, stmt: CppReturnStmt) -> ReturnStatement:
         """Convert C++ return statement."""
         value = None
         if stmt.value:
             value = self.convert_expression(stmt.value)
         
-        return RunaReturn(value)
+        return ReturnStatement(value=value)
     
-    def _convert_integer_literal(self, expr: CppIntegerLiteral) -> RunaLiteral:
+    def _convert_integer_literal(self, expr: CppIntegerLiteral) -> IntegerLiteral:
         """Convert C++ integer literal."""
-        return RunaLiteral(expr.value, "integer")
+        return IntegerLiteral(value=expr.value)
     
-    def _convert_floating_literal(self, expr: CppFloatingLiteral) -> RunaLiteral:
+    def _convert_floating_literal(self, expr: CppFloatingLiteral) -> StringLiteral:
         """Convert C++ floating point literal."""
-        return RunaLiteral(expr.value, "float")
+        return FloatLiteral(value=expr.value)
     
-    def _convert_string_literal(self, expr: CppStringLiteral) -> RunaLiteral:
+    def _convert_string_literal(self, expr: CppStringLiteral) -> StringLiteral:
         """Convert C++ string literal."""
         # Remove quotes and handle escape sequences
         value = expr.value
         if value.startswith('"') and value.endswith('"'):
             value = value[1:-1]
-        return RunaLiteral(value, "string")
+        return StringLiteral(value=value)
     
-    def _convert_character_literal(self, expr: CppCharacterLiteral) -> RunaLiteral:
+    def _convert_character_literal(self, expr: CppCharacterLiteral) -> StringLiteral:
         """Convert C++ character literal."""
         value = expr.value
         if value.startswith("'") and value.endswith("'"):
             value = value[1:-1]
-        return RunaLiteral(value, "character")
+        return StringLiteral(value, "character")
     
-    def _convert_boolean_literal(self, expr: CppBooleanLiteral) -> RunaLiteral:
+    def _convert_boolean_literal(self, expr: CppBooleanLiteral) -> StringLiteral:
         """Convert C++ boolean literal."""
-        return RunaLiteral(expr.value, "boolean")
+        return BooleanLiteral(value=expr.value)
     
-    def _convert_nullptr_literal(self, expr: CppNullptrLiteral) -> RunaLiteral:
+    def _convert_nullptr_literal(self, expr: CppNullptrLiteral) -> StringLiteral:
         """Convert C++ nullptr literal."""
-        return RunaLiteral(None, "null")
+        return StringLiteral(value="null")
     
-    def _convert_identifier(self, expr: CppIdentifier) -> RunaIdentifier:
+    def _convert_identifier(self, expr: CppIdentifier) -> Identifier:
         """Convert C++ identifier."""
-        return RunaIdentifier(expr.name)
+        return Identifier(name=expr.name)
     
-    def _convert_qualified_name(self, expr: CppQualifiedName) -> RunaIdentifier:
+    def _convert_qualified_name(self, expr: CppQualifiedName) -> Identifier:
         """Convert C++ qualified name."""
         # Flatten qualified name to simple identifier
         if expr.scope:
             scope_name = self._expression_to_string(self.convert_expression(expr.scope))
-            return RunaIdentifier(f"{scope_name}::{expr.name}")
+            return Identifier(name=f"{scope_name}::{expr.name}")
         else:
-            return RunaIdentifier(expr.name)
+            return Identifier(name=expr.name)
     
-    def _convert_binary_op(self, expr: CppBinaryOp) -> RunaBinaryOperation:
+    def _convert_binary_op(self, expr: CppBinaryOp) -> BinaryExpression:
         """Convert C++ binary operation."""
         left = self.convert_expression(expr.left)
         right = self.convert_expression(expr.right)
         
         # Map C++ operators to Runa operators
         operator_map = {
-            CppOperator.ADD: "plus",
-            CppOperator.SUB: "minus",
-            CppOperator.MUL: "times",
-            CppOperator.DIV: "divided by",
-            CppOperator.MOD: "modulo",
-            CppOperator.EQ: "is equal to",
-            CppOperator.NE: "is not equal to",
-            CppOperator.LT: "is less than",
-            CppOperator.LE: "is less than or equal to",
-            CppOperator.GT: "is greater than",
-            CppOperator.GE: "is greater than or equal to",
-            CppOperator.LOGICAL_AND: "and",
-            CppOperator.LOGICAL_OR: "or",
-            CppOperator.BIT_AND: "bitwise and",
-            CppOperator.BIT_OR: "bitwise or",
-            CppOperator.BIT_XOR: "bitwise xor",
-            CppOperator.LEFT_SHIFT: "left shift",
-            CppOperator.RIGHT_SHIFT: "right shift",
+            CppOperator.ADD: BinaryOperator.PLUS,
+            CppOperator.SUB: BinaryOperator.MINUS,
+            CppOperator.MUL: BinaryOperator.MULTIPLY,
+            CppOperator.DIV: BinaryOperator.DIVIDE,
+            CppOperator.MOD: BinaryOperator.MODULO,
+            CppOperator.EQ: BinaryOperator.EQUALS,
+            CppOperator.NE: BinaryOperator.NOT_EQUALS,
+            CppOperator.LT: BinaryOperator.LESS_THAN,
+            CppOperator.LE: BinaryOperator.LESS_EQUAL,
+            CppOperator.GT: BinaryOperator.GREATER_THAN,
+            CppOperator.GE: BinaryOperator.GREATER_EQUAL,
+            CppOperator.LOGICAL_AND: BinaryOperator.AND,
+            CppOperator.LOGICAL_OR: BinaryOperator.OR,
         }
         
-        runa_op = operator_map.get(expr.operator, "unknown_op")
-        return RunaBinaryOperation(left, runa_op, right)
+        runa_op = operator_map.get(expr.operator, BinaryOperator.PLUS)
+        return BinaryExpression(
+            left=left,
+            operator=runa_op,
+            right=right
+        )
     
-    def _convert_unary_op(self, expr: CppUnaryOp) -> RunaUnaryOperation:
+    def _convert_unary_op(self, expr: CppUnaryOp) -> UnaryExpression:
         """Convert C++ unary operation."""
         operand = self.convert_expression(expr.operand)
         
@@ -473,69 +1053,99 @@ class CppToRunaConverter:
         }
         
         runa_op = operator_map.get(expr.operator, "unknown_unary_op")
-        return RunaUnaryOperation(runa_op, operand)
+        return UnaryExpression(
+            operator=runa_op,
+            operand=operand
+        )
     
-    def _convert_conditional_op(self, expr: CppConditionalOp) -> RunaConditionalExpression:
+    def _convert_conditional_op(self, expr: CppConditionalOp) -> IfStatement:
         """Convert C++ ternary conditional operator."""
         condition = self.convert_expression(expr.condition)
         true_expr = self.convert_expression(expr.true_expr)
         false_expr = self.convert_expression(expr.false_expr)
         
-        return RunaConditionalExpression(condition, true_expr, false_expr)
+        # Convert ternary to if-else statement
+        return IfStatement(
+            condition=condition,
+            then_block=[ExpressionStatement(expression=true_expr)],
+            else_block=[ExpressionStatement(expression=false_expr)]
+        )
     
-    def _convert_assignment(self, expr: CppAssignment) -> RunaAssignment:
+    def _convert_assignment(self, expr: CppAssignment) -> SetStatement:
         """Convert C++ assignment expression."""
         target = self.convert_expression(expr.left)
         value = self.convert_expression(expr.right)
         
         # Handle compound assignment operators
         if expr.operator == CppOperator.ASSIGN:
-            return RunaAssignment(target, value)
+            return SetStatement(target=target, value=value)
         else:
             # Convert compound assignment to regular assignment with binary op
             operator_map = {
-                CppOperator.ADD_ASSIGN: "plus",
-                CppOperator.SUB_ASSIGN: "minus",
-                CppOperator.MUL_ASSIGN: "times",
-                CppOperator.DIV_ASSIGN: "divided by",
-                CppOperator.MOD_ASSIGN: "modulo",
+                CppOperator.ADD_ASSIGN: BinaryOperator.PLUS,
+                CppOperator.SUB_ASSIGN: BinaryOperator.MINUS,
+                CppOperator.MUL_ASSIGN: BinaryOperator.MULTIPLY,
+                CppOperator.DIV_ASSIGN: BinaryOperator.DIVIDE,
+                CppOperator.MOD_ASSIGN: BinaryOperator.MODULO,
             }
             
             if expr.operator in operator_map:
-                binary_op = RunaBinaryOperation(target, operator_map[expr.operator], value)
-                return RunaAssignment(target, binary_op)
+                binary_op = BinaryExpression(
+                    left=target,
+                    operator=operator_map[expr.operator],
+                    right=value
+                )
+                return SetStatement(target=target, value=binary_op)
             
-            return RunaAssignment(target, value)
+            return SetStatement(target=target, value=value)
     
-    def _convert_call(self, expr: CppCall) -> RunaFunctionCall:
+    def _convert_call(self, expr: CppCall) -> FunctionCall:
         """Convert C++ function call."""
         function = self.convert_expression(expr.function)
-        arguments = [self.convert_expression(arg) for arg in expr.arguments]
+        arguments = [(f"arg_{i}", arg) for i, arg in enumerate([self.convert_expression(arg) for arg in expr.arguments])]
         
-        return RunaFunctionCall(function, arguments)
+        # Extract function name
+        if hasattr(function, 'name'):
+            func_name = function.name
+        else:
+            func_name = "unknown_function"
+            
+        return FunctionCall(
+            function_name=func_name,
+            arguments=arguments
+        )
     
-    def _convert_member_access(self, expr: CppMemberAccess) -> RunaMemberAccess:
+    def _convert_member_access(self, expr: CppMemberAccess) -> MemberAccess:
         """Convert C++ member access."""
         object_expr = self.convert_expression(expr.object)
-        return RunaMemberAccess(object_expr, expr.member)
+        return MemberAccess(
+            object=object_expr,
+            member=expr.member
+        )
     
-    def _convert_array_subscript(self, expr: CppArraySubscript) -> RunaIndexAccess:
+    def _convert_array_subscript(self, expr: CppArraySubscript) -> IndexAccess:
         """Convert C++ array subscript."""
         array = self.convert_expression(expr.array)
         index = self.convert_expression(expr.index)
         
-        return RunaIndexAccess(array, index)
+        return IndexAccess(
+            object=array,
+            index=index
+        )
     
-    def _convert_cast(self, expr: CppCast) -> RunaFunctionCall:
+    def _convert_cast(self, expr: CppCast) -> FunctionCall:
         """Convert C++ cast to Runa type conversion."""
         operand = self.convert_expression(expr.operand)
         target_type = self._convert_type(expr.target_type)
         
         # Convert cast to function call
-        cast_function = RunaIdentifier(f"cast_to_{target_type.name}")
-        return RunaFunctionCall(cast_function, [operand])
+        type_name = getattr(target_type, 'name', 'Unknown')
+        return FunctionCall(
+            function_name=f"cast_to_{type_name}",
+            arguments=[("value", operand)]
+        )
     
-    def _convert_new_expr(self, expr: CppNewExpr) -> RunaFunctionCall:
+    def _convert_new_expr(self, expr: CppNewExpr) -> FunctionCall:
         """Convert C++ new expression."""
         type_name = self._type_to_string(expr.target_type)
         
@@ -546,34 +1156,40 @@ class CppToRunaConverter:
         if expr.is_array and expr.array_size:
             # Array allocation
             size_arg = self.convert_expression(expr.array_size)
-            return RunaFunctionCall(
-                RunaIdentifier(f"new_array_{type_name}"),
-                [size_arg] + args
+            return FunctionCall(
+                function_name=f"new_array_{type_name}",
+                arguments=[("size", size_arg)] + [(f"arg_{i}", arg) for i, arg in enumerate(args)]
             )
         else:
             # Single object allocation
-            return RunaFunctionCall(
-                RunaIdentifier(f"new_{type_name}"),
-                args
+            return FunctionCall(
+                function_name=f"new_{type_name}",
+                arguments=[(f"arg_{i}", arg) for i, arg in enumerate(args)]
             )
     
-    def _convert_delete_expr(self, expr: CppDeleteExpr) -> RunaFunctionCall:
+    def _convert_delete_expr(self, expr: CppDeleteExpr) -> FunctionCall:
         """Convert C++ delete expression."""
         operand = self.convert_expression(expr.operand)
         
         if expr.is_array:
-            return RunaFunctionCall(RunaIdentifier("delete_array"), [operand])
+            return FunctionCall(
+                function_name="delete_array",
+                arguments=[("object", operand)]
+            )
         else:
-            return RunaFunctionCall(RunaIdentifier("delete"), [operand])
+            return FunctionCall(
+                function_name="delete",
+                arguments=[("object", operand)]
+            )
     
-    def _convert_lambda(self, expr: CppLambda) -> RunaLambda:
+    def _convert_lambda(self, expr: CppLambda) -> ProcessDefinition:
         """Convert C++ lambda expression."""
         parameters = []
         if expr.parameters:
             for param in expr.parameters.parameters:
                 param_type = self._convert_type(param.param_type)
                 param_name = param.name or f"lambda_param_{len(parameters)}"
-                runa_param = RunaParameter(param_name, param_type)
+                runa_param = Parameter(param_name, param_type)
                 parameters.append(runa_param)
         
         body = []
@@ -587,14 +1203,26 @@ class CppToRunaConverter:
         if expr.return_type:
             return_type = self._convert_type(expr.return_type)
         
-        return RunaLambda(parameters, return_type, body)
+        lambda_def = ProcessDefinition(
+            name=f"lambda_{self.function_counter}",
+            parameters=parameters,
+            return_type=return_type,
+            body=body
+        )
+        self.function_counter += 1
+        
+        # Add metadata for lambda
+        lambda_def.metadata = lambda_def.metadata or {}
+        lambda_def.metadata["is_lambda"] = True
+        
+        return lambda_def
     
-    def _convert_initializer_list(self, expr: CppInitializerList) -> RunaList:
+    def _convert_initializer_list(self, expr: CppInitializerList) -> ListLiteral:
         """Convert C++ initializer list."""
         elements = [self.convert_expression(elem) for elem in expr.elements]
-        return RunaList(elements)
+        return ListLiteral(elements)
     
-    def _convert_type(self, cpp_type: CppType) -> RunaType:
+    def _convert_type(self, cpp_type: CppType) -> BasicType:
         """Convert C++ type to Runa type."""
         if isinstance(cpp_type, CppBuiltinType):
             # Map C++ builtin types to Runa types
@@ -609,29 +1237,29 @@ class CppToRunaConverter:
                 "std::string": "String",
             }
             runa_name = type_map.get(cpp_type.name, cpp_type.name)
-            return RunaType(runa_name)
+            return BasicType(runa_name)
         
         elif isinstance(cpp_type, CppPointerType):
             # Convert pointer type
             pointee = self._convert_type(cpp_type.pointee_type)
-            return RunaType(f"Pointer[{pointee.name}]")
+            return BasicType(f"Pointer[{pointee.name}]")
         
         elif isinstance(cpp_type, CppReferenceType):
             # Convert reference type
             referenced = self._convert_type(cpp_type.referenced_type)
-            return RunaType(f"Reference[{referenced.name}]")
+            return BasicType(f"Reference[{referenced.name}]")
         
         elif isinstance(cpp_type, CppArrayType):
             # Convert array type
             element = self._convert_type(cpp_type.element_type)
-            return RunaType(f"Array[{element.name}]")
+            return BasicType(f"Array[{element.name}]")
         
         elif isinstance(cpp_type, CppAutoType):
-            return RunaType("Auto")
+            return BasicType("Auto")
         
         else:
             # Default fallback
-            return RunaType("Unknown")
+            return BasicType("Unknown")
     
     def _type_to_string(self, cpp_type: CppType) -> str:
         """Convert C++ type to string representation."""
@@ -644,14 +1272,19 @@ class CppToRunaConverter:
         else:
             return "unknown_type"
     
-    def _expression_to_string(self, expr: RunaExpression) -> str:
+    def _expression_to_string(self, expr: Expression) -> str:
         """Convert Runa expression to string representation."""
-        if isinstance(expr, RunaIdentifier):
+        if isinstance(expr, Identifier):
             return expr.name
-        elif isinstance(expr, RunaLiteral):
+        elif isinstance(expr, StringLiteral):
             return str(expr.value)
         else:
             return "unknown_expr"
+    
+    def _log_error(self, message: str):
+        """Log error message to stderr."""
+        import sys
+        print(f"CPP Converter Error: {message}", file=sys.stderr)
 
 
 class RunaToCppConverter:
@@ -676,82 +1309,86 @@ class RunaToCppConverter:
         
         return CppTranslationUnit(declarations)
     
-    def convert_statement(self, stmt: RunaStatement) -> Union[CppDeclaration, CppStatement, List[Union[CppDeclaration, CppStatement]], None]:
+    def convert_statement(self, stmt: Statement) -> Union[CppDeclaration, CppStatement, List[Union[CppDeclaration, CppStatement]], None]:
         """Convert Runa statement to C++ declaration or statement."""
-        if isinstance(stmt, RunaVariableDeclaration):
+        if isinstance(stmt, LetStatement):
             return self._convert_variable_declaration(stmt)
-        elif isinstance(stmt, RunaFunctionDeclaration):
+        elif isinstance(stmt, ProcessDefinition):
             return self._convert_function_declaration(stmt)
-        elif isinstance(stmt, RunaClassDeclaration):
+        elif isinstance(stmt, TypeDefinition):
             return self._convert_class_declaration(stmt)
-        elif isinstance(stmt, RunaAssignment):
+        elif isinstance(stmt, SetStatement):
             return self._convert_assignment(stmt)
-        elif isinstance(stmt, RunaConditional):
+        elif isinstance(stmt, IfStatement):
             return self._convert_conditional(stmt)
-        elif isinstance(stmt, RunaLoop):
+        elif isinstance(stmt, WhileLoop):
             return self._convert_loop(stmt)
-        elif isinstance(stmt, RunaReturn):
+        elif isinstance(stmt, ReturnStatement):
             return self._convert_return(stmt)
-        elif isinstance(stmt, RunaBreak):
+        elif isinstance(stmt, BreakStatement):
             return CppBreakStmt()
-        elif isinstance(stmt, RunaContinue):
+        elif isinstance(stmt, ContinueStatement):
             return CppContinueStmt()
-        elif isinstance(stmt, RunaExpressionStatement):
+        elif isinstance(stmt, ExpressionStatement):
             return self._convert_expression_statement(stmt)
         
         return None
     
-    def convert_expression(self, expr: RunaExpression) -> CppExpression:
+    def convert_expression(self, expr: Expression) -> CppExpression:
         """Convert Runa expression to C++ expression."""
-        if isinstance(expr, RunaLiteral):
+        if isinstance(expr, StringLiteral):
             return self._convert_literal(expr)
-        elif isinstance(expr, RunaIdentifier):
+        elif isinstance(expr, Identifier):
             return self._convert_identifier(expr)
-        elif isinstance(expr, RunaBinaryOperation):
+        elif isinstance(expr, BinaryExpression):
             return self._convert_binary_operation(expr)
-        elif isinstance(expr, RunaUnaryOperation):
+        elif isinstance(expr, UnaryExpression):
             return self._convert_unary_operation(expr)
-        elif isinstance(expr, RunaFunctionCall):
+        elif isinstance(expr, FunctionCall):
             return self._convert_function_call(expr)
-        elif isinstance(expr, RunaMemberAccess):
+        elif isinstance(expr, MemberAccess):
             return self._convert_member_access(expr)
-        elif isinstance(expr, RunaIndexAccess):
+        elif isinstance(expr, IndexAccess):
             return self._convert_index_access(expr)
-        elif isinstance(expr, RunaConditionalExpression):
+        elif isinstance(expr, IfStatement):
             return self._convert_conditional_expression(expr)
-        elif isinstance(expr, RunaLambda):
+        elif isinstance(expr, ProcessDefinition):
             return self._convert_lambda(expr)
-        elif isinstance(expr, RunaList):
+        elif isinstance(expr, ListLiteral):
             return self._convert_list(expr)
         
         # Fallback
         return CppIdentifier("unknown_expression")
     
-    def _convert_variable_declaration(self, stmt: RunaVariableDeclaration) -> CppVariableDecl:
+    def _convert_variable_declaration(self, stmt: LetStatement) -> CppVariableDecl:
         """Convert Runa variable declaration."""
-        cpp_type = self._convert_type(stmt.var_type)
+        cpp_type = self._convert_type(stmt.type_annotation)
         
         initializer = None
-        if stmt.initial_value:
-            initializer = self.convert_expression(stmt.initial_value)
+        if stmt.value:
+            initializer = self.convert_expression(stmt.value)
         
-        return CppVariableDecl(stmt.name, cpp_type, initializer)
+        return CppVariableDecl(name=stmt.identifier, var_type=cpp_type, initializer=initializer)
     
-    def _convert_function_declaration(self, stmt: RunaFunctionDeclaration) -> CppFunctionDecl:
+    def _convert_function_declaration(self, stmt: ProcessDefinition) -> CppFunctionDecl:
         """Convert Runa function declaration."""
         return_type = self._convert_type(stmt.return_type)
         
         parameters = []
         for param in stmt.parameters:
-            cpp_type = self._convert_type(param.param_type)
+            cpp_type = self._convert_type(param.type_annotation)
             default_value = None
-            if param.default_value:
+            if hasattr(param, 'default_value') and param.default_value:
                 default_value = self.convert_expression(param.default_value)
             
-            cpp_param = CppParameter(param.name, cpp_type, default_value)
+            cpp_param = CppParameter(
+                name=param.name,
+                param_type=cpp_type,
+                default_value=default_value
+            )
             parameters.append(cpp_param)
         
-        param_list = CppParameterList(parameters)
+        param_list = CppParameterList(parameters=parameters)
         
         body = None
         if stmt.body:
@@ -764,11 +1401,11 @@ class RunaToCppConverter:
                     else:
                         cpp_statements.append(converted)
             
-            body = CppCompoundStmt(cpp_statements)
+            body = CppCompoundStmt(statements=cpp_statements)
         
-        return CppFunctionDecl(stmt.name, return_type, param_list, body)
+        return CppFunctionDecl(name=stmt.name, return_type=return_type, parameters=param_list, body=body)
     
-    def _convert_class_declaration(self, stmt: RunaClassDeclaration) -> CppClassDecl:
+    def _convert_class_declaration(self, stmt: TypeDefinition) -> CppClassDecl:
         """Convert Runa class declaration."""
         members = []
         
@@ -785,26 +1422,26 @@ class RunaToCppConverter:
         # Handle base classes
         base_classes = []
         for base_name in stmt.base_classes:
-            base_type = CppBuiltinType(base_name)
-            base_spec = CppBaseSpecifier(base_type)
+            base_type = CppBuiltinType(name=base_name)
+            base_spec = CppBaseSpecifier(base_type=base_type)
             base_classes.append(base_spec)
         
-        return CppClassDecl(stmt.name, base_classes, members)
+        return CppClassDecl(name=stmt.name, base_classes=base_classes, members=members)
     
-    def _convert_assignment(self, stmt: RunaAssignment) -> CppExpressionStmt:
+    def _convert_assignment(self, stmt: SetStatement) -> CppExpressionStmt:
         """Convert Runa assignment."""
         target = self.convert_expression(stmt.target)
         value = self.convert_expression(stmt.value)
         
-        assignment = CppAssignment(target, CppOperator.ASSIGN, value)
-        return CppExpressionStmt(assignment)
+        assignment = CppAssignment(left=target, operator=CppOperator.ASSIGN, right=value)
+        return CppExpressionStmt(expression=assignment)
     
-    def _convert_conditional(self, stmt: RunaConditional) -> CppIfStmt:
+    def _convert_conditional(self, stmt: IfStatement) -> CppIfStmt:
         """Convert Runa conditional."""
         condition = self.convert_expression(stmt.condition)
         
         then_statements = []
-        for then_stmt in stmt.then_body:
+        for then_stmt in stmt.then_block:
             converted = self.convert_statement(then_stmt)
             if converted:
                 if isinstance(converted, list):
@@ -812,12 +1449,12 @@ class RunaToCppConverter:
                 else:
                     then_statements.append(converted)
         
-        then_body = CppCompoundStmt(then_statements)
+        then_body = CppCompoundStmt(statements=then_statements)
         
         else_body = None
-        if stmt.else_body:
+        if stmt.else_block:
             else_statements = []
-            for else_stmt in stmt.else_body:
+            for else_stmt in stmt.else_block:
                 converted = self.convert_statement(else_stmt)
                 if converted:
                     if isinstance(converted, list):
@@ -825,16 +1462,16 @@ class RunaToCppConverter:
                     else:
                         else_statements.append(converted)
             
-            else_body = CppCompoundStmt(else_statements)
+            else_body = CppCompoundStmt(statements=else_statements)
         
-        return CppIfStmt(condition, then_body, else_body)
+        return CppIfStmt(condition=condition, then_stmt=then_body, else_stmt=else_body)
     
-    def _convert_loop(self, stmt: RunaLoop) -> CppStatement:
+    def _convert_loop(self, stmt: WhileLoop) -> CppStatement:
         """Convert Runa loop."""
         condition = self.convert_expression(stmt.condition)
         
         body_statements = []
-        for body_stmt in stmt.body:
+        for body_stmt in stmt.block:
             converted = self.convert_statement(body_stmt)
             if converted:
                 if isinstance(converted, list):
@@ -842,49 +1479,49 @@ class RunaToCppConverter:
                 else:
                     body_statements.append(converted)
         
-        body = CppCompoundStmt(body_statements)
+        body = CppCompoundStmt(statements=body_statements)
         
         if stmt.loop_type == "while":
-            return CppWhileStmt(condition, body)
+            return CppWhileStmt(condition=condition, body=body)
         else:
             # Default to while loop
-            return CppWhileStmt(condition, body)
+            return CppWhileStmt(condition=condition, body=body)
     
-    def _convert_return(self, stmt: RunaReturn) -> CppReturnStmt:
+    def _convert_return(self, stmt: ReturnStatement) -> CppReturnStmt:
         """Convert Runa return."""
         value = None
         if stmt.value:
             value = self.convert_expression(stmt.value)
         
-        return CppReturnStmt(value)
+        return CppReturnStmt(value=value)
     
-    def _convert_expression_statement(self, stmt: RunaExpressionStatement) -> CppExpressionStmt:
+    def _convert_expression_statement(self, stmt: ExpressionStatement) -> CppExpressionStmt:
         """Convert Runa expression statement."""
         expr = self.convert_expression(stmt.expression)
-        return CppExpressionStmt(expr)
+        return CppExpressionStmt(expression=expr)
     
-    def _convert_literal(self, expr: RunaLiteral) -> CppExpression:
+    def _convert_literal(self, expr: StringLiteral) -> CppExpression:
         """Convert Runa literal."""
         if expr.literal_type == "integer":
-            return CppIntegerLiteral(expr.value)
+            return CppIntegerLiteral(value=expr.value)
         elif expr.literal_type == "float":
-            return CppFloatingLiteral(expr.value)
+            return CppFloatingLiteral(value=expr.value)
         elif expr.literal_type == "string":
-            return CppStringLiteral(f'"{expr.value}"')
+            return CppStringLiteral(value=f'"{expr.value}"')
         elif expr.literal_type == "character":
-            return CppCharacterLiteral(f"'{expr.value}'")
+            return CppCharacterLiteral(value=f"'{expr.value}'")
         elif expr.literal_type == "boolean":
-            return CppBooleanLiteral(expr.value)
+            return CppBooleanLiteral(value=expr.value)
         elif expr.literal_type == "null":
             return CppNullptrLiteral()
         else:
-            return CppStringLiteral(f'"{expr.value}"')
+            return CppStringLiteral(value=f'"{expr.value}"')
     
-    def _convert_identifier(self, expr: RunaIdentifier) -> CppIdentifier:
+    def _convert_identifier(self, expr: Identifier) -> CppIdentifier:
         """Convert Runa identifier."""
-        return CppIdentifier(expr.name)
+        return CppIdentifier(name=expr.name)
     
-    def _convert_binary_operation(self, expr: RunaBinaryOperation) -> CppBinaryOp:
+    def _convert_binary_operation(self, expr: BinaryExpression) -> CppBinaryOp:
         """Convert Runa binary operation."""
         left = self.convert_expression(expr.left)
         right = self.convert_expression(expr.right)
@@ -907,9 +1544,9 @@ class RunaToCppConverter:
         }
         
         cpp_op = operator_map.get(expr.operator, CppOperator.ADD)
-        return CppBinaryOp(left, cpp_op, right)
+        return CppBinaryOp(left=left, operator=cpp_op, right=right)
     
-    def _convert_unary_operation(self, expr: RunaUnaryOperation) -> CppUnaryOp:
+    def _convert_unary_operation(self, expr: UnaryExpression) -> CppUnaryOp:
         """Convert Runa unary operation."""
         operand = self.convert_expression(expr.operand)
         
@@ -922,44 +1559,46 @@ class RunaToCppConverter:
         }
         
         cpp_op = operator_map.get(expr.operator, CppOperator.LOGICAL_NOT)
-        return CppUnaryOp(cpp_op, operand)
+        return CppUnaryOp(operator=cpp_op, operand=operand)
     
-    def _convert_function_call(self, expr: RunaFunctionCall) -> CppCall:
+    def _convert_function_call(self, expr: FunctionCall) -> CppCall:
         """Convert Runa function call."""
-        function = self.convert_expression(expr.function)
-        arguments = [self.convert_expression(arg) for arg in expr.arguments]
+        # FunctionCall has function_name (str) and arguments (list of tuples)
+        function_name = expr.function_name
+        arguments = [self.convert_expression(arg[1]) for arg in expr.arguments]
+        function = CppIdentifier(name=function_name)
         
-        return CppCall(function, arguments)
+        return CppCall(function=function, arguments=arguments)
     
-    def _convert_member_access(self, expr: RunaMemberAccess) -> CppMemberAccess:
+    def _convert_member_access(self, expr: MemberAccess) -> CppMemberAccess:
         """Convert Runa member access."""
         object_expr = self.convert_expression(expr.object)
-        return CppMemberAccess(object_expr, expr.member)
+        return CppMemberAccess(object=object_expr, member=expr.member)
     
-    def _convert_index_access(self, expr: RunaIndexAccess) -> CppArraySubscript:
+    def _convert_index_access(self, expr: IndexAccess) -> CppArraySubscript:
         """Convert Runa index access."""
         array = self.convert_expression(expr.object)
         index = self.convert_expression(expr.index)
         
-        return CppArraySubscript(array, index)
+        return CppArraySubscript(array=array, index=index)
     
-    def _convert_conditional_expression(self, expr: RunaConditionalExpression) -> CppConditionalOp:
+    def _convert_conditional_expression(self, expr: IfStatement) -> CppConditionalOp:
         """Convert Runa conditional expression."""
         condition = self.convert_expression(expr.condition)
         true_expr = self.convert_expression(expr.true_value)
         false_expr = self.convert_expression(expr.false_value)
         
-        return CppConditionalOp(condition, true_expr, false_expr)
+        return CppConditionalOp(condition=condition, true_expr=true_expr, false_expr=false_expr)
     
-    def _convert_lambda(self, expr: RunaLambda) -> CppLambda:
+    def _convert_lambda(self, expr: ProcessDefinition) -> CppLambda:
         """Convert Runa lambda."""
         parameters = []
         for param in expr.parameters:
-            cpp_type = self._convert_type(param.param_type)
-            cpp_param = CppParameter(param.name, cpp_type)
+            cpp_type = self._convert_type(param.type_annotation)
+            cpp_param = CppParameter(name=param.name, param_type=cpp_type)
             parameters.append(cpp_param)
         
-        param_list = CppParameterList(parameters)
+        param_list = CppParameterList(parameters=parameters)
         
         body_statements = []
         for stmt in expr.body:
@@ -970,20 +1609,24 @@ class RunaToCppConverter:
                 else:
                     body_statements.append(converted)
         
-        body = CppCompoundStmt(body_statements)
+        body = CppCompoundStmt(statements=body_statements)
         
         return_type = None
         if expr.return_type:
             return_type = self._convert_type(expr.return_type)
         
-        return CppLambda([], param_list, return_type, body)
+        return CppLambda(
+            parameters=param_list,
+            return_type=return_type,
+            body=body
+        )
     
-    def _convert_list(self, expr: RunaList) -> CppInitializerList:
+    def _convert_list(self, expr: ListLiteral) -> CppInitializerList:
         """Convert Runa list."""
         elements = [self.convert_expression(elem) for elem in expr.elements]
-        return CppInitializerList(elements)
+        return CppInitializerList(elements=elements)
     
-    def _convert_type(self, runa_type: RunaType) -> CppType:
+    def _convert_type(self, runa_type: BasicType) -> CppType:
         """Convert Runa type to C++ type."""
         # Map Runa types to C++ types
         type_map = {
@@ -996,7 +1639,7 @@ class RunaToCppConverter:
         }
         
         cpp_name = type_map.get(runa_type.name, runa_type.name)
-        return CppBuiltinType(cpp_name)
+        return CppBuiltinType(name=cpp_name)
 
 
 # Convenience functions

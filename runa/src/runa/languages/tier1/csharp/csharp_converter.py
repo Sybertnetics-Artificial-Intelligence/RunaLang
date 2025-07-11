@@ -8,7 +8,7 @@ Handles modern C# features including async/await, LINQ, generics, and nullable r
 """
 
 from typing import List, Optional, Dict, Any, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .csharp_ast import *
 from ....core.runa_ast import *
@@ -47,7 +47,7 @@ class CSharpToRunaConverter:
         
         return Program(statements)
     
-    def convert_declaration(self, decl: CSharpDeclaration) -> Union[RunaStatement, List[RunaStatement], None]:
+    def convert_declaration(self, decl: CSharpDeclaration) -> Union[Statement, List[Statement], None]:
         """Convert C# declaration to Runa statement(s)."""
         if isinstance(decl, CSharpNamespaceDeclaration):
             return self._convert_namespace_declaration(decl)
@@ -72,7 +72,7 @@ class CSharpToRunaConverter:
         
         return None
     
-    def convert_statement(self, stmt: CSharpStatement) -> Union[RunaStatement, List[RunaStatement], None]:
+    def convert_statement(self, stmt: CSharpStatement) -> Union[Statement, List[Statement], None]:
         """Convert C# statement to Runa statement(s)."""
         if isinstance(stmt, CSharpExpressionStatement):
             return self._convert_expression_statement(stmt)
@@ -111,7 +111,7 @@ class CSharpToRunaConverter:
         
         return None
     
-    def convert_expression(self, expr: CSharpExpression) -> RunaExpression:
+    def convert_expression(self, expr: CSharpExpression) -> Expression:
         """Convert C# expression to Runa expression."""
         if isinstance(expr, CSharpLiteral):
             return self._convert_literal(expr)
@@ -131,7 +131,7 @@ class CSharpToRunaConverter:
             return self._convert_invocation_expression(expr)
         elif isinstance(expr, CSharpMemberAccessExpression):
             return self._convert_member_access_expression(expr)
-        elif isinstance(expr, CSharpElementAccessExpression):
+        elif isinstance(expr, CSharpIndexerAccessExpression):
             return self._convert_element_access_expression(expr)
         elif isinstance(expr, CSharpCastExpression):
             return self._convert_cast_expression(expr)
@@ -177,18 +177,18 @@ class CSharpToRunaConverter:
             return self._convert_query_expression(expr)
         
         # Fallback
-        return RunaIdentifier(f"unknown_expression_{self.variable_counter}")
+        return Identifier(f"unknown_expression_{self.variable_counter}")
     
-    def _convert_using_directive(self, using_directive: CSharpUsingDirective) -> Optional[RunaStatement]:
+    def _convert_using_directive(self, using_directive: CSharpUsingDirective) -> Optional[Statement]:
         """Convert using directive to Runa statement."""
         namespace_name = self._expression_to_string(using_directive.name)
         
         # Convert to Runa import-like statement
-        return RunaExpressionStatement(
-            RunaLiteral(f"using {namespace_name}", "comment")
+        return ExpressionStatement(
+            StringLiteral(f"using {namespace_name}", "comment")
         )
     
-    def _convert_namespace_declaration(self, namespace_decl: CSharpNamespaceDeclaration) -> List[RunaStatement]:
+    def _convert_namespace_declaration(self, namespace_decl: CSharpNamespaceDeclaration) -> List[Statement]:
         """Convert namespace declaration to Runa statements."""
         statements = []
         
@@ -197,8 +197,8 @@ class CSharpToRunaConverter:
         self.namespace_name = self._expression_to_string(namespace_decl.name)
         
         # Add namespace comment
-        statements.append(RunaExpressionStatement(
-            RunaLiteral(f"namespace {self.namespace_name}", "comment")
+        statements.append(ExpressionStatement(
+            StringLiteral(f"namespace {self.namespace_name}", "comment")
         ))
         
         # Convert using directives
@@ -221,7 +221,7 @@ class CSharpToRunaConverter:
         
         return statements
     
-    def _convert_class_declaration(self, class_decl: CSharpClassDeclaration) -> RunaStatement:
+    def _convert_class_declaration(self, class_decl: CSharpClassDeclaration) -> Statement:
         """Convert class declaration to Runa statement."""
         old_class = self.current_class
         self.current_class = class_decl.identifier
@@ -230,7 +230,7 @@ class CSharpToRunaConverter:
         class_name = class_decl.identifier
         
         # Create class definition
-        class_def = RunaFunctionDefinition(
+        class_def = ProcessDefinition(
             name=f"Class_{class_name}",
             parameters=[],
             body=[]
@@ -249,21 +249,21 @@ class CSharpToRunaConverter:
         
         return class_def
     
-    def _convert_struct_declaration(self, struct_decl: CSharpStructDeclaration) -> RunaStatement:
+    def _convert_struct_declaration(self, struct_decl: CSharpStructDeclaration) -> Statement:
         """Convert struct declaration to Runa statement."""
         # Similar to class but with value semantics
         return self._convert_class_declaration(struct_decl)
     
-    def _convert_interface_declaration(self, interface_decl: CSharpInterfaceDeclaration) -> RunaStatement:
+    def _convert_interface_declaration(self, interface_decl: CSharpInterfaceDeclaration) -> Statement:
         """Convert interface declaration to Runa statement."""
         # Convert interface to Runa interface-like structure
         interface_name = interface_decl.identifier
         
-        return RunaExpressionStatement(
-            RunaLiteral(f"interface {interface_name}", "comment")
+        return ExpressionStatement(
+            StringLiteral(f"interface {interface_name}", "comment")
         )
     
-    def _convert_enum_declaration(self, enum_decl: CSharpEnumDeclaration) -> RunaStatement:
+    def _convert_enum_declaration(self, enum_decl: CSharpEnumDeclaration) -> Statement:
         """Convert enum declaration to Runa statement."""
         enum_name = enum_decl.identifier
         
@@ -273,24 +273,24 @@ class CSharpToRunaConverter:
             if isinstance(member, CSharpEnumMemberDeclaration):
                 enum_values.append(member.identifier)
         
-        return RunaExpressionStatement(
-            RunaLiteral(f"enum {enum_name} with values {', '.join(enum_values)}", "comment")
+        return ExpressionStatement(
+            StringLiteral(f"enum {enum_name} with values {', '.join(enum_values)}", "comment")
         )
     
-    def _convert_delegate_declaration(self, delegate_decl: CSharpDelegateDeclaration) -> RunaStatement:
+    def _convert_delegate_declaration(self, delegate_decl: CSharpDelegateDeclaration) -> Statement:
         """Convert delegate declaration to Runa statement."""
         delegate_name = delegate_decl.identifier
         
-        return RunaExpressionStatement(
-            RunaLiteral(f"delegate {delegate_name}", "comment")
+        return ExpressionStatement(
+            StringLiteral(f"delegate {delegate_name}", "comment")
         )
     
-    def _convert_record_declaration(self, record_decl: CSharpRecordDeclaration) -> RunaStatement:
+    def _convert_record_declaration(self, record_decl: CSharpRecordDeclaration) -> Statement:
         """Convert record declaration to Runa statement."""
         record_name = record_decl.identifier
         
         # Create record-like structure
-        record_def = RunaFunctionDefinition(
+        record_def = ProcessDefinition(
             name=f"Record_{record_name}",
             parameters=[],
             body=[]
@@ -307,7 +307,7 @@ class CSharpToRunaConverter:
         
         return record_def
     
-    def _convert_method_declaration(self, method_decl: CSharpMethodDeclaration) -> RunaStatement:
+    def _convert_method_declaration(self, method_decl: CSharpMethodDeclaration) -> Statement:
         """Convert method declaration to Runa function."""
         method_name = method_decl.identifier
         
@@ -321,7 +321,7 @@ class CSharpToRunaConverter:
         if method_decl.parameter_list:
             for param in method_decl.parameter_list.parameters:
                 param_name = param.identifier
-                parameters.append(RunaParameter(param_name))
+                parameters.append(Parameter(param_name))
         
         # Convert body
         body = []
@@ -335,18 +335,18 @@ class CSharpToRunaConverter:
                         body.append(converted)
         elif method_decl.expression_body:
             # Expression body method
-            expr_stmt = RunaExpressionStatement(
+            expr_stmt = ExpressionStatement(
                 self.convert_expression(method_decl.expression_body)
             )
             body.append(expr_stmt)
         
-        return RunaFunctionDefinition(
+        return ProcessDefinition(
             name=method_name,
             parameters=parameters,
             body=body
         )
     
-    def _convert_field_declaration(self, field_decl: CSharpFieldDeclaration) -> RunaStatement:
+    def _convert_field_declaration(self, field_decl: CSharpFieldDeclaration) -> Statement:
         """Convert field declaration to Runa variable."""
         # Get first variable declarator
         if field_decl.declaration.variables:
@@ -358,30 +358,30 @@ class CSharpToRunaConverter:
             if var_decl.initializer:
                 initial_value = self.convert_expression(var_decl.initializer.value)
             
-            return RunaVariableDeclaration(
+            return LetStatement(
                 name=var_name,
                 value=initial_value
             )
         
-        return RunaExpressionStatement(RunaLiteral("field", "comment"))
+        return ExpressionStatement(StringLiteral("field", "comment"))
     
-    def _convert_property_declaration(self, prop_decl: CSharpPropertyDeclaration) -> RunaStatement:
+    def _convert_property_declaration(self, prop_decl: CSharpPropertyDeclaration) -> Statement:
         """Convert property declaration to Runa property."""
         prop_name = prop_decl.identifier
         
         # Create property-like structure
-        return RunaVariableDeclaration(
+        return LetStatement(
             name=prop_name,
             value=None
         )
     
-    def _convert_expression_statement(self, expr_stmt: CSharpExpressionStatement) -> RunaStatement:
+    def _convert_expression_statement(self, expr_stmt: CSharpExpressionStatement) -> Statement:
         """Convert expression statement to Runa statement."""
-        return RunaExpressionStatement(
+        return ExpressionStatement(
             self.convert_expression(expr_stmt.expression)
         )
     
-    def _convert_block_statement(self, block_stmt: CSharpBlock) -> RunaStatement:
+    def _convert_block_statement(self, block_stmt: CSharpBlock) -> Statement:
         """Convert block statement to Runa block."""
         statements = []
         
@@ -393,9 +393,9 @@ class CSharpToRunaConverter:
                 else:
                     statements.append(converted)
         
-        return RunaBlock(statements)
+        return Block(statements)
     
-    def _convert_if_statement(self, if_stmt: CSharpIfStatement) -> RunaStatement:
+    def _convert_if_statement(self, if_stmt: CSharpIfStatement) -> Statement:
         """Convert if statement to Runa if statement."""
         condition = self.convert_expression(if_stmt.condition)
         then_stmt = self.convert_statement(if_stmt.statement)
@@ -404,23 +404,23 @@ class CSharpToRunaConverter:
         if if_stmt.else_statement:
             else_stmt = self.convert_statement(if_stmt.else_statement)
         
-        return RunaIfStatement(
+        return IfStatement(
             condition=condition,
             then_statement=then_stmt,
             else_statement=else_stmt
         )
     
-    def _convert_while_statement(self, while_stmt: CSharpWhileStatement) -> RunaStatement:
+    def _convert_while_statement(self, while_stmt: CSharpWhileStatement) -> Statement:
         """Convert while statement to Runa while statement."""
         condition = self.convert_expression(while_stmt.condition)
         body = self.convert_statement(while_stmt.statement)
         
-        return RunaWhileStatement(
+        return WhileLoop(
             condition=condition,
             body=body
         )
     
-    def _convert_for_statement(self, for_stmt: CSharpForStatement) -> RunaStatement:
+    def _convert_for_statement(self, for_stmt: CSharpForStatement) -> Statement:
         """Convert for statement to Runa for statement."""
         # Convert C# for loop to Runa while loop
         statements = []
@@ -431,54 +431,54 @@ class CSharpToRunaConverter:
             statements.append(init_stmt)
         elif for_stmt.initializers:
             for init in for_stmt.initializers:
-                statements.append(RunaExpressionStatement(self.convert_expression(init)))
+                statements.append(ExpressionStatement(self.convert_expression(init)))
         
         # While loop
         condition = None
         if for_stmt.condition:
             condition = self.convert_expression(for_stmt.condition)
         else:
-            condition = RunaLiteral(True, "boolean")
+            condition = BooleanLiteral(value=True)
         
         # Body with incrementors
         body_statements = []
         body_statements.append(self.convert_statement(for_stmt.statement))
         
         for incrementor in for_stmt.incrementors:
-            body_statements.append(RunaExpressionStatement(self.convert_expression(incrementor)))
+            body_statements.append(ExpressionStatement(self.convert_expression(incrementor)))
         
-        while_stmt = RunaWhileStatement(
+        while_stmt = WhileLoop(
             condition=condition,
-            body=RunaBlock(body_statements)
+            body=Block(body_statements)
         )
         
         statements.append(while_stmt)
         
-        return RunaBlock(statements)
+        return Block(statements)
     
-    def _convert_foreach_statement(self, foreach_stmt: CSharpForEachStatement) -> RunaStatement:
+    def _convert_foreach_statement(self, foreach_stmt: CSharpForEachStatement) -> Statement:
         """Convert foreach statement to Runa for-each statement."""
         variable = foreach_stmt.identifier
         collection = self.convert_expression(foreach_stmt.expression)
         body = self.convert_statement(foreach_stmt.statement)
         
-        return RunaForEachStatement(
+        return ForEachLoop(
             variable=variable,
             collection=collection,
             body=body
         )
     
-    def _convert_do_statement(self, do_stmt: CSharpDoStatement) -> RunaStatement:
+    def _convert_do_statement(self, do_stmt: CSharpDoStatement) -> Statement:
         """Convert do statement to Runa do-while statement."""
         body = self.convert_statement(do_stmt.statement)
         condition = self.convert_expression(do_stmt.condition)
         
-        return RunaDoWhileStatement(
+        return DoWhileLoop(
             body=body,
             condition=condition
         )
     
-    def _convert_switch_statement(self, switch_stmt: CSharpSwitchStatement) -> RunaStatement:
+    def _convert_switch_statement(self, switch_stmt: CSharpSwitchStatement) -> Statement:
         """Convert switch statement to Runa switch statement."""
         expression = self.convert_expression(switch_stmt.expression)
         cases = []
@@ -489,7 +489,7 @@ class CSharpToRunaConverter:
                 if isinstance(label, CSharpCaseSwitchLabel):
                     case_labels.append(self.convert_expression(label.value))
                 elif isinstance(label, CSharpDefaultSwitchLabel):
-                    case_labels.append(RunaLiteral("default", "string"))
+                    case_labels.append(StringLiteral(value="default"))
             
             case_statements = []
             for stmt in section.statements:
@@ -500,41 +500,41 @@ class CSharpToRunaConverter:
                     else:
                         case_statements.append(converted)
             
-            cases.append(RunaSwitchCase(
+            cases.append(SwitchCase(
                 labels=case_labels,
                 statements=case_statements
             ))
         
-        return RunaSwitchStatement(
+        return SwitchStatement(
             expression=expression,
             cases=cases
         )
     
-    def _convert_break_statement(self, break_stmt: CSharpBreakStatement) -> RunaStatement:
+    def _convert_break_statement(self, break_stmt: CSharpBreakStatement) -> Statement:
         """Convert break statement to Runa break statement."""
-        return RunaBreakStatement()
+        return BreakStatement()
     
-    def _convert_continue_statement(self, continue_stmt: CSharpContinueStatement) -> RunaStatement:
+    def _convert_continue_statement(self, continue_stmt: CSharpContinueStatement) -> Statement:
         """Convert continue statement to Runa continue statement."""
-        return RunaContinueStatement()
+        return ContinueStatement()
     
-    def _convert_return_statement(self, return_stmt: CSharpReturnStatement) -> RunaStatement:
+    def _convert_return_statement(self, return_stmt: CSharpReturnStatement) -> Statement:
         """Convert return statement to Runa return statement."""
         value = None
         if return_stmt.expression:
             value = self.convert_expression(return_stmt.expression)
         
-        return RunaReturnStatement(value=value)
+        return ReturnStatement(value=value)
     
-    def _convert_throw_statement(self, throw_stmt: CSharpThrowStatement) -> RunaStatement:
+    def _convert_throw_statement(self, throw_stmt: CSharpThrowStatement) -> Statement:
         """Convert throw statement to Runa throw statement."""
         expression = None
         if throw_stmt.expression:
             expression = self.convert_expression(throw_stmt.expression)
         
-        return RunaThrowStatement(expression=expression)
+        return ThrowStatement(expression=expression)
     
-    def _convert_try_statement(self, try_stmt: CSharpTryStatement) -> RunaStatement:
+    def _convert_try_statement(self, try_stmt: CSharpTryStatement) -> Statement:
         """Convert try statement to Runa try statement."""
         try_block = self.convert_statement(try_stmt.block)
         
@@ -545,7 +545,7 @@ class CSharpToRunaConverter:
                 catch_var = catch_clause.declaration.identifier
             
             catch_body = self.convert_statement(catch_clause.block)
-            catch_blocks.append(RunaCatchBlock(
+            catch_blocks.append(CatchBlock(
                 exception_type=catch_var,
                 body=catch_body
             ))
@@ -554,50 +554,50 @@ class CSharpToRunaConverter:
         if try_stmt.finally_block:
             finally_block = self.convert_statement(try_stmt.finally_block)
         
-        return RunaTryStatement(
+        return TryStatement(
             try_block=try_block,
             catch_blocks=catch_blocks,
             finally_block=finally_block
         )
     
-    def _convert_lock_statement(self, lock_stmt: CSharpLockStatement) -> RunaStatement:
+    def _convert_lock_statement(self, lock_stmt: CSharpLockStatement) -> Statement:
         """Convert lock statement to Runa synchronized statement."""
         expression = self.convert_expression(lock_stmt.expression)
         body = self.convert_statement(lock_stmt.statement)
         
-        return RunaSynchronizedStatement(
+        return SynchronizedStatement(
             expression=expression,
             body=body
         )
     
-    def _convert_using_statement(self, using_stmt: CSharpUsingStatement) -> RunaStatement:
+    def _convert_using_statement(self, using_stmt: CSharpUsingStatement) -> Statement:
         """Convert using statement to Runa try-with-resources statement."""
         resource = None
         if using_stmt.declaration:
             resource = self._convert_variable_declaration(using_stmt.declaration)
         elif using_stmt.expression:
-            resource = RunaExpressionStatement(self.convert_expression(using_stmt.expression))
+            resource = ExpressionStatement(self.convert_expression(using_stmt.expression))
         
         body = self.convert_statement(using_stmt.statement)
         
-        return RunaTryWithResourcesStatement(
+        return TryWithResourcesStatement(
             resource=resource,
             body=body
         )
     
-    def _convert_yield_statement(self, yield_stmt: CSharpYieldStatement) -> RunaStatement:
+    def _convert_yield_statement(self, yield_stmt: CSharpYieldStatement) -> Statement:
         """Convert yield statement to Runa yield statement."""
         if yield_stmt.is_break:
-            return RunaYieldBreakStatement()
+            return YieldBreakStatement()
         else:
             expression = self.convert_expression(yield_stmt.expression)
-            return RunaYieldStatement(expression=expression)
+            return YieldStatement(expression=expression)
     
-    def _convert_local_declaration_statement(self, local_decl: CSharpLocalDeclarationStatement) -> RunaStatement:
+    def _convert_local_declaration_statement(self, local_decl: CSharpLocalDeclarationStatement) -> Statement:
         """Convert local declaration statement to Runa variable declaration."""
         return self._convert_variable_declaration(local_decl.declaration)
     
-    def _convert_variable_declaration(self, var_decl: CSharpVariableDeclaration) -> RunaStatement:
+    def _convert_variable_declaration(self, var_decl: CSharpVariableDeclaration) -> Statement:
         """Convert variable declaration to Runa variable declaration."""
         if var_decl.variables:
             first_var = var_decl.variables[0]
@@ -607,60 +607,60 @@ class CSharpToRunaConverter:
             if first_var.initializer:
                 initial_value = self.convert_expression(first_var.initializer.value)
             
-            return RunaVariableDeclaration(
+            return LetStatement(
                 name=var_name,
                 value=initial_value
             )
         
-        return RunaExpressionStatement(RunaLiteral("variable", "comment"))
+        return ExpressionStatement(StringLiteral("variable", "comment"))
     
-    def _convert_literal(self, literal: CSharpLiteral) -> RunaExpression:
+    def _convert_literal(self, literal: CSharpLiteral) -> Expression:
         """Convert C# literal to Runa literal."""
-        return RunaLiteral(literal.value, literal.literal_type)
+        return StringLiteral(literal.value, literal.literal_type)
     
-    def _convert_identifier(self, identifier: CSharpIdentifier) -> RunaExpression:
+    def _convert_identifier(self, identifier: CSharpIdentifier) -> Expression:
         """Convert C# identifier to Runa identifier."""
-        return RunaIdentifier(identifier.name)
+        return Identifier(identifier.name)
     
-    def _convert_qualified_name(self, qualified_name: CSharpQualifiedName) -> RunaExpression:
+    def _convert_qualified_name(self, qualified_name: CSharpQualifiedName) -> Expression:
         """Convert C# qualified name to Runa qualified name."""
         left = self.convert_expression(qualified_name.left)
         right = self.convert_expression(qualified_name.right)
         
-        return RunaQualifiedName(left, right)
+        return QualifiedName(left, right)
     
-    def _convert_binary_expression(self, binary_expr: CSharpBinaryExpression) -> RunaExpression:
+    def _convert_binary_expression(self, binary_expr: CSharpBinaryExpression) -> Expression:
         """Convert C# binary expression to Runa binary expression."""
         left = self.convert_expression(binary_expr.left)
         right = self.convert_expression(binary_expr.right)
         operator = self._convert_operator(binary_expr.operator)
         
-        return RunaBinaryExpression(left, operator, right)
+        return BinaryExpression(left, operator, right)
     
-    def _convert_unary_expression(self, unary_expr: CSharpUnaryExpression) -> RunaExpression:
+    def _convert_unary_expression(self, unary_expr: CSharpUnaryExpression) -> Expression:
         """Convert C# unary expression to Runa unary expression."""
         operand = self.convert_expression(unary_expr.operand)
         operator = self._convert_operator(unary_expr.operator)
         
-        return RunaUnaryExpression(operator, operand)
+        return UnaryExpression(operator, operand)
     
-    def _convert_conditional_expression(self, cond_expr: CSharpConditionalExpression) -> RunaExpression:
+    def _convert_conditional_expression(self, cond_expr: CSharpConditionalExpression) -> Expression:
         """Convert C# conditional expression to Runa conditional expression."""
         condition = self.convert_expression(cond_expr.condition)
         when_true = self.convert_expression(cond_expr.when_true)
         when_false = self.convert_expression(cond_expr.when_false)
         
-        return RunaConditionalExpression(condition, when_true, when_false)
+        return ConditionalExpression(condition, when_true, when_false)
     
-    def _convert_assignment_expression(self, assign_expr: CSharpAssignmentExpression) -> RunaExpression:
+    def _convert_assignment_expression(self, assign_expr: CSharpAssignmentExpression) -> Expression:
         """Convert C# assignment expression to Runa assignment expression."""
         left = self.convert_expression(assign_expr.left)
         right = self.convert_expression(assign_expr.right)
         operator = self._convert_operator(assign_expr.operator)
         
-        return RunaAssignmentExpression(left, operator, right)
+        return AssignmentExpression(left, operator, right)
     
-    def _convert_invocation_expression(self, invocation_expr: CSharpInvocationExpression) -> RunaExpression:
+    def _convert_invocation_expression(self, invocation_expr: CSharpInvocationExpression) -> Expression:
         """Convert C# invocation expression to Runa method call."""
         function = self.convert_expression(invocation_expr.expression)
         
@@ -668,16 +668,16 @@ class CSharpToRunaConverter:
         for arg in invocation_expr.arguments:
             arguments.append(self.convert_expression(arg))
         
-        return RunaMethodCall(function, arguments)
+        return FunctionCall(function, arguments)
     
-    def _convert_member_access_expression(self, member_access: CSharpMemberAccessExpression) -> RunaExpression:
+    def _convert_member_access_expression(self, member_access: CSharpMemberAccessExpression) -> Expression:
         """Convert C# member access expression to Runa member access."""
         object_expr = self.convert_expression(member_access.expression)
         member_name = member_access.name
         
-        return RunaMemberAccess(object_expr, member_name)
+        return MemberAccess(object_expr, member_name)
     
-    def _convert_element_access_expression(self, element_access: CSharpElementAccessExpression) -> RunaExpression:
+    def _convert_element_access_expression(self, element_access: CSharpIndexerAccessExpression) -> Expression:
         """Convert C# element access expression to Runa array access."""
         array = self.convert_expression(element_access.expression)
         
@@ -686,66 +686,66 @@ class CSharpToRunaConverter:
         if element_access.arguments:
             index = self.convert_expression(element_access.arguments[0])
         
-        return RunaArrayAccess(array, index)
+        return ListLiteralAccess(array, index)
     
-    def _convert_cast_expression(self, cast_expr: CSharpCastExpression) -> RunaExpression:
+    def _convert_cast_expression(self, cast_expr: CSharpCastExpression) -> Expression:
         """Convert C# cast expression to Runa cast expression."""
         expression = self.convert_expression(cast_expr.expression)
         target_type = self._convert_type(cast_expr.target_type)
         
-        return RunaCastExpression(expression, target_type)
+        return CastExpression(expression, target_type)
     
-    def _convert_is_expression(self, is_expr: CSharpIsExpression) -> RunaExpression:
+    def _convert_is_expression(self, is_expr: CSharpIsExpression) -> Expression:
         """Convert C# is expression to Runa instanceof expression."""
         expression = self.convert_expression(is_expr.expression)
         
         if isinstance(is_expr.type_or_pattern, CSharpType):
             type_name = self._convert_type(is_expr.type_or_pattern)
-            return RunaInstanceofExpression(expression, type_name)
+            return InstanceofExpression(expression, type_name)
         else:
             # Pattern matching - convert to instanceof for now
-            return RunaInstanceofExpression(expression, "Object")
+            return InstanceofExpression(expression, "Object")
     
-    def _convert_as_expression(self, as_expr: CSharpAsExpression) -> RunaExpression:
+    def _convert_as_expression(self, as_expr: CSharpAsExpression) -> Expression:
         """Convert C# as expression to Runa cast expression."""
         expression = self.convert_expression(as_expr.expression)
         target_type = self._convert_type(as_expr.target_type)
         
-        return RunaCastExpression(expression, target_type)
+        return CastExpression(expression, target_type)
     
-    def _convert_this_expression(self, this_expr: CSharpThisExpression) -> RunaExpression:
+    def _convert_this_expression(self, this_expr: CSharpThisExpression) -> Expression:
         """Convert C# this expression to Runa this expression."""
-        return RunaThisExpression()
+        return ThisExpression()
     
-    def _convert_base_expression(self, base_expr: CSharpBaseExpression) -> RunaExpression:
+    def _convert_base_expression(self, base_expr: CSharpBaseExpression) -> Expression:
         """Convert C# base expression to Runa super expression."""
-        return RunaSuperExpression()
+        return SuperExpression()
     
-    def _convert_typeof_expression(self, typeof_expr: CSharpTypeofExpression) -> RunaExpression:
+    def _convert_typeof_expression(self, typeof_expr: CSharpTypeofExpression) -> Expression:
         """Convert C# typeof expression to Runa typeof expression."""
         target_type = self._convert_type(typeof_expr.target_type)
-        return RunaTypeofExpression(target_type)
+        return BasicTypeofExpression(target_type)
     
-    def _convert_sizeof_expression(self, sizeof_expr: CSharpSizeofExpression) -> RunaExpression:
+    def _convert_sizeof_expression(self, sizeof_expr: CSharpSizeofExpression) -> Expression:
         """Convert C# sizeof expression to Runa sizeof expression."""
         target_type = self._convert_type(sizeof_expr.target_type)
-        return RunaSizeofExpression(target_type)
+        return SizeofExpression(type_expression=target_type)
     
-    def _convert_nameof_expression(self, nameof_expr: CSharpNameofExpression) -> RunaExpression:
+    def _convert_nameof_expression(self, nameof_expr: CSharpNameofExpression) -> Expression:
         """Convert C# nameof expression to Runa string literal."""
         # Extract name from expression
         name = self._expression_to_string(nameof_expr.expression)
-        return RunaLiteral(name, "string")
+        return StringLiteral(value=name)
     
-    def _convert_default_expression(self, default_expr: CSharpDefaultExpression) -> RunaExpression:
+    def _convert_default_expression(self, default_expr: CSharpDefaultExpression) -> Expression:
         """Convert C# default expression to Runa default expression."""
         if default_expr.target_type:
             target_type = self._convert_type(default_expr.target_type)
-            return RunaDefaultExpression(target_type)
+            return DefaultExpression(type_expression=target_type)
         else:
-            return RunaLiteral(None, "null")
+            return StringLiteral(value="null")
     
-    def _convert_object_creation_expression(self, obj_creation: CSharpObjectCreationExpression) -> RunaExpression:
+    def _convert_object_creation_expression(self, obj_creation: CSharpObjectCreationExpression) -> Expression:
         """Convert C# object creation expression to Runa new expression."""
         if obj_creation.type:
             type_name = self._convert_type(obj_creation.type)
@@ -756,9 +756,11 @@ class CSharpToRunaConverter:
         for arg in obj_creation.arguments:
             arguments.append(self.convert_expression(arg))
         
-        return RunaNewExpression(type_name, arguments)
+        # Create proper new expression
+        type_expr = BasicType(type_name)
+        return NewExpression(type_expression=type_expr, arguments=arguments)
     
-    def _convert_array_creation_expression(self, array_creation: CSharpArrayCreationExpression) -> RunaExpression:
+    def _convert_array_creation_expression(self, array_creation: CSharpArrayCreationExpression) -> Expression:
         """Convert C# array creation expression to Runa array creation."""
         element_type = self._convert_type(array_creation.type)
         
@@ -769,11 +771,11 @@ class CSharpToRunaConverter:
                 if size:
                     dimensions.append(self.convert_expression(size))
                 else:
-                    dimensions.append(RunaLiteral(0, "int"))
+                    dimensions.append(StringLiteral(0, "int"))
         
-        return RunaArrayCreation(element_type, dimensions)
+        return ListLiteralCreation(element_type, dimensions)
     
-    def _convert_lambda_expression(self, lambda_expr: CSharpLambdaExpression) -> RunaExpression:
+    def _convert_lambda_expression(self, lambda_expr: CSharpLambdaExpression) -> Expression:
         """Convert C# lambda expression to Runa lambda expression."""
         parameters = []
         for param in lambda_expr.parameters:
@@ -785,27 +787,32 @@ class CSharpToRunaConverter:
         else:
             body = self.convert_statement(lambda_expr.body)
         
-        return RunaLambdaExpression(parameters, body)
+        self.method_counter += 1
+        return ProcessDefinition(
+            name=f"lambda_{self.method_counter}",
+            parameters=parameters,
+            body=body
+        )
     
-    def _convert_await_expression(self, await_expr: CSharpAwaitExpression) -> RunaExpression:
+    def _convert_await_expression(self, await_expr: CSharpAwaitExpression) -> Expression:
         """Convert C# await expression to Runa await expression."""
         expression = self.convert_expression(await_expr.expression)
-        return RunaAwaitExpression(expression)
+        return AwaitExpression(expression)
     
-    def _convert_tuple_expression(self, tuple_expr: CSharpTupleExpression) -> RunaExpression:
+    def _convert_tuple_expression(self, tuple_expr: CSharpTupleExpression) -> Expression:
         """Convert C# tuple expression to Runa tuple expression."""
         elements = []
         for arg in tuple_expr.arguments:
             elements.append(self.convert_expression(arg.expression))
         
-        return RunaTupleExpression(elements)
+        return TupleExpression(elements=elements)
     
-    def _convert_throw_expression(self, throw_expr: CSharpThrowExpression) -> RunaExpression:
+    def _convert_throw_expression(self, throw_expr: CSharpThrowExpression) -> Expression:
         """Convert C# throw expression to Runa throw expression."""
         expression = self.convert_expression(throw_expr.expression)
-        return RunaThrowExpression(expression)
+        return ThrowExpression(expression)
     
-    def _convert_range_expression(self, range_expr: CSharpRangeExpression) -> RunaExpression:
+    def _convert_range_expression(self, range_expr: CSharpRangeExpression) -> Expression:
         """Convert C# range expression to Runa range expression."""
         start = None
         end = None
@@ -815,14 +822,14 @@ class CSharpToRunaConverter:
         if range_expr.right:
             end = self.convert_expression(range_expr.right)
         
-        return RunaRangeExpression(start, end)
+        return RangeExpression(start, end)
     
-    def _convert_index_expression(self, index_expr: CSharpIndexExpression) -> RunaExpression:
+    def _convert_index_expression(self, index_expr: CSharpIndexExpression) -> Expression:
         """Convert C# index expression to Runa index expression."""
         operand = self.convert_expression(index_expr.operand)
-        return RunaIndexExpression(operand)
+        return IndexExpression(operand)
     
-    def _convert_switch_expression(self, switch_expr: CSharpSwitchExpression) -> RunaExpression:
+    def _convert_switch_expression(self, switch_expr: CSharpSwitchExpression) -> Expression:
         """Convert C# switch expression to Runa switch expression."""
         governing_expression = self.convert_expression(switch_expr.governing_expression)
         
@@ -834,17 +841,72 @@ class CSharpToRunaConverter:
                 when_clause = self.convert_expression(arm.when_clause)
             expression = self.convert_expression(arm.expression)
             
-            arms.append(RunaSwitchArm(pattern, when_clause, expression))
+            arms.append(SwitchArm(pattern, when_clause, expression))
         
-        return RunaSwitchExpression(governing_expression, arms)
+        return SwitchExpression(governing_expression, arms)
     
-    def _convert_with_expression(self, with_expr: CSharpWithExpression) -> RunaExpression:
-        """Convert C# with expression to Runa with expression."""
-        expression = self.convert_expression(with_expr.expression)
-        # For now, just return the expression
-        return expression
+    def _convert_with_expression(self, with_expr: CSharpWithExpression) -> Expression:
+        """Convert C# with expression to Runa with expression.
+        
+        C# with expressions create a copy of an object with specified property updates.
+        Example: new_obj = original_obj with { Prop1 = value1, Prop2 = value2 }
+        """
+        # Convert the base expression (the object being copied)
+        base_expression = self.convert_expression(with_expr.expression)
+        
+        # Convert the initializer (property updates) if present
+        updates = []
+        if with_expr.initializer:
+            for expr in with_expr.initializer.expressions:
+                if isinstance(expr, CSharpAssignmentExpression):
+                    # Convert property assignment to Runa assignment expression
+                    left = self.convert_expression(expr.left)
+                    right = self.convert_expression(expr.right)
+                    assignment = AssignmentExpression(
+                        left=left,
+                        operator="=",
+                        right=right
+                    )
+                    updates.append(assignment)
+                elif isinstance(expr, CSharpIdentifier):
+                    # Handle implicit property assignments (e.g., { Prop } means { Prop = Prop })
+                    prop_name = expr.name
+                    # Create a member access for the property
+                    member_access = MemberAccess(
+                        expression=base_expression,
+                        member=prop_name
+                    )
+                    # Create assignment: Prop = Prop
+                    assignment = AssignmentExpression(
+                        left=member_access,
+                        operator="=",
+                        right=member_access
+                    )
+                    updates.append(assignment)
+                else:
+                    # For other expression types, try to convert them
+                    converted_expr = self.convert_expression(expr)
+                    if isinstance(converted_expr, AssignmentExpression):
+                        updates.append(converted_expr)
+                    else:
+                        # If it's not an assignment, create a default assignment
+                        # This handles edge cases where the expression might be more complex
+                        assignment = AssignmentExpression(
+                            left=converted_expr,
+                            operator="=",
+                            right=converted_expr
+                        )
+                        updates.append(assignment)
+        
+        # Create the Runa WithExpression
+        with_expression = WithExpression(
+            base_expression=base_expression,
+            updates=updates
+        )
+        
+        return with_expression
     
-    def _convert_interpolated_string_expression(self, interp_str: CSharpInterpolatedStringExpression) -> RunaExpression:
+    def _convert_interpolated_string_expression(self, interp_str: CSharpInterpolatedStringExpression) -> Expression:
         """Convert C# interpolated string to Runa interpolated string."""
         parts = []
         for part in interp_str.parts:
@@ -854,9 +916,9 @@ class CSharpToRunaConverter:
                 # Interpolation expression
                 parts.append(self.convert_expression(part.expression))
         
-        return RunaInterpolatedString(parts)
+        return InterpolatedStringExpression(parts=parts)
     
-    def _convert_query_expression(self, query_expr: CSharpQueryExpression) -> RunaExpression:
+    def _convert_query_expression(self, query_expr: CSharpQueryExpression) -> Expression:
         """Convert C# LINQ query expression to Runa query expression."""
         # Convert LINQ to method calls
         from_clause = query_expr.from_clause
@@ -870,48 +932,68 @@ class CSharpToRunaConverter:
         for clause in query_expr.body.clauses:
             if isinstance(clause, CSharpWhereClause):
                 condition = self.convert_expression(clause.condition)
-                result_expr = RunaMethodCall(
-                    RunaMemberAccess(result_expr, "filter"),
-                    [RunaLambdaExpression([variable], condition)]
+                self.method_counter += 1
+                result_expr = FunctionCall(
+                    MemberAccess(result_expr, "filter"),
+                    [ProcessDefinition(
+                        name=f"lambda_{self.method_counter}",
+                        parameters=[],
+                        body=[ExpressionStatement(condition)]
+                    )]
                 )
             elif isinstance(clause, CSharpOrderByClause):
                 for ordering in clause.orderings:
                     key_expr = self.convert_expression(ordering.expression)
-                    result_expr = RunaMethodCall(
-                        RunaMemberAccess(result_expr, "orderBy"),
-                        [RunaLambdaExpression([variable], key_expr)]
+                    self.method_counter += 1
+                    result_expr = FunctionCall(
+                        MemberAccess(result_expr, "orderBy"),
+                        [ProcessDefinition(
+                            name=f"lambda_{self.method_counter}",
+                            parameters=[],
+                            body=[ExpressionStatement(key_expr)]
+                        )]
                     )
         
         # Process select or group clause
         if isinstance(query_expr.body.select_or_group, CSharpSelectClause):
             select_expr = self.convert_expression(query_expr.body.select_or_group.expression)
-            result_expr = RunaMethodCall(
-                RunaMemberAccess(result_expr, "map"),
-                [RunaLambdaExpression([variable], select_expr)]
+            self.method_counter += 1
+            result_expr = FunctionCall(
+                MemberAccess(result_expr, "map"),
+                [ProcessDefinition(
+                    name=f"lambda_{self.method_counter}",
+                    parameters=[],
+                    body=[ExpressionStatement(select_expr)]
+                )]
             )
         elif isinstance(query_expr.body.select_or_group, CSharpGroupClause):
             group_expr = self.convert_expression(query_expr.body.select_or_group.group_expression)
             by_expr = self.convert_expression(query_expr.body.select_or_group.by_expression)
-            result_expr = RunaMethodCall(
-                RunaMemberAccess(result_expr, "groupBy"),
-                [RunaLambdaExpression([variable], by_expr)]
+            self.method_counter += 1
+            result_expr = FunctionCall(
+                MemberAccess(result_expr, "groupBy"),
+                [ProcessDefinition(
+                    name=f"lambda_{self.method_counter}",
+                    parameters=[],
+                    body=[ExpressionStatement(by_expr)]
+                )]
             )
         
         return result_expr
     
-    def _convert_pattern(self, pattern: CSharpPattern) -> RunaExpression:
+    def _convert_pattern(self, pattern: CSharpPattern) -> Expression:
         """Convert C# pattern to Runa pattern."""
         if isinstance(pattern, CSharpConstantPattern):
             return self.convert_expression(pattern.expression)
         elif isinstance(pattern, CSharpDeclarationPattern):
             type_name = self._convert_type(pattern.type)
-            return RunaLiteral(type_name, "string")
+            return StringLiteral(value=type_name)
         elif isinstance(pattern, CSharpVarPattern):
-            return RunaLiteral("var", "string")
+            return StringLiteral(value="var")
         elif isinstance(pattern, CSharpDiscardPattern):
-            return RunaLiteral("_", "string")
+            return StringLiteral(value="_")
         else:
-            return RunaLiteral("pattern", "string")
+            return StringLiteral(value="pattern")
     
     def _convert_operator(self, operator: CSharpOperator) -> str:
         """Convert C# operator to Runa operator."""
@@ -1053,84 +1135,83 @@ class RunaToCSharpConverter:
             members=members
         )
     
-    def convert_statement(self, stmt: RunaStatement) -> Union[CSharpMemberDeclaration, CSharpStatement, List[CSharpMemberDeclaration], None]:
+    def convert_statement(self, stmt: Statement) -> Union[CSharpMemberDeclaration, CSharpStatement, List[CSharpMemberDeclaration], None]:
         """Convert Runa statement to C# statement or member."""
-        if isinstance(stmt, RunaFunctionDefinition):
+        if isinstance(stmt, ProcessDefinition):
             return self._convert_function_definition(stmt)
-        elif isinstance(stmt, RunaVariableDeclaration):
+        elif isinstance(stmt, LetStatement):
             return self._convert_variable_declaration(stmt)
-        elif isinstance(stmt, RunaExpressionStatement):
+        elif isinstance(stmt, ExpressionStatement):
             return self._convert_expression_statement(stmt)
-        elif isinstance(stmt, RunaIfStatement):
+        elif isinstance(stmt, IfStatement):
             return self._convert_if_statement(stmt)
-        elif isinstance(stmt, RunaWhileStatement):
+        elif isinstance(stmt, WhileLoop):
             return self._convert_while_statement(stmt)
-        elif isinstance(stmt, RunaForEachStatement):
+        elif isinstance(stmt, ForEachLoop):
             return self._convert_foreach_statement(stmt)
-        elif isinstance(stmt, RunaDoWhileStatement):
+        elif isinstance(stmt, DoWhileLoop):
             return self._convert_do_while_statement(stmt)
-        elif isinstance(stmt, RunaSwitchStatement):
+        elif isinstance(stmt, SwitchStatement):
             return self._convert_switch_statement(stmt)
-        elif isinstance(stmt, RunaReturnStatement):
+        elif isinstance(stmt, ReturnStatement):
             return self._convert_return_statement(stmt)
-        elif isinstance(stmt, RunaBreakStatement):
+        elif isinstance(stmt, BreakStatement):
             return self._convert_break_statement(stmt)
-        elif isinstance(stmt, RunaContinueStatement):
+        elif isinstance(stmt, ContinueStatement):
             return self._convert_continue_statement(stmt)
-        elif isinstance(stmt, RunaThrowStatement):
+        elif isinstance(stmt, ThrowStatement):
             return self._convert_throw_statement(stmt)
-        elif isinstance(stmt, RunaTryStatement):
+        elif isinstance(stmt, TryStatement):
             return self._convert_try_statement(stmt)
-        elif isinstance(stmt, RunaBlock):
+        elif isinstance(stmt, Block):
             return self._convert_block(stmt)
         
         return None
     
-    def convert_expression(self, expr: RunaExpression) -> CSharpExpression:
+    def convert_expression(self, expr: Expression) -> CSharpExpression:
         """Convert Runa expression to C# expression."""
-        if isinstance(expr, RunaLiteral):
+        if isinstance(expr, StringLiteral):
             return self._convert_literal(expr)
-        elif isinstance(expr, RunaIdentifier):
+        elif isinstance(expr, Identifier):
             return self._convert_identifier(expr)
-        elif isinstance(expr, RunaBinaryExpression):
+        elif isinstance(expr, BinaryExpression):
             return self._convert_binary_expression(expr)
-        elif isinstance(expr, RunaUnaryExpression):
+        elif isinstance(expr, UnaryExpression):
             return self._convert_unary_expression(expr)
-        elif isinstance(expr, RunaMethodCall):
+        elif isinstance(expr, FunctionCall):
             return self._convert_method_call(expr)
-        elif isinstance(expr, RunaMemberAccess):
+        elif isinstance(expr, MemberAccess):
             return self._convert_member_access(expr)
-        elif isinstance(expr, RunaArrayAccess):
+        elif isinstance(expr, ListLiteralAccess):
             return self._convert_array_access(expr)
-        elif isinstance(expr, RunaAssignmentExpression):
+        elif isinstance(expr, SetStatementExpression):
             return self._convert_assignment_expression(expr)
-        elif isinstance(expr, RunaConditionalExpression):
+        elif isinstance(expr, ConditionalExpression):
             return self._convert_conditional_expression(expr)
-        elif isinstance(expr, RunaCastExpression):
+        elif isinstance(expr, CastExpression):
             return self._convert_cast_expression(expr)
-        elif isinstance(expr, RunaInstanceofExpression):
+        elif isinstance(expr, InstanceofExpression):
             return self._convert_instanceof_expression(expr)
-        elif isinstance(expr, RunaThisExpression):
+        elif isinstance(expr, ThisExpression):
             return self._convert_this_expression(expr)
-        elif isinstance(expr, RunaSuperExpression):
+        elif isinstance(expr, SuperExpression):
             return self._convert_super_expression(expr)
-        elif isinstance(expr, RunaNewExpression):
+        elif isinstance(expr, NewExpression):
             return self._convert_new_expression(expr)
-        elif isinstance(expr, RunaArrayCreation):
+        elif isinstance(expr, ListLiteralCreation):
             return self._convert_array_creation(expr)
-        elif isinstance(expr, RunaLambdaExpression):
-            return self._convert_lambda_expression(expr)
-        elif isinstance(expr, RunaAwaitExpression):
+        # ProcessDefinitionExpression removed - use ProcessDefinition for lambdas instead
+        elif isinstance(expr, AwaitExpression):
             return self._convert_await_expression(expr)
-        elif isinstance(expr, RunaTupleExpression):
+        elif isinstance(expr, TupleExpression):
             return self._convert_tuple_expression(expr)
-        elif isinstance(expr, RunaInterpolatedString):
+        elif isinstance(expr, InterpolatedStringExpression):
             return self._convert_interpolated_string(expr)
         
         # Fallback
         return CSharpIdentifier(CSharpNodeType.IDENTIFIER, name="unknown")
     
-    def _convert_function_definition(self, func_def: RunaFunctionDefinition) -> CSharpMethodDeclaration:
+    def _convert_function_definition(self, func_def: ProcessDefinition) -> CSharpMethodDeclaration:
         """Convert Runa function definition to C# method declaration."""
         # Convert parameters
         parameters = []
@@ -1170,7 +1251,7 @@ class RunaToCSharpConverter:
             body=body
         )
     
-    def _convert_variable_declaration(self, var_decl: RunaVariableDeclaration) -> CSharpFieldDeclaration:
+    def _convert_variable_declaration(self, var_decl: LetStatement) -> CSharpFieldDeclaration:
         """Convert Runa variable declaration to C# field declaration."""
         # Create variable declarator
         declarator = CSharpVariableDeclarator(
@@ -1198,14 +1279,14 @@ class RunaToCSharpConverter:
             declaration=declaration
         )
     
-    def _convert_expression_statement(self, expr_stmt: RunaExpressionStatement) -> CSharpExpressionStatement:
+    def _convert_expression_statement(self, expr_stmt: ExpressionStatement) -> CSharpExpressionStatement:
         """Convert Runa expression statement to C# expression statement."""
         return CSharpExpressionStatement(
             CSharpNodeType.EXPRESSION_STATEMENT,
             expression=self.convert_expression(expr_stmt.expression)
         )
     
-    def _convert_if_statement(self, if_stmt: RunaIfStatement) -> CSharpIfStatement:
+    def _convert_if_statement(self, if_stmt: IfStatement) -> CSharpIfStatement:
         """Convert Runa if statement to C# if statement."""
         condition = self.convert_expression(if_stmt.condition)
         then_stmt = self.convert_statement(if_stmt.then_statement)
@@ -1221,7 +1302,7 @@ class RunaToCSharpConverter:
             else_statement=else_stmt
         )
     
-    def _convert_while_statement(self, while_stmt: RunaWhileStatement) -> CSharpWhileStatement:
+    def _convert_while_statement(self, while_stmt: WhileLoop) -> CSharpWhileStatement:
         """Convert Runa while statement to C# while statement."""
         condition = self.convert_expression(while_stmt.condition)
         body = self.convert_statement(while_stmt.body)
@@ -1232,7 +1313,7 @@ class RunaToCSharpConverter:
             statement=body
         )
     
-    def _convert_foreach_statement(self, foreach_stmt: RunaForEachStatement) -> CSharpForEachStatement:
+    def _convert_foreach_statement(self, foreach_stmt: ForEachLoop) -> CSharpForEachStatement:
         """Convert Runa foreach statement to C# foreach statement."""
         collection = self.convert_expression(foreach_stmt.collection)
         body = self.convert_statement(foreach_stmt.body)
@@ -1245,7 +1326,7 @@ class RunaToCSharpConverter:
             statement=body
         )
     
-    def _convert_do_while_statement(self, do_while_stmt: RunaDoWhileStatement) -> CSharpDoStatement:
+    def _convert_do_while_statement(self, do_while_stmt: DoWhileLoop) -> CSharpDoStatement:
         """Convert Runa do-while statement to C# do statement."""
         body = self.convert_statement(do_while_stmt.body)
         condition = self.convert_expression(do_while_stmt.condition)
@@ -1256,7 +1337,7 @@ class RunaToCSharpConverter:
             condition=condition
         )
     
-    def _convert_switch_statement(self, switch_stmt: RunaSwitchStatement) -> CSharpSwitchStatement:
+    def _convert_switch_statement(self, switch_stmt: SwitchStatement) -> CSharpSwitchStatement:
         """Convert Runa switch statement to C# switch statement."""
         expression = self.convert_expression(switch_stmt.expression)
         
@@ -1264,7 +1345,7 @@ class RunaToCSharpConverter:
         for case in switch_stmt.cases:
             labels = []
             for label in case.labels:
-                if isinstance(label, RunaLiteral) and label.value == "default":
+                if isinstance(label, StringLiteral) and label.value == "default":
                     labels.append(CSharpDefaultSwitchLabel(CSharpNodeType.DEFAULT_SWITCH_LABEL))
                 else:
                     labels.append(CSharpCaseSwitchLabel(
@@ -1290,7 +1371,7 @@ class RunaToCSharpConverter:
             sections=sections
         )
     
-    def _convert_return_statement(self, return_stmt: RunaReturnStatement) -> CSharpReturnStatement:
+    def _convert_return_statement(self, return_stmt: ReturnStatement) -> CSharpReturnStatement:
         """Convert Runa return statement to C# return statement."""
         expression = None
         if return_stmt.value:
@@ -1301,15 +1382,15 @@ class RunaToCSharpConverter:
             expression=expression
         )
     
-    def _convert_break_statement(self, break_stmt: RunaBreakStatement) -> CSharpBreakStatement:
+    def _convert_break_statement(self, break_stmt: BreakStatement) -> CSharpBreakStatement:
         """Convert Runa break statement to C# break statement."""
         return CSharpBreakStatement(CSharpNodeType.BREAK_STATEMENT)
     
-    def _convert_continue_statement(self, continue_stmt: RunaContinueStatement) -> CSharpContinueStatement:
+    def _convert_continue_statement(self, continue_stmt: ContinueStatement) -> CSharpContinueStatement:
         """Convert Runa continue statement to C# continue statement."""
         return CSharpContinueStatement(CSharpNodeType.CONTINUE_STATEMENT)
     
-    def _convert_throw_statement(self, throw_stmt: RunaThrowStatement) -> CSharpThrowStatement:
+    def _convert_throw_statement(self, throw_stmt: ThrowStatement) -> CSharpThrowStatement:
         """Convert Runa throw statement to C# throw statement."""
         expression = None
         if throw_stmt.expression:
@@ -1320,7 +1401,7 @@ class RunaToCSharpConverter:
             expression=expression
         )
     
-    def _convert_try_statement(self, try_stmt: RunaTryStatement) -> CSharpTryStatement:
+    def _convert_try_statement(self, try_stmt: TryStatement) -> CSharpTryStatement:
         """Convert Runa try statement to C# try statement."""
         try_block = self.convert_statement(try_stmt.try_block)
         
@@ -1354,7 +1435,7 @@ class RunaToCSharpConverter:
             finally_block=finally_block
         )
     
-    def _convert_block(self, block: RunaBlock) -> CSharpBlock:
+    def _convert_block(self, block: Block) -> CSharpBlock:
         """Convert Runa block to C# block."""
         statements = []
         
@@ -1368,7 +1449,7 @@ class RunaToCSharpConverter:
             statements=statements
         )
     
-    def _convert_literal(self, literal: RunaLiteral) -> CSharpLiteral:
+    def _convert_literal(self, literal: StringLiteral) -> CSharpLiteral:
         """Convert Runa literal to C# literal."""
         return CSharpLiteral(
             CSharpNodeType.LITERAL,
@@ -1376,14 +1457,14 @@ class RunaToCSharpConverter:
             literal_type=literal.literal_type
         )
     
-    def _convert_identifier(self, identifier: RunaIdentifier) -> CSharpIdentifier:
+    def _convert_identifier(self, identifier: Identifier) -> CSharpIdentifier:
         """Convert Runa identifier to C# identifier."""
         return CSharpIdentifier(
             CSharpNodeType.IDENTIFIER,
             name=identifier.name
         )
     
-    def _convert_binary_expression(self, binary_expr: RunaBinaryExpression) -> CSharpBinaryExpression:
+    def _convert_binary_expression(self, binary_expr: BinaryExpression) -> CSharpBinaryExpression:
         """Convert Runa binary expression to C# binary expression."""
         left = self.convert_expression(binary_expr.left)
         right = self.convert_expression(binary_expr.right)
@@ -1396,7 +1477,7 @@ class RunaToCSharpConverter:
             right=right
         )
     
-    def _convert_unary_expression(self, unary_expr: RunaUnaryExpression) -> CSharpUnaryExpression:
+    def _convert_unary_expression(self, unary_expr: UnaryExpression) -> CSharpUnaryExpression:
         """Convert Runa unary expression to C# unary expression."""
         operand = self.convert_expression(unary_expr.operand)
         operator = self._convert_operator(unary_expr.operator)
@@ -1407,7 +1488,7 @@ class RunaToCSharpConverter:
             operand=operand
         )
     
-    def _convert_method_call(self, method_call: RunaMethodCall) -> CSharpInvocationExpression:
+    def _convert_method_call(self, method_call: FunctionCall) -> CSharpInvocationExpression:
         """Convert Runa method call to C# invocation expression."""
         function = self.convert_expression(method_call.function)
         
@@ -1421,7 +1502,7 @@ class RunaToCSharpConverter:
             arguments=arguments
         )
     
-    def _convert_member_access(self, member_access: RunaMemberAccess) -> CSharpMemberAccessExpression:
+    def _convert_member_access(self, member_access: MemberAccess) -> CSharpMemberAccessExpression:
         """Convert Runa member access to C# member access expression."""
         object_expr = self.convert_expression(member_access.object)
         
@@ -1431,18 +1512,18 @@ class RunaToCSharpConverter:
             name=member_access.member
         )
     
-    def _convert_array_access(self, array_access: RunaArrayAccess) -> CSharpElementAccessExpression:
+    def _convert_array_access(self, array_access: ListLiteralAccess) -> CSharpIndexerAccessExpression:
         """Convert Runa array access to C# element access expression."""
         array = self.convert_expression(array_access.array)
         index = self.convert_expression(array_access.index)
         
-        return CSharpElementAccessExpression(
+        return CSharpIndexerAccessExpression(
             CSharpNodeType.ELEMENT_ACCESS_EXPRESSION,
             expression=array,
             arguments=[index]
         )
     
-    def _convert_assignment_expression(self, assign_expr: RunaAssignmentExpression) -> CSharpAssignmentExpression:
+    def _convert_assignment_expression(self, assign_expr: SetStatementExpression) -> CSharpAssignmentExpression:
         """Convert Runa assignment expression to C# assignment expression."""
         left = self.convert_expression(assign_expr.left)
         right = self.convert_expression(assign_expr.right)
@@ -1455,7 +1536,7 @@ class RunaToCSharpConverter:
             right=right
         )
     
-    def _convert_conditional_expression(self, cond_expr: RunaConditionalExpression) -> CSharpConditionalExpression:
+    def _convert_conditional_expression(self, cond_expr: ConditionalExpression) -> CSharpConditionalExpression:
         """Convert Runa conditional expression to C# conditional expression."""
         condition = self.convert_expression(cond_expr.condition)
         when_true = self.convert_expression(cond_expr.when_true)
@@ -1468,7 +1549,7 @@ class RunaToCSharpConverter:
             when_false=when_false
         )
     
-    def _convert_cast_expression(self, cast_expr: RunaCastExpression) -> CSharpCastExpression:
+    def _convert_cast_expression(self, cast_expr: CastExpression) -> CSharpCastExpression:
         """Convert Runa cast expression to C# cast expression."""
         expression = self.convert_expression(cast_expr.expression)
         target_type = self._convert_type(cast_expr.target_type)
@@ -1479,7 +1560,7 @@ class RunaToCSharpConverter:
             expression=expression
         )
     
-    def _convert_instanceof_expression(self, instanceof_expr: RunaInstanceofExpression) -> CSharpIsExpression:
+    def _convert_instanceof_expression(self, instanceof_expr: InstanceofExpression) -> CSharpIsExpression:
         """Convert Runa instanceof expression to C# is expression."""
         expression = self.convert_expression(instanceof_expr.expression)
         target_type = self._convert_type(instanceof_expr.type)
@@ -1490,17 +1571,17 @@ class RunaToCSharpConverter:
             type_or_pattern=target_type
         )
     
-    def _convert_this_expression(self, this_expr: RunaThisExpression) -> CSharpThisExpression:
+    def _convert_this_expression(self, this_expr: ThisExpression) -> CSharpThisExpression:
         """Convert Runa this expression to C# this expression."""
         return CSharpThisExpression(CSharpNodeType.THIS_EXPRESSION)
     
-    def _convert_super_expression(self, super_expr: RunaSuperExpression) -> CSharpBaseExpression:
+    def _convert_super_expression(self, super_expr: SuperExpression) -> CSharpBaseExpression:
         """Convert Runa super expression to C# base expression."""
         return CSharpBaseExpression(CSharpNodeType.BASE_EXPRESSION)
     
-    def _convert_new_expression(self, new_expr: RunaNewExpression) -> CSharpObjectCreationExpression:
+    def _convert_new_expression(self, new_expr: NewExpression) -> CSharpObjectCreationExpression:
         """Convert Runa new expression to C# object creation expression."""
-        obj_type = self._convert_type(new_expr.type)
+        obj_type = self._convert_type(new_expr.type_expression)
         
         arguments = []
         for arg in new_expr.arguments:
@@ -1512,7 +1593,7 @@ class RunaToCSharpConverter:
             arguments=arguments
         )
     
-    def _convert_array_creation(self, array_creation: RunaArrayCreation) -> CSharpArrayCreationExpression:
+    def _convert_array_creation(self, array_creation: ListLiteralCreation) -> CSharpArrayCreationExpression:
         """Convert Runa array creation to C# array creation expression."""
         element_type = self._convert_type(array_creation.element_type)
         
@@ -1541,7 +1622,7 @@ class RunaToCSharpConverter:
             rank_specifiers=rank_specifiers
         )
     
-    def _convert_lambda_expression(self, lambda_expr: RunaLambdaExpression) -> CSharpLambdaExpression:
+    def _convert_lambda_expression(self, lambda_expr: ProcessDefinition) -> CSharpLambdaExpression:
         """Convert Runa lambda expression to C# lambda expression."""
         parameters = []
         for param_name in lambda_expr.parameters:
@@ -1554,7 +1635,7 @@ class RunaToCSharpConverter:
             ))
         
         body = None
-        if isinstance(lambda_expr.body, RunaExpression):
+        if isinstance(lambda_expr.body, Expression):
             body = self.convert_expression(lambda_expr.body)
         else:
             body = self.convert_statement(lambda_expr.body)
@@ -1565,7 +1646,7 @@ class RunaToCSharpConverter:
             body=body
         )
     
-    def _convert_await_expression(self, await_expr: RunaAwaitExpression) -> CSharpAwaitExpression:
+    def _convert_await_expression(self, await_expr: AwaitExpression) -> CSharpAwaitExpression:
         """Convert Runa await expression to C# await expression."""
         expression = self.convert_expression(await_expr.expression)
         
@@ -1574,7 +1655,7 @@ class RunaToCSharpConverter:
             expression=expression
         )
     
-    def _convert_tuple_expression(self, tuple_expr: RunaTupleExpression) -> CSharpTupleExpression:
+    def _convert_tuple_expression(self, tuple_expr: TupleExpression) -> CSharpTupleExpression:
         """Convert Runa tuple expression to C# tuple expression."""
         arguments = []
         for element in tuple_expr.elements:
@@ -1588,7 +1669,7 @@ class RunaToCSharpConverter:
             arguments=arguments
         )
     
-    def _convert_interpolated_string(self, interp_str: RunaInterpolatedString) -> CSharpInterpolatedStringExpression:
+    def _convert_interpolated_string(self, interp_str: InterpolatedStringExpression) -> CSharpInterpolatedStringExpression:
         """Convert Runa interpolated string to C# interpolated string expression."""
         parts = []
         for part in interp_str.parts:

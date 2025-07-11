@@ -4,7 +4,7 @@ Java Language Support for Runa Universal Translation System
 
 This package provides comprehensive Java language support including:
 - Modern Java parsing (Java 8 through Java 21)
-- Bidirectional Java ” Runa AST conversion
+- Bidirectional Java â†” Runa AST conversion
 - Clean Java code generation with multiple style options
 - Round-trip translation verification
 - Generics and type system support
@@ -27,7 +27,7 @@ from .java_toolchain import (
 
 # Package metadata
 __version__ = "1.0.0"
-__author__ = "Runa Universal Translation System"
+__author__ = "Sybertnetics AI Solutions"
 __description__ = "Complete Java language toolchain for universal code translation"
 
 # Main toolchain instance
@@ -50,4 +50,13 @@ __all__ = [
     # Convenience functions
     "parse_java_code", "generate_java_code", "java_round_trip_verify",
     "java_to_runa_translate", "runa_to_java_translate",
+    
+    # AST base classes (main ones)
+    "JavaNode", "JavaExpression", "JavaStatement", "JavaDeclaration", "JavaType",
 ]
+
+# Module metadata
+__language__ = "java"
+__tier__ = 1
+__file_extensions__ = [".java"]
+__mime_types__ = ["text/x-java"]

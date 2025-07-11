@@ -23,29 +23,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import logging
 
-from .sql_ast import (
-    SQLNode, SQLProgram, SQLStatement, SQLExpression, SQLClause,
-    SQLSelectStatement, SQLInsertStatement, SQLUpdateStatement, SQLDeleteStatement,
-    SQLCreateTableStatement, SQLDropTableStatement, SQLAlterTableStatement,
-    SQLBinaryExpression, SQLUnaryExpression, SQLFunctionCall, SQLCaseExpression,
-    SQLCastExpression, SQLSubquery, SQLColumnReference, SQLIdentifier,
-    SQLQualifiedIdentifier, SQLLiteral, SQLIntegerLiteral, SQLFloatLiteral,
-    SQLStringLiteral, SQLBooleanLiteral, SQLNullLiteral, SQLDateLiteral,
-    SQLTimeLiteral, SQLTimestampLiteral, SQLIntervalLiteral,
-    SQLDataType, SQLIntegerType, SQLVarcharType, SQLDecimalType, SQLArrayType,
-    SQLFromClause, SQLWhereClause, SQLGroupByClause, SQLHavingClause,
-    SQLOrderByClause, SQLOrderByExpression, SQLLimitClause, SQLOffsetClause,
-    SQLWithClause, SQLCommonTableExpression, SQLTableReference, SQLTableName,
-    SQLJoin, SQLDerivedTable, SQLColumnDefinition, SQLConstraint,
-    SQLPrimaryKeyConstraint, SQLForeignKeyConstraint, SQLUniqueConstraint,
-    SQLCheckConstraint, SQLDefaultConstraint, SQLInExpression, SQLBetweenExpression,
-    SQLLikeExpression, SQLExistsExpression, SQLWindowSpecification,
-    SQLSetOperation, SQLAlterTableAction, SQLAddColumnAction, SQLDropColumnAction,
-    SQLAlterColumnAction, SQLAddConstraintAction, SQLDropConstraintAction,
-    SQLJSONExtractExpression, SQLJSONObjectExpression, SQLJSONArrayExpression,
-    SQLArrayConstructor, SQLArrayElement, SQLOperator, SQLDialect, JoinType,
-    ConstraintType, WindowFrameType, WindowFrameBound
-)
+from .sql_ast import *
 
 
 class SQLTokenType(Enum):

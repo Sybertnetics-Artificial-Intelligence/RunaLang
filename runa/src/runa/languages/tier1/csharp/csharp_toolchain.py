@@ -18,22 +18,9 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ..base_toolchain import BaseLanguageToolchain, TranslationResult, LanguageFeature
-from .csharp_ast import (
-    CSharpNode, CSharpProgram, CSharpNamespace, CSharpClass, CSharpMethod,
-    CSharpProperty, CSharpField, CSharpParameter, CSharpType, CSharpExpression,
-    CSharpStatement, CSharpDeclaration, CSharpModifier, CSharpAccessModifier,
-    CSharpAttribute, CSharpGenericParameter, CSharpConstraint, CSharpLiteral,
-    CSharpIdentifier, CSharpBinaryExpression, CSharpUnaryExpression,
-    CSharpMemberAccess, CSharpMethodCall, CSharpNewExpression, CSharpArrayAccess,
-    CSharpCastExpression, CSharpConditionalExpression, CSharpLambdaExpression,
-    CSharpAnonymousObject, CSharpQueryExpression, CSharpAwaitExpression,
-    CSharpNullableType, CSharpTupleType, CSharpRecordDeclaration,
-    CSharpSwitchExpression, CSharpPatternMatching, CSharpInterpolatedString,
-    CSharpRangeExpression, CSharpIndexExpression, CSharpWithExpression,
-    CSharpTopLevelStatement, CSharpGlobalUsing, CSharpFileScoped,
-    CSharpInitOnlyProperty, CSharpRecordPattern, CSharpListPattern
-)
+from ...shared.base_toolchain import BaseLanguageToolchain, LanguageMetadata, ToolchainResult
+from ....core.translation_result import TranslationResult, TranslationError
+from .csharp_ast import *
 from .csharp_parser import CSharpLexer, CSharpParser
 from .csharp_converter import CSharpToRunaConverter, RunaToCSharpConverter
 from .csharp_generator import CSharpCodeGenerator, CSharpCodeStyle
@@ -193,72 +180,19 @@ class CSharpToolchain(BaseLanguageToolchain):
         if self.enable_caching:
             self.cache_directory.mkdir(parents=True, exist_ok=True)
         
-        # Setup supported features
-        self._setup_supported_features()
+        # Setup supported features (commented out until LanguageFeature is available)
+        # self._setup_supported_features()
         
         self.logger.info(f"C# toolchain initialized with {self.compiler_options.version.value} targeting {self.compiler_options.framework.value}")
 
-    def _setup_supported_features(self) -> None:
-        """Setup the list of supported C# language features."""
-        self.supported_features = {
-            LanguageFeature.CLASSES: True,
-            LanguageFeature.INTERFACES: True,
-            LanguageFeature.INHERITANCE: True,
-            LanguageFeature.POLYMORPHISM: True,
-            LanguageFeature.GENERICS: True,
-            LanguageFeature.LAMBDAS: True,
-            LanguageFeature.CLOSURES: True,
-            LanguageFeature.ASYNC_AWAIT: True,
-            LanguageFeature.PATTERN_MATCHING: True,
-            LanguageFeature.NULLABLE_TYPES: True,
-            LanguageFeature.RECORDS: True,
-            LanguageFeature.TUPLES: True,
-            LanguageFeature.PROPERTIES: True,
-            LanguageFeature.EVENTS: True,
-            LanguageFeature.DELEGATES: True,
-            LanguageFeature.ATTRIBUTES: True,
-            LanguageFeature.REFLECTION: True,
-            LanguageFeature.LINQ: True,
-            LanguageFeature.EXCEPTION_HANDLING: True,
-            LanguageFeature.MEMORY_MANAGEMENT: False,  # Garbage collected
-            LanguageFeature.OPERATOR_OVERLOADING: True,
-            LanguageFeature.INDEXERS: True,
-            LanguageFeature.DESTRUCTORS: True,
-            LanguageFeature.NAMESPACES: True,
-            LanguageFeature.ASSEMBLIES: True,
-            LanguageFeature.UNSAFE_CODE: True,
-            LanguageFeature.PARTIAL_CLASSES: True,
-            LanguageFeature.EXTENSION_METHODS: True,
-            LanguageFeature.ANONYMOUS_TYPES: True,
-            LanguageFeature.DYNAMIC_TYPING: True,
-            LanguageFeature.COVARIANCE_CONTRAVARIANCE: True,
-            LanguageFeature.NULLABLE_REFERENCE_TYPES: True,
-            LanguageFeature.SWITCH_EXPRESSIONS: True,
-            LanguageFeature.USING_DECLARATIONS: True,
-            LanguageFeature.READONLY_MEMBERS: True,
-            LanguageFeature.DEFAULT_INTERFACE_METHODS: True,
-            LanguageFeature.RANGES_INDICES: True,
-            LanguageFeature.NULL_COALESCING_ASSIGNMENT: True,
-            LanguageFeature.STATIC_LOCAL_FUNCTIONS: True,
-            LanguageFeature.INIT_ONLY_PROPERTIES: True,
-            LanguageFeature.RECORD_TYPES: True,
-            LanguageFeature.TOP_LEVEL_STATEMENTS: True,
-            LanguageFeature.GLOBAL_USING_DIRECTIVES: True,
-            LanguageFeature.FILE_SCOPED_NAMESPACES: True,
-            LanguageFeature.GENERIC_ATTRIBUTES: True,
-            LanguageFeature.STATIC_ABSTRACT_INTERFACE_MEMBERS: True,
-            LanguageFeature.REQUIRED_MEMBERS: True,
-            LanguageFeature.UTF8_STRING_LITERALS: True,
-            LanguageFeature.NEWLINES_IN_STRING_INTERPOLATION: True,
-            LanguageFeature.LIST_PATTERNS: True,
-            LanguageFeature.SLICE_PATTERNS: True,
-            LanguageFeature.PRIMARY_CONSTRUCTORS: True,
-            LanguageFeature.COLLECTION_EXPRESSIONS: True,
-            LanguageFeature.INLINE_ARRAYS: True,
-            LanguageFeature.LAMBDA_DEFAULT_PARAMETERS: True,
-            LanguageFeature.ALIAS_ANY_TYPE: True,
-            LanguageFeature.EXPERIMENTAL_ATTRIBUTE: True
-        }
+    # def _setup_supported_features(self) -> None:
+    #     """Setup the list of supported C# language features."""
+    #     # TODO: Uncomment when LanguageFeature enum is available
+    #     self.supported_features = {
+    #         # LanguageFeature.CLASSES: True,
+    #         # LanguageFeature.INTERFACES: True,
+    #         # ... (other features)
+    #     }
 
     def parse_code(self, code: str) -> CSharpNode:
         """
@@ -425,9 +359,13 @@ class CSharpToolchain(BaseLanguageToolchain):
             # Convert to Runa AST
             runa_ast = self.to_runa_converter.convert(csharp_ast)
             
+            # Generate Runa code from AST
+            from ...runa.runa_generator import generate_runa
+            generated_code = generate_runa(runa_ast) if runa_ast else ""
+            
             # Create result
             result = TranslationResult(
-                code="",  # Runa AST doesn't have code representation here
+                code=generated_code,
                 language="Runa",
                 success=True,
                 ast=runa_ast,
@@ -438,7 +376,8 @@ class CSharpToolchain(BaseLanguageToolchain):
                     "source_language": self.language_name,
                     "csharp_version": self.compiler_options.version.value,
                     "ast_node_count": self.metrics.ast_node_count,
-                    "conversion_time": time.time() - start_time
+                    "conversion_time": time.time() - start_time,
+                    "generated_code_length": len(generated_code)
                 }
             )
             
@@ -607,52 +546,583 @@ class CSharpToolchain(BaseLanguageToolchain):
         return count
 
     def _calculate_semantic_similarity(self, code1: str, code2: str) -> float:
-        """Calculate semantic similarity between two code strings."""
-        # Simple similarity based on normalized structure
-        # In a real implementation, this would use more sophisticated analysis
+        """Calculate semantic similarity between two code strings.
         
-        # Remove whitespace and normalize
-        normalized1 = ''.join(code1.split())
-        normalized2 = ''.join(code2.split())
+        Uses multiple analysis techniques:
+        1. AST structural similarity
+        2. Token-based similarity
+        3. Semantic token analysis
+        4. Control flow similarity
+        5. Variable/function name similarity
         
-        if not normalized1 and not normalized2:
-            return 1.0
-        if not normalized1 or not normalized2:
+        Returns a similarity score between 0.0 (completely different) and 1.0 (identical).
+        """
+        try:
+            # Parse both code strings into ASTs
+            ast1 = self._parse_code_to_ast(code1)
+            ast2 = self._parse_code_to_ast(code2)
+            
+            if ast1 is None or ast2 is None:
+                return 0.0
+            
+            # Calculate multiple similarity metrics
+            structural_similarity = self._calculate_structural_similarity(ast1, ast2)
+            token_similarity = self._calculate_token_similarity(code1, code2)
+            semantic_similarity = self._calculate_semantic_token_similarity(ast1, ast2)
+            control_flow_similarity = self._calculate_control_flow_similarity(ast1, ast2)
+            naming_similarity = self._calculate_naming_similarity(ast1, ast2)
+            
+            # Weighted combination of all metrics
+            weights = {
+                'structural': 0.35,
+                'token': 0.25,
+                'semantic': 0.20,
+                'control_flow': 0.15,
+                'naming': 0.05
+            }
+            
+            final_similarity = (
+                structural_similarity * weights['structural'] +
+                token_similarity * weights['token'] +
+                semantic_similarity * weights['semantic'] +
+                control_flow_similarity * weights['control_flow'] +
+                naming_similarity * weights['naming']
+            )
+            
+            return min(1.0, max(0.0, final_similarity))
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating semantic similarity: {e}")
+            return 0.0
+    
+    def _calculate_structural_similarity(self, ast1: CSharpNode, ast2: CSharpNode) -> float:
+        """Calculate structural similarity between two ASTs."""
+        try:
+            # Extract structural features
+            features1 = self._extract_structural_features(ast1)
+            features2 = self._extract_structural_features(ast2)
+            
+            # Calculate Jaccard similarity
+            intersection = len(features1.intersection(features2))
+            union = len(features1.union(features2))
+            
+            return intersection / union if union > 0 else 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating structural similarity: {e}")
+            return 0.0
+    
+    def _extract_structural_features(self, ast: CSharpNode) -> set:
+        """Extract structural features from AST."""
+        features = set()
+        
+        def extract_features_recursive(node: CSharpNode):
+            if node is None:
+                return
+            
+            # Add node type
+            features.add(f"type:{type(node).__name__}")
+            
+            # Add structural patterns
+            if isinstance(node, CSharpIfStatement):
+                features.add("pattern:if_statement")
+            elif isinstance(node, CSharpWhileStatement):
+                features.add("pattern:while_loop")
+            elif isinstance(node, CSharpForStatement):
+                features.add("pattern:for_loop")
+            elif isinstance(node, CSharpTryStatement):
+                features.add("pattern:try_catch")
+            elif isinstance(node, CSharpMethodDeclaration):
+                features.add("pattern:method_declaration")
+            elif isinstance(node, CSharpClassDeclaration):
+                features.add("pattern:class_declaration")
+            
+            # Recursively process children
+            for child in node.get_children():
+                extract_features_recursive(child)
+        
+        extract_features_recursive(ast)
+        return features
+    
+    def _calculate_token_similarity(self, code1: str, code2: str) -> float:
+        """Calculate token-based similarity between two code strings."""
+        try:
+            # Tokenize both code strings
+            tokens1 = self._tokenize_code(code1)
+            tokens2 = self._tokenize_code(code2)
+            
+            # Calculate token overlap
+            token_set1 = set(tokens1)
+            token_set2 = set(tokens2)
+            
+            intersection = len(token_set1.intersection(token_set2))
+            union = len(token_set1.union(token_set2))
+            
+            return intersection / union if union > 0 else 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating token similarity: {e}")
+            return 0.0
+    
+    def _tokenize_code(self, code: str) -> List[str]:
+        """Tokenize code into meaningful tokens."""
+        # Simple tokenization - in production, use a proper C# lexer
+        import re
+        
+        # Remove comments and strings for basic tokenization
+        code = re.sub(r'//.*$', '', code, flags=re.MULTILINE)  # Single line comments
+        code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)  # Multi-line comments
+        code = re.sub(r'"[^"]*"', 'STRING', code)  # String literals
+        code = re.sub(r"'[^']*'", 'CHAR', code)  # Char literals
+        
+        # Split into tokens
+        tokens = re.findall(r'\b\w+\b|[^\w\s]', code)
+        return [token.lower() for token in tokens if token.strip()]
+    
+    def _calculate_semantic_token_similarity(self, ast1: CSharpNode, ast2: CSharpNode) -> float:
+        """Calculate similarity based on semantic tokens (keywords, operators, etc.)."""
+        try:
+            semantic_tokens1 = self._extract_semantic_tokens(ast1)
+            semantic_tokens2 = self._extract_semantic_tokens(ast2)
+            
+            # Calculate semantic token similarity
+            intersection = len(semantic_tokens1.intersection(semantic_tokens2))
+            union = len(semantic_tokens1.union(semantic_tokens2))
+            
+            return intersection / union if union > 0 else 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating semantic token similarity: {e}")
+            return 0.0
+    
+    def _extract_semantic_tokens(self, ast: CSharpNode) -> set:
+        """Extract semantic tokens from AST."""
+        tokens = set()
+        
+        def extract_tokens_recursive(node: CSharpNode):
+            if node is None:
+                return
+            
+            # Extract keywords and operators
+            if isinstance(node, CSharpBinaryExpression):
+                tokens.add(f"operator:{node.operator.name if node.operator else 'unknown'}")
+            elif isinstance(node, CSharpUnaryExpression):
+                tokens.add(f"operator:{node.operator.name if node.operator else 'unknown'}")
+            elif isinstance(node, CSharpIfStatement):
+                tokens.add("keyword:if")
+            elif isinstance(node, CSharpWhileStatement):
+                tokens.add("keyword:while")
+            elif isinstance(node, CSharpForStatement):
+                tokens.add("keyword:for")
+            elif isinstance(node, CSharpTryStatement):
+                tokens.add("keyword:try")
+            elif isinstance(node, CSharpReturnStatement):
+                tokens.add("keyword:return")
+            elif isinstance(node, CSharpThrowStatement):
+                tokens.add("keyword:throw")
+            
+            # Recursively process children
+            for child in node.get_children():
+                extract_tokens_recursive(child)
+        
+        extract_tokens_recursive(ast)
+        return tokens
+    
+    def _calculate_control_flow_similarity(self, ast1: CSharpNode, ast2: CSharpNode) -> float:
+        """Calculate control flow similarity between two ASTs."""
+        try:
+            flow1 = self._extract_control_flow(ast1)
+            flow2 = self._extract_control_flow(ast2)
+            
+            # Calculate control flow similarity
+            intersection = len(flow1.intersection(flow2))
+            union = len(flow1.union(flow2))
+            
+            return intersection / union if union > 0 else 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating control flow similarity: {e}")
+            return 0.0
+    
+    def _extract_control_flow(self, ast: CSharpNode) -> set:
+        """Extract control flow patterns from AST."""
+        flow_patterns = set()
+        
+        def extract_flow_recursive(node: CSharpNode):
+            if node is None:
+                return
+            
+            # Extract control flow patterns
+            if isinstance(node, CSharpIfStatement):
+                flow_patterns.add("flow:conditional")
+                if node.else_statement:
+                    flow_patterns.add("flow:if_else")
+            elif isinstance(node, CSharpWhileStatement):
+                flow_patterns.add("flow:loop")
+            elif isinstance(node, CSharpForStatement):
+                flow_patterns.add("flow:for_loop")
+            elif isinstance(node, CSharpForEachStatement):
+                flow_patterns.add("flow:foreach_loop")
+            elif isinstance(node, CSharpSwitchStatement):
+                flow_patterns.add("flow:switch")
+            elif isinstance(node, CSharpTryStatement):
+                flow_patterns.add("flow:exception_handling")
+                if node.catches:
+                    flow_patterns.add("flow:try_catch")
+                if node.finally_block:
+                    flow_patterns.add("flow:try_finally")
+            
+            # Recursively process children
+            for child in node.get_children():
+                extract_flow_recursive(child)
+        
+        extract_flow_recursive(ast)
+        return flow_patterns
+    
+    def _calculate_naming_similarity(self, ast1: CSharpNode, ast2: CSharpNode) -> float:
+        """Calculate similarity based on variable, function, and class names."""
+        try:
+            names1 = self._extract_names(ast1)
+            names2 = self._extract_names(ast2)
+            
+            # Calculate name similarity using string similarity
+            total_similarity = 0.0
+            total_comparisons = 0
+            
+            for name1 in names1:
+                for name2 in names2:
+                    similarity = self._string_similarity(name1, name2)
+                    total_similarity += similarity
+                    total_comparisons += 1
+            
+            return total_similarity / total_comparisons if total_comparisons > 0 else 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating naming similarity: {e}")
+            return 0.0
+    
+    def _extract_names(self, ast: CSharpNode) -> set:
+        """Extract names from AST."""
+        names = set()
+        
+        def extract_names_recursive(node: CSharpNode):
+            if node is None:
+                return
+            
+            # Extract identifiers and names
+            if hasattr(node, 'identifier') and node.identifier:
+                names.add(node.identifier.lower())
+            if hasattr(node, 'name') and node.name:
+                names.add(node.name.lower())
+            
+            # Recursively process children
+            for child in node.get_children():
+                extract_names_recursive(child)
+        
+        extract_names_recursive(ast)
+        return names
+    
+    def _string_similarity(self, str1: str, str2: str) -> float:
+        """Calculate string similarity using Levenshtein distance."""
+        if not str1 or not str2:
             return 0.0
         
-        # Calculate character-level similarity
-        from difflib import SequenceMatcher
-        matcher = SequenceMatcher(None, normalized1, normalized2)
-        return matcher.ratio()
+        # Simple Levenshtein distance implementation
+        len1, len2 = len(str1), len(str2)
+        matrix = [[0] * (len2 + 1) for _ in range(len1 + 1)]
+        
+        for i in range(len1 + 1):
+            matrix[i][0] = i
+        for j in range(len2 + 1):
+            matrix[0][j] = j
+        
+        for i in range(1, len1 + 1):
+            for j in range(1, len2 + 1):
+                if str1[i-1] == str2[j-1]:
+                    matrix[i][j] = matrix[i-1][j-1]
+                else:
+                    matrix[i][j] = min(
+                        matrix[i-1][j] + 1,    # deletion
+                        matrix[i][j-1] + 1,    # insertion
+                        matrix[i-1][j-1] + 1   # substitution
+                    )
+        
+        distance = matrix[len1][len2]
+        max_len = max(len1, len2)
+        return 1.0 - (distance / max_len) if max_len > 0 else 1.0
+    
+    def _parse_code_to_ast(self, code: str) -> Optional[CSharpNode]:
+        """Parse code string to AST."""
+        try:
+            # Use the C# parser to parse the code
+            from .csharp_parser import CSharpParser
+            parser = CSharpParser()
+            return parser.parse(code)
+        except Exception as e:
+            self.logger.error(f"Error parsing code to AST: {e}")
+            return None
 
     def _save_ast_cache(self, code_hash: str, ast: CSharpNode) -> None:
-        """Save AST to persistent cache."""
+        """Save AST to cache with proper serialization and compression."""
         if not self.enable_caching:
             return
-        
+            
         try:
             cache_file = self.cache_directory / f"{code_hash}.json"
-            # In a real implementation, we'd serialize the AST properly
-            # For now, we'll just store a placeholder
-            with open(cache_file, 'w') as f:
-                json.dump({"hash": code_hash, "timestamp": time.time()}, f)
+            
+            # Create cache directory if it doesn't exist
+            self.cache_directory.mkdir(parents=True, exist_ok=True)
+            
+            # Serialize AST to JSON with metadata
+            cache_data = {
+                "hash": code_hash,
+                "timestamp": time.time(),
+                "version": "1.0",
+                "language": "csharp",
+                "ast": self._serialize_ast(ast),
+                "metadata": {
+                    "node_count": self._count_nodes(ast),
+                    "max_depth": self._calculate_max_depth(ast),
+                    "file_size": len(str(ast)) if ast else 0
+                }
+            }
+            
+            # Compress and save with atomic write
+            import gzip
+            import json
+            import tempfile
+            
+            # Write to temporary file first for atomic operation
+            temp_file = cache_file.with_suffix('.tmp')
+            with gzip.open(temp_file, 'wt', encoding='utf-8') as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+            
+            # Atomic move to final location
+            temp_file.replace(cache_file)
+            
+            self.logger.debug(f"AST cache saved: {cache_file} ({len(str(cache_data))} bytes)")
+            
         except Exception as e:
             self.logger.warning(f"Failed to save AST cache: {e}")
-
+            # Clean up any partial files
+            temp_file = cache_file.with_suffix('.tmp')
+            if temp_file.exists():
+                temp_file.unlink(missing_ok=True)
+    
     def _load_ast_cache(self, code_hash: str) -> Optional[CSharpNode]:
-        """Load AST from persistent cache."""
-        if not self.enable_caching:
-            return None
-        
+        """Load AST from cache with proper deserialization and validation."""
         try:
             cache_file = self.cache_directory / f"{code_hash}.json"
-            if cache_file.exists():
-                with open(cache_file, 'r') as f:
-                    cache_data = json.load(f)
-                # In a real implementation, we'd deserialize the AST properly
-                # For now, we'll return None to indicate cache miss
+            
+            if not cache_file.exists():
                 return None
+            
+            # Check file age for cache invalidation
+            file_age = time.time() - cache_file.stat().st_mtime
+            if file_age > self.cache_max_age:
+                self.logger.debug(f"Cache file expired: {cache_file}")
+                cache_file.unlink()
+                return None
+            
+            # Load and decompress cache data
+            import gzip
+            import json
+            
+            with gzip.open(cache_file, 'rt', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            
+            # Validate cache data
+            if not self._validate_cache_data(cache_data):
+                self.logger.warning(f"Invalid cache data: {cache_file}")
+                cache_file.unlink()
+                return None
+            
+            # Deserialize AST
+            ast = self._deserialize_ast(cache_data["ast"])
+            
+            self.logger.debug(f"AST cache loaded: {cache_file}")
+            return ast
+            
         except Exception as e:
             self.logger.warning(f"Failed to load AST cache: {e}")
+            # Clean up corrupted cache file
+            cache_file = self.cache_directory / f"{code_hash}.json"
+            if cache_file.exists():
+                cache_file.unlink(missing_ok=True)
+            return None
+    
+    def _serialize_ast(self, ast: CSharpNode) -> dict:
+        """Serialize AST to JSON-serializable format."""
+        if ast is None:
+            return None
         
-        return None
+        def serialize_node(node: CSharpNode) -> dict:
+            if node is None:
+                return None
+            
+            # Get node type
+            node_type = type(node).__name__
+            
+            # Get node attributes
+            attributes = {}
+            for attr_name, attr_value in node.__dict__.items():
+                if attr_name.startswith('_'):
+                    continue
+                
+                if isinstance(attr_value, (str, int, float, bool, type(None))):
+                    attributes[attr_name] = attr_value
+                elif isinstance(attr_value, list):
+                    attributes[attr_name] = [
+                        serialize_node(item) if isinstance(item, CSharpNode) else item
+                        for item in attr_value
+                    ]
+                elif isinstance(attr_value, CSharpNode):
+                    attributes[attr_name] = serialize_node(attr_value)
+                elif hasattr(attr_value, 'name'):  # Enum values
+                    attributes[attr_name] = attr_value.name
+                else:
+                    attributes[attr_name] = str(attr_value)
+            
+            return {
+                "type": node_type,
+                "attributes": attributes
+            }
+        
+        return serialize_node(ast)
+    
+    def _deserialize_ast(self, ast_data: dict) -> Optional[CSharpNode]:
+        """Deserialize AST from JSON format."""
+        if ast_data is None:
+            return None
+        
+        def deserialize_node(data: dict) -> Optional[CSharpNode]:
+            if data is None:
+                return None
+            
+            # Get node type
+            node_type_name = data.get("type")
+            if not node_type_name:
+                return None
+            
+            # Import and get node class
+            from .csharp_ast import CSharpNode
+            node_class = getattr(self._get_ast_module(), node_type_name, None)
+            if not node_class:
+                self.logger.warning(f"Unknown node type: {node_type_name}")
+                return None
+            
+            # Reconstruct node attributes
+            attributes = data.get("attributes", {})
+            reconstructed_attrs = {}
+            
+            for attr_name, attr_value in attributes.items():
+                if isinstance(attr_value, dict) and "type" in attr_value:
+                    # Nested node
+                    reconstructed_attrs[attr_name] = deserialize_node(attr_value)
+                elif isinstance(attr_value, list):
+                    # List of nodes or values
+                    reconstructed_attrs[attr_name] = [
+                        deserialize_node(item) if isinstance(item, dict) and "type" in item else item
+                        for item in attr_value
+                    ]
+                elif attr_name == "operator" and isinstance(attr_value, str):
+                    # Enum reconstruction
+                    from .csharp_ast import CSharpOperator
+                    reconstructed_attrs[attr_name] = getattr(CSharpOperator, attr_value, None)
+                elif attr_name == "type" and isinstance(attr_value, str):
+                    # NodeType enum reconstruction
+                    from .csharp_ast import CSharpNodeType
+                    reconstructed_attrs[attr_name] = getattr(CSharpNodeType, attr_value, None)
+                else:
+                    reconstructed_attrs[attr_name] = attr_value
+            
+            # Create node instance
+            try:
+                return node_class(**reconstructed_attrs)
+            except Exception as e:
+                self.logger.warning(f"Failed to reconstruct node {node_type_name}: {e}")
+                return None
+        
+        return deserialize_node(ast_data)
+    
+    def _get_ast_module(self):
+        """Get the AST module for dynamic imports."""
+        from . import csharp_ast
+        return csharp_ast
+    
+    def _validate_cache_data(self, cache_data: dict) -> bool:
+        """Validate cache data integrity."""
+        required_fields = ["hash", "timestamp", "version", "language", "ast"]
+        
+        # Check required fields
+        for field in required_fields:
+            if field not in cache_data:
+                return False
+        
+        # Check version compatibility
+        if cache_data["version"] != "1.0":
+            return False
+        
+        # Check language
+        if cache_data["language"] != "csharp":
+            return False
+        
+        # Check timestamp
+        if not isinstance(cache_data["timestamp"], (int, float)):
+            return False
+        
+        return True
+    
+    def _count_nodes(self, ast: CSharpNode) -> int:
+        """Count total number of nodes in AST."""
+        if ast is None:
+            return 0
+        
+        count = 1  # Count current node
+        for child in ast.get_children():
+            count += self._count_nodes(child)
+        
+        return count
+    
+    def _calculate_max_depth(self, ast: CSharpNode) -> int:
+        """Calculate maximum depth of AST."""
+        if ast is None:
+            return 0
+        
+        max_depth = 1
+        for child in ast.get_children():
+            child_depth = self._calculate_max_depth(child)
+            max_depth = max(max_depth, child_depth + 1)
+        
+        return max_depth
+
+
+# Convenience functions for external use
+def parse_csharp_code(code: str) -> CSharpNode:
+    """Parse C# code using the default toolchain."""
+    default_toolchain = CSharpToolchain()
+    return default_toolchain.parse_code(code)
+
+
+def generate_csharp_code(ast: CSharpNode) -> str:
+    """Generate C# code using the default toolchain."""
+    default_toolchain = CSharpToolchain()
+    return default_toolchain.generate_code(ast)
+
+
+def csharp_round_trip_verify(code: str, tolerance: float = 0.95) -> Tuple[bool, Dict[str, Any]]:
+    """Verify round-trip translation using the default toolchain."""
+    default_toolchain = CSharpToolchain()
+    return default_toolchain.verify_round_trip(code, tolerance)
+
+
+def csharp_to_runa_translate(code: str) -> TranslationResult:
+    """Translate C# code to Runa using the default toolchain."""
+    default_toolchain = CSharpToolchain()
+    return default_toolchain.translate_to_runa(code)
+
+
+def runa_to_csharp_translate(runa_ast: Any) -> TranslationResult:
+    """Translate Runa AST to C# using the default toolchain."""
+    default_toolchain = CSharpToolchain()
+    return default_toolchain.translate_from_runa(runa_ast)

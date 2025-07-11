@@ -350,7 +350,7 @@ class PackageRegistryServer:
             1: ["javascript", "typescript", "python", "cpp", "java", "csharp", "sql"],
             2: ["rust", "go", "swift", "kotlin", "php", "webassembly"], 
             3: ["html", "css", "shell", "hcl", "yaml", "json", "xml"],
-            4: ["r", "matlab", "julia", "solidity", "graphql"],
+            4: ["r", "matlab", "julia", "solidity", "graphql", "vyper", "move", "michelson", "scilla", "smartpy", "ligo", "plutus", "pact", "scrypto"],
             5: ["lisp", "haskell", "erlang", "elixir", "llvm_ir", "assembly"],
             6: ["objective_c", "visual_basic", "cobol", "ada", "perl", "fortran"]
         }

@@ -625,7 +625,7 @@ class JavaCodeGenerator:
             parts.extend(modifiers)
         
         # Type
-        parts.append(self._generate_type(field_decl.type))
+        parts.append(self._generate_type(field_decl.variable_type))
         
         # Variable declarators
         declarators = []
@@ -1302,8 +1302,8 @@ class JavaCodeGenerator:
         """Generate expression."""
         if isinstance(expr, JavaLiteral):
             return self._generate_literal(expr)
-        elif isinstance(expr, JavaIdentifier):
-            return expr.name
+        elif isinstance(expr, JavaSimpleName):
+            return expr.identifier
         elif isinstance(expr, JavaQualifiedName):
             return self._generate_qualified_name(expr)
         elif isinstance(expr, JavaBinaryExpression):
@@ -1551,9 +1551,9 @@ class JavaCodeGenerator:
     def _generate_type(self, type_ref: JavaType) -> str:
         """Generate type reference."""
         if isinstance(type_ref, JavaPrimitiveType):
-            return type_ref.name
-        elif isinstance(type_ref, JavaNamedType):
-            return type_ref.name
+            return type_ref.primitive_type
+        elif isinstance(type_ref, JavaSimpleName):
+            return type_ref.identifier
         elif isinstance(type_ref, JavaArrayType):
             element_type = self._generate_type(type_ref.element_type)
             return f"{element_type}[]"
@@ -1874,6 +1874,16 @@ def generate_java(ast: JavaCompilationUnit, style: Optional[JavaCodeStyle] = Non
 
 def format_java_code(code: str, style: Optional[JavaCodeStyle] = None) -> str:
     """Format Java code with given style."""
-    # This would require parsing the code first
-    # Implementation would depend on having a Java parser
-    return code  # Placeholder
+    try:
+        # Import the Java parser
+        from .java_parser import parse_java
+        
+        # Parse the code into AST
+        ast = parse_java(code)
+        
+        # Generate formatted code using the generator with specified style
+        return generate_java(ast, style)
+        
+    except Exception as e:
+        # If parsing fails, return original code with a comment
+        return f"// Warning: Failed to parse and reformat code: {e}\n{code}"

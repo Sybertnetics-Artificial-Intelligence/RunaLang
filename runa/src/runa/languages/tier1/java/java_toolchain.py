@@ -17,12 +17,12 @@ import difflib
 import re
 
 from .java_parser import parse_java
-from .java_converter import java_to_runa, runa_to_java
-from .java_generator import JavaCodeGenerator, JavaCodeStyle, generate_java, JavaFormatter
+from .java_converter import JavaToRunaConverter, RunaToJavaConverter
+from .java_generator import JavaCodeGenerator, JavaCodeStyle
 from .java_ast import JavaNode, JavaCompilationUnit
 from ....core.runa_ast import Program
 from ...shared.base_toolchain import BaseLanguageToolchain, LanguageMetadata, ToolchainResult
-from ...core.translation_result import TranslationResult, TranslationError
+from ....core.translation_result import TranslationResult, TranslationError
 
 
 class JavaToolchain(BaseLanguageToolchain):
@@ -541,7 +541,8 @@ class JavaToolchain(BaseLanguageToolchain):
         start_time = time.time()
         
         try:
-            runa_ast = java_to_runa(language_ast)
+            converter = JavaToRunaConverter()
+            runa_ast = converter.convert(language_ast)
             
             conversion_time_ms = (time.time() - start_time) * 1000
             self._update_conversion_stats(conversion_time_ms, True, "to_runa")
@@ -583,7 +584,8 @@ class JavaToolchain(BaseLanguageToolchain):
         start_time = time.time()
         
         try:
-            java_ast = runa_to_java(runa_ast)
+            converter = RunaToJavaConverter()
+            java_ast = converter.convert(runa_ast)
             
             conversion_time_ms = (time.time() - start_time) * 1000
             self._update_conversion_stats(conversion_time_ms, True, "from_runa")
@@ -628,16 +630,8 @@ class JavaToolchain(BaseLanguageToolchain):
             # Configure generator options
             style_name = options.get("style", "default")
             
-            if style_name == "google":
-                style = JavaFormatter.google_style()
-            elif style_name == "oracle":
-                style = JavaFormatter.oracle_style()
-            elif style_name == "eclipse":
-                style = JavaFormatter.eclipse_style()
-            elif style_name == "intellij":
-                style = JavaFormatter.intellij_style()
-            else:
-                style = JavaCodeStyle()
+            # Use default style for now - formatter styles can be added later
+            style = JavaCodeStyle()
             
             # Override specific style options from parameters
             if "indent_size" in options:
@@ -992,7 +986,8 @@ def parse_java_code(source_code: str) -> JavaCompilationUnit:
 
 def generate_java_code(ast: JavaCompilationUnit, **options) -> str:
     """Generate Java source code from AST."""
-    return generate_java(ast, **options)
+    generator = JavaCodeGenerator()
+    return generator.generate(ast)
 
 
 def java_round_trip_verify(source_code: str, **options) -> bool:

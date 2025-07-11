@@ -384,9 +384,16 @@ class JSCodeGenerator:
             self._write("(value) ")
             self._visit_node(node.value)
         elif node.kind == JSPropertyKind.METHOD:
-            self._write("(")
-            # Would need parameters from function
-            self._write(") ")
+            # Print method parameters from the function node
+            if hasattr(node.value, 'params'):
+                self._write("(")
+                for i, param in enumerate(getattr(node.value, 'params', [])):
+                    if i > 0:
+                        self._write(", ")
+                    self._visit_node(param)
+                self._write(") ")
+            else:
+                self._write("() ")
             self._visit_node(node.value)
     
     def _visit_function_expression(self, node: JSFunctionExpression):
@@ -825,7 +832,12 @@ def generate_javascript(ast: JSNode, minify: bool = False, style: str = "standar
 
 
 def format_javascript(code: str, style: str = "standard") -> str:
-    """Format JavaScript code."""
-    # This would require parsing the code first
-    # For now, return the code as-is
-    return code
+    """Format JavaScript code using the internal parser and formatter."""
+    from .js_parser import parse_javascript
+    try:
+        ast = parse_javascript(code)
+        formatter = JSFormatter(style)
+        return formatter.format(ast)
+    except Exception as e:
+        # If parsing fails, return the code as-is
+        return code

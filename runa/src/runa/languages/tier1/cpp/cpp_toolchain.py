@@ -22,7 +22,7 @@ from .cpp_generator import CppCodeGenerator, CppCodeStyle, generate_cpp
 from .cpp_ast import CppNode, CppTranslationUnit
 from ....core.runa_ast import Program
 from ...shared.base_toolchain import BaseLanguageToolchain, LanguageMetadata, ToolchainResult
-from ...core.translation_result import TranslationResult, TranslationError
+from ....core.translation_result import TranslationResult, TranslationError
 
 
 class CppToolchain(BaseLanguageToolchain):

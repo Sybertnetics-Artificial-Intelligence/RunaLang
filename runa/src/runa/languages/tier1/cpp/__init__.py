@@ -4,7 +4,7 @@ C++ Language Support for Runa Universal Translation System
 
 This package provides comprehensive C++ language support including:
 - Modern C++ parsing (C++11 through C++23)
-- Bidirectional C++ ” Runa AST conversion
+- Bidirectional C++ â†” Runa AST conversion
 - Clean C++ code generation with multiple style options
 - Round-trip translation verification
 - Template and generic programming support
@@ -27,7 +27,7 @@ from .cpp_toolchain import (
 
 # Package metadata
 __version__ = "1.0.0"
-__author__ = "Runa Universal Translation System"
+__author__ = "Sybertnetics AI Solutions"
 __description__ = "Complete C++ language toolchain for universal code translation"
 
 # Main toolchain instance
@@ -50,4 +50,13 @@ __all__ = [
     # Convenience functions
     "parse_cpp_code", "generate_cpp_code", "cpp_round_trip_verify",
     "cpp_to_runa_translate", "runa_to_cpp_translate",
+    
+    # AST base classes (main ones)
+    "CppNode", "CppExpression", "CppStatement", "CppDeclaration", "CppType",
 ]
+
+# Module metadata
+__language__ = "cpp"
+__tier__ = 1
+__file_extensions__ = [".cpp", ".cxx", ".cc", ".hpp", ".hxx", ".h"]
+__mime_types__ = ["text/x-c++src", "text/x-c++hdr"]

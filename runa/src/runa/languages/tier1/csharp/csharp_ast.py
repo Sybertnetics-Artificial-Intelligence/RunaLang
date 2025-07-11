@@ -284,9 +284,9 @@ class CSharpOperator(Enum):
 @dataclass
 class CSharpNode(ABC):
     """Base class for all C# AST nodes."""
-    type: CSharpNodeType
-    span: Optional[Dict[str, Any]] = None
-    parent: Optional['CSharpNode'] = None
+    type: Optional[CSharpNodeType] = field(default=None)
+    span: Optional[Dict[str, Any]] = field(default=None)
+    parent: Optional['CSharpNode'] = field(default=None)
     leading_trivia: List[str] = field(default_factory=list)
     trailing_trivia: List[str] = field(default_factory=list)
     
@@ -326,8 +326,9 @@ class CSharpExpression(CSharpNode):
 @dataclass
 class CSharpLiteral(CSharpExpression):
     """C# literal expression."""
-    value: Any
-    literal_type: str  # "int", "string", "bool", etc.
+    value: Any = field(default=None)
+    literal_type: str = field(default="string")  # "int", "string", "bool", etc.
+    type: Optional[CSharpNodeType] = field(default=CSharpNodeType.LITERAL, init=False)
     
     def accept(self, visitor):
         return visitor.visit_literal(self)
@@ -336,7 +337,7 @@ class CSharpLiteral(CSharpExpression):
 @dataclass
 class CSharpIdentifier(CSharpExpression):
     """C# identifier expression."""
-    name: str
+    name: str = ""
     is_verbatim: bool = False  # @identifier
     
     def accept(self, visitor):
@@ -346,8 +347,8 @@ class CSharpIdentifier(CSharpExpression):
 @dataclass
 class CSharpQualifiedName(CSharpExpression):
     """C# qualified name expression."""
-    left: CSharpExpression
-    right: CSharpExpression
+    left: Optional[CSharpExpression] = None
+    right: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_qualified_name(self)
@@ -356,8 +357,8 @@ class CSharpQualifiedName(CSharpExpression):
 @dataclass
 class CSharpGenericName(CSharpExpression):
     """C# generic name expression."""
-    name: str
-    type_arguments: List['CSharpType']
+    name: str = ""
+    type_arguments: List['CSharpType'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_generic_name(self)
@@ -366,9 +367,10 @@ class CSharpGenericName(CSharpExpression):
 @dataclass
 class CSharpBinaryExpression(CSharpExpression):
     """C# binary expression."""
-    left: CSharpExpression
-    operator: CSharpOperator
-    right: CSharpExpression
+    left: Optional[CSharpExpression] = field(default=None)
+    operator: Optional[CSharpOperator] = field(default=CSharpOperator.PLUS)
+    right: Optional[CSharpExpression] = field(default=None)
+    type: Optional[CSharpNodeType] = field(default=CSharpNodeType.BINARY_EXPRESSION, init=False)
     
     def accept(self, visitor):
         return visitor.visit_binary_expression(self)
@@ -377,9 +379,10 @@ class CSharpBinaryExpression(CSharpExpression):
 @dataclass
 class CSharpUnaryExpression(CSharpExpression):
     """C# unary expression."""
-    operator: CSharpOperator
-    operand: CSharpExpression
-    is_prefix: bool = True
+    operator: Optional[CSharpOperator] = field(default=CSharpOperator.LOGICAL_NOT)
+    operand: Optional[CSharpExpression] = field(default=None)
+    is_prefix: bool = field(default=True)
+    type: Optional[CSharpNodeType] = field(default=CSharpNodeType.UNARY_EXPRESSION, init=False)
     
     def accept(self, visitor):
         return visitor.visit_unary_expression(self)
@@ -388,9 +391,9 @@ class CSharpUnaryExpression(CSharpExpression):
 @dataclass
 class CSharpConditionalExpression(CSharpExpression):
     """C# conditional expression (ternary operator)."""
-    condition: CSharpExpression
-    when_true: CSharpExpression
-    when_false: CSharpExpression
+    condition: Optional[CSharpExpression] = None
+    when_true: Optional[CSharpExpression] = None
+    when_false: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_conditional_expression(self)
@@ -399,9 +402,10 @@ class CSharpConditionalExpression(CSharpExpression):
 @dataclass
 class CSharpAssignmentExpression(CSharpExpression):
     """C# assignment expression."""
-    left: CSharpExpression
-    operator: CSharpOperator
-    right: CSharpExpression
+    left: Optional[CSharpExpression] = field(default=None)
+    operator: Optional[CSharpOperator] = field(default=CSharpOperator.ASSIGN)
+    right: Optional[CSharpExpression] = field(default=None)
+    type: Optional[CSharpNodeType] = field(default=CSharpNodeType.ASSIGNMENT_EXPRESSION, init=False)
     
     def accept(self, visitor):
         return visitor.visit_assignment_expression(self)
@@ -410,18 +414,28 @@ class CSharpAssignmentExpression(CSharpExpression):
 @dataclass
 class CSharpInvocationExpression(CSharpExpression):
     """C# method invocation expression."""
-    expression: CSharpExpression
-    arguments: List[CSharpExpression]
+    expression: Optional[CSharpExpression] = None
+    arguments: List[CSharpExpression] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_invocation_expression(self)
 
 
 @dataclass
+class CSharpMethodInvocationExpression(CSharpExpression):
+    """C# method invocation expression."""
+    method_name: str = ""
+    arguments: List[CSharpExpression] = field(default_factory=list)
+    
+    def accept(self, visitor):
+        return visitor.visit_method_invocation_expression(self)
+
+
+@dataclass
 class CSharpMemberAccessExpression(CSharpExpression):
     """C# member access expression."""
-    expression: CSharpExpression
-    name: str
+    expression: Optional[CSharpExpression] = None
+    name: str = ""
     is_conditional: bool = False  # ?. operator
     
     def accept(self, visitor):
@@ -429,21 +443,20 @@ class CSharpMemberAccessExpression(CSharpExpression):
 
 
 @dataclass
-class CSharpElementAccessExpression(CSharpExpression):
-    """C# element access expression (indexer)."""
-    expression: CSharpExpression
-    arguments: List[CSharpExpression]
-    is_conditional: bool = False  # ?[] operator
+class CSharpIndexerAccessExpression(CSharpExpression):
+    """C# indexer access expression."""
+    target: str = ""
+    arguments: List[CSharpExpression] = field(default_factory=list)
     
     def accept(self, visitor):
-        return visitor.visit_element_access_expression(self)
+        return visitor.visit_indexer_access_expression(self)
 
 
 @dataclass
 class CSharpCastExpression(CSharpExpression):
     """C# cast expression."""
-    target_type: 'CSharpType'
-    expression: CSharpExpression
+    target_type: Optional['CSharpType'] = None
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_cast_expression(self)
@@ -452,8 +465,8 @@ class CSharpCastExpression(CSharpExpression):
 @dataclass
 class CSharpIsExpression(CSharpExpression):
     """C# is expression."""
-    expression: CSharpExpression
-    type_or_pattern: Union['CSharpType', 'CSharpPattern']
+    expression: Optional[CSharpExpression] = None
+    type_or_pattern: Optional[Union['CSharpType', 'CSharpPattern']] = None
     
     def accept(self, visitor):
         return visitor.visit_is_expression(self)
@@ -462,8 +475,8 @@ class CSharpIsExpression(CSharpExpression):
 @dataclass
 class CSharpAsExpression(CSharpExpression):
     """C# as expression."""
-    expression: CSharpExpression
-    target_type: 'CSharpType'
+    expression: Optional[CSharpExpression] = None
+    target_type: Optional['CSharpType'] = None
     
     def accept(self, visitor):
         return visitor.visit_as_expression(self)
@@ -488,7 +501,7 @@ class CSharpBaseExpression(CSharpExpression):
 @dataclass
 class CSharpTypeofExpression(CSharpExpression):
     """C# typeof expression."""
-    target_type: 'CSharpType'
+    target_type: Optional['CSharpType'] = None
     
     def accept(self, visitor):
         return visitor.visit_typeof_expression(self)
@@ -497,7 +510,7 @@ class CSharpTypeofExpression(CSharpExpression):
 @dataclass
 class CSharpSizeofExpression(CSharpExpression):
     """C# sizeof expression."""
-    target_type: 'CSharpType'
+    target_type: Optional['CSharpType'] = None
     
     def accept(self, visitor):
         return visitor.visit_sizeof_expression(self)
@@ -506,7 +519,7 @@ class CSharpSizeofExpression(CSharpExpression):
 @dataclass
 class CSharpNameofExpression(CSharpExpression):
     """C# nameof expression (C# 6.0)."""
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_nameof_expression(self)
@@ -524,8 +537,8 @@ class CSharpDefaultExpression(CSharpExpression):
 @dataclass
 class CSharpObjectCreationExpression(CSharpExpression):
     """C# object creation expression."""
-    type: Optional['CSharpType']  # Can be null for anonymous types
-    arguments: List[CSharpExpression]
+    type: Optional['CSharpType'] = None  # Can be null for anonymous types
+    arguments: List[CSharpExpression] = field(default_factory=list)
     initializer: Optional['CSharpInitializerExpression'] = None
     
     def accept(self, visitor):
@@ -533,10 +546,29 @@ class CSharpObjectCreationExpression(CSharpExpression):
 
 
 @dataclass
+class CSharpObjectInitializerExpression(CSharpExpression):
+    """C# object initializer expression."""
+    initializers: List['CSharpInitializerAssignment'] = field(default_factory=list)
+    
+    def accept(self, visitor):
+        return visitor.visit_object_initializer_expression(self)
+
+
+@dataclass
+class CSharpInitializerAssignment(CSharpNode):
+    """C# initializer assignment."""
+    property_name: str = ""
+    value: Optional[CSharpExpression] = None
+    
+    def accept(self, visitor):
+        return visitor.visit_initializer_assignment(self)
+
+
+@dataclass
 class CSharpArrayCreationExpression(CSharpExpression):
     """C# array creation expression."""
-    type: 'CSharpType'
-    rank_specifiers: List[List[CSharpExpression]]  # Dimensions
+    type: Optional['CSharpType'] = None
+    rank_specifiers: List[List[CSharpExpression]] = field(default_factory=list)  # Dimensions
     initializer: Optional['CSharpInitializerExpression'] = None
     
     def accept(self, visitor):
@@ -546,8 +578,8 @@ class CSharpArrayCreationExpression(CSharpExpression):
 @dataclass
 class CSharpImplicitArrayCreationExpression(CSharpExpression):
     """C# implicit array creation expression."""
-    commas: int  # Number of commas (determines dimensions)
-    initializer: 'CSharpInitializerExpression'
+    commas: int = 0  # Number of commas (determines dimensions)
+    initializer: Optional['CSharpInitializerExpression'] = None
     
     def accept(self, visitor):
         return visitor.visit_implicit_array_creation_expression(self)
@@ -556,7 +588,7 @@ class CSharpImplicitArrayCreationExpression(CSharpExpression):
 @dataclass
 class CSharpAnonymousObjectCreationExpression(CSharpExpression):
     """C# anonymous object creation expression."""
-    initializers: List['CSharpAnonymousObjectMemberDeclarator']
+    initializers: List['CSharpAnonymousObjectMemberDeclarator'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_anonymous_object_creation_expression(self)
@@ -565,8 +597,8 @@ class CSharpAnonymousObjectCreationExpression(CSharpExpression):
 @dataclass
 class CSharpAnonymousObjectMemberDeclarator(CSharpNode):
     """C# anonymous object member declarator."""
-    name: Optional[str]  # Can be null for implicit naming
-    expression: CSharpExpression
+    name: Optional[str] = None  # Can be null for implicit naming
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_anonymous_object_member_declarator(self)
@@ -575,7 +607,7 @@ class CSharpAnonymousObjectMemberDeclarator(CSharpNode):
 @dataclass
 class CSharpInitializerExpression(CSharpExpression):
     """C# initializer expression."""
-    expressions: List[CSharpExpression]
+    expressions: List[CSharpExpression] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_initializer_expression(self)
@@ -584,8 +616,8 @@ class CSharpInitializerExpression(CSharpExpression):
 @dataclass
 class CSharpLambdaExpression(CSharpExpression):
     """C# lambda expression."""
-    parameters: List['CSharpParameter']
-    body: Union[CSharpExpression, 'CSharpStatement']
+    parameters: List['CSharpParameter'] = field(default_factory=list)
+    body: Optional[Union[CSharpExpression, 'CSharpStatement']] = None
     is_async: bool = False
     modifiers: List[CSharpModifier] = field(default_factory=list)
     
@@ -596,8 +628,8 @@ class CSharpLambdaExpression(CSharpExpression):
 @dataclass
 class CSharpAnonymousMethodExpression(CSharpExpression):
     """C# anonymous method expression."""
-    parameters: Optional[List['CSharpParameter']]
-    body: 'CSharpStatement'
+    parameters: Optional[List['CSharpParameter']] = None
+    body: Optional['CSharpStatement'] = None
     is_async: bool = False
     
     def accept(self, visitor):
@@ -607,7 +639,7 @@ class CSharpAnonymousMethodExpression(CSharpExpression):
 @dataclass
 class CSharpAwaitExpression(CSharpExpression):
     """C# await expression."""
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_await_expression(self)
@@ -616,7 +648,7 @@ class CSharpAwaitExpression(CSharpExpression):
 @dataclass
 class CSharpTupleExpression(CSharpExpression):
     """C# tuple expression."""
-    arguments: List['CSharpArgument']
+    arguments: List['CSharpArgument'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_tuple_expression(self)
@@ -625,7 +657,7 @@ class CSharpTupleExpression(CSharpExpression):
 @dataclass
 class CSharpThrowExpression(CSharpExpression):
     """C# throw expression."""
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_throw_expression(self)
@@ -634,8 +666,8 @@ class CSharpThrowExpression(CSharpExpression):
 @dataclass
 class CSharpRangeExpression(CSharpExpression):
     """C# range expression (..)."""
-    left: Optional[CSharpExpression]  # Can be null for open range
-    right: Optional[CSharpExpression]  # Can be null for open range
+    left: Optional[CSharpExpression] = None  # Can be null for open range
+    right: Optional[CSharpExpression] = None  # Can be null for open range
     
     def accept(self, visitor):
         return visitor.visit_range_expression(self)
@@ -644,7 +676,7 @@ class CSharpRangeExpression(CSharpExpression):
 @dataclass
 class CSharpIndexExpression(CSharpExpression):
     """C# index expression (^)."""
-    operand: CSharpExpression
+    operand: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_index_expression(self)
@@ -653,8 +685,8 @@ class CSharpIndexExpression(CSharpExpression):
 @dataclass
 class CSharpSwitchExpression(CSharpExpression):
     """C# switch expression."""
-    governing_expression: CSharpExpression
-    arms: List['CSharpSwitchExpressionArm']
+    governing_expression: Optional[CSharpExpression] = None
+    arms: List['CSharpSwitchExpressionArm'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_switch_expression(self)
@@ -663,9 +695,9 @@ class CSharpSwitchExpression(CSharpExpression):
 @dataclass
 class CSharpSwitchExpressionArm(CSharpNode):
     """C# switch expression arm."""
-    pattern: 'CSharpPattern'
-    when_clause: Optional[CSharpExpression]
-    expression: CSharpExpression
+    pattern: Optional['CSharpPattern'] = None
+    when_clause: Optional[CSharpExpression] = None
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_switch_expression_arm(self)
@@ -674,8 +706,8 @@ class CSharpSwitchExpressionArm(CSharpNode):
 @dataclass
 class CSharpWithExpression(CSharpExpression):
     """C# with expression (records)."""
-    expression: CSharpExpression
-    initializer: 'CSharpInitializerExpression'
+    expression: Optional[CSharpExpression] = None
+    initializer: Optional['CSharpInitializerExpression'] = None
     
     def accept(self, visitor):
         return visitor.visit_with_expression(self)
@@ -684,7 +716,7 @@ class CSharpWithExpression(CSharpExpression):
 @dataclass
 class CSharpInterpolatedStringExpression(CSharpExpression):
     """C# interpolated string expression."""
-    parts: List[Union[str, 'CSharpInterpolationExpression']]
+    parts: List[Union[str, 'CSharpInterpolationExpression']] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_interpolated_string_expression(self)
@@ -693,7 +725,7 @@ class CSharpInterpolatedStringExpression(CSharpExpression):
 @dataclass
 class CSharpInterpolationExpression(CSharpNode):
     """C# interpolation expression inside interpolated string."""
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     alignment: Optional[CSharpExpression] = None
     format_string: Optional[str] = None
     
@@ -711,7 +743,7 @@ class CSharpStatement(CSharpNode):
 @dataclass
 class CSharpExpressionStatement(CSharpStatement):
     """C# expression statement."""
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_expression_statement(self)
@@ -720,7 +752,7 @@ class CSharpExpressionStatement(CSharpStatement):
 @dataclass
 class CSharpBlock(CSharpStatement):
     """C# block statement."""
-    statements: List[CSharpStatement]
+    statements: List[CSharpStatement] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_block(self)
@@ -729,8 +761,8 @@ class CSharpBlock(CSharpStatement):
 @dataclass
 class CSharpIfStatement(CSharpStatement):
     """C# if statement."""
-    condition: CSharpExpression
-    statement: CSharpStatement
+    condition: Optional[CSharpExpression] = None
+    statement: Optional[CSharpStatement] = None
     else_statement: Optional[CSharpStatement] = None
     
     def accept(self, visitor):
@@ -740,8 +772,8 @@ class CSharpIfStatement(CSharpStatement):
 @dataclass
 class CSharpWhileStatement(CSharpStatement):
     """C# while statement."""
-    condition: CSharpExpression
-    statement: CSharpStatement
+    condition: Optional[CSharpExpression] = None
+    statement: Optional[CSharpStatement] = None
     
     def accept(self, visitor):
         return visitor.visit_while_statement(self)
@@ -750,11 +782,11 @@ class CSharpWhileStatement(CSharpStatement):
 @dataclass
 class CSharpForStatement(CSharpStatement):
     """C# for statement."""
-    declaration: Optional['CSharpVariableDeclaration']
-    initializers: List[CSharpExpression]
-    condition: Optional[CSharpExpression]
-    incrementors: List[CSharpExpression]
-    statement: CSharpStatement
+    declaration: Optional['CSharpVariableDeclaration'] = None
+    initializers: List[CSharpExpression] = field(default_factory=list)
+    condition: Optional[CSharpExpression] = None
+    incrementors: List[CSharpExpression] = field(default_factory=list)
+    statement: Optional[CSharpStatement] = None
     
     def accept(self, visitor):
         return visitor.visit_for_statement(self)
@@ -763,10 +795,10 @@ class CSharpForStatement(CSharpStatement):
 @dataclass
 class CSharpForEachStatement(CSharpStatement):
     """C# foreach statement."""
-    type: Optional['CSharpType']  # Can be null for var
-    identifier: str
-    expression: CSharpExpression
-    statement: CSharpStatement
+    type: Optional['CSharpType'] = None  # Can be null for var
+    identifier: str = ""
+    expression: Optional[CSharpExpression] = None
+    statement: Optional[CSharpStatement] = None
     await_keyword: bool = False  # C# 8.0
     
     def accept(self, visitor):
@@ -776,8 +808,8 @@ class CSharpForEachStatement(CSharpStatement):
 @dataclass
 class CSharpDoStatement(CSharpStatement):
     """C# do statement."""
-    statement: CSharpStatement
-    condition: CSharpExpression
+    statement: Optional[CSharpStatement] = None
+    condition: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_do_statement(self)
@@ -786,8 +818,8 @@ class CSharpDoStatement(CSharpStatement):
 @dataclass
 class CSharpSwitchStatement(CSharpStatement):
     """C# switch statement."""
-    expression: CSharpExpression
-    sections: List['CSharpSwitchSection']
+    expression: Optional[CSharpExpression] = None
+    sections: List['CSharpSwitchSection'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_switch_statement(self)
@@ -796,8 +828,8 @@ class CSharpSwitchStatement(CSharpStatement):
 @dataclass
 class CSharpSwitchSection(CSharpNode):
     """C# switch section."""
-    labels: List['CSharpSwitchLabel']
-    statements: List[CSharpStatement]
+    labels: List['CSharpSwitchLabel'] = field(default_factory=list)
+    statements: List[CSharpStatement] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_switch_section(self)
@@ -812,7 +844,7 @@ class CSharpSwitchLabel(CSharpNode):
 @dataclass
 class CSharpCaseSwitchLabel(CSharpSwitchLabel):
     """C# case switch label."""
-    value: CSharpExpression
+    value: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_case_switch_label(self)
@@ -829,8 +861,8 @@ class CSharpDefaultSwitchLabel(CSharpSwitchLabel):
 @dataclass
 class CSharpCasePatternSwitchLabel(CSharpSwitchLabel):
     """C# case pattern switch label."""
-    pattern: 'CSharpPattern'
-    when_clause: Optional[CSharpExpression]
+    pattern: Optional['CSharpPattern'] = None
+    when_clause: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_case_pattern_switch_label(self)
@@ -873,8 +905,8 @@ class CSharpThrowStatement(CSharpStatement):
 @dataclass
 class CSharpTryStatement(CSharpStatement):
     """C# try statement."""
-    block: CSharpBlock
-    catches: List['CSharpCatchClause']
+    block: Optional[CSharpBlock] = None
+    catches: List['CSharpCatchClause'] = field(default_factory=list)
     finally_block: Optional[CSharpBlock] = None
     
     def accept(self, visitor):
@@ -884,9 +916,9 @@ class CSharpTryStatement(CSharpStatement):
 @dataclass
 class CSharpCatchClause(CSharpNode):
     """C# catch clause."""
-    declaration: Optional['CSharpCatchDeclaration']
-    filter: Optional['CSharpCatchFilterClause']
-    block: CSharpBlock
+    declaration: Optional['CSharpCatchDeclaration'] = None
+    filter: Optional['CSharpCatchFilterClause'] = None
+    block: Optional[CSharpBlock] = None
     
     def accept(self, visitor):
         return visitor.visit_catch_clause(self)
@@ -895,8 +927,8 @@ class CSharpCatchClause(CSharpNode):
 @dataclass
 class CSharpCatchDeclaration(CSharpNode):
     """C# catch declaration."""
-    type: 'CSharpType'
-    identifier: Optional[str]
+    type: Optional['CSharpType'] = None
+    identifier: Optional[str] = None
     
     def accept(self, visitor):
         return visitor.visit_catch_declaration(self)
@@ -905,7 +937,7 @@ class CSharpCatchDeclaration(CSharpNode):
 @dataclass
 class CSharpCatchFilterClause(CSharpNode):
     """C# catch filter clause."""
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_catch_filter_clause(self)
@@ -914,8 +946,8 @@ class CSharpCatchFilterClause(CSharpNode):
 @dataclass
 class CSharpLockStatement(CSharpStatement):
     """C# lock statement."""
-    expression: CSharpExpression
-    statement: CSharpStatement
+    expression: Optional[CSharpExpression] = None
+    statement: Optional[CSharpStatement] = None
     
     def accept(self, visitor):
         return visitor.visit_lock_statement(self)
@@ -924,9 +956,9 @@ class CSharpLockStatement(CSharpStatement):
 @dataclass
 class CSharpUsingStatement(CSharpStatement):
     """C# using statement."""
-    declaration: Optional['CSharpVariableDeclaration']
-    expression: Optional[CSharpExpression]
-    statement: CSharpStatement
+    declaration: Optional['CSharpVariableDeclaration'] = None
+    expression: Optional[CSharpExpression] = None
+    statement: Optional[CSharpStatement] = None
     await_keyword: bool = False  # C# 8.0
     
     def accept(self, visitor):
@@ -936,7 +968,7 @@ class CSharpUsingStatement(CSharpStatement):
 @dataclass
 class CSharpYieldStatement(CSharpStatement):
     """C# yield statement."""
-    expression: Optional[CSharpExpression]  # null for yield break
+    expression: Optional[CSharpExpression] = None  # null for yield break
     is_break: bool = False
     
     def accept(self, visitor):
@@ -954,8 +986,8 @@ class CSharpEmptyStatement(CSharpStatement):
 @dataclass
 class CSharpLabeledStatement(CSharpStatement):
     """C# labeled statement."""
-    identifier: str
-    statement: CSharpStatement
+    identifier: str = ""
+    statement: Optional[CSharpStatement] = None
     
     def accept(self, visitor):
         return visitor.visit_labeled_statement(self)
@@ -964,7 +996,7 @@ class CSharpLabeledStatement(CSharpStatement):
 @dataclass
 class CSharpGotoStatement(CSharpStatement):
     """C# goto statement."""
-    label: str
+    label: str = ""
     
     def accept(self, visitor):
         return visitor.visit_goto_statement(self)
@@ -973,7 +1005,7 @@ class CSharpGotoStatement(CSharpStatement):
 @dataclass
 class CSharpCheckedStatement(CSharpStatement):
     """C# checked statement."""
-    block: CSharpBlock
+    block: Optional[CSharpBlock] = None
     
     def accept(self, visitor):
         return visitor.visit_checked_statement(self)
@@ -982,7 +1014,7 @@ class CSharpCheckedStatement(CSharpStatement):
 @dataclass
 class CSharpUncheckedStatement(CSharpStatement):
     """C# unchecked statement."""
-    block: CSharpBlock
+    block: Optional[CSharpBlock] = None
     
     def accept(self, visitor):
         return visitor.visit_unchecked_statement(self)
@@ -991,7 +1023,7 @@ class CSharpUncheckedStatement(CSharpStatement):
 @dataclass
 class CSharpUnsafeStatement(CSharpStatement):
     """C# unsafe statement."""
-    block: CSharpBlock
+    block: Optional[CSharpBlock] = None
     
     def accept(self, visitor):
         return visitor.visit_unsafe_statement(self)
@@ -1000,8 +1032,8 @@ class CSharpUnsafeStatement(CSharpStatement):
 @dataclass
 class CSharpFixedStatement(CSharpStatement):
     """C# fixed statement."""
-    declaration: 'CSharpVariableDeclaration'
-    statement: CSharpStatement
+    declaration: Optional['CSharpVariableDeclaration'] = None
+    statement: Optional[CSharpStatement] = None
     
     def accept(self, visitor):
         return visitor.visit_fixed_statement(self)
@@ -1010,7 +1042,7 @@ class CSharpFixedStatement(CSharpStatement):
 @dataclass
 class CSharpLocalDeclarationStatement(CSharpStatement):
     """C# local declaration statement."""
-    declaration: 'CSharpVariableDeclaration'
+    declaration: Optional['CSharpVariableDeclaration'] = None
     await_keyword: bool = False  # C# 8.0
     using_keyword: bool = False  # C# 8.0
     
@@ -1028,10 +1060,10 @@ class CSharpDeclaration(CSharpNode):
 @dataclass
 class CSharpCompilationUnit(CSharpDeclaration):
     """C# compilation unit (file)."""
-    extern_alias_directives: List['CSharpExternAliasDirective']
-    using_directives: List['CSharpUsingDirective']
-    global_attributes: List['CSharpAttributeList']
-    members: List[CSharpDeclaration]
+    extern_alias_directives: List['CSharpExternAliasDirective'] = field(default_factory=list)
+    using_directives: List['CSharpUsingDirective'] = field(default_factory=list)
+    global_attributes: List['CSharpAttributeList'] = field(default_factory=list)
+    members: List[CSharpDeclaration] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_compilation_unit(self)
@@ -1040,10 +1072,10 @@ class CSharpCompilationUnit(CSharpDeclaration):
 @dataclass
 class CSharpNamespaceDeclaration(CSharpDeclaration):
     """C# namespace declaration."""
-    name: CSharpExpression
-    extern_alias_directives: List['CSharpExternAliasDirective']
-    using_directives: List['CSharpUsingDirective']
-    members: List[CSharpDeclaration]
+    name: Optional[CSharpExpression] = None
+    extern_alias_directives: List['CSharpExternAliasDirective'] = field(default_factory=list)
+    using_directives: List['CSharpUsingDirective'] = field(default_factory=list)
+    members: List[CSharpDeclaration] = field(default_factory=list)
     is_file_scoped: bool = False  # C# 10.0
     
     def accept(self, visitor):
@@ -1053,7 +1085,7 @@ class CSharpNamespaceDeclaration(CSharpDeclaration):
 @dataclass
 class CSharpUsingDirective(CSharpDeclaration):
     """C# using directive."""
-    name: CSharpExpression
+    name: Optional[CSharpExpression] = None
     alias: Optional[str] = None
     static_keyword: bool = False  # C# 6.0
     global_keyword: bool = False  # C# 10.0
@@ -1065,7 +1097,7 @@ class CSharpUsingDirective(CSharpDeclaration):
 @dataclass
 class CSharpExternAliasDirective(CSharpDeclaration):
     """C# extern alias directive."""
-    identifier: str
+    identifier: str = ""
     
     def accept(self, visitor):
         return visitor.visit_extern_alias_directive(self)
@@ -1074,9 +1106,9 @@ class CSharpExternAliasDirective(CSharpDeclaration):
 @dataclass
 class CSharpTypeDeclaration(CSharpDeclaration):
     """Base class for C# type declarations."""
-    attributes: List['CSharpAttributeList']
-    modifiers: List[CSharpModifier]
-    identifier: str
+    attributes: List['CSharpAttributeList'] = field(default_factory=list)
+    modifiers: List[CSharpModifier] = field(default_factory=list)
+    identifier: str = ""
     type_parameter_list: Optional['CSharpTypeParameterList'] = None
     constraint_clauses: List['CSharpTypeParameterConstraintClause'] = field(default_factory=list)
     
@@ -1132,8 +1164,8 @@ class CSharpEnumDeclaration(CSharpTypeDeclaration):
 @dataclass
 class CSharpEnumMemberDeclaration(CSharpDeclaration):
     """C# enum member declaration."""
-    attributes: List['CSharpAttributeList']
-    identifier: str
+    attributes: List['CSharpAttributeList'] = field(default_factory=list)
+    identifier: str = ""
     equals_value: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
@@ -1143,7 +1175,7 @@ class CSharpEnumMemberDeclaration(CSharpDeclaration):
 @dataclass
 class CSharpDelegateDeclaration(CSharpTypeDeclaration):
     """C# delegate declaration."""
-    return_type: 'CSharpType'
+    return_type: Optional['CSharpType'] = None
     parameter_list: Optional['CSharpParameterList'] = None
     
     def accept(self, visitor):
@@ -1153,7 +1185,7 @@ class CSharpDelegateDeclaration(CSharpTypeDeclaration):
 @dataclass
 class CSharpRecordDeclaration(CSharpTypeDeclaration):
     """C# record declaration."""
-    class_or_struct_keyword: str  # "class" or "struct"
+    class_or_struct_keyword: str = ""  # "class" or "struct"
     parameter_list: Optional['CSharpParameterList'] = None
     base_list: Optional['CSharpBaseList'] = None
     members: List['CSharpMemberDeclaration'] = field(default_factory=list)
@@ -1165,7 +1197,7 @@ class CSharpRecordDeclaration(CSharpTypeDeclaration):
 @dataclass
 class CSharpBaseList(CSharpNode):
     """C# base list."""
-    types: List['CSharpType']
+    types: List['CSharpType'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_base_list(self)
@@ -1174,14 +1206,14 @@ class CSharpBaseList(CSharpNode):
 @dataclass
 class CSharpMemberDeclaration(CSharpDeclaration):
     """Base class for C# member declarations."""
-    attributes: List['CSharpAttributeList']
-    modifiers: List[CSharpModifier]
+    attributes: List['CSharpAttributeList'] = field(default_factory=list)
+    modifiers: List[CSharpModifier] = field(default_factory=list)
 
 
 @dataclass
 class CSharpFieldDeclaration(CSharpMemberDeclaration):
     """C# field declaration."""
-    declaration: 'CSharpVariableDeclaration'
+    declaration: Optional['CSharpVariableDeclaration'] = None
     
     def accept(self, visitor):
         return visitor.visit_field_declaration(self)
@@ -1190,8 +1222,8 @@ class CSharpFieldDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpMethodDeclaration(CSharpMemberDeclaration):
     """C# method declaration."""
-    return_type: 'CSharpType'
-    identifier: str
+    return_type: Optional['CSharpType'] = None
+    identifier: str = ""
     type_parameter_list: Optional['CSharpTypeParameterList'] = None
     parameter_list: Optional['CSharpParameterList'] = None
     constraint_clauses: List['CSharpTypeParameterConstraintClause'] = field(default_factory=list)
@@ -1206,7 +1238,7 @@ class CSharpMethodDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpConstructorDeclaration(CSharpMemberDeclaration):
     """C# constructor declaration."""
-    identifier: str
+    identifier: str = ""
     parameter_list: Optional['CSharpParameterList'] = None
     initializer: Optional['CSharpConstructorInitializer'] = None
     body: Optional[CSharpBlock] = None
@@ -1220,8 +1252,8 @@ class CSharpConstructorDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpConstructorInitializer(CSharpNode):
     """C# constructor initializer."""
-    this_or_base: str  # "this" or "base"
-    arguments: List[CSharpExpression]
+    this_or_base: str = ""  # "this" or "base"
+    arguments: List[CSharpExpression] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_constructor_initializer(self)
@@ -1230,7 +1262,7 @@ class CSharpConstructorInitializer(CSharpNode):
 @dataclass
 class CSharpDestructorDeclaration(CSharpMemberDeclaration):
     """C# destructor declaration."""
-    identifier: str
+    identifier: str = ""
     parameter_list: Optional['CSharpParameterList'] = None
     body: Optional[CSharpBlock] = None
     expression_body: Optional[CSharpExpression] = None
@@ -1243,8 +1275,8 @@ class CSharpDestructorDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpPropertyDeclaration(CSharpMemberDeclaration):
     """C# property declaration."""
-    type: 'CSharpType'
-    identifier: str
+    type: Optional['CSharpType'] = None
+    identifier: str = ""
     accessor_list: Optional['CSharpAccessorList'] = None
     expression_body: Optional[CSharpExpression] = None
     initializer: Optional['CSharpEqualsValueClause'] = None
@@ -1256,8 +1288,8 @@ class CSharpPropertyDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpIndexerDeclaration(CSharpMemberDeclaration):
     """C# indexer declaration."""
-    type: 'CSharpType'
-    parameter_list: 'CSharpBracketedParameterList'
+    type: Optional['CSharpType'] = None
+    parameter_list: Optional['CSharpBracketedParameterList'] = None
     accessor_list: Optional['CSharpAccessorList'] = None
     expression_body: Optional[CSharpExpression] = None
     
@@ -1268,8 +1300,8 @@ class CSharpIndexerDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpEventDeclaration(CSharpMemberDeclaration):
     """C# event declaration."""
-    type: 'CSharpType'
-    identifier: str
+    type: Optional['CSharpType'] = None
+    identifier: str = ""
     accessor_list: Optional['CSharpAccessorList'] = None
     initializer: Optional['CSharpEqualsValueClause'] = None
     
@@ -1280,7 +1312,7 @@ class CSharpEventDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpEventFieldDeclaration(CSharpMemberDeclaration):
     """C# event field declaration."""
-    declaration: 'CSharpVariableDeclaration'
+    declaration: Optional['CSharpVariableDeclaration'] = None
     
     def accept(self, visitor):
         return visitor.visit_event_field_declaration(self)
@@ -1289,9 +1321,9 @@ class CSharpEventFieldDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpOperatorDeclaration(CSharpMemberDeclaration):
     """C# operator declaration."""
-    return_type: 'CSharpType'
-    operator_token: str
-    parameter_list: 'CSharpParameterList'
+    return_type: Optional['CSharpType'] = None
+    operator_token: str = ""
+    parameter_list: Optional['CSharpParameterList'] = None
     body: Optional[CSharpBlock] = None
     expression_body: Optional[CSharpExpression] = None
     semicolon_token: bool = False
@@ -1303,9 +1335,9 @@ class CSharpOperatorDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpConversionOperatorDeclaration(CSharpMemberDeclaration):
     """C# conversion operator declaration."""
-    implicit_or_explicit: str  # "implicit" or "explicit"
-    type: 'CSharpType'
-    parameter_list: 'CSharpParameterList'
+    implicit_or_explicit: str = ""  # "implicit" or "explicit"
+    type: Optional['CSharpType'] = None
+    parameter_list: Optional['CSharpParameterList'] = None
     body: Optional[CSharpBlock] = None
     expression_body: Optional[CSharpExpression] = None
     semicolon_token: bool = False
@@ -1317,7 +1349,7 @@ class CSharpConversionOperatorDeclaration(CSharpMemberDeclaration):
 @dataclass
 class CSharpAccessorList(CSharpNode):
     """C# accessor list."""
-    accessors: List['CSharpAccessorDeclaration']
+    accessors: List['CSharpAccessorDeclaration'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_accessor_list(self)
@@ -1326,9 +1358,9 @@ class CSharpAccessorList(CSharpNode):
 @dataclass
 class CSharpAccessorDeclaration(CSharpNode):
     """C# accessor declaration."""
-    attributes: List['CSharpAttributeList']
-    modifiers: List[CSharpModifier]
-    keyword: str  # "get", "set", "add", "remove"
+    attributes: List['CSharpAttributeList'] = field(default_factory=list)
+    modifiers: List[CSharpModifier] = field(default_factory=list)
+    keyword: str = ""  # "get", "set", "add", "remove"
     body: Optional[CSharpBlock] = None
     expression_body: Optional[CSharpExpression] = None
     semicolon_token: bool = False
@@ -1347,7 +1379,7 @@ class CSharpType(CSharpNode):
 @dataclass
 class CSharpPredefinedType(CSharpType):
     """C# predefined type."""
-    keyword: str  # "int", "string", "bool", etc.
+    keyword: str = ""  # "int", "string", "bool", etc.
     
     def accept(self, visitor):
         return visitor.visit_predefined_type(self)
@@ -1356,7 +1388,7 @@ class CSharpPredefinedType(CSharpType):
 @dataclass
 class CSharpIdentifierName(CSharpType):
     """C# identifier name type."""
-    identifier: str
+    identifier: str = ""
     
     def accept(self, visitor):
         return visitor.visit_identifier_name(self)
@@ -1365,8 +1397,8 @@ class CSharpIdentifierName(CSharpType):
 @dataclass
 class CSharpQualifiedNameType(CSharpType):
     """C# qualified name type."""
-    left: CSharpType
-    right: CSharpType
+    left: Optional[CSharpType] = None
+    right: Optional[CSharpType] = None
     
     def accept(self, visitor):
         return visitor.visit_qualified_name_type(self)
@@ -1375,18 +1407,29 @@ class CSharpQualifiedNameType(CSharpType):
 @dataclass
 class CSharpGenericNameType(CSharpType):
     """C# generic name type."""
-    identifier: str
-    type_argument_list: 'CSharpTypeArgumentList'
+    identifier: str = ""
+    type_argument_list: Optional['CSharpTypeArgumentList'] = None
     
     def accept(self, visitor):
         return visitor.visit_generic_name_type(self)
 
 
 @dataclass
+class CSharpGenericType(CSharpType):
+    """C# generic type."""
+    identifier: str = ""
+    type_arguments: List['CSharpType'] = field(default_factory=list)
+    array_rank: int = 0
+    
+    def accept(self, visitor):
+        return visitor.visit_generic_type(self)
+
+
+@dataclass
 class CSharpArrayType(CSharpType):
     """C# array type."""
-    element_type: CSharpType
-    rank_specifiers: List['CSharpArrayRankSpecifier']
+    element_type: Optional[CSharpType] = None
+    rank_specifiers: List['CSharpArrayRankSpecifier'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_array_type(self)
@@ -1395,7 +1438,7 @@ class CSharpArrayType(CSharpType):
 @dataclass
 class CSharpArrayRankSpecifier(CSharpNode):
     """C# array rank specifier."""
-    sizes: List[Optional[CSharpExpression]]  # None for omitted dimensions
+    sizes: List[Optional[CSharpExpression]] = field(default_factory=list)  # None for omitted dimensions
     
     def accept(self, visitor):
         return visitor.visit_array_rank_specifier(self)
@@ -1404,7 +1447,7 @@ class CSharpArrayRankSpecifier(CSharpNode):
 @dataclass
 class CSharpPointerType(CSharpType):
     """C# pointer type."""
-    element_type: CSharpType
+    element_type: Optional[CSharpType] = None
     
     def accept(self, visitor):
         return visitor.visit_pointer_type(self)
@@ -1413,7 +1456,7 @@ class CSharpPointerType(CSharpType):
 @dataclass
 class CSharpNullableType(CSharpType):
     """C# nullable type."""
-    element_type: CSharpType
+    element_type: Optional[CSharpType] = None
     
     def accept(self, visitor):
         return visitor.visit_nullable_type(self)
@@ -1422,7 +1465,7 @@ class CSharpNullableType(CSharpType):
 @dataclass
 class CSharpTupleType(CSharpType):
     """C# tuple type."""
-    elements: List['CSharpTupleElement']
+    elements: List['CSharpTupleElement'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_tuple_type(self)
@@ -1431,7 +1474,7 @@ class CSharpTupleType(CSharpType):
 @dataclass
 class CSharpTupleElement(CSharpNode):
     """C# tuple element."""
-    type: CSharpType
+    type: Optional[CSharpType] = None
     identifier: Optional[str] = None
     
     def accept(self, visitor):
@@ -1441,8 +1484,8 @@ class CSharpTupleElement(CSharpNode):
 @dataclass
 class CSharpFunctionPointerType(CSharpType):
     """C# function pointer type."""
-    calling_convention: Optional[str]
-    parameter_list: 'CSharpFunctionPointerParameterList'
+    calling_convention: Optional[str] = None
+    parameter_list: Optional['CSharpFunctionPointerParameterList'] = None
     
     def accept(self, visitor):
         return visitor.visit_function_pointer_type(self)
@@ -1451,7 +1494,7 @@ class CSharpFunctionPointerType(CSharpType):
 @dataclass
 class CSharpScopedType(CSharpType):
     """C# scoped type."""
-    type: CSharpType
+    type: Optional[CSharpType] = None
     
     def accept(self, visitor):
         return visitor.visit_scoped_type(self)
@@ -1461,7 +1504,7 @@ class CSharpScopedType(CSharpType):
 @dataclass
 class CSharpParameterList(CSharpNode):
     """C# parameter list."""
-    parameters: List['CSharpParameter']
+    parameters: List['CSharpParameter'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_parameter_list(self)
@@ -1470,7 +1513,7 @@ class CSharpParameterList(CSharpNode):
 @dataclass
 class CSharpBracketedParameterList(CSharpNode):
     """C# bracketed parameter list."""
-    parameters: List['CSharpParameter']
+    parameters: List['CSharpParameter'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_bracketed_parameter_list(self)
@@ -1479,7 +1522,7 @@ class CSharpBracketedParameterList(CSharpNode):
 @dataclass
 class CSharpFunctionPointerParameterList(CSharpNode):
     """C# function pointer parameter list."""
-    parameters: List['CSharpFunctionPointerParameter']
+    parameters: List['CSharpFunctionPointerParameter'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_function_pointer_parameter_list(self)
@@ -1488,10 +1531,10 @@ class CSharpFunctionPointerParameterList(CSharpNode):
 @dataclass
 class CSharpParameter(CSharpNode):
     """C# parameter."""
-    attributes: List['CSharpAttributeList']
-    modifiers: List[CSharpModifier]
-    type: Optional[CSharpType]  # Can be null for implicit typing
-    identifier: str
+    attributes: List['CSharpAttributeList'] = field(default_factory=list)
+    modifiers: List[CSharpModifier] = field(default_factory=list)
+    type: Optional[CSharpType] = None  # Can be null for implicit typing
+    identifier: str = ""
     default_value: Optional['CSharpEqualsValueClause'] = None
     
     def accept(self, visitor):
@@ -1501,9 +1544,9 @@ class CSharpParameter(CSharpNode):
 @dataclass
 class CSharpFunctionPointerParameter(CSharpNode):
     """C# function pointer parameter."""
-    attributes: List['CSharpAttributeList']
-    modifiers: List[CSharpModifier]
-    type: CSharpType
+    attributes: List['CSharpAttributeList'] = field(default_factory=list)
+    modifiers: List[CSharpModifier] = field(default_factory=list)
+    type: Optional[CSharpType] = None
     
     def accept(self, visitor):
         return visitor.visit_function_pointer_parameter(self)
@@ -1514,7 +1557,7 @@ class CSharpArgument(CSharpNode):
     """C# argument."""
     name_colon: Optional[str] = None  # Named argument
     ref_kind_keyword: Optional[str] = None  # "ref", "out", "in"
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_argument(self)
@@ -1523,7 +1566,7 @@ class CSharpArgument(CSharpNode):
 @dataclass
 class CSharpArgumentList(CSharpNode):
     """C# argument list."""
-    arguments: List[CSharpArgument]
+    arguments: List[CSharpArgument] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_argument_list(self)
@@ -1533,7 +1576,7 @@ class CSharpArgumentList(CSharpNode):
 @dataclass
 class CSharpTypeParameterList(CSharpNode):
     """C# type parameter list."""
-    parameters: List['CSharpTypeParameter']
+    parameters: List['CSharpTypeParameter'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_type_parameter_list(self)
@@ -1542,9 +1585,9 @@ class CSharpTypeParameterList(CSharpNode):
 @dataclass
 class CSharpTypeParameter(CSharpNode):
     """C# type parameter."""
-    attributes: List['CSharpAttributeList']
+    attributes: List['CSharpAttributeList'] = field(default_factory=list)
     variance_keyword: Optional[str] = None  # "in", "out"
-    identifier: str
+    identifier: str = ""
     
     def accept(self, visitor):
         return visitor.visit_type_parameter(self)
@@ -1553,7 +1596,7 @@ class CSharpTypeParameter(CSharpNode):
 @dataclass
 class CSharpTypeArgumentList(CSharpNode):
     """C# type argument list."""
-    arguments: List[CSharpType]
+    arguments: List[CSharpType] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_type_argument_list(self)
@@ -1562,8 +1605,8 @@ class CSharpTypeArgumentList(CSharpNode):
 @dataclass
 class CSharpTypeParameterConstraintClause(CSharpNode):
     """C# type parameter constraint clause."""
-    name: str
-    constraints: List['CSharpTypeParameterConstraint']
+    name: str = ""
+    constraints: List['CSharpTypeParameterConstraint'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_type_parameter_constraint_clause(self)
@@ -1578,7 +1621,7 @@ class CSharpTypeParameterConstraint(CSharpNode):
 @dataclass
 class CSharpClassOrStructConstraint(CSharpTypeParameterConstraint):
     """C# class or struct constraint."""
-    class_or_struct_keyword: str  # "class" or "struct"
+    class_or_struct_keyword: str = ""  # "class" or "struct"
     question_token: bool = False  # For nullable class constraint
     
     def accept(self, visitor):
@@ -1588,7 +1631,7 @@ class CSharpClassOrStructConstraint(CSharpTypeParameterConstraint):
 @dataclass
 class CSharpTypeConstraint(CSharpTypeParameterConstraint):
     """C# type constraint."""
-    type: CSharpType
+    type: Optional[CSharpType] = None
     
     def accept(self, visitor):
         return visitor.visit_type_constraint(self)
@@ -1615,7 +1658,7 @@ class CSharpDefaultConstraint(CSharpTypeParameterConstraint):
 class CSharpAttributeList(CSharpNode):
     """C# attribute list."""
     target: Optional[str] = None  # "assembly", "module", "type", etc.
-    attributes: List['CSharpAttribute']
+    attributes: List['CSharpAttribute'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_attribute_list(self)
@@ -1624,7 +1667,7 @@ class CSharpAttributeList(CSharpNode):
 @dataclass
 class CSharpAttribute(CSharpNode):
     """C# attribute."""
-    name: CSharpType
+    name: Optional[CSharpType] = None
     argument_list: Optional['CSharpAttributeArgumentList'] = None
     
     def accept(self, visitor):
@@ -1634,7 +1677,7 @@ class CSharpAttribute(CSharpNode):
 @dataclass
 class CSharpAttributeArgumentList(CSharpNode):
     """C# attribute argument list."""
-    arguments: List['CSharpAttributeArgument']
+    arguments: List['CSharpAttributeArgument'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_attribute_argument_list(self)
@@ -1645,7 +1688,7 @@ class CSharpAttributeArgument(CSharpNode):
     """C# attribute argument."""
     name_equals: Optional[str] = None  # Named argument
     name_colon: Optional[str] = None  # Named argument
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_attribute_argument(self)
@@ -1655,8 +1698,8 @@ class CSharpAttributeArgument(CSharpNode):
 @dataclass
 class CSharpVariableDeclaration(CSharpNode):
     """C# variable declaration."""
-    type: CSharpType
-    variables: List['CSharpVariableDeclarator']
+    type: Optional[CSharpType] = None
+    variables: List['CSharpVariableDeclarator'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_variable_declaration(self)
@@ -1665,7 +1708,7 @@ class CSharpVariableDeclaration(CSharpNode):
 @dataclass
 class CSharpVariableDeclarator(CSharpNode):
     """C# variable declarator."""
-    identifier: str
+    identifier: str = ""
     bracket_list: Optional['CSharpBracketedArgumentList'] = None
     initializer: Optional['CSharpEqualsValueClause'] = None
     
@@ -1676,7 +1719,7 @@ class CSharpVariableDeclarator(CSharpNode):
 @dataclass
 class CSharpEqualsValueClause(CSharpNode):
     """C# equals value clause."""
-    value: CSharpExpression
+    value: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_equals_value_clause(self)
@@ -1685,7 +1728,7 @@ class CSharpEqualsValueClause(CSharpNode):
 @dataclass
 class CSharpBracketedArgumentList(CSharpNode):
     """C# bracketed argument list."""
-    arguments: List[CSharpArgument]
+    arguments: List[CSharpArgument] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_bracketed_argument_list(self)
@@ -1701,7 +1744,7 @@ class CSharpPattern(CSharpNode):
 @dataclass
 class CSharpConstantPattern(CSharpPattern):
     """C# constant pattern."""
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_constant_pattern(self)
@@ -1710,17 +1753,26 @@ class CSharpConstantPattern(CSharpPattern):
 @dataclass
 class CSharpDeclarationPattern(CSharpPattern):
     """C# declaration pattern."""
-    type: CSharpType
-    designation: Optional['CSharpVariableDesignation']
+    type: Optional[CSharpType] = None
+    designation: Optional['CSharpVariableDesignation'] = None
     
     def accept(self, visitor):
         return visitor.visit_declaration_pattern(self)
 
 
 @dataclass
+class CSharpTypePattern(CSharpPattern):
+    """C# type pattern (for is expressions and switch patterns)."""
+    type: Optional[CSharpType] = None
+    
+    def accept(self, visitor):
+        return visitor.visit_type_pattern(self)
+
+
+@dataclass
 class CSharpVarPattern(CSharpPattern):
     """C# var pattern."""
-    designation: 'CSharpVariableDesignation'
+    designation: Optional['CSharpVariableDesignation'] = None
     
     def accept(self, visitor):
         return visitor.visit_var_pattern(self)
@@ -1737,7 +1789,7 @@ class CSharpDiscardPattern(CSharpPattern):
 @dataclass
 class CSharpTuplePattern(CSharpPattern):
     """C# tuple pattern."""
-    subpatterns: List['CSharpSubpattern']
+    subpatterns: List['CSharpSubpattern'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_tuple_pattern(self)
@@ -1746,8 +1798,8 @@ class CSharpTuplePattern(CSharpPattern):
 @dataclass
 class CSharpPositionalPattern(CSharpPattern):
     """C# positional pattern."""
-    type: Optional[CSharpType]
-    subpatterns: List['CSharpSubpattern']
+    type: Optional[CSharpType] = None
+    subpatterns: List['CSharpSubpattern'] = field(default_factory=list)
     designation: Optional['CSharpVariableDesignation'] = None
     
     def accept(self, visitor):
@@ -1757,8 +1809,8 @@ class CSharpPositionalPattern(CSharpPattern):
 @dataclass
 class CSharpPropertyPattern(CSharpPattern):
     """C# property pattern."""
-    type: Optional[CSharpType]
-    subpatterns: List['CSharpSubpattern']
+    type: Optional[CSharpType] = None
+    subpatterns: List['CSharpSubpattern'] = field(default_factory=list)
     designation: Optional['CSharpVariableDesignation'] = None
     
     def accept(self, visitor):
@@ -1768,8 +1820,8 @@ class CSharpPropertyPattern(CSharpPattern):
 @dataclass
 class CSharpRelationalPattern(CSharpPattern):
     """C# relational pattern."""
-    operator: CSharpOperator
-    expression: CSharpExpression
+    operator: Optional[CSharpOperator] = CSharpOperator.GREATER_THAN
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_relational_pattern(self)
@@ -1778,9 +1830,9 @@ class CSharpRelationalPattern(CSharpPattern):
 @dataclass
 class CSharpLogicalPattern(CSharpPattern):
     """C# logical pattern."""
-    operator: CSharpOperator  # "and", "or", "not"
-    left: Optional[CSharpPattern]
-    right: CSharpPattern
+    operator: Optional[CSharpOperator] = CSharpOperator.LOGICAL_AND  # "and", "or", "not"
+    left: Optional[CSharpPattern] = None
+    right: Optional[CSharpPattern] = None
     
     def accept(self, visitor):
         return visitor.visit_logical_pattern(self)
@@ -1789,7 +1841,7 @@ class CSharpLogicalPattern(CSharpPattern):
 @dataclass
 class CSharpListPattern(CSharpPattern):
     """C# list pattern."""
-    patterns: List[CSharpPattern]
+    patterns: List[CSharpPattern] = field(default_factory=list)
     designation: Optional['CSharpVariableDesignation'] = None
     
     def accept(self, visitor):
@@ -1800,7 +1852,7 @@ class CSharpListPattern(CSharpPattern):
 class CSharpSubpattern(CSharpNode):
     """C# subpattern."""
     name_colon: Optional[str] = None
-    pattern: CSharpPattern
+    pattern: Optional[CSharpPattern] = None
     
     def accept(self, visitor):
         return visitor.visit_subpattern(self)
@@ -1815,7 +1867,7 @@ class CSharpVariableDesignation(CSharpNode):
 @dataclass
 class CSharpSingleVariableDesignation(CSharpVariableDesignation):
     """C# single variable designation."""
-    identifier: str
+    identifier: str = ""
     
     def accept(self, visitor):
         return visitor.visit_single_variable_designation(self)
@@ -1832,7 +1884,7 @@ class CSharpDiscardDesignation(CSharpVariableDesignation):
 @dataclass
 class CSharpParenthesizedVariableDesignation(CSharpVariableDesignation):
     """C# parenthesized variable designation."""
-    variables: List[CSharpVariableDesignation]
+    variables: List[CSharpVariableDesignation] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_parenthesized_variable_designation(self)
@@ -1842,8 +1894,8 @@ class CSharpParenthesizedVariableDesignation(CSharpVariableDesignation):
 @dataclass
 class CSharpQueryExpression(CSharpExpression):
     """C# query expression."""
-    from_clause: 'CSharpFromClause'
-    body: 'CSharpQueryBody'
+    from_clause: Optional['CSharpFromClause'] = None
+    body: Optional['CSharpQueryBody'] = None
     
     def accept(self, visitor):
         return visitor.visit_query_expression(self)
@@ -1852,8 +1904,8 @@ class CSharpQueryExpression(CSharpExpression):
 @dataclass
 class CSharpQueryBody(CSharpNode):
     """C# query body."""
-    clauses: List['CSharpQueryClause']
-    select_or_group: Union['CSharpSelectClause', 'CSharpGroupClause']
+    clauses: List['CSharpQueryClause'] = field(default_factory=list)
+    select_or_group: Optional[Union['CSharpSelectClause', 'CSharpGroupClause']] = None
     continuation: Optional['CSharpQueryContinuation'] = None
     
     def accept(self, visitor):
@@ -1869,9 +1921,9 @@ class CSharpQueryClause(CSharpNode):
 @dataclass
 class CSharpFromClause(CSharpQueryClause):
     """C# from clause."""
-    type: Optional[CSharpType]
-    identifier: str
-    expression: CSharpExpression
+    type: Optional[CSharpType] = None
+    identifier: str = ""
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_from_clause(self)
@@ -1880,8 +1932,8 @@ class CSharpFromClause(CSharpQueryClause):
 @dataclass
 class CSharpLetClause(CSharpQueryClause):
     """C# let clause."""
-    identifier: str
-    expression: CSharpExpression
+    identifier: str = ""
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_let_clause(self)
@@ -1890,7 +1942,7 @@ class CSharpLetClause(CSharpQueryClause):
 @dataclass
 class CSharpWhereClause(CSharpQueryClause):
     """C# where clause."""
-    condition: CSharpExpression
+    condition: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_where_clause(self)
@@ -1899,11 +1951,11 @@ class CSharpWhereClause(CSharpQueryClause):
 @dataclass
 class CSharpJoinClause(CSharpQueryClause):
     """C# join clause."""
-    type: Optional[CSharpType]
-    identifier: str
-    in_expression: CSharpExpression
-    left_expression: CSharpExpression
-    right_expression: CSharpExpression
+    type: Optional[CSharpType] = None
+    identifier: str = ""
+    in_expression: Optional[CSharpExpression] = None
+    left_expression: Optional[CSharpExpression] = None
+    right_expression: Optional[CSharpExpression] = None
     into: Optional['CSharpJoinIntoClause'] = None
     
     def accept(self, visitor):
@@ -1913,7 +1965,7 @@ class CSharpJoinClause(CSharpQueryClause):
 @dataclass
 class CSharpJoinIntoClause(CSharpNode):
     """C# join into clause."""
-    identifier: str
+    identifier: str = ""
     
     def accept(self, visitor):
         return visitor.visit_join_into_clause(self)
@@ -1922,7 +1974,7 @@ class CSharpJoinIntoClause(CSharpNode):
 @dataclass
 class CSharpOrderByClause(CSharpQueryClause):
     """C# order by clause."""
-    orderings: List['CSharpOrdering']
+    orderings: List['CSharpOrdering'] = field(default_factory=list)
     
     def accept(self, visitor):
         return visitor.visit_order_by_clause(self)
@@ -1931,7 +1983,7 @@ class CSharpOrderByClause(CSharpQueryClause):
 @dataclass
 class CSharpOrdering(CSharpNode):
     """C# ordering."""
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     ascending_or_descending: Optional[str] = None  # "ascending" or "descending"
     
     def accept(self, visitor):
@@ -1941,7 +1993,7 @@ class CSharpOrdering(CSharpNode):
 @dataclass
 class CSharpSelectClause(CSharpNode):
     """C# select clause."""
-    expression: CSharpExpression
+    expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_select_clause(self)
@@ -1950,8 +2002,8 @@ class CSharpSelectClause(CSharpNode):
 @dataclass
 class CSharpGroupClause(CSharpNode):
     """C# group clause."""
-    group_expression: CSharpExpression
-    by_expression: CSharpExpression
+    group_expression: Optional[CSharpExpression] = None
+    by_expression: Optional[CSharpExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_group_clause(self)
@@ -1960,8 +2012,8 @@ class CSharpGroupClause(CSharpNode):
 @dataclass
 class CSharpQueryContinuation(CSharpNode):
     """C# query continuation."""
-    identifier: str
-    body: CSharpQueryBody
+    identifier: str = ""
+    body: Optional[CSharpQueryBody] = None
     
     def accept(self, visitor):
         return visitor.visit_query_continuation(self)
@@ -1969,22 +2021,492 @@ class CSharpQueryContinuation(CSharpNode):
 
 # Visitor interface
 class CSharpVisitor(ABC):
-    """Base visitor interface for C# AST."""
+    """Abstract visitor for C# AST nodes."""
+    
+    # Expression visitor methods
+    @abstractmethod
+    def visit_literal(self, node: CSharpLiteral): pass
     
     @abstractmethod
-    def visit_literal(self, node: CSharpLiteral):
-        pass
+    def visit_identifier(self, node: CSharpIdentifier): pass
     
     @abstractmethod
-    def visit_identifier(self, node: CSharpIdentifier):
-        pass
+    def visit_qualified_name(self, node: CSharpQualifiedName): pass
     
     @abstractmethod
-    def visit_compilation_unit(self, node: CSharpCompilationUnit):
-        pass
+    def visit_generic_name(self, node: CSharpGenericName): pass
     
-    # Add visit methods for all node types...
-    # (This would be a very long interface with 100+ methods)
+    @abstractmethod
+    def visit_binary_expression(self, node: CSharpBinaryExpression): pass
+    
+    @abstractmethod
+    def visit_unary_expression(self, node: CSharpUnaryExpression): pass
+    
+    @abstractmethod
+    def visit_conditional_expression(self, node: CSharpConditionalExpression): pass
+    
+    @abstractmethod
+    def visit_assignment_expression(self, node: CSharpAssignmentExpression): pass
+    
+    @abstractmethod
+    def visit_invocation_expression(self, node: CSharpInvocationExpression): pass
+    
+    @abstractmethod
+    def visit_member_access_expression(self, node: CSharpMemberAccessExpression): pass
+    
+    @abstractmethod
+    def visit_element_access_expression(self, node: CSharpIndexerAccessExpression): pass
+    
+    @abstractmethod
+    def visit_cast_expression(self, node: CSharpCastExpression): pass
+    
+    @abstractmethod
+    def visit_is_expression(self, node: CSharpIsExpression): pass
+    
+    @abstractmethod
+    def visit_as_expression(self, node: CSharpAsExpression): pass
+    
+    @abstractmethod
+    def visit_this_expression(self, node: CSharpThisExpression): pass
+    
+    @abstractmethod
+    def visit_base_expression(self, node: CSharpBaseExpression): pass
+    
+    @abstractmethod
+    def visit_typeof_expression(self, node: CSharpTypeofExpression): pass
+    
+    @abstractmethod
+    def visit_sizeof_expression(self, node: CSharpSizeofExpression): pass
+    
+    @abstractmethod
+    def visit_nameof_expression(self, node: CSharpNameofExpression): pass
+    
+    @abstractmethod
+    def visit_default_expression(self, node: CSharpDefaultExpression): pass
+    
+    @abstractmethod
+    def visit_object_creation_expression(self, node: CSharpObjectCreationExpression): pass
+    
+    @abstractmethod
+    def visit_array_creation_expression(self, node: CSharpArrayCreationExpression): pass
+    
+    @abstractmethod
+    def visit_implicit_array_creation_expression(self, node: CSharpImplicitArrayCreationExpression): pass
+    
+    @abstractmethod
+    def visit_anonymous_object_creation_expression(self, node: CSharpAnonymousObjectCreationExpression): pass
+    
+    @abstractmethod
+    def visit_anonymous_object_member_declarator(self, node: CSharpAnonymousObjectMemberDeclarator): pass
+    
+    @abstractmethod
+    def visit_initializer_expression(self, node: CSharpInitializerExpression): pass
+    
+    @abstractmethod
+    def visit_lambda_expression(self, node: CSharpLambdaExpression): pass
+    
+    @abstractmethod
+    def visit_anonymous_method_expression(self, node: CSharpAnonymousMethodExpression): pass
+    
+    @abstractmethod
+    def visit_await_expression(self, node: CSharpAwaitExpression): pass
+    
+    @abstractmethod
+    def visit_tuple_expression(self, node: CSharpTupleExpression): pass
+    
+    @abstractmethod
+    def visit_throw_expression(self, node: CSharpThrowExpression): pass
+    
+    @abstractmethod
+    def visit_range_expression(self, node: CSharpRangeExpression): pass
+    
+    @abstractmethod
+    def visit_index_expression(self, node: CSharpIndexExpression): pass
+    
+    @abstractmethod
+    def visit_switch_expression(self, node: CSharpSwitchExpression): pass
+    
+    @abstractmethod
+    def visit_switch_expression_arm(self, node: CSharpSwitchExpressionArm): pass
+    
+    @abstractmethod
+    def visit_with_expression(self, node: CSharpWithExpression): pass
+    
+    @abstractmethod
+    def visit_interpolated_string_expression(self, node: CSharpInterpolatedStringExpression): pass
+    
+    @abstractmethod
+    def visit_interpolation_expression(self, node: CSharpInterpolationExpression): pass
+    
+    # Statement visitor methods
+    @abstractmethod
+    def visit_expression_statement(self, node: CSharpExpressionStatement): pass
+    
+    @abstractmethod
+    def visit_block(self, node: CSharpBlock): pass
+    
+    @abstractmethod
+    def visit_if_statement(self, node: CSharpIfStatement): pass
+    
+    @abstractmethod
+    def visit_while_statement(self, node: CSharpWhileStatement): pass
+    
+    @abstractmethod
+    def visit_for_statement(self, node: CSharpForStatement): pass
+    
+    @abstractmethod
+    def visit_for_each_statement(self, node: CSharpForEachStatement): pass
+    
+    @abstractmethod
+    def visit_do_statement(self, node: CSharpDoStatement): pass
+    
+    @abstractmethod
+    def visit_switch_statement(self, node: CSharpSwitchStatement): pass
+    
+    @abstractmethod
+    def visit_switch_section(self, node: CSharpSwitchSection): pass
+    
+    @abstractmethod
+    def visit_switch_label(self, node: CSharpSwitchLabel): pass
+    
+    @abstractmethod
+    def visit_case_switch_label(self, node: CSharpCaseSwitchLabel): pass
+    
+    @abstractmethod
+    def visit_default_switch_label(self, node: CSharpDefaultSwitchLabel): pass
+    
+    @abstractmethod
+    def visit_case_pattern_switch_label(self, node: CSharpCasePatternSwitchLabel): pass
+    
+    @abstractmethod
+    def visit_break_statement(self, node: CSharpBreakStatement): pass
+    
+    @abstractmethod
+    def visit_continue_statement(self, node: CSharpContinueStatement): pass
+    
+    @abstractmethod
+    def visit_return_statement(self, node: CSharpReturnStatement): pass
+    
+    @abstractmethod
+    def visit_throw_statement(self, node: CSharpThrowStatement): pass
+    
+    @abstractmethod
+    def visit_try_statement(self, node: CSharpTryStatement): pass
+    
+    @abstractmethod
+    def visit_catch_clause(self, node: CSharpCatchClause): pass
+    
+    @abstractmethod
+    def visit_catch_declaration(self, node: CSharpCatchDeclaration): pass
+    
+    @abstractmethod
+    def visit_catch_filter_clause(self, node: CSharpCatchFilterClause): pass
+    
+    @abstractmethod
+    def visit_lock_statement(self, node: CSharpLockStatement): pass
+    
+    @abstractmethod
+    def visit_using_statement(self, node: CSharpUsingStatement): pass
+    
+    @abstractmethod
+    def visit_yield_statement(self, node: CSharpYieldStatement): pass
+    
+    @abstractmethod
+    def visit_empty_statement(self, node: CSharpEmptyStatement): pass
+    
+    @abstractmethod
+    def visit_labeled_statement(self, node: CSharpLabeledStatement): pass
+    
+    @abstractmethod
+    def visit_goto_statement(self, node: CSharpGotoStatement): pass
+    
+    @abstractmethod
+    def visit_checked_statement(self, node: CSharpCheckedStatement): pass
+    
+    @abstractmethod
+    def visit_unchecked_statement(self, node: CSharpUncheckedStatement): pass
+    
+    @abstractmethod
+    def visit_unsafe_statement(self, node: CSharpUnsafeStatement): pass
+    
+    @abstractmethod
+    def visit_fixed_statement(self, node: CSharpFixedStatement): pass
+    
+    @abstractmethod
+    def visit_local_declaration_statement(self, node: CSharpLocalDeclarationStatement): pass
+    
+    # Declaration visitor methods
+    @abstractmethod
+    def visit_compilation_unit(self, node: CSharpCompilationUnit): pass
+    
+    @abstractmethod
+    def visit_namespace_declaration(self, node: CSharpNamespaceDeclaration): pass
+    
+    @abstractmethod
+    def visit_using_directive(self, node: CSharpUsingDirective): pass
+    
+    @abstractmethod
+    def visit_extern_alias_directive(self, node: CSharpExternAliasDirective): pass
+    
+    @abstractmethod
+    def visit_class_declaration(self, node: CSharpClassDeclaration): pass
+    
+    @abstractmethod
+    def visit_struct_declaration(self, node: CSharpStructDeclaration): pass
+    
+    @abstractmethod
+    def visit_interface_declaration(self, node: CSharpInterfaceDeclaration): pass
+    
+    @abstractmethod
+    def visit_enum_declaration(self, node: CSharpEnumDeclaration): pass
+    
+    @abstractmethod
+    def visit_enum_member_declaration(self, node: CSharpEnumMemberDeclaration): pass
+    
+    @abstractmethod
+    def visit_delegate_declaration(self, node: CSharpDelegateDeclaration): pass
+    
+    @abstractmethod
+    def visit_record_declaration(self, node: CSharpRecordDeclaration): pass
+    
+    @abstractmethod
+    def visit_base_list(self, node: CSharpBaseList): pass
+    
+    @abstractmethod
+    def visit_field_declaration(self, node: CSharpFieldDeclaration): pass
+    
+    @abstractmethod
+    def visit_method_declaration(self, node: CSharpMethodDeclaration): pass
+    
+    @abstractmethod
+    def visit_constructor_declaration(self, node: CSharpConstructorDeclaration): pass
+    
+    @abstractmethod
+    def visit_constructor_initializer(self, node: CSharpConstructorInitializer): pass
+    
+    @abstractmethod
+    def visit_destructor_declaration(self, node: CSharpDestructorDeclaration): pass
+    
+    @abstractmethod
+    def visit_property_declaration(self, node: CSharpPropertyDeclaration): pass
+    
+    @abstractmethod
+    def visit_indexer_declaration(self, node: CSharpIndexerDeclaration): pass
+    
+    @abstractmethod
+    def visit_event_declaration(self, node: CSharpEventDeclaration): pass
+    
+    @abstractmethod
+    def visit_event_field_declaration(self, node: CSharpEventFieldDeclaration): pass
+    
+    @abstractmethod
+    def visit_operator_declaration(self, node: CSharpOperatorDeclaration): pass
+    
+    @abstractmethod
+    def visit_conversion_operator_declaration(self, node: CSharpConversionOperatorDeclaration): pass
+    
+    @abstractmethod
+    def visit_accessor_list(self, node: CSharpAccessorList): pass
+    
+    @abstractmethod
+    def visit_accessor_declaration(self, node: CSharpAccessorDeclaration): pass
+    
+    # Type visitor methods
+    @abstractmethod
+    def visit_predefined_type(self, node: CSharpPredefinedType): pass
+    
+    @abstractmethod
+    def visit_identifier_name(self, node: CSharpIdentifierName): pass
+    
+    @abstractmethod
+    def visit_qualified_name_type(self, node: CSharpQualifiedNameType): pass
+    
+    @abstractmethod
+    def visit_generic_name_type(self, node: CSharpGenericNameType): pass
+    
+    @abstractmethod
+    def visit_generic_type(self, node: CSharpGenericType): pass
+    
+    @abstractmethod
+    def visit_array_type(self, node: CSharpArrayType): pass
+    
+    @abstractmethod
+    def visit_array_rank_specifier(self, node: CSharpArrayRankSpecifier): pass
+    
+    @abstractmethod
+    def visit_pointer_type(self, node: CSharpPointerType): pass
+    
+    @abstractmethod
+    def visit_nullable_type(self, node: CSharpNullableType): pass
+    
+    @abstractmethod
+    def visit_tuple_type(self, node: CSharpTupleType): pass
+    
+    @abstractmethod
+    def visit_tuple_element(self, node: CSharpTupleElement): pass
+    
+    @abstractmethod
+    def visit_function_pointer_type(self, node: CSharpFunctionPointerType): pass
+    
+    @abstractmethod
+    def visit_scoped_type(self, node: CSharpScopedType): pass
+    
+    # Parameter and argument visitor methods
+    @abstractmethod
+    def visit_parameter_list(self, node: CSharpParameterList): pass
+    
+    @abstractmethod
+    def visit_bracketed_parameter_list(self, node: CSharpBracketedParameterList): pass
+    
+    @abstractmethod
+    def visit_function_pointer_parameter_list(self, node: CSharpFunctionPointerParameterList): pass
+    
+    @abstractmethod
+    def visit_parameter(self, node: CSharpParameter): pass
+    
+    @abstractmethod
+    def visit_function_pointer_parameter(self, node: CSharpFunctionPointerParameter): pass
+    
+    @abstractmethod
+    def visit_argument(self, node: CSharpArgument): pass
+    
+    @abstractmethod
+    def visit_argument_list(self, node: CSharpArgumentList): pass
+    
+    @abstractmethod
+    def visit_bracketed_argument_list(self, node: CSharpBracketedArgumentList): pass
+    
+    # Generic type visitor methods
+    @abstractmethod
+    def visit_type_parameter_list(self, node: CSharpTypeParameterList): pass
+    
+    @abstractmethod
+    def visit_type_parameter(self, node: CSharpTypeParameter): pass
+    
+    @abstractmethod
+    def visit_type_argument_list(self, node: CSharpTypeArgumentList): pass
+    
+    @abstractmethod
+    def visit_type_parameter_constraint_clause(self, node: CSharpTypeParameterConstraintClause): pass
+    
+    @abstractmethod
+    def visit_class_or_struct_constraint(self, node: CSharpClassOrStructConstraint): pass
+    
+    @abstractmethod
+    def visit_type_constraint(self, node: CSharpTypeConstraint): pass
+    
+    @abstractmethod
+    def visit_constructor_constraint(self, node: CSharpConstructorConstraint): pass
+    
+    @abstractmethod
+    def visit_default_constraint(self, node: CSharpDefaultConstraint): pass
+    
+    # Attribute visitor methods
+    @abstractmethod
+    def visit_attribute_list(self, node: CSharpAttributeList): pass
+    
+    @abstractmethod
+    def visit_attribute(self, node: CSharpAttribute): pass
+    
+    @abstractmethod
+    def visit_attribute_argument_list(self, node: CSharpAttributeArgumentList): pass
+    
+    @abstractmethod
+    def visit_attribute_argument(self, node: CSharpAttributeArgument): pass
+    
+    # Variable declaration visitor methods
+    @abstractmethod
+    def visit_variable_declaration(self, node: CSharpVariableDeclaration): pass
+    
+    @abstractmethod
+    def visit_variable_declarator(self, node: CSharpVariableDeclarator): pass
+    
+    @abstractmethod
+    def visit_equals_value_clause(self, node: CSharpEqualsValueClause): pass
+    
+    # Pattern visitor methods
+    @abstractmethod
+    def visit_constant_pattern(self, node: CSharpConstantPattern): pass
+    
+    @abstractmethod
+    def visit_declaration_pattern(self, node: CSharpDeclarationPattern): pass
+    
+    @abstractmethod
+    def visit_type_pattern(self, node: CSharpTypePattern): pass
+    
+    @abstractmethod
+    def visit_var_pattern(self, node: CSharpVarPattern): pass
+    
+    @abstractmethod
+    def visit_discard_pattern(self, node: CSharpDiscardPattern): pass
+    
+    @abstractmethod
+    def visit_tuple_pattern(self, node: CSharpTuplePattern): pass
+    
+    @abstractmethod
+    def visit_positional_pattern(self, node: CSharpPositionalPattern): pass
+    
+    @abstractmethod
+    def visit_property_pattern(self, node: CSharpPropertyPattern): pass
+    
+    @abstractmethod
+    def visit_relational_pattern(self, node: CSharpRelationalPattern): pass
+    
+    @abstractmethod
+    def visit_logical_pattern(self, node: CSharpLogicalPattern): pass
+    
+    @abstractmethod
+    def visit_list_pattern(self, node: CSharpListPattern): pass
+    
+    @abstractmethod
+    def visit_subpattern(self, node: CSharpSubpattern): pass
+    
+    # Variable designation visitor methods
+    @abstractmethod
+    def visit_single_variable_designation(self, node: CSharpSingleVariableDesignation): pass
+    
+    @abstractmethod
+    def visit_discard_designation(self, node: CSharpDiscardDesignation): pass
+    
+    @abstractmethod
+    def visit_parenthesized_variable_designation(self, node: CSharpParenthesizedVariableDesignation): pass
+    
+    # LINQ query visitor methods
+    @abstractmethod
+    def visit_query_expression(self, node: CSharpQueryExpression): pass
+    
+    @abstractmethod
+    def visit_query_body(self, node: CSharpQueryBody): pass
+    
+    @abstractmethod
+    def visit_from_clause(self, node: CSharpFromClause): pass
+    
+    @abstractmethod
+    def visit_let_clause(self, node: CSharpLetClause): pass
+    
+    @abstractmethod
+    def visit_where_clause(self, node: CSharpWhereClause): pass
+    
+    @abstractmethod
+    def visit_join_clause(self, node: CSharpJoinClause): pass
+    
+    @abstractmethod
+    def visit_join_into_clause(self, node: CSharpJoinIntoClause): pass
+    
+    @abstractmethod
+    def visit_order_by_clause(self, node: CSharpOrderByClause): pass
+    
+    @abstractmethod
+    def visit_ordering(self, node: CSharpOrdering): pass
+    
+    @abstractmethod
+    def visit_select_clause(self, node: CSharpSelectClause): pass
+    
+    @abstractmethod
+    def visit_group_clause(self, node: CSharpGroupClause): pass
+    
+    @abstractmethod
+    def visit_query_continuation(self, node: CSharpQueryContinuation): pass
 
 
 # Utility functions
@@ -1998,8 +2520,8 @@ def create_literal(value: Any, literal_type: str) -> CSharpLiteral:
     return CSharpLiteral(CSharpNodeType.LITERAL, value=value, literal_type=literal_type)
 
 
-def create_binary_expression(left: CSharpExpression, operator: CSharpOperator, 
-                            right: CSharpExpression) -> CSharpBinaryExpression:
+def create_binary_expression(left: Optional[CSharpExpression] = None, operator: Optional[CSharpOperator] = None, 
+                            right: Optional[CSharpExpression] = None) -> CSharpBinaryExpression:
     """Create a binary expression node."""
     return CSharpBinaryExpression(
         CSharpNodeType.BINARY_EXPRESSION,
@@ -2009,7 +2531,7 @@ def create_binary_expression(left: CSharpExpression, operator: CSharpOperator,
     )
 
 
-def create_method_declaration(name: str, return_type: CSharpType, 
+def create_method_declaration(name: str, return_type: Optional[CSharpType] = None, 
                             parameters: Optional[List[CSharpParameter]] = None,
                             modifiers: Optional[List[CSharpModifier]] = None) -> CSharpMethodDeclaration:
     """Create a method declaration node."""

@@ -7,6 +7,7 @@ Runa is a revolutionary natural language programming language that lets you writ
 ## Table of Contents
 
 - [Installation](#installation)
+- [Language Support](#language-support)
 - [Your First Runa Program](#your-first-runa-program)
 - [Basic Syntax](#basic-syntax)
 - [Variables and Types](#variables-and-types)
@@ -32,6 +33,28 @@ pip install -e .
 
 # Verify installation
 python -m runa.cli --help
+```
+
+## Language Support
+
+Runa's Universal Translation Platform supports over 50+ programming languages organized into 7 tiers based on usage patterns and development priority. 
+
+### Quick Overview
+- **Tier 1-2**: Production-ready with comprehensive support (JavaScript, Python, Rust, Go, etc.)
+- **Tier 3-4**: Good support for specialized domains (HTML, CSS, Solidity, GraphQL, etc.)  
+- **Tier 5-7**: Functional support for niche and legacy languages (LISP, COBOL, Nix, etc.)
+
+For complete language support details, supported features, and quality expectations, see [Language Tier System](LANGUAGE_TIERS.md).
+
+### Translation Examples
+```bash
+# Translate Runa to any supported language
+python -m runa.cli translate app.runa --target javascript
+python -m runa.cli translate app.runa --target rust
+python -m runa.cli translate app.runa --target solidity
+
+# Round-trip verification
+python -m runa.cli verify app.runa --target python --verify-round-trip
 ```
 
 ## Your First Runa Program
@@ -241,73 +264,3 @@ Atomic:
 Lock shared_resource:
     Display "Critical section"
 ```
-
-## Examples
-
-### Example 1: Simple Calculator
-
-```runa
-Process called "add" that takes a as Integer and b as Integer returns Integer:
-    Return a plus b
-
-Process called "multiply" that takes a as Integer and b as Integer returns Integer:
-    Return a multiplied by b
-
-Let x be 10
-Let y be 5
-
-Let sum be Add with a as x and b as y
-Let product be Multiply with a as x and b as y
-
-Display "Sum: " followed by sum
-Display "Product: " followed by product
-```
-
-### Example 2: Data Processing
-
-```runa
-Let numbers be list containing 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
-Let evens be empty list
-
-For each number in numbers:
-    If number modulo 2 is equal to 0:
-        Add number to evens
-
-Display "Even numbers:"
-For each even in evens:
-    Display even
-```
-
-### Example 3: User Input Validation
-
-```runa
-Process called "validate email" that takes email as String returns Boolean:
-    If email contains "@" and email contains ".":
-        Return true
-    Otherwise:
-        Return false
-
-Let user_email be "user@example.com"
-Let is_valid be Validate Email with email as user_email
-
-If is_valid:
-    Display "Valid email address"
-Otherwise:
-    Display "Invalid email address"
-```
-
-## Next Steps
-
-- Read the [Language Reference](LANGUAGE_REFERENCE.md) for complete syntax details
-- Explore [Example Projects](examples/) for more complex applications
-- Check out the [Standard Library](stdlib/) documentation
-- Join our community and contribute to Runa's development
-
-## Getting Help
-
-- Documentation: [docs/](docs/)
-- Examples: [examples/](examples/)
-- Issues: [GitHub Issues](https://github.com/sybertnetics/runa/issues)
-- Community: [Discord Server](https://discord.gg/runa)
-
-Happy coding with Runa! 🚀

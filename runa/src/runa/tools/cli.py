@@ -12,21 +12,160 @@ import json
 from pathlib import Path
 from typing import Optional, List
 
-from .compiler import (
-    compile_runa_to_python, compile_runa_to_javascript, compile_runa_to_runa,
-    parse_runa_source, compile_runa_to_ir
-)
-from .compiler.bidirectional_translator import (
-    BidirectionalTranslator, SupportedLanguage, 
-    create_bidirectional_translator
-)
+# Import from new architecture
+from ..languages.runa.runa_parser import RunaParser
+from ..core.pipeline import TranslationPipeline, TranslationResult
+from ..languages.shared.base_toolchain import ToolchainResult
+import importlib
+import os
+import json
+from pathlib import Path
 
 
 class RunaCLI:
     """Main CLI application for Runa."""
     
     def __init__(self):
-        self.translator = create_bidirectional_translator()
+        self.parser = RunaParser()
+        self.toolchains = {}
+        self.supported_languages = {}
+        self._discover_languages()
+        self._init_toolchains()
+    
+    def _discover_languages(self):
+        """Dynamically discover all supported languages from tier directories."""
+        try:
+            languages_path = Path(__file__).parent.parent / "languages"
+            
+            # Language tier mapping with extensions and priorities
+            tier_info = {
+                'tier1': {'priority': 1, 'category': 'Core Programming Languages'},
+                'tier2': {'priority': 2, 'category': 'Modern Languages'}, 
+                'tier3': {'priority': 3, 'category': 'Configuration/Markup'},
+                'tier4': {'priority': 4, 'category': 'Specialized Languages'},
+                'tier5': {'priority': 5, 'category': 'System/Functional Languages'},
+                'tier6': {'priority': 6, 'category': 'Legacy/Enterprise Languages'}
+            }
+            
+            # File extension and toolchain name mappings
+            extension_map = {
+                'python': 'py', 'javascript': 'js', 'typescript': 'ts', 'cpp': 'cpp',
+                'csharp': 'cs', 'java': 'java', 'sql': 'sql', 'go': 'go', 'rust': 'rs',
+                'php': 'php', 'swift': 'swift', 'kotlin': 'kt', 'r': 'r', 'julia': 'jl',
+                'matlab': 'm', 'solidity': 'sol', 'haskell': 'hs', 'erlang': 'erl',
+                'elixir': 'ex', 'lisp': 'lisp', 'assembly': 'asm', 'cobol': 'cob',
+                'fortran': 'f90', 'ada': 'ada', 'perl': 'pl', 'html': 'html',
+                'css': 'css', 'xml': 'xml', 'yaml': 'yml', 'json': 'json',
+                'shell': 'sh', 'webassembly': 'wasm', 'graphql': 'graphql',
+                'hcl': 'hcl', 'llvm_ir': 'll', 'objective_c': 'm', 'visual_basic': 'vb',
+                # Tier 4 Blockchain Languages
+                'vyper': 'vy', 'move': 'move', 'michelson': 'mich', 'scilla': 'scilla',
+                'smartpy': 'py', 'ligo': 'ligo', 'plutus': 'hs', 'pact': 'pact', 'scrypto': 'rs'
+            }
+            
+            # Toolchain filename mappings (for abbreviated names)
+            toolchain_name_map = {
+                'python': 'py', 'javascript': 'js', 'typescript': 'ts',
+                'csharp': 'csharp', 'cpp': 'cpp', 'java': 'java', 'sql': 'sql'
+            }
+            
+            for tier_name, tier_data in tier_info.items():
+                tier_path = languages_path / tier_name
+                if tier_path.exists():
+                    for lang_dir in tier_path.iterdir():
+                        if lang_dir.is_dir() and lang_dir.name != '__pycache__':
+                            lang_name = lang_dir.name
+                            
+                            # Check if toolchain exists (handle abbreviated names)
+                            toolchain_prefix = toolchain_name_map.get(lang_name, lang_name)
+                            toolchain_file = lang_dir / f"{toolchain_prefix}_toolchain.py"
+                            extension = extension_map.get(lang_name, lang_name.lower())
+                            
+                            self.supported_languages[lang_name] = {
+                                'tier': tier_name,
+                                'priority': tier_data['priority'],
+                                'category': tier_data['category'],
+                                'extension': extension,
+                                'has_toolchain': toolchain_file.exists(),
+                                'module_path': f"runa.languages.{tier_name}.{lang_name}"
+                            }
+            
+            # Add special case for Runa round-trip
+            self.supported_languages['runa'] = {
+                'tier': 'core',
+                'priority': 0,
+                'category': 'Runa Language',
+                'extension': 'runa',
+                'has_toolchain': True,
+                'module_path': 'runa.languages.runa'
+            }
+            
+            if self.supported_languages:
+                print(f"🌍 Discovered {len(self.supported_languages)} supported languages")
+            
+        except Exception as e:
+            print(f"Warning: Language discovery failed: {e}")
+            # Fallback to minimal set
+            self.supported_languages = {
+                'python': {'tier': 'tier1', 'priority': 1, 'category': 'Core', 'extension': 'py', 'has_toolchain': True},
+                'javascript': {'tier': 'tier1', 'priority': 1, 'category': 'Core', 'extension': 'js', 'has_toolchain': True},
+                'runa': {'tier': 'core', 'priority': 0, 'category': 'Runa', 'extension': 'runa', 'has_toolchain': True}
+            }
+
+    def _init_toolchains(self):
+        """Initialize toolchains for languages that have them."""
+        for lang_name, lang_info in self.supported_languages.items():
+            if lang_info['has_toolchain'] and lang_name != 'runa':
+                try:
+                    if lang_name in ['python', 'javascript', 'typescript']:  # Known working toolchains
+                        toolchain_class = self._load_toolchain_class(lang_name, lang_info)
+                        if toolchain_class:
+                            self.toolchains[lang_name] = toolchain_class()
+                except Exception as e:
+                    print(f"Warning: Failed to initialize {lang_name} toolchain: {e}")
+
+    def _load_toolchain_class(self, lang_name: str, lang_info: dict):
+        """Dynamically load toolchain class for a language."""
+        try:
+            # Known working toolchains with specific imports
+            if lang_name == 'python':
+                from ..languages.tier1.python.py_toolchain import PythonToolchain
+                return PythonToolchain
+            elif lang_name == 'javascript':
+                from ..languages.tier1.javascript.js_toolchain import JavaScriptToolchain
+                return JavaScriptToolchain
+            elif lang_name == 'typescript':
+                from ..languages.tier1.typescript.ts_toolchain import TypeScriptToolchain
+                return TypeScriptToolchain
+            else:
+                # Dynamic loading for other languages
+                toolchain_prefix = {
+                    'python': 'py', 'javascript': 'js', 'typescript': 'ts',
+                    'csharp': 'csharp', 'cpp': 'cpp', 'java': 'java', 'sql': 'sql'
+                }.get(lang_name, lang_name)
+                
+                module_path = f"..languages.{lang_info['tier']}.{lang_name}.{toolchain_prefix}_toolchain"
+                toolchain_class_name = f"{lang_name.title()}Toolchain"
+                
+                try:
+                    module = importlib.import_module(module_path, package=__package__)
+                    return getattr(module, toolchain_class_name)
+                except (ImportError, AttributeError):
+                    return None
+                    
+        except Exception as e:
+            print(f"Warning: Could not load {lang_name} toolchain: {e}")
+            return None
+
+    def _get_toolchain(self, language: str):
+        """Get toolchain for specified language."""
+        if language not in self.toolchains:
+            lang_info = self.supported_languages.get(language)
+            if lang_info and lang_info['has_toolchain']:
+                toolchain_class = self._load_toolchain_class(language, lang_info)
+                if toolchain_class:
+                    self.toolchains[language] = toolchain_class()
+        return self.toolchains.get(language)
     
     def compile_command(self, args):
         """Handle runa compile command."""
@@ -43,29 +182,64 @@ class RunaCLI:
             target_lang = args.target.lower()
             
             # Compile to target language
-            if target_lang == 'python':
-                result = compile_runa_to_python(source_code)
-                default_ext = '.py'
-            elif target_lang == 'javascript':
-                result = compile_runa_to_javascript(source_code)
-                default_ext = '.js'
-            elif target_lang == 'runa':
-                result = compile_runa_to_runa(source_code)
-                default_ext = '.runa'
-            else:
-                # Use bidirectional translator for other languages
+            if target_lang not in self.supported_languages:
+                print(f"Error: Unsupported target language '{target_lang}'", file=sys.stderr)
+                available_langs = [lang for lang, info in self.supported_languages.items() 
+                                 if info['has_toolchain'] or lang == 'runa']
+                print(f"Available languages: {', '.join(sorted(available_langs))}")
+                return 1
+            
+            lang_info = self.supported_languages[target_lang]
+            
+            # Check if toolchain is available
+            if not lang_info['has_toolchain'] and target_lang != 'runa':
+                print(f"Error: {target_lang} toolchain not yet implemented", file=sys.stderr)
+                return 1
+            
+            # Parse Runa source
+            try:
+                runa_ast = self.parser.parse(source_code, file_path or "")
+            except Exception as e:
+                print(f"Error: Parse failed: {e}", file=sys.stderr)
+                return 1
+            extension = lang_info['extension']
+            
+            if target_lang == 'runa':
+                # Round-trip generation
                 try:
-                    target_enum = SupportedLanguage(target_lang)
-                    translation = self.translator.translate_runa_to_any(source_code, target_enum)
-                    if not translation.success:
-                        print(f"Error: Translation failed: {'; '.join(translation.errors)}", file=sys.stderr)
-                        return 1
-                    result = translation.target_code
-                    default_ext = self.translator.extensions.get(target_enum, '.txt')
-                except ValueError:
-                    print(f"Error: Unsupported target language '{target_lang}'", file=sys.stderr)
-                    print(f"Supported languages: {', '.join([lang.value for lang in SupportedLanguage])}")
+                    from ..languages.runa.runa_generator import RunaGenerator
+                    generator = RunaGenerator()
+                    result = generator.generate(runa_ast)
+                except Exception as e:
+                    print(f"Error: Runa generation failed: {e}", file=sys.stderr)
                     return 1
+            else:
+                # Use toolchain for target language
+                toolchain = self._get_toolchain(target_lang)
+                if not toolchain:
+                    print(f"Error: Could not load {target_lang} toolchain", file=sys.stderr)
+                    return 1
+                
+                # Convert Runa AST to target language AST
+                try:
+                    from_runa_result = toolchain.from_runa(runa_ast)
+                    if not from_runa_result.success:
+                        print(f"Error: Conversion from Runa failed: {from_runa_result.error_message}", file=sys.stderr)
+                        return 1
+                    
+                    target_ast = from_runa_result.target_ast
+                    
+                    # Generate target language code
+                    gen_result = toolchain.generate(target_ast)
+                    if not gen_result.success:
+                        print(f"Error: Generation failed: {gen_result.error}", file=sys.stderr)
+                        return 1
+                    result = gen_result.data
+                except Exception as e:
+                    print(f"Error: Translation failed: {e}", file=sys.stderr)
+                    return 1
+            
+            default_ext = f'.{extension}'
             
             # Determine output file
             if args.output:
@@ -107,29 +281,36 @@ class RunaCLI:
             
             # Lexical and syntactic validation
             try:
-                ast = parse_runa_source(source_code)
+                ast = self.parser.parse(source_code, args.input)
                 if args.verbose:
                     print(f"✅ Syntax validation passed ({len(ast.statements)} statements)")
             except Exception as e:
                 errors.append(f"Syntax error: {e}")
             
-            # Semantic validation (through IR compilation)
+            # Semantic validation (basic check)
             if not errors:
                 try:
-                    ir_module = compile_runa_to_ir(source_code)
+                    from ..core.semantic import SemanticAnalyzer
+                    analyzer = SemanticAnalyzer()
+                    analyzer.analyze(ast)
                     if args.verbose:
-                        print(f"✅ Semantic validation passed ({len(ir_module.functions)} functions)")
+                        print("✅ Semantic validation passed")
                 except Exception as e:
                     errors.append(f"Semantic error: {e}")
             
             # Round-trip validation
             if not errors and args.round_trip:
                 try:
-                    regenerated = compile_runa_to_runa(source_code)
+                    from ..languages.runa.runa_generator import RunaGenerator
+                    generator = RunaGenerator()
+                    regenerated = generator.generate(ast)
                     # Try to parse the regenerated code
-                    parse_runa_source(regenerated)
-                    if args.verbose:
-                        print("✅ Round-trip validation passed")
+                    try:
+                        regenerated_ast = self.parser.parse(regenerated, "")
+                        if args.verbose:
+                            print("✅ Round-trip validation passed")
+                    except Exception as parse_error:
+                        warnings.append(f"Round-trip warning: {parse_error}")
                 except Exception as e:
                     warnings.append(f"Round-trip warning: {e}")
             
@@ -181,9 +362,30 @@ class RunaCLI:
         print("  • Multiple target languages")
         print()
         print("🎯 Supported Target Languages:")
-        for lang in SupportedLanguage:
-            available = "✅" if lang in self.translator.generators else "🔄"
-            print(f"  {available} {lang.value}")
+        
+        # Group by tier for better organization
+        by_tier = {}
+        for lang_name, lang_info in self.supported_languages.items():
+            tier = lang_info['tier']
+            if tier not in by_tier:
+                by_tier[tier] = []
+            by_tier[tier].append((lang_name, lang_info))
+        
+        # Sort tiers by priority
+        for tier in sorted(by_tier.keys(), key=lambda t: by_tier[t][0][1]['priority']):
+            tier_langs = by_tier[tier]
+            category = tier_langs[0][1]['category']
+            print(f"\n  📁 {category}:")
+            
+            for lang_name, lang_info in sorted(tier_langs):
+                status = "✅" if lang_info['has_toolchain'] else "🔄"
+                ext = lang_info['extension']
+                print(f"    {status} {lang_name} (.{ext})")
+        
+        print(f"\n  📊 Total: {len(self.supported_languages)} languages")
+        implemented = sum(1 for info in self.supported_languages.values() if info['has_toolchain'])
+        print(f"  🚀 Implemented: {implemented}")
+        print(f"  🔄 In Development: {len(self.supported_languages) - implemented}")
         print()
         print("🔧 Available Commands:")
         print("  • runa compile <file> --target <language>")

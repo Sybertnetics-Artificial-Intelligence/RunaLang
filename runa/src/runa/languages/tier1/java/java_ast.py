@@ -208,10 +208,30 @@ class JavaNode(ABC):
     type: JavaNodeType = None
     source_range: Optional[Dict[str, int]] = None
     
+    # Code representation for source code preservation
+    source_code: str = ""  # Original source code for this node
+    formatted_code: str = ""  # Formatted/pretty-printed code
+    
     @abstractmethod
     def accept(self, visitor):
         """Accept a visitor for the visitor pattern."""
         pass
+    
+    def get_source_code(self) -> str:
+        """Get the original source code for this node."""
+        return self.source_code
+    
+    def set_source_code(self, code: str):
+        """Set the original source code for this node."""
+        self.source_code = code
+    
+    def get_formatted_code(self) -> str:
+        """Get the formatted code for this node."""
+        return self.formatted_code
+    
+    def set_formatted_code(self, code: str):
+        """Set the formatted code for this node."""
+        self.formatted_code = code
 
 
 @dataclass
@@ -243,7 +263,7 @@ class JavaType(JavaNode):
 @dataclass
 class JavaLiteral(JavaExpression):
     """Base class for Java literals."""
-    value: Any
+    value: Any = None
 
 
 @dataclass
@@ -328,7 +348,7 @@ class JavaTextBlock(JavaLiteral):
 @dataclass
 class JavaSimpleName(JavaExpression):
     """Java simple name."""
-    identifier: str
+    identifier: str = ""
     
     def __post_init__(self):
         self.type = JavaNodeType.SIMPLE_NAME
@@ -340,8 +360,8 @@ class JavaSimpleName(JavaExpression):
 @dataclass
 class JavaQualifiedName(JavaExpression):
     """Java qualified name."""
-    qualifier: JavaExpression
-    name: 'JavaSimpleName'
+    qualifier: JavaExpression = None
+    name: 'JavaSimpleName' = None
     
     def __post_init__(self):
         self.type = JavaNodeType.QUALIFIED_NAME
@@ -354,9 +374,9 @@ class JavaQualifiedName(JavaExpression):
 @dataclass
 class JavaBinaryExpression(JavaExpression):
     """Java binary expression."""
-    left: JavaExpression
-    operator: JavaOperator
-    right: JavaExpression
+    left: JavaExpression = None
+    operator: JavaOperator = None
+    right: JavaExpression = None
     
     def __post_init__(self):
         self.type = JavaNodeType.BINARY_EXPRESSION
@@ -368,8 +388,8 @@ class JavaBinaryExpression(JavaExpression):
 @dataclass
 class JavaUnaryExpression(JavaExpression):
     """Java unary expression."""
-    operator: JavaOperator
-    operand: JavaExpression
+    operator: JavaOperator = None
+    operand: JavaExpression = None
     is_postfix: bool = False
     
     def __post_init__(self):
@@ -382,9 +402,9 @@ class JavaUnaryExpression(JavaExpression):
 @dataclass
 class JavaConditionalExpression(JavaExpression):
     """Java conditional expression (ternary operator)."""
-    condition: JavaExpression
-    then_expression: JavaExpression
-    else_expression: JavaExpression
+    condition: JavaExpression = None
+    then_expression: JavaExpression = None
+    else_expression: JavaExpression = None
     
     def __post_init__(self):
         self.type = JavaNodeType.CONDITIONAL_EXPRESSION
@@ -396,9 +416,9 @@ class JavaConditionalExpression(JavaExpression):
 @dataclass
 class JavaAssignmentExpression(JavaExpression):
     """Java assignment expression."""
-    left: JavaExpression
-    operator: JavaOperator
-    right: JavaExpression
+    left: JavaExpression = None
+    operator: JavaOperator = None
+    right: JavaExpression = None
     
     def __post_init__(self):
         self.type = JavaNodeType.ASSIGNMENT_EXPRESSION
@@ -410,8 +430,8 @@ class JavaAssignmentExpression(JavaExpression):
 @dataclass
 class JavaMethodInvocation(JavaExpression):
     """Java method invocation."""
-    expression: Optional[JavaExpression]  # Object or class
-    method_name: str
+    expression: Optional[JavaExpression] = None  # Object or class
+    method_name: str = ""
     type_arguments: List[JavaType] = field(default_factory=list)
     arguments: List[JavaExpression] = field(default_factory=list)
     
@@ -425,8 +445,8 @@ class JavaMethodInvocation(JavaExpression):
 @dataclass
 class JavaFieldAccess(JavaExpression):
     """Java field access."""
-    expression: JavaExpression
-    field_name: str
+    expression: JavaExpression = None
+    field_name: str = ""
     
     def __post_init__(self):
         self.type = JavaNodeType.FIELD_ACCESS
@@ -438,8 +458,8 @@ class JavaFieldAccess(JavaExpression):
 @dataclass
 class JavaArrayAccess(JavaExpression):
     """Java array access."""
-    array: JavaExpression
-    index: JavaExpression
+    array: JavaExpression = None
+    index: JavaExpression = None
     
     def __post_init__(self):
         self.type = JavaNodeType.ARRAY_ACCESS
@@ -451,8 +471,8 @@ class JavaArrayAccess(JavaExpression):
 @dataclass
 class JavaCastExpression(JavaExpression):
     """Java cast expression."""
-    target_type: JavaType
-    expression: JavaExpression
+    target_type: JavaType = None
+    expression: JavaExpression = None
     
     def __post_init__(self):
         self.type = JavaNodeType.CAST_EXPRESSION
@@ -464,8 +484,8 @@ class JavaCastExpression(JavaExpression):
 @dataclass
 class JavaInstanceofExpression(JavaExpression):
     """Java instanceof expression."""
-    expression: JavaExpression
-    target_type: JavaType
+    expression: JavaExpression = None
+    target_type: JavaType = None
     
     def __post_init__(self):
         self.type = JavaNodeType.INSTANCEOF_EXPRESSION
@@ -501,7 +521,7 @@ class JavaSuperExpression(JavaExpression):
 @dataclass
 class JavaClassLiteral(JavaExpression):
     """Java class literal (e.g., String.class)."""
-    target_type: JavaType
+    target_type: JavaType = None
     
     def __post_init__(self):
         self.type = JavaNodeType.CLASS_LITERAL
@@ -513,8 +533,8 @@ class JavaClassLiteral(JavaExpression):
 @dataclass
 class JavaArrayCreation(JavaExpression):
     """Java array creation expression."""
-    element_type: JavaType
-    dimensions: List['JavaDimension']
+    element_type: JavaType = None
+    dimensions: List['JavaDimension'] = field(default_factory=list)
     initializer: Optional['JavaArrayInitializer'] = None
     
     def __post_init__(self):
@@ -527,7 +547,7 @@ class JavaArrayCreation(JavaExpression):
 @dataclass
 class JavaArrayInitializer(JavaExpression):
     """Java array initializer."""
-    expressions: List[JavaExpression]
+    expressions: List[JavaExpression] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.ARRAY_INITIALIZER
@@ -539,8 +559,8 @@ class JavaArrayInitializer(JavaExpression):
 @dataclass
 class JavaLambdaExpression(JavaExpression):
     """Java lambda expression (Java 8)."""
-    parameters: List['JavaParameter']
-    body: Union[JavaExpression, 'JavaBlockStatement']
+    parameters: List['JavaParameter'] = field(default_factory=list)
+    body: Union[JavaExpression, 'JavaBlockStatement'] = None
     
     def __post_init__(self):
         self.type = JavaNodeType.LAMBDA_EXPRESSION
@@ -552,8 +572,8 @@ class JavaLambdaExpression(JavaExpression):
 @dataclass
 class JavaMethodReference(JavaExpression):
     """Java method reference (Java 8)."""
-    expression: Optional[JavaExpression]
-    method_name: str
+    expression: Optional[JavaExpression] = None
+    method_name: str = ""
     type_arguments: List[JavaType] = field(default_factory=list)
     
     def __post_init__(self):
@@ -567,7 +587,7 @@ class JavaMethodReference(JavaExpression):
 @dataclass
 class JavaExpressionStatement(JavaStatement):
     """Java expression statement."""
-    expression: JavaExpression
+    expression: JavaExpression = None
     
     def __post_init__(self):
         self.type = JavaNodeType.EXPRESSION_STATEMENT
@@ -579,7 +599,7 @@ class JavaExpressionStatement(JavaStatement):
 @dataclass
 class JavaBlockStatement(JavaStatement):
     """Java block statement."""
-    statements: List[JavaStatement]
+    statements: List[JavaStatement] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.BLOCK_STATEMENT
@@ -591,8 +611,8 @@ class JavaBlockStatement(JavaStatement):
 @dataclass
 class JavaIfStatement(JavaStatement):
     """Java if statement."""
-    condition: JavaExpression
-    then_statement: JavaStatement
+    condition: JavaExpression = None
+    then_statement: JavaStatement = None
     else_statement: Optional[JavaStatement] = None
     
     def __post_init__(self):
@@ -605,8 +625,8 @@ class JavaIfStatement(JavaStatement):
 @dataclass
 class JavaWhileStatement(JavaStatement):
     """Java while statement."""
-    condition: JavaExpression
-    body: JavaStatement
+    condition: JavaExpression = None
+    body: JavaStatement = None
     
     def __post_init__(self):
         self.type = JavaNodeType.WHILE_STATEMENT
@@ -618,10 +638,10 @@ class JavaWhileStatement(JavaStatement):
 @dataclass
 class JavaForStatement(JavaStatement):
     """Java for statement."""
-    initializers: List[JavaExpression]
-    condition: Optional[JavaExpression]
-    updaters: List[JavaExpression]
-    body: JavaStatement
+    initializers: List[JavaExpression] = field(default_factory=list)
+    condition: Optional[JavaExpression] = None
+    updaters: List[JavaExpression] = field(default_factory=list)
+    body: JavaStatement = None
     
     def __post_init__(self):
         self.type = JavaNodeType.FOR_STATEMENT
@@ -633,9 +653,9 @@ class JavaForStatement(JavaStatement):
 @dataclass
 class JavaEnhancedForStatement(JavaStatement):
     """Java enhanced for statement (for-each)."""
-    parameter: 'JavaSingleVariableDeclaration'
-    expression: JavaExpression
-    body: JavaStatement
+    parameter: 'JavaSingleVariableDeclaration' = None
+    expression: JavaExpression = None
+    body: JavaStatement = None
     
     def __post_init__(self):
         self.type = JavaNodeType.ENHANCED_FOR_STATEMENT
@@ -647,8 +667,8 @@ class JavaEnhancedForStatement(JavaStatement):
 @dataclass
 class JavaDoStatement(JavaStatement):
     """Java do-while statement."""
-    body: JavaStatement
-    condition: JavaExpression
+    body: JavaStatement = None
+    condition: JavaExpression = None
     
     def __post_init__(self):
         self.type = JavaNodeType.DO_STATEMENT
@@ -660,8 +680,8 @@ class JavaDoStatement(JavaStatement):
 @dataclass
 class JavaSwitchStatement(JavaStatement):
     """Java switch statement."""
-    expression: JavaExpression
-    statements: List[JavaStatement]
+    expression: JavaExpression = None
+    statements: List[JavaStatement] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.SWITCH_STATEMENT
@@ -673,8 +693,8 @@ class JavaSwitchStatement(JavaStatement):
 @dataclass
 class JavaSwitchExpression(JavaExpression):
     """Java switch expression (Java 14)."""
-    expression: JavaExpression
-    statements: List[JavaStatement]
+    expression: JavaExpression = None
+    statements: List[JavaStatement] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.SWITCH_EXPRESSION
@@ -722,7 +742,7 @@ class JavaReturnStatement(JavaStatement):
 @dataclass
 class JavaThrowStatement(JavaStatement):
     """Java throw statement."""
-    expression: JavaExpression
+    expression: Optional[JavaExpression] = None
     
     def __post_init__(self):
         self.type = JavaNodeType.THROW_STATEMENT
@@ -734,8 +754,8 @@ class JavaThrowStatement(JavaStatement):
 @dataclass
 class JavaTryStatement(JavaStatement):
     """Java try statement."""
+    body: Optional[JavaBlockStatement] = None
     resources: List['JavaVariableDeclaration'] = field(default_factory=list)  # Try-with-resources
-    body: JavaBlockStatement
     catch_clauses: List['JavaCatchClause'] = field(default_factory=list)
     finally_block: Optional[JavaBlockStatement] = None
     
@@ -749,8 +769,8 @@ class JavaTryStatement(JavaStatement):
 @dataclass
 class JavaSynchronizedStatement(JavaStatement):
     """Java synchronized statement."""
-    expression: JavaExpression
-    body: JavaBlockStatement
+    expression: Optional[JavaExpression] = None
+    body: Optional[JavaBlockStatement] = None
     
     def __post_init__(self):
         self.type = JavaNodeType.SYNCHRONIZED_STATEMENT
@@ -762,7 +782,7 @@ class JavaSynchronizedStatement(JavaStatement):
 @dataclass
 class JavaAssertStatement(JavaStatement):
     """Java assert statement."""
-    condition: JavaExpression
+    condition: Optional[JavaExpression] = None
     message: Optional[JavaExpression] = None
     
     def __post_init__(self):
@@ -786,8 +806,8 @@ class JavaEmptyStatement(JavaStatement):
 @dataclass
 class JavaLabeledStatement(JavaStatement):
     """Java labeled statement."""
-    label: str
-    body: JavaStatement
+    label: Optional[str] = None
+    body: Optional[JavaStatement] = None
     
     def __post_init__(self):
         self.type = JavaNodeType.LABELED_STATEMENT
@@ -827,7 +847,7 @@ class JavaCompilationUnit(JavaNode):
 @dataclass
 class JavaPackageDeclaration(JavaDeclaration):
     """Java package declaration."""
-    name: JavaExpression
+    name: Optional[JavaExpression] = None
     
     def __post_init__(self):
         self.type = JavaNodeType.PACKAGE_DECLARATION
@@ -839,7 +859,7 @@ class JavaPackageDeclaration(JavaDeclaration):
 @dataclass
 class JavaImportDeclaration(JavaDeclaration):
     """Java import declaration."""
-    name: JavaExpression
+    name: Optional[JavaExpression] = None
     is_static: bool = False
     is_on_demand: bool = False  # import foo.*;
     
@@ -853,7 +873,7 @@ class JavaImportDeclaration(JavaDeclaration):
 @dataclass
 class JavaTypeDeclaration(JavaDeclaration):
     """Base class for Java type declarations."""
-    name: str
+    name: Optional[str] = None
     type_parameters: List['JavaTypeParameter'] = field(default_factory=list)
     body_declarations: List[JavaDeclaration] = field(default_factory=list)
 
@@ -923,8 +943,8 @@ class JavaRecordDeclaration(JavaTypeDeclaration):
 @dataclass
 class JavaFieldDeclaration(JavaDeclaration):
     """Java field declaration."""
-    variable_type: JavaType
-    fragments: List['JavaVariableDeclarationFragment']
+    variable_type: JavaType = None
+    fragments: List['JavaVariableDeclarationFragment'] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.FIELD_DECLARATION
@@ -936,8 +956,8 @@ class JavaFieldDeclaration(JavaDeclaration):
 @dataclass
 class JavaMethodDeclaration(JavaDeclaration):
     """Java method declaration."""
-    name: str
-    return_type: Optional[JavaType]  # None for constructors
+    name: str = ""
+    return_type: Optional[JavaType] = None  # None for constructors
     type_parameters: List['JavaTypeParameter'] = field(default_factory=list)
     parameters: List['JavaParameter'] = field(default_factory=list)
     thrown_exceptions: List[JavaType] = field(default_factory=list)
@@ -955,8 +975,8 @@ class JavaMethodDeclaration(JavaDeclaration):
 @dataclass
 class JavaVariableDeclaration(JavaDeclaration):
     """Java variable declaration."""
-    variable_type: JavaType
-    fragments: List['JavaVariableDeclarationFragment']
+    variable_type: JavaType = None
+    fragments: List['JavaVariableDeclarationFragment'] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.VARIABLE_DECLARATION
@@ -968,7 +988,7 @@ class JavaVariableDeclaration(JavaDeclaration):
 @dataclass
 class JavaVariableDeclarationFragment(JavaNode):
     """Java variable declaration fragment."""
-    name: str
+    name: Optional[str] = None
     extra_dimensions: int = 0
     initializer: Optional[JavaExpression] = None
     
@@ -979,8 +999,8 @@ class JavaVariableDeclarationFragment(JavaNode):
 @dataclass
 class JavaSingleVariableDeclaration(JavaDeclaration):
     """Java single variable declaration (for parameters, catch clauses, etc.)."""
-    variable_type: JavaType
-    name: str
+    variable_type: JavaType = None
+    name: str = ""
     extra_dimensions: int = 0
     initializer: Optional[JavaExpression] = None
     is_varargs: bool = False
@@ -997,8 +1017,8 @@ class JavaParameter(JavaNode):
     """Java parameter."""
     modifiers: List[JavaModifier] = field(default_factory=list)
     annotations: List['JavaAnnotation'] = field(default_factory=list)
-    parameter_type: JavaType
-    name: str
+    parameter_type: JavaType = None
+    name: str = ""
     is_varargs: bool = False
     
     def accept(self, visitor):
@@ -1008,7 +1028,7 @@ class JavaParameter(JavaNode):
 @dataclass
 class JavaTypeParameter(JavaNode):
     """Java type parameter."""
-    name: str
+    name: str = ""
     bounds: List[JavaType] = field(default_factory=list)
     
     def __post_init__(self):
@@ -1022,7 +1042,7 @@ class JavaTypeParameter(JavaNode):
 @dataclass
 class JavaPrimitiveType(JavaType):
     """Java primitive type."""
-    primitive_type: str  # boolean, byte, char, double, float, int, long, short
+    primitive_type: str = ""  # boolean, byte, char, double, float, int, long, short
     
     def __post_init__(self):
         self.type = JavaNodeType.PRIMITIVE_TYPE
@@ -1034,7 +1054,7 @@ class JavaPrimitiveType(JavaType):
 @dataclass
 class JavaArrayType(JavaType):
     """Java array type."""
-    component_type: JavaType
+    component_type: JavaType = None
     dimensions: List['JavaDimension'] = field(default_factory=list)
     
     def __post_init__(self):
@@ -1047,8 +1067,8 @@ class JavaArrayType(JavaType):
 @dataclass
 class JavaParameterizedType(JavaType):
     """Java parameterized type (generics)."""
-    raw_type: JavaType
-    type_arguments: List[JavaType]
+    raw_type: JavaType = None
+    type_arguments: List[JavaType] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.PARAMETERIZED_TYPE
@@ -1073,7 +1093,7 @@ class JavaWildcardType(JavaType):
 @dataclass
 class JavaUnionType(JavaType):
     """Java union type (multi-catch)."""
-    types: List[JavaType]
+    types: List[JavaType] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.UNION_TYPE
@@ -1085,7 +1105,7 @@ class JavaUnionType(JavaType):
 @dataclass
 class JavaIntersectionType(JavaType):
     """Java intersection type."""
-    types: List[JavaType]
+    types: List[JavaType] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.INTERSECTION_TYPE
@@ -1109,7 +1129,7 @@ class JavaVarType(JavaType):
 @dataclass
 class JavaAnnotation(JavaNode):
     """Java annotation."""
-    type_name: JavaExpression
+    type_name: Optional[JavaExpression] = None
     
     def __post_init__(self):
         self.type = JavaNodeType.ANNOTATION
@@ -1144,7 +1164,7 @@ class JavaMarkerAnnotation(JavaAnnotation):
 @dataclass
 class JavaSingleMemberAnnotation(JavaAnnotation):
     """Java single member annotation."""
-    value: JavaExpression
+    value: Optional[JavaExpression] = None
     
     def __post_init__(self):
         self.type = JavaNodeType.SINGLE_MEMBER_ANNOTATION
@@ -1156,8 +1176,8 @@ class JavaSingleMemberAnnotation(JavaAnnotation):
 @dataclass
 class JavaMemberValuePair(JavaNode):
     """Java member value pair."""
-    name: str
-    value: JavaExpression
+    name: Optional[str] = None
+    value: Optional[JavaExpression] = None
     
     def accept(self, visitor):
         return visitor.visit_member_value_pair(self)
@@ -1166,8 +1186,8 @@ class JavaMemberValuePair(JavaNode):
 @dataclass
 class JavaCatchClause(JavaNode):
     """Java catch clause."""
-    exception: JavaSingleVariableDeclaration
-    body: JavaBlockStatement
+    exception: Optional['JavaSingleVariableDeclaration'] = None
+    body: Optional[JavaBlockStatement] = None
     
     def accept(self, visitor):
         return visitor.visit_catch_clause(self)
@@ -1176,7 +1196,7 @@ class JavaCatchClause(JavaNode):
 @dataclass
 class JavaSwitchCase(JavaStatement):
     """Java switch case."""
-    expressions: List[JavaExpression]  # Empty for default case
+    expressions: List[JavaExpression] = field(default_factory=list)  # Empty for default case
     is_default: bool = False
     
     def __post_init__(self):
@@ -1189,7 +1209,7 @@ class JavaSwitchCase(JavaStatement):
 @dataclass
 class JavaEnumConstant(JavaNode):
     """Java enum constant."""
-    name: str
+    name: Optional[str] = None
     arguments: List[JavaExpression] = field(default_factory=list)
     anonymous_class_declaration: Optional['JavaAnonymousClassDeclaration'] = None
     
@@ -1203,7 +1223,7 @@ class JavaEnumConstant(JavaNode):
 @dataclass
 class JavaAnonymousClassDeclaration(JavaNode):
     """Java anonymous class declaration."""
-    body_declarations: List[JavaDeclaration]
+    body_declarations: List[JavaDeclaration] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.ANONYMOUS_CLASS_DECLARATION
@@ -1227,7 +1247,7 @@ class JavaDimension(JavaNode):
 @dataclass
 class JavaModuleDeclaration(JavaDeclaration):
     """Java module declaration (Java 9)."""
-    name: JavaExpression
+    name: Optional[JavaExpression] = None
     is_open: bool = False
     module_statements: List['JavaModuleStatement'] = field(default_factory=list)
     
@@ -1247,7 +1267,7 @@ class JavaModuleStatement(JavaNode):
 @dataclass
 class JavaRequiresDirective(JavaModuleStatement):
     """Java requires directive."""
-    module_name: JavaExpression
+    module_name: Optional[JavaExpression] = None
     is_transitive: bool = False
     is_static: bool = False
     
@@ -1261,7 +1281,7 @@ class JavaRequiresDirective(JavaModuleStatement):
 @dataclass
 class JavaExportsDirective(JavaModuleStatement):
     """Java exports directive."""
-    package_name: JavaExpression
+    package_name: Optional[JavaExpression] = None
     target_modules: List[JavaExpression] = field(default_factory=list)
     
     def __post_init__(self):
@@ -1274,7 +1294,7 @@ class JavaExportsDirective(JavaModuleStatement):
 @dataclass
 class JavaOpensDirective(JavaModuleStatement):
     """Java opens directive."""
-    package_name: JavaExpression
+    package_name: Optional[JavaExpression] = None
     target_modules: List[JavaExpression] = field(default_factory=list)
     
     def __post_init__(self):
@@ -1287,7 +1307,7 @@ class JavaOpensDirective(JavaModuleStatement):
 @dataclass
 class JavaUsesDirective(JavaModuleStatement):
     """Java uses directive."""
-    service_name: JavaExpression
+    service_name: Optional[JavaExpression] = None
     
     def __post_init__(self):
         self.type = JavaNodeType.USES_DIRECTIVE
@@ -1299,14 +1319,106 @@ class JavaUsesDirective(JavaModuleStatement):
 @dataclass
 class JavaProvidesDirective(JavaModuleStatement):
     """Java provides directive."""
-    service_name: JavaExpression
-    implementation_names: List[JavaExpression]
+    service_name: Optional[JavaExpression] = None
+    implementation_names: List[JavaExpression] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = JavaNodeType.PROVIDES_DIRECTIVE
     
     def accept(self, visitor):
         return visitor.visit_provides_directive(self)
+
+
+# Additional missing classes for Java generator support
+
+@dataclass
+class JavaParenthesizedExpression(JavaExpression):
+    """Java parenthesized expression."""
+    expression: Optional[JavaExpression] = None
+    
+    def __post_init__(self):
+        self.type = JavaNodeType.BINARY_EXPRESSION  # Reuse existing type
+    
+    def accept(self, visitor):
+        return visitor.visit_parenthesized_expression(self)
+
+
+@dataclass
+class JavaBodyDeclaration(JavaDeclaration):
+    """Base class for Java body declarations (fields, methods, constructors, etc.)."""
+    pass
+
+
+@dataclass
+class JavaConstructorDeclaration(JavaBodyDeclaration):
+    """Java constructor declaration."""
+    name: str = ""
+    type_parameters: List['JavaTypeParameter'] = field(default_factory=list)
+    parameters: List['JavaParameter'] = field(default_factory=list)
+    thrown_exceptions: List[JavaType] = field(default_factory=list)
+    body: Optional[JavaBlockStatement] = None
+    is_compact_constructor: bool = False  # For records
+    
+    def __post_init__(self):
+        self.type = JavaNodeType.CONSTRUCTOR_DECLARATION
+    
+    def accept(self, visitor):
+        return visitor.visit_constructor_declaration(self)
+
+
+@dataclass
+class JavaLocalVariableDeclaration(JavaStatement):
+    """Java local variable declaration."""
+    variable_type: Optional[JavaType] = None
+    fragments: List['JavaVariableDeclarationFragment'] = field(default_factory=list)
+    
+    def __post_init__(self):
+        self.type = JavaNodeType.LOCAL_VARIABLE_DECLARATION
+    
+    def accept(self, visitor):
+        return visitor.visit_local_variable_declaration(self)
+
+
+@dataclass
+class JavaLambdaParameter(JavaNode):
+    """Java lambda parameter."""
+    type: Optional[JavaType] = None
+    name: Optional[str] = None
+    
+    def accept(self, visitor):
+        return visitor.visit_lambda_parameter(self)
+
+
+@dataclass
+class JavaClassInstanceCreation(JavaExpression):
+    """Java class instance creation expression (new Type(args))."""
+    type: Optional[JavaType] = None
+    arguments: List[JavaExpression] = field(default_factory=list)
+    anonymous_class_body: Optional['JavaAnonymousClassDeclaration'] = None
+    
+    def __post_init__(self):
+        self.type = JavaNodeType.CLASS_LITERAL  # Reuse existing node type
+    
+    def accept(self, visitor):
+        return visitor.visit_class_instance_creation(self)
+
+
+@dataclass
+class JavaModuleDirective(JavaNode):
+    """Base class for Java module directives."""
+    pass
+
+
+@dataclass
+class JavaRecordComponent(JavaNode):
+    """Java record component (Java 14+)."""
+    modifiers: List[JavaModifier] = field(default_factory=list)
+    annotations: List['JavaAnnotation'] = field(default_factory=list)
+    component_type: JavaType = None
+    name: str = ""
+    
+    def accept(self, visitor):
+        return visitor.visit_record_component(self)
 
 
 class JavaNodeVisitor(ABC):
@@ -1557,3 +1669,15 @@ class JavaNodeVisitor(ABC):
     
     @abstractmethod
     def visit_provides_directive(self, node: JavaProvidesDirective): pass
+
+
+@dataclass
+class JavaRecordComponent(JavaNode):
+    """Java record component (Java 14+)."""
+    modifiers: List[JavaModifier] = field(default_factory=list)
+    annotations: List['JavaAnnotation'] = field(default_factory=list)
+    component_type: JavaType = None
+    name: str = ""
+    
+    def accept(self, visitor):
+        return visitor.visit_record_component(self)

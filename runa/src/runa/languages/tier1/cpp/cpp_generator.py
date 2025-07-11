@@ -815,21 +815,243 @@ class CppCodeGenerator:
             self._visit_template_parameter(param)
     
     def _visit_template_parameter(self, node: CppTemplateParameter):
-        """Visit template parameter."""
-        if node.kind == "type":
-            self._write("typename")
-        elif node.kind == "template":
-            self._write("template")
-        else:
-            # Non-type parameter - simplified
+        """Visit template parameter with comprehensive handling."""
+        try:
+            if hasattr(node, 'kind'):
+                if node.kind == "type":
+                    # Type parameter: typename T
+                    self._write("typename")
+                    
+                    # Handle C++20 concepts/constraints
+                    if hasattr(node, 'constraints') and node.constraints:
+                        self._write(" ")
+                        self._visit_constraint_list(node.constraints)
+                    
+                    if hasattr(node, 'name') and node.name:
+                        self._write(f" {node.name}")
+                    
+                    # Handle default type
+                    if hasattr(node, 'default_value') and node.default_value:
+                        self._write(" = ")
+                        self._visit_node(node.default_value)
+                
+                elif node.kind == "non_type":
+                    # Non-type parameter: int N
+                    if hasattr(node, 'type') and node.type:
+                        self._visit_node(node.type)
+                    else:
+                        self._write("auto")
+                    
+                    if hasattr(node, 'name') and node.name:
+                        self._write(f" {node.name}")
+                    
+                    # Handle default value
+                    if hasattr(node, 'default_value') and node.default_value:
+                        self._write(" = ")
+                        self._visit_node(node.default_value)
+                
+                elif node.kind == "template":
+                    # Template template parameter: template<typename> class Container
+                    self._write("template")
+                    
+                    # Handle template parameters of the template parameter
+                    if hasattr(node, 'template_params') and node.template_params:
+                        self._write("<")
+                        self._visit_template_parameter_list(node.template_params)
+                        self._write(">")
+                    
+                    self._write(" class")
+                    
+                    if hasattr(node, 'name') and node.name:
+                        self._write(f" {node.name}")
+                    
+                    # Handle default template
+                    if hasattr(node, 'default_value') and node.default_value:
+                        self._write(" = ")
+                        self._visit_node(node.default_value)
+                
+                elif node.kind == "concept":
+                    # C++20 concept parameter: Concept T
+                    if hasattr(node, 'concept_name') and node.concept_name:
+                        self._write(node.concept_name)
+                    else:
+                        self._write("Concept")
+                    
+                    if hasattr(node, 'name') and node.name:
+                        self._write(f" {node.name}")
+                    
+                    # Handle concept arguments
+                    if hasattr(node, 'concept_args') and node.concept_args:
+                        self._write("<")
+                        for i, arg in enumerate(node.concept_args):
+                            if i > 0:
+                                self._write(", ")
+                            self._visit_node(arg)
+                        self._write(">")
+                
+                elif node.kind == "parameter_pack":
+                    # Variadic template parameter: typename... Args
+                    self._write("typename...")
+                    
+                    if hasattr(node, 'name') and node.name:
+                        self._write(f" {node.name}")
+                    
+                    # Handle constraints for parameter packs
+                    if hasattr(node, 'constraints') and node.constraints:
+                        self._write(" ")
+                        self._visit_constraint_list(node.constraints)
+                
+                elif node.kind == "non_type_pack":
+                    # Non-type parameter pack: int... Values
+                    if hasattr(node, 'type') and node.type:
+                        self._visit_node(node.type)
+                    else:
+                        self._write("auto")
+                    
+                    self._write("...")
+                    
+                    if hasattr(node, 'name') and node.name:
+                        self._write(f" {node.name}")
+                
+                else:
+                    # Unknown parameter kind - fallback
+                    self._write("auto")
+                    if hasattr(node, 'name') and node.name:
+                        self._write(f" {node.name}")
+            else:
+                # Fallback for nodes without kind attribute
+                self._write("auto")
+                if hasattr(node, 'name') and node.name:
+                    self._write(f" {node.name}")
+                    
+        except Exception as e:
+            self._log_error(f"Error visiting template parameter: {e}")
+            # Fallback to basic output
             self._write("auto")
-        
-        if node.name:
-            self._write(f" {node.name}")
-        
-        if node.default_value:
-            self._write(" = ")
-            self._visit_node(node.default_value)
+            if hasattr(node, 'name') and node.name:
+                self._write(f" {node.name}")
+    
+    def _visit_constraint_list(self, constraints):
+        """Visit C++20 concept constraints."""
+        try:
+            if not constraints:
+                return
+            
+            # Handle single constraint
+            if len(constraints) == 1:
+                self._visit_constraint(constraints[0])
+                return
+            
+            # Handle multiple constraints with logical operators
+            for i, constraint in enumerate(constraints):
+                if i > 0:
+                    # Add logical operator between constraints
+                    if hasattr(constraint, 'logical_op'):
+                        if constraint.logical_op == "and":
+                            self._write(" && ")
+                        elif constraint.logical_op == "or":
+                            self._write(" || ")
+                        else:
+                            self._write(" && ")
+                    else:
+                        self._write(" && ")
+                
+                self._visit_constraint(constraint)
+                
+        except Exception as e:
+            self._log_error(f"Error visiting constraint list: {e}")
+    
+    def _visit_constraint(self, constraint):
+        """Visit individual C++20 concept constraint."""
+        try:
+            if hasattr(constraint, 'kind'):
+                if constraint.kind == "concept":
+                    # Concept constraint: Concept<T>
+                    if hasattr(constraint, 'concept_name'):
+                        self._write(constraint.concept_name)
+                    
+                    if hasattr(constraint, 'arguments') and constraint.arguments:
+                        self._write("<")
+                        for i, arg in enumerate(constraint.arguments):
+                            if i > 0:
+                                self._write(", ")
+                            self._visit_node(arg)
+                        self._write(">")
+                
+                elif constraint.kind == "type":
+                    # Type constraint: std::is_integral_v<T>
+                    if hasattr(constraint, 'type'):
+                        self._visit_node(constraint.type)
+                
+                elif constraint.kind == "expression":
+                    # Expression constraint: requires { T::value }
+                    self._write("requires { ")
+                    if hasattr(constraint, 'expression'):
+                        self._visit_node(constraint.expression)
+                    self._write(" }")
+                
+                elif constraint.kind == "compound":
+                    # Compound constraint: requires { typename T::type; }
+                    self._write("requires { ")
+                    if hasattr(constraint, 'requirements'):
+                        for req in constraint.requirements:
+                            self._visit_requirement(req)
+                            self._write("; ")
+                    self._write("}")
+                
+                else:
+                    # Unknown constraint type
+                    self._write("auto")
+            else:
+                # Fallback
+                self._write("auto")
+                
+        except Exception as e:
+            self._log_error(f"Error visiting constraint: {e}")
+            self._write("auto")
+    
+    def _visit_requirement(self, requirement):
+        """Visit C++20 requirement within a requires clause."""
+        try:
+            if hasattr(requirement, 'kind'):
+                if requirement.kind == "type":
+                    # Type requirement: typename T::type
+                    self._write("typename ")
+                    if hasattr(requirement, 'type'):
+                        self._visit_node(requirement.type)
+                
+                elif requirement.kind == "simple":
+                    # Simple requirement: T::value
+                    if hasattr(requirement, 'expression'):
+                        self._visit_node(requirement.expression)
+                
+                elif requirement.kind == "compound":
+                    # Compound requirement: { T::value } -> std::convertible_to<int>
+                    self._write("{ ")
+                    if hasattr(requirement, 'expression'):
+                        self._visit_node(requirement.expression)
+                    self._write(" }")
+                    
+                    if hasattr(requirement, 'return_type'):
+                        self._write(" -> ")
+                        self._visit_node(requirement.return_type)
+                
+                elif requirement.kind == "nested":
+                    # Nested requirement: requires T::value
+                    self._write("requires ")
+                    if hasattr(requirement, 'constraint'):
+                        self._visit_constraint(requirement.constraint)
+                
+                else:
+                    # Unknown requirement type
+                    self._write("auto")
+            else:
+                # Fallback
+                self._write("auto")
+                
+        except Exception as e:
+            self._log_error(f"Error visiting requirement: {e}")
+            self._write("auto")
     
     def _visit_builtin_type(self, node: CppBuiltinType):
         """Visit builtin type."""
@@ -893,23 +1115,175 @@ class CppCodeGenerator:
         self._write(f"{spaces}{access.value}:\n")
     
     def _needs_parentheses(self, node: CppBinaryOp) -> bool:
-        """Check if binary operation needs parentheses."""
-        # Simplified precedence check
-        precedence = {
-            CppOperator.LOGICAL_OR: 1,
-            CppOperator.LOGICAL_AND: 2,
-            CppOperator.BIT_OR: 3,
-            CppOperator.BIT_XOR: 4,
-            CppOperator.BIT_AND: 5,
-            CppOperator.EQ: 6, CppOperator.NE: 6,
-            CppOperator.LT: 7, CppOperator.LE: 7, CppOperator.GT: 7, CppOperator.GE: 7,
-            CppOperator.LEFT_SHIFT: 8, CppOperator.RIGHT_SHIFT: 8,
-            CppOperator.ADD: 9, CppOperator.SUB: 9,
-            CppOperator.MUL: 10, CppOperator.DIV: 10, CppOperator.MOD: 10,
-        }
-        
-        # For now, be conservative and add parentheses for mixed operations
-        return False  # Simplified
+        """Check if binary operation needs parentheses based on operator precedence."""
+        try:
+            # C++ operator precedence table (higher number = higher precedence)
+            precedence = {
+                # Assignment operators (lowest precedence)
+                CppOperator.ASSIGN: 1,
+                CppOperator.ADD_ASSIGN: 1, CppOperator.SUB_ASSIGN: 1,
+                CppOperator.MUL_ASSIGN: 1, CppOperator.DIV_ASSIGN: 1, CppOperator.MOD_ASSIGN: 1,
+                CppOperator.LEFT_SHIFT_ASSIGN: 1, CppOperator.RIGHT_SHIFT_ASSIGN: 1,
+                CppOperator.BIT_AND_ASSIGN: 1, CppOperator.BIT_OR_ASSIGN: 1, CppOperator.BIT_XOR_ASSIGN: 1,
+                
+                # Conditional operator
+                CppOperator.CONDITIONAL: 2,
+                
+                # Logical OR
+                CppOperator.LOGICAL_OR: 3,
+                
+                # Logical AND
+                CppOperator.LOGICAL_AND: 4,
+                
+                # Bitwise OR
+                CppOperator.BIT_OR: 5,
+                
+                # Bitwise XOR
+                CppOperator.BIT_XOR: 6,
+                
+                # Bitwise AND
+                CppOperator.BIT_AND: 7,
+                
+                # Equality operators
+                CppOperator.EQ: 8, CppOperator.NE: 8,
+                
+                # Relational operators
+                CppOperator.LT: 9, CppOperator.LE: 9, CppOperator.GT: 9, CppOperator.GE: 9,
+                CppOperator.SPACESHIP: 9,  # C++20 three-way comparison
+                
+                # Shift operators
+                CppOperator.LEFT_SHIFT: 10, CppOperator.RIGHT_SHIFT: 10,
+                
+                # Additive operators
+                CppOperator.ADD: 11, CppOperator.SUB: 11,
+                
+                # Multiplicative operators
+                CppOperator.MUL: 12, CppOperator.DIV: 12, CppOperator.MOD: 12,
+                
+                # Pointer-to-member operators
+                CppOperator.POINTER_TO_MEMBER: 13,
+                
+                # Unary operators (highest precedence)
+                CppOperator.UNARY_PLUS: 14, CppOperator.UNARY_MINUS: 14,
+                CppOperator.LOGICAL_NOT: 14, CppOperator.BIT_NOT: 14,
+                CppOperator.DEREF: 14, CppOperator.ADDR_OF: 14,
+                CppOperator.SIZEOF: 14, CppOperator.ALIGNOF: 14,
+                CppOperator.CAST: 14, CppOperator.NEW: 14, CppOperator.DELETE: 14,
+            }
+            
+            # Get current operator precedence
+            current_prec = precedence.get(node.operator, 0)
+            
+            # Check left operand
+            if isinstance(node.left, CppBinaryOp):
+                left_prec = precedence.get(node.left.operator, 0)
+                # Left associativity: if left precedence is lower, we need parentheses
+                if left_prec < current_prec:
+                    return True
+                # Same precedence: check associativity rules
+                elif left_prec == current_prec:
+                    # Most operators are left-associative, except assignment and conditional
+                    if node.operator in [CppOperator.ASSIGN, CppOperator.ADD_ASSIGN, 
+                                       CppOperator.SUB_ASSIGN, CppOperator.MUL_ASSIGN,
+                                       CppOperator.DIV_ASSIGN, CppOperator.MOD_ASSIGN,
+                                       CppOperator.LEFT_SHIFT_ASSIGN, CppOperator.RIGHT_SHIFT_ASSIGN,
+                                       CppOperator.BIT_AND_ASSIGN, CppOperator.BIT_OR_ASSIGN,
+                                       CppOperator.BIT_XOR_ASSIGN, CppOperator.CONDITIONAL]:
+                        # Right-associative operators
+                        return False
+                    else:
+                        # Left-associative operators
+                        return True
+            
+            # Check right operand
+            if isinstance(node.right, CppBinaryOp):
+                right_prec = precedence.get(node.right.operator, 0)
+                # Right associativity: if right precedence is lower or equal, we need parentheses
+                if right_prec < current_prec:
+                    return True
+                # Same precedence: check associativity rules
+                elif right_prec == current_prec:
+                    # Assignment and conditional are right-associative
+                    if node.operator in [CppOperator.ASSIGN, CppOperator.ADD_ASSIGN, 
+                                       CppOperator.SUB_ASSIGN, CppOperator.MUL_ASSIGN,
+                                       CppOperator.DIV_ASSIGN, CppOperator.MOD_ASSIGN,
+                                       CppOperator.LEFT_SHIFT_ASSIGN, CppOperator.RIGHT_SHIFT_ASSIGN,
+                                       CppOperator.BIT_AND_ASSIGN, CppOperator.BIT_OR_ASSIGN,
+                                       CppOperator.BIT_XOR_ASSIGN, CppOperator.CONDITIONAL]:
+                        # Right-associative operators
+                        return True
+                    else:
+                        # Left-associative operators
+                        return False
+            
+            # Special cases for mixed-type operations
+            if self._is_mixed_type_operation(node):
+                return True
+            
+            return False
+            
+        except Exception as e:
+            # Conservative approach: add parentheses if there's any uncertainty
+            self._log_warning(f"Error in precedence check: {e}")
+            return True
+    
+    def _is_mixed_type_operation(self, node: CppBinaryOp) -> bool:
+        """Check if operation involves mixed types that might need explicit parentheses."""
+        try:
+            # Check for mixed arithmetic types
+            if node.operator in [CppOperator.ADD, CppOperator.SUB, CppOperator.MUL, CppOperator.DIV]:
+                left_type = self._get_expression_type(node.left)
+                right_type = self._get_expression_type(node.right)
+                
+                # Mixed integer/floating point operations
+                if (left_type in ['int', 'long', 'short', 'char'] and 
+                    right_type in ['float', 'double', 'long double']):
+                    return True
+                if (right_type in ['int', 'long', 'short', 'char'] and 
+                    left_type in ['float', 'double', 'long double']):
+                    return True
+                
+                # Mixed signed/unsigned operations
+                if (left_type in ['int', 'long', 'short', 'char'] and 
+                    right_type in ['unsigned int', 'unsigned long', 'unsigned short', 'unsigned char']):
+                    return True
+                if (right_type in ['int', 'long', 'short', 'char'] and 
+                    left_type in ['unsigned int', 'unsigned long', 'unsigned short', 'unsigned char']):
+                    return True
+            
+            # Check for pointer arithmetic
+            if node.operator in [CppOperator.ADD, CppOperator.SUB]:
+                left_type = self._get_expression_type(node.left)
+                right_type = self._get_expression_type(node.right)
+                
+                if 'pointer' in left_type or 'pointer' in right_type:
+                    return True
+            
+            return False
+            
+        except Exception:
+            return False
+    
+    def _get_expression_type(self, expr) -> str:
+        """Get the type of an expression (simplified)."""
+        try:
+            if hasattr(expr, 'type'):
+                return str(expr.type)
+            elif hasattr(expr, 'kind'):
+                if expr.kind == "integer_literal":
+                    return "int"
+                elif expr.kind == "floating_literal":
+                    return "double"
+                elif expr.kind == "string_literal":
+                    return "const char*"
+                elif expr.kind == "boolean_literal":
+                    return "bool"
+                elif expr.kind == "identifier":
+                    # Try to infer type from context
+                    return "auto"
+            return "auto"
+        except Exception:
+            return "auto"
     
     def _write(self, text: str):
         """Write text to output."""

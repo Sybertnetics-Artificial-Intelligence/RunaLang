@@ -11,10 +11,12 @@ import re
 from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import urlparse, unquote
 
-from .compiler.lexer import RunaLexer
-from .compiler.parser import RunaParser
-from .compiler.semantic import SemanticAnalyzer
-from .compiler.ast_nodes import *
+# Import from new architecture
+from ...languages.runa.lexer import RunaLexer
+from ...languages.runa.runa_parser import RunaParser
+from ...core.semantic import SemanticAnalyzer
+from ...core.runa_ast import *
+from ...core.translation_result import TranslationStatus
 
 
 class Position:
@@ -143,24 +145,28 @@ class RunaLanguageServer:
             return diagnostics
         
         try:
-            # Initialize lexer with text
-            self.lexer.reset_state()
-            tokens = self.lexer.tokenize(text)
+            # Parse using new architecture
+            parse_result = self.parser.parse(text)
             
-            # Parse with proper error handling
-            try:
-                ast = self.parser.parse(tokens)
+            if parse_result.status != TranslationStatus.SUCCESS:
+                # Parse error
+                diagnostic = self._create_diagnostic_from_error(
+                    Exception(parse_result.error_message), "syntax", text
+                )
+                diagnostics.append(diagnostic)
+            else:
+                ast = parse_result.result
                 
-                # Semantic analysis with context
+                # Semantic analysis
                 try:
-                    self.semantic_analyzer.reset()
                     self.semantic_analyzer.analyze(ast)
                     
-                    # Check for semantic warnings
-                    warnings = self.semantic_analyzer.get_warnings()
-                    for warning in warnings:
-                        diagnostic = self._create_diagnostic_from_warning(warning)
-                        diagnostics.append(diagnostic)
+                    # Check for semantic warnings (if analyzer provides them)
+                    if hasattr(self.semantic_analyzer, 'get_warnings'):
+                        warnings = self.semantic_analyzer.get_warnings()
+                        for warning in warnings:
+                            diagnostic = self._create_diagnostic_from_warning(warning)
+                            diagnostics.append(diagnostic)
                         
                 except Exception as semantic_error:
                     diagnostic = self._create_diagnostic_from_error(
@@ -168,15 +174,9 @@ class RunaLanguageServer:
                     )
                     diagnostics.append(diagnostic)
                     
-            except Exception as parse_error:
-                diagnostic = self._create_diagnostic_from_error(
-                    parse_error, "syntax", text
-                )
-                diagnostics.append(diagnostic)
-                
-        except Exception as lex_error:
+        except Exception as error:
             diagnostic = self._create_diagnostic_from_error(
-                lex_error, "lexical", text
+                error, "general", text
             )
             diagnostics.append(diagnostic)
         

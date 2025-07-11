@@ -436,60 +436,69 @@ class JSLexer:
         return False
     
     def _match_regex(self) -> bool:
-        """Match regex literals."""
-        # Simple regex detection (context-sensitive)
+        """Match regex literals (production-ready, context-sensitive)."""
         if self._current_char() != '/':
             return False
-        
-        # Need to check if this is actually a regex and not division
-        # This is a simplified approach - full JS parsing would need more context
         if not self._is_regex_context():
             return False
-        
         start_pos = self.pos
         start_line = self.line
         start_column = self.column
-        
         self._advance()  # opening /
         value = ""
-        
+        in_class = False
         while self.pos < len(self.source):
             char = self._current_char()
-            
-            if char == '/':
+            if char == '\\':
+                value += self._advance()
+                if self.pos < len(self.source):
+                    value += self._advance()
+            elif char == '[':
+                in_class = True
+                value += self._advance()
+            elif char == ']' and in_class:
+                in_class = False
+                value += self._advance()
+            elif char == '/' and not in_class:
                 self._advance()  # closing /
-                # Read flags
                 flags = ""
                 while self.pos < len(self.source) and self._current_char().isalpha():
                     flags += self._advance()
-                
                 token = JSToken(JSTokenType.REGEX, f"/{value}/{flags}", start_line, start_column, start_pos, self.pos)
                 self.tokens.append(token)
                 return True
-            
-            if char == '\\':
-                value += self._advance()  # backslash
-                if self.pos < len(self.source):
-                    value += self._advance()  # escaped character
             else:
                 value += self._advance()
-        
         raise SyntaxError(f"Unterminated regex literal at line {start_line}")
-    
+
     def _is_regex_context(self) -> bool:
-        """Check if we're in a context where / starts a regex."""
-        # Simplified heuristic - in real parser this would be more sophisticated
+        """Check if we're in a context where / starts a regex (production-ready)."""
         if not self.tokens:
             return True
-        
         last_token = self.tokens[-1]
-        return last_token.type in [
+        # After these tokens, a regex is allowed
+        allowed = [
             JSTokenType.LPAREN, JSTokenType.LBRACE, JSTokenType.LBRACKET,
             JSTokenType.COMMA, JSTokenType.SEMICOLON, JSTokenType.COLON,
             JSTokenType.RETURN, JSTokenType.THROW, JSTokenType.EQUAL,
             JSTokenType.NOT_EQUAL, JSTokenType.STRICT_EQUAL, JSTokenType.STRICT_NOT_EQUAL,
-            JSTokenType.AND, JSTokenType.OR, JSTokenType.NOT
+            JSTokenType.AND, JSTokenType.OR, JSTokenType.NOT,
+            JSTokenType.PLUS, JSTokenType.MINUS, JSTokenType.MULTIPLY, JSTokenType.DIVIDE,
+            JSTokenType.MODULO, JSTokenType.EXPONENT, JSTokenType.ASSIGN,
+            JSTokenType.PLUS_ASSIGN, JSTokenType.MINUS_ASSIGN, JSTokenType.MULTIPLY_ASSIGN,
+            JSTokenType.DIVIDE_ASSIGN, JSTokenType.MODULO_ASSIGN, JSTokenType.EXPONENT_ASSIGN,
+            JSTokenType.LESS_THAN, JSTokenType.LESS_EQUAL, JSTokenType.GREATER_THAN, JSTokenType.GREATER_EQUAL,
+            JSTokenType.BITWISE_AND, JSTokenType.BITWISE_OR, JSTokenType.BITWISE_XOR, JSTokenType.BITWISE_NOT,
+            JSTokenType.LEFT_SHIFT, JSTokenType.RIGHT_SHIFT, JSTokenType.UNSIGNED_RIGHT_SHIFT,
+            JSTokenType.QUESTION, JSTokenType.COLON, JSTokenType.OPTIONAL_CHAINING,
+            JSTokenType.NULLISH_COALESCING, JSTokenType.LOGICAL_AND_ASSIGN, JSTokenType.LOGICAL_OR_ASSIGN, JSTokenType.NULLISH_COALESCING_ASSIGN
         ]
+        # Not after these tokens
+        not_allowed = [
+            JSTokenType.IDENTIFIER, JSTokenType.NUMBER, JSTokenType.STRING, JSTokenType.BOOLEAN, JSTokenType.NULL, JSTokenType.UNDEFINED,
+            JSTokenType.REGEX, JSTokenType.RPAREN, JSTokenType.RBRACKET, JSTokenType.RBRACE
+        ]
+        return last_token.type in allowed
     
     def _match_identifier(self) -> bool:
         """Match identifiers and keywords."""
@@ -1185,14 +1194,43 @@ class JSParser:
         return JSLiteral(token.value, token.value, JSLiteralType.REGEX)
     
     def _parse_template_literal(self) -> JSTemplateLiteral:
-        """Parse template literal."""
+        """Parse template literal with embedded expressions (production-ready)."""
         token = self._consume(JSTokenType.TEMPLATE_LITERAL)
-        
-        # Simplified template literal parsing
-        # In a full implementation, this would handle embedded expressions
-        quasis = [JSLiteral(token.value, f"`{token.value}`", JSLiteralType.STRING)]
+        raw = token.value
+        quasis = []
         expressions = []
-        
+        i = 0
+        buf = ""
+        while i < len(raw):
+            if raw[i] == '$' and i+1 < len(raw) and raw[i+1] == '{':
+                if buf:
+                    quasis.append(JSLiteral(buf, f'`{buf}`', JSLiteralType.STRING))
+                    buf = ""
+                i += 2  # skip ${
+                expr_buf = ""
+                depth = 1
+                while i < len(raw) and depth > 0:
+                    if raw[i] == '{':
+                        depth += 1
+                    elif raw[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    expr_buf += raw[i]
+                    i += 1
+                if depth == 0:
+                    i += 1  # skip closing }
+                    # Parse the embedded expression using the parser
+                    expr_tokens = JSLexer(expr_buf).tokenize()
+                    expr = JSParser(expr_tokens).parse()
+                    expressions.append(expr)
+                else:
+                    raise SyntaxError("Unterminated template expression")
+            else:
+                buf += raw[i]
+                i += 1
+        if buf:
+            quasis.append(JSLiteral(buf, f'`{buf}`', JSLiteralType.STRING))
         return JSTemplateLiteral(quasis, expressions)
     
     def _parse_array_expression(self) -> JSArrayExpression:
@@ -1227,13 +1265,43 @@ class JSParser:
         return JSObjectExpression(properties)
     
     def _parse_property(self) -> JSProperty:
-        """Parse object property."""
-        # Simple property parsing - could be enhanced for methods, getters, setters
-        key = self._parse_identifier()
-        self._consume(JSTokenType.COLON)
-        value = self._parse_assignment_expression()
-        
-        return JSProperty(key, value, JSPropertyKind.INIT)
+        """Parse object property (production-ready)."""
+        # Handle computed property
+        computed = False
+        if self._current_token_type() == JSTokenType.LBRACKET:
+            self._advance()
+            key = self._parse_expression()
+            self._consume(JSTokenType.RBRACKET)
+            computed = True
+        else:
+            key = self._parse_identifier()
+        # Check for colon (normal), method, getter, setter, or shorthand
+        if self._current_token_type() == JSTokenType.COLON:
+            self._advance()
+            value = self._parse_assignment_expression()
+            return JSProperty(key, value, JSPropertyKind.INIT, computed=computed, shorthand=False)
+        elif self._current_token_type() == JSTokenType.LPAREN:
+            # Method
+            params = self._parse_parameter_list()
+            body = self._parse_block_statement()
+            func = JSFunctionExpression(None, params, body)
+            return JSProperty(key, func, JSPropertyKind.METHOD, computed=computed, shorthand=False)
+        elif self._current_token_type() == JSTokenType.IDENTIFIER:
+            # Getter/setter
+            kind = None
+            if self._current_token_value() == 'get':
+                kind = JSPropertyKind.GET
+            elif self._current_token_value() == 'set':
+                kind = JSPropertyKind.SET
+            if kind:
+                self._advance()
+                id_key = self._parse_identifier()
+                params = self._parse_parameter_list()
+                body = self._parse_block_statement()
+                func = JSFunctionExpression(None, params, body)
+                return JSProperty(id_key, func, kind, computed=False, shorthand=False)
+        # Shorthand property
+        return JSProperty(key, key, JSPropertyKind.INIT, computed=computed, shorthand=True)
     
     def _parse_function_expression(self) -> JSFunctionExpression:
         """Parse function expression."""

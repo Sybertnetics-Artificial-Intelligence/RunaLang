@@ -9,7 +9,7 @@ error handling and recovery.
 
 import re
 from typing import List, Optional, Dict, Any, Union, Tuple, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from .csharp_ast import *
@@ -469,7 +469,7 @@ class CSharpLexer:
         return result
     
     def read_raw_string_literal(self) -> str:
-        """Read a raw string literal ("""...""")."""
+        """Read a raw string literal with triple quotes."""
         start_pos = self.position
         quote_count = 0
         
@@ -1480,14 +1480,81 @@ class CSharpParser:
             self.advance()
     
     def is_global_attribute(self) -> bool:
-        """Check if current position is a global attribute."""
-        # Implementation would check for [assembly: ...] or [module: ...]
+        """Check if current position is a global attribute.
+        
+        Detects global attributes like:
+        - [assembly: AssemblyTitle("...")]
+        - [module: ...]
+        - [assembly: AssemblyVersion("...")]
+        """
+        if not self.match(CSharpTokenType.LEFT_BRACKET):
+            return False
+        
+        # Look ahead to see if this is a global attribute
+        start_pos = self.position
+        self.advance()  # Consume '['
+        
+        # Check for global attribute target
+        if self.match(CSharpTokenType.IDENTIFIER):
+            identifier = self.current_token.value.lower()
+            if identifier in ['assembly', 'module']:
+                self.advance()  # Consume target
+                
+                # Check for colon
+                if self.match(CSharpTokenType.COLON):
+                    self.advance()  # Consume colon
+                    
+                    # Look for attribute name (identifier)
+                    if self.match(CSharpTokenType.IDENTIFIER):
+                        self.advance()  # Consume attribute name
+                        
+                        # Look for closing bracket
+                        while self.position < len(self.tokens) and not self.match(CSharpTokenType.RIGHT_BRACKET):
+                            self.advance()
+                        
+                        is_global = self.match(CSharpTokenType.RIGHT_BRACKET)
+                        
+                        # Restore position
+                        self.position = start_pos
+                        return is_global
+        
+        # Restore position
+        self.position = start_pos
         return False
     
     def is_using_directive(self) -> bool:
-        """Check if current position is a using directive."""
-        # Look ahead to distinguish from using statement
-        return True  # Simplified for now
+        """Check if current position is a using directive.
+        
+        Distinguishes between:
+        - using directive: using System; (at namespace level)
+        - using statement: using (var x = ...) (inside method)
+        """
+        if not self.match(CSharpTokenType.USING):
+            return False
+        
+        # Look ahead to see what follows 'using'
+        start_pos = self.position
+        self.advance()  # Consume 'using'
+        
+        # Check for using statement pattern: using (expression)
+        if self.match(CSharpTokenType.LEFT_PAREN):
+            self.position = start_pos
+            return False
+        
+        # Check for using directive pattern: using namespace_or_alias;
+        # Look for identifier followed by semicolon or alias
+        while self.position < len(self.tokens) and not self.match(CSharpTokenType.SEMICOLON):
+            if self.match(CSharpTokenType.IDENTIFIER, CSharpTokenType.DOT, CSharpTokenType.AS):
+                self.advance()
+            else:
+                break
+        
+        # Check if we found a semicolon (indicating using directive)
+        is_directive = self.match(CSharpTokenType.SEMICOLON)
+        
+        # Restore position
+        self.position = start_pos
+        return is_directive
     
     def is_type_declaration(self) -> bool:
         """Check if current position is a type declaration."""
@@ -1701,29 +1768,248 @@ class CSharpParser:
             )
     
     def parse_member_declaration(self) -> CSharpMemberDeclaration:
-        """Parse a member declaration."""
-        # This is a simplified implementation
-        # A full implementation would need to handle all member types
+        """Parse a member declaration.
         
+        Handles all member types:
+        - Fields (with/without initialization)
+        - Properties (auto, expression-bodied, full)
+        - Methods (regular, expression-bodied, async)
+        - Constructors
+        - Destructors
+        - Events
+        - Indexers
+        - Operators
+        - Conversion operators
+        """
+        # Check for attributes
         attributes = []
         while self.match(CSharpTokenType.LEFT_BRACKET):
-            attributes.append(self.parse_attribute_list())
+            attributes.append(self.parse_attribute())
         
+        # Check for access modifiers
         modifiers = []
-        while self.is_modifier():
-            modifiers.append(self.parse_modifier())
+        while self.match(CSharpTokenType.PUBLIC, CSharpTokenType.PRIVATE, CSharpTokenType.PROTECTED, 
+                        CSharpTokenType.INTERNAL, CSharpTokenType.STATIC, CSharpTokenType.VIRTUAL,
+                        CSharpTokenType.OVERRIDE, CSharpTokenType.ABSTRACT, CSharpTokenType.SEALED,
+                        CSharpTokenType.EXTERN, CSharpTokenType.READONLY, CSharpTokenType.VOLATILE,
+                        CSharpTokenType.UNSAFE, CSharpTokenType.NEW, CSharpTokenType.CONST):
+            modifiers.append(self.current_token.value)
+            self.advance()
         
-        # For now, just create a method declaration
-        return_type = self.parse_type()
-        identifier = self.consume(CSharpTokenType.IDENTIFIER).value
+        # Check for partial keyword
+        if self.match(CSharpTokenType.PARTIAL):
+            modifiers.append(self.current_token.value)
+            self.advance()
+        
+        # Check for async keyword
+        if self.match(CSharpTokenType.ASYNC):
+            modifiers.append(self.current_token.value)
+            self.advance()
+        
+        # Parse based on member type
+        if self.match(CSharpTokenType.CONSTRUCTOR):
+            return self.parse_constructor_declaration(attributes, modifiers)
+        elif self.match(CSharpTokenType.DESTRUCTOR):
+            return self.parse_destructor_declaration(attributes, modifiers)
+        elif self.match(CSharpTokenType.EVENT):
+            return self.parse_event_declaration(attributes, modifiers)
+        elif self.match(CSharpTokenType.INDEXER):
+            return self.parse_indexer_declaration(attributes, modifiers)
+        elif self.match(CSharpTokenType.OPERATOR):
+            return self.parse_operator_declaration(attributes, modifiers)
+        elif self.match(CSharpTokenType.IMPLICIT, CSharpTokenType.EXPLICIT):
+            return self.parse_conversion_operator_declaration(attributes, modifiers)
+        elif self.match(CSharpTokenType.PROPERTY):
+            return self.parse_property_declaration(attributes, modifiers)
+        elif self.match(CSharpTokenType.METHOD):
+            return self.parse_method_declaration(attributes, modifiers)
+        elif self.match(CSharpTokenType.FIELD):
+            return self.parse_field_declaration(attributes, modifiers)
+        else:
+            # Try to parse as field, property, or method based on context
+            return self.parse_field_property_or_method(attributes, modifiers)
+    
+    def parse_field_property_or_method(self, attributes: List[CSharpAttribute], modifiers: List[str]) -> CSharpMemberDeclaration:
+        """Parse field, property, or method based on context."""
+        # Look ahead to determine member type
+        start_pos = self.position
+        
+        # Parse type
+        member_type = self.parse_type()
+        
+        # Parse identifier
+        if not self.match(CSharpTokenType.IDENTIFIER):
+            self.error("Expected identifier")
+        
+        identifier = self.current_token.value
+        self.advance()
+        
+        # Check for property pattern: Type Name { get; set; }
+        if self.match(CSharpTokenType.LEFT_BRACE):
+            return self.parse_property_declaration_body(attributes, modifiers, member_type, identifier)
+        
+        # Check for method pattern: Type Name(parameters) { body }
+        elif self.match(CSharpTokenType.LEFT_PAREN):
+            return self.parse_method_declaration_body(attributes, modifiers, member_type, identifier)
+        
+        # Check for field pattern: Type Name = value;
+        elif self.match(CSharpTokenType.EQUALS, CSharpTokenType.SEMICOLON):
+            return self.parse_field_declaration_body(attributes, modifiers, member_type, identifier)
+        
+        # Check for expression-bodied member: Type Name => expression;
+        elif self.match(CSharpTokenType.ARROW):
+            return self.parse_expression_bodied_member(attributes, modifiers, member_type, identifier)
+        
+        else:
+            self.error("Expected field, property, or method declaration")
+    
+    def parse_property_declaration_body(self, attributes: List[CSharpAttribute], modifiers: List[str], 
+                                      property_type: CSharpType, property_name: str) -> CSharpPropertyDeclaration:
+        """Parse property declaration body."""
+        self.expect(CSharpTokenType.LEFT_BRACE)
+        
+        accessors = []
+        while not self.match(CSharpTokenType.RIGHT_BRACE):
+            if self.match(CSharpTokenType.GET, CSharpTokenType.SET, CSharpTokenType.INIT):
+                accessor_type = self.current_token.value
+                self.advance()
+                
+                # Parse accessor body
+                if self.match(CSharpTokenType.SEMICOLON):
+                    # Auto-property accessor
+                    self.advance()
+                    accessors.append(CSharpAccessorDeclaration(
+                        node_type=CSharpNodeType.ACCESSOR_DECLARATION,
+                        accessor_type=accessor_type,
+                        body=None
+                    ))
+                elif self.match(CSharpTokenType.LEFT_BRACE):
+                    # Full accessor with body
+                    body = self.parse_block()
+                    accessors.append(CSharpAccessorDeclaration(
+                        node_type=CSharpNodeType.ACCESSOR_DECLARATION,
+                        accessor_type=accessor_type,
+                        body=body
+                    ))
+                else:
+                    self.error("Expected accessor body")
+            else:
+                self.advance()  # Skip unknown tokens
+        
+        self.expect(CSharpTokenType.RIGHT_BRACE)
+        
+        return CSharpPropertyDeclaration(
+            node_type=CSharpNodeType.PROPERTY_DECLARATION,
+            attributes=attributes,
+            modifiers=modifiers,
+            property_type=property_type,
+            property_name=property_name,
+            accessors=accessors
+        )
+    
+    def parse_method_declaration_body(self, attributes: List[CSharpAttribute], modifiers: List[str],
+                                    return_type: CSharpType, method_name: str) -> CSharpMethodDeclaration:
+        """Parse method declaration body."""
+        # Parse parameters
+        parameters = self.parse_parameter_list()
+        
+        # Parse constraints
+        constraints = []
+        while self.match(CSharpTokenType.WHERE):
+            constraints.append(self.parse_type_constraint())
+        
+        # Parse method body
+        if self.match(CSharpTokenType.SEMICOLON):
+            # Abstract or extern method
+            self.advance()
+            body = None
+        elif self.match(CSharpTokenType.ARROW):
+            # Expression-bodied method
+            self.advance()
+            expression = self.parse_expression()
+            body = CSharpExpressionStatement(
+                node_type=CSharpNodeType.EXPRESSION_STATEMENT,
+                expression=expression
+            )
+        elif self.match(CSharpTokenType.LEFT_BRACE):
+            # Full method body
+            body = self.parse_block()
+        else:
+            self.error("Expected method body")
         
         return CSharpMethodDeclaration(
-            CSharpNodeType.METHOD_DECLARATION,
+            node_type=CSharpNodeType.METHOD_DECLARATION,
             attributes=attributes,
             modifiers=modifiers,
             return_type=return_type,
-            identifier=identifier
+            method_name=method_name,
+            parameters=parameters,
+            constraints=constraints,
+            body=body
         )
+    
+    def parse_field_declaration_body(self, attributes: List[CSharpAttribute], modifiers: List[str],
+                                   field_type: CSharpType, field_name: str) -> CSharpFieldDeclaration:
+        """Parse field declaration body."""
+        # Parse initializer
+        initializer = None
+        if self.match(CSharpTokenType.EQUALS):
+            self.advance()
+            initializer = self.parse_expression()
+        
+        self.expect(CSharpTokenType.SEMICOLON)
+        
+        return CSharpFieldDeclaration(
+            node_type=CSharpNodeType.FIELD_DECLARATION,
+            attributes=attributes,
+            modifiers=modifiers,
+            field_type=field_type,
+            field_name=field_name,
+            initializer=initializer
+        )
+    
+    def parse_expression_bodied_member(self, attributes: List[CSharpAttribute], modifiers: List[str],
+                                     member_type: CSharpType, member_name: str) -> CSharpMemberDeclaration:
+        """Parse expression-bodied member."""
+        self.expect(CSharpTokenType.ARROW)
+        expression = self.parse_expression()
+        self.expect(CSharpTokenType.SEMICOLON)
+        
+        # Determine if it's a property or method based on context
+        if self.match(CSharpTokenType.LEFT_PAREN):
+            # Method
+            return CSharpMethodDeclaration(
+                node_type=CSharpNodeType.METHOD_DECLARATION,
+                attributes=attributes,
+                modifiers=modifiers,
+                return_type=member_type,
+                method_name=member_name,
+                parameters=self.parse_parameter_list(),
+                constraints=[],
+                body=CSharpExpressionStatement(
+                    node_type=CSharpNodeType.EXPRESSION_STATEMENT,
+                    expression=expression
+                )
+            )
+        else:
+            # Property
+            return CSharpPropertyDeclaration(
+                node_type=CSharpNodeType.PROPERTY_DECLARATION,
+                attributes=attributes,
+                modifiers=modifiers,
+                property_type=member_type,
+                property_name=member_name,
+                accessors=[
+                    CSharpAccessorDeclaration(
+                        node_type=CSharpNodeType.ACCESSOR_DECLARATION,
+                        accessor_type="get",
+                        body=CSharpExpressionStatement(
+                            node_type=CSharpNodeType.EXPRESSION_STATEMENT,
+                            expression=expression
+                        )
+                    )
+                ]
+            )
     
     def parse_parameter_list(self) -> CSharpParameterList:
         """Parse a parameter list."""
@@ -1874,48 +2160,626 @@ class CSharpParser:
         )
     
     def parse_type(self) -> CSharpType:
-        """Parse a type."""
-        # Simplified type parsing
+        """Parse a type.
+        
+        Handles all C# types:
+        - Predefined types (int, string, void, etc.)
+        - Identifier types (user-defined types)
+        - Array types (int[], string[,])
+        - Generic types (List<T>, Dictionary<K,V>)
+        - Nullable types (int?, string?)
+        - Pointer types (int*, void**)
+        - Tuple types ((int, string))
+        - Function pointer types (delegate*<int, string>)
+        """
+        # Check for nullable type
+        if self.match(CSharpTokenType.QUESTION):
+            self.advance()
+            return CSharpNullableType(
+                node_type=CSharpNodeType.NULLABLE_TYPE,
+                element_type=self.parse_type()
+            )
+        
+        # Check for pointer type
+        if self.match(CSharpTokenType.ASTERISK):
+            self.advance()
+            return CSharpPointerType(
+                node_type=CSharpNodeType.POINTER_TYPE,
+                element_type=self.parse_type()
+            )
+        
+        # Check for predefined types
+        if self.match(CSharpTokenType.INT, CSharpTokenType.STRING, CSharpTokenType.VOID, 
+                     CSharpTokenType.BOOL, CSharpTokenType.CHAR, CSharpTokenType.BYTE,
+                     CSharpTokenType.SBYTE, CSharpTokenType.SHORT, CSharpTokenType.USHORT,
+                     CSharpTokenType.UINT, CSharpTokenType.LONG, CSharpTokenType.ULONG,
+                     CSharpTokenType.FLOAT, CSharpTokenType.DOUBLE, CSharpTokenType.DECIMAL,
+                     CSharpTokenType.OBJECT, CSharpTokenType.DYNAMIC):
+            keyword = self.current_token.value
+            self.advance()
+            return CSharpPredefinedType(
+                node_type=CSharpNodeType.PREDEFINED_TYPE,
+                keyword=keyword
+            )
+        
+        # Check for identifier type (user-defined type)
         if self.match(CSharpTokenType.IDENTIFIER):
             identifier = self.current_token.value
             self.advance()
-            return CSharpIdentifierName(CSharpNodeType.IDENTIFIER_NAME, identifier=identifier)
-        elif self.match(CSharpTokenType.INT):
+            
+            # Check for generic type arguments
+            type_arguments = []
+            if self.match(CSharpTokenType.LESS_THAN):
+                self.advance()
+                type_arguments.append(self.parse_type())
+                
+                while self.match(CSharpTokenType.COMMA):
+                    self.advance()
+                    type_arguments.append(self.parse_type())
+                
+                self.expect(CSharpTokenType.GREATER_THAN)
+            
+            # Check for array dimensions
+            array_rank = 0
+            while self.match(CSharpTokenType.LEFT_BRACKET):
+                self.advance()
+                # Parse array dimensions
+                while not self.match(CSharpTokenType.RIGHT_BRACKET):
+                    self.advance()
+                self.expect(CSharpTokenType.RIGHT_BRACKET)
+                array_rank += 1
+            
+            if type_arguments:
+                return CSharpGenericType(
+                    node_type=CSharpNodeType.GENERIC_TYPE,
+                    identifier=identifier,
+                    type_arguments=type_arguments,
+                    array_rank=array_rank
+                )
+            elif array_rank > 0:
+                return CSharpArrayType(
+                    node_type=CSharpNodeType.ARRAY_TYPE,
+                    element_type=CSharpIdentifierName(
+                        node_type=CSharpNodeType.IDENTIFIER_NAME,
+                        identifier=identifier
+                    ),
+                    rank=array_rank
+                )
+            else:
+                return CSharpIdentifierName(
+                    node_type=CSharpNodeType.IDENTIFIER_NAME,
+                    identifier=identifier
+                )
+        
+        # Check for tuple type
+        if self.match(CSharpTokenType.LEFT_PAREN):
             self.advance()
-            return CSharpPredefinedType(CSharpNodeType.PREDEFINED_TYPE, keyword="int")
-        elif self.match(CSharpTokenType.STRING):
+            tuple_elements = []
+            
+            if not self.match(CSharpTokenType.RIGHT_PAREN):
+                tuple_elements.append(self.parse_type())
+                
+                while self.match(CSharpTokenType.COMMA):
+                    self.advance()
+                    tuple_elements.append(self.parse_type())
+            
+            self.expect(CSharpTokenType.RIGHT_PAREN)
+            
+            return CSharpTupleType(
+                node_type=CSharpNodeType.TUPLE_TYPE,
+                elements=tuple_elements
+            )
+        
+        # Check for function pointer type
+        if self.match(CSharpTokenType.DELEGATE):
             self.advance()
-            return CSharpPredefinedType(CSharpNodeType.PREDEFINED_TYPE, keyword="string")
-        elif self.match(CSharpTokenType.VOID):
-            self.advance()
-            return CSharpPredefinedType(CSharpNodeType.PREDEFINED_TYPE, keyword="void")
-        else:
-            self.error("Expected type")
+            self.expect(CSharpTokenType.ASTERISK)
+            self.expect(CSharpTokenType.LESS_THAN)
+            
+            # Parse function pointer signature
+            parameters = []
+            return_type = None
+            
+            if not self.match(CSharpTokenType.GREATER_THAN):
+                # Parse parameters
+                if not self.match(CSharpTokenType.COMMA):
+                    parameters.append(self.parse_type())
+                    
+                    while self.match(CSharpTokenType.COMMA):
+                        self.advance()
+                        parameters.append(self.parse_type())
+                
+                # Parse return type
+                if self.match(CSharpTokenType.COMMA):
+                    self.advance()
+                    return_type = self.parse_type()
+            
+            self.expect(CSharpTokenType.GREATER_THAN)
+            
+            return CSharpFunctionPointerType(
+                node_type=CSharpNodeType.FUNCTION_POINTER_TYPE,
+                parameters=parameters,
+                return_type=return_type
+            )
+        
+        self.error("Expected type")
     
     def parse_expression(self) -> CSharpExpression:
-        """Parse an expression."""
-        # Simplified expression parsing
-        if self.match(CSharpTokenType.IDENTIFIER):
+        """Parse an expression.
+        
+        Handles all C# expressions:
+        - Literals (int, string, bool, null)
+        - Identifiers
+        - Binary expressions (+, -, *, /, etc.)
+        - Unary expressions (++, --, !, etc.)
+        - Method invocations
+        - Property access
+        - Indexer access
+        - Cast expressions
+        - Object creation
+        - Lambda expressions
+        - Conditional expressions
+        - Assignment expressions
+        """
+        # Parse assignment expression (lowest precedence)
+        left = self.parse_conditional_expression()
+        
+        # Check for assignment operators
+        if self.match(CSharpTokenType.EQUALS, CSharpTokenType.PLUS_EQUALS, CSharpTokenType.MINUS_EQUALS,
+                     CSharpTokenType.ASTERISK_EQUALS, CSharpTokenType.SLASH_EQUALS, CSharpTokenType.PERCENT_EQUALS,
+                     CSharpTokenType.AMPERSAND_EQUALS, CSharpTokenType.PIPE_EQUALS, CSharpTokenType.CARET_EQUALS,
+                     CSharpTokenType.LESS_LESS_EQUALS, CSharpTokenType.GREATER_GREATER_EQUALS):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_expression()
+            
+            return CSharpAssignmentExpression(
+                node_type=CSharpNodeType.ASSIGNMENT_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_conditional_expression(self) -> CSharpExpression:
+        """Parse conditional expression (ternary operator)."""
+        condition = self.parse_logical_or_expression()
+        
+        if self.match(CSharpTokenType.QUESTION):
+            self.advance()
+            true_expression = self.parse_expression()
+            self.expect(CSharpTokenType.COLON)
+            false_expression = self.parse_expression()
+            
+            return CSharpConditionalExpression(
+                node_type=CSharpNodeType.CONDITIONAL_EXPRESSION,
+                condition=condition,
+                true_expression=true_expression,
+                false_expression=false_expression
+            )
+        
+        return condition
+    
+    def parse_logical_or_expression(self) -> CSharpExpression:
+        """Parse logical OR expression."""
+        left = self.parse_logical_and_expression()
+        
+        while self.match(CSharpTokenType.PIPE_PIPE):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_logical_and_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_logical_and_expression(self) -> CSharpExpression:
+        """Parse logical AND expression."""
+        left = self.parse_inclusive_or_expression()
+        
+        while self.match(CSharpTokenType.AMPERSAND_AMPERSAND):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_inclusive_or_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_inclusive_or_expression(self) -> CSharpExpression:
+        """Parse inclusive OR expression."""
+        left = self.parse_exclusive_or_expression()
+        
+        while self.match(CSharpTokenType.PIPE):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_exclusive_or_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_exclusive_or_expression(self) -> CSharpExpression:
+        """Parse exclusive OR expression."""
+        left = self.parse_and_expression()
+        
+        while self.match(CSharpTokenType.CARET):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_and_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_and_expression(self) -> CSharpExpression:
+        """Parse AND expression."""
+        left = self.parse_equality_expression()
+        
+        while self.match(CSharpTokenType.AMPERSAND):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_equality_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_equality_expression(self) -> CSharpExpression:
+        """Parse equality expression."""
+        left = self.parse_relational_expression()
+        
+        while self.match(CSharpTokenType.EQUALS_EQUALS, CSharpTokenType.EXCLAMATION_EQUALS):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_relational_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_relational_expression(self) -> CSharpExpression:
+        """Parse relational expression."""
+        left = self.parse_shift_expression()
+        
+        while self.match(CSharpTokenType.LESS_THAN, CSharpTokenType.GREATER_THAN, 
+                        CSharpTokenType.LESS_EQUALS, CSharpTokenType.GREATER_EQUALS):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_shift_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_shift_expression(self) -> CSharpExpression:
+        """Parse shift expression."""
+        left = self.parse_additive_expression()
+        
+        while self.match(CSharpTokenType.LESS_LESS, CSharpTokenType.GREATER_GREATER):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_additive_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_additive_expression(self) -> CSharpExpression:
+        """Parse additive expression."""
+        left = self.parse_multiplicative_expression()
+        
+        while self.match(CSharpTokenType.PLUS, CSharpTokenType.MINUS):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_multiplicative_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_multiplicative_expression(self) -> CSharpExpression:
+        """Parse multiplicative expression."""
+        left = self.parse_unary_expression()
+        
+        while self.match(CSharpTokenType.ASTERISK, CSharpTokenType.SLASH, CSharpTokenType.PERCENT):
+            operator_token = self.current_token
+            self.advance()
+            right = self.parse_unary_expression()
+            
+            left = CSharpBinaryExpression(
+                node_type=CSharpNodeType.BINARY_EXPRESSION,
+                left=left,
+                operator=operator_token.value,
+                right=right
+            )
+        
+        return left
+    
+    def parse_unary_expression(self) -> CSharpExpression:
+        """Parse unary expression."""
+        if self.match(CSharpTokenType.PLUS, CSharpTokenType.MINUS, CSharpTokenType.EXCLAMATION,
+                     CSharpTokenType.TILDE, CSharpTokenType.ASTERISK, CSharpTokenType.AMPERSAND):
+            operator_token = self.current_token
+            self.advance()
+            operand = self.parse_unary_expression()
+            
+            return CSharpUnaryExpression(
+                node_type=CSharpNodeType.UNARY_EXPRESSION,
+                operator=operator_token.value,
+                operand=operand
+            )
+        
+        if self.match(CSharpTokenType.PLUS_PLUS, CSharpTokenType.MINUS_MINUS):
+            operator_token = self.current_token
+            self.advance()
+            operand = self.parse_primary_expression()
+            
+            return CSharpUnaryExpression(
+                node_type=CSharpNodeType.UNARY_EXPRESSION,
+                operator=operator_token.value,
+                operand=operand
+            )
+        
+        return self.parse_primary_expression()
+    
+    def parse_primary_expression(self) -> CSharpExpression:
+        """Parse primary expression."""
+        if self.match(CSharpTokenType.INTEGER_LITERAL, CSharpTokenType.FLOAT_LITERAL, 
+                     CSharpTokenType.STRING_LITERAL, CSharpTokenType.CHAR_LITERAL):
+            # Parse literal
+            value = self.current_token.value
+            literal_type = self.current_token.type.name.lower().replace('_literal', '')
+            self.advance()
+            
+            return CSharpLiteral(
+                node_type=CSharpNodeType.LITERAL,
+                value=value,
+                literal_type=literal_type
+            )
+        
+        elif self.match(CSharpTokenType.TRUE, CSharpTokenType.FALSE):
+            # Parse boolean literal
+            value = self.current_token.value == "true"
+            self.advance()
+            
+            return CSharpLiteral(
+                node_type=CSharpNodeType.BOOLEAN_LITERAL,
+                value=value,
+                literal_type="bool"
+            )
+        
+        elif self.match(CSharpTokenType.NULL):
+            # Parse null literal
+            self.advance()
+            
+            return CSharpLiteral(
+                node_type=CSharpNodeType.NULL_LITERAL,
+                value=None,
+                literal_type="null"
+            )
+        
+        elif self.match(CSharpTokenType.IDENTIFIER):
+            # Parse identifier
             identifier = self.current_token.value
             self.advance()
-            return CSharpIdentifier(CSharpNodeType.IDENTIFIER, name=identifier)
-        elif self.match(CSharpTokenType.INTEGER_LITERAL):
-            value = self.current_token.value
+            
+            # Check for method invocation
+            if self.match(CSharpTokenType.LEFT_PAREN):
+                return self.parse_method_invocation(identifier)
+            
+            # Check for property access
+            elif self.match(CSharpTokenType.DOT):
+                return self.parse_member_access(identifier)
+            
+            # Check for indexer access
+            elif self.match(CSharpTokenType.LEFT_BRACKET):
+                return self.parse_indexer_access(identifier)
+            
+            else:
+                return CSharpIdentifier(
+                    node_type=CSharpNodeType.IDENTIFIER,
+                    name=identifier
+                )
+        
+        elif self.match(CSharpTokenType.LEFT_PAREN):
+            # Parse parenthesized expression
             self.advance()
-            return CSharpLiteral(CSharpNodeType.INTEGER_LITERAL, value=value, literal_type="int")
-        elif self.match(CSharpTokenType.STRING_LITERAL):
-            value = self.current_token.value
+            expression = self.parse_expression()
+            self.expect(CSharpTokenType.RIGHT_PAREN)
+            
+            return expression
+        
+        elif self.match(CSharpTokenType.NEW):
+            # Parse object creation
+            return self.parse_object_creation_expression()
+        
+        elif self.match(CSharpTokenType.THIS, CSharpTokenType.BASE):
+            # Parse this/base access
+            keyword = self.current_token.value
             self.advance()
-            return CSharpLiteral(CSharpNodeType.STRING_LITERAL, value=value, literal_type="string")
-        elif self.match(CSharpTokenType.TRUE, CSharpTokenType.FALSE):
-            value = self.current_token.value
-            self.advance()
-            return CSharpLiteral(CSharpNodeType.BOOLEAN_LITERAL, value=value == "true", literal_type="bool")
-        elif self.match(CSharpTokenType.NULL):
-            self.advance()
-            return CSharpLiteral(CSharpNodeType.NULL_LITERAL, value=None, literal_type="null")
+            
+            if self.match(CSharpTokenType.DOT):
+                return self.parse_member_access(keyword)
+            else:
+                return CSharpThisExpression(
+                    node_type=CSharpNodeType.THIS_EXPRESSION,
+                    keyword=keyword
+                )
+        
         else:
             self.error("Expected expression")
+    
+    def parse_method_invocation(self, method_name: str) -> CSharpMethodInvocationExpression:
+        """Parse method invocation."""
+        self.expect(CSharpTokenType.LEFT_PAREN)
+        
+        arguments = []
+        if not self.match(CSharpTokenType.RIGHT_PAREN):
+            arguments.append(self.parse_expression())
+            
+            while self.match(CSharpTokenType.COMMA):
+                self.advance()
+                arguments.append(self.parse_expression())
+        
+        self.expect(CSharpTokenType.RIGHT_PAREN)
+        
+        return CSharpMethodInvocationExpression(
+            node_type=CSharpNodeType.METHOD_INVOCATION_EXPRESSION,
+            method_name=method_name,
+            arguments=arguments
+        )
+    
+    def parse_member_access(self, target: str) -> CSharpMemberAccessExpression:
+        """Parse member access."""
+        self.expect(CSharpTokenType.DOT)
+        
+        if not self.match(CSharpTokenType.IDENTIFIER):
+            self.error("Expected identifier")
+        
+        member_name = self.current_token.value
+        self.advance()
+        
+        return CSharpMemberAccessExpression(
+            node_type=CSharpNodeType.MEMBER_ACCESS_EXPRESSION,
+            target=target,
+            member_name=member_name
+        )
+    
+    def parse_indexer_access(self, target: str) -> CSharpIndexerAccessExpression:
+        """Parse indexer access."""
+        self.expect(CSharpTokenType.LEFT_BRACKET)
+        
+        arguments = []
+        if not self.match(CSharpTokenType.RIGHT_BRACKET):
+            arguments.append(self.parse_expression())
+            
+            while self.match(CSharpTokenType.COMMA):
+                self.advance()
+                arguments.append(self.parse_expression())
+        
+        self.expect(CSharpTokenType.RIGHT_BRACKET)
+        
+        return CSharpIndexerAccessExpression(
+            node_type=CSharpNodeType.INDEXER_ACCESS_EXPRESSION,
+            target=target,
+            arguments=arguments
+        )
+    
+    def parse_object_creation_expression(self) -> CSharpObjectCreationExpression:
+        """Parse object creation expression."""
+        self.expect(CSharpTokenType.NEW)
+        
+        # Parse type
+        object_type = self.parse_type()
+        
+        # Parse constructor arguments
+        arguments = []
+        if self.match(CSharpTokenType.LEFT_PAREN):
+            self.advance()
+            
+            if not self.match(CSharpTokenType.RIGHT_PAREN):
+                arguments.append(self.parse_expression())
+                
+                while self.match(CSharpTokenType.COMMA):
+                    self.advance()
+                    arguments.append(self.parse_expression())
+            
+            self.expect(CSharpTokenType.RIGHT_PAREN)
+        
+        # Parse object initializer
+        initializer = None
+        if self.match(CSharpTokenType.LEFT_BRACE):
+            initializer = self.parse_object_initializer()
+        
+        return CSharpObjectCreationExpression(
+            node_type=CSharpNodeType.OBJECT_CREATION_EXPRESSION,
+            object_type=object_type,
+            arguments=arguments,
+            initializer=initializer
+        )
+    
+    def parse_object_initializer(self) -> CSharpObjectInitializerExpression:
+        """Parse object initializer."""
+        self.expect(CSharpTokenType.LEFT_BRACE)
+        
+        initializers = []
+        if not self.match(CSharpTokenType.RIGHT_BRACE):
+            initializers.append(self.parse_initializer_assignment())
+            
+            while self.match(CSharpTokenType.COMMA):
+                self.advance()
+                initializers.append(self.parse_initializer_assignment())
+        
+        self.expect(CSharpTokenType.RIGHT_BRACE)
+        
+        return CSharpObjectInitializerExpression(
+            node_type=CSharpNodeType.OBJECT_INITIALIZER_EXPRESSION,
+            initializers=initializers
+        )
+    
+    def parse_initializer_assignment(self) -> CSharpInitializerAssignment:
+        """Parse initializer assignment."""
+        if not self.match(CSharpTokenType.IDENTIFIER):
+            self.error("Expected identifier")
+        
+        property_name = self.current_token.value
+        self.advance()
+        
+        self.expect(CSharpTokenType.EQUALS)
+        value = self.parse_expression()
+        
+        return CSharpInitializerAssignment(
+            node_type=CSharpNodeType.INITIALIZER_ASSIGNMENT,
+            property_name=property_name,
+            value=value
+        )
 
 
 # Convenience functions

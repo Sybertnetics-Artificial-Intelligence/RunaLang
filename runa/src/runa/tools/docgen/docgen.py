@@ -9,8 +9,10 @@ import os
 import re
 from typing import List, Dict, Optional
 from dataclasses import dataclass
-from .compiler.parser import parse_runa_source
-from .compiler.ast_nodes import *
+# Import from new architecture
+from ...languages.runa.runa_parser import RunaParser
+from ...core.runa_ast import *
+from ...core.translation_result import TranslationStatus
 
 @dataclass
 class DocFunction:
@@ -35,6 +37,7 @@ class RunaDocGenerator:
     
     def __init__(self):
         self.modules: Dict[str, DocModule] = {}
+        self.parser = RunaParser()
     
     def generate_docs(self, source_path: str, output_path: str):
         """Generate documentation for all Runa files in source_path."""
@@ -60,7 +63,10 @@ class RunaDocGenerator:
                 source = f.read()
             
             # Parse the source code
-            ast = parse_runa_source(source)
+            parse_result = self.parser.parse(source)
+            if parse_result.status != TranslationStatus.SUCCESS:
+                raise Exception(f"Parse failed: {parse_result.error_message}")
+            ast = parse_result.result
             
             # Extract module name from file path
             module_name = os.path.splitext(os.path.basename(file_path))[0]

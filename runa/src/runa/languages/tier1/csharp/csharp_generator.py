@@ -1107,7 +1107,7 @@ class CSharpCodeGenerator:
             return self._invocation_expression_to_string(node)
         elif isinstance(node, CSharpMemberAccessExpression):
             return self._member_access_expression_to_string(node)
-        elif isinstance(node, CSharpElementAccessExpression):
+        elif isinstance(node, CSharpIndexerAccessExpression):
             return self._element_access_expression_to_string(node)
         elif isinstance(node, CSharpCastExpression):
             return self._cast_expression_to_string(node)
@@ -1119,11 +1119,11 @@ class CSharpCodeGenerator:
             return "this"
         elif isinstance(node, CSharpBaseExpression):
             return "base"
-        elif isinstance(node, CSharpTypeOfExpression):
+        elif isinstance(node, CSharpTypeofExpression):
             return f"typeof({self._type_to_string(node.type)})"
-        elif isinstance(node, CSharpSizeOfExpression):
+        elif isinstance(node, CSharpSizeofExpression):
             return f"sizeof({self._type_to_string(node.type)})"
-        elif isinstance(node, CSharpNameOfExpression):
+        elif isinstance(node, CSharpNameofExpression):
             return f"nameof({self._expression_to_string(node.expression)})"
         elif isinstance(node, CSharpDefaultExpression):
             if node.type:
@@ -1157,19 +1157,24 @@ class CSharpCodeGenerator:
     
     def _literal_to_string(self, node: CSharpLiteral) -> str:
         """Convert literal to string."""
-        if isinstance(node, CSharpStringLiteral):
-            if node.is_verbatim:
+        if node.literal_type == "string":
+            # Check for special string attributes if they exist
+            is_verbatim = getattr(node, 'is_verbatim', False)
+            is_raw = getattr(node, 'is_raw', False)
+            if is_verbatim:
                 return f'@"{node.value}"'
-            elif node.is_raw:
+            elif is_raw:
                 return f'"""{node.value}"""'
             else:
                 return f'"{node.value}"'
-        elif isinstance(node, CSharpCharacterLiteral):
+        elif node.literal_type == "char":
             return f"'{node.value}'"
-        elif isinstance(node, CSharpBooleanLiteral):
+        elif node.literal_type == "bool":
             return "true" if node.value else "false"
-        elif isinstance(node, CSharpNullLiteral):
+        elif node.literal_type == "null":
             return "null"
+        elif node.literal_type in ["int", "long", "float", "double", "decimal"]:
+            return str(node.value)
         else:
             return str(node.value)
     
@@ -1237,7 +1242,7 @@ class CSharpCodeGenerator:
         else:
             return f"{expression}{node.operator}{node.name}"
     
-    def _element_access_expression_to_string(self, node: CSharpElementAccessExpression) -> str:
+    def _element_access_expression_to_string(self, node: CSharpIndexerAccessExpression) -> str:
         """Convert element access expression to string."""
         expression = self._expression_to_string(node.expression)
         
@@ -1457,11 +1462,11 @@ class CSharpCodeGenerator:
         """Convert type to string."""
         if isinstance(type_node, CSharpPredefinedType):
             return type_node.name
-        elif isinstance(type_node, CSharpIdentifierType):
+        elif isinstance(type_node, CSharpIdentifierName):
             return type_node.name
-        elif isinstance(type_node, CSharpQualifiedType):
+        elif isinstance(type_node, CSharpQualifiedNameType):
             return f"{self._type_to_string(type_node.left)}.{type_node.right}"
-        elif isinstance(type_node, CSharpGenericType):
+        elif isinstance(type_node, CSharpGenericNameType):
             base_type = self._type_to_string(type_node.base_type)
             type_args = [self._type_to_string(arg) for arg in type_node.type_arguments]
             return f"{base_type}<{', '.join(type_args)}>"
@@ -1529,21 +1534,345 @@ class CSharpCodeGenerator:
             self._write_line(f"[{attr_str}]")
     
     def _statements_to_string(self, statements: List[CSharpStatement]) -> str:
-        """Convert statements to string."""
-        # This is a simplified version for inline use
+        """Convert statements to properly formatted C# code string.
+        
+        Handles all C# statement types with proper indentation, formatting,
+        and language-specific syntax generation.
+        """
+        if not statements:
+            return ""
+        
         parts = []
         for stmt in statements:
             if isinstance(stmt, CSharpExpressionStatement):
-                parts.append(f"{self._expression_to_string(stmt.expression)};")
+                if stmt.expression:
+                    parts.append(f"{self._expression_to_string(stmt.expression)};")
+                else:
+                    parts.append(";")
+                    
             elif isinstance(stmt, CSharpReturnStatement):
                 if stmt.expression:
                     parts.append(f"return {self._expression_to_string(stmt.expression)};")
                 else:
                     parts.append("return;")
+            elif isinstance(stmt, CSharpBreakStatement):
+                parts.append("break;")
+                
+            elif isinstance(stmt, CSharpContinueStatement):
+                parts.append("continue;")
+                
+            elif isinstance(stmt, CSharpThrowStatement):
+                if stmt.expression:
+                    parts.append(f"throw {self._expression_to_string(stmt.expression)};")
+                else:
+                    parts.append("throw;")
+                    
+            elif isinstance(stmt, CSharpIfStatement):
+                parts.append(self._if_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpWhileStatement):
+                parts.append(self._while_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpForStatement):
+                parts.append(self._for_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpForEachStatement):
+                parts.append(self._foreach_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpDoStatement):
+                parts.append(self._do_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpSwitchStatement):
+                parts.append(self._switch_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpTryStatement):
+                parts.append(self._try_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpLockStatement):
+                parts.append(self._lock_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpUsingStatement):
+                parts.append(self._using_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpYieldStatement):
+                if stmt.is_break:
+                    parts.append("yield break;")
+                elif stmt.expression:
+                    parts.append(f"yield return {self._expression_to_string(stmt.expression)};")
+                else:
+                    parts.append("yield return;")
+                    
+            elif isinstance(stmt, CSharpEmptyStatement):
+                parts.append(";")
+                
+            elif isinstance(stmt, CSharpLabeledStatement):
+                parts.append(f"{stmt.identifier}: {self._statement_to_string(stmt.statement)}")
+                
+            elif isinstance(stmt, CSharpGotoStatement):
+                parts.append(f"goto {stmt.label};")
+                
+            elif isinstance(stmt, CSharpCheckedStatement):
+                checked_block = self._block_to_string(stmt.block)
+                parts.append(f"checked {{\n{checked_block}\n}}")
+                
+            elif isinstance(stmt, CSharpUncheckedStatement):
+                unchecked_block = self._block_to_string(stmt.block)
+                parts.append(f"unchecked {{\n{unchecked_block}\n}}")
+                
+            elif isinstance(stmt, CSharpUnsafeStatement):
+                unsafe_block = self._block_to_string(stmt.block)
+                parts.append(f"unsafe {{\n{unsafe_block}\n}}")
+                
+            elif isinstance(stmt, CSharpFixedStatement):
+                parts.append(self._fixed_statement_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpLocalDeclarationStatement):
+                parts.append(self._local_declaration_to_string(stmt))
+                
+            elif isinstance(stmt, CSharpBlock):
+                parts.append(self._block_to_string(stmt))
+                
             else:
-                parts.append("/* complex statement */")
+                # For any unrecognized statement types, generate a comment with the type
+                stmt_type = type(stmt).__name__
+                parts.append(f"/* Unhandled statement type: {stmt_type} */")
+        
+        return "\n".join(parts)
+    
+    def _if_statement_to_string(self, if_stmt: CSharpIfStatement) -> str:
+        """Convert if statement to C# code string."""
+        condition = self._expression_to_string(if_stmt.condition) if if_stmt.condition else "true"
+        then_part = self._statement_to_string(if_stmt.statement) if if_stmt.statement else ""
+        
+        then_indented = self._indent_text(then_part)
+        result = f"if ({condition}) {{\n{then_indented}\n}}"
+        
+        if if_stmt.else_statement:
+            else_part = self._statement_to_string(if_stmt.else_statement)
+            else_indented = self._indent_text(else_part)
+            result += f" else {{\n{else_indented}\n}}"
+        
+        return result
+    
+    def _while_statement_to_string(self, while_stmt: CSharpWhileStatement) -> str:
+        """Convert while statement to C# code string."""
+        condition = self._expression_to_string(while_stmt.condition) if while_stmt.condition else "true"
+        body = self._statement_to_string(while_stmt.statement) if while_stmt.statement else ""
+        
+        body_indented = self._indent_text(body)
+        return f"while ({condition}) {{\n{body_indented}\n}}"
+    
+    def _for_statement_to_string(self, for_stmt: CSharpForStatement) -> str:
+        """Convert for statement to C# code string."""
+        parts = []
+        
+        # Initializers
+        if for_stmt.declaration:
+            parts.append(self._variable_declaration_to_string(for_stmt.declaration))
+        elif for_stmt.initializers:
+            initializers = [self._expression_to_string(init) for init in for_stmt.initializers]
+            parts.append("; ".join(initializers))
+        else:
+            parts.append("")
+        
+        # Condition
+        condition = self._expression_to_string(for_stmt.condition) if for_stmt.condition else ""
+        parts.append(condition)
+        
+        # Incrementors
+        if for_stmt.incrementors:
+            incrementors = [self._expression_to_string(inc) for inc in for_stmt.incrementors]
+            parts.append("; ".join(incrementors))
+        else:
+            parts.append("")
+        
+        # Body
+        body = self._statement_to_string(for_stmt.statement) if for_stmt.statement else ""
+        
+        for_parts = '; '.join(parts)
+        body_indented = self._indent_text(body)
+        return f"for ({for_parts}) {{\n{body_indented}\n}}"
+    
+    def _foreach_statement_to_string(self, foreach_stmt: CSharpForEachStatement) -> str:
+        """Convert foreach statement to C# code string."""
+        type_str = self._type_to_string(foreach_stmt.type) if foreach_stmt.type else "var"
+        expression = self._expression_to_string(foreach_stmt.expression) if foreach_stmt.expression else ""
+        body = self._statement_to_string(foreach_stmt.statement) if foreach_stmt.statement else ""
+        
+        await_keyword = "await " if foreach_stmt.await_keyword else ""
+        
+        body_indented = self._indent_text(body)
+        return f"{await_keyword}foreach ({type_str} {foreach_stmt.identifier} in {expression}) {{\n{body_indented}\n}}"
+    
+    def _do_statement_to_string(self, do_stmt: CSharpDoStatement) -> str:
+        """Convert do statement to C# code string."""
+        body = self._statement_to_string(do_stmt.statement) if do_stmt.statement else ""
+        condition = self._expression_to_string(do_stmt.condition) if do_stmt.condition else "true"
+        
+        body_indented = self._indent_text(body)
+        return f"do {{\n{body_indented}\n}} while ({condition});"
+    
+    def _switch_statement_to_string(self, switch_stmt: CSharpSwitchStatement) -> str:
+        """Convert switch statement to C# code string."""
+        expression = self._expression_to_string(switch_stmt.expression) if switch_stmt.expression else ""
+        
+        sections = []
+        for section in switch_stmt.sections:
+            section_str = self._switch_section_to_string(section)
+            sections.append(section_str)
+        
+        sections_text = '\n'.join(sections)
+        return f"switch ({expression}) {{\n{self._indent_text(sections_text)}\n}}"
+    
+    def _switch_section_to_string(self, section: CSharpSwitchSection) -> str:
+        """Convert switch section to C# code string."""
+        labels = []
+        for label in section.labels:
+            if isinstance(label, CSharpCaseSwitchLabel):
+                if label.value:
+                    labels.append(f"case {self._expression_to_string(label.value)}:")
+                else:
+                    labels.append("case:")
+            elif isinstance(label, CSharpDefaultSwitchLabel):
+                labels.append("default:")
+            elif isinstance(label, CSharpCasePatternSwitchLabel):
+                pattern = self._pattern_to_string(label.pattern) if label.pattern else ""
+                when = f" when {self._expression_to_string(label.when_clause)}" if label.when_clause else ""
+                labels.append(f"case {pattern}{when}:")
+        
+        statements = []
+        for stmt in section.statements:
+            if isinstance(stmt, CSharpBreakStatement):
+                statements.append("break;")
+            else:
+                statements.append(self._statement_to_string(stmt))
+        
+        return "\n".join(labels) + "\n" + "\n".join(statements)
+    
+    def _try_statement_to_string(self, try_stmt: CSharpTryStatement) -> str:
+        """Convert try statement to C# code string."""
+        parts = []
+        
+        # Try block
+        if try_stmt.block:
+            try_block = self._block_to_string(try_stmt.block)
+            parts.append(f"try {{\n{try_block}\n}}")
+        
+        # Catch clauses
+        for catch in try_stmt.catches:
+            parts.append(self._catch_clause_to_string(catch))
+        
+        # Finally block
+        if try_stmt.finally_block:
+            finally_block = self._block_to_string(try_stmt.finally_block)
+            parts.append(f"finally {{\n{finally_block}\n}}")
+        
+        return "\n".join(parts)
+    
+    def _catch_clause_to_string(self, catch: CSharpCatchClause) -> str:
+        """Convert catch clause to C# code string."""
+        parts = ["catch"]
+        
+        if catch.declaration:
+            type_str = self._type_to_string(catch.declaration.type) if catch.declaration.type else ""
+            identifier = catch.declaration.identifier or ""
+            if type_str or identifier:
+                parts.append(f"({type_str} {identifier})")
+        
+        if catch.filter:
+            filter_expr = self._expression_to_string(catch.filter.expression) if catch.filter.expression else ""
+            parts.append(f" when ({filter_expr})")
+        
+        if catch.block:
+            catch_block = self._block_to_string(catch.block)
+            parts.append(f" {{\n{catch_block}\n}}")
+        else:
+            parts.append(" {}")
         
         return " ".join(parts)
+    
+    def _lock_statement_to_string(self, lock_stmt: CSharpLockStatement) -> str:
+        """Convert lock statement to C# code string."""
+        expression = self._expression_to_string(lock_stmt.expression) if lock_stmt.expression else ""
+        body = self._statement_to_string(lock_stmt.statement) if lock_stmt.statement else ""
+        
+        body_indented = self._indent_text(body)
+        return f"lock ({expression}) {{\n{body_indented}\n}}"
+    
+    def _using_statement_to_string(self, using_stmt: CSharpUsingStatement) -> str:
+        """Convert using statement to C# code string."""
+        parts = []
+        
+        if using_stmt.await_keyword:
+            parts.append("await")
+        
+        parts.append("using")
+        
+        if using_stmt.declaration:
+            parts.append(f"({self._variable_declaration_to_string(using_stmt.declaration)})")
+        elif using_stmt.expression:
+            parts.append(f"({self._expression_to_string(using_stmt.expression)})")
+        
+        if using_stmt.statement:
+            body = self._statement_to_string(using_stmt.statement)
+            body_indented = self._indent_text(body)
+            parts.append(f" {{\n{body_indented}\n}}")
+        else:
+            parts.append(" {}")
+        
+        return " ".join(parts)
+    
+    def _fixed_statement_to_string(self, fixed_stmt: CSharpFixedStatement) -> str:
+        """Convert fixed statement to C# code string."""
+        declaration = self._variable_declaration_to_string(fixed_stmt.declaration) if fixed_stmt.declaration else ""
+        body = self._statement_to_string(fixed_stmt.statement) if fixed_stmt.statement else ""
+        
+        body_indented = self._indent_text(body)
+        return f"fixed ({declaration}) {{\n{body_indented}\n}}"
+    
+    def _local_declaration_to_string(self, local_decl: CSharpLocalDeclarationStatement) -> str:
+        """Convert local declaration statement to C# code string."""
+        parts = []
+        
+        if local_decl.await_keyword:
+            parts.append("await")
+        
+        if local_decl.using_keyword:
+            parts.append("using")
+        
+        if local_decl.declaration:
+            parts.append(self._variable_declaration_to_string(local_decl.declaration))
+        
+        return " ".join(parts) + ";"
+    
+    def _block_to_string(self, block: CSharpBlock) -> str:
+        """Convert block to C# code string."""
+        if not block.statements:
+            return ""
+        
+        statements = []
+        for stmt in block.statements:
+            statements.append(self._statement_to_string(stmt))
+        
+        return "\n".join(statements)
+    
+    def _statement_to_string(self, stmt: CSharpStatement) -> str:
+        """Convert a single statement to C# code string."""
+        if isinstance(stmt, CSharpBlock):
+            return self._block_to_string(stmt)
+        else:
+            # For non-block statements, wrap them in a list and use the main method
+            return self._statements_to_string([stmt])
+    
+    def _indent_text(self, text: str, indent_level: int = 1) -> str:
+        """Indent text by the specified number of levels."""
+        if not text:
+            return ""
+        
+        indent = "    " * indent_level
+        lines = text.split('\n')
+        indented_lines = [indent + line if line.strip() else line for line in lines]
+        return '\n'.join(indented_lines)
     
     def _write_line(self, text: str = "") -> None:
         """Write a line with proper indentation."""
