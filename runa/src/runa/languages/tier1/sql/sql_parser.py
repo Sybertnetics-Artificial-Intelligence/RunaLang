@@ -236,7 +236,7 @@ class SQLTokenType(Enum):
     
     # Operators
     PLUS = auto()          # +
-    MINUS = auto()         # -
+    MINUS_OP = auto()      # - (arithmetic minus)
     MULTIPLY = auto()      # *
     DIVIDE = auto()        # /
     MODULO = auto()        # %
@@ -292,14 +292,13 @@ class SQLTokenType(Enum):
     PARAMETER = auto()     # ?
     NAMED_PARAMETER = auto() # :name or $1
     WILDCARD = auto()      # *
-    PLACEHOLDER = auto()   # Placeholder for missing tokens
     
     # End of file
     EOF = auto()
     
     # Whitespace and comments (usually ignored)
     WHITESPACE = auto()
-    COMMENT = auto()
+    SINGLE_LINE_COMMENT = auto()  # Renamed to avoid conflict with COMMENT keyword
     MULTILINE_COMMENT = auto()
 
 
@@ -364,8 +363,8 @@ class SQLLexer:
             (r'/\*.*?\*/', SQLTokenType.MULTILINE_COMMENT),
             
             # Single line comments
-            (r'--.*?$', SQLTokenType.COMMENT),
-            (r'#.*?$', SQLTokenType.COMMENT),  # MySQL style
+            (r'--.*?$', SQLTokenType.SINGLE_LINE_COMMENT),
+            (r'#.*?$', SQLTokenType.SINGLE_LINE_COMMENT),  # MySQL style
             
             # String literals
             (r"'(?:[^'\\]|\\.)*'", SQLTokenType.STRING),
@@ -413,7 +412,7 @@ class SQLLexer:
             
             # Single-character operators
             (r'\+', SQLTokenType.PLUS),
-            (r'-', SQLTokenType.MINUS),
+            (r'-', SQLTokenType.MINUS_OP),
             (r'\*', SQLTokenType.MULTIPLY),
             (r'/', SQLTokenType.DIVIDE),
             (r'%', SQLTokenType.MODULO),
@@ -604,7 +603,8 @@ class SQLLexer:
             'UNION': SQLTokenType.UNION,
             'INTERSECT': SQLTokenType.INTERSECT,
             'EXCEPT': SQLTokenType.EXCEPT,
-            'MINUS': SQLTokenType.MINUS,
+            'MINUS': SQLTokenType.MINUS,  # Set operation
+            # Note: arithmetic minus is MINUS_OP
             
             # Transactions
             'COMMIT': SQLTokenType.COMMIT,
@@ -641,7 +641,7 @@ class SQLLexer:
             'DOMAIN': SQLTokenType.DOMAIN,
             'TYPE': SQLTokenType.TYPE,
             'ENUM': SQLTokenType.ENUM,
-            'COMMENT': SQLTokenType.COMMENT,
+            'COMMENT': SQLTokenType.COMMENT,  # SQL keyword
             'ANALYZE': SQLTokenType.ANALYZE,
             'VACUUM': SQLTokenType.VACUUM,
             'EXPLAIN': SQLTokenType.EXPLAIN,
@@ -787,7 +787,7 @@ class SQLLexer:
         # Filter out whitespace and comments unless needed
         filtered_tokens = []
         for token in self.tokens:
-            if token.type not in [SQLTokenType.WHITESPACE, SQLTokenType.COMMENT, SQLTokenType.MULTILINE_COMMENT]:
+            if token.type not in [SQLTokenType.WHITESPACE, SQLTokenType.SINGLE_LINE_COMMENT, SQLTokenType.MULTILINE_COMMENT]:
                 filtered_tokens.append(token)
         
         return filtered_tokens
@@ -918,7 +918,7 @@ class SQLParser:
             SQLTokenType.BETWEEN: 4,
             SQLTokenType.IS: 4,
             SQLTokenType.PLUS: 5,
-            SQLTokenType.MINUS: 5,
+            SQLTokenType.MINUS_OP: 5,
             SQLTokenType.MULTIPLY: 6,
             SQLTokenType.DIVIDE: 6,
             SQLTokenType.MODULO: 6,
@@ -1771,13 +1771,13 @@ class SQLParser:
         """Parse term expression."""
         expr = self._parse_factor_expression()
         
-        while self._check(SQLTokenType.PLUS, SQLTokenType.MINUS, SQLTokenType.CONCAT):
+        while self._check(SQLTokenType.PLUS, SQLTokenType.MINUS_OP, SQLTokenType.CONCAT):
             operator_token = self._advance()
             right = self._parse_factor_expression()
             
             operator_map = {
                 SQLTokenType.PLUS: SQLOperator.PLUS,
-                SQLTokenType.MINUS: SQLOperator.MINUS,
+                SQLTokenType.MINUS_OP: SQLOperator.MINUS,
                 SQLTokenType.CONCAT: SQLOperator.CONCAT,
             }
             
@@ -1815,14 +1815,14 @@ class SQLParser:
     
     def _parse_unary_expression(self) -> SQLExpression:
         """Parse unary expression."""
-        if self._check(SQLTokenType.NOT, SQLTokenType.PLUS, SQLTokenType.MINUS):
+        if self._check(SQLTokenType.NOT, SQLTokenType.PLUS, SQLTokenType.MINUS_OP):
             operator_token = self._advance()
             operand = self._parse_unary_expression()
             
             operator_map = {
                 SQLTokenType.NOT: SQLOperator.NOT,
                 SQLTokenType.PLUS: SQLOperator.PLUS,
-                SQLTokenType.MINUS: SQLOperator.MINUS,
+                SQLTokenType.MINUS_OP: SQLOperator.MINUS,
             }
             
             operator = operator_map.get(operator_token.type, SQLOperator.NOT)
@@ -2224,3 +2224,14 @@ class SQLParser:
                 return
             
             self._advance()
+
+
+def parse_sql(source: str) -> 'SQLStatement':
+    """Parse SQL source code into AST."""
+    try:
+        lexer = SQLLexer(source)
+        tokens = lexer.tokenize()
+        parser = SQLParser(tokens)
+        return parser.parse()
+    except Exception as e:
+        raise SQLParseError(f"Failed to parse SQL: {e}")

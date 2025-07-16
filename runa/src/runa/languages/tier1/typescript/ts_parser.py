@@ -642,13 +642,20 @@ class TSParser:
     def _parse_statement(self) -> Optional[TSNode]:
         """Parse a statement."""
         try:
+            # Handle `const enum` before general enum/const handling
+            if self._match(TSTokenType.CONST):
+                if self._match(TSTokenType.ENUM):
+                    return self._parse_enum_declaration(True)
+                # fall back to variable declarations
+                return self._parse_variable_declaration()
+
             # Type declarations
             if self._match(TSTokenType.INTERFACE):
                 return self._parse_interface_declaration()
             if self._match(TSTokenType.TYPE):
                 return self._parse_type_alias_declaration()
             if self._match(TSTokenType.ENUM):
-                return self._parse_enum_declaration()
+                return self._parse_enum_declaration(False)
             if self._match(TSTokenType.NAMESPACE):
                 return self._parse_namespace_declaration()
             
@@ -729,10 +736,9 @@ class TSParser:
         
         return TSTypeAliasDeclaration(name_node, type_parameters, type_annotation)
     
-    def _parse_enum_declaration(self) -> TSEnumDeclaration:
-        """Parse enum declaration."""
-        const = False  # TODO: Handle const enums
-        
+    def _parse_enum_declaration(self, const: bool = False) -> TSEnumDeclaration:
+        """Parse enum declaration. `const` flag indicates preceding `const` keyword."""
+
         name = self._consume(TSTokenType.IDENTIFIER, "Expected enum name").value
         name_node = TSIdentifier(name)
         
@@ -1063,100 +1069,109 @@ class TSParser:
         """Parse expression (simplified)."""
         return self._parse_assignment()
     
+    def _token_to_operator(self, token: 'TSToken') -> TSOperator:
+        """Map a lexer token to the corresponding TSOperator enum value."""
+        mapping = {
+            TSTokenType.PLUS: TSOperator.PLUS,
+            TSTokenType.MINUS: TSOperator.MINUS,
+            TSTokenType.MULTIPLY: TSOperator.MULTIPLY,
+            TSTokenType.DIVIDE: TSOperator.DIVIDE,
+            TSTokenType.MODULO: TSOperator.MODULO,
+            TSTokenType.EXPONENT: TSOperator.EXPONENT,
+            TSTokenType.EQUAL: TSOperator.EQUAL,
+            TSTokenType.NOT_EQUAL: TSOperator.NOT_EQUAL,
+            TSTokenType.STRICT_EQUAL: TSOperator.STRICT_EQUAL,
+            TSTokenType.STRICT_NOT_EQUAL: TSOperator.STRICT_NOT_EQUAL,
+            TSTokenType.LESS_THAN: TSOperator.LESS_THAN,
+            TSTokenType.LESS_EQUAL: TSOperator.LESS_EQUAL,
+            TSTokenType.GREATER_THAN: TSOperator.GREATER_THAN,
+            TSTokenType.GREATER_EQUAL: TSOperator.GREATER_EQUAL,
+            TSTokenType.AND: TSOperator.AND,
+            TSTokenType.OR: TSOperator.OR,
+            TSTokenType.ASSIGN: TSOperator.ASSIGN,
+            TSTokenType.NOT: TSOperator.NOT,
+        }
+        return mapping[token.type]
+
+
     def _parse_assignment(self) -> TSNode:
-        """Parse assignment expression."""
+        """Parse assignment expression using right-associativity."""
         expr = self._parse_logical_or()
-        
         if self._match(TSTokenType.ASSIGN):
-            value = self._parse_assignment()
-            # Return assignment expression
-            return expr  # Simplified
-        
+            operator_token = self._previous()
+            operator = self._token_to_operator(operator_token)
+            right = self._parse_assignment()
+            return TSAssignmentExpression(expr, operator, right)
         return expr
-    
+
     def _parse_logical_or(self) -> TSNode:
-        """Parse logical OR expression."""
         expr = self._parse_logical_and()
-        
         while self._match(TSTokenType.OR):
-            operator = self._previous()
+            operator_token = self._previous()
+            operator = self._token_to_operator(operator_token)
             right = self._parse_logical_and()
-            # Create binary expression
-            expr = right  # Simplified
-        
+            expr = TSLogicalExpression(expr, operator, right)
         return expr
-    
+
     def _parse_logical_and(self) -> TSNode:
-        """Parse logical AND expression."""
         expr = self._parse_equality()
-        
         while self._match(TSTokenType.AND):
-            operator = self._previous()
+            operator_token = self._previous()
+            operator = self._token_to_operator(operator_token)
             right = self._parse_equality()
-            # Create binary expression
-            expr = right  # Simplified
-        
+            expr = TSLogicalExpression(expr, operator, right)
         return expr
-    
+
     def _parse_equality(self) -> TSNode:
-        """Parse equality expression."""
         expr = self._parse_comparison()
-        
-        while self._match(TSTokenType.EQUAL, TSTokenType.NOT_EQUAL, 
+        while self._match(TSTokenType.EQUAL, TSTokenType.NOT_EQUAL,
                            TSTokenType.STRICT_EQUAL, TSTokenType.STRICT_NOT_EQUAL):
-            operator = self._previous()
+            operator_token = self._previous()
+            operator = self._token_to_operator(operator_token)
             right = self._parse_comparison()
-            # Create binary expression
-            expr = right  # Simplified
-        
+            expr = TSBinaryExpression(expr, operator, right)
         return expr
-    
+
     def _parse_comparison(self) -> TSNode:
-        """Parse comparison expression."""
         expr = self._parse_addition()
-        
         while self._match(TSTokenType.GREATER_THAN, TSTokenType.GREATER_EQUAL,
                            TSTokenType.LESS_THAN, TSTokenType.LESS_EQUAL):
-            operator = self._previous()
+            operator_token = self._previous()
+            operator = self._token_to_operator(operator_token)
             right = self._parse_addition()
-            # Create binary expression
-            expr = right  # Simplified
-        
+            expr = TSBinaryExpression(expr, operator, right)
         return expr
-    
+
     def _parse_addition(self) -> TSNode:
-        """Parse addition expression."""
         expr = self._parse_multiplication()
-        
         while self._match(TSTokenType.PLUS, TSTokenType.MINUS):
-            operator = self._previous()
+            operator_token = self._previous()
+            operator = self._token_to_operator(operator_token)
             right = self._parse_multiplication()
-            # Create binary expression
-            expr = right  # Simplified
-        
+            expr = TSBinaryExpression(expr, operator, right)
         return expr
-    
+
     def _parse_multiplication(self) -> TSNode:
-        """Parse multiplication expression."""
         expr = self._parse_unary()
-        
         while self._match(TSTokenType.MULTIPLY, TSTokenType.DIVIDE, TSTokenType.MODULO):
-            operator = self._previous()
+            operator_token = self._previous()
+            operator = self._token_to_operator(operator_token)
             right = self._parse_unary()
-            # Create binary expression
-            expr = right  # Simplified
-        
+            expr = TSBinaryExpression(expr, operator, right)
         return expr
-    
+
     def _parse_unary(self) -> TSNode:
-        """Parse unary expression."""
         if self._match(TSTokenType.NOT, TSTokenType.MINUS, TSTokenType.PLUS):
-            operator = self._previous()
-            right = self._parse_unary()
-            # Create unary expression
-            return right  # Simplified
-        
+            operator_token = self._previous()
+            operator = self._token_to_operator(operator_token)
+            argument = self._parse_unary()
+            return TSUnaryExpression(operator, argument, True)
         return self._parse_postfix()
+
+    def _parse_expression_statement(self) -> TSNode:
+        expr = self._parse_expression()
+        self._consume(TSTokenType.SEMICOLON, "Expected ';' after expression")
+        return TSExpressionStatement(expr)
     
     def _parse_postfix(self) -> TSNode:
         """Parse postfix expression."""
@@ -1232,12 +1247,6 @@ class TSParser:
         self._consume(TSTokenType.RBRACE, "Expected '}'")
         
         return TSBlockStatement(statements)
-    
-    def _parse_expression_statement(self) -> TSNode:
-        """Parse expression statement."""
-        expr = self._parse_expression()
-        self._consume(TSTokenType.SEMICOLON, "Expected ';' after expression")
-        return expr  # Simplified
     
     # Helper methods
     def _match(self, *types: TSTokenType) -> bool:

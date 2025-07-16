@@ -12,13 +12,16 @@ Key Features:
 - Detailed error reporting with location tracking
 """
 
+from __future__ import annotations
 from typing import List, Dict, Any, Optional, Set, Tuple, Union
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import json
 from datetime import datetime
 
-from .runa_ast import ASTNode, SourceLocation, TranslationMetadata
+from .runa_ast import ASTNode, SourceLocation, TranslationMetadata, Program
+from .base_components import BaseLanguageParser
+from ..ir.runa_cfg_builder import CFGBuilder
 
 
 class DifferenceType(Enum):
@@ -273,11 +276,96 @@ class ASTComparator:
                 ))
 
 
-class PipelineVerifier:
-    """Verifies the entire translation pipeline for correctness."""
+class SemanticComparator:
+    """
+    Compares two ASTs for semantic equivalence by converting both to a
+    Control Flow Graph (CFG) and comparing the resulting graphs.
+    """
+    
+    def compare(self, node1: ASTNode, node2: ASTNode) -> VerificationResult:
+        """
+        Performs semantic comparison by building and comparing CFGs.
+        
+        Note: This assumes a CFG can be built for both ASTs. For ASTs not yet
+        supported by the CFGBuilder, this will fail.
+        """
+        try:
+            # Step 1 & 2: Build a CFG for each AST.
+            # We assume a generic 'build_cfg' function can dispatch to the
+            # correct builder based on AST type. For now, we only have a Runa builder.
+            cfg1 = self._build_cfg_for_ast(node1)
+            cfg2 = self._build_cfg_for_ast(node2)
+            
+            # Step 3: Compare the two CFGs.
+            return self._compare_cfgs(cfg1, cfg2)
+
+        except Exception as e:
+            return VerificationResult(
+                is_identical=False,
+                differences=[f"Failed to perform semantic comparison: {e}"]
+            )
+
+    def _build_cfg_for_ast(self, node: ASTNode) -> 'ControlFlowGraph':
+        """Builds a CFG for a given AST node."""
+        # This is a dispatcher. As we add more language frontends, we would
+        # add more cases here to select the correct CFG builder.
+        if isinstance(node, RunaProgram):
+            builder = CFGBuilder()
+            return builder.build(node)
+        else:
+            # In a full implementation, we might have builders for Python's AST,
+            # C++'s AST, etc.
+            raise NotImplementedError(f"No CFGBuilder available for AST type: {type(node).__name__}")
+
+    def _compare_cfgs(self, cfg1: 'ControlFlowGraph', cfg2: 'ControlFlowGraph') -> VerificationResult:
+        """
+        Compares two CFGs for equivalence. This is a simplified comparison
+        that checks for an identical number of basic blocks and instructions.
+        A full isomorphism check is a much more complex graph theory problem.
+        """
+        mismatches = []
+        
+        # Heuristic 1: Compare block count
+        if len(cfg1.blocks) != len(cfg2.blocks):
+            mismatches.append(f"CFG block count mismatch: {len(cfg1.blocks)} vs {len(cfg2.blocks)}")
+            return VerificationResult(is_identical=False, differences=mismatches)
+            
+        # Heuristic 2: Compare instruction count per block
+        for b1, b2 in zip(cfg1.blocks, cfg2.blocks):
+            if len(b1.instructions) != len(b2.instructions):
+                mismatches.append(f"Block {b1.id} instruction count mismatch: {len(b1.instructions)} vs {len(b2.instructions)}")
+        
+            # Heuristic 3: Compare the instructions themselves for structural equality.
+            for i, (inst1, inst2) in enumerate(zip(b1.instructions, b2.instructions)):
+                if inst1 != inst2:
+                    mismatches.append(
+                        f"Block {b1.id}, instruction {i} mismatch:\n"
+                        f"  - Got: {inst1}\n"
+                        f"  - Expected: {inst2}"
+                    )
+
+        return VerificationResult(is_identical=not mismatches, differences=mismatches)
+
+
+class ASTVerifier:
+    """
+    Verifies ASTs for correctness, equivalence, and semantic integrity.
+    """
     
     def __init__(self):
-        self.comparator = ASTComparator(ignore_node_ids=True)
+        self.structural_comparator = ASTComparator()
+        self.semantic_comparator = SemanticComparator()
+    
+    def verify_syntax(self, source_code: str, parser: BaseLanguageParser) -> VerificationResult:
+        """Verify that source code parses without errors."""
+        try:
+            parser.parse(source_code, "verification_temp.runa")
+            return VerificationResult(is_identical=True, differences=[])
+        except Exception as e:
+            return VerificationResult(
+                is_identical=False,
+                differences=[f"Syntax verification failed: {e}"]
+            )
     
     def verify_round_trip(self, original_ast: ASTNode, round_trip_ast: ASTNode) -> VerificationResult:
         """
@@ -288,11 +376,12 @@ class PipelineVerifier:
         
         Runa_AST_1 and Runa_AST_2 should be identical (or semantically equivalent).
         """
-        return self.comparator.compare(original_ast, round_trip_ast)
+        return self.structural_comparator.compare(original_ast, round_trip_ast)
     
     def verify_translation_chain(self, checkpoints: List[Tuple[str, ASTNode]]) -> Dict[str, VerificationResult]:
         """
-        Verify a complete translation chain with multiple checkpoints.
+        Verify a complete translation chain with multiple checkpoints, using the
+        appropriate comparison strategy for each transition.
         
         Args:
             checkpoints: List of (stage_name, ast) tuples representing pipeline stages
@@ -308,13 +397,13 @@ class PipelineVerifier:
             
             transition_name = f"{stage1_name} -> {stage2_name}"
             
-            # For round-trip verification, we expect ASTs to be identical
-            # For forward translation, we might have different comparison strategies
-            if "round_trip" in transition_name.lower():
-                result = self.verify_round_trip(stage1_ast, stage2_ast)
+            # Determine the correct comparison strategy
+            if stage1_name == stage2_name or "round_trip" in transition_name.lower():
+                # Structural comparison for identical stages or explicit round-trips
+                result = self.structural_comparator.compare(stage1_ast, stage2_ast)
             else:
-                # For now, use standard comparison for all transitions
-                result = self.comparator.compare(stage1_ast, stage2_ast)
+                # Semantic comparison for transitions between different languages/ASTs
+                result = self.semantic_comparator.compare(stage1_ast, stage2_ast)
             
             results[transition_name] = result
         
@@ -393,7 +482,7 @@ def compare_asts(expected: ASTNode, actual: ASTNode,
 
 def verify_round_trip(original: ASTNode, round_trip: ASTNode) -> VerificationResult:
     """Quick round-trip verification."""
-    verifier = PipelineVerifier()
+    verifier = ASTVerifier()
     return verifier.verify_round_trip(original, round_trip)
 
 

@@ -132,11 +132,11 @@ class PythonASTConverter:
     def _convert_module(self, node: ast.Module) -> PyModule:
         """Convert module node."""
         body = [self.convert(stmt) for stmt in node.body]
-        return PyModule(body)
+        return PyModule(body=body)
     
     def _convert_constant(self, node: ast.Constant) -> PyConstant:
         """Convert constant node."""
-        return PyConstant(node.value)
+        return PyConstant(value=node.value)
     
     def _convert_name(self, node: ast.Name) -> PyName:
         """Convert name node."""
@@ -146,7 +146,7 @@ class PythonASTConverter:
         elif isinstance(node.ctx, ast.Del):
             ctx = PyContext.DEL
         
-        return PyName(node.id, ctx)
+        return PyName(id=node.id, ctx=ctx)
     
     def _convert_binop(self, node: ast.BinOp) -> PyBinOp:
         """Convert binary operation node."""
@@ -177,7 +177,7 @@ class PythonASTConverter:
         args = [self.convert(arg) for arg in node.args]
         keywords = [self.convert(kw) for kw in node.keywords]
         
-        return PyCall(func, args, keywords)
+        return PyCall(func=func, args=args, keywords=keywords)
     
     def _convert_attribute(self, node: ast.Attribute) -> PyAttribute:
         """Convert attribute node."""
@@ -302,13 +302,13 @@ class PythonASTConverter:
     def _convert_expr_stmt(self, node: ast.Expr) -> PyExpressionStmt:
         """Convert expression statement node."""
         value = self.convert(node.value)
-        return PyExpressionStmt(value)
+        return PyExpressionStmt(value=value)
     
     def _convert_assign(self, node: ast.Assign) -> PyAssign:
         """Convert assign node."""
         targets = [self.convert(target) for target in node.targets]
         value = self.convert(node.value)
-        return PyAssign(targets, value)
+        return PyAssign(targets=targets, value=value)
     
     def _convert_ann_assign(self, node: ast.AnnAssign) -> PyAnnAssign:
         """Convert annotated assign node."""

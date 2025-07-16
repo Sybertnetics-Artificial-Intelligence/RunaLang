@@ -341,7 +341,7 @@ class SQLOperator(Enum):
     MULTIPLY = "*"
     DIVIDE = "/"
     MODULO = "%"
-    POWER = "^"
+    POWER = "POWER"  # Some SQL dialects use POWER() function
     
     # Comparison operators
     EQUAL = "="
@@ -402,17 +402,17 @@ class SQLOperator(Enum):
     JSON_EXTRACT_TEXT = "->>"
     JSON_PATH = "#>"
     JSON_PATH_TEXT = "#>>"
-    JSON_CONTAINS = "@>"
-    JSON_CONTAINED = "<@"
+    JSON_CONTAINS = "JSON_@>"
+    JSON_CONTAINED = "JSON_<@"
     JSON_EXISTS = "?"
     JSON_EXISTS_ANY = "?|"
     JSON_EXISTS_ALL = "?&"
     
     # Array operators (PostgreSQL)
-    ARRAY_CONTAINS = "@>"
-    ARRAY_CONTAINED = "<@"
+    ARRAY_CONTAINS = "ARRAY_@>"
+    ARRAY_CONTAINED = "ARRAY_<@"
     ARRAY_OVERLAP = "&&"
-    ARRAY_CONCAT = "||"
+    ARRAY_CONCAT = "ARRAY_||"
     ARRAY_ELEMENT = "[]"
 
 
@@ -457,7 +457,7 @@ class WindowFrameBound(Enum):
 @dataclass
 class SQLNode(ABC):
     """Base class for all SQL AST nodes."""
-    node_type: SQLNodeType
+    node_type: SQLNodeType = None
     line: int = 0
     column: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -511,7 +511,7 @@ class SQLClause(SQLNode):
 @dataclass
 class SQLLiteral(SQLExpression):
     """Base class for SQL literals."""
-    value: Any
+    value: Any = None
     
     def accept(self, visitor):
         return visitor.visit_literal(self)
@@ -520,7 +520,7 @@ class SQLLiteral(SQLExpression):
 @dataclass
 class SQLIntegerLiteral(SQLLiteral):
     """SQL integer literal."""
-    value: int
+    value: int = 0
     
     def __post_init__(self):
         self.node_type = SQLNodeType.INTEGER_LITERAL
@@ -532,7 +532,7 @@ class SQLIntegerLiteral(SQLLiteral):
 @dataclass
 class SQLFloatLiteral(SQLLiteral):
     """SQL float literal."""
-    value: float
+    value: float = 0.0
     
     def __post_init__(self):
         self.node_type = SQLNodeType.FLOAT_LITERAL
@@ -544,7 +544,7 @@ class SQLFloatLiteral(SQLLiteral):
 @dataclass
 class SQLStringLiteral(SQLLiteral):
     """SQL string literal."""
-    value: str
+    value: str = ""
     quote_char: str = "'"
     
     def __post_init__(self):
@@ -557,7 +557,7 @@ class SQLStringLiteral(SQLLiteral):
 @dataclass
 class SQLBooleanLiteral(SQLLiteral):
     """SQL boolean literal."""
-    value: bool
+    value: bool = False
     
     def __post_init__(self):
         self.node_type = SQLNodeType.BOOLEAN_LITERAL
@@ -569,7 +569,7 @@ class SQLBooleanLiteral(SQLLiteral):
 @dataclass
 class SQLNullLiteral(SQLLiteral):
     """SQL NULL literal."""
-    value: None = None
+    value: Optional[Any] = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.NULL_LITERAL
@@ -581,7 +581,7 @@ class SQLNullLiteral(SQLLiteral):
 @dataclass
 class SQLDateLiteral(SQLLiteral):
     """SQL date literal."""
-    value: str
+    value: str = ""
     
     def __post_init__(self):
         self.node_type = SQLNodeType.DATE_LITERAL
@@ -593,7 +593,7 @@ class SQLDateLiteral(SQLLiteral):
 @dataclass
 class SQLTimeLiteral(SQLLiteral):
     """SQL time literal."""
-    value: str
+    value: str = ""
     
     def __post_init__(self):
         self.node_type = SQLNodeType.TIME_LITERAL
@@ -605,7 +605,7 @@ class SQLTimeLiteral(SQLLiteral):
 @dataclass
 class SQLTimestampLiteral(SQLLiteral):
     """SQL timestamp literal."""
-    value: str
+    value: str = ""
     
     def __post_init__(self):
         self.node_type = SQLNodeType.TIMESTAMP_LITERAL
@@ -617,8 +617,8 @@ class SQLTimestampLiteral(SQLLiteral):
 @dataclass
 class SQLIntervalLiteral(SQLLiteral):
     """SQL interval literal."""
-    value: str
-    unit: str
+    value: str = ""
+    unit: str = "DAY"
     
     def __post_init__(self):
         self.node_type = SQLNodeType.INTERVAL_LITERAL
@@ -631,7 +631,7 @@ class SQLIntervalLiteral(SQLLiteral):
 @dataclass
 class SQLIdentifier(SQLExpression):
     """SQL identifier."""
-    name: str
+    name: str = ""
     quoted: bool = False
     quote_char: str = '"'
     
@@ -645,7 +645,7 @@ class SQLIdentifier(SQLExpression):
 @dataclass
 class SQLQualifiedIdentifier(SQLExpression):
     """SQL qualified identifier (schema.table.column)."""
-    parts: List[str]
+    parts: List[str] = field(default_factory=list)
     quoted: List[bool] = field(default_factory=list)
     
     def __post_init__(self):
@@ -661,7 +661,7 @@ class SQLQualifiedIdentifier(SQLExpression):
 @dataclass
 class SQLDataType(SQLNode):
     """Base class for SQL data types."""
-    name: str
+    name: str = ""
     parameters: List[Union[int, str]] = field(default_factory=list)
     
     def __post_init__(self):
@@ -717,7 +717,7 @@ class SQLDecimalType(SQLDataType):
 @dataclass
 class SQLArrayType(SQLDataType):
     """SQL array type."""
-    element_type: SQLDataType
+    element_type: Optional[SQLDataType] = None
     dimensions: Optional[int] = None
     
     def __post_init__(self):
@@ -732,13 +732,33 @@ class SQLArrayType(SQLDataType):
         return [self.element_type]
 
 
+@dataclass
+class SQLFloatType(SQLDataType):
+    """SQL FLOAT/REAL type."""
+    precision: Optional[int] = None
+    def __post_init__(self):
+        self.node_type = SQLNodeType.FLOAT_TYPE
+        self.name = "FLOAT"
+    def accept(self, visitor):
+        return visitor.visit_data_type(self)
+
+@dataclass
+class SQLBooleanType(SQLDataType):
+    """SQL BOOLEAN type."""
+    def __post_init__(self):
+        self.node_type = SQLNodeType.BOOLEAN_TYPE
+        self.name = "BOOLEAN"
+    def accept(self, visitor):
+        return visitor.visit_data_type(self)
+
+
 # Expression nodes
 @dataclass
 class SQLBinaryExpression(SQLExpression):
     """SQL binary expression."""
-    left: SQLExpression
-    operator: SQLOperator
-    right: SQLExpression
+    left: Optional[SQLExpression] = None
+    operator: SQLOperator = SQLOperator.EQUAL
+    right: Optional[SQLExpression] = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.BINARY_EXPRESSION
@@ -754,8 +774,8 @@ class SQLBinaryExpression(SQLExpression):
 @dataclass
 class SQLUnaryExpression(SQLExpression):
     """SQL unary expression."""
-    operator: SQLOperator
-    operand: SQLExpression
+    operator: SQLOperator = SQLOperator.EQUAL
+    operand: Optional[SQLExpression] = None
     prefix: bool = True
     
     def __post_init__(self):
@@ -772,7 +792,7 @@ class SQLUnaryExpression(SQLExpression):
 @dataclass
 class SQLFunctionCall(SQLExpression):
     """SQL function call."""
-    name: str
+    name: str = ""
     arguments: List[SQLExpression] = field(default_factory=list)
     distinct: bool = False
     window: Optional['SQLWindowSpecification'] = None
@@ -819,8 +839,8 @@ class SQLCaseExpression(SQLExpression):
 @dataclass
 class SQLCastExpression(SQLExpression):
     """SQL CAST expression."""
-    expression: SQLExpression
-    target_type: SQLDataType
+    expression: Optional[SQLExpression] = None
+    target_type: Optional[SQLDataType] = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.CAST_EXPRESSION
@@ -836,7 +856,7 @@ class SQLCastExpression(SQLExpression):
 @dataclass
 class SQLSubquery(SQLExpression):
     """SQL subquery."""
-    query: 'SQLSelectStatement'
+    query: Optional['SQLSelectStatement'] = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.SUBQUERY
@@ -866,8 +886,8 @@ class SQLColumnReference(SQLExpression):
 @dataclass
 class SQLInExpression(SQLExpression):
     """SQL IN expression."""
-    expression: SQLExpression
-    values: List[SQLExpression]
+    expression: Optional[SQLExpression] = None
+    values: List[SQLExpression] = field(default_factory=list)
     negated: bool = False
     
     def __post_init__(self):
@@ -884,9 +904,9 @@ class SQLInExpression(SQLExpression):
 @dataclass
 class SQLBetweenExpression(SQLExpression):
     """SQL BETWEEN expression."""
-    expression: SQLExpression
-    lower_bound: SQLExpression
-    upper_bound: SQLExpression
+    expression: Optional[SQLExpression] = None
+    lower_bound: Optional[SQLExpression] = None
+    upper_bound: Optional[SQLExpression] = None
     negated: bool = False
     
     def __post_init__(self):
@@ -903,8 +923,8 @@ class SQLBetweenExpression(SQLExpression):
 @dataclass
 class SQLLikeExpression(SQLExpression):
     """SQL LIKE expression."""
-    expression: SQLExpression
-    pattern: SQLExpression
+    expression: Optional[SQLExpression] = None
+    pattern: Optional[SQLExpression] = None
     escape: Optional[SQLExpression] = None
     negated: bool = False
     case_insensitive: bool = False  # ILIKE
@@ -926,7 +946,7 @@ class SQLLikeExpression(SQLExpression):
 @dataclass
 class SQLExistsExpression(SQLExpression):
     """SQL EXISTS expression."""
-    subquery: SQLSubquery
+    subquery: Optional[SQLSubquery] = None
     negated: bool = False
     
     def __post_init__(self):
@@ -988,7 +1008,7 @@ class SQLSelectStatement(SQLStatement):
 @dataclass
 class SQLInsertStatement(SQLStatement):
     """SQL INSERT statement."""
-    table: SQLIdentifier
+    table: Optional[SQLIdentifier] = None
     columns: List[SQLIdentifier] = field(default_factory=list)
     values: List[List[SQLExpression]] = field(default_factory=list)
     select_query: Optional[SQLSelectStatement] = None
@@ -1015,7 +1035,7 @@ class SQLInsertStatement(SQLStatement):
 @dataclass
 class SQLUpdateStatement(SQLStatement):
     """SQL UPDATE statement."""
-    table: SQLIdentifier
+    table: Optional[SQLIdentifier] = None
     set_clauses: List[Tuple[SQLIdentifier, SQLExpression]] = field(default_factory=list)
     from_clause: Optional['SQLFromClause'] = None
     where_clause: Optional['SQLWhereClause'] = None
@@ -1043,7 +1063,7 @@ class SQLUpdateStatement(SQLStatement):
 @dataclass
 class SQLDeleteStatement(SQLStatement):
     """SQL DELETE statement."""
-    table: SQLIdentifier
+    table: Optional[SQLIdentifier] = None
     where_clause: Optional['SQLWhereClause'] = None
     returning: List[SQLExpression] = field(default_factory=list)
     
@@ -1065,7 +1085,7 @@ class SQLDeleteStatement(SQLStatement):
 @dataclass
 class SQLCreateTableStatement(SQLStatement):
     """SQL CREATE TABLE statement."""
-    table_name: SQLIdentifier
+    table_name: Optional[SQLIdentifier] = None
     columns: List['SQLColumnDefinition'] = field(default_factory=list)
     constraints: List['SQLConstraint'] = field(default_factory=list)
     temporary: bool = False
@@ -1089,7 +1109,7 @@ class SQLCreateTableStatement(SQLStatement):
 @dataclass
 class SQLDropTableStatement(SQLStatement):
     """SQL DROP TABLE statement."""
-    table_names: List[SQLIdentifier]
+    table_names: List[SQLIdentifier] = field(default_factory=list)
     if_exists: bool = False
     cascade: bool = False
     
@@ -1107,7 +1127,7 @@ class SQLDropTableStatement(SQLStatement):
 @dataclass
 class SQLAlterTableStatement(SQLStatement):
     """SQL ALTER TABLE statement."""
-    table_name: SQLIdentifier
+    table_name: Optional[SQLIdentifier] = None
     actions: List['SQLAlterTableAction'] = field(default_factory=list)
     
     def __post_init__(self):
@@ -1141,7 +1161,7 @@ class SQLFromClause(SQLClause):
 @dataclass
 class SQLWhereClause(SQLClause):
     """SQL WHERE clause."""
-    condition: SQLExpression
+    condition: Optional[SQLExpression] = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.WHERE_CLAUSE
@@ -1157,7 +1177,7 @@ class SQLWhereClause(SQLClause):
 @dataclass
 class SQLGroupByClause(SQLClause):
     """SQL GROUP BY clause."""
-    expressions: List[SQLExpression]
+    expressions: List[SQLExpression] = field(default_factory=list)
     
     def __post_init__(self):
         self.node_type = SQLNodeType.GROUP_BY_CLAUSE
@@ -1173,7 +1193,7 @@ class SQLGroupByClause(SQLClause):
 @dataclass
 class SQLHavingClause(SQLClause):
     """SQL HAVING clause."""
-    condition: SQLExpression
+    condition: Optional[SQLExpression] = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.HAVING_CLAUSE
@@ -1189,7 +1209,7 @@ class SQLHavingClause(SQLClause):
 @dataclass
 class SQLOrderByClause(SQLClause):
     """SQL ORDER BY clause."""
-    expressions: List['SQLOrderByExpression']
+    expressions: List['SQLOrderByExpression'] = field(default_factory=list)
     
     def __post_init__(self):
         self.node_type = SQLNodeType.ORDER_BY_CLAUSE
@@ -1205,7 +1225,7 @@ class SQLOrderByClause(SQLClause):
 @dataclass
 class SQLOrderByExpression(SQLExpression):
     """SQL ORDER BY expression."""
-    expression: SQLExpression
+    expression: Optional[SQLExpression] = None
     ascending: bool = True
     nulls_first: Optional[bool] = None
     
@@ -1223,7 +1243,7 @@ class SQLOrderByExpression(SQLExpression):
 @dataclass
 class SQLLimitClause(SQLClause):
     """SQL LIMIT clause."""
-    count: SQLExpression
+    count: SQLExpression = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.LIMIT_CLAUSE
@@ -1239,7 +1259,7 @@ class SQLLimitClause(SQLClause):
 @dataclass
 class SQLOffsetClause(SQLClause):
     """SQL OFFSET clause."""
-    count: SQLExpression
+    count: SQLExpression = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.OFFSET_CLAUSE
@@ -1255,7 +1275,7 @@ class SQLOffsetClause(SQLClause):
 @dataclass
 class SQLWithClause(SQLClause):
     """SQL WITH clause (Common Table Expressions)."""
-    cte_list: List['SQLCommonTableExpression']
+    cte_list: List['SQLCommonTableExpression'] = field(default_factory=list)
     recursive: bool = False
     
     def __post_init__(self):
@@ -1272,9 +1292,9 @@ class SQLWithClause(SQLClause):
 @dataclass
 class SQLCommonTableExpression(SQLNode):
     """SQL Common Table Expression."""
-    name: SQLIdentifier
+    name: Optional[SQLIdentifier] = None
     columns: List[SQLIdentifier] = field(default_factory=list)
-    query: SQLSelectStatement = None
+    query: Optional[SQLSelectStatement] = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.CTE
@@ -1303,7 +1323,7 @@ class SQLTableReference(SQLNode):
 @dataclass
 class SQLTableName(SQLTableReference):
     """Simple table name reference."""
-    name: SQLIdentifier
+    name: Optional[SQLIdentifier] = None
     
     def accept(self, visitor):
         return visitor.visit_table_name(self)
@@ -1319,9 +1339,9 @@ class SQLTableName(SQLTableReference):
 @dataclass
 class SQLJoin(SQLTableReference):
     """SQL JOIN operation."""
-    join_type: JoinType
-    left: SQLTableReference
-    right: SQLTableReference
+    join_type: JoinType = JoinType.INNER
+    left: Optional[SQLTableReference] = None
+    right: Optional[SQLTableReference] = None
     condition: Optional[SQLExpression] = None
     using_columns: List[SQLIdentifier] = field(default_factory=list)
     
@@ -1343,7 +1363,7 @@ class SQLJoin(SQLTableReference):
 @dataclass
 class SQLDerivedTable(SQLTableReference):
     """Derived table (subquery in FROM clause)."""
-    query: SQLSelectStatement
+    query: Optional[SQLSelectStatement] = None
     
     def accept(self, visitor):
         return visitor.visit_derived_table(self)
@@ -1360,8 +1380,8 @@ class SQLDerivedTable(SQLTableReference):
 @dataclass
 class SQLColumnDefinition(SQLNode):
     """SQL column definition."""
-    name: SQLIdentifier
-    data_type: SQLDataType
+    name: Optional[SQLIdentifier] = None
+    data_type: Optional[SQLDataType] = None
     constraints: List['SQLConstraint'] = field(default_factory=list)
     
     def __post_init__(self):
@@ -1378,7 +1398,7 @@ class SQLColumnDefinition(SQLNode):
 @dataclass
 class SQLConstraint(SQLNode):
     """Base class for SQL constraints."""
-    constraint_type: ConstraintType
+    constraint_type: Optional[ConstraintType] = None
     name: Optional[SQLIdentifier] = None
     
     def accept(self, visitor):
@@ -1409,7 +1429,7 @@ class SQLPrimaryKeyConstraint(SQLConstraint):
 class SQLForeignKeyConstraint(SQLConstraint):
     """SQL FOREIGN KEY constraint."""
     columns: List[SQLIdentifier] = field(default_factory=list)
-    referenced_table: SQLIdentifier = None
+    referenced_table: Optional[SQLIdentifier] = None
     referenced_columns: List[SQLIdentifier] = field(default_factory=list)
     on_delete: Optional[str] = None
     on_update: Optional[str] = None
@@ -1455,7 +1475,7 @@ class SQLUniqueConstraint(SQLConstraint):
 @dataclass
 class SQLCheckConstraint(SQLConstraint):
     """SQL CHECK constraint."""
-    condition: SQLExpression
+    condition: Optional[SQLExpression] = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.CHECK_CONSTRAINT
@@ -1475,7 +1495,7 @@ class SQLCheckConstraint(SQLConstraint):
 @dataclass
 class SQLDefaultConstraint(SQLConstraint):
     """SQL DEFAULT constraint."""
-    value: SQLExpression
+    value: SQLExpression = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.DEFAULT_CONSTRAINT
@@ -1517,8 +1537,8 @@ class SQLWindowSpecification(SQLNode):
 @dataclass
 class SQLFrameClause(SQLNode):
     """SQL frame clause for window functions."""
-    frame_type: WindowFrameType
-    start_bound: WindowFrameBound
+    frame_type: Optional[WindowFrameType] = None
+    start_bound: Optional[WindowFrameBound] = None
     end_bound: Optional[WindowFrameBound] = None
     
     def __post_init__(self):
@@ -1532,9 +1552,9 @@ class SQLFrameClause(SQLNode):
 @dataclass
 class SQLSetOperation(SQLStatement):
     """SQL set operation (UNION, INTERSECT, EXCEPT)."""
-    left: SQLSelectStatement
-    right: SQLSelectStatement
-    operation: str
+    left: Optional[SQLSelectStatement] = None
+    right: Optional[SQLSelectStatement] = None
+    operation: str = "UNION"
     all_modifier: bool = False
     
     def __post_init__(self):
@@ -1563,7 +1583,7 @@ class SQLAlterTableAction(SQLNode):
 @dataclass
 class SQLAddColumnAction(SQLAlterTableAction):
     """ALTER TABLE ADD COLUMN action."""
-    column: SQLColumnDefinition
+    column: SQLColumnDefinition = None
     
     def accept(self, visitor):
         return visitor.visit_add_column_action(self)
@@ -1576,7 +1596,7 @@ class SQLAddColumnAction(SQLAlterTableAction):
 @dataclass
 class SQLDropColumnAction(SQLAlterTableAction):
     """ALTER TABLE DROP COLUMN action."""
-    column_name: SQLIdentifier
+    column_name: SQLIdentifier = None
     if_exists: bool = False
     cascade: bool = False
     
@@ -1591,7 +1611,7 @@ class SQLDropColumnAction(SQLAlterTableAction):
 @dataclass
 class SQLAlterColumnAction(SQLAlterTableAction):
     """ALTER TABLE ALTER COLUMN action."""
-    column_name: SQLIdentifier
+    column_name: SQLIdentifier = None
     new_data_type: Optional[SQLDataType] = None
     set_default: Optional[SQLExpression] = None
     drop_default: bool = False
@@ -1614,7 +1634,7 @@ class SQLAlterColumnAction(SQLAlterTableAction):
 @dataclass
 class SQLAddConstraintAction(SQLAlterTableAction):
     """ALTER TABLE ADD CONSTRAINT action."""
-    constraint: SQLConstraint
+    constraint: SQLConstraint = None
     
     def accept(self, visitor):
         return visitor.visit_add_constraint_action(self)
@@ -1627,7 +1647,7 @@ class SQLAddConstraintAction(SQLAlterTableAction):
 @dataclass
 class SQLDropConstraintAction(SQLAlterTableAction):
     """ALTER TABLE DROP CONSTRAINT action."""
-    constraint_name: SQLIdentifier
+    constraint_name: SQLIdentifier = None
     if_exists: bool = False
     cascade: bool = False
     
@@ -1643,8 +1663,8 @@ class SQLDropConstraintAction(SQLAlterTableAction):
 @dataclass
 class SQLJSONExtractExpression(SQLExpression):
     """SQL JSON extract expression."""
-    json_expression: SQLExpression
-    path: SQLExpression
+    json_expression: SQLExpression = None
+    path: SQLExpression = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.JSON_EXTRACT
@@ -1712,8 +1732,8 @@ class SQLArrayConstructor(SQLExpression):
 @dataclass
 class SQLArrayElement(SQLExpression):
     """SQL array element access."""
-    array_expression: SQLExpression
-    index: SQLExpression
+    array_expression: SQLExpression = None
+    index: SQLExpression = None
     
     def __post_init__(self):
         self.node_type = SQLNodeType.ARRAY_ELEMENT
@@ -1973,3 +1993,567 @@ class SQLVisitor(ABC):
     
     def visit_array_element(self, node: SQLArrayElement):
         return self.visit_binary_expression(node)
+
+@dataclass
+class SQLParameter(SQLNode):
+    """SQL stored procedure/function parameter."""
+    name: Optional[SQLIdentifier] = None
+    data_type: Optional[SQLDataType] = None
+    direction: str = "IN"  # IN, OUT, INOUT
+    default: Optional[SQLExpression] = None
+
+    def __post_init__(self):
+        self.node_type = SQLNodeType.PARAMETER
+
+    def accept(self, visitor):
+        return visitor.visit_parameter(self) if hasattr(visitor, "visit_parameter") else None
+
+    @property
+    def children(self) -> List[SQLNode]:
+        children = [self.name, self.data_type]
+        if self.default:
+            children.append(self.default)
+        return children
+
+@dataclass
+class SQLCreateProcedureStatement(SQLStatement):
+    """SQL CREATE PROCEDURE statement."""
+    name: Optional[SQLIdentifier] = None
+    parameters: List[SQLParameter] = field(default_factory=list)
+    body: List[SQLStatement] = field(default_factory=list)
+    return_type: Optional[SQLDataType] = None  # Some dialects support RETURNS
+    or_replace: bool = False
+    if_not_exists: bool = False
+
+    def __post_init__(self):
+        self.node_type = SQLNodeType.CREATE_PROCEDURE
+
+    def accept(self, visitor):
+        return visitor.visit_create_procedure_statement(self) if hasattr(visitor, "visit_create_procedure_statement") else None
+
+    @property
+    def children(self) -> List[SQLNode]:
+        children = [self.name] + self.parameters + self.body
+        if self.return_type:
+            children.append(self.return_type)
+        return children
+
+
+@dataclass
+class SQLCreateFunctionStatement(SQLStatement):
+    """SQL CREATE FUNCTION statement."""
+    name: Optional[SQLIdentifier] = None
+    parameters: List[SQLParameter] = field(default_factory=list)
+    return_type: Optional[SQLDataType] = None
+    body: List[SQLStatement] = field(default_factory=list)
+    language: str = "SQL"
+    deterministic: bool = False
+    security: str = "DEFINER"  # DEFINER, INVOKER
+    or_replace: bool = False
+    if_not_exists: bool = False
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.CREATE_FUNCTION
+    
+    def accept(self, visitor):
+        return visitor.visit_create_function_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = [self.name] + self.parameters + self.body
+        if self.return_type:
+            children.append(self.return_type)
+        return children
+
+
+@dataclass
+class SQLCreateTriggerStatement(SQLStatement):
+    """SQL CREATE TRIGGER statement."""
+    name: Optional[SQLIdentifier] = None
+    timing: str = "AFTER"  # BEFORE, AFTER, INSTEAD OF
+    events: List[str] = field(default_factory=list)  # INSERT, UPDATE, DELETE
+    table_name: Optional[SQLIdentifier] = None
+    for_each: str = "ROW"  # ROW, STATEMENT
+    when_condition: Optional[SQLExpression] = None
+    body: List[SQLStatement] = field(default_factory=list)
+    or_replace: bool = False
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.CREATE_TRIGGER
+    
+    def accept(self, visitor):
+        return visitor.visit_create_trigger_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = [self.name, self.table_name]
+        if self.when_condition:
+            children.append(self.when_condition)
+        children.extend(self.body)
+        return children
+
+
+# Stored Procedure & Control Flow Constructs - Production Ready Extensions
+@dataclass
+class SQLIfStatement(SQLStatement):
+    """SQL IF statement for stored procedures."""
+    condition: Optional[SQLExpression] = None
+    then_statements: List[SQLStatement] = field(default_factory=list)
+    elseif_clauses: List[Tuple[SQLExpression, List[SQLStatement]]] = field(default_factory=list)
+    else_statements: List[SQLStatement] = field(default_factory=list)
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.IF_STATEMENT
+    
+    def accept(self, visitor):
+        return visitor.visit_if_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = [self.condition] + self.then_statements + self.else_statements
+        for cond, stmts in self.elseif_clauses:
+            children.extend([cond] + stmts)
+        return children
+
+
+@dataclass
+class SQLWhileLoop(SQLStatement):
+    """SQL WHILE loop for stored procedures."""
+    condition: Optional[SQLExpression] = None
+    body: List[SQLStatement] = field(default_factory=list)
+    label: Optional[str] = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.WHILE_LOOP
+    
+    def accept(self, visitor):
+        return visitor.visit_while_loop(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return [self.condition] + self.body
+
+
+@dataclass
+class SQLForLoop(SQLStatement):
+    """SQL FOR loop for stored procedures."""
+    variable: SQLIdentifier = None
+    start_value: SQLExpression = None
+    end_value: SQLExpression = None
+    step_value: Optional[SQLExpression] = None
+    body: List[SQLStatement] = field(default_factory=list)
+    label: Optional[str] = None
+    reverse: bool = False
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.FOR_LOOP
+    
+    def accept(self, visitor):
+        return visitor.visit_for_loop(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = [self.variable, self.start_value, self.end_value]
+        if self.step_value:
+            children.append(self.step_value)
+        children.extend(self.body)
+        return children
+
+
+@dataclass
+class SQLLoopStatement(SQLStatement):
+    """SQL LOOP statement (infinite loop with EXIT)."""
+    body: List[SQLStatement] = field(default_factory=list)
+    label: Optional[str] = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.LOOP_STATEMENT
+    
+    def accept(self, visitor):
+        return visitor.visit_loop_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return self.body
+
+
+@dataclass
+class SQLRepeatStatement(SQLStatement):
+    """SQL REPEAT/UNTIL statement."""
+    body: List[SQLStatement] = field(default_factory=list)
+    condition: Optional[SQLExpression] = None
+    label: Optional[str] = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.REPEAT_STATEMENT
+    
+    def accept(self, visitor):
+        return visitor.visit_repeat_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = self.body.copy()
+        if self.condition:
+            children.append(self.condition)
+        return children
+
+
+@dataclass
+class SQLReturnStatement(SQLStatement):
+    """SQL RETURN statement for functions/procedures."""
+    value: Optional[SQLExpression] = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.RETURN_STATEMENT
+    
+    def accept(self, visitor):
+        return visitor.visit_return_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return [self.value] if self.value else []
+
+
+@dataclass
+class SQLRaiseStatement(SQLStatement):
+    """SQL RAISE/SIGNAL statement for exceptions."""
+    condition_name: Optional[str] = None
+    message: Optional[SQLExpression] = None
+    sqlstate: Optional[str] = None
+    error_code: Optional[SQLExpression] = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.RAISE_STATEMENT
+    
+    def accept(self, visitor):
+        return visitor.visit_raise_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = []
+        if self.message:
+            children.append(self.message)
+        if self.error_code:
+            children.append(self.error_code)
+        return children
+
+
+@dataclass
+class SQLExitStatement(SQLStatement):
+    """SQL EXIT statement for loops."""
+    label: Optional[str] = None
+    condition: Optional[SQLExpression] = None
+    
+    def accept(self, visitor):
+        return visitor.visit_exit_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return [self.condition] if self.condition else []
+
+
+@dataclass
+class SQLContinueStatement(SQLStatement):
+    """SQL CONTINUE statement for loops."""
+    label: Optional[str] = None
+    condition: Optional[SQLExpression] = None
+    
+    def accept(self, visitor):
+        return visitor.visit_continue_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return [self.condition] if self.condition else []
+
+
+@dataclass
+class SQLGotoStatement(SQLStatement):
+    """SQL GOTO statement."""
+    label: str = ""
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.GOTO_STATEMENT
+    
+    def accept(self, visitor):
+        return visitor.visit_goto_statement(self)
+
+
+@dataclass
+class SQLLabelStatement(SQLStatement):
+    """SQL label statement."""
+    name: str = ""
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.LABEL
+    
+    def accept(self, visitor):
+        return visitor.visit_label_statement(self)
+
+
+@dataclass
+class SQLTryCatchBlock(SQLStatement):
+    """SQL TRY/CATCH block."""
+    try_body: List[SQLStatement] = field(default_factory=list)
+    catch_handlers: List['SQLExceptionHandler'] = field(default_factory=list)
+    finally_block: Optional[List[SQLStatement]] = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.TRY_CATCH
+    
+    def accept(self, visitor):
+        return visitor.visit_try_catch_block(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = self.try_body + self.catch_handlers
+        if self.finally_block:
+            children.extend(self.finally_block)
+        return children
+
+
+@dataclass
+class SQLExceptionHandler(SQLNode):
+    """SQL exception handler in TRY/CATCH."""
+    exception_types: List[str] = field(default_factory=list)
+    variable_name: Optional[str] = None
+    body: List[SQLStatement] = field(default_factory=list)
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.EXCEPTION_HANDLER
+    
+    def accept(self, visitor):
+        return visitor.visit_exception_handler(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return self.body
+
+
+@dataclass
+class SQLCursorDeclaration(SQLStatement):
+    """SQL cursor declaration."""
+    name: Optional[SQLIdentifier] = None
+    query: Optional[SQLSelectStatement] = None
+    parameters: List[SQLParameter] = field(default_factory=list)
+    is_scroll: bool = False
+    is_insensitive: bool = False
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.CURSOR_DECLARATION
+    
+    def accept(self, visitor):
+        return visitor.visit_cursor_declaration(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return [self.name, self.query] + self.parameters
+
+
+@dataclass
+class SQLCursorOpen(SQLStatement):
+    """SQL cursor OPEN statement."""
+    cursor_name: SQLIdentifier = None
+    arguments: List[SQLExpression] = field(default_factory=list)
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.CURSOR_OPEN
+    
+    def accept(self, visitor):
+        return visitor.visit_cursor_open(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return [self.cursor_name] + self.arguments
+
+
+@dataclass
+class SQLCursorFetch(SQLStatement):
+    """SQL cursor FETCH statement."""
+    cursor_name: SQLIdentifier = None
+    variables: List[SQLIdentifier] = field(default_factory=list)
+    direction: str = "NEXT"  # NEXT, PRIOR, FIRST, LAST, ABSOLUTE, RELATIVE
+    count: Optional[SQLExpression] = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.CURSOR_FETCH
+    
+    def accept(self, visitor):
+        return visitor.visit_cursor_fetch(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = [self.cursor_name] + self.variables
+        if self.count:
+            children.append(self.count)
+        return children
+
+
+@dataclass
+class SQLCursorClose(SQLStatement):
+    """SQL cursor CLOSE statement."""
+    cursor_name: SQLIdentifier = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.CURSOR_CLOSE
+    
+    def accept(self, visitor):
+        return visitor.visit_cursor_close(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return [self.cursor_name]
+
+
+@dataclass
+class SQLDeclareStatement(SQLStatement):
+    """SQL DECLARE statement for variables."""
+    variables: List[Tuple[SQLIdentifier, SQLDataType, Optional[SQLExpression]]] = field(default_factory=list)
+    
+    def accept(self, visitor):
+        return visitor.visit_declare_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = []
+        for var_name, var_type, default_value in self.variables:
+            children.extend([var_name, var_type])
+            if default_value:
+                children.append(default_value)
+        return children
+
+
+@dataclass
+class SQLSetStatement(SQLStatement):
+    """SQL SET statement for variable assignment."""
+    assignments: List[Tuple[SQLIdentifier, SQLExpression]] = field(default_factory=list)
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.SET
+    
+    def accept(self, visitor):
+        return visitor.visit_set_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = []
+        for var_name, value in self.assignments:
+            children.extend([var_name, value])
+        return children
+
+
+# Administrative statements
+@dataclass
+class SQLExplainStatement(SQLStatement):
+    """SQL EXPLAIN statement."""
+    query: SQLStatement = None
+    format: str = "TEXT"  # TEXT, JSON, XML, YAML
+    analyze: bool = False
+    verbose: bool = False
+    costs: bool = True
+    buffers: bool = False
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.EXPLAIN
+    
+    def accept(self, visitor):
+        return visitor.visit_explain_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return [self.query]
+
+
+@dataclass
+class SQLShowStatement(SQLStatement):
+    """SQL SHOW statement."""
+    object_type: str = "TABLES"  # TABLES, COLUMNS, DATABASES, etc.
+    object_name: Optional[SQLIdentifier] = None
+    pattern: Optional[str] = None
+    where_clause: Optional[SQLWhereClause] = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.SHOW
+    
+    def accept(self, visitor):
+        return visitor.visit_show_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = []
+        if self.object_name:
+            children.append(self.object_name)
+        if self.where_clause:
+            children.append(self.where_clause)
+        return children
+
+
+@dataclass
+class SQLDescribeStatement(SQLStatement):
+    """SQL DESCRIBE statement."""
+    table_name: Optional[SQLIdentifier] = None
+    column_name: Optional[SQLIdentifier] = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.DESCRIBE
+    
+    def accept(self, visitor):
+        return visitor.visit_describe_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        children = [self.table_name]
+        if self.column_name:
+            children.append(self.column_name)
+        return children
+
+
+@dataclass
+class SQLUseStatement(SQLStatement):
+    """SQL USE statement."""
+    database_name: SQLIdentifier = None
+    
+    def __post_init__(self):
+        self.node_type = SQLNodeType.USE
+    
+    def accept(self, visitor):
+        return visitor.visit_use_statement(self)
+    
+    @property
+    def children(self) -> List[SQLNode]:
+        return [self.database_name]
+
+
+# Helper functions for creating common SQL constructs
+def create_sql_identifier(name: str, quoted: bool = False) -> SQLIdentifier:
+    """Create an SQL identifier."""
+    return SQLIdentifier(name=name, quoted=quoted)
+
+
+def create_sql_literal(value: Any, literal_type: str = "string") -> SQLLiteral:
+    """Create an SQL literal based on type."""
+    if literal_type == "integer":
+        return SQLIntegerLiteral(value=int(value))
+    elif literal_type == "float":
+        return SQLFloatLiteral(value=float(value))
+    elif literal_type == "boolean":
+        return SQLBooleanLiteral(value=bool(value))
+    elif value is None:
+        return SQLNullLiteral()
+    else:
+        return SQLStringLiteral(value=str(value))
+
+
+def create_sql_binary_expr(left: SQLExpression, operator: SQLOperator, 
+                          right: SQLExpression) -> SQLBinaryExpression:
+    """Create an SQL binary expression."""
+    return SQLBinaryExpression(left=left, operator=operator, right=right)
+
+
+def create_sql_select(columns: List[SQLExpression], 
+                     table_name: Optional[str] = None) -> SQLSelectStatement:
+    """Create a basic SQL SELECT statement."""
+    select = SQLSelectStatement(select_list=columns)
+    if table_name:
+        table_ref = SQLTableName(name=create_sql_identifier(table_name))
+        select.from_clause = SQLFromClause(table_references=[table_ref])
+    return select

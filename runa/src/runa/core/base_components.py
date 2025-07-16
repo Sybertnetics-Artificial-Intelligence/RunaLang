@@ -428,8 +428,7 @@ class {language_info.name.title()}Parser(BaseLanguageParser):
     def _parse_tokens(self, tokens: List[str]) -> ASTNode:
         """Parse tokens into AST - IMPLEMENT THIS."""
         # TODO: Implement parsing
-        # TODO: Implement Parser implementation needed
-            return StringLiteral(value="Parser implementation needed_placeholder")
+        raise NotImplementedError("Parsing logic not yet implemented for this template.")
 '''
     
     @staticmethod
@@ -478,14 +477,12 @@ class {language_info.name.title()}Converter(BaseLanguageConverter):
     def _convert_to_runa(self, node: ASTNode) -> ASTNode:
         """Convert a single node to Runa - IMPLEMENT THIS."""
         # TODO: Implement node-by-node conversion logic
-        # TODO: Implement Converter implementation needed
-            return StringLiteral(value="Converter implementation needed_placeholder")
+        raise NotImplementedError("AST to Runa conversion not implemented for this template.")
     
     def _convert_from_runa(self, node: ASTNode) -> ASTNode:
         """Convert a single Runa node to {language_info.name} - IMPLEMENT THIS."""
         # TODO: Implement node-by-node conversion logic
-        # TODO: Implement Converter implementation needed
-            return StringLiteral(value="Converter implementation needed_placeholder")
+        raise NotImplementedError("Runa to AST conversion not implemented for this template.")
 '''
     
     @staticmethod
@@ -527,9 +524,7 @@ class {language_info.name.title()}Generator(BaseLanguageGenerator):
         """Generate code for a single AST node - IMPLEMENT THIS."""
         # TODO: Implement node-by-node code generation
         # This should dispatch to specific methods based on node type
-        
-        # TODO: Implement Generator implementation needed
-            return StringLiteral(value="Generator implementation needed_placeholder")
+        raise NotImplementedError("Code generation logic not implemented for this template.")
 '''
 
 

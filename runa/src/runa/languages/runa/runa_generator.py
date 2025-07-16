@@ -6,8 +6,8 @@ This is the "pretty printer" for the Runa language itself.
 """
 
 from typing import List, Dict, Any, Optional
-from runa.core.base_components import BaseLanguageGenerator, GenerationError, LanguageInfo, LanguageTier
-from runa.core.runa_ast import *
+from ...core.base_components import BaseLanguageGenerator, GenerationError, LanguageInfo, LanguageTier
+from ...core.runa_ast import *
 
 
 # Define Runa language info
@@ -284,6 +284,12 @@ class RunaGenerator(BaseLanguageGenerator):
             code_lines.append(f"{indent}Return {value_str}")
         else:
             code_lines.append(f"{indent}Return")
+    
+    def _generate_expressionstatement(self, node: ExpressionStatement, code_lines: List[str], indent_level: int):
+        """Generate expression statement."""
+        indent = self.get_indent(indent_level)
+        expr_str = self._expression_to_string(node.expression)
+        code_lines.append(f"{indent}{expr_str}")
     
     # === HELPER METHODS ===
     

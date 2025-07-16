@@ -1002,10 +1002,10 @@ class RunaToJSConverter:
             for catch_clause in stmt.catch_clauses:
                 param = JSIdentifier(catch_clause.exception_name) if catch_clause.exception_name else None
                 catch_body = self.convert_statement(catch_clause.block)
-                if not isinstance(catch_body, JSBlockStatement):
-                    catch_body = JSBlockStatement([catch_body] if catch_body else [])
-                
-                handler = JSCatchClause(param, catch_body)
+            if not isinstance(catch_body, JSBlockStatement):
+                catch_body = JSBlockStatement([catch_body] if catch_body else [])
+            
+            handler = JSCatchClause(param, catch_body)
         
         finally_block = None
         if stmt.finally_block:

@@ -1,120 +1,104 @@
 #!/usr/bin/env python3
 """
-Script to automatically fix dataclass field ordering issues in the Runa AST.
+Fix dataclass field ordering issues in AST files.
 
-This script adds default values to all required fields in dataclasses that inherit
-from ASTNode (which has default fields), fixing the "non-default argument follows
-default argument" error.
+This script identifies fields without default values in dataclasses that inherit from 
+classes with default values, and fixes them by adding appropriate defaults.
 """
 
 import re
-import sys
-from typing import Dict, List, Tuple
+import os
+from pathlib import Path
 
-def fix_dataclass_fields(file_path: str) -> None:
-    """Fix dataclass field ordering in the given file."""
-    
+def fix_dataclass_fields(file_path):
+    """Fix dataclass field ordering issues in a Python file."""
     with open(file_path, 'r') as f:
         content = f.read()
     
-    # Default values for common field types
-    default_values = {
-        'str': '""',
-        'int': '0',
-        'float': '0.0',
-        'bool': 'False',
-        'List[Expression]': 'field(default_factory=list)',
-        'List[Statement]': 'field(default_factory=list)',
-        'List[TypeExpression]': 'field(default_factory=list)',
-        'List[Parameter]': 'field(default_factory=list)',
-        'List[MatchCase]': 'field(default_factory=list)',
-        'List[CatchClause]': 'field(default_factory=list)',
-        'List[str]': 'field(default_factory=list)',
-        'List[tuple[Expression, Expression]]': 'field(default_factory=list)',
-        'List[Tuple[Expression, Expression]]': 'field(default_factory=list)',
-        'List[Tuple[str, Expression]]': 'field(default_factory=list)',
-        'List[tuple[str, Expression]]': 'field(default_factory=list)',
-        'Expression': 'None',
-        'Optional[Expression]': 'None',
-        'TypeExpression': 'None',
-        'Optional[TypeExpression]': 'None',
-        'BinaryOperator': 'None',
-        'Optional[BinaryOperator]': 'None',
-        'UnaryOperator': 'None',
-        'Pattern': 'None',
-        'Statement': 'None',
-        'Declaration': 'None',
-    }
+    # Pattern to find dataclass fields without defaults that come after inheritance
+    # This is a simplified approach - we'll add default values to required fields
+    patterns_to_fix = [
+        # Field definitions that need default values
+        (r'(\s+)(\w+): str\n', r'\1\2: str = ""\n'),
+        (r'(\s+)(\w+): int\n', r'\1\2: int = 0\n'),
+        (r'(\s+)(\w+): bool\n', r'\1\2: bool = False\n'),
+        (r'(\s+)(\w+): float\n', r'\1\2: float = 0.0\n'),
+        (r'(\s+)(\w+): List\[(.*?)\]\n', r'\1\2: List[\3] = None\n'),
+        (r'(\s+)(\w+): Dict\[(.*?)\]\n', r'\1\2: Dict[\3] = None\n'),
+        (r'(\s+)(\w+): Any\n', r'\1\2: Any = None\n'),
+        # Enum types
+        (r'(\s+)(\w+): Py(\w+)\n', r'\1\2: Py\3 = None\n'),
+        (r'(\s+)(\w+): TS(\w+)\n', r'\1\2: TS\3 = None\n'),
+        (r'(\s+)(\w+): JS(\w+)\n', r'\1\2: JS\3 = None\n'),
+        (r'(\s+)(\w+): Java(\w+)\n', r'\1\2: Java\3 = None\n'),
+        (r'(\s+)(\w+): CSharp(\w+)\n', r'\1\2: CSharp\3 = None\n'),
+        (r'(\s+)(\w+): Cpp(\w+)\n', r'\1\2: Cpp\3 = None\n'),
+        (r'(\s+)(\w+): SQL(\w+)\n', r'\1\2: SQL\3 = None\n'),
+        # Some specific field patterns
+        (r'(\s+)id: str\n', r'\1id: str = ""\n'),
+        (r'(\s+)name: str\n', r'\1name: str = ""\n'),
+        (r'(\s+)operator: str\n', r'\1operator: str = ""\n'),
+        (r'(\s+)op: (\w+)\n', r'\1op: \2 = None\n'),
+        (r'(\s+)value: Any\n', r'\1value: Any = None\n'),
+        (r'(\s+)left: (\w+Expression)\n', r'\1left: \2 = None\n'),
+        (r'(\s+)right: (\w+Expression)\n', r'\1right: \2 = None\n'),
+        (r'(\s+)operand: (\w+Expression)\n', r'\1operand: \2 = None\n'),
+        (r'(\s+)test: (\w+Expression)\n', r'\1test: \2 = None\n'),
+        (r'(\s+)body: List\[(\w+)\]\n', r'\1body: List[\2] = None\n'),
+        (r'(\s+)orelse: List\[(\w+)\]\n', r'\1orelse: List[\2] = None\n'),
+        (r'(\s+)(\w+): (\w+Expression)\n', r'\1\2: \3 = None\n'),
+        (r'(\s+)(\w+): (\w+Statement)\n', r'\1\2: \3 = None\n'),
+    ]
     
-    # Find all dataclass definitions with inheritance from ASTNode hierarchy
-    pattern = r'@dataclass\s*\nclass\s+(\w+)\((Expression|Statement|Declaration|TypeExpression|ASTNode)\):\s*\n(.*?)\n\s*def\s+'
-    
-    def fix_field(match):
-        class_name = match.group(1)
-        parent_class = match.group(2)
-        class_body = match.group(3)
-        
-        print(f"Processing class {class_name} inheriting from {parent_class}")
-        
-        # Find field definitions
-        field_pattern = r'^\s*(\w+):\s*([^=\n]+)$'
-        lines = class_body.split('\n')
-        fixed_lines = []
-        
-        for line in lines:
-            field_match = re.match(field_pattern, line.strip())
-            if field_match:
-                field_name = field_match.group(1)
-                field_type = field_match.group(2).strip()
-                
-                # Skip if field already has a default value
-                if '=' in line:
-                    fixed_lines.append(line)
-                    continue
-                
-                # Add appropriate default value
-                default_value = default_values.get(field_type)
-                if not default_value:
-                    # Handle more complex types
-                    if field_type.startswith('List['):
-                        default_value = 'field(default_factory=list)'
-                    elif field_type.startswith('Optional[') or field_type.startswith('Union['):
-                        default_value = 'None'
-                    elif 'Expression' in field_type or 'Statement' in field_type or 'Declaration' in field_type:
-                        default_value = 'None'
-                        # Also make the type Optional if it isn't already
-                        if not field_type.startswith('Optional['):
-                            field_type = f'Optional[{field_type}]'
-                    else:
-                        # Default to None for unknown types and make them Optional
-                        default_value = 'None'
-                        if not field_type.startswith('Optional['):
-                            field_type = f'Optional[{field_type}]'
-                
-                # Reconstruct the line with default value
-                indent = len(line) - len(line.lstrip())
-                fixed_line = ' ' * indent + f'{field_name}: {field_type} = {default_value}'
-                fixed_lines.append(fixed_line)
-                print(f"  Fixed field: {field_name}: {field_type} = {default_value}")
-            else:
-                fixed_lines.append(line)
-        
-        # Reconstruct the class
-        fixed_body = '\n'.join(fixed_lines)
-        return f'@dataclass\nclass {class_name}({parent_class}):\n{fixed_body}\n    def '
-    
-    # Apply the fixes
     original_content = content
-    content = re.sub(pattern, fix_field, content, flags=re.MULTILINE | re.DOTALL)
+    for pattern, replacement in patterns_to_fix:
+        content = re.sub(pattern, replacement, content)
     
+    # Only write if there were changes
     if content != original_content:
-        print(f"Writing fixed content to {file_path}")
         with open(file_path, 'w') as f:
             f.write(content)
-        print("Successfully fixed dataclass field ordering issues!")
-    else:
-        print("No changes needed.")
+        print(f"Fixed dataclass fields in {file_path}")
+        return True
+    return False
+
+def main():
+    """Fix dataclass issues in all tier 1 language AST files."""
+    runa_dir = Path("src/runa/languages/tier1")
+    
+    if not runa_dir.exists():
+        print(f"Directory {runa_dir} not found. Make sure you're in the runa project root.")
+        return
+    
+    ast_files = []
+    for lang_dir in runa_dir.iterdir():
+        if lang_dir.is_dir():
+            # Try different naming patterns
+            potential_names = [
+                f"{lang_dir.name}_ast.py",  # Standard pattern
+                "py_ast.py",  # Python
+                "js_ast.py",  # JavaScript  
+                "ts_ast.py",  # TypeScript
+            ]
+            for name in potential_names:
+                ast_file = lang_dir / name
+                if ast_file.exists():
+                    ast_files.append(ast_file)
+                    break
+    
+    print(f"Found {len(ast_files)} AST files to check:")
+    for file_path in ast_files:
+        print(f"  {file_path}")
+    
+    fixed_count = 0
+    for file_path in ast_files:
+        try:
+            if fix_dataclass_fields(file_path):
+                fixed_count += 1
+        except Exception as e:
+            print(f"Error fixing {file_path}: {e}")
+    
+    print(f"\nFixed dataclass issues in {fixed_count} files.")
 
 if __name__ == "__main__":
-    ast_file = "/mnt/d/SybertneticsUmbrella/SybertneticsAISolutions/MonoRepo/runa/src/runa/core/runa_ast.py"
-    fix_dataclass_fields(ast_file)
+    main()

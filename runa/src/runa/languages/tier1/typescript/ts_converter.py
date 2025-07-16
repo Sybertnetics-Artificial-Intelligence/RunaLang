@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from .ts_ast import *
 from ....core.runa_ast import *
 
-
 class TSToRunaConverter:
     """Converts TypeScript AST to Runa AST."""
     
@@ -36,7 +35,7 @@ class TSToRunaConverter:
         
         return Program(statements)
     
-    def convert_statement(self, stmt: TSNode) -> Union[RunaStatement, List[RunaStatement], None]:
+    def convert_statement(self, stmt: TSNode) -> Union[Statement, List[Statement], None]:
         """Convert TypeScript statement to Runa statement."""
         if isinstance(stmt, TSVariableDeclaration):
             return self._convert_variable_declaration(stmt)
@@ -66,11 +65,11 @@ class TSToRunaConverter:
         elif isinstance(stmt, TSNode):
             expr = self.convert_expression(stmt)
             if expr:
-                return RunaExpressionStatement(expr)
+                return ExpressionStatement(expr)
         
         return None
     
-    def convert_expression(self, expr: TSNode) -> Optional[RunaExpression]:
+    def convert_expression(self, expr: TSNode) -> Optional[Expression]:
         """Convert TypeScript expression to Runa expression."""
         if isinstance(expr, TSLiteral):
             return self._convert_literal(expr)
@@ -84,7 +83,7 @@ class TSToRunaConverter:
         # Add more expression conversions as needed
         return None
     
-    def convert_type(self, ts_type: TSType) -> RunaType:
+    def convert_type(self, ts_type: TSType) -> TypeExpression:
         """Convert TypeScript type to Runa type."""
         if isinstance(ts_type, TSTypeReference):
             return self._convert_type_reference(ts_type)
@@ -108,9 +107,9 @@ class TSToRunaConverter:
             return self._convert_type_literal(ts_type)
         
         # Default to Any type
-        return RunaType("Any")
+        return TypeExpression("Any")
     
-    def _convert_variable_declaration(self, stmt: TSVariableDeclaration) -> List[RunaStatement]:
+    def _convert_variable_declaration(self, stmt: TSVariableDeclaration) -> List[Statement]:
         """Convert variable declaration to Runa Let statements."""
         statements = []
         
@@ -129,15 +128,15 @@ class TSToRunaConverter:
                 # Convert initial value
                 if declarator.init:
                     value = self.convert_expression(declarator.init)
-                    let_stmt = RunaLet(name, value, variable_type, mutable)
+                    let_stmt = LetStatement(name, value, variable_type, mutable)
                 else:
-                    let_stmt = RunaLet(name, RunaLiteral(None, "undefined"), variable_type, mutable)
+                    let_stmt = LetStatement(name, Expression(None, "undefined"), variable_type, mutable)
                 
                 statements.append(let_stmt)
         
         return statements
     
-    def _convert_function_declaration(self, stmt: TSFunctionDeclaration) -> RunaProcessDefinition:
+    def _convert_function_declaration(self, stmt: TSFunctionDeclaration) -> ProcessDefinition:
         """Convert function declaration to Runa Process definition."""
         func_name = stmt.name.name
         
@@ -146,7 +145,7 @@ class TSToRunaConverter:
         for param in stmt.parameters:
             if isinstance(param, TSParameter):
                 param_name = param.name.name
-                param_type = RunaType("Any")
+                param_type = TypeExpression("Any")
                 
                 if param.type_annotation:
                     param_type = self.convert_type(param.type_annotation.type_annotation)
@@ -156,11 +155,11 @@ class TSToRunaConverter:
                 if param.default_value:
                     default_value = self.convert_expression(param.default_value)
                 
-                runa_param = RunaParameter(param_name, param_type, default_value)
+                runa_param = Parameter(param_name, param_type, default_value)
                 params.append(runa_param)
         
         # Convert return type
-        return_type = RunaType("Any")
+        return_type = TypeExpression("Any")
         if stmt.return_type:
             return_type = self.convert_type(stmt.return_type.type_annotation)
         
@@ -174,16 +173,16 @@ class TSToRunaConverter:
                 else:
                     body_statements.append(converted)
         
-        return RunaProcessDefinition(
+        return ProcessDefinition(
             name=func_name,
             parameters=params,
             return_type=return_type,
-            body=RunaBlock(body_statements),
+            body=Block(body_statements),
             is_async=stmt.async_,
             type_parameters=self._convert_type_parameters(stmt.type_parameters)
         )
     
-    def _convert_interface_declaration(self, stmt: TSInterfaceDeclaration) -> RunaInterfaceDefinition:
+    def _convert_interface_declaration(self, stmt: TSInterfaceDeclaration) -> ProcessDefinition:
         """Convert interface declaration to Runa interface definition."""
         interface_name = stmt.name.name
         
@@ -202,25 +201,25 @@ class TSToRunaConverter:
                 else:
                     members.append(converted_member)
         
-        return RunaInterfaceDefinition(
+        return ProcessDefinition(
             name=interface_name,
             extends=extends,
             type_parameters=self._convert_type_parameters(stmt.type_parameters),
             members=members
         )
     
-    def _convert_type_alias_declaration(self, stmt: TSTypeAliasDeclaration) -> RunaStatement:
+    def _convert_type_alias_declaration(self, stmt: TSTypeAliasDeclaration) -> Statement:
         """Convert type alias declaration to Runa equivalent."""
         # For now, convert to a comment or documentation
         alias_name = stmt.name.name
         type_def = self.convert_type(stmt.type_annotation)
         
         # Create a process that returns the type (simplified representation)
-        return RunaExpressionStatement(
-            RunaLiteral(f"Type alias: {alias_name}", f"// Type {alias_name}")
+        return ExpressionStatement(
+            Expression(f"Type alias: {alias_name}", f"// Type {alias_name}")
         )
     
-    def _convert_enum_declaration(self, stmt: TSEnumDeclaration) -> RunaStatement:
+    def _convert_enum_declaration(self, stmt: TSEnumDeclaration) -> Statement:
         """Convert enum declaration to Runa equivalent."""
         enum_name = stmt.name.name
         
@@ -232,16 +231,16 @@ class TSToRunaConverter:
             if member.initializer:
                 value = self.convert_expression(member.initializer)
             else:
-                value = RunaLiteral(i, str(i))
+                value = Expression(i, str(i))
             
-            statements.append(RunaLet(member_name, value, RunaType("Integer"), False))
+            statements.append(LetStatement(member_name, value, TypeExpression("Integer"), False))
         
         # Return the first statement or a block
-        return statements[0] if statements else RunaExpressionStatement(
-            RunaLiteral(f"Empty enum: {enum_name}", f"// Empty enum {enum_name}")
+        return statements[0] if statements else ExpressionStatement(
+            Expression(f"Empty enum: {enum_name}", f"// Empty enum {enum_name}")
         )
     
-    def _convert_class_declaration(self, stmt: TSClassDeclaration) -> RunaClassDefinition:
+    def _convert_class_declaration(self, stmt: TSClassDeclaration) -> ProcessDefinition:
         """Convert class declaration to Runa class definition."""
         class_name = stmt.name.name
         
@@ -265,7 +264,7 @@ class TSToRunaConverter:
                 else:
                     members.append(converted_member)
         
-        return RunaClassDefinition(
+        return ProcessDefinition(
             name=class_name,
             base_class=base_class,
             interfaces=interfaces,
@@ -273,7 +272,7 @@ class TSToRunaConverter:
             members=members
         )
     
-    def _convert_namespace_declaration(self, stmt: TSNamespaceDeclaration) -> RunaStatement:
+    def _convert_namespace_declaration(self, stmt: TSNamespaceDeclaration) -> Statement:
         """Convert namespace declaration to Runa equivalent."""
         namespace_name = stmt.name.name
         
@@ -288,12 +287,12 @@ class TSToRunaConverter:
                     body_statements.append(converted)
         
         # For now, just return a block with a comment
-        return RunaBlock([
-            RunaExpressionStatement(RunaLiteral(f"Namespace: {namespace_name}", f"// Namespace {namespace_name}")),
+        return Block([
+            ExpressionStatement(Expression(f"Namespace: {namespace_name}", f"// Namespace {namespace_name}")),
             *body_statements
         ])
     
-    def _convert_block_statement(self, stmt: TSBlockStatement) -> RunaBlock:
+    def _convert_block_statement(self, stmt: TSBlockStatement) -> Block:
         """Convert block statement."""
         statements = []
         for body_stmt in stmt.body:
@@ -304,37 +303,37 @@ class TSToRunaConverter:
                 else:
                     statements.append(converted)
         
-        return RunaBlock(statements)
+        return Block(statements)
     
-    def _convert_literal(self, expr: TSLiteral) -> RunaLiteral:
+    def _convert_literal(self, expr: TSLiteral) -> Expression:
         """Convert literal expression."""
         if expr.literal_type == TSLiteralType.NULL:
-            return RunaLiteral(None, "null", "null")
+            return Expression(None, "null", "null")
         elif expr.literal_type == TSLiteralType.UNDEFINED:
-            return RunaLiteral(None, "undefined", "undefined")
+            return Expression(None, "undefined", "undefined")
         elif expr.literal_type == TSLiteralType.BOOLEAN:
-            return RunaLiteral(expr.value, "true" if expr.value else "false", "boolean")
+            return Expression(expr.value, "true" if expr.value else "false", "boolean")
         elif expr.literal_type == TSLiteralType.NUMBER:
-            return RunaLiteral(expr.value, str(expr.value), "number")
+            return Expression(expr.value, str(expr.value), "number")
         elif expr.literal_type == TSLiteralType.STRING:
-            return RunaLiteral(expr.value, f'"{expr.value}"', "string")
+            return Expression(expr.value, f'"{expr.value}"', "string")
         elif expr.literal_type == TSLiteralType.BIGINT:
-            return RunaLiteral(expr.value, str(expr.value), "bigint")
+            return Expression(expr.value, str(expr.value), "bigint")
         else:
-            return RunaLiteral(expr.value, expr.raw, "unknown")
+            return Expression(expr.value, expr.raw, "unknown")
     
-    def _convert_identifier(self, expr: TSIdentifier) -> RunaIdentifier:
+    def _convert_identifier(self, expr: TSIdentifier) -> Identifier:
         """Convert identifier expression."""
-        return RunaIdentifier(expr.name)
+        return Identifier(expr.name)
     
-    def _convert_type_assertion(self, expr: TSTypeAssertion) -> RunaTypeAssertion:
+    def _convert_type_assertion(self, expr: TSTypeAssertion) -> CastExpression:
         """Convert type assertion."""
         target_type = self.convert_type(expr.type_annotation)
         expression = self.convert_expression(expr.expression)
         
-        return RunaTypeAssertion(expression, target_type)
+        return CastExpression(expression, target_type)
     
-    def _convert_type_reference(self, ts_type: TSTypeReference) -> RunaType:
+    def _convert_type_reference(self, ts_type: TSTypeReference) -> TypeExpression:
         """Convert type reference."""
         type_name = ts_type.type_name.name
         
@@ -343,44 +342,44 @@ class TSToRunaConverter:
         for arg in ts_type.type_arguments:
             generic_args.append(self.convert_type(arg))
         
-        return RunaType(type_name, generic_args)
+        return TypeExpression(type_name, generic_args)
     
-    def _convert_union_type(self, ts_type: TSUnionType) -> RunaType:
+    def _convert_union_type(self, ts_type: TSUnionType) -> TypeExpression:
         """Convert union type to Runa type."""
         # For now, use the first type in the union
         if ts_type.types:
             return self.convert_type(ts_type.types[0])
-        return RunaType("Any")
+        return TypeExpression("Any")
     
-    def _convert_intersection_type(self, ts_type: TSIntersectionType) -> RunaType:
+    def _convert_intersection_type(self, ts_type: TSIntersectionType) -> TypeExpression:
         """Convert intersection type to Runa type."""
         # For now, use the first type in the intersection
         if ts_type.types:
             return self.convert_type(ts_type.types[0])
-        return RunaType("Any")
+        return TypeExpression("Any")
     
-    def _convert_array_type(self, ts_type: TSArrayType) -> RunaType:
+    def _convert_array_type(self, ts_type: TSArrayType) -> TypeExpression:
         """Convert array type."""
         element_type = self.convert_type(ts_type.element_type)
-        return RunaType("List", [element_type])
+        return TypeExpression("List", [element_type])
     
-    def _convert_tuple_type(self, ts_type: TSTupleType) -> RunaType:
+    def _convert_tuple_type(self, ts_type: TSTupleType) -> TypeExpression:
         """Convert tuple type."""
         # For now, convert to array of first element type
         if ts_type.element_types:
             element_type = self.convert_type(ts_type.element_types[0])
-            return RunaType("List", [element_type])
-        return RunaType("List", [RunaType("Any")])
+            return TypeExpression("List", [element_type])
+        return TypeExpression("List", [TypeExpression("Any")])
     
-    def _convert_function_type(self, ts_type: TSFunctionType) -> RunaType:
+    def _convert_function_type(self, ts_type: TSFunctionType) -> TypeExpression:
         """Convert function type."""
         # For now, just return a Function type
-        return RunaType("Function")
+        return TypeExpression("Function")
     
-    def _convert_type_literal(self, ts_type: TSTypeLiteral) -> RunaType:
+    def _convert_type_literal(self, ts_type: TSTypeLiteral) -> TypeExpression:
         """Convert type literal."""
         # For now, convert to Object type
-        return RunaType("Object")
+        return TypeExpression("Object")
     
     def _convert_type_parameters(self, type_params: List[TSTypeParameter]) -> List[str]:
         """Convert type parameters."""
@@ -408,43 +407,43 @@ class RunaToTSConverter:
         
         return TSProgram(statements, "module")
     
-    def convert_statement(self, stmt: RunaStatement) -> Union[TSNode, List[TSNode], None]:
+    def convert_statement(self, stmt: Statement) -> Union[TSNode, List[TSNode], None]:
         """Convert Runa statement to TypeScript statement."""
-        if isinstance(stmt, RunaLet):
+        if isinstance(stmt, LetStatement):
             return self._convert_let_statement(stmt)
         
-        elif isinstance(stmt, RunaProcessDefinition):
+        elif isinstance(stmt, ProcessDefinition):
             return self._convert_process_definition(stmt)
         
-        elif isinstance(stmt, RunaInterfaceDefinition):
+        elif isinstance(stmt, ProcessDefinition):
             return self._convert_interface_definition(stmt)
         
-        elif isinstance(stmt, RunaClassDefinition):
+        elif isinstance(stmt, ProcessDefinition):
             return self._convert_class_definition(stmt)
         
-        elif isinstance(stmt, RunaExpressionStatement):
+        elif isinstance(stmt, ExpressionStatement):
             return self._convert_expression_statement(stmt)
         
-        elif isinstance(stmt, RunaBlock):
+        elif isinstance(stmt, Block):
             return self._convert_block(stmt)
         
         return None
     
-    def convert_expression(self, expr: RunaExpression) -> TSNode:
+    def convert_expression(self, expr: Expression) -> TSNode:
         """Convert Runa expression to TypeScript expression."""
-        if isinstance(expr, RunaLiteral):
+        if isinstance(expr, Expression):
             return self._convert_literal(expr)
         
-        elif isinstance(expr, RunaIdentifier):
+        elif isinstance(expr, Identifier):
             return self._convert_identifier(expr)
         
-        elif isinstance(expr, RunaTypeAssertion):
+        elif isinstance(expr, CastExpression):
             return self._convert_type_assertion(expr)
         
         # Add more expression conversions as needed
         return TSIdentifier("unknown")
     
-    def convert_type(self, runa_type: RunaType) -> TSType:
+    def convert_type(self, runa_type: TypeExpression) -> TSType:
         """Convert Runa type to TypeScript type."""
         # Map basic types
         type_map = {
@@ -472,7 +471,7 @@ class RunaToTSConverter:
         
         return TSTypeReference(TSIdentifier(base_type))
     
-    def _convert_let_statement(self, stmt: RunaLet) -> TSVariableDeclaration:
+    def _convert_let_statement(self, stmt: LetStatement) -> TSVariableDeclaration:
         """Convert Let statement to variable declaration."""
         id_node = TSIdentifier(stmt.name)
         
@@ -493,7 +492,7 @@ class RunaToTSConverter:
         
         return TSVariableDeclaration([declarator], kind)
     
-    def _convert_process_definition(self, stmt: RunaProcessDefinition) -> TSFunctionDeclaration:
+    def _convert_process_definition(self, stmt: ProcessDefinition) -> TSFunctionDeclaration:
         """Convert Process definition to function declaration."""
         name_node = TSIdentifier(stmt.name)
         
@@ -545,7 +544,7 @@ class RunaToTSConverter:
             stmt.is_async
         )
     
-    def _convert_interface_definition(self, stmt: RunaInterfaceDefinition) -> TSInterfaceDeclaration:
+    def _convert_interface_definition(self, stmt: ProcessDefinition) -> TSInterfaceDeclaration:
         """Convert interface definition to TypeScript interface."""
         name_node = TSIdentifier(stmt.name)
         
@@ -571,7 +570,7 @@ class RunaToTSConverter:
         
         return TSInterfaceDeclaration(name_node, type_parameters, extends_clause, body)
     
-    def _convert_class_definition(self, stmt: RunaClassDefinition) -> TSClassDeclaration:
+    def _convert_class_definition(self, stmt: ProcessDefinition) -> TSClassDeclaration:
         """Convert class definition to TypeScript class."""
         name_node = TSIdentifier(stmt.name)
         
@@ -608,12 +607,12 @@ class RunaToTSConverter:
             body
         )
     
-    def _convert_expression_statement(self, stmt: RunaExpressionStatement) -> TSNode:
+    def _convert_expression_statement(self, stmt: ExpressionStatement) -> TSNode:
         """Convert expression statement."""
         expr = self.convert_expression(stmt.expression)
         return expr
     
-    def _convert_block(self, stmt: RunaBlock) -> TSBlockStatement:
+    def _convert_block(self, stmt: Block) -> TSBlockStatement:
         """Convert block statement."""
         statements = []
         for sub_stmt in stmt.statements:
@@ -626,7 +625,7 @@ class RunaToTSConverter:
         
         return TSBlockStatement(statements)
     
-    def _convert_literal(self, expr: RunaLiteral) -> TSLiteral:
+    def _convert_literal(self, expr: Expression) -> TSLiteral:
         """Convert literal expression."""
         if expr.value is None:
             if expr.literal_type == "null":
@@ -642,11 +641,11 @@ class RunaToTSConverter:
         else:
             return TSLiteral(expr.value, str(expr.value), TSLiteralType.STRING)
     
-    def _convert_identifier(self, expr: RunaIdentifier) -> TSIdentifier:
+    def _convert_identifier(self, expr: Identifier) -> TSIdentifier:
         """Convert identifier expression."""
         return TSIdentifier(expr.name)
     
-    def _convert_type_assertion(self, expr: RunaTypeAssertion) -> TSTypeAssertion:
+    def _convert_type_assertion(self, expr: CastExpression) -> TSTypeAssertion:
         """Convert type assertion."""
         type_annotation = self.convert_type(expr.target_type)
         expression = self.convert_expression(expr.expression)

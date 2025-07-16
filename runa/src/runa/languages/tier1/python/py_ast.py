@@ -185,7 +185,7 @@ class PyStatement(PyNode):
 @dataclass
 class PyConstant(PyExpression):
     """Python constant node."""
-    value: Any
+    value: Any = None
     kind: Optional[str] = None
     
     def __post_init__(self):
@@ -198,7 +198,7 @@ class PyConstant(PyExpression):
 @dataclass
 class PyName(PyExpression):
     """Python name node."""
-    id: str
+    id: str = ""
     ctx: PyContext = PyContext.LOAD
     
     def __post_init__(self):
@@ -211,9 +211,9 @@ class PyName(PyExpression):
 @dataclass
 class PyBinOp(PyExpression):
     """Python binary operation node."""
-    left: PyExpression
-    op: PyOperator
-    right: PyExpression
+    left: PyExpression = None
+    op: PyOperator = None
+    right: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.BINARY_OP
@@ -225,8 +225,8 @@ class PyBinOp(PyExpression):
 @dataclass
 class PyUnaryOp(PyExpression):
     """Python unary operation node."""
-    op: PyOperator
-    operand: PyExpression
+    op: PyOperator = None
+    operand: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.UNARY_OP
@@ -238,9 +238,9 @@ class PyUnaryOp(PyExpression):
 @dataclass
 class PyCompare(PyExpression):
     """Python comparison node."""
-    left: PyExpression
-    ops: List[PyOperator]
-    comparators: List[PyExpression]
+    left: PyExpression = None
+    ops: List[PyOperator] = None
+    comparators: List[PyExpression] = None
     
     def __post_init__(self):
         self.type = PyNodeType.COMPARE
@@ -252,9 +252,9 @@ class PyCompare(PyExpression):
 @dataclass
 class PyCall(PyExpression):
     """Python function call node."""
-    func: PyExpression
-    args: List[PyExpression]
-    keywords: List['PyKeyword']
+    func: PyExpression = None
+    args: List[PyExpression] = field(default_factory=list)
+    keywords: List['PyKeyword'] = field(default_factory=list)
     
     def __post_init__(self):
         self.type = PyNodeType.CALL
@@ -266,8 +266,8 @@ class PyCall(PyExpression):
 @dataclass
 class PyAttribute(PyExpression):
     """Python attribute access node."""
-    value: PyExpression
-    attr: str
+    value: PyExpression = None
+    attr: str = ""
     ctx: PyContext = PyContext.LOAD
     
     def __post_init__(self):
@@ -280,8 +280,8 @@ class PyAttribute(PyExpression):
 @dataclass
 class PySubscript(PyExpression):
     """Python subscript node."""
-    value: PyExpression
-    slice: PyExpression
+    value: PyExpression = None
+    slice: PyExpression = None
     ctx: PyContext = PyContext.LOAD
     
     def __post_init__(self):
@@ -308,7 +308,7 @@ class PySlice(PyExpression):
 @dataclass
 class PyList(PyExpression):
     """Python list node."""
-    elts: List[PyExpression]
+    elts: List[PyExpression] = None
     ctx: PyContext = PyContext.LOAD
     
     def __post_init__(self):
@@ -321,7 +321,7 @@ class PyList(PyExpression):
 @dataclass
 class PyTuple(PyExpression):
     """Python tuple node."""
-    elts: List[PyExpression]
+    elts: List[PyExpression] = None
     ctx: PyContext = PyContext.LOAD
     
     def __post_init__(self):
@@ -334,7 +334,7 @@ class PyTuple(PyExpression):
 @dataclass
 class PySet(PyExpression):
     """Python set node."""
-    elts: List[PyExpression]
+    elts: List[PyExpression] = None
     
     def __post_init__(self):
         self.type = PyNodeType.SET
@@ -346,8 +346,8 @@ class PySet(PyExpression):
 @dataclass
 class PyDict(PyExpression):
     """Python dictionary node."""
-    keys: List[Optional[PyExpression]]
-    values: List[PyExpression]
+    keys: List[Optional[PyExpression]] = None
+    values: List[PyExpression] = None
     
     def __post_init__(self):
         self.type = PyNodeType.DICT
@@ -359,8 +359,8 @@ class PyDict(PyExpression):
 @dataclass
 class PyListComp(PyExpression):
     """Python list comprehension node."""
-    elt: PyExpression
-    generators: List['PyComprehension']
+    elt: PyExpression = None
+    generators: List['PyComprehension'] = None
     
     def __post_init__(self):
         self.type = PyNodeType.LIST_COMP
@@ -372,8 +372,8 @@ class PyListComp(PyExpression):
 @dataclass
 class PySetComp(PyExpression):
     """Python set comprehension node."""
-    elt: PyExpression
-    generators: List['PyComprehension']
+    elt: PyExpression = None
+    generators: List['PyComprehension'] = None
     
     def __post_init__(self):
         self.type = PyNodeType.SET_COMP
@@ -385,9 +385,9 @@ class PySetComp(PyExpression):
 @dataclass
 class PyDictComp(PyExpression):
     """Python dictionary comprehension node."""
-    key: PyExpression
-    value: PyExpression
-    generators: List['PyComprehension']
+    key: PyExpression = None
+    value: PyExpression = None
+    generators: List['PyComprehension'] = None
     
     def __post_init__(self):
         self.type = PyNodeType.DICT_COMP
@@ -399,8 +399,8 @@ class PyDictComp(PyExpression):
 @dataclass
 class PyGeneratorExp(PyExpression):
     """Python generator expression node."""
-    elt: PyExpression
-    generators: List['PyComprehension']
+    elt: PyExpression = None
+    generators: List['PyComprehension'] = None
     
     def __post_init__(self):
         self.type = PyNodeType.GENERATOR_EXP
@@ -412,8 +412,8 @@ class PyGeneratorExp(PyExpression):
 @dataclass
 class PyLambda(PyExpression):
     """Python lambda node."""
-    args: 'PyArguments'
-    body: PyExpression
+    args: 'PyArguments' = None
+    body: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.LAMBDA
@@ -425,9 +425,9 @@ class PyLambda(PyExpression):
 @dataclass
 class PyIfExp(PyExpression):
     """Python conditional expression node."""
-    test: PyExpression
-    body: PyExpression
-    orelse: PyExpression
+    test: PyExpression = None
+    body: PyExpression = None
+    orelse: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.CONDITIONAL
@@ -439,7 +439,7 @@ class PyIfExp(PyExpression):
 @dataclass
 class PyStarred(PyExpression):
     """Python starred expression node."""
-    value: PyExpression
+    value: PyExpression = None
     ctx: PyContext = PyContext.LOAD
     
     def __post_init__(self):
@@ -464,7 +464,7 @@ class PyYield(PyExpression):
 @dataclass
 class PyYieldFrom(PyExpression):
     """Python yield from expression node."""
-    value: PyExpression
+    value: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.YIELD_FROM
@@ -476,7 +476,7 @@ class PyYieldFrom(PyExpression):
 @dataclass
 class PyAwait(PyExpression):
     """Python await expression node."""
-    value: PyExpression
+    value: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.AWAIT
@@ -488,8 +488,8 @@ class PyAwait(PyExpression):
 @dataclass
 class PyNamedExpr(PyExpression):
     """Python named expression node (walrus operator)."""
-    target: PyExpression
-    value: PyExpression
+    target: PyExpression = None
+    value: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.NAMED_EXPR
@@ -502,7 +502,7 @@ class PyNamedExpr(PyExpression):
 @dataclass
 class PyExpressionStmt(PyStatement):
     """Python expression statement node."""
-    value: PyExpression
+    value: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.EXPRESSION_STMT
@@ -514,8 +514,8 @@ class PyExpressionStmt(PyStatement):
 @dataclass
 class PyAssign(PyStatement):
     """Python assignment statement node."""
-    targets: List[PyExpression]
-    value: PyExpression
+    targets: List[PyExpression] = field(default_factory=list)
+    value: PyExpression = None
     type_comment: Optional[str] = None
     
     def __post_init__(self):
@@ -528,8 +528,8 @@ class PyAssign(PyStatement):
 @dataclass
 class PyAnnAssign(PyStatement):
     """Python annotated assignment statement node."""
-    target: PyExpression
-    annotation: PyExpression
+    target: PyExpression = None
+    annotation: PyExpression = None
     value: Optional[PyExpression] = None
     simple: bool = True
     
@@ -543,9 +543,9 @@ class PyAnnAssign(PyStatement):
 @dataclass
 class PyAugAssign(PyStatement):
     """Python augmented assignment statement node."""
-    target: PyExpression
-    op: PyOperator
-    value: PyExpression
+    target: PyExpression = None
+    op: PyOperator = None
+    value: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.AUG_ASSIGN
@@ -570,7 +570,7 @@ class PyRaise(PyStatement):
 @dataclass
 class PyAssert(PyStatement):
     """Python assert statement node."""
-    test: PyExpression
+    test: PyExpression = None
     msg: Optional[PyExpression] = None
     
     def __post_init__(self):
@@ -583,7 +583,7 @@ class PyAssert(PyStatement):
 @dataclass
 class PyDelete(PyStatement):
     """Python delete statement node."""
-    targets: List[PyExpression]
+    targets: List[PyExpression] = None
     
     def __post_init__(self):
         self.type = PyNodeType.DELETE
@@ -628,9 +628,9 @@ class PyContinue(PyStatement):
 @dataclass
 class PyIf(PyStatement):
     """Python if statement node."""
-    test: PyExpression
-    body: List[PyStatement]
-    orelse: List[PyStatement]
+    test: PyExpression = None
+    body: List[PyStatement] = None
+    orelse: List[PyStatement] = None
     
     def __post_init__(self):
         self.type = PyNodeType.IF
@@ -642,9 +642,9 @@ class PyIf(PyStatement):
 @dataclass
 class PyWhile(PyStatement):
     """Python while statement node."""
-    test: PyExpression
-    body: List[PyStatement]
-    orelse: List[PyStatement]
+    test: PyExpression = None
+    body: List[PyStatement] = None
+    orelse: List[PyStatement] = None
     
     def __post_init__(self):
         self.type = PyNodeType.WHILE
@@ -656,10 +656,10 @@ class PyWhile(PyStatement):
 @dataclass
 class PyFor(PyStatement):
     """Python for statement node."""
-    target: PyExpression
-    iter: PyExpression
-    body: List[PyStatement]
-    orelse: List[PyStatement]
+    target: PyExpression = None
+    iter: PyExpression = None
+    body: List[PyStatement] = None
+    orelse: List[PyStatement] = None
     type_comment: Optional[str] = None
     
     def __post_init__(self):
@@ -672,10 +672,10 @@ class PyFor(PyStatement):
 @dataclass
 class PyTry(PyStatement):
     """Python try statement node."""
-    body: List[PyStatement]
-    handlers: List['PyExceptHandler']
-    orelse: List[PyStatement]
-    finalbody: List[PyStatement]
+    body: List[PyStatement] = None
+    handlers: List['PyExceptHandler'] = None
+    orelse: List[PyStatement] = None
+    finalbody: List[PyStatement] = None
     
     def __post_init__(self):
         self.type = PyNodeType.TRY
@@ -687,8 +687,8 @@ class PyTry(PyStatement):
 @dataclass
 class PyWith(PyStatement):
     """Python with statement node."""
-    items: List['PyWithItem']
-    body: List[PyStatement]
+    items: List['PyWithItem'] = None
+    body: List[PyStatement] = None
     type_comment: Optional[str] = None
     
     def __post_init__(self):
@@ -701,10 +701,10 @@ class PyWith(PyStatement):
 @dataclass
 class PyFunctionDef(PyStatement):
     """Python function definition node."""
-    name: str
-    args: 'PyArguments'
-    body: List[PyStatement]
-    decorator_list: List[PyExpression]
+    name: str = ""
+    args: 'PyArguments' = None
+    body: List[PyStatement] = None
+    decorator_list: List[PyExpression] = None
     returns: Optional[PyExpression] = None
     type_comment: Optional[str] = None
     
@@ -718,10 +718,10 @@ class PyFunctionDef(PyStatement):
 @dataclass
 class PyAsyncFunctionDef(PyStatement):
     """Python async function definition node."""
-    name: str
-    args: 'PyArguments'
-    body: List[PyStatement]
-    decorator_list: List[PyExpression]
+    name: str = ""
+    args: 'PyArguments' = None
+    body: List[PyStatement] = None
+    decorator_list: List[PyExpression] = None
     returns: Optional[PyExpression] = None
     type_comment: Optional[str] = None
     
@@ -735,11 +735,11 @@ class PyAsyncFunctionDef(PyStatement):
 @dataclass
 class PyClassDef(PyStatement):
     """Python class definition node."""
-    name: str
-    bases: List[PyExpression]
-    keywords: List['PyKeyword']
-    body: List[PyStatement]
-    decorator_list: List[PyExpression]
+    name: str = ""
+    bases: List[PyExpression] = None
+    keywords: List['PyKeyword'] = None
+    body: List[PyStatement] = None
+    decorator_list: List[PyExpression] = None
     
     def __post_init__(self):
         self.type = PyNodeType.CLASS_DEF
@@ -763,7 +763,7 @@ class PyReturn(PyStatement):
 @dataclass
 class PyGlobal(PyStatement):
     """Python global statement node."""
-    names: List[str]
+    names: List[str] = None
     
     def __post_init__(self):
         self.type = PyNodeType.GLOBAL
@@ -775,7 +775,7 @@ class PyGlobal(PyStatement):
 @dataclass
 class PyNonlocal(PyStatement):
     """Python nonlocal statement node."""
-    names: List[str]
+    names: List[str] = None
     
     def __post_init__(self):
         self.type = PyNodeType.NONLOCAL
@@ -787,7 +787,7 @@ class PyNonlocal(PyStatement):
 @dataclass
 class PyImport(PyStatement):
     """Python import statement node."""
-    names: List['PyAlias']
+    names: List['PyAlias'] = None
     
     def __post_init__(self):
         self.type = PyNodeType.IMPORT
@@ -799,8 +799,8 @@ class PyImport(PyStatement):
 @dataclass
 class PyImportFrom(PyStatement):
     """Python import from statement node."""
-    module: Optional[str]
-    names: List['PyAlias']
+    module: Optional[str] = None
+    names: List['PyAlias'] = None
     level: int = 0
     
     def __post_init__(self):
@@ -813,7 +813,7 @@ class PyImportFrom(PyStatement):
 @dataclass
 class PyModule(PyNode):
     """Python module node."""
-    body: List[PyStatement]
+    body: List[PyStatement] = field(default_factory=list)
     type_ignores: List[str] = field(default_factory=list)
     
     def __post_init__(self):
@@ -841,7 +841,7 @@ class PyExceptHandler(PyNode):
 @dataclass
 class PyWithItem(PyNode):
     """Python with item node."""
-    context_expr: PyExpression
+    context_expr: PyExpression = None
     optional_vars: Optional[PyExpression] = None
     
     def accept(self, visitor):
@@ -869,7 +869,7 @@ class PyArguments(PyNode):
 @dataclass
 class PyArg(PyNode):
     """Python argument node."""
-    arg: str
+    arg: str = ""
     annotation: Optional[PyExpression] = None
     type_comment: Optional[str] = None
     
@@ -883,8 +883,8 @@ class PyArg(PyNode):
 @dataclass
 class PyKeyword(PyNode):
     """Python keyword argument node."""
-    arg: Optional[str]
-    value: PyExpression
+    arg: Optional[str] = None
+    value: PyExpression = None
     
     def __post_init__(self):
         self.type = PyNodeType.KEYWORD
@@ -896,7 +896,7 @@ class PyKeyword(PyNode):
 @dataclass
 class PyAlias(PyNode):
     """Python alias node."""
-    name: str
+    name: str = ""
     asname: Optional[str] = None
     
     def __post_init__(self):
@@ -909,9 +909,9 @@ class PyAlias(PyNode):
 @dataclass
 class PyComprehension(PyNode):
     """Python comprehension node."""
-    target: PyExpression
-    iter: PyExpression
-    ifs: List[PyExpression]
+    target: PyExpression = None
+    iter: PyExpression = None
+    ifs: List[PyExpression] = None
     is_async: bool = False
     
     def __post_init__(self):

@@ -863,12 +863,44 @@ class SQLCodeGenerator(SQLVisitor):
         self._indent_level = max(0, self._indent_level - 1)
     
     def _needs_parentheses(self, expr: SQLExpression, parent: SQLNode) -> bool:
-        """Determine if expression needs parentheses."""
-        # Simplified precedence check
-        if isinstance(expr, SQLBinaryExpression) and isinstance(parent, SQLBinaryExpression):
-            # Add proper operator precedence logic here
-            pass
-        return False
+        """Determine if expression needs parentheses based on SQL operator precedence."""
+        # Only meaningful for binary expressions nested inside other binary expressions
+        if not (isinstance(expr, SQLBinaryExpression) and isinstance(parent, SQLBinaryExpression)):
+            return False
+
+        # Precedence table (higher number = higher precedence)
+        precedence_map = {
+            SQLOperator.MULTIPLY: 40,
+            SQLOperator.DIVIDE: 40,
+            SQLOperator.MODULO: 40,
+            SQLOperator.PLUS: 30,
+            SQLOperator.MINUS: 30,
+            # Comparisons
+            SQLOperator.EQUAL: 20,
+            SQLOperator.NOT_EQUAL: 20,
+            SQLOperator.NOT_EQUAL_ALT: 20,
+            SQLOperator.LESS_THAN: 20,
+            SQLOperator.GREATER_THAN: 20,
+            SQLOperator.LESS_EQUAL: 20,
+            SQLOperator.GREATER_EQUAL: 20,
+            # Logical
+            SQLOperator.AND: 10,
+            SQLOperator.OR: 5,
+        }
+
+        child_prec = precedence_map.get(expr.operator, 0)
+        parent_prec = precedence_map.get(parent.operator, 0)
+
+        if child_prec < parent_prec:
+            # Lower precedence than parent → needs parentheses
+            return True
+        if child_prec > parent_prec:
+            # Higher precedence → no parentheses needed
+            return False
+
+        # Equal precedence – add parentheses for non-associative operators to preserve order
+        non_associative = {SQLOperator.MINUS, SQLOperator.DIVIDE, SQLOperator.MODULO}
+        return expr.operator in non_associative
     
     def _add_generation_metadata(self, ast: SQLProgram):
         """Add generation metadata."""
@@ -1083,4 +1115,11 @@ class SQLCodeGenerator(SQLVisitor):
         """Visit DEFAULT constraint."""
         self._write_keyword("DEFAULT")
         self._write(" ")
-        node.value.accept(self) 
+        node.value.accept(self)
+
+
+def generate_sql(node, **options) -> str:
+    """Generate SQL code from AST node."""
+    generator = SQLCodeGenerator(**options)
+    node.accept(generator)
+    return generator.get_output() 

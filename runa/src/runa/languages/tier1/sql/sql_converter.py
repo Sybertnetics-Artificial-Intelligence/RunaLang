@@ -19,53 +19,10 @@ from typing import List, Optional, Dict, Any, Union, Tuple
 from dataclasses import dataclass
 import logging
 
-from .sql_ast import (
-    SQLNode, SQLProgram, SQLStatement, SQLExpression, SQLClause,
-    SQLSelectStatement, SQLInsertStatement, SQLUpdateStatement, SQLDeleteStatement,
-    SQLCreateTableStatement, SQLDropTableStatement, SQLAlterTableStatement,
-    SQLBinaryExpression, SQLUnaryExpression, SQLFunctionCall, SQLCaseExpression,
-    SQLCastExpression, SQLSubquery, SQLColumnReference, SQLIdentifier,
-    SQLQualifiedIdentifier, SQLLiteral, SQLIntegerLiteral, SQLFloatLiteral,
-    SQLStringLiteral, SQLBooleanLiteral, SQLNullLiteral, SQLDateLiteral,
-    SQLTimeLiteral, SQLTimestampLiteral, SQLIntervalLiteral,
-    SQLDataType, SQLIntegerType, SQLVarcharType, SQLDecimalType, SQLArrayType,
-    SQLFromClause, SQLWhereClause, SQLGroupByClause, SQLHavingClause,
-    SQLOrderByClause, SQLOrderByExpression, SQLLimitClause, SQLOffsetClause,
-    SQLWithClause, SQLCommonTableExpression, SQLTableReference, SQLTableName,
-    SQLJoin, SQLDerivedTable, SQLColumnDefinition, SQLConstraint,
-    SQLPrimaryKeyConstraint, SQLForeignKeyConstraint, SQLUniqueConstraint,
-    SQLCheckConstraint, SQLDefaultConstraint, SQLInExpression, SQLBetweenExpression,
-    SQLLikeExpression, SQLExistsExpression, SQLWindowSpecification,
-    SQLSetOperation, SQLAlterTableAction, SQLAddColumnAction, SQLDropColumnAction,
-    SQLAlterColumnAction, SQLAddConstraintAction, SQLDropConstraintAction,
-    SQLJSONExtractExpression, SQLJSONObjectExpression, SQLJSONArrayExpression,
-    SQLArrayConstructor, SQLArrayElement, SQLOperator, SQLDialect, JoinType,
-    ConstraintType, WindowFrameType, WindowFrameBound
-)
+from .sql_ast import *
 
 # Import Runa AST nodes
-from ....core.runa_ast import (
-    ASTNode, Program, Statement, Expression, Declaration, TypeExpression,
-    BasicType, GenericType, UnionType, IntersectionType, OptionalType,
-    FunctionType, IntegerLiteral, FloatLiteral, StringLiteral, BooleanLiteral,
-    ListLiteral, DictionaryLiteral, Identifier, MemberAccess, IndexAccess,
-    BinaryOperator, BinaryExpression, UnaryExpression, FunctionCall,
-    LetStatement, DefineStatement, SetStatement, IfStatement, WhileStatement,
-    ForStatement, TryStatement, RaiseStatement, ReturnStatement, BreakStatement,
-    ContinueStatement, ExpressionStatement, ProcessDeclaration, StructDefinition,
-    MethodDefinition, FieldDefinition, PropertyDefinition, AnnotationDefinition,
-    ImportStatement, ExportStatement, ModuleDefinition, BlockStatement,
-    MatchStatement, ConditionalExpression, ListComprehension, LambdaExpression,
-    AwaitExpression, YieldExpression, SpreadExpression, TupleExpression,
-    SliceExpression, AssignmentExpression, AugmentedAssignmentExpression,
-    ChainedComparisonExpression, TernaryExpression, CompoundStatement,
-    EventDefinition, ConstraintDefinition, ValidationDefinition, 
-    TransformationDefinition, ConnectionDefinition, TriggerDefinition,
-    TaskDefinition, WorkflowDefinition, EnvironmentDefinition, 
-    SecurityDefinition, MetadataDefinition, TestDefinition, 
-    PerformanceDefinition, DocumentationDefinition, VersionDefinition,
-    SourceLocation, TranslationMetadata
-)
+from ....core.runa_ast import *
 
 
 class SQLToRunaConverter:
@@ -1077,13 +1034,12 @@ class RunaToSQLConverter:
     
     def _convert_process_declaration(self, stmt: ProcessDeclaration) -> Union[SQLStatement, List[SQLStatement]]:
         """Convert Runa process declaration to SQL query or stored procedure."""
-        # For now, convert simple data processing processes to SELECT statements
+        # Detect query-like processes first
         if self._is_query_process(stmt):
             return self._convert_query_process(stmt)
-        else:
-            # Convert to stored procedure (placeholder)
-            return self._convert_stored_procedure(stmt)
-    
+        # Otherwise convert to stored procedure
+        return self._convert_stored_procedure(stmt)
+
     def _is_query_process(self, stmt: ProcessDeclaration) -> bool:
         """Check if a process is a query-like operation."""
         # Simple heuristic: if it has a return statement and uses data operations
@@ -1179,12 +1135,86 @@ class RunaToSQLConverter:
             limit_clause=limit_clause
         )
     
-    def _convert_stored_procedure(self, stmt: ProcessDeclaration) -> SQLStatement:
-        """Convert process to stored procedure (placeholder)."""
-        # For now, create a comment statement
-        return SQLSelectStatement(
-            select_list=[SQLStringLiteral(value=f"-- Stored procedure: {stmt.name}")]
+    def _convert_stored_procedure(self, stmt: ProcessDeclaration) -> SQLCreateProcedureStatement:
+        """Convert a Runa ProcessDeclaration into a SQL stored procedure."""
+        # Parameters
+        parameters: List[SQLParameter] = []
+        for param in stmt.parameters:
+            sql_type = self._convert_type_expression(param.type_annotation) if param.type_annotation else SQLVarcharType()
+            direction = self._get_parameter_direction(param)
+            param_name = SQLIdentifier(name=param.name)
+            parameters.append(SQLParameter(name=param_name, data_type=sql_type, direction=direction))
+
+        # Convert body statements to SQL
+        body_sql: List[SQLStatement] = []
+        if isinstance(stmt.body, BlockStatement):
+            for s in stmt.body.statements:
+                converted = self.convert_statement(s)
+                if converted:
+                    if isinstance(converted, list):
+                        body_sql.extend(converted)
+                    else:
+                        body_sql.append(converted)
+
+        proc_stmt = SQLCreateProcedureStatement(
+            name=SQLIdentifier(name=stmt.name),
+            parameters=parameters,
+            body=body_sql,
+            return_type=None  # Runa processes can have return; we may map later
         )
+        return proc_stmt
+
+    def _get_parameter_direction(self, param: 'Parameter') -> str:
+        """
+        Determine parameter direction (IN/OUT/INOUT) from annotations or naming conventions.
+        
+        Args:
+            param: Function parameter to analyze
+            
+        Returns:
+            Parameter direction as string: "IN", "OUT", or "INOUT"
+        """
+        # Check for explicit annotations first
+        if hasattr(param, 'annotations') and param.annotations:
+            for annotation in param.annotations:
+                if hasattr(annotation, 'name'):
+                    if annotation.name.lower() in ['out', 'output']:
+                        return "OUT"
+                    elif annotation.name.lower() in ['inout', 'in_out', 'bidirectional']:
+                        return "INOUT"
+        
+        # Check parameter name for conventions
+        param_name = param.name.lower()
+        if param_name.startswith('out_') or param_name.endswith('_out'):
+            return "OUT"
+        elif param_name.startswith('inout_') or param_name.endswith('_inout'):
+            return "INOUT"
+        elif 'result' in param_name or 'output' in param_name:
+            return "OUT"
+        
+        # Check type annotation for direction hints
+        if hasattr(param, 'type_annotation') and param.type_annotation:
+            type_str = str(param.type_annotation).lower()
+            if 'output' in type_str or 'result' in type_str:
+                return "OUT"
+            elif 'inout' in type_str or 'bidirectional' in type_str:
+                return "INOUT"
+        
+        # Default to IN parameter
+        return "IN"
+
+    # Helper to convert Runa TypeExpression to SQLDataType
+    def _convert_type_expression(self, type_expr: TypeExpression) -> SQLDataType:
+        if isinstance(type_expr, BasicType):
+            mapping = {
+                "Integer": SQLIntegerType(),
+                "Float": SQLFloatType(),
+                "String": SQLVarcharType(length=255),
+                "Boolean": SQLBooleanType(),
+            }
+            return mapping.get(type_expr.name, SQLVarcharType(length=255))
+        # Fallback
+        return SQLVarcharType(length=255)
     
     def _convert_expression_statement(self, stmt: ExpressionStatement) -> Optional[SQLStatement]:
         """Convert Runa expression statement to SQL statement."""
@@ -1412,33 +1442,15 @@ class RunaToSQLConverter:
                 name="VALUES",
                 arguments=elements
             )
-    
-    def _convert_type_expression(self, type_expr: TypeExpression) -> SQLDataType:
-        """Convert Runa type expression to SQL data type."""
-        if isinstance(type_expr, BasicType):
-            sql_type_name = self.type_mapping.get(type_expr.name, type_expr.name)
-            
-            if sql_type_name == 'VARCHAR':
-                return SQLVarcharType(length=255)  # Default length
-            elif sql_type_name == 'DECIMAL':
-                return SQLDecimalType(precision=10, scale=2)  # Default precision
-            elif sql_type_name == 'INTEGER':
-                return SQLIntegerType()
-            else:
-                return SQLDataType(name=sql_type_name)
-        
-        elif isinstance(type_expr, GenericType):
-            if type_expr.base_type == "List" and type_expr.type_args:
-                element_type = self._convert_type_expression(type_expr.type_args[0])
-                return SQLArrayType(element_type=element_type)
-            else:
-                return SQLDataType(name=type_expr.base_type)
-        
-        elif isinstance(type_expr, OptionalType):
-            if type_expr.inner_type:
-                return self._convert_type_expression(type_expr.inner_type)
-            else:
-                return SQLDataType(name="TEXT")
-        
-        else:
-            return SQLDataType(name="TEXT")  # Default fallback
+
+
+def sql_to_runa(sql_ast) -> 'Program':
+    """Convert SQL AST to Runa AST."""
+    converter = SQLToRunaConverter()
+    return converter.convert(sql_ast)
+
+
+def runa_to_sql(runa_ast: 'Program'):
+    """Convert Runa AST to SQL AST."""
+    converter = RunaToSQLConverter()
+    return converter.convert(runa_ast)

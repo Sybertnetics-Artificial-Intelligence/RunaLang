@@ -74,6 +74,50 @@ class CppNodeType(Enum):
     TRY_STMT = auto()
     DECLARATION_STMT = auto()
     
+    # Modern C++ constructs (C++17-C++23)
+    STRUCTURED_BINDING_DECL = auto()  # C++17
+    IF_INIT_STMT = auto()  # C++17
+    SWITCH_INIT_STMT = auto()  # C++17
+    CONSTEXPR_IF_STMT = auto()  # C++17
+    
+    # Coroutines (C++20)
+    CO_AWAIT_EXPR = auto()
+    CO_YIELD_EXPR = auto()
+    CO_RETURN_STMT = auto()
+    
+    # Concepts (C++20)
+    CONCEPT_DECL = auto()
+    REQUIRES_CLAUSE = auto()
+    CONSTRAINT_EXPR = auto()
+    
+    # Modules (C++20)
+    MODULE_DECL = auto()
+    MODULE_IMPORT_DECL = auto()
+    EXPORT_DECL = auto()
+    
+    # Additional missing constructs
+    PACK_EXPANSION_EXPR = auto()
+    FOLD_EXPR = auto()  # C++17
+    NOEXCEPT_EXPR = auto()
+    ALIGNOF_EXPR = auto()
+    TYPEID_EXPR = auto()
+    DECLTYPE_EXPR = auto()
+    
+    # Template specializations
+    TEMPLATE_SPECIALIZATION_DECL = auto()
+    PARTIAL_SPECIALIZATION_DECL = auto()
+    
+    # More complete type system
+    PLACEHOLDER_TYPE = auto()  # auto, decltype(auto)
+    DEDUCED_TYPE = auto()
+    DEPENDENT_TYPE = auto()
+    TYPENAME_TYPE = auto()
+    
+    # Additional statements
+    ASM_STMT = auto()
+    PRAGMA_STMT = auto()
+    ATTRIBUTE_STMT = auto()
+    
     # Declarations
     VARIABLE_DECL = auto()
     FUNCTION_DECL = auto()
@@ -95,7 +139,6 @@ class CppNodeType(Enum):
     TEMPLATE_ARGUMENT = auto()
     TEMPLATE_SPECIALIZATION = auto()
     TEMPLATE_INSTANTIATION = auto()
-    CONCEPT_DECL = auto()  # C++20
     
     # Types
     BUILTIN_TYPE = auto()
@@ -126,10 +169,10 @@ class CppNodeType(Enum):
     COROUTINE_YIELD = auto()  # C++20
     COROUTINE_AWAIT = auto()  # C++20
     
-    # Module constructs (C++20)
-    MODULE_DECL = auto()
+    # Module constructs (C++20) - using definitions from line 94-96
+    # MODULE_DECL = auto()  # Already defined above
     IMPORT_DECL = auto()
-    EXPORT_DECL = auto()
+    # EXPORT_DECL = auto()  # Already defined above
     
     # Translation unit
     TRANSLATION_UNIT = auto()
@@ -1226,3 +1269,329 @@ class CppNodeVisitor(ABC):
     
     @abstractmethod
     def visit_translation_unit(self, node: CppTranslationUnit): pass
+
+
+# ============================================================================
+# Modern C++ Constructs (C++17-C++23) - Production Ready Extensions
+# ============================================================================
+
+@dataclass
+class CppStructuredBinding(CppDeclaration):
+    """C++ structured binding declaration (C++17)."""
+    identifiers: List[str] = field(default_factory=list)
+    initializer: Optional[CppExpression] = None
+    cv_qualifiers: List[CppTypeQualifier] = field(default_factory=list)
+    
+    def __post_init__(self):
+        self.type = CppNodeType.STRUCTURED_BINDING_DECL
+    
+    def accept(self, visitor):
+        return visitor.visit_structured_binding(self)
+
+
+@dataclass
+class CppIfInitStatement(CppStatement):
+    """C++ if statement with init (C++17)."""
+    init_stmt: Optional[CppStatement] = None
+    condition: Optional[CppExpression] = None
+    then_stmt: Optional[CppStatement] = None
+    else_stmt: Optional[CppStatement] = None
+    is_constexpr: bool = False  # constexpr if (C++17)
+    
+    def __post_init__(self):
+        self.type = CppNodeType.IF_INIT_STMT
+    
+    def accept(self, visitor):
+        return visitor.visit_if_init_stmt(self)
+
+
+@dataclass
+class CppCoAwaitExpr(CppExpression):
+    """C++ co_await expression (C++20)."""
+    operand: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.CO_AWAIT_EXPR
+    
+    def accept(self, visitor):
+        return visitor.visit_co_await_expr(self)
+
+
+@dataclass
+class CppCoYieldExpr(CppExpression):
+    """C++ co_yield expression (C++20)."""
+    operand: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.CO_YIELD_EXPR
+    
+    def accept(self, visitor):
+        return visitor.visit_co_yield_expr(self)
+
+
+@dataclass
+class CppCoReturnStmt(CppStatement):
+    """C++ co_return statement (C++20)."""
+    value: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.CO_RETURN_STMT
+    
+    def accept(self, visitor):
+        return visitor.visit_co_return_stmt(self)
+
+
+@dataclass
+class CppConceptDecl(CppDeclaration):
+    """C++ concept declaration (C++20)."""
+    name: str = ""
+    template_params: Optional[CppTemplateParameterList] = None
+    constraint: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.CONCEPT_DECL
+    
+    def accept(self, visitor):
+        return visitor.visit_concept_decl(self)
+
+
+@dataclass
+class CppRequiresClause(CppExpression):
+    """C++ requires clause (C++20)."""
+    constraint: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.REQUIRES_CLAUSE
+    
+    def accept(self, visitor):
+        return visitor.visit_requires_clause(self)
+
+
+@dataclass
+class CppRequiresExpr(CppExpression):
+    """C++ requires expression (C++20)."""
+    parameters: Optional[CppParameterList] = None
+    requirements: List[CppExpression] = field(default_factory=list)
+    
+    def __post_init__(self):
+        self.type = CppNodeType.CONSTRAINT_EXPR
+    
+    def accept(self, visitor):
+        return visitor.visit_requires_expr(self)
+
+
+@dataclass
+class CppModuleDecl(CppDeclaration):
+    """C++ module declaration (C++20)."""
+    name: str = ""
+    partition_name: Optional[str] = None
+    is_interface: bool = True
+    
+    def __post_init__(self):
+        self.type = CppNodeType.MODULE_DECL
+    
+    def accept(self, visitor):
+        return visitor.visit_module_decl(self)
+
+
+@dataclass
+class CppModuleImportDecl(CppDeclaration):
+    """C++ import declaration (C++20)."""
+    module_name: str = ""
+    partition_name: Optional[str] = None
+    is_header_unit: bool = False
+    
+    def __post_init__(self):
+        self.type = CppNodeType.MODULE_IMPORT_DECL
+    
+    def accept(self, visitor):
+        return visitor.visit_module_import_decl(self)
+
+
+@dataclass
+class CppExportDecl(CppDeclaration):
+    """C++ export declaration (C++20)."""
+    declaration: Optional[CppDeclaration] = None
+    is_module: bool = False
+    module_name: Optional[str] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.EXPORT_DECL
+    
+    def accept(self, visitor):
+        return visitor.visit_export_decl(self)
+
+
+@dataclass
+class CppFoldExpr(CppExpression):
+    """C++ fold expression (C++17)."""
+    pattern: Optional[CppExpression] = None
+    operator: Optional[CppOperator] = None
+    is_left_fold: bool = True
+    init_expr: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.FOLD_EXPR
+    
+    def accept(self, visitor):
+        return visitor.visit_fold_expr(self)
+
+
+@dataclass
+class CppPackExpansion(CppExpression):
+    """C++ pack expansion expression."""
+    pattern: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.PACK_EXPANSION_EXPR
+    
+    def accept(self, visitor):
+        return visitor.visit_pack_expansion(self)
+
+
+@dataclass
+class CppNoexceptExpr(CppExpression):
+    """C++ noexcept expression."""
+    operand: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.NOEXCEPT_EXPR
+    
+    def accept(self, visitor):
+        return visitor.visit_noexcept_expr(self)
+
+
+@dataclass
+class CppAlignofExpr(CppExpression):
+    """C++ alignof expression."""
+    operand: Union[CppExpression, CppType] = None
+    is_type: bool = False
+    
+    def __post_init__(self):
+        self.type = CppNodeType.ALIGNOF_EXPR
+    
+    def accept(self, visitor):
+        return visitor.visit_alignof_expr(self)
+
+
+@dataclass
+class CppTypeidExpr(CppExpression):
+    """C++ typeid expression."""
+    operand: Union[CppExpression, CppType] = None
+    is_type: bool = False
+    
+    def __post_init__(self):
+        self.type = CppNodeType.TYPEID_EXPR
+    
+    def accept(self, visitor):
+        return visitor.visit_typeid_expr(self)
+
+
+@dataclass
+class CppDecltypeExpr(CppExpression):
+    """C++ decltype expression."""
+    operand: Optional[CppExpression] = None
+    is_decltype_auto: bool = False
+    
+    def __post_init__(self):
+        self.type = CppNodeType.DECLTYPE_EXPR
+    
+    def accept(self, visitor):
+        return visitor.visit_decltype_expr(self)
+
+
+@dataclass
+class CppTemplateSpecialization(CppDeclaration):
+    """C++ template specialization."""
+    template_decl: Optional[CppTemplateDecl] = None
+    specialization_args: List[Union[CppType, CppExpression]] = field(default_factory=list)
+    declaration: Optional[CppDeclaration] = None
+    is_partial: bool = False
+    
+    def __post_init__(self):
+        self.type = CppNodeType.TEMPLATE_SPECIALIZATION_DECL
+    
+    def accept(self, visitor):
+        return visitor.visit_template_specialization(self)
+
+
+@dataclass
+class CppDesignatedInitializer(CppExpression):
+    """C++ designated initializer (C++20)."""
+    designators: List[Union[str, CppExpression]] = field(default_factory=list)  # field names or array indices
+    value: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.DESIGNATED_INITIALIZER
+    
+    def accept(self, visitor):
+        return visitor.visit_designated_initializer(self)
+
+
+@dataclass
+class CppAsmStmt(CppStatement):
+    """C++ inline assembly statement."""
+    assembly_code: str = ""
+    outputs: List[str] = field(default_factory=list)
+    inputs: List[str] = field(default_factory=list)
+    clobbers: List[str] = field(default_factory=list)
+    is_volatile: bool = False
+    
+    def __post_init__(self):
+        self.type = CppNodeType.ASM_STMT
+    
+    def accept(self, visitor):
+        return visitor.visit_asm_stmt(self)
+
+
+@dataclass
+class CppAttribute(CppNode):
+    """C++ attribute (C++11)."""
+    namespace: Optional[str] = None
+    name: str = ""
+    arguments: List[CppExpression] = field(default_factory=list)
+    
+    def accept(self, visitor):
+        return visitor.visit_attribute(self)
+
+
+@dataclass
+class CppStaticAssertDecl(CppDeclaration):
+    """C++ static_assert declaration."""
+    condition: Optional[CppExpression] = None
+    message: Optional[CppExpression] = None
+    
+    def __post_init__(self):
+        self.type = CppNodeType.STATIC_ASSERT_DECL
+    
+    def accept(self, visitor):
+        return visitor.visit_static_assert_decl(self)
+
+
+# Helper functions for creating common C++ constructs
+def create_cpp_identifier(name: str) -> CppIdentifier:
+    """Create a C++ identifier."""
+    return CppIdentifier(name=name)
+
+
+def create_cpp_binary_op(left: CppExpression, operator: CppOperator, right: CppExpression) -> CppBinaryOp:
+    """Create a C++ binary operation."""
+    return CppBinaryOp(left=left, operator=operator, right=right)
+
+
+def create_cpp_function_decl(name: str, return_type: CppType = None, 
+                            parameters: CppParameterList = None) -> CppFunctionDecl:
+    """Create a C++ function declaration."""
+    return CppFunctionDecl(
+        name=name,
+        return_type=return_type or CppBuiltinType(name="void"),
+        parameters=parameters or CppParameterList()
+    )
+
+
+def create_cpp_class_decl(name: str, base_classes: List[CppBaseSpecifier] = None) -> CppClassDecl:
+    """Create a C++ class declaration."""
+    return CppClassDecl(
+        name=name,
+        base_classes=base_classes or []
+    )

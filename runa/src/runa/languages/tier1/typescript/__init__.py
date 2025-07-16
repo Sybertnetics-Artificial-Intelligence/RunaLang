@@ -9,11 +9,11 @@ and round-trip verification for the Runa universal translation system.
 from .ts_ast import *
 from .ts_parser import parse_typescript, TSLexer, TSParser
 from .ts_converter import ts_to_runa, runa_to_ts, TSToRunaConverter, RunaToTSConverter
-from .ts_generator import generate_typescript, TSCodeGenerator, TSCodeStyle, TSFormatter
+from .ts_generator import generate_typescript, TSCodeGenerator, TSFormatter
 from .ts_toolchain import (
     TypeScriptToolchain,
-    parse_ts_code,
-    generate_ts_code,
+    parse_ts,
+    generate_ts,
     ts_round_trip_verify,
     ts_to_runa_translate,
     runa_to_ts_translate
@@ -39,10 +39,10 @@ __all__ = [
     "ts_to_runa", "runa_to_ts", "TSToRunaConverter", "RunaToTSConverter",
     
     # Generator
-    "generate_typescript", "TSCodeGenerator", "TSCodeStyle", "TSFormatter",
+    "generate_typescript", "TSCodeGenerator", "TSFormatter",
     
     # Convenience functions
-    "parse_ts_code", "generate_ts_code", "ts_round_trip_verify",
+    "parse_ts", "generate_ts", "ts_round_trip_verify",
     "ts_to_runa_translate", "runa_to_ts_translate",
     
     # AST base classes (main ones)

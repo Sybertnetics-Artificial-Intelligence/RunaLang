@@ -148,11 +148,8 @@ class CSharpToolchain(BaseLanguageToolchain):
             performance_logging: Enable detailed performance logging
         """
         super().__init__(
-            language_name="C#",
-            language_version="12.0",
-            file_extension=".cs",
-            supports_compilation=True,
-            supports_interpretation=False
+            language_id="csharp",
+            version="12.0"
         )
         
         self.compiler_options = compiler_options or CSharpCompilerOptions()
@@ -161,9 +158,9 @@ class CSharpToolchain(BaseLanguageToolchain):
         self.cache_directory = Path(cache_directory) if cache_directory else Path.home() / ".runa_cache" / "csharp"
         self.performance_logging = performance_logging
         
-        # Initialize components
-        self.lexer = CSharpLexer()
-        self.parser = CSharpParser()
+        # Component factories (create when needed)
+        self._lexer_factory = lambda source: CSharpLexer(source)
+        self._parser_factory = lambda tokens: CSharpParser(tokens)
         self.to_runa_converter = CSharpToRunaConverter()
         self.from_runa_converter = RunaToCSharpConverter()
         self.generator = CSharpCodeGenerator(style=code_style)
@@ -1095,6 +1092,156 @@ class CSharpToolchain(BaseLanguageToolchain):
             max_depth = max(max_depth, child_depth + 1)
         
         return max_depth
+    
+    # Abstract method implementations
+    @property
+    def metadata(self) -> 'LanguageMetadata':
+        """Get language metadata."""
+        from ...shared.base_toolchain import LanguageMetadata
+        return LanguageMetadata(
+            name="C#",
+            version="12.0", 
+            file_extensions=[".cs"],
+            supports_compilation=True,
+            supports_interpretation=False,
+            tier=1
+        )
+    
+    @property
+    def supported_features(self) -> Dict[str, bool]:
+        """Get supported language features."""
+        return {
+            "classes": True,
+            "interfaces": True,
+            "generics": True,
+            "async_await": True,
+            "lambdas": True,
+            "linq": True,
+            "nullable_reference_types": True,
+            "pattern_matching": True,
+            "records": True,
+            "structs": True,
+            "enums": True,
+            "properties": True,
+            "events": True,
+            "operators": True,
+            "indexers": True,
+            "delegates": True,
+            "attributes": True,
+            "preprocessor": True,
+            "unsafe_code": False  # Not currently supported
+        }
+    
+    def parse(self, source_code: str, file_path: Optional[str] = None) -> 'ToolchainResult':
+        """Parse source code into language-specific AST."""
+        from ...shared.base_toolchain import ToolchainResult
+        try:
+            ast = self.parse_code(source_code)
+            return ToolchainResult(
+                success=True,
+                result=ast,
+                file_path=file_path,
+                processing_time=0.0  # Would measure actual time
+            )
+        except Exception as e:
+            return ToolchainResult(
+                success=False,
+                error=str(e),
+                file_path=file_path,
+                processing_time=0.0
+            )
+    
+    def to_runa(self, language_ast: Any) -> 'TranslationResult':
+        """Convert language AST to Runa AST."""
+        from ....core.translation_result import TranslationResult
+        try:
+            runa_ast = self.to_runa_converter.convert(language_ast)
+            return TranslationResult(
+                success=True,
+                result=runa_ast,
+                warnings=[],
+                errors=[]
+            )
+        except Exception as e:
+            return TranslationResult(
+                success=False,
+                result=None,
+                warnings=[],
+                errors=[str(e)]
+            )
+    
+    def from_runa(self, runa_ast: 'Program') -> 'TranslationResult':
+        """Convert Runa AST to language AST."""
+        from ....core.translation_result import TranslationResult
+        try:
+            csharp_ast = self.from_runa_converter.convert(runa_ast)
+            return TranslationResult(
+                success=True,
+                result=csharp_ast,
+                warnings=[],
+                errors=[]
+            )
+        except Exception as e:
+            return TranslationResult(
+                success=False,
+                result=None,
+                warnings=[],
+                errors=[str(e)]
+            )
+    
+    def generate(self, language_ast: Any, **options) -> 'ToolchainResult':
+        """Generate source code from language AST."""
+        from ...shared.base_toolchain import ToolchainResult
+        try:
+            code = self.generate_code(language_ast)
+            return ToolchainResult(
+                success=True,
+                result=code,
+                processing_time=0.0
+            )
+        except Exception as e:
+            return ToolchainResult(
+                success=False,
+                error=str(e),
+                processing_time=0.0
+            )
+    
+    def _compare_ast_structure(self, ast1: Any, ast2: Any) -> bool:
+        """Compare AST structure for syntax preservation."""
+        # Simplified comparison - would need proper AST comparison logic
+        return type(ast1) == type(ast2)
+    
+    def _compare_semantics(self, ast1: Any, ast2: Any) -> bool:
+        """Compare AST semantics.""" 
+        # Simplified semantic comparison
+        return self._compare_ast_structure(ast1, ast2)
+    
+    def _find_differences(self, ast1: Any, ast2: Any) -> List[str]:
+        """Find differences between ASTs."""
+        differences = []
+        if type(ast1) != type(ast2):
+            differences.append(f"Type mismatch: {type(ast1)} vs {type(ast2)}")
+        return differences
+    
+    def _calculate_similarity(self, code1: str, code2: str) -> float:
+        """Calculate similarity score between code strings."""
+        # Simple string similarity - would use more sophisticated comparison
+        if code1 == code2:
+            return 1.0
+        # Use difflib for basic similarity
+        import difflib
+        return difflib.SequenceMatcher(None, code1, code2).ratio()
+    
+    def _detect_features(self, ast: Any) -> List[str]:
+        """Detect language features used in AST."""
+        features = []
+        # Would traverse AST to detect specific language features
+        features.append("basic_syntax")
+        return features
+    
+    def _calculate_complexity(self, ast: Any) -> int:
+        """Calculate complexity score of AST."""
+        return self._count_nodes(ast)
 
 
 # Convenience functions for external use

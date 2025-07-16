@@ -28,7 +28,7 @@ from datetime import datetime
 import time
 
 from .runa_ast import ASTNode, SourceLocation, TranslationMetadata
-from .verification import VerificationResult, PipelineVerifier, VerificationReporter
+from .verification import VerificationResult, ASTVerifier, VerificationReporter
 
 
 class PipelineStage(Enum):
@@ -149,7 +149,7 @@ class TranslationPipeline:
     
     def __init__(self):
         self.toolchains: Dict[str, LanguageToolchain] = {}
-        self.verifier = PipelineVerifier()
+        self.verifier = ASTVerifier()
         self.logger = logging.getLogger(__name__)
         
         # Runa toolchain will be registered separately

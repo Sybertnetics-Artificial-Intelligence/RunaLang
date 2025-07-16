@@ -8,6 +8,7 @@ preserving semantics and enabling round-trip translation.
 
 from typing import List, Optional, Dict, Any, Union
 from dataclasses import dataclass
+import uuid
 
 from .py_ast import *
 from ....core.runa_ast import *
@@ -33,9 +34,9 @@ class PyToRunaConverter:
                 else:
                     statements.append(converted)
         
-        return Program(statements)
+        return Program(statements=statements)
     
-    def convert_statement(self, stmt: PyStatement) -> Union[RunaStatement, List[RunaStatement], None]:
+    def convert_statement(self, stmt: PyStatement) -> Union[Statement, List[Statement], None]:
         """Convert Python statement to Runa statement."""
         if isinstance(stmt, PyAssign):
             return self._convert_assign(stmt)
@@ -72,19 +73,19 @@ class PyToRunaConverter:
         elif isinstance(stmt, PyExpressionStmt):
             return self._convert_expression_stmt(stmt)
         elif isinstance(stmt, PyPass):
-            return RunaExpressionStatement(RunaLiteral("pass", "pass"))
+            return ExpressionStatement(StringLiteral("pass", "pass"))
         elif isinstance(stmt, PyBreak):
-            return RunaBreak()
+            return BreakStatement()
         elif isinstance(stmt, PyContinue):
-            return RunaContinue()
+            return ContinueStatement()
         elif isinstance(stmt, PyGlobal):
-            return RunaExpressionStatement(RunaLiteral(f"global {', '.join(stmt.names)}", "global"))
+            return ExpressionStatement(StringLiteral(f"global {', '.join(stmt.names)}", "global"))
         elif isinstance(stmt, PyNonlocal):
-            return RunaExpressionStatement(RunaLiteral(f"nonlocal {', '.join(stmt.names)}", "nonlocal"))
+            return ExpressionStatement(StringLiteral(f"nonlocal {', '.join(stmt.names)}", "nonlocal"))
         
         return None
     
-    def convert_expression(self, expr: PyExpression) -> RunaExpression:
+    def convert_expression(self, expr: PyExpression) -> Expression:
         """Convert Python expression to Runa expression."""
         if isinstance(expr, PyConstant):
             return self._convert_constant(expr)
@@ -122,9 +123,9 @@ class PyToRunaConverter:
             return self._convert_yield(expr)
         
         # Default fallback
-        return RunaLiteral(str(expr), str(expr))
+        return StringLiteral(str(expr), str(expr))
     
-    def _convert_assign(self, stmt: PyAssign) -> RunaStatement:
+    def _convert_assign(self, stmt: PyAssign) -> Statement:
         """Convert assignment statement."""
         value = self.convert_expression(stmt.value)
         
@@ -132,35 +133,35 @@ class PyToRunaConverter:
         if len(stmt.targets) == 1:
             target = stmt.targets[0]
             if isinstance(target, PyName):
-                return RunaLet(target.id, value)
+                return LetStatement(identifier=target.id, value=value)
             else:
                 # Complex assignment target
                 target_expr = self.convert_expression(target)
-                return RunaAssignment(target_expr, value)
+                return AssignmentExpression(target_expr, value)
         else:
             # Multiple assignment - create multiple let statements
             statements = []
             for target in stmt.targets:
                 if isinstance(target, PyName):
-                    statements.append(RunaLet(target.id, value))
+                    statements.append(LetStatement(identifier=target.id, value=value))
                 else:
                     target_expr = self.convert_expression(target)
-                    statements.append(RunaAssignment(target_expr, value))
+                    statements.append(AssignmentExpression(target_expr, value))
             return statements
     
-    def _convert_ann_assign(self, stmt: PyAnnAssign) -> RunaStatement:
+    def _convert_ann_assign(self, stmt: PyAnnAssign) -> Statement:
         """Convert annotated assignment statement."""
         if isinstance(stmt.target, PyName):
             variable_type = self._convert_type_annotation(stmt.annotation)
             value = self.convert_expression(stmt.value) if stmt.value else None
-            return RunaLet(stmt.target.id, value, variable_type)
+            return LetStatement(stmt.target.id, value, variable_type)
         else:
             # Complex assignment target
             target_expr = self.convert_expression(stmt.target)
             value = self.convert_expression(stmt.value) if stmt.value else None
-            return RunaAssignment(target_expr, value)
+            return AssignmentExpression(target_expr, value)
     
-    def _convert_aug_assign(self, stmt: PyAugAssign) -> RunaStatement:
+    def _convert_aug_assign(self, stmt: PyAugAssign) -> Statement:
         """Convert augmented assignment statement."""
         target = self.convert_expression(stmt.target)
         value = self.convert_expression(stmt.value)
@@ -177,20 +178,23 @@ class PyToRunaConverter:
         }
         
         operator = operator_map.get(stmt.op, "plus")
-        binary_op = RunaBinaryOperation(target, operator, value)
+        binary_op = BinaryExpression(target, operator, value)
         
-        return RunaAssignment(target, binary_op)
+        return AssignmentExpression(target, binary_op)
     
-    def _convert_functiondef(self, stmt: PyFunctionDef) -> RunaProcessDefinition:
+    def _convert_functiondef(self, stmt: PyFunctionDef) -> ProcessDefinition:
         """Convert function definition."""
         # Convert parameters
         params = []
-        for arg in stmt.args.args:
-            param_type = self._convert_type_annotation(arg.annotation) if arg.annotation else RunaType("Any")
-            params.append(RunaParameter(arg.arg, param_type))
+        if stmt.args and stmt.args.args:
+            for arg in stmt.args.args:
+                param_type = self._convert_type_annotation(arg.annotation) if arg.annotation else BasicType("Any")
+                params.append(Parameter(arg.arg, param_type))
         
         # Convert defaults
-        defaults = [self.convert_expression(default) for default in stmt.args.defaults]
+        defaults = []
+        if stmt.args and stmt.args.defaults:
+            defaults = [self.convert_expression(default) for default in stmt.args.defaults]
         
         # Apply defaults to parameters
         if defaults:
@@ -201,33 +205,34 @@ class PyToRunaConverter:
                     params[param_index].default_value = default
         
         # Convert return type
-        return_type = self._convert_type_annotation(stmt.returns) if stmt.returns else RunaType("Any")
+        return_type = self._convert_type_annotation(stmt.returns) if stmt.returns else BasicType("Any")
         
         # Convert body
         body_statements = []
-        for body_stmt in stmt.body:
-            converted = self.convert_statement(body_stmt)
-            if converted:
-                if isinstance(converted, list):
-                    body_statements.extend(converted)
-                else:
-                    body_statements.append(converted)
+        if stmt.body:
+            for body_stmt in stmt.body:
+                converted = self.convert_statement(body_stmt)
+                if converted:
+                    if isinstance(converted, list):
+                        body_statements.extend(converted)
+                    else:
+                        body_statements.append(converted)
         
-        return RunaProcessDefinition(
+        return ProcessDefinition(
             name=stmt.name,
             parameters=params,
             return_type=return_type,
-            body=RunaBlock(body_statements)
+            body=body_statements
         )
     
-    def _convert_async_functiondef(self, stmt: PyAsyncFunctionDef) -> RunaProcessDefinition:
+    def _convert_async_functiondef(self, stmt: PyAsyncFunctionDef) -> ProcessDefinition:
         """Convert async function definition."""
         # Convert like regular function but mark as async
         process_def = self._convert_functiondef(stmt)
         process_def.is_async = True
         return process_def
     
-    def _convert_classdef(self, stmt: PyClassDef) -> RunaClassDefinition:
+    def _convert_classdef(self, stmt: PyClassDef) -> ProcessDefinition:
         """Convert class definition."""
         # Convert base classes
         base_class = None
@@ -239,27 +244,33 @@ class PyToRunaConverter:
         
         # Convert members
         members = []
-        for member in stmt.body:
-            converted = self.convert_statement(member)
-            if converted:
-                if isinstance(converted, list):
-                    members.extend(converted)
-                else:
-                    members.append(converted)
+        if stmt.body:
+            for member in stmt.body:
+                converted = self.convert_statement(member)
+                if converted:
+                    if isinstance(converted, list):
+                        members.extend(converted)
+                    else:
+                        members.append(converted)
         
-        return RunaClassDefinition(
+        base_classes = []
+        if base_class:
+            base_classes.append(base_class)
+        if interfaces:
+            base_classes.extend(interfaces)
+        
+        return ProcessDefinition(
             name=stmt.name,
-            base_class=base_class,
-            interfaces=interfaces,
-            members=members
+            base_classes=base_classes,
+            body=members
         )
     
-    def _convert_return(self, stmt: PyReturn) -> RunaReturn:
+    def _convert_return(self, stmt: PyReturn) -> Statement:
         """Convert return statement."""
         value = self.convert_expression(stmt.value) if stmt.value else None
-        return RunaReturn(value)
+        return ReturnStatement(value)
     
-    def _convert_if(self, stmt: PyIf) -> RunaConditional:
+    def _convert_if(self, stmt: PyIf) -> IfStatement:
         """Convert if statement."""
         condition = self.convert_expression(stmt.test)
         
@@ -271,7 +282,7 @@ class PyToRunaConverter:
                     then_statements.extend(converted)
                 else:
                     then_statements.append(converted)
-        then_branch = RunaBlock(then_statements)
+        then_branch = Block(then_statements)
         
         else_branch = None
         if stmt.orelse:
@@ -283,11 +294,11 @@ class PyToRunaConverter:
                         else_statements.extend(converted)
                     else:
                         else_statements.append(converted)
-            else_branch = RunaBlock(else_statements)
+            else_branch = Block(else_statements)
         
-        return RunaConditional(condition, then_branch, else_branch)
+        return IfStatement(condition, then_branch, else_branch)
     
-    def _convert_while(self, stmt: PyWhile) -> RunaWhileLoop:
+    def _convert_while(self, stmt: PyWhile) -> WhileLoop:
         """Convert while statement."""
         condition = self.convert_expression(stmt.test)
         
@@ -300,13 +311,13 @@ class PyToRunaConverter:
                 else:
                     body_statements.append(converted)
         
-        return RunaWhileLoop(condition, RunaBlock(body_statements))
+        return WhileLoop(condition, Block(body_statements))
     
-    def _convert_for(self, stmt: PyFor) -> RunaForLoop:
+    def _convert_for(self, stmt: PyFor) -> ForRangeLoop:
         """Convert for statement."""
         # Python for loops are different from C-style for loops
         # Convert to a while loop with iteration
-        condition = RunaLiteral(True, "True")
+        condition = StringLiteral(True, "True")
         
         body_statements = []
         for body_stmt in stmt.body:
@@ -317,9 +328,9 @@ class PyToRunaConverter:
                 else:
                     body_statements.append(converted)
         
-        return RunaForLoop(condition, RunaBlock(body_statements))
+        return ForRangeLoop(condition, Block(body_statements))
     
-    def _convert_try(self, stmt: PyTry) -> RunaTryCatch:
+    def _convert_try(self, stmt: PyTry) -> TryStatement:
         """Convert try statement."""
         try_statements = []
         for try_stmt in stmt.body:
@@ -329,7 +340,7 @@ class PyToRunaConverter:
                     try_statements.extend(converted)
                 else:
                     try_statements.append(converted)
-        try_block = RunaBlock(try_statements)
+        try_block = Block(try_statements)
         
         catch_block = None
         catch_parameter = None
@@ -346,7 +357,7 @@ class PyToRunaConverter:
                         catch_statements.extend(converted)
                     else:
                         catch_statements.append(converted)
-            catch_block = RunaBlock(catch_statements)
+            catch_block = Block(catch_statements)
         
         finally_block = None
         if stmt.finalbody:
@@ -358,14 +369,32 @@ class PyToRunaConverter:
                         finally_statements.extend(converted)
                     else:
                         finally_statements.append(converted)
-            finally_block = RunaBlock(finally_statements)
+            finally_block = Block(finally_statements)
         
-        return RunaTryCatch(try_block, catch_block, catch_parameter, None, finally_block)
+        return TryStatement(try_block, catch_block, catch_parameter, None, finally_block)
     
-    def _convert_with(self, stmt: PyWith) -> RunaStatement:
-        """Convert with statement."""
-        # Simplified conversion - treat as a block
-        body_statements = []
+    def _convert_with(self, stmt: PyWith) -> Statement:
+        """Convert with statement using TryWithResourcesStatement for resource management."""
+        # Only handle the first withitem for now
+        if not stmt.items:
+            # Fallback to simple block conversion
+            return self._convert_block(stmt)
+
+        with_item = stmt.items[0]
+        resource_expr = self.convert_expression(with_item.context_expr)
+
+        # Determine variable binding
+        if with_item.optional_vars and isinstance(with_item.optional_vars, PyName):
+            resource_var_name = with_item.optional_vars.id
+        else:
+            # Generate a temporary variable name
+            resource_var_name = f"_res_{uuid.uuid4().hex[:8]}"
+
+        # Let resource_var_name = resource_expr
+        resource_let = LetStatement(resource_var_name, resource_expr)
+
+        # Convert body statements
+        body_statements: List[Statement] = []
         for body_stmt in stmt.body:
             converted = self.convert_statement(body_stmt)
             if converted:
@@ -373,36 +402,38 @@ class PyToRunaConverter:
                     body_statements.extend(converted)
                 else:
                     body_statements.append(converted)
-        
-        return RunaBlock(body_statements)
+
+        try_block = Block(body_statements)
+        try_with_stmt = TryWithResourcesStatement(resource=resource_let, body=try_block)
+        return try_with_stmt
     
-    def _convert_raise(self, stmt: PyRaise) -> RunaThrow:
+    def _convert_raise(self, stmt: PyRaise) -> ThrowStatement:
         """Convert raise statement."""
-        value = self.convert_expression(stmt.exc) if stmt.exc else RunaLiteral("Exception", "Exception")
-        return RunaThrow(value)
+        value = self.convert_expression(stmt.exc) if stmt.exc else StringLiteral("Exception", "Exception")
+        return ThrowStatement(value)
     
-    def _convert_assert(self, stmt: PyAssert) -> RunaStatement:
+    def _convert_assert(self, stmt: PyAssert) -> Statement:
         """Convert assert statement."""
         # Convert to an if statement that throws
         condition = self.convert_expression(stmt.test)
-        msg = self.convert_expression(stmt.msg) if stmt.msg else RunaLiteral("AssertionError", "AssertionError")
+        msg = self.convert_expression(stmt.msg) if stmt.msg else StringLiteral("AssertionError", "AssertionError")
         
         # If not condition, throw msg
-        not_condition = RunaUnaryOperation("not", condition)
-        throw_stmt = RunaThrow(msg)
+        not_condition = UnaryExpression("not", condition)
+        throw_stmt = ThrowStatement(msg)
         
-        return RunaConditional(not_condition, RunaBlock([throw_stmt]))
+        return IfStatement(not_condition, Block([throw_stmt]))
     
-    def _convert_import(self, stmt: PyImport) -> RunaStatement:
+    def _convert_import(self, stmt: PyImport) -> Statement:
         """Convert import statement."""
         imports = []
         for alias in stmt.names:
             import_name = alias.asname if alias.asname else alias.name
             imports.append(import_name)
         
-        return RunaImport("", imports)
+        return ImportStatement("", imports)
     
-    def _convert_import_from(self, stmt: PyImportFrom) -> RunaStatement:
+    def _convert_import_from(self, stmt: PyImportFrom) -> Statement:
         """Convert import from statement."""
         module = stmt.module or ""
         imports = []
@@ -410,31 +441,33 @@ class PyToRunaConverter:
             import_name = alias.asname if alias.asname else alias.name
             imports.append(import_name)
         
-        return RunaImport(module, imports)
+        return ImportStatement(module, imports)
     
-    def _convert_expression_stmt(self, stmt: PyExpressionStmt) -> RunaExpressionStatement:
+    def _convert_expression_stmt(self, stmt: PyExpressionStmt) -> ExpressionStatement:
         """Convert expression statement."""
         expr = self.convert_expression(stmt.value)
-        return RunaExpressionStatement(expr)
+        return ExpressionStatement(expression=expr)
     
-    def _convert_constant(self, expr: PyConstant) -> RunaLiteral:
+    def _convert_constant(self, expr: PyConstant) -> Expression:
         """Convert constant expression."""
         if expr.value is None:
-            return RunaLiteral(None, "None", "null")
+            return StringLiteral(value="None")
         elif isinstance(expr.value, bool):
-            return RunaLiteral(expr.value, "True" if expr.value else "False", "boolean")
-        elif isinstance(expr.value, (int, float)):
-            return RunaLiteral(expr.value, str(expr.value), "number")
+            return BooleanLiteral(value=expr.value)
+        elif isinstance(expr.value, int):
+            return IntegerLiteral(value=expr.value)
+        elif isinstance(expr.value, float):
+            return FloatLiteral(value=expr.value)
         elif isinstance(expr.value, str):
-            return RunaLiteral(expr.value, f'"{expr.value}"', "string")
+            return StringLiteral(value=expr.value)
         else:
-            return RunaLiteral(expr.value, str(expr.value), "unknown")
+            return StringLiteral(value=str(expr.value))
     
-    def _convert_name(self, expr: PyName) -> RunaIdentifier:
+    def _convert_name(self, expr: PyName) -> Expression:
         """Convert name expression."""
-        return RunaIdentifier(expr.id)
+        return Identifier(name=expr.id)
     
-    def _convert_binop(self, expr: PyBinOp) -> RunaBinaryOperation:
+    def _convert_binop(self, expr: PyBinOp) -> BinaryExpression:
         """Convert binary operation."""
         left = self.convert_expression(expr.left)
         right = self.convert_expression(expr.right)
@@ -456,9 +489,9 @@ class PyToRunaConverter:
         }
         
         operator = operator_map.get(expr.op, "plus")
-        return RunaBinaryOperation(left, operator, right)
+        return BinaryExpression(left, operator, right)
     
-    def _convert_unaryop(self, expr: PyUnaryOp) -> RunaUnaryOperation:
+    def _convert_unaryop(self, expr: PyUnaryOp) -> UnaryExpression:
         """Convert unary operation."""
         operand = self.convert_expression(expr.operand)
         
@@ -470,9 +503,9 @@ class PyToRunaConverter:
         }
         
         operator = operator_map.get(expr.op, "not")
-        return RunaUnaryOperation(operator, operand)
+        return UnaryExpression(operator, operand)
     
-    def _convert_compare(self, expr: PyCompare) -> RunaBinaryOperation:
+    def _convert_compare(self, expr: PyCompare) -> BinaryExpression:
         """Convert comparison expression."""
         left = self.convert_expression(expr.left)
         
@@ -497,100 +530,129 @@ class PyToRunaConverter:
             operator = operator_map.get(op, "is equal to")
             
             if i == 0:
-                result = RunaBinaryOperation(left, operator, right)
+                result = BinaryExpression(left, operator, right)
             else:
                 # Chain with 'and'
-                new_comparison = RunaBinaryOperation(result, operator, right)
-                result = RunaBinaryOperation(result, "and", new_comparison)
+                new_comparison = BinaryExpression(result, operator, right)
+                result = BinaryExpression(result, "and", new_comparison)
         
         return result
     
-    def _convert_call(self, expr: PyCall) -> RunaFunctionCall:
+    def _convert_call(self, expr: PyCall) -> FunctionCall:
         """Convert call expression."""
         if isinstance(expr.func, PyName):
             func_name = expr.func.id
         elif isinstance(expr.func, PyAttribute):
             # Method call
             object_expr = self.convert_expression(expr.func.value)
-            return RunaMethodCall(object_expr, expr.func.attr, [self.convert_expression(arg) for arg in expr.args])
+            args = [(None, self.convert_expression(arg)) for arg in expr.args]
+            return FunctionCall(function_name=f"{object_expr}.{expr.func.attr}", arguments=args)
         else:
             func_name = "unknown_function"
         
-        args = [self.convert_expression(arg) for arg in expr.args]
-        return RunaFunctionCall(func_name, args)
+        args = [(None, self.convert_expression(arg)) for arg in expr.args]
+        return FunctionCall(function_name=func_name, arguments=args)
     
-    def _convert_attribute(self, expr: PyAttribute) -> RunaMemberAccess:
+    def _convert_attribute(self, expr: PyAttribute) -> MemberAccess:
         """Convert attribute access."""
         object_expr = self.convert_expression(expr.value)
-        return RunaMemberAccess(object_expr, expr.attr)
+        return MemberAccess(object_expr, expr.attr)
     
-    def _convert_subscript(self, expr: PySubscript) -> RunaArrayAccess:
+    def _convert_subscript(self, expr: PySubscript) -> IndexAccess:
         """Convert subscript access."""
         array_expr = self.convert_expression(expr.value)
         index_expr = self.convert_expression(expr.slice)
-        return RunaArrayAccess(array_expr, index_expr)
+        return IndexAccess(array_expr, index_expr)
     
-    def _convert_list(self, expr: PyList) -> RunaArrayLiteral:
+    def _convert_list(self, expr: PyList) -> ListLiteral:
         """Convert list literal."""
-        elements = [self.convert_expression(elt) for elt in expr.elts]
-        return RunaArrayLiteral(elements)
+        elements = []
+        if expr.elts:
+            elements = [self.convert_expression(elt) for elt in expr.elts]
+        return ListLiteral(elements)
     
-    def _convert_tuple(self, expr: PyTuple) -> RunaArrayLiteral:
+    def _convert_tuple(self, expr: PyTuple) -> ListLiteral:
         """Convert tuple literal (as array)."""
-        elements = [self.convert_expression(elt) for elt in expr.elts]
-        return RunaArrayLiteral(elements)
+        elements = []
+        if expr.elts:
+            elements = [self.convert_expression(elt) for elt in expr.elts]
+        return ListLiteral(elements)
     
-    def _convert_dict(self, expr: PyDict) -> RunaObjectLiteral:
+    def _convert_dict(self, expr: PyDict) -> DictionaryLiteral:
         """Convert dictionary literal."""
         properties = []
         for key, value in zip(expr.keys, expr.values):
             if key:
                 key_str = str(key.value) if isinstance(key, PyConstant) else "unknown"
                 value_expr = self.convert_expression(value)
-                properties.append(RunaObjectProperty(key_str, value_expr))
+                properties.append((key_str, value_expr))
         
-        return RunaObjectLiteral(properties)
+        return DictionaryLiteral(properties)
     
-    def _convert_set(self, expr: PySet) -> RunaArrayLiteral:
+    def _convert_set(self, expr: PySet) -> ListLiteral:
         """Convert set literal (as array)."""
         elements = [self.convert_expression(elt) for elt in expr.elts]
-        return RunaArrayLiteral(elements)
+        return ListLiteral(elements)
     
-    def _convert_lambda(self, expr: PyLambda) -> RunaLambda:
+    def _convert_lambda(self, expr: PyLambda) -> LambdaExpression:
         """Convert lambda expression."""
         params = []
         for arg in expr.args.args:
-            param_type = self._convert_type_annotation(arg.annotation) if arg.annotation else RunaType("Any")
-            params.append(RunaParameter(arg.arg, param_type))
+            param_type = self._convert_type_annotation(arg.annotation) if arg.annotation else BasicType("Any")
+            params.append(Parameter(arg.arg, param_type))
         
-        body = RunaBlock([RunaReturn(self.convert_expression(expr.body))])
-        return RunaLambda(params, body)
+        body = Block([ReturnStatement(self.convert_expression(expr.body))])
+        return LambdaExpression(params, body)
     
-    def _convert_ifexp(self, expr: PyIfExp) -> RunaConditionalExpression:
+    def _convert_ifexp(self, expr: PyIfExp) -> ConditionalExpression:
         """Convert conditional expression."""
         condition = self.convert_expression(expr.test)
         then_value = self.convert_expression(expr.body)
         else_value = self.convert_expression(expr.orelse)
         
-        return RunaConditionalExpression(condition, then_value, else_value)
+        return ConditionalExpression(condition, then_value, else_value)
     
-    def _convert_listcomp(self, expr: PyListComp) -> RunaArrayLiteral:
-        """Convert list comprehension (simplified)."""
-        # For now, just return the element
-        element = self.convert_expression(expr.elt)
-        return RunaArrayLiteral([element])
+    def _convert_listcomp(self, expr: PyListComp) -> Expression:
+        """Convert list comprehension to QueryExpression (Select + Where)."""
+        if not expr.generators:
+            # No generators – treat as simple list literal
+            element = self.convert_expression(expr.elt)
+            return ListLiteral([element])
+
+        # Handle first generator
+        gen = expr.generators[0]
+        # Target variable name (assume PyName)
+        if isinstance(gen.target, PyName):
+            var_name = gen.target.id
+        else:
+            var_name = f"_item_{uuid.uuid4().hex[:6]}"
+
+        iterable_expr = self.convert_expression(gen.iter)
+
+        clauses = []
+        # Where clauses for each if condition in the generator
+        for if_cond in gen.ifs:
+            cond_expr = self.convert_expression(if_cond)
+            clauses.append(WhereClause(cond_expr))
+
+        # Select clause with element expression
+        element_expr = self.convert_expression(expr.elt)
+        clauses.append(SelectClause(element_expr))
+
+        query_expr = QueryExpression(source=iterable_expr, clauses=clauses)
+        return query_expr
     
-    def _convert_await(self, expr: PyAwait) -> RunaAwait:
+    def _convert_await(self, expr: PyAwait) -> AwaitExpression:
         """Convert await expression."""
         expression = self.convert_expression(expr.value)
-        return RunaAwait(expression)
+        return AwaitExpression(expression)
     
-    def _convert_yield(self, expr: PyYield) -> RunaYield:
+    def _convert_yield(self, expr: PyYield) -> YieldStatement:
         """Convert yield expression."""
         value = self.convert_expression(expr.value) if expr.value else None
-        return RunaYield(value)
+        return YieldStatement(value)
     
-    def _convert_type_annotation(self, annotation: PyExpression) -> RunaType:
+    def _convert_type_annotation(self, annotation: PyExpression) -> BasicType:
         """Convert type annotation."""
         if isinstance(annotation, PyName):
             type_map = {
@@ -604,9 +666,9 @@ class PyToRunaConverter:
                 "set": "Set",
                 "None": "Null",
             }
-            return RunaType(type_map.get(annotation.id, annotation.id))
+            return BasicType(type_map.get(annotation.id, annotation.id))
         else:
-            return RunaType("Any")
+            return BasicType("Any")
 
 
 class RunaToPyConverter:
@@ -630,76 +692,80 @@ class RunaToPyConverter:
         
         return PyModule(statements)
     
-    def convert_statement(self, stmt: RunaStatement) -> Union[PyStatement, List[PyStatement], None]:
+    def convert_statement(self, stmt: Statement) -> Union[PyStatement, List[PyStatement], None]:
         """Convert Runa statement to Python statement."""
-        if isinstance(stmt, RunaLet):
+        if isinstance(stmt, LetStatement):
             return self._convert_let(stmt)
-        elif isinstance(stmt, RunaAssignment):
+        elif isinstance(stmt, AssignmentExpression):
             return self._convert_assignment(stmt)
-        elif isinstance(stmt, RunaProcessDefinition):
+        elif isinstance(stmt, ProcessDefinition):
             return self._convert_process_definition(stmt)
-        elif isinstance(stmt, RunaClassDefinition):
+        elif isinstance(stmt, ProcessDefinition): # This case is for class definitions
             return self._convert_class_definition(stmt)
-        elif isinstance(stmt, RunaReturn):
+        elif isinstance(stmt, ReturnStatement):
             return self._convert_return(stmt)
-        elif isinstance(stmt, RunaConditional):
+        elif isinstance(stmt, IfStatement):
             return self._convert_conditional(stmt)
-        elif isinstance(stmt, RunaWhileLoop):
+        elif isinstance(stmt, WhileLoop):
             return self._convert_while_loop(stmt)
-        elif isinstance(stmt, RunaForLoop):
+        elif isinstance(stmt, ForRangeLoop):
             return self._convert_for_loop(stmt)
-        elif isinstance(stmt, RunaTryCatch):
+        elif isinstance(stmt, TryStatement):
             return self._convert_try_catch(stmt)
-        elif isinstance(stmt, RunaThrow):
+        elif isinstance(stmt, ThrowStatement):
             return self._convert_throw(stmt)
-        elif isinstance(stmt, RunaImport):
+        elif isinstance(stmt, ImportStatement):
             return self._convert_import(stmt)
-        elif isinstance(stmt, RunaExpressionStatement):
+        elif isinstance(stmt, ExpressionStatement):
             return self._convert_expression_statement(stmt)
-        elif isinstance(stmt, RunaBreak):
+        elif isinstance(stmt, BreakStatement):
             return PyBreak()
-        elif isinstance(stmt, RunaContinue):
+        elif isinstance(stmt, ContinueStatement):
             return PyContinue()
-        elif isinstance(stmt, RunaBlock):
+        elif isinstance(stmt, Block):
             return self._convert_block(stmt)
+        elif isinstance(stmt, TryWithResourcesStatement):
+            return self._convert_try_with_resources(stmt)
+        elif isinstance(stmt, QueryExpression):
+            return self._convert_query_expression(stmt)
         
         return None
     
-    def convert_expression(self, expr: RunaExpression) -> PyExpression:
+    def convert_expression(self, expr: AssignmentExpression) -> PyExpression:
         """Convert Runa expression to Python expression."""
-        if isinstance(expr, RunaLiteral):
+        if isinstance(expr, StringLiteral):
             return self._convert_literal(expr)
-        elif isinstance(expr, RunaIdentifier):
+        elif isinstance(expr, Identifier):
             return self._convert_identifier(expr)
-        elif isinstance(expr, RunaBinaryOperation):
+        elif isinstance(expr, BinaryExpression):
             return self._convert_binary_operation(expr)
-        elif isinstance(expr, RunaUnaryOperation):
+        elif isinstance(expr, UnaryExpression):
             return self._convert_unary_operation(expr)
-        elif isinstance(expr, RunaFunctionCall):
+        elif isinstance(expr, FunctionCall):
             return self._convert_function_call(expr)
-        elif isinstance(expr, RunaMethodCall):
-            return self._convert_method_call(expr)
-        elif isinstance(expr, RunaMemberAccess):
+        elif isinstance(expr, MemberAccess):
             return self._convert_member_access(expr)
-        elif isinstance(expr, RunaArrayAccess):
+        elif isinstance(expr, IndexAccess):
             return self._convert_array_access(expr)
-        elif isinstance(expr, RunaArrayLiteral):
+        elif isinstance(expr, ListLiteral):
             return self._convert_array_literal(expr)
-        elif isinstance(expr, RunaObjectLiteral):
+        elif isinstance(expr, DictionaryLiteral):
             return self._convert_object_literal(expr)
-        elif isinstance(expr, RunaLambda):
+        elif isinstance(expr, LambdaExpression):
             return self._convert_lambda(expr)
-        elif isinstance(expr, RunaConditionalExpression):
+        elif isinstance(expr, ConditionalExpression):
             return self._convert_conditional_expression(expr)
-        elif isinstance(expr, RunaAwait):
+        elif isinstance(expr, AwaitExpression):
             return self._convert_await(expr)
-        elif isinstance(expr, RunaYield):
+        elif isinstance(expr, YieldStatement):
             return self._convert_yield(expr)
+        elif isinstance(expr, QueryExpression):
+            return self._convert_query_expression(expr)
         
         # Default fallback
         return PyConstant(str(expr))
     
-    def _convert_let(self, stmt: RunaLet) -> PyStatement:
+    def _convert_let(self, stmt: LetStatement) -> PyStatement:
         """Convert let statement."""
         target = PyName(stmt.name, PyContext.STORE)
         value = self.convert_expression(stmt.value) if stmt.value else PyConstant(None)
@@ -712,13 +778,13 @@ class RunaToPyConverter:
             # Regular assignment
             return PyAssign([target], value)
     
-    def _convert_assignment(self, stmt: RunaAssignment) -> PyStatement:
+    def _convert_assignment(self, stmt: AssignmentExpression) -> PyStatement:
         """Convert assignment statement."""
         target = self.convert_expression(stmt.target)
         value = self.convert_expression(stmt.value)
         return PyAssign([target], value)
     
-    def _convert_process_definition(self, stmt: RunaProcessDefinition) -> PyStatement:
+    def _convert_process_definition(self, stmt: ProcessDefinition) -> PyStatement:
         """Convert process definition."""
         # Convert parameters
         args = []
@@ -751,7 +817,7 @@ class RunaToPyConverter:
         else:
             return PyFunctionDef(stmt.name, arguments, body, [], returns)
     
-    def _convert_class_definition(self, stmt: RunaClassDefinition) -> PyStatement:
+    def _convert_class_definition(self, stmt: ProcessDefinition) -> PyStatement:
         """Convert class definition."""
         bases = []
         if stmt.base_class:
@@ -773,12 +839,12 @@ class RunaToPyConverter:
         
         return PyClassDef(stmt.name, bases, [], body, [])
     
-    def _convert_return(self, stmt: RunaReturn) -> PyStatement:
+    def _convert_return(self, stmt: ReturnStatement) -> PyStatement:
         """Convert return statement."""
         value = self.convert_expression(stmt.value) if stmt.value else None
         return PyReturn(value)
     
-    def _convert_conditional(self, stmt: RunaConditional) -> PyStatement:
+    def _convert_conditional(self, stmt: IfStatement) -> PyStatement:
         """Convert conditional statement."""
         test = self.convert_expression(stmt.condition)
         
@@ -803,7 +869,7 @@ class RunaToPyConverter:
         
         return PyIf(test, body, orelse)
     
-    def _convert_while_loop(self, stmt: RunaWhileLoop) -> PyStatement:
+    def _convert_while_loop(self, stmt: WhileLoop) -> PyStatement:
         """Convert while loop."""
         test = self.convert_expression(stmt.condition)
         
@@ -818,7 +884,7 @@ class RunaToPyConverter:
         
         return PyWhile(test, body, [])
     
-    def _convert_for_loop(self, stmt: RunaForLoop) -> PyStatement:
+    def _convert_for_loop(self, stmt: ForRangeLoop) -> PyStatement:
         """Convert for loop (simplified)."""
         # Convert to while loop
         test = self.convert_expression(stmt.condition)
@@ -834,7 +900,7 @@ class RunaToPyConverter:
         
         return PyWhile(test, body, [])
     
-    def _convert_try_catch(self, stmt: RunaTryCatch) -> PyStatement:
+    def _convert_try_catch(self, stmt: TryStatement) -> PyStatement:
         """Convert try-catch statement."""
         # Convert try block
         try_body = []
@@ -874,12 +940,12 @@ class RunaToPyConverter:
         
         return PyTry(try_body, handlers, [], finalbody)
     
-    def _convert_throw(self, stmt: RunaThrow) -> PyStatement:
+    def _convert_throw(self, stmt: ThrowStatement) -> PyStatement:
         """Convert throw statement."""
         exc = self.convert_expression(stmt.value)
         return PyRaise(exc)
     
-    def _convert_import(self, stmt: RunaImport) -> PyStatement:
+    def _convert_import(self, stmt: ImportStatement) -> PyStatement:
         """Convert import statement."""
         if stmt.module:
             # from module import names
@@ -894,12 +960,12 @@ class RunaToPyConverter:
                 aliases.append(PyAlias(import_name))
             return PyImport(aliases)
     
-    def _convert_expression_statement(self, stmt: RunaExpressionStatement) -> PyStatement:
+    def _convert_expression_statement(self, stmt: ExpressionStatement) -> PyStatement:
         """Convert expression statement."""
         expr = self.convert_expression(stmt.expression)
         return PyExpressionStmt(expr)
     
-    def _convert_block(self, stmt: RunaBlock) -> List[PyStatement]:
+    def _convert_block(self, stmt: Block) -> List[PyStatement]:
         """Convert block statement."""
         statements = []
         for sub_stmt in stmt.statements:
@@ -911,15 +977,15 @@ class RunaToPyConverter:
                     statements.append(converted)
         return statements
     
-    def _convert_literal(self, expr: RunaLiteral) -> PyExpression:
+    def _convert_literal(self, expr: StringLiteral) -> PyExpression:
         """Convert literal expression."""
         return PyConstant(expr.value)
     
-    def _convert_identifier(self, expr: RunaIdentifier) -> PyExpression:
+    def _convert_identifier(self, expr: Identifier) -> PyExpression:
         """Convert identifier expression."""
         return PyName(expr.name)
     
-    def _convert_binary_operation(self, expr: RunaBinaryOperation) -> PyExpression:
+    def _convert_binary_operation(self, expr: BinaryExpression) -> PyExpression:
         """Convert binary operation."""
         left = self.convert_expression(expr.left)
         right = self.convert_expression(expr.right)
@@ -972,7 +1038,7 @@ class RunaToPyConverter:
                 # Default to addition
                 return PyBinOp(left, PyOperator.ADD, right)
     
-    def _convert_unary_operation(self, expr: RunaUnaryOperation) -> PyExpression:
+    def _convert_unary_operation(self, expr: UnaryExpression) -> PyExpression:
         """Convert unary operation."""
         operand = self.convert_expression(expr.operand)
         
@@ -986,47 +1052,40 @@ class RunaToPyConverter:
         operator = operator_map.get(expr.operator, PyOperator.NOT)
         return PyUnaryOp(operator, operand)
     
-    def _convert_function_call(self, expr: RunaFunctionCall) -> PyExpression:
+    def _convert_function_call(self, expr: FunctionCall) -> PyExpression:
         """Convert function call."""
         func = PyName(expr.function_name)
         args = [self.convert_expression(arg) for arg in expr.arguments]
         return PyCall(func, args, [])
     
-    def _convert_method_call(self, expr: RunaMethodCall) -> PyExpression:
-        """Convert method call."""
-        obj = self.convert_expression(expr.object)
-        func = PyAttribute(obj, expr.method)
-        args = [self.convert_expression(arg) for arg in expr.arguments]
-        return PyCall(func, args, [])
-    
-    def _convert_member_access(self, expr: RunaMemberAccess) -> PyExpression:
+    def _convert_member_access(self, expr: MemberAccess) -> PyExpression:
         """Convert member access."""
         obj = self.convert_expression(expr.object)
         return PyAttribute(obj, expr.member)
     
-    def _convert_array_access(self, expr: RunaArrayAccess) -> PyExpression:
+    def _convert_array_access(self, expr: IndexAccess) -> PyExpression:
         """Convert array access."""
         array = self.convert_expression(expr.array)
         index = self.convert_expression(expr.index)
         return PySubscript(array, index)
     
-    def _convert_array_literal(self, expr: RunaArrayLiteral) -> PyExpression:
+    def _convert_array_literal(self, expr: ListLiteral) -> PyExpression:
         """Convert array literal."""
         elements = [self.convert_expression(element) for element in expr.elements]
         return PyList(elements)
     
-    def _convert_object_literal(self, expr: RunaObjectLiteral) -> PyExpression:
+    def _convert_object_literal(self, expr: DictionaryLiteral) -> PyExpression:
         """Convert object literal."""
         keys = []
         values = []
         
         for prop in expr.properties:
-            keys.append(PyConstant(prop.key))
-            values.append(self.convert_expression(prop.value))
+            keys.append(PyConstant(prop[0]))
+            values.append(self.convert_expression(prop[1]))
         
         return PyDict(keys, values)
     
-    def _convert_lambda(self, expr: RunaLambda) -> PyExpression:
+    def _convert_lambda(self, expr: LambdaExpression) -> PyExpression:
         """Convert lambda expression."""
         args = []
         for param in expr.parameters:
@@ -1036,14 +1095,14 @@ class RunaToPyConverter:
         arguments = PyArguments(args=args)
         
         # Extract body expression (assume single return)
-        if expr.body.statements and isinstance(expr.body.statements[0], RunaReturn):
+        if expr.body.statements and isinstance(expr.body.statements[0], ReturnStatement):
             body = self.convert_expression(expr.body.statements[0].value)
         else:
             body = PyConstant(None)
         
         return PyLambda(arguments, body)
     
-    def _convert_conditional_expression(self, expr: RunaConditionalExpression) -> PyExpression:
+    def _convert_conditional_expression(self, expr: ConditionalExpression) -> PyExpression:
         """Convert conditional expression."""
         test = self.convert_expression(expr.condition)
         body = self.convert_expression(expr.then_value)
@@ -1051,17 +1110,81 @@ class RunaToPyConverter:
         
         return PyIfExp(test, body, orelse)
     
-    def _convert_await(self, expr: RunaAwait) -> PyExpression:
+    def _convert_await(self, expr: AwaitExpression) -> PyExpression:
         """Convert await expression."""
         value = self.convert_expression(expr.expression)
         return PyAwait(value)
     
-    def _convert_yield(self, expr: RunaYield) -> PyExpression:
+    def _convert_yield(self, expr: YieldStatement) -> PyExpression:
         """Convert yield expression."""
         value = self.convert_expression(expr.value) if expr.value else None
         return PyYield(value)
     
-    def _convert_type(self, runa_type: RunaType) -> PyExpression:
+    def _convert_try_with_resources(self, stmt: TryWithResourcesStatement) -> PyStatement:
+        """Convert try-with-resources statement."""
+        resource_let = stmt.resource
+        try_block = stmt.body
+
+        # Convert try block
+        try_body = []
+        for try_stmt in try_block.statements:
+            converted = self.convert_statement(try_stmt)
+            if converted:
+                if isinstance(converted, list):
+                    try_body.extend(converted)
+                else:
+                    try_body.append(converted)
+
+        # Convert catch block
+        handlers = []
+        if stmt.catch_block:
+            catch_body = []
+            for catch_stmt in stmt.catch_block.statements:
+                converted = self.convert_statement(catch_stmt)
+                if converted:
+                    if isinstance(converted, list):
+                        catch_body.extend(converted)
+                    else:
+                        catch_body.append(converted)
+            
+            handler = PyExceptHandler(None, resource_let.name, catch_body)
+            handlers.append(handler)
+        
+        # Convert finally block
+        finalbody = []
+        if stmt.finally_block:
+            for finally_stmt in stmt.finally_block.statements:
+                converted = self.convert_statement(finally_stmt)
+                if converted:
+                    if isinstance(converted, list):
+                        finalbody.extend(converted)
+                    else:
+                        finalbody.append(converted)
+        
+        return PyTry(try_body, handlers, [], finalbody)
+
+    def _convert_query_expression(self, expr: QueryExpression) -> PyExpression:
+        """Convert query expression to Python expression."""
+        source_expr = self.convert_expression(expr.source)
+        clauses = []
+        for clause in expr.clauses:
+            if isinstance(clause, WhereClause):
+                clauses.append(self._convert_where_clause(clause))
+            elif isinstance(clause, SelectClause):
+                clauses.append(self._convert_select_clause(clause))
+        return QueryExpression(source_expr, clauses)
+
+    def _convert_where_clause(self, clause: WhereClause) -> WhereClause:
+        """Convert where clause."""
+        condition = self.convert_expression(clause.condition)
+        return WhereClause(condition)
+
+    def _convert_select_clause(self, clause: SelectClause) -> SelectClause:
+        """Convert select clause."""
+        expression = self.convert_expression(clause.expression)
+        return SelectClause(expression)
+    
+    def _convert_type(self, runa_type: BasicType) -> PyExpression:
         """Convert Runa type to Python type expression."""
         type_map = {
             "Integer": "int",

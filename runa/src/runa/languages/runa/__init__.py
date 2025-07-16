@@ -15,8 +15,8 @@ runa_generator = RunaGenerator()
 
 def register_runa_toolchain():
     """Register the Runa toolchain with the global pipeline."""
-    from runa.core.pipeline import get_pipeline
-    from runa.core.base_components import register_language_info
+    from ...core.pipeline import get_pipeline
+    from ...core.base_components import register_language_info
     
     # Register language info
     register_language_info(RUNA_LANGUAGE_INFO)

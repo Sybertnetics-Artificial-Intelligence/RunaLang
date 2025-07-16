@@ -20,7 +20,7 @@ from .ts_generator import TSCodeGenerator, generate_typescript
 from .ts_ast import TSNode, TSProgram
 from ....core.runa_ast import Program
 from ...shared.base_toolchain import BaseLanguageToolchain, LanguageMetadata, ToolchainResult
-from ...core.translation_result import TranslationResult, TranslationError
+from ....core.translation_result import TranslationResult, TranslationError
 
 
 class TypeScriptToolchain(BaseLanguageToolchain):
