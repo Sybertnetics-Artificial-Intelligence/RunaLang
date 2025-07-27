@@ -1,0 +1,920 @@
+Note:
+Runa Standard Library: Locks and Synchronization Module
+
+Provides mutual exclusion locks, read-write locks, and condition variables for
+thread synchronization. Essential for protecting shared resources and
+coordinating thread execution in concurrent programs.
+
+Features:
+- Mutex locks for exclusive access to shared resources
+- Read-write locks for concurrent readers with exclusive writers
+- Condition variables for thread coordination and signaling
+- Reentrant locks supporting recursive locking by same thread
+- Try-lock operations with timeout support
+- Lock fairness policies (FIFO, priority-based)
+- Deadlock detection and prevention mechanisms
+- Performance monitoring and contention tracking
+- Integration with Runa's actor model
+- Cross-platform lock implementations
+
+Lock Types:
+- Mutex: Basic mutual exclusion lock
+- ReentrantMutex: Recursive mutex allowing multiple acquisitions
+- ReadWriteLock: Allows multiple readers or single writer
+- SpinLock: CPU-intensive lock for short critical sections
+- ConditionVariable: Thread coordination and signaling
+
+Thread Safety: All lock operations are thread-safe and designed
+for high-performance concurrent access patterns.
+:End Note
+
+Import "stdlib/concurrent/atomic" as atomic
+
+Note: Core Lock Types
+Type Mutex is Dictionary with:
+    locked as Boolean defaults to false
+    owner_thread_id as Optional[Integer] defaults to None
+    waiting_threads as List[Integer] defaults to list containing
+    acquisition_count as Integer defaults to 0
+    creation_timestamp as Float defaults to 0.0
+    total_acquisitions as Integer defaults to 0
+    total_contentions as Integer defaults to 0
+    max_wait_time as Float defaults to 0.0
+    fairness_policy as String defaults to "fifo"
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type ReentrantMutex is Dictionary with:
+    locked as Boolean defaults to false
+    owner_thread_id as Optional[Integer] defaults to None
+    recursion_count as Integer defaults to 0
+    waiting_threads as List[Integer] defaults to list containing
+    creation_timestamp as Float defaults to 0.0
+    total_acquisitions as Integer defaults to 0
+    total_contentions as Integer defaults to 0
+    max_wait_time as Float defaults to 0.0
+    fairness_policy as String defaults to "fifo"
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type ReadWriteLock is Dictionary with:
+    readers_count as Integer defaults to 0
+    writer_thread_id as Optional[Integer] defaults to None
+    waiting_readers as List[Integer] defaults to list containing
+    waiting_writers as List[Integer] defaults to list containing
+    creation_timestamp as Float defaults to 0.0
+    total_read_acquisitions as Integer defaults to 0
+    total_write_acquisitions as Integer defaults to 0
+    total_contentions as Integer defaults to 0
+    max_wait_time as Float defaults to 0.0
+    writer_preference as Boolean defaults to false
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type SpinLock is Dictionary with:
+    locked as Boolean defaults to false
+    owner_thread_id as Optional[Integer] defaults to None
+    spin_count as Integer defaults to 0
+    creation_timestamp as Float defaults to 0.0
+    total_spins as Integer defaults to 0
+    total_acquisitions as Integer defaults to 0
+    max_spin_time as Float defaults to 0.0
+    adaptive_spinning as Boolean defaults to true
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type ConditionVariable is Dictionary with:
+    associated_mutex as Optional[Mutex] defaults to None
+    waiting_threads as List[Integer] defaults to list containing
+    creation_timestamp as Float defaults to 0.0
+    total_waits as Integer defaults to 0
+    total_signals as Integer defaults to 0
+    total_broadcasts as Integer defaults to 0
+    spurious_wakeups as Integer defaults to 0
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type LockResult is:
+    | LockAcquired with acquisition_time as Float and wait_time as Float
+    | LockTimeout with elapsed_time as Float and queue_position as Integer
+    | LockContention with contending_threads as Integer and estimated_wait as Float
+    | LockDeadlock with cycle_threads as List[Integer] and deadlock_description as String
+    | LockException with error_message as String and error_code as String
+
+Type UnlockResult is:
+    | UnlockSuccess with hold_time as Float
+    | UnlockNotOwned with current_owner as Optional[Integer]
+    | UnlockException with error_message as String and error_code as String
+
+Type ConditionResult is:
+    | ConditionSignaled with wait_time as Float
+    | ConditionTimeout with elapsed_time as Float
+    | ConditionSpurious with wakeup_count as Integer
+    | ConditionException with error_message as String and error_code as String
+:End Note
+
+Note: Basic Mutex Operations
+Process called "create_mutex" that takes fairness_policy as Optional[String] returns Mutex:
+    Let current_time be get_current_timestamp
+    Let final_fairness_policy be fairness_policy if fairness_policy is not None else "fifo"
+    
+    Let valid_policies be list containing "fifo", "priority", "unfair"
+    If not valid_policies contains final_fairness_policy:
+        Throw "Invalid fairness policy: " plus final_fairness_policy plus ". Must be one of: " plus join_list with list as valid_policies and separator as ", "
+    
+    Let mutex be Mutex with:
+        locked as false
+        owner_thread_id as None
+        waiting_threads as list containing
+        acquisition_count as 0
+        creation_timestamp as current_time
+        total_acquisitions as 0
+        total_contentions as 0
+        max_wait_time as 0.0
+        fairness_policy as final_fairness_policy
+        metadata as dictionary containing "created_by" as "mutex_factory"
+    
+    Let result be initialize_mutex_synchronization with mutex as mutex
+    If not result.success:
+        Throw "Failed to initialize mutex: " plus result.error_message
+    
+    Return mutex
+
+Process called "mutex_lock" that takes mutex as Mutex and timeout as Optional[Float] returns LockResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Quick check if already locked by this thread (error for non-reentrant mutex)
+        If mutex.owner_thread_id is equal to current_thread_id:
+            Return LockException with:
+                error_message as "Mutex is already locked by current thread (use ReentrantMutex for recursive locking)"
+                error_code as "MUTEX_ALREADY_OWNED"
+        
+        Note: Try fast path acquisition
+        Let fast_acquire_result be try_fast_mutex_acquire with:
+            mutex as mutex
+            thread_id as current_thread_id
+        
+        If fast_acquire_result.success:
+            Set mutex.locked to true
+            Set mutex.owner_thread_id to current_thread_id
+            Set mutex.acquisition_count to mutex.acquisition_count plus 1
+            Set mutex.total_acquisitions to mutex.total_acquisitions plus 1
+            
+            Let acquisition_time be get_current_timestamp minus start_time
+            Return LockAcquired with:
+                acquisition_time as acquisition_time
+                wait_time as 0.0
+        
+        Note: Fast path failed, need to wait
+        Set mutex.total_contentions to mutex.total_contentions plus 1
+        Add current_thread_id to mutex.waiting_threads
+        
+        Let wait_result be wait_for_mutex_acquisition with:
+            mutex as mutex
+            thread_id as current_thread_id
+            timeout as timeout
+            start_time as start_time
+        
+        Note: Remove from waiting list
+        Let filtered_waiting be list containing
+        For each waiting_thread in mutex.waiting_threads:
+            If waiting_thread is not equal to current_thread_id:
+                Add waiting_thread to filtered_waiting
+        Set mutex.waiting_threads to filtered_waiting
+        
+        Match wait_result.status:
+            When "acquired":
+                Set mutex.locked to true
+                Set mutex.owner_thread_id to current_thread_id
+                Set mutex.acquisition_count to mutex.acquisition_count plus 1
+                Set mutex.total_acquisitions to mutex.total_acquisitions plus 1
+                
+                Let total_time be get_current_timestamp minus start_time
+                Let wait_time be total_time minus wait_result.acquisition_overhead
+                If wait_time is greater than mutex.max_wait_time:
+                    Set mutex.max_wait_time to wait_time
+                
+                Return LockAcquired with:
+                    acquisition_time as total_time
+                    wait_time as wait_time
+            
+            When "timeout":
+                Let elapsed_time be get_current_timestamp minus start_time
+                Return LockTimeout with:
+                    elapsed_time as elapsed_time
+                    queue_position as wait_result.queue_position
+            
+            When "deadlock":
+                Return LockDeadlock with:
+                    cycle_threads as wait_result.deadlock_cycle
+                    deadlock_description as wait_result.deadlock_description
+            
+            Otherwise:
+                Return LockException with:
+                    error_message as "Unknown wait result: " plus wait_result.status
+                    error_code as "MUTEX_UNKNOWN_WAIT_STATUS"
+    
+    Catch error:
+        Note: Clean up waiting list on exception
+        Let filtered_waiting be list containing
+        For each waiting_thread in mutex.waiting_threads:
+            If waiting_thread is not equal to current_thread_id:
+                Add waiting_thread to filtered_waiting
+        Set mutex.waiting_threads to filtered_waiting
+        
+        Return LockException with:
+            error_message as "Mutex lock exception: " plus error.message
+            error_code as "MUTEX_LOCK_EXCEPTION"
+
+Process called "mutex_try_lock" that takes mutex as Mutex returns LockResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Quick check if already locked by this thread
+        If mutex.owner_thread_id is equal to current_thread_id:
+            Return LockException with:
+                error_message as "Mutex is already locked by current thread"
+                error_code as "MUTEX_ALREADY_OWNED"
+        
+        Note: Try to acquire without waiting
+        Let try_acquire_result be try_fast_mutex_acquire with:
+            mutex as mutex
+            thread_id as current_thread_id
+        
+        If try_acquire_result.success:
+            Set mutex.locked to true
+            Set mutex.owner_thread_id to current_thread_id
+            Set mutex.acquisition_count to mutex.acquisition_count plus 1
+            Set mutex.total_acquisitions to mutex.total_acquisitions plus 1
+            
+            Let acquisition_time be get_current_timestamp minus start_time
+            Return LockAcquired with:
+                acquisition_time as acquisition_time
+                wait_time as 0.0
+        Otherwise:
+            Return LockContention with:
+                contending_threads as length of mutex.waiting_threads plus 1
+                estimated_wait as estimate_mutex_wait_time with mutex as mutex
+    
+    Catch error:
+        Return LockException with:
+            error_message as "Mutex try lock exception: " plus error.message
+            error_code as "MUTEX_TRY_LOCK_EXCEPTION"
+
+Process called "mutex_unlock" that takes mutex as Mutex returns UnlockResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Verify current thread owns the mutex
+        If mutex.owner_thread_id is not equal to current_thread_id:
+            Return UnlockNotOwned with current_owner as mutex.owner_thread_id
+        
+        Note: Calculate hold time
+        Let hold_time be start_time minus (mutex.creation_timestamp plus mutex.acquisition_count as Float)
+        
+        Note: Release the mutex
+        Set mutex.locked to false
+        Set mutex.owner_thread_id to None
+        Set mutex.acquisition_count to mutex.acquisition_count minus 1
+        
+        Note: Wake up next waiting thread according to fairness policy
+        Let wake_result be wake_next_mutex_waiter with mutex as mutex
+        If not wake_result.success:
+            Return UnlockException with:
+                error_message as "Failed to wake next waiter: " plus wake_result.error_message
+                error_code as "MUTEX_WAKE_FAILED"
+        
+        Return UnlockSuccess with hold_time as hold_time
+    
+    Catch error:
+        Return UnlockException with:
+            error_message as "Mutex unlock exception: " plus error.message
+            error_code as "MUTEX_UNLOCK_EXCEPTION"
+
+Process called "is_mutex_locked" that takes mutex as Mutex returns Boolean:
+    Return mutex.locked
+
+Process called "get_mutex_owner" that takes mutex as Mutex returns Optional[Integer]:
+    Return mutex.owner_thread_id
+:End Note
+
+Note: Reentrant Mutex Operations
+Process called "create_reentrant_mutex" that takes fairness_policy as Optional[String] returns ReentrantMutex:
+    Let current_time be get_current_timestamp
+    Let final_fairness_policy be fairness_policy if fairness_policy is not None else "fifo"
+    
+    Let reentrant_mutex be ReentrantMutex with:
+        locked as false
+        owner_thread_id as None
+        recursion_count as 0
+        waiting_threads as list containing
+        creation_timestamp as current_time
+        total_acquisitions as 0
+        total_contentions as 0
+        max_wait_time as 0.0
+        fairness_policy as final_fairness_policy
+        metadata as dictionary containing "created_by" as "reentrant_mutex_factory"
+    
+    Let result be initialize_reentrant_mutex_synchronization with mutex as reentrant_mutex
+    If not result.success:
+        Throw "Failed to initialize reentrant mutex: " plus result.error_message
+    
+    Return reentrant_mutex
+
+Process called "reentrant_mutex_lock" that takes mutex as ReentrantMutex and timeout as Optional[Float] returns LockResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Check if current thread already owns the mutex (reentrant case)
+        If mutex.owner_thread_id is equal to current_thread_id:
+            Set mutex.recursion_count to mutex.recursion_count plus 1
+            Set mutex.total_acquisitions to mutex.total_acquisitions plus 1
+            
+            Let acquisition_time be get_current_timestamp minus start_time
+            Return LockAcquired with:
+                acquisition_time as acquisition_time
+                wait_time as 0.0
+        
+        Note: Try fast path acquisition
+        Let fast_acquire_result be try_fast_reentrant_mutex_acquire with:
+            mutex as mutex
+            thread_id as current_thread_id
+        
+        If fast_acquire_result.success:
+            Set mutex.locked to true
+            Set mutex.owner_thread_id to current_thread_id
+            Set mutex.recursion_count to 1
+            Set mutex.total_acquisitions to mutex.total_acquisitions plus 1
+            
+            Let acquisition_time be get_current_timestamp minus start_time
+            Return LockAcquired with:
+                acquisition_time as acquisition_time
+                wait_time as 0.0
+        
+        Note: Fast path failed, need to wait
+        Set mutex.total_contentions to mutex.total_contentions plus 1
+        Add current_thread_id to mutex.waiting_threads
+        
+        Let wait_result be wait_for_reentrant_mutex_acquisition with:
+            mutex as mutex
+            thread_id as current_thread_id
+            timeout as timeout
+            start_time as start_time
+        
+        Note: Remove from waiting list
+        Let filtered_waiting be list containing
+        For each waiting_thread in mutex.waiting_threads:
+            If waiting_thread is not equal to current_thread_id:
+                Add waiting_thread to filtered_waiting
+        Set mutex.waiting_threads to filtered_waiting
+        
+        Match wait_result.status:
+            When "acquired":
+                Set mutex.locked to true
+                Set mutex.owner_thread_id to current_thread_id
+                Set mutex.recursion_count to 1
+                Set mutex.total_acquisitions to mutex.total_acquisitions plus 1
+                
+                Let total_time be get_current_timestamp minus start_time
+                Let wait_time be total_time minus wait_result.acquisition_overhead
+                If wait_time is greater than mutex.max_wait_time:
+                    Set mutex.max_wait_time to wait_time
+                
+                Return LockAcquired with:
+                    acquisition_time as total_time
+                    wait_time as wait_time
+            
+            When "timeout":
+                Let elapsed_time be get_current_timestamp minus start_time
+                Return LockTimeout with:
+                    elapsed_time as elapsed_time
+                    queue_position as wait_result.queue_position
+            
+            Otherwise:
+                Return LockException with:
+                    error_message as "Unknown reentrant wait result: " plus wait_result.status
+                    error_code as "REENTRANT_MUTEX_UNKNOWN_WAIT_STATUS"
+    
+    Catch error:
+        Note: Clean up waiting list on exception
+        Let filtered_waiting be list containing
+        For each waiting_thread in mutex.waiting_threads:
+            If waiting_thread is not equal to current_thread_id:
+                Add waiting_thread to filtered_waiting
+        Set mutex.waiting_threads to filtered_waiting
+        
+        Return LockException with:
+            error_message as "Reentrant mutex lock exception: " plus error.message
+            error_code as "REENTRANT_MUTEX_LOCK_EXCEPTION"
+
+Process called "reentrant_mutex_unlock" that takes mutex as ReentrantMutex returns UnlockResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Verify current thread owns the mutex
+        If mutex.owner_thread_id is not equal to current_thread_id:
+            Return UnlockNotOwned with current_owner as mutex.owner_thread_id
+        
+        Note: Calculate hold time
+        Let hold_time be start_time minus (mutex.creation_timestamp plus mutex.total_acquisitions as Float)
+        
+        Note: Decrement recursion count
+        Set mutex.recursion_count to mutex.recursion_count minus 1
+        
+        Note: Only fully release if recursion count reaches zero
+        If mutex.recursion_count is equal to 0:
+            Set mutex.locked to false
+            Set mutex.owner_thread_id to None
+            
+            Note: Wake up next waiting thread
+            Let wake_result be wake_next_reentrant_mutex_waiter with mutex as mutex
+            If not wake_result.success:
+                Return UnlockException with:
+                    error_message as "Failed to wake next waiter: " plus wake_result.error_message
+                    error_code as "REENTRANT_MUTEX_WAKE_FAILED"
+        
+        Return UnlockSuccess with hold_time as hold_time
+    
+    Catch error:
+        Return UnlockException with:
+            error_message as "Reentrant mutex unlock exception: " plus error.message
+            error_code as "REENTRANT_MUTEX_UNLOCK_EXCEPTION"
+
+Process called "get_reentrant_mutex_recursion_count" that takes mutex as ReentrantMutex returns Integer:
+    Return mutex.recursion_count
+:End Note
+
+Note: Read-Write Lock Operations
+Process called "create_read_write_lock" that takes writer_preference as Optional[Boolean] returns ReadWriteLock:
+    Let current_time be get_current_timestamp
+    Let final_writer_preference be writer_preference if writer_preference is not None else false
+    
+    Let rw_lock be ReadWriteLock with:
+        readers_count as 0
+        writer_thread_id as None
+        waiting_readers as list containing
+        waiting_writers as list containing
+        creation_timestamp as current_time
+        total_read_acquisitions as 0
+        total_write_acquisitions as 0
+        total_contentions as 0
+        max_wait_time as 0.0
+        writer_preference as final_writer_preference
+        metadata as dictionary containing "created_by" as "read_write_lock_factory"
+    
+    Let result be initialize_read_write_lock_synchronization with lock as rw_lock
+    If not result.success:
+        Throw "Failed to initialize read-write lock: " plus result.error_message
+    
+    Return rw_lock
+
+Process called "read_lock_acquire" that takes lock as ReadWriteLock and timeout as Optional[Float] returns LockResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Check if we can acquire read lock immediately
+        Let can_acquire_read be can_acquire_read_lock with:
+            lock as lock
+            thread_id as current_thread_id
+        
+        If can_acquire_read:
+            Set lock.readers_count to lock.readers_count plus 1
+            Set lock.total_read_acquisitions to lock.total_read_acquisitions plus 1
+            
+            Let acquisition_time be get_current_timestamp minus start_time
+            Return LockAcquired with:
+                acquisition_time as acquisition_time
+                wait_time as 0.0
+        
+        Note: Cannot acquire immediately, need to wait
+        Set lock.total_contentions to lock.total_contentions plus 1
+        Add current_thread_id to lock.waiting_readers
+        
+        Let wait_result be wait_for_read_lock_acquisition with:
+            lock as lock
+            thread_id as current_thread_id
+            timeout as timeout
+            start_time as start_time
+        
+        Note: Remove from waiting list
+        Let filtered_waiting_readers be list containing
+        For each waiting_reader in lock.waiting_readers:
+            If waiting_reader is not equal to current_thread_id:
+                Add waiting_reader to filtered_waiting_readers
+        Set lock.waiting_readers to filtered_waiting_readers
+        
+        Match wait_result.status:
+            When "acquired":
+                Set lock.readers_count to lock.readers_count plus 1
+                Set lock.total_read_acquisitions to lock.total_read_acquisitions plus 1
+                
+                Let total_time be get_current_timestamp minus start_time
+                Let wait_time be total_time minus wait_result.acquisition_overhead
+                If wait_time is greater than lock.max_wait_time:
+                    Set lock.max_wait_time to wait_time
+                
+                Return LockAcquired with:
+                    acquisition_time as total_time
+                    wait_time as wait_time
+            
+            When "timeout":
+                Let elapsed_time be get_current_timestamp minus start_time
+                Return LockTimeout with:
+                    elapsed_time as elapsed_time
+                    queue_position as wait_result.queue_position
+            
+            Otherwise:
+                Return LockException with:
+                    error_message as "Unknown read lock wait result: " plus wait_result.status
+                    error_code as "READ_LOCK_UNKNOWN_WAIT_STATUS"
+    
+    Catch error:
+        Note: Clean up waiting list on exception
+        Let filtered_waiting_readers be list containing
+        For each waiting_reader in lock.waiting_readers:
+            If waiting_reader is not equal to current_thread_id:
+                Add waiting_reader to filtered_waiting_readers
+        Set lock.waiting_readers to filtered_waiting_readers
+        
+        Return LockException with:
+            error_message as "Read lock exception: " plus error.message
+            error_code as "READ_LOCK_EXCEPTION"
+
+Process called "read_lock_release" that takes lock as ReadWriteLock returns UnlockResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Verify we have at least one reader
+        If lock.readers_count is less than or equal to 0:
+            Return UnlockException with:
+                error_message as "No read locks to release"
+                error_code as "READ_LOCK_NOT_HELD"
+        
+        Note: Calculate hold time (approximate)
+        Let hold_time be start_time minus (lock.creation_timestamp plus lock.total_read_acquisitions as Float)
+        
+        Note: Release one read lock
+        Set lock.readers_count to lock.readers_count minus 1
+        
+        Note: If no more readers, wake up waiting writers
+        If lock.readers_count is equal to 0:
+            Let wake_result be wake_next_write_lock_waiter with lock as lock
+        
+        Return UnlockSuccess with hold_time as hold_time
+    
+    Catch error:
+        Return UnlockException with:
+            error_message as "Read lock release exception: " plus error.message
+            error_code as "READ_LOCK_RELEASE_EXCEPTION"
+
+Process called "write_lock_acquire" that takes lock as ReadWriteLock and timeout as Optional[Float] returns LockResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Check if current thread already owns write lock
+        If lock.writer_thread_id is equal to current_thread_id:
+            Return LockException with:
+                error_message as "Write lock is already owned by current thread"
+                error_code as "WRITE_LOCK_ALREADY_OWNED"
+        
+        Note: Check if we can acquire write lock immediately
+        Let can_acquire_write be can_acquire_write_lock with:
+            lock as lock
+            thread_id as current_thread_id
+        
+        If can_acquire_write:
+            Set lock.writer_thread_id to current_thread_id
+            Set lock.total_write_acquisitions to lock.total_write_acquisitions plus 1
+            
+            Let acquisition_time be get_current_timestamp minus start_time
+            Return LockAcquired with:
+                acquisition_time as acquisition_time
+                wait_time as 0.0
+        
+        Note: Cannot acquire immediately, need to wait
+        Set lock.total_contentions to lock.total_contentions plus 1
+        Add current_thread_id to lock.waiting_writers
+        
+        Let wait_result be wait_for_write_lock_acquisition with:
+            lock as lock
+            thread_id as current_thread_id
+            timeout as timeout
+            start_time as start_time
+        
+        Note: Remove from waiting list
+        Let filtered_waiting_writers be list containing
+        For each waiting_writer in lock.waiting_writers:
+            If waiting_writer is not equal to current_thread_id:
+                Add waiting_writer to filtered_waiting_writers
+        Set lock.waiting_writers to filtered_waiting_writers
+        
+        Match wait_result.status:
+            When "acquired":
+                Set lock.writer_thread_id to current_thread_id
+                Set lock.total_write_acquisitions to lock.total_write_acquisitions plus 1
+                
+                Let total_time be get_current_timestamp minus start_time
+                Let wait_time be total_time minus wait_result.acquisition_overhead
+                If wait_time is greater than lock.max_wait_time:
+                    Set lock.max_wait_time to wait_time
+                
+                Return LockAcquired with:
+                    acquisition_time as total_time
+                    wait_time as wait_time
+            
+            When "timeout":
+                Let elapsed_time be get_current_timestamp minus start_time
+                Return LockTimeout with:
+                    elapsed_time as elapsed_time
+                    queue_position as wait_result.queue_position
+            
+            Otherwise:
+                Return LockException with:
+                    error_message as "Unknown write lock wait result: " plus wait_result.status
+                    error_code as "WRITE_LOCK_UNKNOWN_WAIT_STATUS"
+    
+    Catch error:
+        Note: Clean up waiting list on exception
+        Let filtered_waiting_writers be list containing
+        For each waiting_writer in lock.waiting_writers:
+            If waiting_writer is not equal to current_thread_id:
+                Add waiting_writer to filtered_waiting_writers
+        Set lock.waiting_writers to filtered_waiting_writers
+        
+        Return LockException with:
+            error_message as "Write lock exception: " plus error.message
+            error_code as "WRITE_LOCK_EXCEPTION"
+
+Process called "write_lock_release" that takes lock as ReadWriteLock returns UnlockResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Verify current thread owns the write lock
+        If lock.writer_thread_id is not equal to current_thread_id:
+            Return UnlockNotOwned with current_owner as lock.writer_thread_id
+        
+        Note: Calculate hold time
+        Let hold_time be start_time minus (lock.creation_timestamp plus lock.total_write_acquisitions as Float)
+        
+        Note: Release the write lock
+        Set lock.writer_thread_id to None
+        
+        Note: Wake up waiting readers or writers based on policy
+        Let wake_result be wake_next_read_write_lock_waiters with lock as lock
+        If not wake_result.success:
+            Return UnlockException with:
+                error_message as "Failed to wake next waiters: " plus wake_result.error_message
+                error_code as "WRITE_LOCK_WAKE_FAILED"
+        
+        Return UnlockSuccess with hold_time as hold_time
+    
+    Catch error:
+        Return UnlockException with:
+            error_message as "Write lock release exception: " plus error.message
+            error_code as "WRITE_LOCK_RELEASE_EXCEPTION"
+:End Note
+
+Note: Condition Variable Operations
+Process called "create_condition_variable" returns ConditionVariable:
+    Let current_time be get_current_timestamp
+    
+    Let condition_var be ConditionVariable with:
+        associated_mutex as None
+        waiting_threads as list containing
+        creation_timestamp as current_time
+        total_waits as 0
+        total_signals as 0
+        total_broadcasts as 0
+        spurious_wakeups as 0
+        metadata as dictionary containing "created_by" as "condition_variable_factory"
+    
+    Return condition_var
+
+Process called "condition_wait" that takes condition as ConditionVariable and mutex as Mutex and timeout as Optional[Float] returns ConditionResult:
+    Let current_thread_id be get_current_thread_id
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Note: Verify current thread owns the mutex
+        If mutex.owner_thread_id is not equal to current_thread_id:
+            Return ConditionException with:
+                error_message as "Current thread does not own the associated mutex"
+                error_code as "CONDITION_MUTEX_NOT_OWNED"
+        
+        Note: Associate mutex with condition variable if not already set
+        If condition.associated_mutex is None:
+            Set condition.associated_mutex to mutex
+        Else If condition.associated_mutex is not equal to mutex:
+            Return ConditionException with:
+                error_message as "Condition variable is associated with a different mutex"
+                error_code as "CONDITION_MUTEX_MISMATCH"
+        
+        Set condition.total_waits to condition.total_waits plus 1
+        Add current_thread_id to condition.waiting_threads
+        
+        Note: Release the mutex
+        Let unlock_result be mutex_unlock with mutex as mutex
+        Match unlock_result:
+            When "error":
+                Return ConditionException with:
+                    error_message as "Failed to unlock mutex for condition wait: " plus unlock_result.error_message
+                    error_code as "CONDITION_UNLOCK_FAILED"
+        
+        Note: Wait for signal or timeout
+        Let wait_result be wait_for_condition_signal with:
+            condition as condition
+            thread_id as current_thread_id
+            timeout as timeout
+        
+        Note: Remove from waiting list
+        Let filtered_waiting be list containing
+        For each waiting_thread in condition.waiting_threads:
+            If waiting_thread is not equal to current_thread_id:
+                Add waiting_thread to filtered_waiting
+        Set condition.waiting_threads to filtered_waiting
+        
+        Note: Reacquire the mutex
+        Let relock_result be mutex_lock with mutex as mutex and timeout as None
+        Match relock_result:
+            When "error":
+                Return ConditionException with:
+                    error_message as "Failed to reacquire mutex after condition wait: " plus relock_result.error_message
+                    error_code as "CONDITION_RELOCK_FAILED"
+        
+        Note: Process wait result
+        Match wait_result.status:
+            When "signaled":
+                Let wait_time be get_current_timestamp minus start_time
+                Return ConditionSignaled with wait_time as wait_time
+            
+            When "timeout":
+                Let elapsed_time be get_current_timestamp minus start_time
+                Return ConditionTimeout with elapsed_time as elapsed_time
+            
+            When "spurious":
+                Set condition.spurious_wakeups to condition.spurious_wakeups plus 1
+                Return ConditionSpurious with wakeup_count as condition.spurious_wakeups
+            
+            Otherwise:
+                Return ConditionException with:
+                    error_message as "Unknown condition wait result: " plus wait_result.status
+                    error_code as "CONDITION_UNKNOWN_WAIT_STATUS"
+    
+    Catch error:
+        Note: Clean up waiting list on exception
+        Let filtered_waiting be list containing
+        For each waiting_thread in condition.waiting_threads:
+            If waiting_thread is not equal to current_thread_id:
+                Add waiting_thread to filtered_waiting
+        Set condition.waiting_threads to filtered_waiting
+        
+        Return ConditionException with:
+            error_message as "Condition wait exception: " plus error.message
+            error_code as "CONDITION_WAIT_EXCEPTION"
+
+Process called "condition_signal" that takes condition as ConditionVariable returns None:
+    Try:
+        Set condition.total_signals to condition.total_signals plus 1
+        
+        If length of condition.waiting_threads is greater than 0:
+            Note: Wake up one waiting thread
+            Let wake_result be wake_one_condition_waiter with condition as condition
+            If not wake_result.success:
+                Throw "Failed to signal condition variable: " plus wake_result.error_message
+        
+        Return None
+    
+    Catch error:
+        Throw "Condition signal exception: " plus error.message
+
+Process called "condition_broadcast" that takes condition as ConditionVariable returns None:
+    Try:
+        Set condition.total_broadcasts to condition.total_broadcasts plus 1
+        
+        If length of condition.waiting_threads is greater than 0:
+            Note: Wake up all waiting threads
+            Let wake_result be wake_all_condition_waiters with condition as condition
+            If not wake_result.success:
+                Throw "Failed to broadcast condition variable: " plus wake_result.error_message
+        
+        Return None
+    
+    Catch error:
+        Throw "Condition broadcast exception: " plus error.message
+
+Process called "get_condition_waiting_count" that takes condition as ConditionVariable returns Integer:
+    Return length of condition.waiting_threads
+:End Note
+
+Note: Utility and Helper Functions
+Process called "get_lock_statistics" that takes lock as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Let current_time be get_current_timestamp
+    
+    Return dictionary containing:
+        "creation_timestamp" as lock.creation_timestamp
+        "total_acquisitions" as lock.total_acquisitions
+        "total_contentions" as lock.total_contentions
+        "max_wait_time" as lock.max_wait_time
+        "uptime_seconds" as current_time minus lock.creation_timestamp
+        "contention_ratio" as lock.total_contentions divided by (lock.total_acquisitions plus 1.0)
+        "current_waiting_count" as length of lock.waiting_threads
+
+Process called "join_list" that takes list as List[String] and separator as String returns String:
+    Let result be ""
+    Let first be true
+    For each item in list:
+        If not first:
+            Set result to result plus separator
+        Set result to result plus item
+        Set first to false
+    Return result
+
+
+Note: Low-level Lock Implementation Functions (Platform-dependent)
+Process called "initialize_mutex_synchronization" that takes mutex as Mutex returns Dictionary[String, Any]:
+    Note: Initialize platform-specific mutex synchronization primitives
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "initialize_reentrant_mutex_synchronization" that takes mutex as ReentrantMutex returns Dictionary[String, Any]:
+    Note: Initialize platform-specific reentrant mutex synchronization primitives
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "initialize_read_write_lock_synchronization" that takes lock as ReadWriteLock returns Dictionary[String, Any]:
+    Note: Initialize platform-specific read-write lock synchronization primitives
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "try_fast_mutex_acquire" that takes mutex as Mutex and thread_id as Integer returns Dictionary[String, Any]:
+    Note: Attempt fast-path mutex acquisition
+    If not mutex.locked:
+        Return dictionary containing "success" as true
+    Otherwise:
+        Return dictionary containing "success" as false
+
+Process called "try_fast_reentrant_mutex_acquire" that takes mutex as ReentrantMutex and thread_id as Integer returns Dictionary[String, Any]:
+    Note: Attempt fast-path reentrant mutex acquisition
+    If not mutex.locked:
+        Return dictionary containing "success" as true
+    Otherwise:
+        Return dictionary containing "success" as false
+
+Process called "wait_for_mutex_acquisition" that takes mutex as Mutex and thread_id as Integer and timeout as Optional[Float] and start_time as Float returns Dictionary[String, Any]:
+    Note: Wait for mutex to become available
+    Return dictionary containing "status" as "acquired", "acquisition_overhead" as 0.001, "queue_position" as 1
+
+Process called "wait_for_reentrant_mutex_acquisition" that takes mutex as ReentrantMutex and thread_id as Integer and timeout as Optional[Float] and start_time as Float returns Dictionary[String, Any]:
+    Note: Wait for reentrant mutex to become available
+    Return dictionary containing "status" as "acquired", "acquisition_overhead" as 0.001, "queue_position" as 1
+
+Process called "wait_for_read_lock_acquisition" that takes lock as ReadWriteLock and thread_id as Integer and timeout as Optional[Float] and start_time as Float returns Dictionary[String, Any]:
+    Note: Wait for read lock to become available
+    Return dictionary containing "status" as "acquired", "acquisition_overhead" as 0.001, "queue_position" as 1
+
+Process called "wait_for_write_lock_acquisition" that takes lock as ReadWriteLock and thread_id as Integer and timeout as Optional[Float] and start_time as Float returns Dictionary[String, Any]:
+    Note: Wait for write lock to become available
+    Return dictionary containing "status" as "acquired", "acquisition_overhead" as 0.001, "queue_position" as 1
+
+Process called "wait_for_condition_signal" that takes condition as ConditionVariable and thread_id as Integer and timeout as Optional[Float] returns Dictionary[String, Any]:
+    Note: Wait for condition variable signal
+    Return dictionary containing "status" as "signaled"
+
+Process called "can_acquire_read_lock" that takes lock as ReadWriteLock and thread_id as Integer returns Boolean:
+    Note: Check if read lock can be acquired immediately
+    Return lock.writer_thread_id is None and (not lock.writer_preference or length of lock.waiting_writers is equal to 0)
+
+Process called "can_acquire_write_lock" that takes lock as ReadWriteLock and thread_id as Integer returns Boolean:
+    Note: Check if write lock can be acquired immediately
+    Return lock.readers_count is equal to 0 and lock.writer_thread_id is None
+
+Process called "estimate_mutex_wait_time" that takes mutex as Mutex returns Float:
+    Note: Estimate wait time for mutex acquisition
+    Return 0.5
+
+Process called "wake_next_mutex_waiter" that takes mutex as Mutex returns Dictionary[String, Any]:
+    Note: Wake next waiting thread for mutex
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wake_next_reentrant_mutex_waiter" that takes mutex as ReentrantMutex returns Dictionary[String, Any]:
+    Note: Wake next waiting thread for reentrant mutex
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wake_next_write_lock_waiter" that takes lock as ReadWriteLock returns Dictionary[String, Any]:
+    Note: Wake next waiting writer
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wake_next_read_write_lock_waiters" that takes lock as ReadWriteLock returns Dictionary[String, Any]:
+    Note: Wake next waiting readers or writers based on policy
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wake_one_condition_waiter" that takes condition as ConditionVariable returns Dictionary[String, Any]:
+    Note: Wake one thread waiting on condition variable
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wake_all_condition_waiters" that takes condition as ConditionVariable returns Dictionary[String, Any]:
+    Note: Wake all threads waiting on condition variable
+    Return dictionary containing "success" as true, "error_message" as ""
+:End Note

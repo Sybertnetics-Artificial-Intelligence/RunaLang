@@ -3558,4 +3558,55 @@ Bracket indexing is concise and idiomatic for programmatic code. For natural lan
 
 Note: Runa supports both natural language syntax (e.g., "the name of user") and dot notation (e.g., user.name) for field access. Natural language is recommended for basic/intermediate examples, while dot notation is preferred for advanced/backend development.
 
-</rewritten_file>
+## Context Management Protocol (Standard Library)
+
+Runa supports robust, idiomatic context management for both synchronous and asynchronous resources via the following protocols:
+
+```runa
+Protocol ContextManager defines:
+    Process called "enter_context" returns Any
+    Process called "exit_context" returns None
+
+Protocol AsyncContextManager defines:
+    Async Process called "enter_async_context" returns Any
+    Async Process called "exit_async_context" returns None
+```
+
+Any type implementing these protocols can be used with the `With` statement for resource management. For asynchronous context management, use an `Async:` block with `With` inside.
+
+### Example: Synchronous Lock Context
+```runa
+Let lock be create_lock
+With enter_context with lock as lock_resource:
+    Note: Critical section
+    Display "Lock acquired!"
+    Let released be release_lock with lock as lock_resource
+```
+
+### Example: Asynchronous Lock Context
+```runa
+Async:
+    Let lock be create_lock
+    With enter_async_context with lock as lock_resource:
+        Note: Async critical section
+        Display "Async lock acquired!"
+        Let released be release_lock with lock as lock_resource
+```
+
+### Example: Using Helper Processes
+```runa
+With acquire_lock as lock:
+    Display "Lock acquired via helper!"
+
+Async:
+    With acquire_lock_async as lock:
+        Display "Async lock acquired via helper!"
+```
+
+#### Rationale
+- The protocol is extensible: any user-defined type can implement `enter_context`/`exit_context` or their async variants.
+- This design matches the ergonomics of Python's `with`/`async with` and Rust's RAII/context traits, but is fully idiomatic to Runa.
+- For async context management, use `Async:` blocks with `With` inside, as `AsyncWith` is not yet a language keyword.
+- All error handling is explicit: if a resource cannot be acquired or released, an exception is thrown.
+
+See also: [Async Module Standard Library Documentation](../standard-library/async_module.md)

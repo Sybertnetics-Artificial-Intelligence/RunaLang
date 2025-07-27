@@ -695,3 +695,7 @@ index_expression ::= primary_expression '[' expression ']'
 # Let y be d["key"]
 
 # Bracket indexing is supported for lists, dictionaries, and other indexable types. It is equivalent to calling the appropriate process (e.g., get_at_index, get_value).
+
+Note:
+For asynchronous context management, use 'Async:' blocks with 'With' inside, as 'AsyncWith' is not yet a language keyword. See the context manager protocol in the standard library documentation for details and idiomatic usage.
+:End Note

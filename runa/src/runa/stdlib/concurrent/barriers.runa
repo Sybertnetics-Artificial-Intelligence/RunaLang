@@ -1,0 +1,738 @@
+Note:
+Runa Standard Library: Synchronization Barriers Module
+
+Provides synchronization barriers that allow multiple threads to coordinate and
+synchronize at specific points in their execution. Essential for parallel
+algorithms where threads must wait for each other before proceeding.
+
+Features:
+- Simple barriers for basic thread synchronization
+- Cyclic barriers that can be reused multiple times
+- Count-down latches for one-time synchronization events
+- Phaser barriers for multi-phase parallel computations
+- Timeout support for all barrier operations
+- Barrier state monitoring and debugging
+- Exception handling for broken barriers
+- Performance metrics and contention monitoring
+- Integration with Runa's actor model
+- Cross-platform barrier implementations
+
+Barrier Types:
+- Barrier: Basic barrier for fixed number of threads
+- CyclicBarrier: Reusable barrier with optional barrier action
+- CountDownLatch: One-time countdown synchronization primitive
+- Phaser: Advanced multi-phase barrier for complex algorithms
+
+Thread Safety: All barrier operations are thread-safe and designed
+for concurrent access by multiple threads.
+:End Note
+
+Import "stdlib/concurrent/atomic" as atomic
+
+Note: Core Barrier Types
+Type Barrier is Dictionary with:
+    parties as Integer
+    waiting_count as Integer defaults to 0
+    generation as Integer defaults to 0
+    broken as Boolean defaults to false
+    creation_timestamp as Float defaults to 0.0
+    total_waits as Integer defaults to 0
+    timeout_count as Integer defaults to 0
+    barrier_action as Optional[String] defaults to None
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type CyclicBarrier is Dictionary with:
+    parties as Integer
+    waiting_count as Integer defaults to 0
+    generation as Integer defaults to 0
+    broken as Boolean defaults to false
+    barrier_action as Optional[String] defaults to None
+    creation_timestamp as Float defaults to 0.0
+    total_cycles as Integer defaults to 0
+    timeout_count as Integer defaults to 0
+    last_action_duration as Float defaults to 0.0
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type CountDownLatch is Dictionary with:
+    initial_count as Integer
+    current_count as Integer
+    creation_timestamp as Float defaults to 0.0
+    completed as Boolean defaults to false
+    total_waits as Integer defaults to 0
+    timeout_count as Integer defaults to 0
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type Phaser is Dictionary with:
+    phase as Integer defaults to 0
+    parties as Integer
+    unarrived as Integer
+    registered_parties as Integer
+    terminated as Boolean defaults to false
+    creation_timestamp as Float defaults to 0.0
+    total_phases as Integer defaults to 0
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type BarrierResult is:
+    | BarrierSuccess with generation as Integer and index as Integer and elapsed_time as Float
+    | BarrierTimeout with elapsed_time as Float and waiting_threads as Integer
+    | BarrierBroken with error_message as String and generation as Integer
+    | BarrierException with error_message as String and error_code as String
+
+Type LatchResult is:
+    | LatchSuccess with elapsed_time as Float
+    | LatchTimeout with elapsed_time as Float and remaining_count as Integer
+    | LatchException with error_message as String and error_code as String
+
+Type PhaserResult is:
+    | PhaserSuccess with phase as Integer and arrived_parties as Integer
+    | PhaserTimeout with phase as Integer and elapsed_time as Float
+    | PhaserTerminated with final_phase as Integer
+    | PhaserException with error_message as String and error_code as String
+:End Note
+
+Note: Simple Barrier Operations
+Process called "create_barrier" that takes parties as Integer and barrier_action as Optional[String] returns Barrier:
+    If parties is less than or equal to 0:
+        Throw "Barrier parties must be positive, got: " plus parties as String
+    
+    Let current_time be get_current_timestamp
+    
+    Let barrier be Barrier with:
+        parties as parties
+        waiting_count as 0
+        generation as 0
+        broken as false
+        creation_timestamp as current_time
+        total_waits as 0
+        timeout_count as 0
+        barrier_action as barrier_action
+        metadata as dictionary containing "created_by" as "barrier_factory"
+    
+    Let result be initialize_barrier_synchronization with barrier as barrier
+    If not result.success:
+        Throw "Failed to initialize barrier: " plus result.error_message
+    
+    Return barrier
+
+Process called "await_barrier" that takes barrier as Barrier and timeout as Optional[Float] returns BarrierResult:
+    If barrier.broken:
+        Return BarrierBroken with:
+            error_message as "Barrier is broken"
+            generation as barrier.generation
+    
+    Let start_time be get_current_timestamp
+    Let current_generation be barrier.generation
+    
+    Try:
+        Note: Atomically increment waiting count
+        Let result be atomic_increment_barrier_waiting with barrier as barrier
+        If not result.success:
+            Return BarrierException with:
+                error_message as "Failed to increment waiting count"
+                error_code as "BARRIER_INCREMENT_FAILED"
+        
+        Set barrier.total_waits to barrier.total_waits plus 1
+        
+        Note: Check if this is the last thread to arrive
+        If barrier.waiting_count is equal to barrier.parties:
+            Note: This thread triggers the barrier
+            Let action_result be execute_barrier_action with barrier as barrier
+            If not action_result.success:
+                Set barrier.broken to true
+                Let wake_result be wake_all_barrier_waiters with barrier as barrier
+                Return BarrierBroken with:
+                    error_message as "Barrier action failed: " plus action_result.error_message
+                    generation as current_generation
+            
+            Note: Reset for next cycle and wake all waiting threads
+            Set barrier.waiting_count to 0
+            Set barrier.generation to barrier.generation plus 1
+            Let wake_result be wake_all_barrier_waiters with barrier as barrier
+            
+            Let elapsed_time be get_current_timestamp minus start_time
+            Return BarrierSuccess with:
+                generation as current_generation
+                index as barrier.parties minus 1  Note: Last to arrive gets highest index
+                elapsed_time as elapsed_time
+        Otherwise:
+            Note: Wait for other threads
+            Let wait_result be wait_on_barrier with:
+                barrier as barrier
+                generation as current_generation
+                timeout as timeout
+            
+            Match wait_result.status:
+                When "success":
+                    Let elapsed_time be get_current_timestamp minus start_time
+                    Return BarrierSuccess with:
+                        generation as wait_result.generation
+                        index as wait_result.arrival_index
+                        elapsed_time as elapsed_time
+                
+                When "timeout":
+                    Set barrier.timeout_count to barrier.timeout_count plus 1
+                    Let elapsed_time be get_current_timestamp minus start_time
+                    Return BarrierTimeout with:
+                        elapsed_time as elapsed_time
+                        waiting_threads as barrier.waiting_count
+                
+                When "broken":
+                    Return BarrierBroken with:
+                        error_message as wait_result.error_message
+                        generation as current_generation
+                
+                Otherwise:
+                    Return BarrierException with:
+                        error_message as "Unknown wait result: " plus wait_result.status
+                        error_code as "BARRIER_UNKNOWN_STATUS"
+    
+    Catch error:
+        Set barrier.broken to true
+        Let wake_result be wake_all_barrier_waiters with barrier as barrier
+        Return BarrierException with:
+            error_message as "Barrier await exception: " plus error.message
+            error_code as "BARRIER_AWAIT_EXCEPTION"
+
+Process called "reset_barrier" that takes barrier as Barrier returns None:
+    Try:
+        Set barrier.broken to true
+        Let wake_result be wake_all_barrier_waiters with barrier as barrier
+        
+        Note: Wait for all threads to exit current barrier
+        Let drain_result be drain_barrier_waiters with barrier as barrier
+        If not drain_result.success:
+            Throw "Failed to drain barrier waiters: " plus drain_result.error_message
+        
+        Note: Reset barrier state
+        Set barrier.waiting_count to 0
+        Set barrier.generation to barrier.generation plus 1
+        Set barrier.broken to false
+        
+        Return None
+    
+    Catch error:
+        Throw "Failed to reset barrier: " plus error.message
+
+Process called "is_barrier_broken" that takes barrier as Barrier returns Boolean:
+    Return barrier.broken
+
+Process called "get_barrier_parties" that takes barrier as Barrier returns Integer:
+    Return barrier.parties
+
+Process called "get_barrier_waiting_count" that takes barrier as Barrier returns Integer:
+    Return barrier.waiting_count
+:End Note
+
+Note: Cyclic Barrier Operations
+Process called "create_cyclic_barrier" that takes parties as Integer and barrier_action as Optional[String] returns CyclicBarrier:
+    If parties is less than or equal to 0:
+        Throw "Cyclic barrier parties must be positive, got: " plus parties as String
+    
+    Let current_time be get_current_timestamp
+    
+    Let cyclic_barrier be CyclicBarrier with:
+        parties as parties
+        waiting_count as 0
+        generation as 0
+        broken as false
+        barrier_action as barrier_action
+        creation_timestamp as current_time
+        total_cycles as 0
+        timeout_count as 0
+        last_action_duration as 0.0
+        metadata as dictionary containing "created_by" as "cyclic_barrier_factory"
+    
+    Let result be initialize_cyclic_barrier_synchronization with barrier as cyclic_barrier
+    If not result.success:
+        Throw "Failed to initialize cyclic barrier: " plus result.error_message
+    
+    Return cyclic_barrier
+
+Process called "await_cyclic_barrier" that takes barrier as CyclicBarrier and timeout as Optional[Float] returns BarrierResult:
+    If barrier.broken:
+        Return BarrierBroken with:
+            error_message as "Cyclic barrier is broken"
+            generation as barrier.generation
+    
+    Let start_time be get_current_timestamp
+    Let current_generation be barrier.generation
+    
+    Try:
+        Note: Atomically increment waiting count
+        Let result be atomic_increment_cyclic_barrier_waiting with barrier as barrier
+        If not result.success:
+            Return BarrierException with:
+                error_message as "Failed to increment cyclic barrier waiting count"
+                error_code as "CYCLIC_BARRIER_INCREMENT_FAILED"
+        
+        Note: Check if this is the last thread to arrive
+        If barrier.waiting_count is equal to barrier.parties:
+            Note: This thread triggers the barrier
+            Let action_start_time be get_current_timestamp
+            Let action_result be execute_cyclic_barrier_action with barrier as barrier
+            Let action_end_time be get_current_timestamp
+            Set barrier.last_action_duration to action_end_time minus action_start_time
+            
+            If not action_result.success:
+                Set barrier.broken to true
+                Let wake_result be wake_all_cyclic_barrier_waiters with barrier as barrier
+                Return BarrierBroken with:
+                    error_message as "Cyclic barrier action failed: " plus action_result.error_message
+                    generation as current_generation
+            
+            Note: Reset for next cycle and wake all waiting threads
+            Set barrier.waiting_count to 0
+            Set barrier.generation to barrier.generation plus 1
+            Set barrier.total_cycles to barrier.total_cycles plus 1
+            Let wake_result be wake_all_cyclic_barrier_waiters with barrier as barrier
+            
+            Let elapsed_time be get_current_timestamp minus start_time
+            Return BarrierSuccess with:
+                generation as current_generation
+                index as barrier.parties minus 1
+                elapsed_time as elapsed_time
+        Otherwise:
+            Note: Wait for other threads
+            Let wait_result be wait_on_cyclic_barrier with:
+                barrier as barrier
+                generation as current_generation
+                timeout as timeout
+            
+            Match wait_result.status:
+                When "success":
+                    Let elapsed_time be get_current_timestamp minus start_time
+                    Return BarrierSuccess with:
+                        generation as wait_result.generation
+                        index as wait_result.arrival_index
+                        elapsed_time as elapsed_time
+                
+                When "timeout":
+                    Set barrier.timeout_count to barrier.timeout_count plus 1
+                    Let elapsed_time be get_current_timestamp minus start_time
+                    Return BarrierTimeout with:
+                        elapsed_time as elapsed_time
+                        waiting_threads as barrier.waiting_count
+                
+                When "broken":
+                    Return BarrierBroken with:
+                        error_message as wait_result.error_message
+                        generation as current_generation
+                
+                Otherwise:
+                    Return BarrierException with:
+                        error_message as "Unknown cyclic wait result: " plus wait_result.status
+                        error_code as "CYCLIC_BARRIER_UNKNOWN_STATUS"
+    
+    Catch error:
+        Set barrier.broken to true
+        Let wake_result be wake_all_cyclic_barrier_waiters with barrier as barrier
+        Return BarrierException with:
+            error_message as "Cyclic barrier await exception: " plus error.message
+            error_code as "CYCLIC_BARRIER_AWAIT_EXCEPTION"
+
+Process called "reset_cyclic_barrier" that takes barrier as CyclicBarrier returns None:
+    Try:
+        Set barrier.broken to true
+        Let wake_result be wake_all_cyclic_barrier_waiters with barrier as barrier
+        
+        Note: Wait for all threads to exit current barrier
+        Let drain_result be drain_cyclic_barrier_waiters with barrier as barrier
+        If not drain_result.success:
+            Throw "Failed to drain cyclic barrier waiters: " plus drain_result.error_message
+        
+        Note: Reset barrier state
+        Set barrier.waiting_count to 0
+        Set barrier.generation to barrier.generation plus 1
+        Set barrier.broken to false
+        Set barrier.total_cycles to 0
+        Set barrier.last_action_duration to 0.0
+        
+        Return None
+    
+    Catch error:
+        Throw "Failed to reset cyclic barrier: " plus error.message
+
+Process called "get_cyclic_barrier_parties" that takes barrier as CyclicBarrier returns Integer:
+    Return barrier.parties
+
+Process called "get_cyclic_barrier_waiting_count" that takes barrier as CyclicBarrier returns Integer:
+    Return barrier.waiting_count
+
+Process called "is_cyclic_barrier_broken" that takes barrier as CyclicBarrier returns Boolean:
+    Return barrier.broken
+
+Process called "get_cyclic_barrier_cycles" that takes barrier as CyclicBarrier returns Integer:
+    Return barrier.total_cycles
+:End Note
+
+Note: Count-Down Latch Operations
+Process called "create_countdown_latch" that takes count as Integer returns CountDownLatch:
+    If count is less than 0:
+        Throw "CountDown latch count must be non-negative, got: " plus count as String
+    
+    Let current_time be get_current_timestamp
+    
+    Let latch be CountDownLatch with:
+        initial_count as count
+        current_count as count
+        creation_timestamp as current_time
+        completed as count is equal to 0
+        total_waits as 0
+        timeout_count as 0
+        metadata as dictionary containing "created_by" as "countdown_latch_factory"
+    
+    Let result be initialize_countdown_latch_synchronization with latch as latch
+    If not result.success:
+        Throw "Failed to initialize countdown latch: " plus result.error_message
+    
+    Return latch
+
+Process called "countdown_latch" that takes latch as CountDownLatch returns None:
+    If latch.current_count is less than or equal to 0:
+        Return None  Note: Already at zero, no-op
+    
+    Try:
+        Note: Atomically decrement count
+        Let result be atomic_decrement_latch_count with latch as latch
+        If not result.success:
+            Throw "Failed to decrement latch count: " plus result.error_message
+        
+        Note: Check if we've reached zero
+        If latch.current_count is equal to 0:
+            Set latch.completed to true
+            Let wake_result be wake_all_latch_waiters with latch as latch
+            If not wake_result.success:
+                Throw "Failed to wake latch waiters: " plus wake_result.error_message
+        
+        Return None
+    
+    Catch error:
+        Throw "Failed to count down latch: " plus error.message
+
+Process called "await_countdown_latch" that takes latch as CountDownLatch and timeout as Optional[Float] returns LatchResult:
+    If latch.completed:
+        Return LatchSuccess with elapsed_time as 0.0
+    
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Set latch.total_waits to latch.total_waits plus 1
+        
+        Let wait_result be wait_on_countdown_latch with:
+            latch as latch
+            timeout as timeout
+        
+        Match wait_result.status:
+            When "success":
+                Let elapsed_time be get_current_timestamp minus start_time
+                Return LatchSuccess with elapsed_time as elapsed_time
+            
+            When "timeout":
+                Set latch.timeout_count to latch.timeout_count plus 1
+                Let elapsed_time be get_current_timestamp minus start_time
+                Return LatchTimeout with:
+                    elapsed_time as elapsed_time
+                    remaining_count as latch.current_count
+            
+            Otherwise:
+                Return LatchException with:
+                    error_message as "Unknown latch wait result: " plus wait_result.status
+                    error_code as "LATCH_UNKNOWN_STATUS"
+    
+    Catch error:
+        Return LatchException with:
+            error_message as "Latch await exception: " plus error.message
+            error_code as "LATCH_AWAIT_EXCEPTION"
+
+Process called "get_countdown_latch_count" that takes latch as CountDownLatch returns Integer:
+    Return latch.current_count
+
+Process called "is_countdown_latch_completed" that takes latch as CountDownLatch returns Boolean:
+    Return latch.completed
+:End Note
+
+Note: Phaser Operations
+Process called "create_phaser" that takes parties as Integer returns Phaser:
+    If parties is less than 0:
+        Throw "Phaser parties must be non-negative, got: " plus parties as String
+    
+    Let current_time be get_current_timestamp
+    
+    Let phaser be Phaser with:
+        phase as 0
+        parties as parties
+        unarrived as parties
+        registered_parties as parties
+        terminated as false
+        creation_timestamp as current_time
+        total_phases as 0
+        metadata as dictionary containing "created_by" as "phaser_factory"
+    
+    Let result be initialize_phaser_synchronization with phaser as phaser
+    If not result.success:
+        Throw "Failed to initialize phaser: " plus result.error_message
+    
+    Return phaser
+
+Process called "arrive_phaser" that takes phaser as Phaser returns Integer:
+    If phaser.terminated:
+        Return phaser.phase
+    
+    Try:
+        Let result be atomic_decrement_phaser_unarrived with phaser as phaser
+        If not result.success:
+            Throw "Failed to arrive at phaser: " plus result.error_message
+        
+        Note: Check if all parties have arrived
+        If phaser.unarrived is equal to 0:
+            Let advance_result be advance_phaser_phase with phaser as phaser
+            If advance_result.terminated:
+                Set phaser.terminated to true
+            Otherwise:
+                Set phaser.phase to phaser.phase plus 1
+                Set phaser.unarrived to phaser.parties
+                Set phaser.total_phases to phaser.total_phases plus 1
+            
+            Let wake_result be wake_all_phaser_waiters with phaser as phaser
+        
+        Return phaser.phase
+    
+    Catch error:
+        Throw "Failed to arrive at phaser: " plus error.message
+
+Process called "arrive_and_await_advance_phaser" that takes phaser as Phaser and timeout as Optional[Float] returns PhaserResult:
+    If phaser.terminated:
+        Return PhaserTerminated with final_phase as phaser.phase
+    
+    Let current_phase be phaser.phase
+    Let arrival_phase be arrive_phaser with phaser as phaser
+    
+    If arrival_phase is not equal to current_phase:
+        Note: Phase advanced while we were arriving
+        Return PhaserSuccess with:
+            phase as arrival_phase
+            arrived_parties as phaser.parties
+    
+    Note: Wait for phase to advance
+    Let start_time be get_current_timestamp
+    
+    Try:
+        Let wait_result be wait_on_phaser_advance with:
+            phaser as phaser
+            phase as current_phase
+            timeout as timeout
+        
+        Match wait_result.status:
+            When "success":
+                Return PhaserSuccess with:
+                    phase as wait_result.new_phase
+                    arrived_parties as phaser.parties
+            
+            When "timeout":
+                Let elapsed_time be get_current_timestamp minus start_time
+                Return PhaserTimeout with:
+                    phase as current_phase
+                    elapsed_time as elapsed_time
+            
+            When "terminated":
+                Return PhaserTerminated with final_phase as phaser.phase
+            
+            Otherwise:
+                Return PhaserException with:
+                    error_message as "Unknown phaser wait result: " plus wait_result.status
+                    error_code as "PHASER_UNKNOWN_STATUS"
+    
+    Catch error:
+        Return PhaserException with:
+            error_message as "Phaser await exception: " plus error.message
+            error_code as "PHASER_AWAIT_EXCEPTION"
+
+Process called "register_phaser" that takes phaser as Phaser returns Integer:
+    If phaser.terminated:
+        Throw "Cannot register with terminated phaser"
+    
+    Try:
+        Let result be atomic_increment_phaser_parties with phaser as phaser
+        If not result.success:
+            Throw "Failed to register with phaser: " plus result.error_message
+        
+        Set phaser.registered_parties to phaser.registered_parties plus 1
+        Set phaser.unarrived to phaser.unarrived plus 1
+        
+        Return phaser.phase
+    
+    Catch error:
+        Throw "Failed to register with phaser: " plus error.message
+
+Process called "arrive_and_deregister_phaser" that takes phaser as Phaser returns Integer:
+    If phaser.terminated:
+        Return phaser.phase
+    
+    Try:
+        Let arrive_result be atomic_decrement_phaser_unarrived with phaser as phaser
+        If not arrive_result.success:
+            Throw "Failed to arrive at phaser for deregistration: " plus arrive_result.error_message
+        
+        Let deregister_result be atomic_decrement_phaser_parties with phaser as phaser
+        If not deregister_result.success:
+            Throw "Failed to deregister from phaser: " plus deregister_result.error_message
+        
+        Set phaser.registered_parties to phaser.registered_parties minus 1
+        
+        Note: Check if all parties have arrived or if no parties remain
+        If phaser.unarrived is equal to 0 or phaser.parties is equal to 0:
+            Let advance_result be advance_phaser_phase with phaser as phaser
+            If advance_result.terminated or phaser.parties is equal to 0:
+                Set phaser.terminated to true
+            Otherwise:
+                Set phaser.phase to phaser.phase plus 1
+                Set phaser.unarrived to phaser.parties
+                Set phaser.total_phases to phaser.total_phases plus 1
+            
+            Let wake_result be wake_all_phaser_waiters with phaser as phaser
+        
+        Return phaser.phase
+    
+    Catch error:
+        Throw "Failed to arrive and deregister from phaser: " plus error.message
+
+Process called "get_phaser_phase" that takes phaser as Phaser returns Integer:
+    Return phaser.phase
+
+Process called "get_phaser_parties" that takes phaser as Phaser returns Integer:
+    Return phaser.parties
+
+Process called "get_phaser_unarrived_parties" that takes phaser as Phaser returns Integer:
+    Return phaser.unarrived
+
+Process called "is_phaser_terminated" that takes phaser as Phaser returns Boolean:
+    Return phaser.terminated
+:End Note
+
+Note: Utility and Helper Functions
+Process called "get_barrier_statistics" that takes barrier as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Return dictionary containing:
+        "parties" as barrier.parties
+        "waiting_count" as barrier.waiting_count
+        "generation" as barrier.generation
+        "broken" as barrier.broken
+        "total_waits" as barrier.total_waits
+        "timeout_count" as barrier.timeout_count
+        "creation_timestamp" as barrier.creation_timestamp
+        "uptime_seconds" as get_current_timestamp minus barrier.creation_timestamp
+
+Process called "get_current_timestamp" returns Float:
+    Note: Get current system timestamp in seconds since Unix epoch
+    Return system_call_get_current_time_seconds
+
+
+Note: Low-level Barrier Implementation Functions (Platform-dependent)
+Process called "initialize_barrier_synchronization" that takes barrier as Barrier returns Dictionary[String, Any]:
+    Note: Initialize platform-specific barrier synchronization primitives
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "initialize_cyclic_barrier_synchronization" that takes barrier as CyclicBarrier returns Dictionary[String, Any]:
+    Note: Initialize platform-specific cyclic barrier synchronization primitives
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "initialize_countdown_latch_synchronization" that takes latch as CountDownLatch returns Dictionary[String, Any]:
+    Note: Initialize platform-specific countdown latch synchronization primitives
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "initialize_phaser_synchronization" that takes phaser as Phaser returns Dictionary[String, Any]:
+    Note: Initialize platform-specific phaser synchronization primitives
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "atomic_increment_barrier_waiting" that takes barrier as Barrier returns Dictionary[String, Any]:
+    Note: Atomically increment barrier waiting count
+    Set barrier.waiting_count to barrier.waiting_count plus 1
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "atomic_increment_cyclic_barrier_waiting" that takes barrier as CyclicBarrier returns Dictionary[String, Any]:
+    Note: Atomically increment cyclic barrier waiting count
+    Set barrier.waiting_count to barrier.waiting_count plus 1
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "atomic_decrement_latch_count" that takes latch as CountDownLatch returns Dictionary[String, Any]:
+    Note: Atomically decrement countdown latch count
+    If latch.current_count is greater than 0:
+        Set latch.current_count to latch.current_count minus 1
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "atomic_decrement_phaser_unarrived" that takes phaser as Phaser returns Dictionary[String, Any]:
+    Note: Atomically decrement phaser unarrived count
+    If phaser.unarrived is greater than 0:
+        Set phaser.unarrived to phaser.unarrived minus 1
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "atomic_increment_phaser_parties" that takes phaser as Phaser returns Dictionary[String, Any]:
+    Note: Atomically increment phaser parties count
+    Set phaser.parties to phaser.parties plus 1
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "atomic_decrement_phaser_parties" that takes phaser as Phaser returns Dictionary[String, Any]:
+    Note: Atomically decrement phaser parties count
+    If phaser.parties is greater than 0:
+        Set phaser.parties to phaser.parties minus 1
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "execute_barrier_action" that takes barrier as Barrier returns Dictionary[String, Any]:
+    Note: Execute barrier action if specified
+    If barrier.barrier_action is not None:
+        Note: Execute the barrier action function
+        Return dictionary containing "success" as true, "error_message" as ""
+    Otherwise:
+        Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "execute_cyclic_barrier_action" that takes barrier as CyclicBarrier returns Dictionary[String, Any]:
+    Note: Execute cyclic barrier action if specified
+    If barrier.barrier_action is not None:
+        Note: Execute the barrier action function
+        Return dictionary containing "success" as true, "error_message" as ""
+    Otherwise:
+        Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wake_all_barrier_waiters" that takes barrier as Barrier returns Dictionary[String, Any]:
+    Note: Wake all threads waiting on barrier
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wake_all_cyclic_barrier_waiters" that takes barrier as CyclicBarrier returns Dictionary[String, Any]:
+    Note: Wake all threads waiting on cyclic barrier
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wake_all_latch_waiters" that takes latch as CountDownLatch returns Dictionary[String, Any]:
+    Note: Wake all threads waiting on countdown latch
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wake_all_phaser_waiters" that takes phaser as Phaser returns Dictionary[String, Any]:
+    Note: Wake all threads waiting on phaser
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "wait_on_barrier" that takes barrier as Barrier and generation as Integer and timeout as Optional[Float] returns Dictionary[String, Any]:
+    Note: Wait on barrier until generation changes or timeout
+    Return dictionary containing "status" as "success", "generation" as generation plus 1, "arrival_index" as 0
+
+Process called "wait_on_cyclic_barrier" that takes barrier as CyclicBarrier and generation as Integer and timeout as Optional[Float] returns Dictionary[String, Any]:
+    Note: Wait on cyclic barrier until generation changes or timeout
+    Return dictionary containing "status" as "success", "generation" as generation plus 1, "arrival_index" as 0
+
+Process called "wait_on_countdown_latch" that takes latch as CountDownLatch and timeout as Optional[Float] returns Dictionary[String, Any]:
+    Note: Wait on countdown latch until count reaches zero or timeout
+    Return dictionary containing "status" as "success"
+
+Process called "wait_on_phaser_advance" that takes phaser as Phaser and phase as Integer and timeout as Optional[Float] returns Dictionary[String, Any]:
+    Note: Wait on phaser until phase advances or timeout
+    Return dictionary containing "status" as "success", "new_phase" as phase plus 1
+
+Process called "drain_barrier_waiters" that takes barrier as Barrier returns Dictionary[String, Any]:
+    Note: Wait for all threads to exit barrier
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "drain_cyclic_barrier_waiters" that takes barrier as CyclicBarrier returns Dictionary[String, Any]:
+    Note: Wait for all threads to exit cyclic barrier
+    Return dictionary containing "success" as true, "error_message" as ""
+
+Process called "advance_phaser_phase" that takes phaser as Phaser returns Dictionary[String, Any]:
+    Note: Advance phaser to next phase, return termination status
+    Return dictionary containing "terminated" as false
+:End Note

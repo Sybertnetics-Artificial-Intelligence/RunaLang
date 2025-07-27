@@ -1,0 +1,530 @@
+Note:
+Runa Standard Library: Async Queue Module
+
+Provides comprehensive async queue implementations for producer-consumer patterns,
+task distribution, and inter-coroutine communication with enterprise-grade features.
+
+Features:
+- Multiple queue types (FIFO, LIFO, Priority, Bounded)
+- Backpressure handling and flow control
+- Queue monitoring and metrics
+- Dead letter queues and error handling
+- Distributed queue support
+- Memory-efficient implementations
+:End Note
+
+Import "async.async" as async
+Import "async.core" as core
+
+Note: Queue Types and Interfaces
+Type QueueType is:
+    | FIFO_QUEUE
+    | LIFO_QUEUE
+    | PRIORITY_QUEUE
+    | BOUNDED_QUEUE
+    | RING_BUFFER_QUEUE
+    | DELAY_QUEUE
+
+Type QueueStats is Dictionary with:
+    total_items_enqueued as Integer
+    total_items_dequeued as Integer
+    current_size as Integer
+    max_size_reached as Integer
+    total_wait_time_ms as Float
+    average_wait_time_ms as Float
+    producer_blocked_count as Integer
+    consumer_blocked_count as Integer
+
+Type AsyncQueue is Dictionary with:
+    queue_id as String
+    queue_type as QueueType
+    max_size as Optional[Integer]
+    items as List[Any]
+    waiters_get as List[Task]
+    waiters_put as List[Task]
+    closed as Boolean defaults to false
+    stats as QueueStats
+    metadata as Dictionary[String, Any]
+
+Type PriorityItem is Dictionary with:
+    item as Any
+    priority as Integer
+    enqueue_time as Float
+    metadata as Dictionary[String, Any]
+
+Note: Basic Queue Operations
+Process called "create_async_queue" that takes queue_type as QueueType and max_size as Optional[Integer] returns AsyncQueue:
+    Return AsyncQueue with:
+        queue_id as generate_unique_id
+        queue_type as queue_type
+        max_size as max_size
+        items as list containing
+        waiters_get as list containing
+        waiters_put as list containing
+        closed as false
+        stats as create_queue_stats
+        metadata as dictionary containing
+
+Process called "create_queue_stats" returns QueueStats:
+    Return QueueStats with:
+        total_items_enqueued as 0
+        total_items_dequeued as 0
+        current_size as 0
+        max_size_reached as 0
+        total_wait_time_ms as 0.0
+        average_wait_time_ms as 0.0
+        producer_blocked_count as 0
+        consumer_blocked_count as 0
+
+Async Process called "put" that takes queue as AsyncQueue and item as Any returns None:
+    If queue["closed"]:
+        Throw "Queue is closed"
+    
+    Let start_time be get_high_precision_time
+    
+    Note: Check if queue is full
+    If queue["max_size"] is not None and length of queue["items"] is greater than or equal to queue["max_size"]:
+        Note: Block until space is available
+        Let current_task be get_current_task
+        Add current_task to queue["waiters_put"]
+        Set queue["stats"]["producer_blocked_count"] to queue["stats"]["producer_blocked_count"] plus 1
+        
+        Note: Suspend until woken up
+        Await task_completion with task as current_task
+        
+        Note: Remove from waiters
+        remove_task_from_list with list as queue["waiters_put"] and task as current_task
+    
+    Note: Add item based on queue type
+    Match queue["queue_type"]:
+        When FIFO_QUEUE:
+            Add item to end of queue["items"]
+        
+        When LIFO_QUEUE:
+            Insert item at index 0 in queue["items"]
+        
+        When PRIORITY_QUEUE:
+            Let priority_item be PriorityItem with:
+                item as item
+                priority as get_item_priority with item as item
+                enqueue_time as get_high_precision_time
+                metadata as dictionary containing
+            insert_by_priority with items as queue["items"] and priority_item as priority_item
+        
+        When BOUNDED_QUEUE:
+            Add item to end of queue["items"]
+        
+        When RING_BUFFER_QUEUE:
+            insert_ring_buffer with items as queue["items"] and item as item and max_size as queue["max_size"]
+        
+        When DELAY_QUEUE:
+            Let delay_item be create_delay_item with item as item and delay as get_item_delay with item as item
+            insert_by_delay with items as queue["items"] and delay_item as delay_item
+    
+    Note: Update statistics
+    Set queue["stats"]["total_items_enqueued"] to queue["stats"]["total_items_enqueued"] plus 1
+    Set queue["stats"]["current_size"] to length of queue["items"]
+    Let end_time be get_high_precision_time
+    Let wait_time be end_time minus start_time
+    Set queue["stats"]["total_wait_time_ms"] to queue["stats"]["total_wait_time_ms"] plus wait_time
+    update_average_wait_time with stats as queue["stats"]
+    
+    If queue["stats"]["current_size"] is greater than queue["stats"]["max_size_reached"]:
+        Set queue["stats"]["max_size_reached"] to queue["stats"]["current_size"]
+    
+    Note: Wake up waiting consumers
+    If length of queue["waiters_get"] is greater than 0:
+        Let waiting_consumer be queue["waiters_get"] at index 0
+        Remove queue["waiters_get"] at index 0
+        resume_task with task as waiting_consumer
+
+Async Process called "get" that takes queue as AsyncQueue returns Any:
+    Let start_time be get_high_precision_time
+    
+    Note: Wait until item is available
+    While length of queue["items"] is equal to 0 and not queue["closed"]:
+        Let current_task be get_current_task
+        Add current_task to queue["waiters_get"]
+        Set queue["stats"]["consumer_blocked_count"] to queue["stats"]["consumer_blocked_count"] plus 1
+        
+        Note: Suspend until woken up
+        Await task_completion with task as current_task
+        
+        Note: Remove from waiters
+        remove_task_from_list with list as queue["waiters_get"] and task as current_task
+    
+    Note: Check if queue was closed while waiting
+    If queue["closed"] and length of queue["items"] is equal to 0:
+        Throw "Queue is closed and empty"
+    
+    Note: Get item based on queue type
+    Let item be None
+    Match queue["queue_type"]:
+        When FIFO_QUEUE:
+            Set item to queue["items"] at index 0
+            Remove queue["items"] at index 0
+        
+        When LIFO_QUEUE:
+            Set item to queue["items"] at index 0
+            Remove queue["items"] at index 0
+        
+        When PRIORITY_QUEUE:
+            Let priority_item be queue["items"] at index 0
+            Remove queue["items"] at index 0
+            Set item to priority_item["item"]
+        
+        When BOUNDED_QUEUE:
+            Set item to queue["items"] at index 0
+            Remove queue["items"] at index 0
+        
+        When RING_BUFFER_QUEUE:
+            Set item to get_ring_buffer_item with items as queue["items"]
+        
+        When DELAY_QUEUE:
+            Set item to get_ready_delay_item with items as queue["items"]
+            If item is None:
+                Note: No items ready yet, wait
+                Let current_task be get_current_task
+                schedule_delay_wakeup with queue as queue and task as current_task
+                Await task_completion with task as current_task
+                Set item to get_ready_delay_item with items as queue["items"]
+    
+    Note: Update statistics
+    Set queue["stats"]["total_items_dequeued"] to queue["stats"]["total_items_dequeued"] plus 1
+    Set queue["stats"]["current_size"] to length of queue["items"]
+    Let end_time be get_high_precision_time
+    Let wait_time be end_time minus start_time
+    Set queue["stats"]["total_wait_time_ms"] to queue["stats"]["total_wait_time_ms"] plus wait_time
+    update_average_wait_time with stats as queue["stats"]
+    
+    Note: Wake up waiting producers
+    If length of queue["waiters_put"] is greater than 0:
+        Let waiting_producer be queue["waiters_put"] at index 0
+        Remove queue["waiters_put"] at index 0
+        resume_task with task as waiting_producer
+    
+    Return item
+
+Process called "put_nowait" that takes queue as AsyncQueue and item as Any returns Boolean:
+    If queue["closed"]:
+        Return false
+    
+    If queue["max_size"] is not None and length of queue["items"] is greater than or equal to queue["max_size"]:
+        Return false
+    
+    Note: Add item immediately without blocking
+    Match queue["queue_type"]:
+        When FIFO_QUEUE:
+            Add item to end of queue["items"]
+        
+        When LIFO_QUEUE:
+            Insert item at index 0 in queue["items"]
+        
+        When PRIORITY_QUEUE:
+            Let priority_item be PriorityItem with:
+                item as item
+                priority as get_item_priority with item as item
+                enqueue_time as get_high_precision_time
+                metadata as dictionary containing
+            insert_by_priority with items as queue["items"] and priority_item as priority_item
+    
+    Note: Update statistics
+    Set queue["stats"]["total_items_enqueued"] to queue["stats"]["total_items_enqueued"] plus 1
+    Set queue["stats"]["current_size"] to length of queue["items"]
+    
+    Note: Wake up waiting consumers
+    If length of queue["waiters_get"] is greater than 0:
+        Let waiting_consumer be queue["waiters_get"] at index 0
+        Remove queue["waiters_get"] at index 0
+        resume_task with task as waiting_consumer
+    
+    Return true
+
+Process called "get_nowait" that takes queue as AsyncQueue returns Optional[Any]:
+    If length of queue["items"] is equal to 0:
+        Return None
+    
+    Note: Get item immediately without blocking
+    Let item be None
+    Match queue["queue_type"]:
+        When FIFO_QUEUE:
+            Set item to queue["items"] at index 0
+            Remove queue["items"] at index 0
+        
+        When LIFO_QUEUE:
+            Set item to queue["items"] at index 0
+            Remove queue["items"] at index 0
+        
+        When PRIORITY_QUEUE:
+            Let priority_item be queue["items"] at index 0
+            Remove queue["items"] at index 0
+            Set item to priority_item["item"]
+    
+    Note: Update statistics
+    Set queue["stats"]["total_items_dequeued"] to queue["stats"]["total_items_dequeued"] plus 1
+    Set queue["stats"]["current_size"] to length of queue["items"]
+    
+    Note: Wake up waiting producers
+    If length of queue["waiters_put"] is greater than 0:
+        Let waiting_producer be queue["waiters_put"] at index 0
+        Remove queue["waiters_put"] at index 0
+        resume_task with task as waiting_producer
+    
+    Return item
+
+Note: Queue Management
+Process called "close_queue" that takes queue as AsyncQueue returns None:
+    Set queue["closed"] to true
+    
+    Note: Wake up all waiting tasks
+    For each waiting_task in queue["waiters_get"]:
+        resume_task with task as waiting_task
+    
+    For each waiting_task in queue["waiters_put"]:
+        resume_task with task as waiting_task
+    
+    Clear list queue["waiters_get"]
+    Clear list queue["waiters_put"]
+
+Process called "is_queue_empty" that takes queue as AsyncQueue returns Boolean:
+    Return length of queue["items"] is equal to 0
+
+Process called "is_queue_full" that takes queue as AsyncQueue returns Boolean:
+    If queue["max_size"] is None:
+        Return false
+    
+    Return length of queue["items"] is greater than or equal to queue["max_size"]
+
+Process called "queue_size" that takes queue as AsyncQueue returns Integer:
+    Return length of queue["items"]
+
+Process called "peek_queue" that takes queue as AsyncQueue returns Optional[Any]:
+    If length of queue["items"] is equal to 0:
+        Return None
+    
+    Match queue["queue_type"]:
+        When PRIORITY_QUEUE:
+            Let priority_item be queue["items"] at index 0
+            Return priority_item["item"]
+        Otherwise:
+            Return queue["items"] at index 0
+
+Process called "clear_queue" that takes queue as AsyncQueue returns None:
+    Clear list queue["items"]
+    Set queue["stats"]["current_size"] to 0
+    
+    Note: Wake up all waiting producers
+    For each waiting_task in queue["waiters_put"]:
+        resume_task with task as waiting_task
+    
+    Clear list queue["waiters_put"]
+
+Note: Priority Queue Operations
+Process called "insert_by_priority" that takes items as List[PriorityItem] and priority_item as PriorityItem returns None:
+    Let inserted be false
+    Let i be 0
+    
+    While i is less than length of items and not inserted:
+        Let current_item be items at index i
+        
+        Note: Higher priority values go first
+        If priority_item["priority"] is greater than current_item["priority"]:
+            Insert priority_item at index i in items
+            Set inserted to true
+        Otherwise if priority_item["priority"] is equal to current_item["priority"]:
+            Note: Use enqueue time as tiebreaker (FIFO for same priority)
+            If priority_item["enqueue_time"] is less than current_item["enqueue_time"]:
+                Insert priority_item at index i in items
+                Set inserted to true
+        
+        Set i to i plus 1
+    
+    If not inserted:
+        Add priority_item to end of items
+
+Process called "get_item_priority" that takes item as Any returns Integer:
+    If "priority" is in item and item is Dictionary:
+        Return item["priority"]
+    Otherwise:
+        Return 0  Note: Default priority
+
+Note: Delay Queue Operations
+Process called "create_delay_item" that takes item as Any and delay as Float returns Dictionary[String, Any]:
+    Return dictionary with:
+        "item" as item
+        "ready_time" as get_high_precision_time plus delay
+        "enqueue_time" as get_high_precision_time
+
+Process called "get_item_delay" that takes item as Any returns Float:
+    If "delay" is in item and item is Dictionary:
+        Return item["delay"]
+    Otherwise:
+        Return 0.0  Note: No delay
+
+Process called "insert_by_delay" that takes items as List[Dictionary[String, Any]] and delay_item as Dictionary[String, Any] returns None:
+    Let inserted be false
+    Let i be 0
+    
+    While i is less than length of items and not inserted:
+        Let current_item be items at index i
+        
+        If delay_item["ready_time"] is less than current_item["ready_time"]:
+            Insert delay_item at index i in items
+            Set inserted to true
+        
+        Set i to i plus 1
+    
+    If not inserted:
+        Add delay_item to end of items
+
+Process called "get_ready_delay_item" that takes items as List[Dictionary[String, Any]] returns Optional[Any]:
+    If length of items is equal to 0:
+        Return None
+    
+    Let current_time be get_high_precision_time
+    Let first_item be items at index 0
+    
+    If first_item["ready_time"] is less than or equal to current_time:
+        Remove items at index 0
+        Return first_item["item"]
+    
+    Return None
+
+Process called "schedule_delay_wakeup" that takes queue as AsyncQueue and task as Task returns None:
+    If length of queue["items"] is greater than 0:
+        Let next_item be queue["items"] at index 0
+        Let delay_ms be next_item["ready_time"] minus get_high_precision_time
+        
+        If delay_ms is greater than 0:
+            schedule_timer with delay_ms as delay_ms and callback as create_wakeup_callback with task as task
+
+Process called "create_wakeup_callback" that takes task as Task returns Process:
+    Return Process called "wakeup_task" that takes timer as Dictionary[String, Any] returns None:
+        resume_task with task as task
+
+Note: Ring Buffer Operations
+Process called "insert_ring_buffer" that takes items as List[Any] and item as Any and max_size as Integer returns None:
+    If length of items is greater than or equal to max_size:
+        Remove items at index 0
+    
+    Add item to end of items
+
+Process called "get_ring_buffer_item" that takes items as List[Any] returns Any:
+    Let item be items at index 0
+    Remove items at index 0
+    Return item
+
+Note: Queue Monitoring and Metrics
+Process called "get_queue_stats" that takes queue as AsyncQueue returns QueueStats:
+    Return queue["stats"]
+
+Process called "update_average_wait_time" that takes stats as QueueStats returns None:
+    Let total_operations be stats["total_items_enqueued"] plus stats["total_items_dequeued"]
+    If total_operations is greater than 0:
+        Set stats["average_wait_time_ms"] to stats["total_wait_time_ms"] divided by total_operations
+
+Process called "reset_queue_stats" that takes queue as AsyncQueue returns None:
+    Set queue["stats"] to create_queue_stats
+
+Process called "create_queue_monitor" that takes queue as AsyncQueue and interval_ms as Float returns Process:
+    Return Process called "monitor_queue" returns None:
+        While not queue["closed"]:
+            Let stats be queue["stats"]
+            Display "Queue " plus queue["queue_id"] plus " stats:"
+            Display "  Size: " plus stats["current_size"]
+            Display "  Total enqueued: " plus stats["total_items_enqueued"]
+            Display "  Total dequeued: " plus stats["total_items_dequeued"]
+            Display "  Average wait time: " plus stats["average_wait_time_ms"] plus "ms"
+            Display "  Producers blocked: " plus stats["producer_blocked_count"]
+            Display "  Consumers blocked: " plus stats["consumer_blocked_count"]
+            
+            Await sleep with duration_ms as interval_ms
+
+Note: Specialized Queue Types
+Process called "create_bounded_queue" that takes max_size as Integer returns AsyncQueue:
+    Return create_async_queue with queue_type as BOUNDED_QUEUE and max_size as max_size
+
+Process called "create_priority_queue" returns AsyncQueue:
+    Return create_async_queue with queue_type as PRIORITY_QUEUE and max_size as None
+
+Process called "create_lifo_queue" that takes max_size as Optional[Integer] returns AsyncQueue:
+    Return create_async_queue with queue_type as LIFO_QUEUE and max_size as max_size
+
+Process called "create_delay_queue" that takes max_size as Optional[Integer] returns AsyncQueue:
+    Return create_async_queue with queue_type as DELAY_QUEUE and max_size as max_size
+
+Process called "create_ring_buffer_queue" that takes size as Integer returns AsyncQueue:
+    Return create_async_queue with queue_type as RING_BUFFER_QUEUE and max_size as size
+
+Note: Advanced Queue Patterns
+Async Process called "queue_batch_put" that takes queue as AsyncQueue and items as List[Any] returns None:
+    For each item in items:
+        Await put with queue as queue and item as item
+
+Async Process called "queue_batch_get" that takes queue as AsyncQueue and count as Integer returns List[Any]:
+    Let results be list containing
+    Let i be 0
+    
+    While i is less than count:
+        Let item be Await get with queue as queue
+        Add item to results
+        Set i to i plus 1
+    
+    Return results
+
+Process called "create_queue_pool" that takes queue_count as Integer and queue_type as QueueType and max_size as Optional[Integer] returns List[AsyncQueue]:
+    Let queues be list containing
+    Let i be 0
+    
+    While i is less than queue_count:
+        Let queue be create_async_queue with queue_type as queue_type and max_size as max_size
+        Add queue to queues
+        Set i to i plus 1
+    
+    Return queues
+
+Process called "round_robin_put" that takes queues as List[AsyncQueue] and item as Any returns AsyncQueue:
+    Let selected_index be 0
+    Let min_size be queue_size with queue as queues at index 0
+    Let i be 1
+    
+    While i is less than length of queues:
+        Let current_size be queue_size with queue as queues at index i
+        If current_size is less than min_size:
+            Set min_size to current_size
+            Set selected_index to i
+        Set i to i plus 1
+    
+    Let selected_queue be queues at index selected_index
+    put_nowait with queue as selected_queue and item as item
+    Return selected_queue
+
+Note: Utility Functions
+Process called "remove_task_from_list" that takes list as List[Task] and task as Task returns None:
+    Let i be 0
+    While i is less than length of list:
+        If list at index i is equal to task:
+            Remove list at index i
+            Return
+        Set i to i plus 1
+
+Process called "resume_task" that takes task as Task returns None:
+    Note: Implementation depends on event loop integration
+    core.resume_coroutine with loop as get_current_loop and task as task and result as None
+
+Process called "get_current_task" returns Task:
+    Note: Implementation depends on event loop integration
+    Return get_current_coroutine_task
+
+Process called "get_current_loop" returns EventLoop:
+    Note: Implementation depends on event loop integration
+    Return get_current_event_loop
+
+Process called "generate_unique_id" returns String:
+    Note: Implementation depends on system utilities
+    Return "queue_" plus get_timestamp plus "_" plus get_random_string
+
+Process called "schedule_timer" that takes delay_ms as Float and callback as Process returns None:
+    Note: Implementation depends on event loop timer system
+    Let loop be get_current_loop
+    core.create_timer with loop as loop and delay_ms as delay_ms and callback as callback and task as None

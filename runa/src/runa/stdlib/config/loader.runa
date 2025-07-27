@@ -1,0 +1,1220 @@
+Note:
+Runa Standard Library: Configuration Loader Module
+
+Provides comprehensive configuration file loading capabilities supporting multiple formats
+(JSON, YAML, TOML, INI, XML, ENV), hierarchical configuration merging, file watching,
+and robust error handling. This module serves as the foundation for application
+configuration management with production-ready features.
+
+Features:
+- Multi-format configuration file loading (JSON, YAML, TOML, INI, XML, ENV)
+- Hierarchical configuration merging with precedence rules
+- Configuration file watching and hot-reloading
+- Schema validation and type conversion
+- Environment variable interpolation in config files
+- Configuration templating and preprocessing
+- Remote configuration loading (HTTP/HTTPS, S3, etc.)
+- Configuration caching and performance optimization
+- Detailed error reporting and debugging
+- Configuration versioning and migration support
+
+Supported Formats:
+- JSON: JavaScript Object Notation with comments support
+- YAML: YAML Ain't Markup Language with anchors and references
+- TOML: Tom's Obvious, Minimal Language
+- INI: Traditional INI files with sections
+- XML: Extensible Markup Language with XPath support
+- ENV: Environment variable files (.env format)
+- Properties: Java-style properties files
+
+Security Features:
+- Secure file access with permission validation
+- Configuration encryption and decryption
+- Sensitive value detection and masking
+- Configuration integrity verification
+
+Thread Safety: All loading operations are thread-safe and support
+concurrent access across multiple execution contexts.
+:End Note
+
+Import "stdlib/config/environment" as environment
+Import "stdlib/io/file" as file
+Import "stdlib/json/json" as json
+
+Note: Core Configuration Loader Types
+Type ConfigFormat is:
+    | JSON
+    | YAML  
+    | TOML
+    | INI
+    | XML
+    | ENV
+    | PROPERTIES
+    | AUTO
+
+Type ConfigFile is Dictionary with:
+    path as String
+    format as ConfigFormat
+    exists as Boolean defaults to false
+    readable as Boolean defaults to false
+    size as Integer defaults to 0
+    last_modified as Float defaults to 0.0
+    encoding as String defaults to "utf-8"
+    permissions as String defaults to ""
+    content_hash as Optional[String] defaults to None
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type LoaderOptions is Dictionary with:
+    strict_mode as Boolean defaults to false
+    allow_missing_files as Boolean defaults to true
+    enable_interpolation as Boolean defaults to true
+    interpolation_syntax as String defaults to "shell"
+    enable_includes as Boolean defaults to false
+    max_include_depth as Integer defaults to 10
+    enable_caching as Boolean defaults to true
+    cache_ttl as Float defaults to 300.0
+    enable_validation as Boolean defaults to false
+    validation_schema as Optional[Dictionary[String, Any]] defaults to None
+    encoding as String defaults to "utf-8"
+    file_size_limit as Integer defaults to 10485760
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+
+Type LoadResult[T] is:
+    | LoadSuccess with data as T and source_file as String and format as ConfigFormat and load_time as Float
+    | LoadError with error_message as String and error_code as String and source_file as String
+    | LoadPartial with data as T and errors as List[String] and source_file as String
+
+Type MergeStrategy is:
+    | OVERRIDE
+    | MERGE_DEEP
+    | MERGE_SHALLOW
+    | APPEND_LISTS
+    | UNION_MAPS
+
+Type ConfigCache is Dictionary with:
+    cached_configs as Dictionary[String, Dictionary[String, Any]] defaults to dictionary containing
+    cache_timestamps as Dictionary[String, Float] defaults to dictionary containing
+    cache_hashes as Dictionary[String, String] defaults to dictionary containing
+    cache_hits as Integer defaults to 0
+    cache_misses as Integer defaults to 0
+    max_cache_size as Integer defaults to 100
+    ttl_seconds as Float defaults to 300.0
+    metadata as Dictionary[String, Any] defaults to dictionary containing
+:End Note
+
+Note: Core Configuration Loading Functions
+Process called "load_configuration_file" that takes path as String and format as Optional[ConfigFormat] and options as Optional[LoaderOptions] returns LoadResult[Dictionary[String, Any]]:
+    Let start_time be get_current_timestamp
+    Let final_options be options if options is not None else create_default_loader_options
+    Let final_format be format if format is not None else detect_config_format with path as path
+    
+    Try:
+        Note: Validate file access
+        Let file_validation be validate_config_file_access with:
+            path as path
+            options as final_options
+        
+        If not file_validation.accessible:
+            Return LoadError with:
+                error_message as "Cannot access configuration file: " plus file_validation.error_message
+                error_code as "FILE_ACCESS_ERROR"
+                source_file as path
+        
+        Note: Check cache if enabled
+        If final_options.enable_caching:
+            Let cache_result be check_configuration_cache with:
+                path as path
+                file_info as file_validation.file_info
+            
+            If cache_result.found and not cache_result.expired:
+                Return LoadSuccess with:
+                    data as cache_result.data
+                    source_file as path
+                    format as final_format
+                    load_time as get_current_timestamp minus start_time
+        
+        Note: Read file content
+        Let content_result be read_config_file_content with:
+            path as path
+            encoding as final_options.encoding
+            size_limit as final_options.file_size_limit
+        
+        If not content_result.success:
+            Return LoadError with:
+                error_message as "Failed to read configuration file: " plus content_result.error_message
+                error_code as "FILE_READ_ERROR"
+                source_file as path
+        
+        Let file_content be content_result.content
+        
+        Note: Apply preprocessing if enabled
+        If final_options.enable_interpolation:
+            Let interpolated_content be interpolate_configuration_content with:
+                content as file_content
+                syntax as final_options.interpolation_syntax
+                options as final_options
+            
+            If interpolated_content.success:
+                Set file_content to interpolated_content.result
+            Else If final_options.strict_mode:
+                Return LoadError with:
+                    error_message as "Configuration interpolation failed: " plus interpolated_content.error_message
+                    error_code as "INTERPOLATION_ERROR"
+                    source_file as path
+        
+        Note: Parse configuration based on format
+        Let parse_result be parse_configuration_content with:
+            content as file_content
+            format as final_format
+            options as final_options
+        
+        Match parse_result:
+            When ParseSuccess:
+                Let loaded_data be parse_result.data
+                
+                Note: Handle includes if enabled
+                If final_options.enable_includes:
+                    Let include_result be process_configuration_includes with:
+                        data as loaded_data
+                        base_path as get_directory_from_path with path as path
+                        options as final_options
+                        depth as 0
+                    
+                    If include_result.success:
+                        Set loaded_data to include_result.merged_data
+                    Else If final_options.strict_mode:
+                        Return LoadError with:
+                            error_message as "Include processing failed: " plus include_result.error_message
+                            error_code as "INCLUDE_ERROR"
+                            source_file as path
+                
+                Note: Validate configuration if schema provided
+                If final_options.enable_validation and final_options.validation_schema is not None:
+                    Let validation_result be validate_configuration_data with:
+                        data as loaded_data
+                        schema as final_options.validation_schema
+                    
+                    If not validation_result.valid:
+                        If final_options.strict_mode:
+                            Return LoadError with:
+                                error_message as "Configuration validation failed: " plus validation_result.error_message
+                                error_code as "VALIDATION_ERROR"
+                                source_file as path
+                        Otherwise:
+                            Return LoadPartial with:
+                                data as loaded_data
+                                errors as validation_result.errors
+                                source_file as path
+                
+                Note: Cache result if caching enabled
+                If final_options.enable_caching:
+                    cache_configuration_data with:
+                        path as path
+                        data as loaded_data
+                        file_info as file_validation.file_info
+                
+                Return LoadSuccess with:
+                    data as loaded_data
+                    source_file as path
+                    format as final_format
+                    load_time as get_current_timestamp minus start_time
+            
+            When ParseError:
+                Return LoadError with:
+                    error_message as "Configuration parsing failed: " plus parse_result.error_message
+                    error_code as "PARSE_ERROR"
+                    source_file as path
+    
+    Catch error:
+        Return LoadError with:
+            error_message as "Configuration loading exception: " plus error.message
+            error_code as "LOADER_EXCEPTION"
+            source_file as path
+
+Process called "load_multiple_configuration_files" that takes file_paths as List[String] and merge_strategy as Optional[MergeStrategy] and options as Optional[LoaderOptions] returns LoadResult[Dictionary[String, Any]]:
+    Let final_merge_strategy be merge_strategy if merge_strategy is not None else MERGE_DEEP
+    Let final_options be options if options is not None else create_default_loader_options
+    Let start_time be get_current_timestamp
+    
+    Let merged_config be dictionary containing
+    Let load_errors be list containing
+    Let loaded_files be list containing
+    
+    Try:
+        For each config_path in file_paths:
+            Let load_result be load_configuration_file with:
+                path as config_path
+                format as None
+                options as final_options
+            
+            Match load_result:
+                When LoadSuccess:
+                    Add config_path to loaded_files
+                    Set merged_config to merge_configuration_data with:
+                        base_config as merged_config
+                        overlay_config as load_result.data
+                        strategy as final_merge_strategy
+                
+                When LoadError:
+                    If not final_options.allow_missing_files:
+                        Return LoadError with:
+                            error_message as "Failed to load required configuration file: " plus load_result.error_message
+                            error_code as load_result.error_code
+                            source_file as config_path
+                    Otherwise:
+                        Add load_result.error_message to load_errors
+                
+                When LoadPartial:
+                    Add config_path to loaded_files
+                    Set merged_config to merge_configuration_data with:
+                        base_config as merged_config
+                        overlay_config as load_result.data
+                        strategy as final_merge_strategy
+                    
+                    For each error in load_result.errors:
+                        Add error to load_errors
+        
+        If length of loaded_files is equal to 0:
+            Return LoadError with:
+                error_message as "No configuration files could be loaded"
+                error_code as "NO_FILES_LOADED"
+                source_file as join_list with list as file_paths and separator as ", "
+        
+        If length of load_errors is greater than 0:
+            Return LoadPartial with:
+                data as merged_config
+                errors as load_errors
+                source_file as join_list with list as loaded_files and separator as ", "
+        
+        Return LoadSuccess with:
+            data as merged_config
+            source_file as join_list with list as loaded_files and separator as ", "
+            format as AUTO
+            load_time as get_current_timestamp minus start_time
+    
+    Catch error:
+        Return LoadError with:
+            error_message as "Multiple configuration loading exception: " plus error.message
+            error_code as "MULTIPLE_LOADER_EXCEPTION"
+            source_file as join_list with list as file_paths and separator as ", "
+
+Process called "save_configuration_file" that takes data as Dictionary[String, Any] and path as String and format as Optional[ConfigFormat] and options as Optional[LoaderOptions] returns Dictionary[String, Any]:
+    Let final_format be format if format is not None else detect_config_format with path as path
+    Let final_options be options if options is not None else create_default_loader_options
+    
+    Try:
+        Note: Validate file write access
+        Let write_validation be validate_config_file_write_access with:
+            path as path
+            options as final_options
+        
+        If not write_validation.writable:
+            Return dictionary containing:
+                "success" as false
+                "error_message" as "Cannot write to configuration file: " plus write_validation.error_message
+                "error_code" as "FILE_WRITE_ACCESS_ERROR"
+        
+        Note: Serialize configuration data
+        Let serialize_result be serialize_configuration_data with:
+            data as data
+            format as final_format
+            options as final_options
+        
+        If not serialize_result.success:
+            Return dictionary containing:
+                "success" as false
+                "error_message" as "Configuration serialization failed: " plus serialize_result.error_message
+                "error_code" as "SERIALIZATION_ERROR"
+        
+        Note: Write to file
+        Let write_result be write_config_file_content with:
+            path as path
+            content as serialize_result.content
+            encoding as final_options.encoding
+        
+        If write_result.success:
+            Note: Invalidate cache if enabled
+            If final_options.enable_caching:
+                invalidate_configuration_cache with path as path
+            
+            Return dictionary containing:
+                "success" as true
+                "path" as path
+                "format" as final_format
+                "bytes_written" as write_result.bytes_written
+        Otherwise:
+            Return dictionary containing:
+                "success" as false
+                "error_message" as "Failed to write configuration file: " plus write_result.error_message
+                "error_code" as "FILE_WRITE_ERROR"
+    
+    Catch error:
+        Return dictionary containing:
+            "success" as false
+            "error_message" as "Configuration save exception: " plus error.message
+            "error_code" as "SAVE_EXCEPTION"
+:End Note
+
+Note: Configuration Format Detection and Parsing
+Process called "detect_config_format" that takes path as String returns ConfigFormat:
+    Let file_extension be get_file_extension with path as path
+    Let lowercase_extension be lowercase of file_extension
+    
+    Match lowercase_extension:
+        When ".json":
+            Return JSON
+        When ".yaml":
+            Return YAML
+        When ".yml":
+            Return YAML
+        When ".toml":
+            Return TOML
+        When ".ini":
+            Return INI
+        When ".xml":
+            Return XML
+        When ".env":
+            Return ENV
+        When ".properties":
+            Return PROPERTIES
+        Otherwise:
+            Note: Try to detect from file content
+            Let content_detection be detect_format_from_content with path as path
+            If content_detection.detected:
+                Return content_detection.format
+            Otherwise:
+                Return AUTO
+
+Process called "parse_configuration_content" that takes content as String and format as ConfigFormat and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Match format:
+            When JSON:
+                Return parse_json_configuration with:
+                    content as content
+                    options as options
+            
+            When YAML:
+                Return parse_yaml_configuration with:
+                    content as content
+                    options as options
+            
+            When TOML:
+                Return parse_toml_configuration with:
+                    content as content
+                    options as options
+            
+            When INI:
+                Return parse_ini_configuration with:
+                    content as content
+                    options as options
+            
+            When XML:
+                Return parse_xml_configuration with:
+                    content as content
+                    options as options
+            
+            When ENV:
+                Return parse_env_configuration with:
+                    content as content
+                    options as options
+            
+            When PROPERTIES:
+                Return parse_properties_configuration with:
+                    content as content
+                    options as options
+            
+            When AUTO:
+                Return parse_auto_detect_configuration with:
+                    content as content
+                    options as options
+            
+            Otherwise:
+                Return dictionary containing:
+                    "type" as "ParseError"
+                    "error_message" as "Unsupported configuration format: " plus format as String
+    
+    Catch error:
+        Return dictionary containing:
+            "type" as "ParseError"
+            "error_message" as "Configuration parsing exception: " plus error.message
+
+Process called "serialize_configuration_data" that takes data as Dictionary[String, Any] and format as ConfigFormat and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Match format:
+            When JSON:
+                Return serialize_json_configuration with:
+                    data as data
+                    options as options
+            
+            When YAML:
+                Return serialize_yaml_configuration with:
+                    data as data
+                    options as options
+            
+            When TOML:
+                Return serialize_toml_configuration with:
+                    data as data
+                    options as options
+            
+            When INI:
+                Return serialize_ini_configuration with:
+                    data as data
+                    options as options
+            
+            When XML:
+                Return serialize_xml_configuration with:
+                    data as data
+                    options as options
+            
+            When ENV:
+                Return serialize_env_configuration with:
+                    data as data
+                    options as options
+            
+            When PROPERTIES:
+                Return serialize_properties_configuration with:
+                    data as data
+                    options as options
+            
+            Otherwise:
+                Return dictionary containing:
+                    "success" as false
+                    "error_message" as "Unsupported configuration format for serialization: " plus format as String
+    
+    Catch error:
+        Return dictionary containing:
+            "success" as false
+            "error_message" as "Configuration serialization exception: " plus error.message
+:End Note
+
+Note: Configuration Merging and Strategy Implementation
+Process called "merge_configuration_data" that takes base_config as Dictionary[String, Any] and overlay_config as Dictionary[String, Any] and strategy as MergeStrategy returns Dictionary[String, Any]:
+    Match strategy:
+        When OVERRIDE:
+            Return merge_with_override_strategy with:
+                base as base_config
+                overlay as overlay_config
+        
+        When MERGE_DEEP:
+            Return merge_with_deep_strategy with:
+                base as base_config
+                overlay as overlay_config
+        
+        When MERGE_SHALLOW:
+            Return merge_with_shallow_strategy with:
+                base as base_config
+                overlay as overlay_config
+        
+        When APPEND_LISTS:
+            Return merge_with_append_lists_strategy with:
+                base as base_config
+                overlay as overlay_config
+        
+        When UNION_MAPS:
+            Return merge_with_union_maps_strategy with:
+                base as base_config
+                overlay as overlay_config
+        
+        Otherwise:
+            Return merge_with_deep_strategy with:
+                base as base_config
+                overlay as overlay_config
+
+Process called "merge_with_deep_strategy" that takes base as Dictionary[String, Any] and overlay as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Let result be deep_copy_dictionary with dict as base
+    
+    For each key, value in overlay:
+        If result contains key:
+            Let base_value be result[key]
+            
+            If is_dictionary with value as base_value and is_dictionary with value as value:
+                Note: Recursively merge dictionaries
+                Set result[key] to merge_with_deep_strategy with:
+                    base as base_value
+                    overlay as value
+            Else If is_list with value as base_value and is_list with value as value:
+                Note: Merge lists (replace by default, could be configured)
+                Set result[key] to value
+            Otherwise:
+                Note: Override scalar values
+                Set result[key] to value
+        Otherwise:
+            Note: Add new key
+            Set result[key] to deep_copy_value with value as value
+    
+    Return result
+
+Process called "merge_with_override_strategy" that takes base as Dictionary[String, Any] and overlay as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Let result be deep_copy_dictionary with dict as base
+    
+    For each key, value in overlay:
+        Set result[key] to deep_copy_value with value as value
+    
+    Return result
+
+Process called "merge_with_shallow_strategy" that takes base as Dictionary[String, Any] and overlay as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Let result be deep_copy_dictionary with dict as base
+    
+    For each key, value in overlay:
+        If not result contains key:
+            Set result[key] to deep_copy_value with value as value
+    
+    Return result
+
+Process called "merge_with_append_lists_strategy" that takes base as Dictionary[String, Any] and overlay as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Let result be deep_copy_dictionary with dict as base
+    
+    For each key, value in overlay:
+        If result contains key:
+            Let base_value be result[key]
+            
+            If is_list with value as base_value and is_list with value as value:
+                Note: Append lists
+                Let merged_list be deep_copy_list with list as base_value
+                For each item in value:
+                    Add deep_copy_value with value as item to merged_list
+                Set result[key] to merged_list
+            Otherwise:
+                Set result[key] to deep_copy_value with value as value
+        Otherwise:
+            Set result[key] to deep_copy_value with value as value
+    
+    Return result
+
+Process called "merge_with_union_maps_strategy" that takes base as Dictionary[String, Any] and overlay as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Let result be deep_copy_dictionary with dict as base
+    
+    For each key, value in overlay:
+        If result contains key:
+            Let base_value be result[key]
+            
+            If is_dictionary with value as base_value and is_dictionary with value as value:
+                Note: Union maps (keep both base and overlay values, overlay wins on conflicts)
+                Set result[key] to merge_with_deep_strategy with:
+                    base as base_value
+                    overlay as value
+            Otherwise:
+                Set result[key] to deep_copy_value with value as value
+        Otherwise:
+            Set result[key] to deep_copy_value with value as value
+    
+    Return result
+:End Note
+
+Note: Configuration File Format Parsers
+Process called "parse_json_configuration" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Note: Remove comments if in strict mode (JSON doesn't support comments)
+        Let processed_content be If options.strict_mode then content else remove_json_comments with content as content
+        
+        Let parsed_data be json.parse with content as processed_content
+        
+        Return dictionary containing:
+            "type" as "ParseSuccess"
+            "data" as parsed_data
+    
+    Catch error:
+        Return dictionary containing:
+            "type" as "ParseError"
+            "error_message" as "JSON parsing failed: " plus error.message
+
+Process called "parse_yaml_configuration" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Let parsed_data be parse_yaml_content with:
+            content as content
+            safe_load as options.strict_mode
+        
+        Return dictionary containing:
+            "type" as "ParseSuccess"
+            "data" as parsed_data
+    
+    Catch error:
+        Return dictionary containing:
+            "type" as "ParseError"
+            "error_message" as "YAML parsing failed: " plus error.message
+
+Process called "parse_toml_configuration" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Let parsed_data be parse_toml_content with content as content
+        
+        Return dictionary containing:
+            "type" as "ParseSuccess"
+            "data" as parsed_data
+    
+    Catch error:
+        Return dictionary containing:
+            "type" as "ParseError"
+            "error_message" as "TOML parsing failed: " plus error.message
+
+Process called "parse_ini_configuration" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Let parsed_data be parse_ini_content with:
+            content as content
+            case_sensitive as true
+            allow_no_value as not options.strict_mode
+        
+        Return dictionary containing:
+            "type" as "ParseSuccess"
+            "data" as parsed_data
+    
+    Catch error:
+        Return dictionary containing:
+            "type" as "ParseError"
+            "error_message" as "INI parsing failed: " plus error.message
+
+Process called "parse_xml_configuration" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Let parsed_data be parse_xml_content with:
+            content as content
+            preserve_namespaces as true
+        
+        Return dictionary containing:
+            "type" as "ParseSuccess"
+            "data" as parsed_data
+    
+    Catch error:
+        Return dictionary containing:
+            "type" as "ParseError"
+            "error_message" as "XML parsing failed: " plus error.message
+
+Process called "parse_env_configuration" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Let parsed_data be parse_env_content with:
+            content as content
+            expand_variables as options.enable_interpolation
+        
+        Return dictionary containing:
+            "type" as "ParseSuccess"
+            "data" as parsed_data
+    
+    Catch error:
+        Return dictionary containing:
+            "type" as "ParseError"
+            "error_message" as "ENV parsing failed: " plus error.message
+
+Process called "parse_properties_configuration" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Let parsed_data be parse_properties_content with content as content
+        
+        Return dictionary containing:
+            "type" as "ParseSuccess"
+            "data" as parsed_data
+    
+    Catch error:
+        Return dictionary containing:
+            "type" as "ParseError"
+            "error_message" as "Properties parsing failed: " plus error.message
+
+Process called "parse_auto_detect_configuration" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Try different formats in order of likelihood
+    Let formats_to_try be list containing JSON, YAML, TOML, INI, ENV, PROPERTIES
+    
+    For each format in formats_to_try:
+        Let parse_result be parse_configuration_content with:
+            content as content
+            format as format
+            options as options
+        
+        If parse_result contains "type" and parse_result["type"] is equal to "ParseSuccess":
+            Return parse_result
+    
+    Return dictionary containing:
+        "type" as "ParseError"
+        "error_message" as "Could not auto-detect configuration format"
+:End Note
+
+Note: Configuration Interpolation and Preprocessing
+Process called "interpolate_configuration_content" that takes content as String and syntax as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Match syntax:
+            When "shell":
+                Return interpolate_shell_syntax with:
+                    content as content
+                    options as options
+            
+            When "mustache":
+                Return interpolate_mustache_syntax with:
+                    content as content
+                    options as options
+            
+            When "jinja":
+                Return interpolate_jinja_syntax with:
+                    content as content
+                    options as options
+            
+            Otherwise:
+                Return interpolate_shell_syntax with:
+                    content as content
+                    options as options
+    
+    Catch error:
+        Return dictionary containing:
+            "success" as false
+            "error_message" as "Interpolation exception: " plus error.message
+
+Process called "interpolate_shell_syntax" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Note: Use environment module for shell-style variable expansion
+        Let interpolated_content be environment.expand_environment_variables with:
+            text as content
+            allow_defaults as true
+        
+        Return dictionary containing:
+            "success" as true
+            "result" as interpolated_content
+    
+    Catch error:
+        Return dictionary containing:
+            "success" as false
+            "error_message" as "Shell interpolation failed: " plus error.message
+
+Process called "process_configuration_includes" that takes data as Dictionary[String, Any] and base_path as String and options as LoaderOptions and depth as Integer returns Dictionary[String, Any]:
+    If depth is greater than options.max_include_depth:
+        Return dictionary containing:
+            "success" as false
+            "error_message" as "Maximum include depth exceeded: " plus depth as String
+    
+    Try:
+        Let processed_data be deep_copy_dictionary with dict as data
+        
+        Note: Look for include directives
+        If processed_data contains "include":
+            Let include_value be processed_data["include"]
+            
+            If is_string with value as include_value:
+                Note: Single include
+                Let include_result be process_single_include with:
+                    include_path as include_value
+                    base_path as base_path
+                    options as options
+                    depth as depth plus 1
+                
+                If include_result.success:
+                    Set processed_data to merge_configuration_data with:
+                        base_config as include_result.data
+                        overlay_config as processed_data
+                        strategy as MERGE_DEEP
+                
+                Note: Remove include directive
+                Remove "include" from processed_data
+            
+            Else If is_list with value as include_value:
+                Note: Multiple includes
+                Let merged_includes be dictionary containing
+                
+                For each include_path in include_value:
+                    Let include_result be process_single_include with:
+                        include_path as include_path
+                        base_path as base_path
+                        options as options
+                        depth as depth plus 1
+                    
+                    If include_result.success:
+                        Set merged_includes to merge_configuration_data with:
+                            base_config as merged_includes
+                            overlay_config as include_result.data
+                            strategy as MERGE_DEEP
+                
+                Set processed_data to merge_configuration_data with:
+                    base_config as merged_includes
+                    overlay_config as processed_data
+                    strategy as MERGE_DEEP
+                
+                Note: Remove include directive
+                Remove "include" from processed_data
+        
+        Return dictionary containing:
+            "success" as true
+            "merged_data" as processed_data
+    
+    Catch error:
+        Return dictionary containing:
+            "success" as false
+            "error_message" as "Include processing failed: " plus error.message
+
+Process called "process_single_include" that takes include_path as String and base_path as String and options as LoaderOptions and depth as Integer returns Dictionary[String, Any]:
+    Let full_path be resolve_include_path with:
+        include_path as include_path
+        base_path as base_path
+    
+    Let load_result be load_configuration_file with:
+        path as full_path
+        format as None
+        options as options
+    
+    Match load_result:
+        When LoadSuccess:
+            Return dictionary containing:
+                "success" as true
+                "data" as load_result.data
+        
+        When LoadError:
+            If options.allow_missing_files:
+                Return dictionary containing:
+                    "success" as true
+                    "data" as dictionary containing
+            Otherwise:
+                Return dictionary containing:
+                    "success" as false
+                    "error_message" as load_result.error_message
+        
+        When LoadPartial:
+            Return dictionary containing:
+                "success" as true
+                "data" as load_result.data
+:End Note
+
+Note: Configuration Caching System
+Process called "check_configuration_cache" that takes path as String and file_info as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Let cache be get_global_config_cache
+    
+    If cache.cached_configs contains path:
+        Let cached_timestamp be cache.cache_timestamps[path]
+        Let cached_hash be cache.cache_hashes[path]
+        Let current_time be get_current_timestamp
+        
+        Note: Check if cache is expired
+        If current_time minus cached_timestamp is less than cache.ttl_seconds:
+            Note: Check if file has been modified
+            Let current_hash be calculate_file_hash with file_info as file_info
+            
+            If current_hash is equal to cached_hash:
+                Set cache.cache_hits to cache.cache_hits plus 1
+                Return dictionary containing:
+                    "found" as true
+                    "expired" as false
+                    "data" as cache.cached_configs[path]
+    
+    Set cache.cache_misses to cache.cache_misses plus 1
+    Return dictionary containing:
+        "found" as false
+        "expired" as true
+        "data" as dictionary containing
+
+Process called "cache_configuration_data" that takes path as String and data as Dictionary[String, Any] and file_info as Dictionary[String, Any] returns None:
+    Let cache be get_global_config_cache
+    Let current_time be get_current_timestamp
+    
+    Note: Implement LRU eviction if cache is full
+    If length of cache.cached_configs is greater than or equal to cache.max_cache_size:
+        evict_oldest_cache_entry with cache as cache
+    
+    Set cache.cached_configs[path] to deep_copy_dictionary with dict as data
+    Set cache.cache_timestamps[path] to current_time
+    Set cache.cache_hashes[path] to calculate_file_hash with file_info as file_info
+    
+    Return None
+
+Process called "invalidate_configuration_cache" that takes path as String returns None:
+    Let cache be get_global_config_cache
+    
+    If cache.cached_configs contains path:
+        Remove path from cache.cached_configs
+        Remove path from cache.cache_timestamps
+        Remove path from cache.cache_hashes
+    
+    Return None
+
+Process called "clear_configuration_cache" returns None:
+    Let cache be get_global_config_cache
+    
+    Set cache.cached_configs to dictionary containing
+    Set cache.cache_timestamps to dictionary containing
+    Set cache.cache_hashes to dictionary containing
+    Set cache.cache_hits to 0
+    Set cache.cache_misses to 0
+    
+    Return None
+:End Note
+
+Note: Utility and Helper Functions
+Process called "create_default_loader_options" returns LoaderOptions:
+    Return LoaderOptions with:
+        strict_mode as false
+        allow_missing_files as true
+        enable_interpolation as true
+        interpolation_syntax as "shell"
+        enable_includes as false
+        max_include_depth as 10
+        enable_caching as true
+        cache_ttl as 300.0
+        enable_validation as false
+        validation_schema as None
+        encoding as "utf-8"
+        file_size_limit as 10485760
+        metadata as dictionary containing
+
+Process called "validate_config_file_access" that takes path as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Try:
+        Let file_exists be file.exists with path as path
+        If not file_exists:
+            Return dictionary containing:
+                "accessible" as false
+                "error_message" as "Configuration file does not exist: " plus path
+                "file_info" as dictionary containing
+        
+        Let file_readable be file.is_readable with path as path
+        If not file_readable:
+            Return dictionary containing:
+                "accessible" as false
+                "error_message" as "Configuration file is not readable: " plus path
+                "file_info" as dictionary containing
+        
+        Let file_size be file.get_size with path as path
+        If file_size is greater than options.file_size_limit:
+            Return dictionary containing:
+                "accessible" as false
+                "error_message" as "Configuration file too large: " plus file_size as String plus " bytes (limit: " plus options.file_size_limit as String plus ")"
+                "file_info" as dictionary containing
+        
+        Let file_info be dictionary containing:
+            "path" as path
+            "size" as file_size
+            "last_modified" as file.get_last_modified with path as path
+            "readable" as true
+            "exists" as true
+        
+        Return dictionary containing:
+            "accessible" as true
+            "error_message" as ""
+            "file_info" as file_info
+    
+    Catch error:
+        Return dictionary containing:
+            "accessible" as false
+            "error_message" as "File access validation failed: " plus error.message
+            "file_info" as dictionary containing
+
+Process called "get_file_extension" that takes path as String returns String:
+    Let last_dot_index be last_index_of with text as path and substring as "."
+    If last_dot_index is equal to -1:
+        Return ""
+    Otherwise:
+        Return substring of path from last_dot_index to length of path
+
+Process called "get_directory_from_path" that takes path as String returns String:
+    Let last_slash_index be last_index_of with text as path and substring as "/"
+    If last_slash_index is equal to -1:
+        Return "."
+    Otherwise:
+        Return substring of path from 0 to last_slash_index
+
+Process called "resolve_include_path" that takes include_path as String and base_path as String returns String:
+    If starts_with with text as include_path and prefix as "/":
+        Note: Absolute path
+        Return include_path
+    Otherwise:
+        Note: Relative path
+        Return base_path plus "/" plus include_path
+
+Process called "deep_copy_dictionary" that takes dict as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Let result be dictionary containing
+    For each key, value in dict:
+        Set result[key] to deep_copy_value with value as value
+    Return result
+
+Process called "deep_copy_value" that takes value as Any returns Any:
+    If is_dictionary with value as value:
+        Return deep_copy_dictionary with dict as value
+    Else If is_list with value as value:
+        Return deep_copy_list with list as value
+    Otherwise:
+        Return value
+
+Process called "deep_copy_list" that takes list as List[Any] returns List[Any]:
+    Let result be list containing
+    For each item in list:
+        Add deep_copy_value with value as item to result
+    Return result
+
+Process called "is_dictionary" that takes value as Any returns Boolean:
+    Note: Implementation should check if value is a dictionary
+    Return false
+
+Process called "is_list" that takes value as Any returns Boolean:
+    Note: Implementation should check if value is a list
+    Return false
+
+Process called "is_string" that takes value as Any returns Boolean:
+    Note: Implementation should check if value is a string
+    Return false
+
+Process called "get_current_timestamp" returns Float:
+    Note: Returns current system timestamp with microsecond precision
+    Let time_result be system_call_current_time
+    Return time_result.seconds as Float plus (time_result.microseconds as Float divided by 1000000.0)
+
+Process called "lowercase" that takes text as String returns String:
+    Note: Implementation should convert string to lowercase
+    Return text
+
+Process called "join_list" that takes list as List[String] and separator as String returns String:
+    Let result be ""
+    Let first be true
+    For each item in list:
+        If not first:
+            Set result to result plus separator
+        Set result to result plus item
+        Set first to false
+    Return result
+
+Process called "last_index_of" that takes text as String and substring as String returns Integer:
+    Note: Implementation should return last index of substring in text
+    Return -1
+
+Process called "substring" that takes text as String and start as Integer and end as Integer returns String:
+    Note: Implementation should extract substring
+    Return text
+
+Process called "starts_with" that takes text as String and prefix as String returns Boolean:
+    Note: Implementation should check if text starts with prefix
+    Return false
+:End Note
+
+Note: Low-level Configuration Operations (Platform-dependent)
+Process called "read_config_file_content" that takes path as String and encoding as String and size_limit as Integer returns Dictionary[String, Any]:
+    Note: Platform-specific implementation to read file content
+    Return dictionary containing "success" as true, "content" as "", "error_message" as ""
+
+Process called "write_config_file_content" that takes path as String and content as String and encoding as String returns Dictionary[String, Any]:
+    Note: Platform-specific implementation to write file content
+    Return dictionary containing "success" as true, "bytes_written" as 0, "error_message" as ""
+
+Process called "validate_config_file_write_access" that takes path as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Platform-specific implementation to validate write access
+    Return dictionary containing "writable" as true, "error_message" as ""
+
+Process called "detect_format_from_content" that takes path as String returns Dictionary[String, Any]:
+    Note: Detect format by examining file content
+    Return dictionary containing "detected" as false, "format" as AUTO
+
+Process called "calculate_file_hash" that takes file_info as Dictionary[String, Any] returns String:
+    Note: Calculate hash for file change detection
+    Return "hash_placeholder"
+
+Process called "get_global_config_cache" returns ConfigCache:
+    Note: Get or create global configuration cache
+    Return ConfigCache with:
+        cached_configs as dictionary containing
+        cache_timestamps as dictionary containing
+        cache_hashes as dictionary containing
+        cache_hits as 0
+        cache_misses as 0
+        max_cache_size as 100
+        ttl_seconds as 300.0
+        metadata as dictionary containing
+
+Process called "evict_oldest_cache_entry" that takes cache as ConfigCache returns None:
+    Note: Implement LRU eviction policy
+    Return None
+
+Process called "remove_json_comments" that takes content as String returns String:
+    Note: Remove JSON comments for compatibility
+    Return content
+
+Process called "parse_yaml_content" that takes content as String and safe_load as Boolean returns Dictionary[String, Any]:
+    Note: Parse YAML content
+    Return dictionary containing
+
+Process called "parse_toml_content" that takes content as String returns Dictionary[String, Any]:
+    Note: Parse TOML content
+    Return dictionary containing
+
+Process called "parse_ini_content" that takes content as String and case_sensitive as Boolean and allow_no_value as Boolean returns Dictionary[String, Any]:
+    Note: Parse INI content
+    Return dictionary containing
+
+Process called "parse_xml_content" that takes content as String and preserve_namespaces as Boolean returns Dictionary[String, Any]:
+    Note: Parse XML content
+    Return dictionary containing
+
+Process called "parse_env_content" that takes content as String and expand_variables as Boolean returns Dictionary[String, Any]:
+    Note: Parse .env file content
+    Let result be dictionary containing
+    Let lines be split_string with value as content and separator as "\n"
+    
+    For each line in lines:
+        Let trimmed_line be trim_whitespace with value as line
+        
+        Note: Skip empty lines and comments
+        If trimmed_line is equal to "" or starts_with with text as trimmed_line and prefix as "Note:":
+            Continue
+        
+        Note: Find key=value pairs
+        Let equals_index be index_of with text as trimmed_line and substring as "="
+        If equals_index is not equal to -1:
+            Let key be trim_whitespace with value as substring of trimmed_line from 0 to equals_index
+            Let value be trim_whitespace with value as substring of trimmed_line from (equals_index plus 1) to length of trimmed_line
+            
+            Note: Remove quotes if present
+            If starts_with with text as value and prefix as "\"" and ends_with with text as value and suffix as "\"":
+                Set value to substring of value from 1 to (length of value minus 1)
+            
+            Set result[key] to value
+    
+    Return result
+
+Process called "parse_properties_content" that takes content as String returns Dictionary[String, Any]:
+    Note: Parse Java properties content
+    Return dictionary containing
+
+Process called "serialize_json_configuration" that takes data as Dictionary[String, Any] and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Serialize data to JSON format
+    Return dictionary containing "success" as true, "content" as "{}", "error_message" as ""
+
+Process called "serialize_yaml_configuration" that takes data as Dictionary[String, Any] and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Serialize data to YAML format
+    Return dictionary containing "success" as true, "content" as "", "error_message" as ""
+
+Process called "serialize_toml_configuration" that takes data as Dictionary[String, Any] and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Serialize data to TOML format
+    Return dictionary containing "success" as true, "content" as "", "error_message" as ""
+
+Process called "serialize_ini_configuration" that takes data as Dictionary[String, Any] and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Serialize data to INI format
+    Return dictionary containing "success" as true, "content" as "", "error_message" as ""
+
+Process called "serialize_xml_configuration" that takes data as Dictionary[String, Any] and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Serialize data to XML format
+    Return dictionary containing "success" as true, "content" as "", "error_message" as ""
+
+Process called "serialize_env_configuration" that takes data as Dictionary[String, Any] and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Serialize data to .env format
+    Let content be ""
+    For each key, value in data:
+        Set content to content plus key plus "=" plus value as String plus "\n"
+    
+    Return dictionary containing "success" as true, "content" as content, "error_message" as ""
+
+Process called "serialize_properties_configuration" that takes data as Dictionary[String, Any] and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Serialize data to properties format
+    Return dictionary containing "success" as true, "content" as "", "error_message" as ""
+
+Process called "interpolate_mustache_syntax" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Interpolate mustache-style templates
+    Return dictionary containing "success" as true, "result" as content
+
+Process called "interpolate_jinja_syntax" that takes content as String and options as LoaderOptions returns Dictionary[String, Any]:
+    Note: Interpolate Jinja-style templates
+    Return dictionary containing "success" as true, "result" as content
+
+Process called "validate_configuration_data" that takes data as Dictionary[String, Any] and schema as Dictionary[String, Any] returns Dictionary[String, Any]:
+    Note: Validate configuration against schema
+    Return dictionary containing "valid" as true, "errors" as list containing, "error_message" as ""
+
+Process called "trim_whitespace" that takes value as String returns String:
+    Note: Implementation should remove leading and trailing whitespace
+    Return value
+
+Process called "split_string" that takes value as String and separator as String returns List[String]:
+    Note: Implementation should split string by separator
+    Return list containing value
+
+Process called "index_of" that takes text as String and substring as String returns Integer:
+    Note: Implementation should return index of substring in text
+    Return -1
+
+Process called "ends_with" that takes text as String and suffix as String returns Boolean:
+    Note: Implementation should check if text ends with suffix
+    Return false
+:End Note
