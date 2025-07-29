@@ -242,7 +242,7 @@ pub extern "C" fn system_call_crypto_algorithms(
     std::mem::forget(algorithm_ptrs);
     
     unsafe {
-        *algorithms_out = algorithms_ptr;
+        *algorithms_out = algorithms_ptr as *const c_char;
         *count_out = count;
     }
     
@@ -300,11 +300,13 @@ pub extern "C" fn system_call_crypto_secure_wipe(data: *mut u8, length: usize) -
 // ============================================================================
 
 /// Validate hash algorithm name
+#[allow(dead_code)]
 fn is_supported_algorithm(algorithm: &str) -> bool {
     matches!(algorithm, "md5" | "sha1" | "sha256" | "sha512")
 }
 
 /// Get expected hash length for algorithm
+#[allow(dead_code)]
 fn get_hash_length(algorithm: &str) -> usize {
     match algorithm {
         "md5" => 16,

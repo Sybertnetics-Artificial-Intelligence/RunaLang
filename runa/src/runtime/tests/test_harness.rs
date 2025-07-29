@@ -3,7 +3,7 @@
 // For each .runa file, runs it with runac.exe and compares output to .out file if present.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -30,7 +30,7 @@ fn run_all_runa_tests() {
     find_runa_files(test_dir, &mut files);
     assert!(!files.is_empty(), "No .runa test files found in tests/ directory");
 
-    let runac_path = Path::new("../../runa/rust/target/debug/runac.exe");
+    let runac_path = Path::new("target/debug/runac.exe");
     assert!(runac_path.exists(), "runac.exe not found at {:?}", runac_path);
 
     let mut failures = Vec::new();

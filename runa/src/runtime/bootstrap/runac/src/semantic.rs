@@ -359,7 +359,7 @@ impl AstVisitor for SemanticAnalyzer {
                 }
                 Ok(*boxed_elem_type)
             }
-            RunaType::Dictionary(boxed_key_type, boxed_value_type) => {
+            RunaType::Dictionary(_boxed_key_type, boxed_value_type) => {
                 // For now, allow any key type (could be stricter)
                 Ok(*boxed_value_type)
             }

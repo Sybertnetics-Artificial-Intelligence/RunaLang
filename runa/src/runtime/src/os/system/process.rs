@@ -222,7 +222,7 @@ mod tests {
         assert!(arg_count > 0);
         
         let env_count = get_env_count();
-        assert!(env_count >= 0); // This is always true for usize, but kept for clarity
+        assert!(env_count >= 0);
     }
 
     #[test]

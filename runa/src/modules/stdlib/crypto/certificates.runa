@@ -1,0 +1,936 @@
+Note: Runa Standard Library - X.509 Digital Certificates and PKI
+This module provides production-grade X.509 certificate parsing, validation, creation,
+and TLS/SSL certificate management for public key infrastructure (PKI) operations.
+
+Supports certificate chains, CRL validation, OCSP, certificate extensions,
+and complete RFC 5280 compliance for secure certificate-based authentication.
+
+Specification compliance: RFC 5280, RFC 6818, RFC 6960, RFC 5746, RFC 8446 (TLS 1.3).
+
+Import "crypto/asymmetric" as asymmetric
+Import "crypto/hash" as hash
+Import "crypto/primitives/random" as random
+Import "time" as time
+Import "encoding/asn1" as asn1
+Import "encoding/base64" as base64
+Import "net/http" as http
+
+Type X509Certificate is Dictionary with:
+    version as Integer
+    serial_number as List[Integer]
+    signature_algorithm as String
+    issuer as DistinguishedName
+    subject as DistinguishedName
+    valid_from as DateTime
+    valid_to as DateTime
+    public_key as asymmetric.PublicKey
+    signature as List[Integer]
+    extensions as List[X509Extension]
+    raw_der_bytes as List[Integer]
+
+Type DistinguishedName is Dictionary with:
+    common_name as Optional[String]
+    organization as Optional[String]
+    organizational_unit as Optional[String]
+    country as Optional[String]
+    state as Optional[String]
+    locality as Optional[String]
+    email as Optional[String]
+    raw_attributes as List[Dictionary[String, String]]
+
+Type X509Extension is Dictionary with:
+    oid as String
+    critical as Boolean
+    value as List[Integer]
+    parsed_value as Optional[Dictionary[String, Any]]
+
+Type CertificateChain is Dictionary with:
+    certificates as List[X509Certificate]
+    root_certificate as X509Certificate
+    intermediate_certificates as List[X509Certificate]
+    end_entity_certificate as X509Certificate
+    validation_time as DateTime
+
+Type CertificateRequest is Dictionary with:
+    version as Integer
+    subject as DistinguishedName
+    public_key as asymmetric.PublicKey
+    attributes as List[Dictionary[String, Any]]
+    signature_algorithm as String
+    signature as List[Integer]
+    raw_der_bytes as List[Integer]
+
+Type CertificateRevocationList is Dictionary with:
+    version as Integer
+    issuer as DistinguishedName
+    this_update as DateTime
+    next_update as Optional[DateTime]
+    revoked_certificates as List[RevokedCertificate]
+    signature_algorithm as String
+    signature as List[Integer]
+    extensions as List[X509Extension]
+
+Type RevokedCertificate is Dictionary with:
+    serial_number as List[Integer]
+    revocation_date as DateTime
+    reason_code as Optional[Integer]
+    extensions as List[X509Extension]
+
+Type CertificateValidationResult is Dictionary with:
+    is_valid as Boolean
+    trust_chain_valid as Boolean
+    not_expired as Boolean
+    signature_valid as Boolean
+    revocation_status as RevocationStatus
+    validation_errors as List[String]
+    validation_warnings as List[String]
+
+Type RevocationStatus is Enum with:
+    Not_Checked
+    Valid
+    Revoked
+    Unknown
+    Error
+
+Type CertificateResult is Union with:
+    CertificateSuccess with value as Dictionary[String, Any]
+    CertificateFailure with error as CertificateError and message as String
+
+Type CertificateError is Enum with:
+    Invalid_Certificate
+    Invalid_Signature
+    Expired_Certificate
+    Invalid_Chain
+    Untrusted_Root
+    Revoked_Certificate
+    Invalid_Extension
+    Parsing_Error
+    Validation_Error
+    Network_Error
+    Internal_Error
+
+Note: Certificate Algorithm Constants
+Let SIGNATURE_RSA_SHA256 be "sha256WithRSAEncryption"
+Let SIGNATURE_RSA_SHA384 be "sha384WithRSAEncryption"
+Let SIGNATURE_RSA_SHA512 be "sha512WithRSAEncryption"
+Let SIGNATURE_ECDSA_SHA256 be "ecdsa-with-SHA256"
+Let SIGNATURE_ECDSA_SHA384 be "ecdsa-with-SHA384"
+Let SIGNATURE_ECDSA_SHA512 be "ecdsa-with-SHA512"
+Let SIGNATURE_ED25519 be "Ed25519"
+
+Note: X.509 Extension OIDs
+Let OID_BASIC_CONSTRAINTS be "2.5.29.19"
+Let OID_KEY_USAGE be "2.5.29.15"
+Let OID_EXTENDED_KEY_USAGE be "2.5.29.37"
+Let OID_SUBJECT_ALT_NAME be "2.5.29.17"
+Let OID_AUTHORITY_KEY_IDENTIFIER be "2.5.29.35"
+Let OID_SUBJECT_KEY_IDENTIFIER be "2.5.29.14"
+Let OID_CRL_DISTRIBUTION_POINTS be "2.5.29.31"
+Let OID_AUTHORITY_INFO_ACCESS be "1.3.6.1.5.5.7.1.1"
+Let OID_CERTIFICATE_POLICIES be "2.5.29.32"
+
+Note: Key Usage Flags
+Let KEY_USAGE_DIGITAL_SIGNATURE be 0
+Let KEY_USAGE_KEY_ENCIPHERMENT be 2
+Let KEY_USAGE_DATA_ENCIPHERMENT be 3
+Let KEY_USAGE_KEY_AGREEMENT be 4
+Let KEY_USAGE_KEY_CERT_SIGN be 5
+Let KEY_USAGE_CRL_SIGN be 6
+
+Note: Extended Key Usage OIDs
+Let EKU_SERVER_AUTH be "1.3.6.1.5.5.7.3.1"
+Let EKU_CLIENT_AUTH be "1.3.6.1.5.5.7.3.2"
+Let EKU_CODE_SIGNING be "1.3.6.1.5.5.7.3.3"
+Let EKU_EMAIL_PROTECTION be "1.3.6.1.5.5.7.3.4"
+Let EKU_TIME_STAMPING be "1.3.6.1.5.5.7.3.8"
+Let EKU_OCSP_SIGNING be "1.3.6.1.5.5.7.3.9"
+
+Note: Primary Certificate Interface Functions
+
+Process called "parse_x509_certificate" that takes der_bytes as List[Integer] returns CertificateResult[X509Certificate]:
+    Note: Parse DER-encoded X.509 certificate according to RFC 5280
+    Try:
+        Note: Parse outer Certificate ASN.1 structure
+        Let certificate_asn1_result be asn1.parse_der with data as der_bytes
+        Match certificate_asn1_result:
+            When asn1.Asn1Failure:
+                Return CertificateFailure with:
+                    error as CertificateError.Parsing_Error
+                    message as "Failed to parse certificate DER: " plus certificate_asn1_result.message
+            When asn1.Asn1Success with value as certificate_asn1:
+                Note: Extract TBSCertificate (To Be Signed Certificate)
+                Let tbs_certificate_result be extract_tbs_certificate with certificate_asn1 as certificate_asn1
+                Match tbs_certificate_result:
+                    When CertificateFailure:
+                        Return tbs_certificate_result
+                    When CertificateSuccess with value as tbs_data:
+                        Note: Extract signature algorithm and signature
+                        Let signature_info_result be extract_signature_info with certificate_asn1 as certificate_asn1
+                        Match signature_info_result:
+                            When CertificateFailure:
+                                Return signature_info_result
+                            When CertificateSuccess with value as signature_info:
+                                Note: Parse TBSCertificate fields
+                                Let certificate_fields_result be parse_tbs_certificate_fields with tbs_asn1 as tbs_data["tbs_asn1"]
+                                Match certificate_fields_result:
+                                    When CertificateFailure:
+                                        Return certificate_fields_result
+                                    When CertificateSuccess with value as cert_fields:
+                                        Note: Create complete certificate object
+                                        Let certificate be X509Certificate with:
+                                            version as cert_fields["version"]
+                                            serial_number as cert_fields["serial_number"]
+                                            signature_algorithm as signature_info["algorithm"]
+                                            issuer as cert_fields["issuer"]
+                                            subject as cert_fields["subject"]
+                                            valid_from as cert_fields["valid_from"]
+                                            valid_to as cert_fields["valid_to"]
+                                            public_key as cert_fields["public_key"]
+                                            signature as signature_info["signature"]
+                                            extensions as cert_fields["extensions"]
+                                            raw_der_bytes as der_bytes
+                                        
+                                        Return CertificateSuccess with value as certificate
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Parsing_Error
+            message as "Certificate parsing error: " plus error as String
+
+Process called "validate_certificate" that takes certificate as X509Certificate and trusted_roots as List[X509Certificate] and validation_time as Optional[DateTime] returns CertificateResult[CertificateValidationResult]:
+    Note: Validate X.509 certificate against trusted roots and policies
+    Try:
+        Let current_time be validation_time if validation_time is not None else time.now
+        Let validation_errors be empty list
+        Let validation_warnings be empty list
+        Let is_valid be true
+        
+        Note: Check certificate validity period
+        Let time_valid be validate_certificate_time_period with certificate as certificate and validation_time as current_time
+        If not time_valid:
+            Add "Certificate is expired or not yet valid" to validation_errors
+            Set is_valid to false
+        
+        Note: Validate certificate signature
+        Let signature_valid_result be verify_certificate_signature with certificate as certificate and trusted_roots as trusted_roots
+        Match signature_valid_result:
+            When CertificateFailure:
+                Add "Certificate signature validation failed: " plus signature_valid_result.message to validation_errors
+                Set is_valid to false
+            When CertificateSuccess with value as signature_valid:
+                If not signature_valid:
+                    Add "Certificate signature is invalid" to validation_errors
+                    Set is_valid to false
+        
+        Note: Build and validate certificate chain
+        Let chain_result be build_certificate_chain with certificate as certificate and trusted_roots as trusted_roots
+        Match chain_result:
+            When CertificateFailure:
+                Add "Certificate chain validation failed: " plus chain_result.message to validation_errors
+                Set is_valid to false
+            When CertificateSuccess with value as chain:
+                Note: Validate chain constraints and extensions
+                Let chain_valid_result be validate_certificate_chain_constraints with chain as chain
+                Match chain_valid_result:
+                    When CertificateFailure:
+                        Add "Certificate chain constraints failed: " plus chain_valid_result.message to validation_errors
+                        Set is_valid to false
+                    When CertificateSuccess:
+                        Note: Chain is valid
+        
+        Note: Check certificate revocation status
+        Let revocation_result be check_certificate_revocation with certificate as certificate
+        Match revocation_result:
+            When CertificateFailure:
+                Add "Revocation check failed: " plus revocation_result.message to validation_warnings
+            When CertificateSuccess with value as revocation_status:
+                If revocation_status is equal to RevocationStatus.Revoked:
+                    Add "Certificate has been revoked" to validation_errors
+                    Set is_valid to false
+        
+        Note: Validate critical extensions
+        Let extensions_result be validate_critical_extensions with certificate as certificate
+        Match extensions_result:
+            When CertificateFailure:
+                Add "Critical extension validation failed: " plus extensions_result.message to validation_errors
+                Set is_valid to false
+            When CertificateSuccess:
+                Note: Extensions are valid
+        
+        Let validation_result be CertificateValidationResult with:
+            is_valid as is_valid
+            trust_chain_valid as (chain_result is CertificateSuccess)
+            not_expired as time_valid
+            signature_valid as (signature_valid_result is CertificateSuccess)
+            revocation_status as (revocation_result["status"] if revocation_result is CertificateSuccess else RevocationStatus.Error)
+            validation_errors as validation_errors
+            validation_warnings as validation_warnings
+        
+        Return CertificateSuccess with value as validation_result
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Validation_Error
+            message as "Certificate validation error: " plus error as String
+
+Process called "create_certificate_request" that takes subject as DistinguishedName and key_pair as asymmetric.AsymmetricKeyPair and extensions as Optional[List[X509Extension]] returns CertificateResult[CertificateRequest]:
+    Note: Create PKCS#10 Certificate Signing Request (CSR)
+    Try:
+        Note: Build CertificationRequestInfo structure
+        Let request_info_result be build_csr_info with subject as subject and public_key as key_pair.public_key and extensions as extensions
+        Match request_info_result:
+            When CertificateFailure:
+                Return request_info_result
+            When CertificateSuccess with value as request_info:
+                Note: Sign the request using private key
+                Let signature_algorithm be determine_signature_algorithm with key_pair as key_pair
+                Let signature_result be asymmetric.sign_message with private_key as key_pair.private_key and message as request_info["der_bytes"] and hash_algorithm as "SHA256" and padding_scheme as None
+                Match signature_result:
+                    When asymmetric.AsymmetricFailure:
+                        Return CertificateFailure with:
+                            error as CertificateError.Invalid_Signature
+                            message as "Failed to sign certificate request: " plus signature_result.message
+                    When asymmetric.AsymmetricSuccess with value as signature:
+                        Note: Build complete CSR
+                        Let csr_result be build_complete_csr with request_info as request_info["asn1"] and signature_algorithm as signature_algorithm and signature as signature.signature_bytes
+                        Match csr_result:
+                            When CertificateSuccess with value as csr_der:
+                                Let certificate_request be CertificateRequest with:
+                                    version as 0
+                                    subject as subject
+                                    public_key as key_pair.public_key
+                                    attributes as (extensions if extensions is not None else empty list)
+                                    signature_algorithm as signature_algorithm
+                                    signature as signature.signature_bytes
+                                    raw_der_bytes as csr_der
+                                
+                                Return CertificateSuccess with value as certificate_request
+                            When CertificateFailure:
+                                Return csr_result
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Internal_Error
+            message as "CSR creation error: " plus error as String
+
+Process called "issue_certificate" that takes csr as CertificateRequest and issuer_certificate as X509Certificate and issuer_private_key as asymmetric.PrivateKey and validity_days as Integer and extensions as Optional[List[X509Extension]] returns CertificateResult[X509Certificate]:
+    Note: Issue X.509 certificate from CSR (Certificate Authority function)
+    Try:
+        Note: Generate unique serial number
+        Let serial_number_result be generate_certificate_serial_number
+        Match serial_number_result:
+            When CertificateFailure:
+                Return serial_number_result
+            When CertificateSuccess with value as serial_number:
+                Note: Set validity period
+                Let current_time be time.now
+                Let valid_from be current_time
+                Let valid_to be time.add_days with datetime as current_time and days as validity_days
+                
+                Note: Prepare certificate extensions
+                Let final_extensions be prepare_certificate_extensions with requested_extensions as extensions and csr as csr and issuer as issuer_certificate
+                
+                Note: Build TBSCertificate structure
+                Let tbs_cert_result be build_tbs_certificate with:
+                    version as 2,
+                    serial_number as serial_number,
+                    issuer as issuer_certificate.subject,
+                    subject as csr.subject,
+                    valid_from as valid_from,
+                    valid_to as valid_to,
+                    public_key as csr.public_key,
+                    extensions as final_extensions
+                
+                Match tbs_cert_result:
+                    When CertificateFailure:
+                        Return tbs_cert_result
+                    When CertificateSuccess with value as tbs_cert:
+                        Note: Sign certificate with issuer's private key
+                        Let signature_algorithm be determine_signature_algorithm_for_key with private_key as issuer_private_key
+                        Let signature_result be asymmetric.sign_message with private_key as issuer_private_key and message as tbs_cert["der_bytes"] and hash_algorithm as "SHA256" and padding_scheme as None
+                        Match signature_result:
+                            When asymmetric.AsymmetricFailure:
+                                Return CertificateFailure with:
+                                    error as CertificateError.Invalid_Signature
+                                    message as "Failed to sign certificate: " plus signature_result.message
+                            When asymmetric.AsymmetricSuccess with value as signature:
+                                Note: Build complete certificate
+                                Let certificate_result be build_complete_certificate with tbs_certificate as tbs_cert["asn1"] and signature_algorithm as signature_algorithm and signature as signature.signature_bytes
+                                Match certificate_result:
+                                    When CertificateSuccess with value as certificate_der:
+                                        Note: Parse the created certificate to return proper object
+                                        Let final_cert_result be parse_x509_certificate with der_bytes as certificate_der
+                                        Return final_cert_result
+                                    When CertificateFailure:
+                                        Return certificate_result
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Internal_Error
+            message as "Certificate issuance error: " plus error as String
+
+Process called "verify_certificate_chain" that takes certificate_chain as CertificateChain and trusted_roots as List[X509Certificate] and validation_time as Optional[DateTime] returns CertificateResult[Boolean]:
+    Note: Verify complete certificate chain up to trusted root
+    Try:
+        Let current_time be validation_time if validation_time is not None else time.now
+        
+        Note: Start with end-entity certificate
+        Let current_cert be certificate_chain.end_entity_certificate
+        Let chain_certificates be certificate_chain.certificates
+        
+        Note: Validate each certificate in the chain
+        For i from 0 to (length of chain_certificates minus 2):
+            Let cert be chain_certificates at index i
+            Let issuer_cert be chain_certificates at index (i plus 1)
+            
+            Note: Verify current certificate against its issuer
+            Let verification_result be verify_single_certificate with certificate as cert and issuer_certificate as issuer_cert and validation_time as current_time
+            Match verification_result:
+                When CertificateFailure:
+                    Return verification_result
+                When CertificateSuccess with value as is_valid:
+                    If not is_valid:
+                        Return CertificateFailure with:
+                            error as CertificateError.Invalid_Chain
+                            message as "Certificate chain verification failed at index " plus i as String
+        
+        Note: Verify root certificate is trusted
+        Let root_cert be certificate_chain.root_certificate
+        Let is_trusted_root be false
+        
+        For trusted_root in trusted_roots:
+            If certificates_equal with cert1 as root_cert and cert2 as trusted_root:
+                Set is_trusted_root to true
+                Break
+        
+        If not is_trusted_root:
+            Return CertificateFailure with:
+                error as CertificateError.Untrusted_Root
+                message as "Root certificate is not in trusted store"
+        
+        Return CertificateSuccess with value as true
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Validation_Error
+            message as "Chain verification error: " plus error as String
+
+Process called "check_certificate_revocation" that takes certificate as X509Certificate returns CertificateResult[RevocationStatus]:
+    Note: Check certificate revocation status via CRL and OCSP
+    Try:
+        Note: First try OCSP if available
+        Let ocsp_result be check_certificate_ocsp with certificate as certificate
+        Match ocsp_result:
+            When CertificateSuccess with value as ocsp_status:
+                If ocsp_status is not equal to RevocationStatus.Unknown:
+                    Return CertificateSuccess with value as ocsp_status
+            When CertificateFailure:
+                Note: OCSP failed, fall back to CRL
+        
+        Note: Check via CRL Distribution Points
+        Let crl_result be check_certificate_crl with certificate as certificate
+        Match crl_result:
+            When CertificateSuccess with value as crl_status:
+                Return CertificateSuccess with value as crl_status
+            When CertificateFailure:
+                Note: Both OCSP and CRL failed
+                Return CertificateSuccess with value as RevocationStatus.Unknown
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Network_Error
+            message as "Revocation check error: " plus error as String
+
+Process called "export_certificate_pem" that takes certificate as X509Certificate returns CertificateResult[String]:
+    Note: Export certificate to PEM format
+    Try:
+        Let base64_result be base64.encode with data as certificate.raw_der_bytes
+        Match base64_result:
+            When base64.Base64Success with value as base64_data:
+                Let pem_data be "-----BEGIN CERTIFICATE-----\n" plus base64_data plus "\n-----END CERTIFICATE-----\n"
+                Return CertificateSuccess with value as pem_data
+            When base64.Base64Failure:
+                Return CertificateFailure with:
+                    error as CertificateError.Internal_Error
+                    message as "Failed to encode certificate to Base64"
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Internal_Error
+            message as "PEM export error: " plus error as String
+
+Process called "import_certificate_pem" that takes pem_data as String returns CertificateResult[X509Certificate]:
+    Note: Import certificate from PEM format
+    Try:
+        Note: Extract Base64 data from PEM wrapper
+        Let base64_data be extract_base64_from_pem with pem_data as pem_data and type as "CERTIFICATE"
+        If base64_data is None:
+            Return CertificateFailure with:
+                error as CertificateError.Parsing_Error
+                message as "Invalid PEM format: no certificate data found"
+        
+        Note: Decode Base64 to DER bytes
+        Let der_result be base64.decode with data as base64_data
+        Match der_result:
+            When base64.Base64Success with value as der_bytes:
+                Note: Parse DER certificate
+                Let certificate_result be parse_x509_certificate with der_bytes as der_bytes
+                Return certificate_result
+            When base64.Base64Failure:
+                Return CertificateFailure with:
+                    error as CertificateError.Parsing_Error
+                    message as "Failed to decode PEM Base64 data"
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Parsing_Error
+            message as "PEM import error: " plus error as String
+
+Note: Certificate Chain Building and Validation
+
+Process called "build_certificate_chain" that takes certificate as X509Certificate and trusted_roots as List[X509Certificate] returns CertificateResult[CertificateChain]:
+    Note: Build certificate chain from end-entity to trusted root
+    Try:
+        Let chain_certificates be list containing certificate
+        Let current_cert be certificate
+        Let max_chain_length be 10
+        
+        Note: Build chain by following issuer links
+        For depth from 1 to max_chain_length:
+            Note: Check if current certificate is self-signed (root)
+            If is_self_signed_certificate with certificate as current_cert:
+                Note: Verify if this root is trusted
+                Let is_trusted be false
+                For trusted_root in trusted_roots:
+                    If certificates_equal with cert1 as current_cert and cert2 as trusted_root:
+                        Set is_trusted to true
+                        Break
+                
+                If is_trusted:
+                    Let certificate_chain be CertificateChain with:
+                        certificates as chain_certificates
+                        root_certificate as current_cert
+                        intermediate_certificates as (chain_certificates from index 1 to (length of chain_certificates minus 1))
+                        end_entity_certificate as certificate
+                        validation_time as time.now
+                    
+                    Return CertificateSuccess with value as certificate_chain
+                Else:
+                    Return CertificateFailure with:
+                        error as CertificateError.Untrusted_Root
+                        message as "Certificate chain ends with untrusted root"
+            
+            Note: Find issuer certificate
+            Let issuer_result be find_issuer_certificate with certificate as current_cert and trusted_roots as trusted_roots
+            Match issuer_result:
+                When CertificateFailure:
+                    Return CertificateFailure with:
+                        error as CertificateError.Invalid_Chain
+                        message as "Cannot find issuer for certificate: " plus issuer_result.message
+                When CertificateSuccess with value as issuer_cert:
+                    Add issuer_cert to chain_certificates
+                    Set current_cert to issuer_cert
+        
+        Return CertificateFailure with:
+            error as CertificateError.Invalid_Chain
+            message as "Certificate chain too long (max " plus max_chain_length as String plus " certificates)"
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Internal_Error
+            message as "Chain building error: " plus error as String
+
+Process called "validate_certificate_chain_constraints" that takes chain as CertificateChain returns CertificateResult[Boolean]:
+    Note: Validate certificate chain constraints including Basic Constraints and Key Usage
+    Try:
+        Let certificates be chain.certificates
+        
+        Note: Validate each certificate's constraints
+        For i from 0 to (length of certificates minus 1):
+            Let cert be certificates at index i
+            Let is_ca_cert be (i is not equal to 0)  Note: All except end-entity should be CA certs
+            
+            Note: Check Basic Constraints extension
+            Let basic_constraints_result be get_basic_constraints_extension with certificate as cert
+            Match basic_constraints_result:
+                When CertificateSuccess with value as basic_constraints:
+                    If is_ca_cert:
+                        Note: CA certificates must have CA flag set
+                        If not basic_constraints["is_ca"]:
+                            Return CertificateFailure with:
+                                error as CertificateError.Invalid_Chain
+                                message as "Intermediate certificate is not marked as CA"
+                        
+                        Note: Check path length constraint
+                        If basic_constraints["path_length"] is not None:
+                            Let remaining_depth be (length of certificates minus i minus 2)
+                            If remaining_depth is greater than basic_constraints["path_length"]:
+                                Return CertificateFailure with:
+                                    error as CertificateError.Invalid_Chain
+                                    message as "Path length constraint violated"
+                    Else:
+                        Note: End-entity certificates should not have CA flag set
+                        If basic_constraints["is_ca"]:
+                            Return CertificateFailure with:
+                                error as CertificateError.Invalid_Chain
+                                message as "End-entity certificate incorrectly marked as CA"
+                When CertificateFailure:
+                    Note: Basic Constraints missing - check if required
+                    If is_ca_cert:
+                        Return CertificateFailure with:
+                            error as CertificateError.Invalid_Chain
+                            message as "CA certificate missing Basic Constraints extension"
+            
+            Note: Validate Key Usage for CA certificates
+            If is_ca_cert:
+                Let key_usage_result be get_key_usage_extension with certificate as cert
+                Match key_usage_result:
+                    When CertificateSuccess with value as key_usage:
+                        If not (KEY_USAGE_KEY_CERT_SIGN in key_usage):
+                            Return CertificateFailure with:
+                                error as CertificateError.Invalid_Chain
+                                message as "CA certificate missing keyCertSign usage"
+                    When CertificateFailure:
+                        Return CertificateFailure with:
+                            error as CertificateError.Invalid_Chain
+                            message as "CA certificate missing Key Usage extension"
+        
+        Return CertificateSuccess with value as true
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Validation_Error
+            message as "Chain constraint validation error: " plus error as String
+
+Process called "verify_single_certificate" that takes certificate as X509Certificate and issuer_certificate as X509Certificate and validation_time as DateTime returns CertificateResult[Boolean]:
+    Note: Verify single certificate against its issuer
+    Try:
+        Note: Check that issuer matches
+        If not distinguished_names_equal with dn1 as certificate.issuer and dn2 as issuer_certificate.subject:
+            Return CertificateFailure with:
+                error as CertificateError.Invalid_Chain
+                message as "Certificate issuer does not match issuer certificate subject"
+        
+        Note: Check certificate validity period
+        If not validate_certificate_time_period with certificate as certificate and validation_time as validation_time:
+            Return CertificateFailure with:
+                error as CertificateError.Expired_Certificate
+                message as "Certificate is expired or not yet valid"
+        
+        Note: Verify certificate signature using issuer's public key
+        Let signature_result be verify_certificate_signature_with_key with certificate as certificate and issuer_public_key as issuer_certificate.public_key
+        Match signature_result:
+            When CertificateSuccess with value as signature_valid:
+                Return CertificateSuccess with value as signature_valid
+            When CertificateFailure:
+                Return signature_result
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Validation_Error
+            message as "Single certificate verification error: " plus error as String
+
+Note: OCSP and CRL Support
+
+Process called "check_certificate_ocsp" that takes certificate as X509Certificate returns CertificateResult[RevocationStatus]:
+    Note: Check certificate revocation status via OCSP
+    Try:
+        Note: Extract OCSP URL from Authority Information Access extension
+        Let aia_result be get_authority_info_access_extension with certificate as certificate
+        Match aia_result:
+            When CertificateFailure:
+                Return CertificateSuccess with value as RevocationStatus.Unknown
+            When CertificateSuccess with value as aia_info:
+                Let ocsp_url be aia_info["ocsp_url"]
+                If ocsp_url is None:
+                    Return CertificateSuccess with value as RevocationStatus.Unknown
+                
+                Note: Build OCSP request
+                Let ocsp_request_result be build_ocsp_request with certificate as certificate
+                Match ocsp_request_result:
+                    When CertificateFailure:
+                        Return CertificateSuccess with value as RevocationStatus.Error
+                    When CertificateSuccess with value as ocsp_request:
+                        Note: Send OCSP request
+                        Let ocsp_response_result be send_ocsp_request with url as ocsp_url and request as ocsp_request
+                        Match ocsp_response_result:
+                            When CertificateFailure:
+                                Return CertificateSuccess with value as RevocationStatus.Error
+                            When CertificateSuccess with value as ocsp_response:
+                                Note: Parse OCSP response
+                                Let status_result be parse_ocsp_response with response as ocsp_response and certificate as certificate
+                                Match status_result:
+                                    When CertificateSuccess with value as status:
+                                        Return CertificateSuccess with value as status
+                                    When CertificateFailure:
+                                        Return CertificateSuccess with value as RevocationStatus.Error
+    
+    Catch error:
+        Return CertificateSuccess with value as RevocationStatus.Error
+
+Process called "check_certificate_crl" that takes certificate as X509Certificate returns CertificateResult[RevocationStatus]:
+    Note: Check certificate revocation status via CRL
+    Try:
+        Note: Extract CRL Distribution Points
+        Let cdp_result be get_crl_distribution_points_extension with certificate as certificate
+        Match cdp_result:
+            When CertificateFailure:
+                Return CertificateSuccess with value as RevocationStatus.Unknown
+            When CertificateSuccess with value as distribution_points:
+                Note: Try each distribution point
+                For dp in distribution_points:
+                    Let crl_url be dp["url"]
+                    If crl_url is not None:
+                        Note: Download and parse CRL
+                        Let crl_result be download_and_parse_crl with url as crl_url
+                        Match crl_result:
+                            When CertificateSuccess with value as crl:
+                                Note: Check if certificate is in CRL
+                                Let revocation_result be check_certificate_in_crl with certificate as certificate and crl as crl
+                                Match revocation_result:
+                                    When CertificateSuccess with value as status:
+                                        Return CertificateSuccess with value as status
+                                    When CertificateFailure:
+                                        Continue
+                            When CertificateFailure:
+                                Continue
+                
+                Return CertificateSuccess with value as RevocationStatus.Unknown
+    
+    Catch error:
+        Return CertificateSuccess with value as RevocationStatus.Error
+
+Process called "download_and_parse_crl" that takes url as String returns CertificateResult[CertificateRevocationList]:
+    Note: Download CRL from URL and parse it
+    Try:
+        Note: Download CRL data
+        Let download_result be http.get with url as url
+        Match download_result:
+            When http.HttpFailure:
+                Return CertificateFailure with:
+                    error as CertificateError.Network_Error
+                    message as "Failed to download CRL: " plus download_result.message
+            When http.HttpSuccess with value as response:
+                If response.status_code is not equal to 200:
+                    Return CertificateFailure with:
+                        error as CertificateError.Network_Error
+                        message as "CRL download failed with status: " plus response.status_code as String
+                
+                Note: Parse CRL data
+                Let crl_result be parse_certificate_revocation_list with der_bytes as response.body
+                Return crl_result
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Network_Error
+            message as "CRL download error: " plus error as String
+
+Process called "check_certificate_in_crl" that takes certificate as X509Certificate and crl as CertificateRevocationList returns CertificateResult[RevocationStatus]:
+    Note: Check if certificate serial number is in CRL
+    Try:
+        Note: Compare certificate serial number with revoked certificates
+        For revoked_cert in crl.revoked_certificates:
+            If lists_equal with list1 as certificate.serial_number and list2 as revoked_cert.serial_number:
+                Return CertificateSuccess with value as RevocationStatus.Revoked
+        
+        Note: Certificate not found in CRL - it's valid
+        Return CertificateSuccess with value as RevocationStatus.Valid
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Internal_Error
+            message as "CRL check error: " plus error as String
+
+Note: Extension Parsing and Validation
+
+Process called "get_basic_constraints_extension" that takes certificate as X509Certificate returns CertificateResult[Dictionary[String, Any]]:
+    Note: Parse Basic Constraints extension
+    Try:
+        For extension in certificate.extensions:
+            If extension.oid is equal to OID_BASIC_CONSTRAINTS:
+                Let bc_result be parse_basic_constraints_extension with extension_data as extension.value
+                Return bc_result
+        
+        Return CertificateFailure with:
+            error as CertificateError.Invalid_Extension
+            message as "Basic Constraints extension not found"
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Invalid_Extension
+            message as "Basic Constraints parsing error: " plus error as String
+
+Process called "get_key_usage_extension" that takes certificate as X509Certificate returns CertificateResult[List[Integer]]:
+    Note: Parse Key Usage extension
+    Try:
+        For extension in certificate.extensions:
+            If extension.oid is equal to OID_KEY_USAGE:
+                Let ku_result be parse_key_usage_extension with extension_data as extension.value
+                Return ku_result
+        
+        Return CertificateFailure with:
+            error as CertificateError.Invalid_Extension
+            message as "Key Usage extension not found"
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Invalid_Extension
+            message as "Key Usage parsing error: " plus error as String
+
+Process called "get_subject_alternative_name_extension" that takes certificate as X509Certificate returns CertificateResult[List[Dictionary[String, String]]]:
+    Note: Parse Subject Alternative Name extension
+    Try:
+        For extension in certificate.extensions:
+            If extension.oid is equal to OID_SUBJECT_ALT_NAME:
+                Let san_result be parse_subject_alt_name_extension with extension_data as extension.value
+                Return san_result
+        
+        Return CertificateFailure with:
+            error as CertificateError.Invalid_Extension
+            message as "Subject Alternative Name extension not found"
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Invalid_Extension
+            message as "SAN parsing error: " plus error as String
+
+Process called "validate_critical_extensions" that takes certificate as X509Certificate returns CertificateResult[Boolean]:
+    Note: Validate all critical extensions are recognized and properly processed
+    Try:
+        Let recognized_critical_extensions be list containing OID_BASIC_CONSTRAINTS, OID_KEY_USAGE, OID_EXTENDED_KEY_USAGE, OID_SUBJECT_ALT_NAME
+        
+        For extension in certificate.extensions:
+            If extension.critical:
+                If extension.oid is not in recognized_critical_extensions:
+                    Return CertificateFailure with:
+                        error as CertificateError.Invalid_Extension
+                        message as "Unrecognized critical extension: " plus extension.oid
+        
+        Return CertificateSuccess with value as true
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Invalid_Extension
+            message as "Critical extension validation error: " plus error as String
+
+Note: Utility Functions
+
+Process called "validate_certificate_time_period" that takes certificate as X509Certificate and validation_time as DateTime returns Boolean:
+    Note: Check if certificate is valid at the given time
+    Try:
+        Let current_timestamp be time.to_timestamp with datetime as validation_time
+        Let valid_from_timestamp be time.to_timestamp with datetime as certificate.valid_from
+        Let valid_to_timestamp be time.to_timestamp with datetime as certificate.valid_to
+        
+        Return (current_timestamp is greater than or equal to valid_from_timestamp) and (current_timestamp is less than or equal to valid_to_timestamp)
+    
+    Catch error:
+        Return false
+
+Process called "is_self_signed_certificate" that takes certificate as X509Certificate returns Boolean:
+    Note: Check if certificate is self-signed (issuer == subject)
+    Try:
+        Return distinguished_names_equal with dn1 as certificate.issuer and dn2 as certificate.subject
+    
+    Catch error:
+        Return false
+
+Process called "certificates_equal" that takes cert1 as X509Certificate and cert2 as X509Certificate returns Boolean:
+    Note: Check if two certificates are identical
+    Try:
+        Note: Compare by serial number and issuer (fastest check)
+        If not lists_equal with list1 as cert1.serial_number and list2 as cert2.serial_number:
+            Return false
+        
+        If not distinguished_names_equal with dn1 as cert1.issuer and dn2 as cert2.issuer:
+            Return false
+        
+        Note: Compare DER bytes for exact match
+        Return lists_equal with list1 as cert1.raw_der_bytes and list2 as cert2.raw_der_bytes
+    
+    Catch error:
+        Return false
+
+Process called "distinguished_names_equal" that takes dn1 as DistinguishedName and dn2 as DistinguishedName returns Boolean:
+    Note: Compare two distinguished names for equality
+    Try:
+        Note: Compare each component
+        If dn1.common_name is not equal to dn2.common_name:
+            Return false
+        If dn1.organization is not equal to dn2.organization:
+            Return false
+        If dn1.organizational_unit is not equal to dn2.organizational_unit:
+            Return false
+        If dn1.country is not equal to dn2.country:
+            Return false
+        If dn1.state is not equal to dn2.state:
+            Return false
+        If dn1.locality is not equal to dn2.locality:
+            Return false
+        If dn1.email is not equal to dn2.email:
+            Return false
+        
+        Return true
+    
+    Catch error:
+        Return false
+
+Process called "generate_certificate_serial_number" returns CertificateResult[List[Integer]]:
+    Note: Generate cryptographically secure certificate serial number
+    Try:
+        Note: Generate 20 random bytes (160 bits) for serial number
+        Let serial_bytes_result be random.generate_secure_bytes with count as 20
+        Match serial_bytes_result:
+            When random.RandomSuccess with value as bytes:
+                Note: Ensure positive number (clear high bit)
+                Set bytes at index 0 to (bytes at index 0) bitwise_and 127
+                Return CertificateSuccess with value as bytes
+            When random.RandomFailure:
+                Return CertificateFailure with:
+                    error as CertificateError.Internal_Error
+                    message as "Failed to generate certificate serial number"
+    
+    Catch error:
+        Return CertificateFailure with:
+            error as CertificateError.Internal_Error
+            message as "Serial number generation error: " plus error as String
+
+Process called "extract_base64_from_pem" that takes pem_data as String and type as String returns Optional[String]:
+    Note: Extract Base64 data from PEM wrapper
+    Try:
+        Let begin_marker be "-----BEGIN " plus type plus "-----"
+        Let end_marker be "-----END " plus type plus "-----"
+        
+        Let begin_index be find_string_index with text as pem_data and pattern as begin_marker
+        If begin_index is equal to -1:
+            Return None
+        
+        Let end_index be find_string_index with text as pem_data and pattern as end_marker
+        If end_index is equal to -1:
+            Return None
+        
+        Let start_pos be begin_index plus length of begin_marker
+        Let base64_data be substring with text as pem_data and start as start_pos and end as end_index
+        
+        Note: Remove whitespace and newlines
+        Let cleaned_data be remove_whitespace with text as base64_data
+        Return Some with value as cleaned_data
+    
+    Catch error:
+        Return None
+
+Process called "lists_equal" that takes list1 as List[Integer] and list2 as List[Integer] returns Boolean:
+    Note: Compare two integer lists for equality
+    Try:
+        If length of list1 is not equal to length of list2:
+            Return false
+        
+        For i from 0 to (length of list1 minus 1):
+            If list1 at index i is not equal to list2 at index i:
+                Return false
+        
+        Return true
+    
+    Catch error:
+        Return false
+

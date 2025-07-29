@@ -343,7 +343,7 @@ impl Parser {
         if self.match_token(TokenType::If) {
             let then_expr = self.or_expression()?;
             self.consume(TokenType::Else, "Expect 'else' in ternary expression.")?;
-            let else_expr = self.or_expression()?;
+            let _else_expr = self.or_expression()?;
             
             // For now, we'll use a binary expression to represent ternary
             // In a full implementation, we'd need a TernaryExpr variant

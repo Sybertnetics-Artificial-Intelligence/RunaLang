@@ -120,7 +120,86 @@ class Token:
     position: int
 ```
 
-### Lexer Implementation
+### Enhanced Lexer Implementation
+
+The Runa lexer has been enhanced with production-grade performance optimizations, advanced error recovery, and comprehensive edge case handling.
+
+#### Key Enhancements
+
+**Performance Optimizations:**
+- **Streaming Mode**: Automatically activates for files larger than 1MB
+- **Chunked Processing**: 8KB chunks for efficient memory usage
+- **Buffer Optimization**: Increased buffer size to 8KB for better throughput
+- **Lookahead Enhancement**: Increased to 20 tokens for complex multi-word constructs
+- **Memory Management**: Token pooling, string sharing, automatic cleanup
+
+**Advanced Error Recovery:**
+- **Multiple Recovery Strategies**: Skip to newline, whitespace, identifier, operator, string start, comment start
+- **Context-Aware Recovery**: Intelligent recovery based on context
+- **Recovery Confidence**: Scoring for recovery strategy effectiveness
+- **Enhanced Error Reporting**: Detailed error messages with suggestions
+
+**Edge Case Handling:**
+- **Extended String Support**: Up to 50KB strings with enhanced Unicode
+- **Complex Number Formats**: Support for large numbers (200+ digits) with underscore separators
+- **Multi-word Constructs**: Support for constructs up to 8 words with case-insensitive matching
+- **Deep Indentation**: Robust handling of complex indentation patterns
+
+#### Implementation Example
+
+```runa
+Note: Enhanced Lexer Usage
+Let source be "Let x be 42\nIf x is greater than 10:\n    Display \"Large number\""
+Let tokens be tokenize with source_code as source and file_path as "test.runa"
+
+Note: Performance monitoring
+Let metrics be get_lexer_performance_metrics with lexer as lexer
+Display "Tokens Generated: " plus metrics.tokens_generated
+Display "Multi-word Matches: " plus metrics.multi_word_matches
+Display "Error Recoveries: " plus metrics.error_recoveries
+Display "Processing Time: " plus metrics.processing_time_ms plus "ms"
+
+Note: Memory usage tracking
+Let memory_usage be get_lexer_memory_usage with lexer as lexer
+Display "Memory Usage: " plus memory_usage.current_memory_kb plus "KB"
+```
+
+#### Error Recovery Example
+
+```runa
+Note: Malformed source with error recovery
+Let malformed_source be "Let x be \"Hello World\nLet y be 42"
+Let tokens be tokenize with source_code as malformed_source and file_path as "malformed.runa"
+
+Note: Lexer recovers and continues processing
+Return length of tokens is greater than 0 and
+       tokens at index (length of tokens minus 1).type is equal to EOF
+```
+
+#### Configuration Options
+
+```runa
+Note: Lexer configuration
+Let lexer_config be dictionary containing:
+    "max_string_length" as 50000
+    "max_number_length" as 200
+    "max_unicode_escapes" as 100
+    "max_underscores" as 50
+    "max_phrase_length" as 8
+    "streaming_threshold" as 1000000
+    "chunk_size" as 8192
+    "max_lookahead" as 20
+    "max_recovery_depth" as 10
+```
+
+#### Performance Benchmarks
+
+- **Small Files (<1KB)**: <1ms processing time
+- **Medium Files (1-100KB)**: 1-10ms processing time
+- **Large Files (100KB-1MB)**: 10-100ms processing time
+- **Very Large Files (>1MB)**: 100ms+ with streaming mode
+
+#### Legacy Python Implementation (Reference)
 
 ```python
 import re

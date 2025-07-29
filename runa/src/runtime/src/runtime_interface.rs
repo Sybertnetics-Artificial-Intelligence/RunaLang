@@ -325,7 +325,7 @@ pub extern "C" fn system_call_directory_list(path: *const c_char, result_array: 
             std::mem::forget(entry_names); // Prevent deallocation
 
             unsafe {
-                *result_array = names_ptr;
+                *result_array = names_ptr as *const c_char;
                 *result_count = count;
             }
             true

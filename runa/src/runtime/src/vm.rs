@@ -3,7 +3,11 @@
 use runa_common::bytecode::{Chunk, OpCode, Value, Function};
 use std::collections::HashMap;
 
+// These constants will be used when implementing stack overflow protection
+// and frame limit enforcement in future versions
+#[allow(dead_code)]
 const STACK_MAX: usize = 256;
+#[allow(dead_code)]
 const FRAMES_MAX: usize = 64;
 
 
@@ -63,6 +67,7 @@ impl VirtualMachine {
         InterpretResult::Ok
     }
     
+    #[allow(dead_code)]
     fn call_function_by_name(&mut self, name: &str, arg_count: usize) -> InterpretResult {
         if let Some(function_value) = self.globals.get(name) {
             if let Value::Function(function) = function_value {
