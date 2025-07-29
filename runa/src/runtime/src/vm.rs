@@ -94,8 +94,17 @@ impl VirtualMachine {
                 let b = self.pop();
                 let a = self.pop();
                 match (a, b) {
-                    (Value::Number(a_val), Value::Number(b_val)) => {
-                        self.push(Value::Number(a_val $op b_val));
+                    (Value::Integer(a_val), Value::Integer(b_val)) => {
+                        self.push(Value::Integer(a_val $op b_val));
+                    }
+                    (Value::Float(a_val), Value::Float(b_val)) => {
+                        self.push(Value::Float(a_val $op b_val));
+                    }
+                    (Value::Integer(a_val), Value::Float(b_val)) => {
+                        self.push(Value::Float(a_val as f64 $op b_val));
+                    }
+                    (Value::Float(a_val), Value::Integer(b_val)) => {
+                        self.push(Value::Float(a_val $op b_val as f64));
                     }
                     _ => return InterpretResult::RuntimeError,
                 }
@@ -106,8 +115,17 @@ impl VirtualMachine {
                 let b = self.pop();
                 let a = self.pop();
                 match (a, b) {
-                    (Value::Number(a_val), Value::Number(b_val)) => {
+                    (Value::Integer(a_val), Value::Integer(b_val)) => {
                         self.push(Value::Boolean(a_val $op b_val));
+                    }
+                    (Value::Float(a_val), Value::Float(b_val)) => {
+                        self.push(Value::Boolean(a_val $op b_val));
+                    }
+                    (Value::Integer(a_val), Value::Float(b_val)) => {
+                        self.push(Value::Boolean((a_val as f64) $op b_val));
+                    }
+                    (Value::Float(a_val), Value::Integer(b_val)) => {
+                        self.push(Value::Boolean(a_val $op (b_val as f64)));
                     }
                     _ => return InterpretResult::RuntimeError,
                 }
@@ -145,8 +163,17 @@ impl VirtualMachine {
                     let b = self.pop();
                     let a = self.pop();
                     match (a, b) {
-                        (Value::Number(a_val), Value::Number(b_val)) => {
-                            self.push(Value::Number(a_val + b_val));
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val + b_val));
+                        }
+                        (Value::Float(a_val), Value::Float(b_val)) => {
+                            self.push(Value::Float(a_val + b_val));
+                        }
+                        (Value::Integer(a_val), Value::Float(b_val)) => {
+                            self.push(Value::Float(a_val as f64 + b_val));
+                        }
+                        (Value::Float(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Float(a_val + b_val as f64));
                         }
                         (Value::String(a_str), Value::String(b_str)) => {
                             self.push(Value::String(format!("{}{}", a_str, b_str)));
@@ -157,12 +184,283 @@ impl VirtualMachine {
                 OpCode::Subtract => binary_op_num!(-),
                 OpCode::Multiply => binary_op_num!(*),
                 OpCode::Divide => binary_op_num!(/),
+                OpCode::Modulo => binary_op_num!(%),
+                OpCode::Power => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val.pow(b_val as u32)));
+                        }
+                        (Value::Float(a_val), Value::Float(b_val)) => {
+                            self.push(Value::Float(a_val.powf(b_val)));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::Negate => {
+                    let value = self.pop();
+                    match value {
+                        Value::Integer(n) => self.push(Value::Integer(-n)),
+                        Value::Float(x) => self.push(Value::Float(-x)),
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                // Natural Language Arithmetic Operators
+                OpCode::Plus => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val + b_val));
+                        }
+                        (Value::Float(a_val), Value::Float(b_val)) => {
+                            self.push(Value::Float(a_val + b_val));
+                        }
+                        (Value::String(a_str), Value::String(b_str)) => {
+                            self.push(Value::String(format!("{}{}", a_str, b_str)));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::Minus => binary_op_num!(-),
+                OpCode::MultipliedBy => binary_op_num!(*),
+                OpCode::DividedBy => binary_op_num!(/),
+                OpCode::PowerOf => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val.pow(b_val as u32)));
+                        }
+                        (Value::Float(a_val), Value::Float(b_val)) => {
+                            self.push(Value::Float(a_val.powf(b_val)));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::ModuloOp => binary_op_num!(%),
+                // String Operations
+                OpCode::Concat => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::String(a_str), Value::String(b_str)) => {
+                            self.push(Value::String(format!("{}{}", a_str, b_str)));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::Substring => {
+                    let end = self.pop();
+                    let start = self.pop();
+                    let string = self.pop();
+                    match (string, start, end) {
+                        (Value::String(s), Value::Integer(start_idx), Value::Integer(end_idx)) => {
+                            if start_idx >= 0 && end_idx >= start_idx && end_idx <= s.len() as i64 {
+                                let start = start_idx as usize;
+                                let end = end_idx as usize;
+                                self.push(Value::String(s[start..end].to_string()));
+                            } else {
+                                return InterpretResult::RuntimeError;
+                            }
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::StringLength => {
+                    let value = self.pop();
+                    match value {
+                        Value::String(s) => self.push(Value::Integer(s.len() as i64)),
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                // Logic Operations
+                OpCode::Not => {
+                    let value = self.pop();
+                    match value {
+                        Value::Boolean(b) => self.push(Value::Boolean(!b)),
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::And => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Boolean(a_val), Value::Boolean(b_val)) => {
+                            self.push(Value::Boolean(a_val && b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::Or => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Boolean(a_val), Value::Boolean(b_val)) => {
+                            self.push(Value::Boolean(a_val || b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                // Natural Language Logic Operators
+                OpCode::LogicalAnd => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Boolean(a_val), Value::Boolean(b_val)) => {
+                            self.push(Value::Boolean(a_val && b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::LogicalOr => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Boolean(a_val), Value::Boolean(b_val)) => {
+                            self.push(Value::Boolean(a_val || b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::LogicalNot => {
+                    let value = self.pop();
+                    match value {
+                        Value::Boolean(b) => self.push(Value::Boolean(!b)),
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                // Comparison Operations
                 OpCode::Equal => binary_op_bool!(==),
                 OpCode::NotEqual => binary_op_bool!(!=),
                 OpCode::Greater => binary_op_bool!(>),
                 OpCode::GreaterEqual => binary_op_bool!(>=),
                 OpCode::Less => binary_op_bool!(<),
                 OpCode::LessEqual => binary_op_bool!(<=),
+                // Natural Language Comparison Operators
+                OpCode::IsEqualTo => binary_op_bool!(==),
+                OpCode::IsNotEqualTo => binary_op_bool!(!=),
+                OpCode::IsGreaterThan => binary_op_bool!(>),
+                OpCode::IsLessThan => binary_op_bool!(<),
+                OpCode::IsGreaterThanOrEqualTo => binary_op_bool!(>=),
+                OpCode::IsLessThanOrEqualTo => binary_op_bool!(<=),
+                // Bitwise Operations
+                OpCode::BitwiseAnd => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val & b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::BitwiseOr => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val | b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::BitwiseXor => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val ^ b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::BitwiseNot => {
+                    let value = self.pop();
+                    match value {
+                        Value::Integer(n) => self.push(Value::Integer(!n)),
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::ShiftLeft => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val << b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::ShiftRight => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val >> b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                // Natural Language Bitwise Operators
+                OpCode::BitwiseAndOp => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val & b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::BitwiseOrOp => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val | b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::BitwiseXorOp => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val ^ b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::BitwiseNotOp => {
+                    let value = self.pop();
+                    match value {
+                        Value::Integer(n) => self.push(Value::Integer(!n)),
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::ShiftedLeftBy => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val << b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
+                OpCode::ShiftedRightBy => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    match (a, b) {
+                        (Value::Integer(a_val), Value::Integer(b_val)) => {
+                            self.push(Value::Integer(a_val >> b_val));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                },
                 OpCode::Jump => {
                     let offset = self.read_short();
                     self.current_frame_mut().ip += offset;
@@ -198,55 +496,30 @@ impl VirtualMachine {
                         return InterpretResult::Ok;
                     }
                 }
+                OpCode::DefineFunction => {
+                    let ip = self.current_frame().ip;
+                    let name_index = self.current_chunk().code[ip] as usize;
+                    let param_count = self.current_chunk().code[ip + 1] as usize;
+                    self.current_frame_mut().ip += 2;
+                    let name = match &self.current_chunk().constants[name_index] {
+                        Value::String(s) => s.clone(),
+                        _ => return InterpretResult::RuntimeError,
+                    };
+                    let function = Function {
+                        name,
+                        chunk: Chunk::new(),
+                        arity: param_count,
+                    };
+                    self.push(Value::Function(Box::new(function)));
+                }
                 OpCode::Call => {
                     let ip = self.current_frame().ip;
                     let arg_count = self.current_chunk().code[ip] as usize;
                     self.current_frame_mut().ip += 1;
-                    
-                    // Get the function from the stack
-                    let function_value = self.stack[self.stack.len() - arg_count - 1].clone();
-                    
-                    match function_value {
-                        Value::Function(function) => {
-                            // Remove the function and arguments from the stack
-                            for _ in 0..arg_count + 1 {
-                                self.pop();
-                            }
-                            
-                            // Call the function
-                            if let InterpretResult::RuntimeError = self.call_function(*function, arg_count) {
-                                return InterpretResult::RuntimeError;
-                            }
-                        }
-                        _ => {
-                            println!("Can only call functions");
-                            return InterpretResult::RuntimeError;
-                        }
-                    }
-                }
-                OpCode::DefineFunction => {
-                    let ip = self.current_frame().ip;
-                    let name_index = self.current_chunk().code[ip] as usize;
-                    self.current_frame_mut().ip += 1;
-                    let _param_count = self.current_chunk().code[self.current_frame().ip] as usize;
-                    self.current_frame_mut().ip += 1;
-                    
-                    // The function is already on the stack from the Constant opcode
-                    // We keep it there for the SetLocal instruction that follows
-                    // Just store a copy in globals for debugging/fallback
-                    if let Some(function_value) = self.stack.last() {
-                        if let Value::Function(function) = function_value {
-                            let function_name = format!("function_{}", name_index);
-                            self.globals.insert(function_name, Value::Function(function.clone()));
-                        }
-                    }
-                }
-                OpCode::Concat => {
-                    let b = self.pop();
-                    let a = self.pop();
-                    match (a, b) {
-                        (Value::String(a_str), Value::String(b_str)) => {
-                            self.push(Value::String(format!("{}{}", a_str, b_str)));
+                    let function = self.peek(arg_count).clone();
+                    match function {
+                        Value::Function(func) => {
+                            self.call_function(*func, arg_count);
                         }
                         _ => return InterpretResult::RuntimeError,
                     }
@@ -256,30 +529,241 @@ impl VirtualMachine {
                     println!("{}", value);
                 }
                 OpCode::ReadLine => {
-                    use std::io::{self, Write};
-                    io::stdout().flush().unwrap();
                     let mut input = String::new();
-                    if io::stdin().read_line(&mut input).is_ok() {
-                        // Remove trailing newline
-                        input = input.trim_end_matches('\n').to_string();
-                        self.push(Value::String(input));
-                    } else {
-                        self.push(Value::String("".to_string()));
-                    }
+                    std::io::stdin().read_line(&mut input).unwrap();
+                    self.push(Value::String(input.trim().to_string()));
                 }
                 OpCode::ReadNumber => {
-                    use std::io::{self, Write};
-                    io::stdout().flush().unwrap();
                     let mut input = String::new();
-                    if io::stdin().read_line(&mut input).is_ok() {
-                        if let Ok(num) = input.trim().parse::<f64>() {
-                            self.push(Value::Number(num));
-                        } else {
-                            self.push(Value::Number(0.0));
-                        }
-                    } else {
-                        self.push(Value::Number(0.0));
+                    std::io::stdin().read_line(&mut input).unwrap();
+                    match input.trim().parse::<f64>() {
+                        Ok(n) => self.push(Value::Number(n)),
+                        Err(_) => return InterpretResult::RuntimeError,
                     }
+                }
+                // --- Language Keywords ---
+                OpCode::Display => {
+                    let value = self.pop();
+                    println!("{}", value);
+                }
+                OpCode::Length => {
+                    let value = self.pop();
+                    let length = match value {
+                        Value::String(s) => s.len() as f64,
+                        Value::List(items) => items.len() as f64,
+                        Value::Dictionary(items) => items.len() as f64,
+                        _ => return InterpretResult::RuntimeError,
+                    };
+                    self.push(Value::Number(length));
+                }
+                OpCode::GetItem => {
+                    let index = self.pop();
+                    let list = self.pop();
+                    match (list, index) {
+                        (Value::List(items), Value::Number(idx)) => {
+                            let idx = idx as usize;
+                            if idx < items.len() {
+                                self.push(items[idx].clone());
+                            } else {
+                                return InterpretResult::RuntimeError;
+                            }
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                }
+                OpCode::SetItem => {
+                    let value = self.pop();
+                    let index = self.pop();
+                    let list = self.pop();
+                    match (list, index, value) {
+                        (Value::List(mut items), Value::Number(idx), val) => {
+                            let idx = idx as usize;
+                            if idx < items.len() {
+                                items[idx] = val;
+                                self.push(Value::List(items));
+                            } else {
+                                return InterpretResult::RuntimeError;
+                            }
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                }
+                OpCode::GetDict => {
+                    let key = self.pop();
+                    let dict = self.pop();
+                    match dict {
+                        Value::Dictionary(items) => {
+                            if let Some((_, value)) = items.iter().find(|(k, _)| k == &key) {
+                                self.push(value.clone());
+                            } else {
+                                self.push(Value::Nil);
+                            }
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                }
+                OpCode::SetDict => {
+                    let value = self.pop();
+                    let key = self.pop();
+                    let dict = self.pop();
+                    match dict {
+                        Value::Dictionary(mut items) => {
+                            // Remove existing key if present
+                            items.retain(|(k, _)| k != &key);
+                            // Add new key-value pair
+                            items.push((key, value));
+                            self.push(Value::Dictionary(items));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                }
+                OpCode::CreateList => {
+                    let ip = self.current_frame().ip;
+                    let item_count = self.current_chunk().code[ip] as usize;
+                    self.current_frame_mut().ip += 1;
+                    let mut items = Vec::new();
+                    for _ in 0..item_count {
+                        items.push(self.pop());
+                    }
+                    items.reverse(); // Restore original order
+                    self.push(Value::List(items));
+                }
+                OpCode::CreateDict => {
+                    let ip = self.current_frame().ip;
+                    let pair_count = self.current_chunk().code[ip] as usize;
+                    self.current_frame_mut().ip += 1;
+                    let mut items = Vec::new();
+                    for _ in 0..pair_count {
+                        let value = self.pop();
+                        let key = self.pop();
+                        items.push((key, value));
+                    }
+                    items.reverse(); // Restore original order
+                    self.push(Value::Dictionary(items));
+                }
+                OpCode::AddToList => {
+                    let item = self.pop();
+                    let list = self.pop();
+                    match list {
+                        Value::List(mut items) => {
+                            items.push(item);
+                            self.push(Value::List(items));
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                }
+                OpCode::RemoveFromList => {
+                    let item = self.pop();
+                    let list = self.pop();
+                    match list {
+                        Value::List(mut items) => {
+                            if let Some(pos) = items.iter().position(|x| x == &item) {
+                                items.remove(pos);
+                                self.push(Value::List(items));
+                                self.push(Value::Boolean(true));
+                            } else {
+                                self.push(Value::List(items));
+                                self.push(Value::Boolean(false));
+                            }
+                        }
+                        _ => return InterpretResult::RuntimeError,
+                    }
+                }
+                OpCode::Contains => {
+                    let item = self.pop();
+                    let collection = self.pop();
+                    let contains = match collection {
+                        Value::List(items) => items.contains(&item),
+                        Value::String(s) => {
+                            if let Value::String(substr) = item {
+                                s.contains(&substr)
+                            } else {
+                                false
+                            }
+                        }
+                        Value::Dictionary(items) => {
+                            items.iter().any(|(k, _)| k == &item)
+                        }
+                        _ => false,
+                    };
+                    self.push(Value::Boolean(contains));
+                }
+                OpCode::ToString => {
+                    let value = self.pop();
+                    let string = match value {
+                        Value::String(s) => s,
+                        Value::Number(n) => n.to_string(),
+                        Value::Boolean(b) => b.to_string(),
+                        Value::List(_) => "[list]".to_string(),
+                        Value::Dictionary(_) => "{dictionary}".to_string(),
+                        Value::Function(func) => format!("<function {}>", func.name),
+                        Value::Nil => "nil".to_string(),
+                    };
+                    self.push(Value::String(string));
+                }
+                OpCode::ToInteger => {
+                    let value = self.pop();
+                    let integer = match value {
+                        Value::Number(n) => n as i64 as f64,
+                        Value::String(s) => {
+                            match s.parse::<f64>() {
+                                Ok(n) => n,
+                                Err(_) => return InterpretResult::RuntimeError,
+                            }
+                        }
+                        Value::Boolean(b) => if b { 1.0 } else { 0.0 },
+                        _ => return InterpretResult::RuntimeError,
+                    };
+                    self.push(Value::Number(integer));
+                }
+                OpCode::ToFloat => {
+                    let value = self.pop();
+                    let float = match value {
+                        Value::Number(n) => n,
+                        Value::String(s) => {
+                            match s.parse::<f64>() {
+                                Ok(n) => n,
+                                Err(_) => return InterpretResult::RuntimeError,
+                            }
+                        }
+                        Value::Boolean(b) => if b { 1.0 } else { 0.0 },
+                        _ => return InterpretResult::RuntimeError,
+                    };
+                    self.push(Value::Number(float));
+                }
+                OpCode::ToBoolean => {
+                    let value = self.pop();
+                    let boolean = match value {
+                        Value::Boolean(b) => b,
+                        Value::Number(n) => n != 0.0,
+                        Value::String(s) => !s.is_empty(),
+                        Value::List(items) => !items.is_empty(),
+                        Value::Dictionary(items) => !items.is_empty(),
+                        Value::Function(_) => true,
+                        Value::Nil => false,
+                    };
+                    self.push(Value::Boolean(boolean));
+                }
+                OpCode::TypeOf => {
+                    let value = self.pop();
+                    let type_name = match value {
+                        Value::Number(_) => "Number",
+                        Value::Boolean(_) => "Boolean",
+                        Value::String(_) => "String",
+                        Value::List(_) => "List",
+                        Value::Dictionary(_) => "Dictionary",
+                        Value::Function(_) => "Function",
+                        Value::Nil => "Nil",
+                    };
+                    self.push(Value::String(type_name.to_string()));
+                }
+                OpCode::IsNone => {
+                    let value = self.pop();
+                    self.push(Value::Boolean(matches!(value, Value::Nil)));
+                }
+                OpCode::IsNotNone => {
+                    let value = self.pop();
+                    self.push(Value::Boolean(!matches!(value, Value::Nil)));
                 }
                 _ => {
                     println!("Unimplemented opcode: {:?}", op_code);

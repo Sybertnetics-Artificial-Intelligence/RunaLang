@@ -5,6 +5,35 @@
 
 This implementation guide provides comprehensive instructions for building Runa language processors, including compilers, interpreters, transpilers, and development tools. It covers the complete implementation pipeline from lexical analysis through code generation and runtime support.
 
+## Architecture Overview
+
+### Core Components
+
+1. **Lexer** - Tokenizes Runa source code
+2. **Parser** - Builds Abstract Syntax Tree (AST)
+3. **Semantic Analyzer** - Performs type checking and validation
+4. **IR Generator** - Converts AST to intermediate representation
+5. **Runtime** - Executes compiled bytecode
+6. **Standard Library** - Provides essential functions and types
+
+### Language Keywords vs Standard Library
+
+Runa distinguishes between **language keywords** and **standard library functions**:
+
+#### Language Keywords (Built into Runtime)
+```runa
+Display "Hello World"     Note: Language construct
+Let x be 42              Note: Language construct
+length of list_var       Note: Language construct
+```
+
+#### Standard Library Functions (Callable)
+```runa
+sort_list with list as numbers                    Note: Function call
+filter_list with list as data and predicate as f  Note: Function call
+map_list with list as items and function as g     Note: Function call
+```
+
 ## Implementation Architecture
 
 ### Core Components
