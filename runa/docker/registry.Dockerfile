@@ -29,7 +29,7 @@ WORKDIR $REGISTRY_HOME
 
 # Copy registry-specific files
 COPY --chown=registry:registry src/runa/tools/package/ ./package/
-COPY --chown=registry:registry pyproject.toml .
+COPY --chown=registry:registry runa.toml .
 COPY --chown=registry:registry requirements.txt .
 
 # Install Python dependencies
