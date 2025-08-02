@@ -395,7 +395,7 @@ impl fmt::Display for Value {
 }
 
 // Production-ready chunk structure with debugging information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub code: Vec<u8>,
     pub constants: Vec<Value>,
@@ -403,7 +403,7 @@ pub struct Chunk {
     pub source_map: Vec<SourceLocation>,  // Source location for each instruction
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceLocation {
     pub file: String,
     pub line: usize,

@@ -79,6 +79,9 @@ pub enum Stmt {
     Return(ReturnStmt),
     Function(FunctionStmt),
     Print(PrintStmt),
+    Match(MatchStmt),
+    TypeDef(TypeDefStmt),
+    EnumDef(EnumDefStmt),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -134,4 +137,35 @@ pub struct FunctionStmt {
 #[derive(Debug, PartialEq, Clone)]
 pub struct PrintStmt {
     pub value: Expr,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct MatchStmt {
+    pub expr: Expr,
+    pub cases: Vec<WhenCase>,
+    pub default_case: Option<BlockStmt>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct WhenCase {
+    pub pattern: Expr,
+    pub body: BlockStmt,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct TypeDefStmt {
+    pub name: Token,
+    pub fields: Vec<TypeField>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct TypeField {
+    pub name: Token,
+    pub field_type: Token,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct EnumDefStmt {
+    pub name: Token,
+    pub variants: Vec<Token>,
 } 

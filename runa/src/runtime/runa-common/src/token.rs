@@ -79,6 +79,11 @@ pub enum TokenType {
     IsGreaterThanOrEqualTo,
     IsLessThanOrEqualTo,
     CalledWith, // Added for natural function call syntax
+    
+    // Natural language function call patterns
+    Call,
+    Invoke,
+    Execute,
 
     // Mathematical and Assignment Operators
     Plus,

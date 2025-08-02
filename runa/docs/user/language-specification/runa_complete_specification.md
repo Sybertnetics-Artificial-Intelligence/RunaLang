@@ -367,7 +367,7 @@ Let element be the element of array at index 5
 #### Type Definitions with Methods
 
 ```runa
-Type Circle is Dictionary with:
+Type called "Circle":
     radius as Float
 
     Process called "area" returns Float:
@@ -498,7 +498,7 @@ Process called "identity"[T] that takes value as T returns T:
     Return value
 
 Note: Generic pair type
-Type Pair[A, B] is Dictionary with:
+Type called "Pair"[A, B]:
     first as A
     second as B
 
@@ -962,7 +962,7 @@ Every Runa file is implicitly a module. Modules can export declarations and impo
 Note: geometry.runa
 Export Define constant PI as 3.14159
 
-Export Type Circle is Dictionary with:
+Export Type called "Circle":
     radius as Float
 
     Process called "area" returns Float:
@@ -1382,15 +1382,15 @@ When build_mode is "development":
 ### Exception Hierarchy
 
 ```runa
-Type Error is Dictionary with:
+Type called "Error":
     message as String
     stack_trace as List[String]
 
-Type RuntimeError is Error
-Type TypeError is Error
-Type ValueError is Error
-Type FileNotFoundError is Error
-Type NetworkError is Error
+Type called "RuntimeError" inherits from Error
+Type called "TypeError" inherits from Error
+Type called "ValueError" inherits from Error
+Type called "FileNotFoundError" inherits from Error
+Type called "NetworkError" inherits from Error
 ```
 
 ### Try-Catch-Finally

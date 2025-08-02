@@ -202,7 +202,7 @@ type_identifier       ::= identifier
 ## Type Definitions
 
 ```ebnf
-type_definition       ::= "Type" identifier generic_params? "is" type_body
+type_definition       ::= "Type" "called" string_literal generic_params? ":" type_body
 
 generic_params        ::= '[' generic_param (',' generic_param)* ']'
 
@@ -210,10 +210,13 @@ generic_param         ::= identifier type_constraint?
 
 type_constraint       ::= ':' type_expression
 
-type_body             ::= record_definition | adt_definition | type_alias
+type_body             ::= record_definition | adt_definition | type_alias | enumeration_definition
 
-record_definition     ::= "Dictionary" "with" inheritance_clause? protocol_conformance_clause? ':'
-                         INDENT record_member* DEDENT
+record_definition     ::= INDENT record_member+ DEDENT
+
+enumeration_definition ::= "Enumeration" "containing" ":" INDENT enum_variant+ DEDENT
+
+enum_variant          ::= identifier NEWLINE
 
 inheritance_clause    ::= "inherits" "from" type_identifier
 

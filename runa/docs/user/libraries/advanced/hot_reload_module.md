@@ -2,373 +2,440 @@
 
 ## Overview
 
-The Hot Reload module provides dynamic code reloading capabilities for the Runa programming language, enabling rapid development iteration without application restart. This enterprise-grade hot reloading system supports incremental compilation, state preservation, and seamless code updates with performance competitive with leading development environments.
+The Hot Reload module provides enterprise-grade dynamic code reloading capabilities for the Runa programming language, enabling rapid development iteration without application restart. This production-ready hot reloading system supports incremental compilation, state preservation, and seamless code updates with performance competitive with leading development environments like Rust Analyzer, TypeScript Language Server, and Python's importlib.reload().
 
 ## Quick Start
 
 ```runa
 Import "advanced.hot_reload.core" as hot_reload
-Import "advanced.hot_reload.watcher" as reload_watcher
+Import "advanced.hot_reload.file_watching" as file_watcher
 
 Note: Initialize hot reload system
-Let hot_reload_config be dictionary with:
-    "watch_directories" as list containing "src/", "lib/",
-    "file_patterns" as list containing "*.runa", "*.toml",
-    "reload_strategy" as "incremental",
-    "state_preservation" as true,
-    "dependency_tracking" as true
+Let hot_reload_config be HotReloadConfig with:
+    enabled as true
+    watch_paths as list containing "src", "lib", "modules"
+    ignore_patterns as list containing "*.tmp", "*.log", ".git/*", "node_modules/*", "__pycache__/*"
+    poll_interval as 0.5
+    max_file_size as 52428800
+    preserve_state as true
+    incremental_compilation as true
+    cache_enabled as true
+    cache_size as 1000
+    error_recovery as true
+    performance_monitoring as true
+    ai_mode as false
+    max_reload_depth as 50
+    thread_pool_size as 4
+    memory_limit as 536870912
+    enable_metrics as true
+    enable_profiling as false
 
-Let reload_system be hot_reload.initialize[hot_reload_config]
+Let reload_context be hot_reload.create_hot_reload_context[hot_reload_config]
 
-Note: Start watching for changes
-reload_watcher.start_watching[reload_system]
-Display "Hot reload system active - watching for changes..."
+Note: Start hot reload system
+Let started be hot_reload.start_hot_reload[reload_context]
+If started:
+    Display "Hot reload system active - watching for changes..."
 ```
 
 ## Architecture Components
 
-### Core Reloading Engine
-- **Incremental Compilation**: Compile only changed modules and dependencies
-- **State Preservation**: Maintain application state across reloads
-- **Dependency Resolution**: Automatic dependency graph management
-- **Change Detection**: File system monitoring with intelligent filtering
+### Core Reloading Engine (`core.runa`)
+- **Incremental Compilation**: Compile only changed modules and dependencies with caching
+- **State Preservation**: Maintain application state across reloads with type safety
+- **Dependency Resolution**: Automatic dependency graph management with circular detection
+- **Change Detection**: File system monitoring with intelligent filtering and debouncing
+- **Error Recovery**: Comprehensive error handling with rollback mechanisms
+- **Performance Monitoring**: Real-time metrics collection and bottleneck detection
 
-### Watch System
-- **File System Watcher**: Cross-platform file change detection
-- **Pattern Matching**: Configurable file patterns and exclusions
-- **Batch Processing**: Intelligent batching of rapid file changes
-- **Recursive Monitoring**: Deep directory tree monitoring
+### File Watching System (`file_watching.runa`)
+- **Cross-Platform File Watcher**: Native OS APIs (inotify, FSEvents, ReadDirectoryChangesW)
+- **Event-Based Monitoring**: Real-time file change detection with configurable polling fallback
+- **Pattern Matching**: Advanced file filtering with glob patterns and regex support
+- **Batch Processing**: Intelligent batching of rapid file changes with debouncing
+- **Recursive Monitoring**: Deep directory tree monitoring with configurable depth limits
+- **Performance Optimization**: Optimized for large file sets with event buffering
 
-### State Management
-- **State Serialization**: Automatic state capture and restoration
-- **Memory Management**: Efficient memory cleanup during reloads
-- **Session Persistence**: Maintain user sessions across reloads
-- **Data Integrity**: Ensure data consistency during transitions
+### Dependency Tracking (`dependency_tracking.runa`)
+- **Dependency Graph Management**: Real-time graph construction and maintenance
+- **Circular Dependency Detection**: Automatic detection with detailed reporting and resolution
+- **Impact Analysis**: Change propagation analysis to determine affected modules
+- **Dependency Visualization**: Graph algorithms for dependency analysis and reporting
+- **Incremental Updates**: Minimize computation overhead with smart updates
+- **Version Compatibility**: Cross-module dependency resolution with conflict detection
+
+### Incremental Updates (`incremental_updates.runa`)
+- **Intelligent Change Detection**: Advanced diffing algorithms for meaningful changes
+- **Incremental Compilation**: Dependency-aware updates with caching and optimization
+- **Change Propagation**: Analysis to minimize unnecessary updates
+- **Update Batching**: Reduce system overhead with intelligent batching
+- **Rollback Mechanisms**: Intelligent rollback for failed updates
+- **Update Validation**: Verification systems for update integrity
+
+### State Preservation (`state_preservation.runa`)
+- **Advanced State Serialization**: Type-safe serialization with validation
+- **Module State Management**: Variables, functions, types, and metadata preservation
+- **State Validation**: Integrity checking and validation mechanisms
+- **Cross-Module Coordination**: State synchronization across modules
+- **State Versioning**: Backward compatibility with migration support
+- **Performance Optimization**: Memory-efficient storage and retrieval
+
+### Production Core (`production_core.runa`)
+- **Enterprise-Grade Features**: Thread-safe operations with concurrent processing
+- **Memory Management**: Configurable resource limits and garbage collection
+- **Production Monitoring**: Comprehensive metrics collection and alerting
+- **AI/Agent Integration**: Semantic change detection and workflow integration
+- **Zero-Downtime Updates**: Hot-swapping with rollback capabilities
+- **Security Features**: Code validation and security checks
 
 ## API Reference
 
 ### Core Functions
 
-#### `initialize[config]`
-Initializes the hot reload system with specified configuration.
+#### `create_hot_reload_context[config]`
+Creates a hot reload context with specified configuration.
 
 **Parameters:**
-- `config` (Dictionary): Hot reload configuration with watch paths, patterns, and strategies
+- `config` (Optional[HotReloadConfig]): Hot reload configuration with watch paths, patterns, and strategies
 
 **Returns:**
-- `HotReloadSystem`: Configured hot reload system instance
+- `HotReloadContext`: Configured hot reload context instance
 
 **Example:**
 ```runa
-Let config be dictionary with:
-    "watch_directories" as list containing "src/", "tests/", "configs/",
-    "file_patterns" as list containing "*.runa", "*.json", "*.toml",
-    "exclude_patterns" as list containing "*.tmp", "*.log", ".git/*",
-    "reload_strategy" as "smart_incremental",
-    "state_preservation" as true,
-    "hot_swap_enabled" as true,
-    "rollback_on_error" as true,
-    "max_reload_attempts" as 3
+Let config be HotReloadConfig with:
+    enabled as true
+    watch_paths as list containing "src", "tests", "configs"
+    ignore_patterns as list containing "*.tmp", "*.log", ".git/*", "node_modules/*"
+    poll_interval as 0.5
+    max_file_size as 52428800
+    preserve_state as true
+    incremental_compilation as true
+    cache_enabled as true
+    cache_size as 1000
+    error_recovery as true
+    performance_monitoring as true
+    ai_mode as false
+    max_reload_depth as 50
+    thread_pool_size as 4
+    memory_limit as 536870912
+    enable_metrics as true
+    enable_profiling as false
 
-Let reload_system be hot_reload.initialize[config]
+Let reload_context be hot_reload.create_hot_reload_context[config]
 ```
 
-#### `enable_hot_reload[system, target_modules]`
-Enables hot reloading for specific modules or entire application.
+#### `start_hot_reload[context]`
+Starts the hot reload system with the provided context.
 
 **Parameters:**
-- `system` (HotReloadSystem): Hot reload system instance
-- `target_modules` (List[String]): Modules to enable hot reloading for
+- `context` (HotReloadContext): Hot reload context instance
 
 **Returns:**
-- `ReloadStatus`: Status of hot reload enablement
+- `Boolean`: Success status of hot reload startup
 
 **Example:**
 ```runa
-Let target_modules be list containing "business_logic", "data_processing", "web_handlers"
-Let status be hot_reload.enable_hot_reload[reload_system, target_modules]
+Let started be hot_reload.start_hot_reload[reload_context]
 
-If status["enabled"]:
-    Display "Hot reload enabled for modules: " with message target_modules
+If started:
+    Display "Hot reload system started successfully"
+Otherwise:
+    Display "Failed to start hot reload system"
 ```
 
-#### `perform_reload[system, changed_files]`
-Performs hot reload for specified changed files.
+#### `reload_module[context, module_path]`
+Performs hot reload for a specific module.
 
 **Parameters:**
-- `system` (HotReloadSystem): Hot reload system instance
-- `changed_files` (List[String]): Files that have changed and need reloading
+- `context` (HotReloadContext): Hot reload context instance
+- `module_path` (String): Path to the module that needs reloading
 
 **Returns:**
 - `ReloadResult`: Results of the reload operation with status and metrics
 
 **Example:**
 ```runa
-Let changed_files be list containing "src/main.runa", "src/utils.runa"
-Let reload_result be hot_reload.perform_reload[reload_system, changed_files]
+Let module_path be "src/main.runa"
+Let reload_result be hot_reload.reload_module[reload_context, module_path]
 
-If reload_result["success"]:
-    Display "Successfully reloaded " with message reload_result["modules_reloaded"] with message " modules"
-    Display "Reload time: " with message reload_result["reload_time_ms"] with message "ms"
+Match reload_result:
+    When ReloadSuccess with changed_modules as changed and preserved_state as state:
+        Display "Successfully reloaded module: " plus module_path
+        Display "Preserved state for " plus state size as string plus " variables"
+    When ReloadError with error as err and rollback_required as rollback:
+        Display "Reload failed: " plus err
+        If rollback:
+            Display "Rollback was performed"
+    When ReloadPartial with successful_modules as success and failed_modules as failed:
+        Display "Partial reload - successful: " plus success size as string plus ", failed: " plus failed size as string
+```
+
+### File Watching Functions
+
+#### `create_file_watcher[paths]`
+Creates a file watcher for the specified paths.
+
+**Parameters:**
+- `paths` (List[String]): List of paths to watch for changes
+
+**Returns:**
+- `FileWatcher`: File watcher instance
+
+**Example:**
+```runa
+Let watch_paths be list containing "src", "lib", "config"
+Let file_watcher be file_watcher.create_file_watcher[watch_paths]
+
+Note: Register file change callback
+Let callback be Process called "handle_file_change" that takes event as FileChangeEvent returns None:
+    Display "File changed: " plus event.file_path
+    Display "Change type: " plus event.change_type
+    Display "Timestamp: " plus event.timestamp as string
+    
+    Note: Trigger reload for Runa files
+    If event.file_path ends with ".runa":
+        Let reload_result be hot_reload.reload_module[reload_context, event.file_path]
+        Match reload_result:
+            When ReloadSuccess with changed_modules as changed and preserved_state as state:
+                Display "✓ Hot reload successful for " plus event.file_path
+            When ReloadError with error as err and rollback_required as rollback:
+                Display "✗ Hot reload failed for " plus event.file_path plus ": " plus err
+            When ReloadPartial with successful_modules as success and failed_modules as failed:
+                Display "⚠ Partial hot reload for " plus event.file_path
+
+Let registered be file_watcher.register_file_change_callback[file_watcher, callback]
+```
+
+#### `start_file_watcher[watcher]`
+Starts the file watcher for monitoring changes.
+
+**Parameters:**
+- `watcher` (FileWatcher): File watcher instance to start
+
+**Returns:**
+- `Boolean`: Success status of watcher startup
+
+**Example:**
+```runa
+Let started be file_watcher.start_file_watcher[file_watcher]
+
+If started:
+    Display "File watcher started successfully"
 Otherwise:
-    Display "Reload failed: " with message reload_result["error"]
-```
-
-### Watcher Functions
-
-#### `start_watching[system]`
-Starts the file system watcher for automatic change detection.
-
-**Parameters:**
-- `system` (HotReloadSystem): Hot reload system to start watching for
-
-**Returns:**
-- `WatcherHandle`: Handle to the active watcher process
-
-**Example:**
-```runa
-Let watcher_handle be reload_watcher.start_watching[reload_system]
-
-Note: Configure change event handler
-reload_watcher.set_change_handler[watcher_handle, Process called "handle_file_change" that takes change_event as Dictionary returns Boolean:
-    Display "File changed: " with message change_event["file_path"]
-    
-    Note: Determine if reload is needed
-    Let should_reload be reload_watcher.should_trigger_reload[change_event]
-    
-    If should_reload:
-        Let reload_result be hot_reload.perform_reload[reload_system, list containing change_event["file_path"]]
-        Return reload_result["success"]
-    
-    Return true
-]
-```
-
-#### `configure_watch_patterns[watcher, patterns]`
-Configures file patterns for the watcher system.
-
-**Parameters:**
-- `watcher` (WatcherHandle): Active watcher handle
-- `patterns` (Dictionary): Include/exclude patterns configuration
-
-**Returns:**
-- `Boolean`: Success status of pattern configuration
-
-**Example:**
-```runa
-Let patterns be dictionary with:
-    "include" as list containing "*.runa", "*.md", "config/*.toml",
-    "exclude" as list containing "*.tmp", "*.log", "build/*", ".git/*",
-    "ignore_hidden" as true,
-    "case_sensitive" as false
-
-Let pattern_result be reload_watcher.configure_watch_patterns[watcher_handle, patterns]
+    Display "Failed to start file watcher"
 ```
 
 ### State Management Functions
 
-#### `capture_state[system, modules]`
-Captures current application state for preservation during reload.
+#### `preserve_module_state[context, module_name]`
+Preserves the current state of a module for restoration during reload.
 
 **Parameters:**
-- `system` (HotReloadSystem): Hot reload system instance
-- `modules` (List[String]): Modules to capture state from
+- `context` (HotReloadContext): Hot reload context instance
+- `module_name` (String): Name of the module to preserve state for
 
 **Returns:**
-- `StateSnapshot`: Serialized state snapshot
+- `ModuleState`: Preserved module state
 
 **Example:**
 ```runa
-Let modules_to_preserve be list containing "session_manager", "cache_system", "user_data"
-Let state_snapshot be hot_reload.capture_state[reload_system, modules_to_preserve]
+Let module_name be "session_manager"
+Let preserved_state be hot_reload.preserve_module_state[reload_context, module_name]
 
-Note: Store critical state information
-Let critical_state be dictionary with:
-    "user_sessions" as state_snapshot["session_manager"]["sessions"],
-    "cached_data" as state_snapshot["cache_system"]["cache"],
-    "application_config" as state_snapshot["user_data"]["config"]
+Display "Preserved state for module: " plus module_name
+Display "Variables preserved: " plus preserved_state.variables size as string
+Display "Functions preserved: " plus preserved_state.functions size as string
+Display "Types preserved: " plus preserved_state.types size as string
 ```
 
-#### `restore_state[system, state_snapshot]`
-Restores application state after successful reload.
+#### `restore_module_state[context, module_name, state]`
+Restores the state of a module after reload.
 
 **Parameters:**
-- `system` (HotReloadSystem): Hot reload system instance
-- `state_snapshot` (StateSnapshot): Previously captured state snapshot
+- `context` (HotReloadContext): Hot reload context instance
+- `module_name` (String): Name of the module to restore state for
+- `state` (ModuleState): Previously preserved module state
 
 **Returns:**
-- `RestoreResult`: State restoration results with success status
+- `Boolean`: Success status of state restoration
 
 **Example:**
 ```runa
-Let restore_result be hot_reload.restore_state[reload_system, state_snapshot]
+Let module_name be "session_manager"
+Let restored be hot_reload.restore_module_state[reload_context, module_name, preserved_state]
 
-If restore_result["success"]:
-    Display "State restored successfully for " with message restore_result["restored_modules"]
-    Display "Restored data items: " with message restore_result["data_items_restored"]
+If restored:
+    Display "State restored successfully for module: " plus module_name
 Otherwise:
-    Display "State restoration failed: " with message restore_result["error"]
-    Display "Manual state recovery may be required"
+    Display "Failed to restore state for module: " plus module_name
 ```
 
 ## Advanced Features
 
-### Smart Incremental Reloading
+### Dependency Tracking
 
 The hot reload system uses intelligent dependency analysis to minimize reload scope:
 
 ```runa
-Import "advanced.hot_reload.dependency" as reload_deps
+Import "advanced.hot_reload.dependency_tracking" as dependency_tracking
 
-Note: Configure dependency tracking
-Let dependency_config be dictionary with:
-    "track_imports" as true,
-    "track_function_calls" as true,
-    "track_data_dependencies" as true,
-    "cache_dependency_graph" as true,
-    "incremental_analysis" as true
+Note: Create dependency graph
+Let dependency_graph be dependency_tracking.create_dependency_graph
 
-reload_deps.configure_dependency_tracking[reload_system, dependency_config]
+Note: Add module dependencies
+Let module_name be "main"
+Let dependencies be list containing "utils", "config", "database"
+Let added be dependency_tracking.add_module_dependency[dependency_graph, module_name, dependencies]
 
 Note: Analyze impact of changes
-Let impact_analysis be reload_deps.analyze_change_impact[reload_system, changed_files]
-Display "Modules requiring reload: " with message impact_analysis["affected_modules"]
-Display "Estimated reload time: " with message impact_analysis["estimated_time_ms"] with message "ms"
+Let changed_module be "utils"
+Let impact_analysis be dependency_tracking.analyze_change_impact[dependency_graph, changed_module]
+Display "Modules requiring reload: " plus impact_analysis.affected_modules size as string
+Display "Impact level: " plus impact_analysis.impact_level
+Display "Estimated reload time: " plus impact_analysis.estimated_reload_time as string plus "ms"
 ```
 
-### Hot Swap Capabilities
+### Incremental Updates
 
-Advanced hot swapping for minimal disruption:
+Advanced incremental update capabilities for minimal disruption:
 
 ```runa
-Import "advanced.hot_reload.hot_swap" as hot_swap
+Import "advanced.hot_reload.incremental_updates" as incremental_updates
 
-Note: Configure hot swap settings
-Let hot_swap_config be dictionary with:
-    "swap_strategy" as "gradual_rollout",
-    "validation_timeout_ms" as 5000,
-    "rollback_on_failure" as true,
-    "preserve_connections" as true,
-    "graceful_transition" as true
+Note: Create incremental update context
+Let update_config be IncrementalUpdateConfig with:
+    enabled as true
+    diff_threshold as 0.1
+    batch_size as 10
+    max_parallel_updates as 5
+    update_timeout as 300.0
+    rollback_on_failure as true
+    validate_updates as true
+    performance_monitoring as true
+    ai_mode as false
 
-hot_swap.configure[reload_system, hot_swap_config]
+Let update_context be incremental_updates.create_incremental_update_context[update_config]
 
-Note: Perform hot swap with validation
-Let swap_result be hot_swap.perform_hot_swap[reload_system, new_module_version, dictionary with:
-    "validation_checks" as list containing "syntax_validation", "type_checking", "integration_tests",
-    "rollback_timeout_ms" as 10000,
-    "health_check_endpoint" as "/health"
-]
+Note: Process file changes incrementally
+Let file_path be "src/main.runa"
+Let old_content be "Let x be 1"
+Let new_content be "Let x be 2"
+Let file_diff be incremental_updates.create_file_diff[file_path, old_content, new_content]
+
+Let update_result be incremental_updates.process_incremental_update[update_context, file_diff]
+Match update_result:
+    When UpdateSuccess with updated_modules as updated and performance_metrics as metrics:
+        Display "Incremental update successful for " plus updated size as string plus " modules"
+        Display "Update time: " plus metrics["update_time"] as string plus "ms"
+    When UpdateError with error as err and failed_modules as failed and rollback_required as rollback:
+        Display "Incremental update failed: " plus err
+        If rollback:
+            Display "Rollback was performed"
 ```
 
-### Development Server Integration
+### State Preservation
 
-Integration with development servers for web applications:
+Advanced state preservation and restoration capabilities:
 
 ```runa
-Import "advanced.hot_reload.dev_server" as dev_server
+Import "advanced.hot_reload.state_preservation" as state_preservation
 
-Note: Create development server with hot reload
-Let server_config be dictionary with:
-    "port" as 8080,
-    "host" as "localhost",
-    "hot_reload_enabled" as true,
-    "websocket_port" as 8081,
-    "browser_refresh" as true,
-    "asset_reloading" as true
+Note: Create state preservation context
+Let state_config be StatePreservationConfig with:
+    enabled as true
+    preserve_variables as true
+    preserve_functions as true
+    preserve_types as true
+    preserve_metadata as true
+    compression_enabled as true
+    validation_enabled as true
+    versioning_enabled as true
+    max_state_size as 104857600
+    performance_monitoring as true
+    ai_mode as false
 
-Let dev_server_instance be dev_server.create_server[server_config, reload_system]
+Let state_context be state_preservation.create_state_preservation_context[state_config]
 
-Note: Start server with hot reload capabilities
-dev_server.start[dev_server_instance]
+Note: Capture module state
+Let module_name be "session_manager"
+Let module_state be state_preservation.capture_module_state[state_context, module_name]
 
-Note: Configure client-side refresh
-dev_server.configure_browser_refresh[dev_server_instance, dictionary with:
-    "refresh_strategy" as "selective",
-    "preserve_form_data" as true,
-    "maintain_scroll_position" as true,
-    "update_css_in_place" as true
-]
+Note: Serialize state for storage
+Let serialized_state be state_preservation.serialize_state[state_context, module_state]
+Let saved be state_preservation.save_state_to_file[state_context, serialized_state, "session_state.json"]
+
+Note: Restore state after reload
+Let loaded_state be state_preservation.load_state_from_file[state_context, "session_state.json"]
+Let restored_state be state_preservation.deserialize_state[state_context, loaded_state]
+Let restored be state_preservation.restore_module_state[state_context, module_name, restored_state]
 ```
 
 ## Performance Optimization
 
 ### Compilation Optimization
 
-Optimize compilation performance for faster reloads:
+The hot reload system includes built-in compilation optimization:
 
 ```runa
-Import "advanced.hot_reload.optimization" as reload_opt
+Note: Compilation caching is enabled by default in HotReloadConfig
+Let config be HotReloadConfig with:
+    cache_enabled as true
+    cache_size as 1000
+    incremental_compilation as true
+    performance_monitoring as true
 
-Let optimization_config be dictionary with:
-    "parallel_compilation" as true,
-    "compilation_cache" as true,
-    "incremental_type_checking" as true,
-    "ast_caching" as true,
-    "symbol_table_persistence" as true
+Let reload_context be hot_reload.create_hot_reload_context[config]
 
-reload_opt.configure_compilation[reload_system, optimization_config]
-
-Note: Configure memory management
-Let memory_config be dictionary with:
-    "garbage_collection_strategy" as "incremental",
-    "memory_pool_size_mb" as 256,
-    "cache_eviction_policy" as "lru",
-    "memory_pressure_threshold" as 0.8
-
-reload_opt.configure_memory_management[reload_system, memory_config]
+Note: Get performance metrics
+Let metrics be hot_reload.get_performance_metrics[reload_context]
+Display "Last reload time: " plus metrics["last_reload_time"] as string plus "ms"
+Display "Total reloads: " plus reload_context.reload_count as string
 ```
 
 ### File System Optimization
 
-Optimize file system watching for better performance:
+The file watching system includes performance optimizations:
 
 ```runa
-Import "advanced.hot_reload.fs_optimization" as fs_opt
+Note: File watcher includes built-in optimizations
+Let file_watcher be file_watcher.create_file_watcher[list containing "src", "lib"]
 
-Let fs_config be dictionary with:
-    "watch_debounce_ms" as 100,
-    "batch_processing" as true,
-    "ignore_temporary_files" as true,
-    "optimize_for_ide" as true,
-    "recursive_depth_limit" as 10
+Note: Configure watcher with performance settings
+Set file_watcher.metadata["debounce_delay"] to 0.1
+Set file_watcher.metadata["batch_processing"] to true
+Set file_watcher.metadata["ignore_temporary"] to true
 
-fs_opt.optimize_file_watching[reload_system, fs_config]
+Let started be file_watcher.start_file_watcher[file_watcher]
 ```
 
 ## Security Considerations
 
-### Secure Reloading
+### Error Handling and Recovery
 
-Implement security measures for production-safe hot reloading:
+The hot reload system includes comprehensive error handling:
 
 ```runa
-Import "advanced.hot_reload.security" as reload_security
+Note: Error recovery is enabled by default
+Let config be HotReloadConfig with:
+    error_recovery as true
+    performance_monitoring as true
 
-Let security_config be dictionary with:
-    "code_signing_required" as true,
-    "trusted_sources_only" as true,
-    "sandbox_new_code" as true,
-    "audit_logging" as true,
-    "permission_validation" as true
+Let reload_context be hot_reload.create_hot_reload_context[config]
 
-reload_security.configure_security[reload_system, security_config]
+Note: Get error log
+Let error_log be hot_reload.get_error_log[reload_context]
+For each error in error_log:
+    Display "Error: " plus error
 
-Note: Validate code before reload
-Process called "validate_code_security" that takes code_path as String returns Dictionary:
-    Let validation_result be reload_security.validate_code[code_path, dictionary with:
-        "check_malicious_patterns" as true,
-        "validate_imports" as true,
-        "check_system_calls" as true,
-        "analyze_resource_usage" as true
-    ]
-    
-    If validation_result["safe"]:
-        Return dictionary with: "approved" as true, "reason" as "security_validation_passed"
-    Otherwise:
-        Return dictionary with: "approved" as false, "reason" as validation_result["security_issues"]
+Note: Clear error log
+hot_reload.clear_error_log[reload_context]
 
-reload_security.set_validation_handler[reload_system, validate_code_security]
+Note: AI-powered error suggestions
+hot_reload.enable_ai_mode[reload_context]
+Let suggestions be hot_reload.get_ai_suggestions[reload_context, "compilation error"]
+For each suggestion in suggestions:
+    Display "Suggestion: " plus suggestion
 ```
 
 ## Integration Examples
