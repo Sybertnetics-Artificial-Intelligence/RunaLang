@@ -5,6 +5,8 @@ pub mod memory;
 pub mod os;
 pub mod ffi;
 pub mod concurrency;
+pub mod gc;
+pub mod ownership;
 
 // NEW: Runtime Interface - The 25 Essential System Calls
 pub mod runtime_interface;

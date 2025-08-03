@@ -2,7 +2,7 @@
 
 ## Overview
 
-The JIT (Just-In-Time) Compilation module provides dynamic compilation and optimization capabilities for the Runa programming language. This enterprise-grade JIT infrastructure includes adaptive optimization, runtime profiling, intelligent caching, and performance-driven compilation with competitive performance to leading JIT systems like HotSpot and V8.
+The JIT (Just-In-Time) Compilation module provides dynamic compilation and optimization capabilities for the Runa programming language. This enterprise-grade JIT infrastructure includes bytecode analysis, native code generation, adaptive optimization, runtime profiling, intelligent caching, and performance-driven compilation with competitive performance to leading JIT systems like HotSpot and V8.
 
 ## Quick Start
 
@@ -10,261 +10,315 @@ The JIT (Just-In-Time) Compilation module provides dynamic compilation and optim
 Import "advanced.jit.compiler" as jit_compiler
 Import "advanced.jit.optimization" as jit_optimization
 
-Note: Create a simple JIT compilation system
-Let jit_config be dictionary with:
-    "compilation_strategy" as "adaptive_compilation",
-    "optimization_level" as "aggressive_optimization",
-    "profiling_mode" as "continuous_profiling",
-    "caching_policy" as "intelligent_code_caching"
+Note: Create JIT compilation context
+Let jit_config be JITConfig with:
+    enabled as true
+    target_architecture as "auto"
+    optimization_level as 2
+    max_code_size as 104857600
+    enable_inlining as true
+    enable_specialization as true
+    enable_profiling as true
+    enable_debugging as false
+    memory_pool_size as 10485760
+    compilation_threshold as 1000
 
-Let jit_system be jit_compiler.create_jit_system[jit_config]
+Let jit_context be jit_compiler.create_jit_context[jit_config]
 
-Note: Compile a function with JIT optimization
-Let function_code be """
-Process called "calculate_fibonacci" that takes n as Integer returns Integer:
-    If n is less than or equal to 1:
-        Return n
-    Else:
-        Return calculate_fibonacci[n minus 1] plus calculate_fibonacci[n minus 2]
-"""
+Note: Create bytecode block for compilation
+Let bytecode_block be BytecodeBlock with:
+    instructions as list containing BytecodeInstruction with:
+        opcode as 1
+        operands as list containing 42
+        offset as 0
+        type_info as TypeInfo with:
+            type_id as "int"
+            type_kind as "primitive"
+            size as 8
+            alignment as 8
+            is_primitive as true
+            is_reference as false
+        profiling_data as empty dictionary
+        metadata as empty dictionary
+    basic_blocks as empty list
+    control_flow_graph as empty dictionary
+    type_info as empty dictionary
+    profiling_data as empty dictionary
+    metadata as empty dictionary
 
-Let compilation_request be dictionary with:
-    "source_code" as function_code,
-    "optimization_hints" as list containing "recursive_optimization", "memoization_candidate",
-    "performance_target" as "high_throughput",
-    "compilation_priority" as "medium"
+Note: Compile bytecode to native code
+Let compilation_result be jit_compiler.compile_bytecode[jit_context, bytecode_block]
 
-Let jit_result = jit_compiler.compile_with_jit[jit_system, compilation_request]
-Display "JIT compilation completed: " with message jit_result["compilation_successful"]
-Display "Optimization level achieved: " with message jit_result["optimization_level"]
-Display "Performance improvement: " with message jit_result["performance_gain"] with message "x"
+Match compilation_result:
+    When CompilationSuccess with native_code as code and performance_metrics as metrics:
+        Display "JIT compilation successful"
+        Display "Code size: " plus code.size as string plus " bytes"
+        Display "Compilation time: " plus metrics["compilation_time"] as string plus "ms"
+    When CompilationError with error as err and details as details:
+        Display "JIT compilation failed: " plus err
+    When CompilationWarning with warning as warn and native_code as code:
+        Display "JIT compilation warning: " plus warn
 ```
 
 ## Architecture Components
 
-### JIT Compiler Core
-- **Compilation Pipeline**: Multi-stage compilation from source to optimized machine code
-- **Intermediate Representation**: Advanced IR with SSA form and control flow analysis
-- **Code Generation**: Platform-specific optimized code generation
-- **Runtime Integration**: Seamless integration with Runa runtime system
+### JIT Compiler Core (`compiler.runa`)
+- **Bytecode Analysis**: Advanced bytecode analysis with control flow and type information
+- **Native Code Generation**: Multi-architecture code generation (x86-64, ARM64, RISC-V)
+- **Memory Management**: Efficient code pool management with dynamic allocation
+- **Compilation Pipeline**: Multi-stage compilation with caching and optimization
+- **Cross-Platform Support**: Architecture detection and platform-specific optimizations
+- **Debug Integration**: Debug information generation and source mapping
 
-### Adaptive Optimization
+### Optimization Engine (`optimization.runa`)
+- **Loop Optimization**: Advanced loop analysis with unrolling and vectorization
+- **Profile-Guided Optimization**: Runtime feedback for optimization decisions
+- **Interprocedural Optimization**: Cross-function analysis and optimization
+- **Memory Access Optimization**: Memory access pattern analysis and optimization
+- **SIMD Generation**: Vector instruction generation for multiple architectures
+- **Code Layout Optimization**: Cache-friendly code layout optimization
+
+### Profiling System (`profiling.runa`)
+- **Performance Monitoring**: Real-time performance monitoring with minimal overhead
+- **Memory Profiling**: Memory usage profiling and leak detection
+- **Cache Performance Analysis**: Cache hit/miss analysis and optimization
+- **Compilation Time Tracking**: Compilation time profiling and optimization
+- **Runtime Performance Monitoring**: Runtime performance monitoring with sampling
+- **AI/Agent Insights**: AI-powered profiling insights and recommendations
+
+### Caching Infrastructure (`caching.runa`)
+- **Multi-Level Caching**: L1, L2, L3 caching with different eviction policies
+- **Intelligent Cache Management**: Smart cache invalidation and management
+- **Memory-Efficient Storage**: Compression and efficient storage strategies
+- **Cache Warming**: Predictive cache warming for frequently used code
+- **Cross-Process Sharing**: Cache sharing across processes for better performance
+- **Cache Statistics**: Comprehensive cache statistics and monitoring
+
+### Adaptive Compilation (`adaptive.runa`)
 - **Hot Path Detection**: Automatic identification of frequently executed code paths
 - **Dynamic Optimization**: Runtime optimization based on execution patterns
 - **Deoptimization**: Safe fallback mechanisms for optimization failures
 - **Speculative Optimization**: Optimistic optimizations with runtime validation
 
-### Profiling System
-- **Execution Profiling**: Detailed execution time and frequency analysis
-- **Memory Profiling**: Memory access patterns and allocation tracking
-- **Branch Profiling**: Branch prediction and execution flow analysis
-- **Type Profiling**: Dynamic type usage analysis for optimization
-
-### Caching Infrastructure
-- **Code Cache Management**: Intelligent management of compiled code cache
-- **Compilation Cache**: Caching of compilation artifacts and metadata
-- **Profile Cache**: Persistent storage of profiling data
-- **Invalidation Strategies**: Smart cache invalidation and update mechanisms
+### Production Compiler (`production_compiler.runa`)
+- **Enterprise Features**: Production-ready compilation with error handling
+- **Performance Monitoring**: Comprehensive performance monitoring and metrics
+- **Resource Management**: Efficient resource management and cleanup
+- **Integration Support**: Seamless integration with Runa runtime system
 
 ## API Reference
 
 ### Core JIT Functions
 
-#### `create_jit_system[config]`
-Creates a comprehensive JIT compilation system with specified optimization and profiling capabilities.
+#### `create_jit_context[config]`
+Creates a JIT compilation context with specified configuration and optimization settings.
 
 **Parameters:**
-- `config` (Dictionary): JIT system configuration with compilation strategies, optimization levels, and caching policies
+- `config` (Optional[JITConfig]): JIT configuration with architecture, optimization level, and memory settings
 
 **Returns:**
-- `JITSystem`: Configured JIT compilation system instance
+- `JITContext`: Configured JIT compilation context instance
 
 **Example:**
 ```runa
-Let config be dictionary with:
-    "compilation_architecture" as dictionary with:
-        "compilation_strategy" as "tiered_compilation",
-        "compilation_tiers" as list containing:
-            dictionary with: "tier" as "interpreter", "threshold" as 0, "optimization_level" as "none",
-            dictionary with: "tier" as "c1_compiler", "threshold" as 100, "optimization_level" as "basic",
-            dictionary with: "tier" as "c2_compiler", "threshold" as 10000, "optimization_level" as "aggressive"
-        "deoptimization_strategy" as "safe_deoptimization",
-        "compilation_queue_management" as "priority_based_compilation"
-    "optimization_framework" as dictionary with:
-        "optimization_passes" as list containing:
-            "dead_code_elimination", "constant_folding", "loop_optimization", "inlining",
-            "escape_analysis", "vectorization", "register_allocation", "instruction_scheduling"
-        "adaptive_optimization" as dictionary with:
-            "hot_method_threshold" as 10000,
-            "hot_loop_threshold" as 1000,
-            "cold_method_threshold" as 100,
-            "optimization_budget" as "unlimited"
-        "speculative_optimization" as dictionary with:
-            "type_speculation" as true,
-            "branch_speculation" as true,
-            "call_site_speculation" as true,
-            "bounds_check_elimination" as true
-    "profiling_configuration" as dictionary with:
-        "profiling_mode" as "continuous_sampling",
-        "sampling_frequency" as 1000,
-        "profile_collection" as list containing "execution_frequency", "type_profile", "branch_profile", "memory_profile",
-        "profile_storage" as "persistent_profiles",
-        "profile_aggregation" as "weighted_aggregation"
-    "caching_system" as dictionary with:
-        "code_cache_size_mb" as 256,
-        "compilation_cache_enabled" as true,
-        "profile_cache_enabled" as true,
-        "cache_eviction_policy" as "lru_with_frequency_bias",
-        "cache_persistence" as "disk_backed_cache"
-    "runtime_integration" as dictionary with:
-        "gc_integration" as "gc_aware_compilation",
-        "memory_management" as "region_based_allocation",
-        "exception_handling" as "zero_cost_exceptions",
-        "debugging_support" as "full_debugging_information"
+Let config be JITConfig with:
+    enabled as true
+    target_architecture as "auto"
+    optimization_level as 2
+    max_code_size as 104857600
+    enable_inlining as true
+    enable_specialization as true
+    enable_profiling as true
+    enable_debugging as false
+    memory_pool_size as 10485760
+    compilation_threshold as 1000
 
-Let jit_system be jit_compiler.create_jit_system[config]
+Let jit_context be jit_compiler.create_jit_context[config]
+```
+#### `compile_bytecode[context, bytecode]`
+Compiles bytecode to native code using the JIT compiler.
+
+**Parameters:**
+- `context` (JITContext): JIT compilation context
+- `bytecode` (BytecodeBlock): Bytecode block to compile
+
+**Returns:**
+- `CompilationResult`: Result of compilation with native code or error information
+
+**Example:**
+```runa
+Let bytecode_block be BytecodeBlock with:
+    instructions as list containing BytecodeInstruction with:
+        opcode as 4  # BINARY_ADD
+        operands as list containing 10, 20
+        offset as 0
+        type_info as TypeInfo with:
+            type_id as "int"
+            type_kind as "primitive"
+            size as 8
+            alignment as 8
+            is_primitive as true
+            is_reference as false
+        profiling_data as empty dictionary
+        metadata as empty dictionary
+    basic_blocks as empty list
+    control_flow_graph as empty dictionary
+    type_info as empty dictionary
+    profiling_data as empty dictionary
+    metadata as empty dictionary
+
+Let compilation_result be jit_compiler.compile_bytecode[jit_context, bytecode_block]
+
+Match compilation_result:
+    When CompilationSuccess with native_code as code and performance_metrics as metrics:
+        Display "Compilation successful"
+        Display "Native code size: " plus code.size as string plus " bytes"
+        Display "Compilation time: " plus metrics["compilation_time"] as string plus "ms"
+    When CompilationError with error as err and details as details:
+        Display "Compilation failed: " plus err
+    When CompilationWarning with warning as warn and native_code as code:
+        Display "Compilation warning: " plus warn
 ```
 
-#### `compile_with_jit[system, compilation_request]`
-Compiles code using the JIT system with adaptive optimization and profiling.
+#### `optimize_bytecode[bytecode, context]`
+Optimizes bytecode using various optimization techniques.
 
 **Parameters:**
-- `system` (JITSystem): JIT compilation system instance
-- `compilation_request` (Dictionary): Compilation request with source code and optimization parameters
+- `bytecode` (BytecodeBlock): Bytecode block to optimize
+- `context` (JITContext): JIT compilation context
 
 **Returns:**
-- `JITCompilation`: Compilation results with performance metrics and optimization details
+- `BytecodeBlock`: Optimized bytecode block
 
 **Example:**
 ```runa
-Let compilation_request be dictionary with:
-    "compilation_metadata" as dictionary with:
-        "source_identifier" as "matrix_multiplication_kernel",
-        "source_language" as "runa",
-        "compilation_context" as "high_performance_computing",
-        "target_architecture" as "x86_64_avx512"
-    "source_specification" as dictionary with:
-        "source_code" as matrix_multiply_implementation,
-        "source_dependencies" as list containing "linear_algebra_lib", "simd_intrinsics",
-        "compilation_unit_type" as "function",
-        "entry_point" as "multiply_matrices"
-    "optimization_requirements" as dictionary with:
-        "performance_target" as dictionary with:
-            "target_metric" as "throughput",
-            "target_value" as "1000_operations_per_second",
-            "acceptable_range" as dictionary with: "min" as 800, "max" as 1200
-        "optimization_constraints" as dictionary with:
-            "compilation_time_limit_ms" as 5000,
-            "memory_usage_limit_mb" as 128,
-            "code_size_limit_kb" as 64,
-            "energy_efficiency_requirement" as "moderate"
-        "optimization_hints" as list containing:
-            dictionary with: "hint_type" as "vectorization", "hint_data" as "simd_friendly_loops",
-            dictionary with: "hint_type" as "memory_access", "hint_data" as "sequential_access_pattern",
-            dictionary with: "hint_type" as "branching", "hint_data" as "predictable_branches"
-    "profiling_configuration" as dictionary with:
-        "enable_profiling" as true,
-        "profiling_scope" as "compilation_unit",
-        "profiling_duration" as "adaptive_duration",
-        "profile_feedback" as "immediate_feedback"
-    "compilation_preferences" as dictionary with:
-        "compilation_priority" as "high",
-        "optimization_aggressiveness" as "aggressive",
-        "debug_information" as "optimized_debug_info",
-        "error_handling" as "production_optimized"
+Let optimized_bytecode be jit_compiler.optimize_bytecode[bytecode_block, jit_context]
 
-Let jit_compilation = jit_compiler.compile_with_jit[jit_system, compilation_request]
+Display "Optimization completed"
+Display "Original instructions: " plus bytecode_block.instructions size as string
+Display "Optimized instructions: " plus optimized_bytecode.instructions size as string
+```
+### Optimization Functions
 
-Display "JIT Compilation Results:"
-Display "  Compilation successful: " with message jit_compilation["compilation_successful"]
-Display "  Compilation time: " with message jit_compilation["compilation_time_ms"] with message " ms"
-Display "  Generated code size: " with message jit_compilation["code_size_bytes"] with message " bytes"
-Display "  Optimization level: " with message jit_compilation["achieved_optimization_level"]
+#### `constant_folding[bytecode]`
+Performs constant folding optimization on bytecode.
 
-Display "Performance Metrics:"
-Display "  Baseline performance: " with message jit_compilation["performance_metrics"]["baseline_performance"]
-Display "  Optimized performance: " with message jit_compilation["performance_metrics"]["optimized_performance"]
-Display "  Performance improvement: " with message jit_compilation["performance_metrics"]["improvement_factor"] with message "x"
-Display "  Compilation efficiency: " with message jit_compilation["performance_metrics"]["compilation_efficiency"]
+**Parameters:**
+- `bytecode` (BytecodeBlock): Bytecode block to optimize
 
-Display "Optimization Details:"
-For each optimization in jit_compilation["applied_optimizations"]:
-    Display "  - " with message optimization["optimization_name"] with message ":"
-    Display "    Impact: " with message optimization["performance_impact"]
-    Display "    Cost: " with message optimization["compilation_cost"]
-    Display "    Confidence: " with message optimization["optimization_confidence"]
+**Returns:**
+- `BytecodeBlock`: Bytecode block with constant folding applied
 
-If jit_compilation["profiling_data"]["profiling_available"]:
-    Display "Profiling Information:"
-    Display "  Execution hotspots: " with message jit_compilation["profiling_data"]["hotspot_count"]
-    Display "  Branch prediction accuracy: " with message jit_compilation["profiling_data"]["branch_accuracy"]
-    Display "  Cache hit rate: " with message jit_compilation["profiling_data"]["cache_hit_rate"]
-    Display "  Memory access efficiency: " with message jit_compilation["profiling_data"]["memory_efficiency"]
+**Example:**
+```runa
+Let optimized_bytecode be jit_compiler.constant_folding[bytecode_block]
 
-If jit_compilation["warnings"]["has_warnings"]:
-    Display "Compilation Warnings:"
-    For each warning in jit_compilation["warnings"]["warning_list"]:
-        Display "  ⚠️  " with message warning["warning_type"] with message ": " with message warning["description"]
-        Display "    Severity: " with message warning["severity"]
-        Display "    Recommendation: " with message warning["recommendation"]
+Display "Constant folding completed"
+Display "Instructions optimized: " plus optimized_bytecode.instructions size as string
 ```
 
-### Adaptive Optimization Functions
-
-#### `create_adaptive_optimizer[system, optimization_config]`
-Creates an adaptive optimization system for dynamic code optimization.
+#### `dead_code_elimination[bytecode]`
+Removes dead code from bytecode.
 
 **Parameters:**
-- `system` (JITSystem): JIT system instance
-- `optimization_config` (Dictionary): Adaptive optimization configuration and parameters
+- `bytecode` (BytecodeBlock): Bytecode block to optimize
 
 **Returns:**
-- `AdaptiveOptimizer`: Configured adaptive optimization system
+- `BytecodeBlock`: Bytecode block with dead code removed
 
 **Example:**
 ```runa
-Let optimization_config be dictionary with:
-    "adaptation_strategy" as dictionary with:
-        "optimization_approach" as "feedback_driven_optimization",
-        "adaptation_frequency" as "continuous_adaptation",
-        "optimization_triggers" as list containing "performance_regression", "hot_path_discovery", "type_profile_change", "memory_pressure",
-        "deoptimization_triggers" as list containing "speculation_failure", "rare_path_execution", "debugging_requirement"
-    "hot_path_detection" as dictionary with:
-        "detection_algorithm" as "statistical_hotspot_detection",
-        "execution_threshold" as dictionary with: "method_calls" as 10000, "loop_iterations" as 1000, "basic_block_executions" as 5000,
-        "time_window" as "sliding_window_analysis",
-        "confidence_threshold" as 0.95
-    "optimization_policies" as dictionary with:
-        "inlining_policy" as dictionary with:
-            "max_inline_depth" as 5,
-            "size_threshold" as 1000,
-            "frequency_threshold" as 100,
-            "polymorphic_inline_limit" as 3
-        "vectorization_policy" as dictionary with:
-            "auto_vectorization" as true,
-            "vector_width" as "auto_detect",
-            "alignment_requirements" as "strict_alignment",
-            "cost_model" as "hardware_aware_cost_model"
-        "loop_optimization_policy" as dictionary with:
-            "loop_unrolling" as "adaptive_unrolling",
-            "loop_invariant_motion" as true,
-            "loop_fusion" as "profitable_fusion",
-            "loop_distribution" as "cache_friendly_distribution"
-    "speculative_optimization" as dictionary with:
-        "type_speculation" as dictionary with:
-            "monomorphic_assumption" as true,
-            "polymorphic_inline_cache" as true,
-            "type_feedback_threshold" as 0.9
-        "branch_speculation" as dictionary with:
-            "branch_prediction" as "profile_guided_prediction",
-            "trace_compilation" as true,
-            "speculative_scheduling" as true
-        "bounds_check_elimination" as dictionary with:
-            "range_analysis" as "advanced_range_analysis",
-            "array_bounds_speculation" as true,
-            "overflow_protection" as "hardware_overflow_detection"
+Let optimized_bytecode be jit_compiler.dead_code_elimination[bytecode_block]
 
-Let adaptive_optimizer = jit_optimization.create_adaptive_optimizer[jit_system, optimization_config]
+Display "Dead code elimination completed"
+Display "Instructions removed: " plus (bytecode_block.instructions size minus optimized_bytecode.instructions size) as string
+```
+
+#### `loop_optimization[bytecode]`
+Optimizes loops in bytecode.
+
+**Parameters:**
+- `bytecode` (BytecodeBlock): Bytecode block to optimize
+
+**Returns:**
+- `BytecodeBlock`: Bytecode block with loop optimizations applied
+
+**Example:**
+```runa
+Let optimized_bytecode be jit_compiler.loop_optimization[bytecode_block]
+
+Display "Loop optimization completed"
+```
+
+### Memory Management Functions
+
+#### `create_code_pool[size]`
+Creates a code pool for managing native code memory.
+
+**Parameters:**
+- `size` (Integer): Size of the code pool in bytes
+
+**Returns:**
+- `CodePool`: Code pool instance for memory management
+
+**Example:**
+```runa
+Let code_pool be jit_compiler.create_code_pool[10485760]  # 10MB pool
+
+Display "Code pool created with size: " plus code_pool.total_size as string plus " bytes"
+```
+
+#### `allocate_code_memory[code, context]`
+Allocates memory for native code in the code pool.
+
+**Parameters:**
+- `code` (NativeCode): Native code to allocate memory for
+- `context` (JITContext): JIT compilation context
+
+**Returns:**
+- `NativeCode`: Native code with allocated memory
+
+**Example:**
+```runa
+Let allocated_code be jit_compiler.allocate_code_memory[native_code, jit_context]
+
+Display "Code allocated at address: " plus allocated_code.metadata["memory_address"] as string
+```
+### Architecture Detection Functions
+
+#### `detect_target_architecture[context]`
+Detects the target architecture for code generation.
+
+**Parameters:**
+- `context` (JITContext): JIT compilation context
+
+**Returns:**
+- `String`: Target architecture identifier
+
+**Example:**
+```runa
+Let architecture be jit_compiler.detect_target_architecture[jit_context]
+
+Display "Target architecture: " plus architecture
+```
+
+### Utility Functions
+
+#### `generate_cache_key[bytecode]`
+Generates a cache key for bytecode compilation.
+
+**Parameters:**
+- `bytecode` (BytecodeBlock): Bytecode block to generate key for
+
+**Returns:**
+- `String`: Cache key for the bytecode
+
+**Example:**
+```runa
+Let cache_key be jit_compiler.generate_cache_key[bytecode_block]
+
+Display "Cache key: " plus cache_key
+```
 ```
 
 #### `optimize_hot_path[optimizer, hot_path_data, optimization_context]`
@@ -351,43 +405,32 @@ If hot_path_optimization["speculative_optimizations"]["has_speculative"]:
         Display "    Fallback strategy: " with message speculation["deoptimization_strategy"]
 ```
 
-### Profiling System Functions
+### Profiling Functions
 
-#### `create_profiler[system, profiling_configuration]`
-Creates a comprehensive profiling system for runtime performance analysis.
+#### `create_profiling_context[config]`
+Creates a profiling context for performance monitoring.
 
 **Parameters:**
-- `system` (JITSystem): JIT system instance
-- `profiling_configuration` (Dictionary): Profiling configuration and analysis parameters
+- `config` (Optional[ProfilingConfig]): Profiling configuration
 
 **Returns:**
-- `JITProfiler`: Configured profiling system with analysis capabilities
+- `ProfilingContext`: Profiling context instance
 
 **Example:**
 ```runa
-Let profiling_configuration be dictionary with:
-    "profiling_scope" as dictionary with:
-        "profiling_granularity" as "instruction_level_profiling",
-        "profiling_coverage" as "comprehensive_coverage",
-        "profiling_targets" as list containing "execution_frequency", "memory_access", "branch_behavior", "type_usage", "resource_consumption",
-        "temporal_analysis" as "time_series_profiling"
-    "data_collection" as dictionary with:
-        "sampling_strategy" as "adaptive_sampling",
-        "sampling_frequency" as dictionary with: "base_frequency" as 1000, "adaptive_range" as dictionary with: "min" as 100, "max" as 10000,
-        "collection_overhead_limit" as 0.05,
-        "data_aggregation" as "hierarchical_aggregation"
-    "analysis_capabilities" as dictionary with:
-        "statistical_analysis" as "advanced_statistical_methods",
-        "pattern_recognition" as "machine_learning_pattern_detection",
-        "anomaly_detection" as "multivariate_anomaly_detection",
-        "predictive_modeling" as "performance_prediction_models"
-    "storage_management" as dictionary with:
-        "data_storage" as "compressed_time_series",
-        "retention_policy" as "adaptive_retention",
-        "data_export" as list containing "json", "protobuf", "csv", "binary",
-        "real_time_streaming" as "low_latency_streaming"
+Import "advanced.jit.profiling" as jit_profiling
 
-Let jit_profiler = jit_profiling.create_profiler[jit_system, profiling_configuration]
+Let profiling_config be ProfilingConfig with:
+    enabled as true
+    sampling_rate as 0.01
+    memory_profiling as true
+    cache_profiling as true
+    compilation_profiling as true
+    runtime_profiling as true
+    enable_ai_insights as true
+    max_profiling_data as 1000000
+
+Let profiling_context be jit_profiling.create_profiling_context[profiling_config]
 ```
 
 #### `analyze_execution_profile[profiler, analysis_request]`
@@ -454,174 +497,132 @@ For each bottleneck in profile_analysis["bottleneck_analysis"]["identified_bottl
     Display "    Recommended fix: " with message bottleneck["recommended_solution"]
 
 Display "Optimization Recommendations:"
-For each recommendation in profile_analysis["optimization_recommendations"]["recommendations"]:
-    Display "  - " with message recommendation["optimization_type"] with message ":"
-    Display "    Expected benefit: " with message recommendation["expected_benefit"]
-    Display "    Implementation effort: " with message recommendation["implementation_effort"]
-    Display "    Risk assessment: " with message recommendation["risk_level"]
-    Display "    Priority: " with message recommendation["recommendation_priority"]
-
-If profile_analysis["performance_regressions"]["regressions_detected"]:
-    Display "Performance Regressions:"
-    For each regression in profile_analysis["performance_regressions"]["regression_list"]:
-        Display "  - " with message regression["function_name"] with message ":"
-        Display "    Performance change: " with message regression["performance_change"]
-        Display "    Regression severity: " with message regression["severity"]
-        Display "    Likely cause: " with message regression["probable_cause"]
-```
-
 ## Advanced Features
 
-### Tiered Compilation
+### Optimization Techniques
 
-Implement sophisticated tiered compilation strategies:
+The JIT compiler includes various optimization techniques:
 
 ```runa
-Import "advanced.jit.adaptive" as adaptive_jit
+Note: Apply different optimization levels
+Let optimization_level_1 be jit_compiler.constant_folding[bytecode_block]
+Let optimization_level_2 be jit_compiler.dead_code_elimination[optimization_level_1]
+Let optimization_level_3 be jit_compiler.loop_optimization[optimization_level_2]
 
-Note: Create tiered compilation system
-Let tiered_config be dictionary with:
-    "compilation_tiers" as list containing:
-        dictionary with:
-            "tier_name" as "interpreter",
-            "activation_threshold" as 0,
-            "compilation_time_budget_ms" as 0,
-            "optimization_level" as "none",
-            "profiling_enabled" as true
-        dictionary with:
-            "tier_name" as "fast_compiler",
-            "activation_threshold" as 100,
-            "compilation_time_budget_ms" as 50,
-            "optimization_level" as "basic",
-            "profiling_enabled" as true
-        dictionary with:
-            "tier_name" as "optimizing_compiler",
-            "activation_threshold" as 10000,
-            "compilation_time_budget_ms" as 5000,
-            "optimization_level" as "aggressive",
-            "profiling_enabled" as false
-    "tier_transition_policy" as "profile_guided_transitions",
-    "deoptimization_support" as true,
-    "compilation_queue_management" as "priority_based_scheduling"
-
-Let tiered_compiler = adaptive_jit.create_tiered_compiler[jit_system, tiered_config]
-
-Note: Monitor compilation tier transitions
-Let tier_monitoring = adaptive_jit.monitor_tier_transitions[tiered_compiler]
-
-Display "Tiered Compilation Status:"
-Display "  Active methods by tier:"
-For each tier_stats in tier_monitoring["tier_statistics"]:
-    Display "    " with message tier_stats["tier_name"] with message ": " with message tier_stats["active_methods"] with message " methods"
-    Display "      Average compilation time: " with message tier_stats["avg_compilation_time_ms"] with message " ms"
-    Display "      Success rate: " with message tier_stats["compilation_success_rate"]
+Display "Optimization pipeline completed"
+Display "Final instruction count: " plus optimization_level_3.instructions size as string
 ```
 
-### Dynamic Deoptimization
+### Memory Management
 
-Implement safe deoptimization mechanisms:
+Efficient memory management for generated code:
 
 ```runa
-Import "advanced.jit.deoptimization" as deoptimization
+Note: Create and manage code pools
+Let code_pool be jit_compiler.create_code_pool[10485760]  # 10MB
 
-Note: Create deoptimization system
-Let deopt_config be dictionary with:
-    "deoptimization_triggers" as list containing "speculation_failure", "debugging_request", "profiling_requirement", "code_patching",
-    "deoptimization_strategy" as "safe_point_deoptimization",
-    "state_reconstruction" as "precise_state_reconstruction",
-    "performance_monitoring" as "deoptimization_cost_tracking"
-
-Let deopt_system = deoptimization.create_deoptimization_system[jit_system, deopt_config]
-
-Note: Handle speculation failure deoptimization
-Let deopt_context = dictionary with:
-    "deoptimization_reason" as "type_speculation_failure",
-    "failed_speculation" as speculation_details,
-    "execution_state" as current_execution_state,
-    "recovery_strategy" as "fallback_to_interpreter"
-
-Let deopt_result = deoptimization.handle_deoptimization[deopt_system, deopt_context]
-
-Display "Deoptimization Result:"
-Display "  Deoptimization successful: " with message deopt_result["deoptimization_successful"]
-Display "  State reconstruction time: " with message deopt_result["reconstruction_time_ms"] with message " ms"
-Display "  Fallback method: " with message deopt_result["fallback_method"]
+Display "Code pool created"
+Display "Total size: " plus code_pool.total_size as string plus " bytes"
+Display "Used size: " plus code_pool.used_size as string plus " bytes"
 ```
 
-### Code Cache Management
+### Cross-Platform Support
 
-Advanced code cache management and optimization:
+The JIT compiler supports multiple architectures:
 
 ```runa
+Note: Detect and use appropriate architecture
+Let architecture be jit_compiler.detect_target_architecture[jit_context]
+
+Match architecture:
+    When "x86_64":
+        Display "Using x86-64 optimizations"
+    When "arm64":
+        Display "Using ARM64 optimizations"
+    When "riscv64":
+        Display "Using RISC-V optimizations"
+    Otherwise:
+        Display "Using generic optimizations"
+```
+
+## Best Practices
+
+### Performance Optimization
+
+1. **Optimization Levels**: Use appropriate optimization levels based on performance requirements
+2. **Memory Management**: Monitor code pool usage and adjust sizes as needed
+3. **Caching Strategy**: Implement effective caching for frequently compiled code
+4. **Profiling Integration**: Use profiling data to guide optimization decisions
+
+### Error Handling
+
+1. **Compilation Errors**: Handle compilation failures gracefully with fallback mechanisms
+2. **Memory Errors**: Monitor memory usage and implement proper cleanup
+3. **Architecture Detection**: Ensure proper fallback for unsupported architectures
+
+### Example: Complete JIT Workflow
+
+```runa
+Note: Complete JIT compilation workflow
+Import "advanced.jit.compiler" as jit_compiler
+Import "advanced.jit.profiling" as jit_profiling
 Import "advanced.jit.caching" as jit_caching
 
-Note: Create intelligent code cache
-Let cache_config be dictionary with:
-    "cache_architecture" as dictionary with:
-        "cache_size_mb" as 512,
-        "cache_segments" as list containing "hot_code", "warm_code", "cold_code", "speculative_code",
-        "eviction_policy" as "multi_level_lru_with_hotness",
-        "fragmentation_management" as "automatic_compaction"
-    "cache_optimization" as dictionary with:
-        "code_layout_optimization" as "function_reordering",
-        "cache_line_alignment" as "optimal_alignment",
-        "prefetching_strategy" as "predictive_prefetching",
-        "compression" as "lightweight_compression"
-    "cache_monitoring" as dictionary with:
-        "hit_rate_monitoring" as true,
-        "fragmentation_tracking" as true,
-        "eviction_analysis" as true,
-        "performance_impact_analysis" as true
+Note: Initialize all components
+Let jit_config be JITConfig with:
+    enabled as true
+    target_architecture as "auto"
+    optimization_level as 2
+    max_code_size as 104857600
+    enable_inlining as true
+    enable_specialization as true
+    enable_profiling as true
+    enable_debugging as false
+    memory_pool_size as 10485760
+    compilation_threshold as 1000
 
-Let code_cache = jit_caching.create_code_cache[jit_system, cache_config]
+Let jit_context be jit_compiler.create_jit_context[jit_config]
 
-Note: Optimize cache layout for performance
-Let optimization_request = dictionary with:
-    "optimization_objective" as "maximize_cache_efficiency",
-    "profiling_data" as cache_access_patterns,
-    "performance_constraints" as cache_performance_requirements
+Let profiling_config be ProfilingConfig with:
+    enabled as true
+    sampling_rate as 0.01
+    memory_profiling as true
+    cache_profiling as true
+    compilation_profiling as true
+    runtime_profiling as true
+    enable_ai_insights as true
+    max_profiling_data as 1000000
 
-Let cache_optimization = jit_caching.optimize_cache_layout[code_cache, optimization_request]
+Let profiling_context be jit_profiling.create_profiling_context[profiling_config]
 
-Display "Code Cache Optimization:"
-Display "  Optimization successful: " with message cache_optimization["optimization_successful"]
-Display "  Cache hit rate improvement: " with message cache_optimization["hit_rate_improvement"]
-Display "  Memory fragmentation reduction: " with message cache_optimization["fragmentation_reduction"]
+Let cache_config be CacheConfig with:
+    enabled as true
+    cache_levels as 3
+    l1_size as 1048576
+    l2_size as 10485760
+    l3_size as 104857600
+    enable_compression as true
+    enable_persistence as true
+    enable_sharing as true
+    eviction_policy as "lru"
+    warmup_strategy as "predictive"
+
+Let cache_context be jit_caching.create_cache_context[cache_config]
+
+Note: Compile and optimize bytecode
+Let compilation_result be jit_compiler.compile_bytecode[jit_context, bytecode_block]
+
+Match compilation_result:
+    When CompilationSuccess with native_code as code and performance_metrics as metrics:
+        Display "JIT compilation successful"
+        Display "Performance metrics: " plus metrics
+    When CompilationError with error as err and details as details:
+        Display "Compilation failed: " plus err
+    When CompilationWarning with warning as warn and native_code as code:
+        Display "Compilation warning: " plus warn
 ```
 
-### Machine Learning-Based Optimization
-
-Use ML for optimization decision making:
-
-```runa
-Import "advanced.jit.ml_optimization" as ml_jit
-
-Note: Create ML-based optimization system
-Let ml_config be dictionary with:
-    "machine_learning_models" as dictionary with:
-        "optimization_selection_model" as "gradient_boosting_classifier",
-        "performance_prediction_model" as "neural_network_regressor",
-        "compilation_cost_model" as "random_forest_regressor",
-        "hotspot_prediction_model" as "time_series_forecaster"
-    "training_data" as dictionary with:
-        "historical_profiles" as historical_profiling_database,
-        "benchmark_results" as optimization_benchmark_data,
-        "feature_engineering" as "automatic_feature_extraction",
-        "model_validation" as "cross_validation_with_holdout"
-    "online_learning" as dictionary with:
-        "adaptive_learning" as true,
-        "feedback_integration" as "immediate_feedback",
-        "model_updating_frequency" as "continuous_updates",
-        "performance_tracking" as "a_b_testing"
-
-Let ml_optimizer = ml_jit.create_ml_optimizer[jit_system, ml_config]
-
-Note: Use ML to predict optimal optimization strategy
-Let optimization_decision_request = dictionary with:
-    "code_characteristics" as code_feature_vector,
-    "execution_context" as runtime_context_features,
-    "performance_requirements" as performance_targets,
-    "resource_constraints" as available_resources
+This JIT module provides a comprehensive foundation for dynamic compilation and optimization in Runa applications. The combination of bytecode analysis, native code generation, and advanced optimization techniques makes it suitable for high-performance applications requiring runtime compilation.
 
 Let ml_decision = ml_jit.predict_optimization_strategy[ml_optimizer, optimization_decision_request]
 

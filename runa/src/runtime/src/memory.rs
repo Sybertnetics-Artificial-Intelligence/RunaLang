@@ -1,9 +1,13 @@
-//! Memory management primitives for the Runa runtime.
+//! Advanced memory management system for the Runa runtime.
+//! Provides custom allocators, GC algorithms, and ownership tracking.
 
-use std::alloc::{alloc as std_alloc, Layout};
+use std::alloc::{alloc as std_alloc, dealloc as std_dealloc, Layout};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+use std::ptr::NonNull;
 use crate::runa_object;
 
-/// Memory allocation statistics for debugging and monitoring
+/// Advanced memory allocation statistics for debugging and monitoring
 #[derive(Debug, Default, Clone)]
 pub struct MemoryStats {
     pub total_allocated: usize,
@@ -11,6 +15,59 @@ pub struct MemoryStats {
     pub current_usage: usize,
     pub allocation_count: usize,
     pub deallocation_count: usize,
+    pub peak_usage: usize,
+    pub fragmentation_ratio: f64,
+    pub gc_collections: usize,
+    pub gc_time_ms: u64,
+}
+
+/// Custom allocator trait for pluggable memory allocation strategies
+pub trait CustomAllocator: Send + Sync {
+    fn allocate(&self, size: usize, align: usize) -> Result<NonNull<u8>, AllocError>;
+    fn deallocate(&self, ptr: NonNull<u8>, size: usize, align: usize);
+    fn reallocate(&self, ptr: NonNull<u8>, old_size: usize, new_size: usize, align: usize) -> Result<NonNull<u8>, AllocError>;
+    fn get_stats(&self) -> AllocatorStats;
+    fn reset_stats(&self);
+}
+
+#[derive(Debug, Clone)]
+pub struct AllocatorStats {
+    pub allocated_bytes: usize,
+    pub freed_bytes: usize,
+    pub active_allocations: usize,
+    pub peak_allocations: usize,
+    pub fragmentation: f64,
+}
+
+#[derive(Debug)]
+pub enum AllocError {
+    OutOfMemory,
+    InvalidSize,
+    InvalidAlignment,
+    Fragmentation,
+}
+
+/// Arena allocator for fast bulk allocations
+pub struct ArenaAllocator {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    offset: Arc<Mutex<usize>>,
+    stats: Arc<Mutex<AllocatorStats>>,
+}
+
+/// Pool allocator for fixed-size allocations
+pub struct PoolAllocator {
+    block_size: usize,
+    free_blocks: Arc<Mutex<Vec<NonNull<u8>>>>,
+    allocated_blocks: Arc<Mutex<HashMap<*mut u8, usize>>>,
+    stats: Arc<Mutex<AllocatorStats>>,
+}
+
+/// Stack allocator for LIFO allocations
+pub struct StackAllocator {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    top: Arc<Mutex<usize>>,
+    markers: Arc<Mutex<Vec<usize>>>,
+    stats: Arc<Mutex<AllocatorStats>>,
 }
 
 use std::sync::Mutex;
@@ -208,6 +265,227 @@ pub fn move_memory(dst: runa_object, src: runa_object, size: usize) -> bool {
         );
     }
     true
+}
+
+// ============================================================================
+// CUSTOM ALLOCATOR IMPLEMENTATIONS
+// ============================================================================
+
+impl ArenaAllocator {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buffer: Arc::new(Mutex::new(vec![0u8; capacity])),
+            offset: Arc::new(Mutex::new(0)),
+            stats: Arc::new(Mutex::new(AllocatorStats::default())),
+        }
+    }
+    
+    pub fn reset(&self) {
+        if let (Ok(mut offset), Ok(mut stats)) = (self.offset.lock(), self.stats.lock()) {
+            *offset = 0;
+            stats.reset();
+        }
+    }
+}
+
+impl CustomAllocator for ArenaAllocator {
+    fn allocate(&self, size: usize, align: usize) -> Result<NonNull<u8>, AllocError> {
+        if size == 0 {
+            return Err(AllocError::InvalidSize);
+        }
+        
+        let (buffer_guard, mut offset_guard, mut stats_guard) = {
+            let buffer = self.buffer.lock().map_err(|_| AllocError::OutOfMemory)?;
+            let offset = self.offset.lock().map_err(|_| AllocError::OutOfMemory)?;
+            let stats = self.stats.lock().map_err(|_| AllocError::OutOfMemory)?;
+            (buffer, offset, stats)
+        };
+        
+        let aligned_offset = (*offset_guard + align - 1) & !(align - 1);
+        let end_offset = aligned_offset + size;
+        
+        if end_offset > buffer_guard.len() {
+            return Err(AllocError::OutOfMemory);
+        }
+        
+        let ptr = unsafe {
+            NonNull::new_unchecked(buffer_guard.as_ptr().add(aligned_offset) as *mut u8)
+        };
+        
+        *offset_guard = end_offset;
+        stats_guard.allocated_bytes += size;
+        stats_guard.active_allocations += 1;
+        
+        Ok(ptr)
+    }
+    
+    fn deallocate(&self, _ptr: NonNull<u8>, size: usize, _align: usize) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.freed_bytes += size;
+            stats.active_allocations = stats.active_allocations.saturating_sub(1);
+        }
+    }
+    
+    fn reallocate(&self, _ptr: NonNull<u8>, _old_size: usize, new_size: usize, align: usize) -> Result<NonNull<u8>, AllocError> {
+        // Arena allocators can't reallocate in place, so allocate new
+        self.allocate(new_size, align)
+    }
+    
+    fn get_stats(&self) -> AllocatorStats {
+        self.stats.lock().unwrap_or_default().clone()
+    }
+    
+    fn reset_stats(&self) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.reset();
+        }
+    }
+}
+
+impl PoolAllocator {
+    pub fn new(block_size: usize, pool_size: usize) -> Self {
+        let mut free_blocks = Vec::new();
+        let buffer = vec![0u8; block_size * pool_size];
+        
+        for i in 0..pool_size {
+            let ptr = unsafe {
+                NonNull::new_unchecked(buffer.as_ptr().add(i * block_size) as *mut u8)
+            };
+            free_blocks.push(ptr);
+        }
+        
+        Self {
+            block_size,
+            free_blocks: Arc::new(Mutex::new(free_blocks)),
+            allocated_blocks: Arc::new(Mutex::new(HashMap::new())),
+            stats: Arc::new(Mutex::new(AllocatorStats::default())),
+        }
+    }
+}
+
+impl CustomAllocator for PoolAllocator {
+    fn allocate(&self, size: usize, _align: usize) -> Result<NonNull<u8>, AllocError> {
+        if size > self.block_size {
+            return Err(AllocError::InvalidSize);
+        }
+        
+        let (mut free_blocks, mut allocated_blocks, mut stats) = {
+            let free = self.free_blocks.lock().map_err(|_| AllocError::OutOfMemory)?;
+            let alloc = self.allocated_blocks.lock().map_err(|_| AllocError::OutOfMemory)?;
+            let stats = self.stats.lock().map_err(|_| AllocError::OutOfMemory)?;
+            (free, alloc, stats)
+        };
+        
+        let ptr = free_blocks.pop().ok_or(AllocError::OutOfMemory)?;
+        allocated_blocks.insert(ptr.as_ptr(), self.block_size);
+        
+        stats.allocated_bytes += self.block_size;
+        stats.active_allocations += 1;
+        
+        Ok(ptr)
+    }
+    
+    fn deallocate(&self, ptr: NonNull<u8>, _size: usize, _align: usize) {
+        if let (Ok(mut free_blocks), Ok(mut allocated_blocks), Ok(mut stats)) = 
+            (self.free_blocks.lock(), self.allocated_blocks.lock(), self.stats.lock()) {
+            
+            if allocated_blocks.remove(&ptr.as_ptr()).is_some() {
+                free_blocks.push(ptr);
+                stats.freed_bytes += self.block_size;
+                stats.active_allocations = stats.active_allocations.saturating_sub(1);
+            }
+        }
+    }
+    
+    fn reallocate(&self, ptr: NonNull<u8>, _old_size: usize, new_size: usize, align: usize) -> Result<NonNull<u8>, AllocError> {
+        if new_size <= self.block_size {
+            Ok(ptr) // No need to reallocate if it fits
+        } else {
+            let new_ptr = self.allocate(new_size, align)?;
+            self.deallocate(ptr, self.block_size, align);
+            Ok(new_ptr)
+        }
+    }
+    
+    fn get_stats(&self) -> AllocatorStats {
+        self.stats.lock().unwrap_or_default().clone()
+    }
+    
+    fn reset_stats(&self) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.reset();
+        }
+    }
+}
+
+impl Default for AllocatorStats {
+    fn default() -> Self {
+        Self {
+            allocated_bytes: 0,
+            freed_bytes: 0,
+            active_allocations: 0,
+            peak_allocations: 0,
+            fragmentation: 0.0,
+        }
+    }
+}
+
+impl AllocatorStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+// ============================================================================
+// FFI EXPORTS FOR CUSTOM ALLOCATORS
+// ============================================================================
+
+#[no_mangle]
+pub extern "C" fn runa_create_arena_allocator(capacity: usize) -> *mut ArenaAllocator {
+    let allocator = Box::new(ArenaAllocator::new(capacity));
+    Box::into_raw(allocator)
+}
+
+#[no_mangle]
+pub extern "C" fn runa_create_pool_allocator(block_size: usize, pool_size: usize) -> *mut PoolAllocator {
+    let allocator = Box::new(PoolAllocator::new(block_size, pool_size));
+    Box::into_raw(allocator)
+}
+
+#[no_mangle]
+pub extern "C" fn runa_arena_allocate(allocator: *mut ArenaAllocator, size: usize, align: usize) -> runa_object {
+    if allocator.is_null() {
+        return std::ptr::null_mut();
+    }
+    
+    let allocator = unsafe { &*allocator };
+    match allocator.allocate(size, align) {
+        Ok(ptr) => ptr.as_ptr() as runa_object,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runa_pool_allocate(allocator: *mut PoolAllocator, size: usize, align: usize) -> runa_object {
+    if allocator.is_null() {
+        return std::ptr::null_mut();
+    }
+    
+    let allocator = unsafe { &*allocator };
+    match allocator.allocate(size, align) {
+        Ok(ptr) => ptr.as_ptr() as runa_object,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runa_get_allocator_stats(allocator: *mut dyn CustomAllocator) -> AllocatorStats {
+    if allocator.is_null() {
+        return AllocatorStats::default();
+    }
+    
+    let allocator = unsafe { &*allocator };
+    allocator.get_stats()
 }
 
 #[cfg(test)]
