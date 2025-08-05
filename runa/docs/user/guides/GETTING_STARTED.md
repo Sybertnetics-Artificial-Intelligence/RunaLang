@@ -10,7 +10,7 @@ Make sure you have Python 3.8+ installed, then:
 
 ```bash
 # Clone the repository
-git clone https://github.com/sybertnetics/runa
+git clone https://github.com/sybertneticsaisolutions/runa
 cd runa
 
 # Install Runa
@@ -117,12 +117,12 @@ Compile and run to see functions in action.
 
 In just 5 minutes, you've learned:
 
-✅ How to install and use Runa  
-✅ Basic variable declaration and math  
-✅ Natural language syntax for operations  
-✅ Conditional statements (if/otherwise)  
-✅ Loops (for-range)  
-✅ Function definition and calling  
+How to install and use Runa  
+Basic variable declaration and math  
+Natural language syntax for operations  
+Conditional statements (if/otherwise)  
+Loops (for-range)  
+Function definition and calling  
 
 ## Next Steps
 

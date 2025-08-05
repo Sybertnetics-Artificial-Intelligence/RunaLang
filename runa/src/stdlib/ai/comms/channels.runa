@@ -612,19 +612,115 @@ Process called "string_from_integer" that takes number as Integer returns String
     Return "0"
 
 Process called "perform_channel_connection" that takes channel as Channel returns Dictionary:
-    Return dictionary containing
-        "success" as true
+    Try:
+        Let channel_type be channel get "channel_type"
+        Let local_endpoint be channel get "local_endpoint"
+        Let remote_endpoint be channel get "remote_endpoint"
+        Let config be channel get "configuration"
+        
+        If channel_type is equal to "tcp":
+            Let connection_result be establish_tcp_connection(local_endpoint, remote_endpoint, config)
+            Return connection_result
+        Otherwise if channel_type is equal to "websocket":
+            Let connection_result be establish_websocket_connection(local_endpoint, remote_endpoint, config)
+            Return connection_result
+        Otherwise if channel_type is equal to "udp":
+            Let connection_result be establish_udp_connection(local_endpoint, remote_endpoint, config)
+            Return connection_result
+        Otherwise if channel_type is equal to "quic":
+            Let connection_result be establish_quic_connection(local_endpoint, remote_endpoint, config)
+            Return connection_result
+        Otherwise if channel_type is equal to "ipc":
+            Let connection_result be establish_ipc_connection(local_endpoint, remote_endpoint, config)
+            Return connection_result
+        Otherwise:
+            Return dictionary containing
+                "success" as false
+                "error" as "Unsupported channel type: " plus channel_type
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "Connection failed: " plus error get "message"
 
 Process called "perform_channel_send" that takes channel as Channel and data as Any returns Dictionary:
-    Return dictionary containing
-        "success" as true
-        "bytes_sent" as 1024
+    Try:
+        Let serialized_data be serialize_channel_data(data)
+        Let config be channel get "configuration"
+        
+        If config get "compression_enabled":
+            Set serialized_data as compress_channel_data(serialized_data)
+        
+        If config get "encryption_enabled":
+            Set serialized_data as encrypt_channel_data(serialized_data, channel get "security_context")
+        
+        Let bytes_to_send be calculate_data_size(serialized_data)
+        
+        If config get "bandwidth_limit" is not none:
+            Let bandwidth_check be check_bandwidth_limit(channel, bytes_to_send)
+            If not bandwidth_check get "allowed":
+                Return dictionary containing
+                    "success" as false
+                    "error" as "Bandwidth limit exceeded"
+        
+        Let send_result be send_channel_data(channel, serialized_data)
+        
+        If send_result get "success":
+            Update send metrics for channel with bytes_to_send
+            Return dictionary containing
+                "success" as true
+                "bytes_sent" as bytes_to_send
+                "compression_ratio" as calculate_compression_ratio(data, serialized_data)
+        Otherwise:
+            Return dictionary containing
+                "success" as false
+                "error" as send_result get "error"
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "Send failed: " plus error get "message"
 
 Process called "perform_channel_receive" that takes channel as Channel returns Dictionary:
-    Return dictionary containing
-        "success" as true
-        "data" as "received_data"
-        "bytes_received" as 1024
+    Try:
+        Let config be channel get "configuration"
+        Let timeout be config get "timeout_settings" get "read_timeout"
+        
+        Let receive_result be receive_channel_data(channel, timeout)
+        
+        If not receive_result get "success":
+            Return receive_result
+        
+        Let received_data be receive_result get "data"
+        Let bytes_received be receive_result get "bytes_received"
+        
+        If config get "encryption_enabled":
+            Let decrypt_result be decrypt_channel_data(received_data, channel get "security_context")
+            If not decrypt_result get "success":
+                Return dictionary containing
+                    "success" as false
+                    "error" as "Decryption failed: " plus decrypt_result get "error"
+            Set received_data as decrypt_result get "data"
+        
+        If config get "compression_enabled":
+            Let decompress_result be decompress_channel_data(received_data)
+            If decompress_result get "success":
+                Set received_data as decompress_result get "data"
+        
+        Let deserialized_data be deserialize_channel_data(received_data)
+        
+        Update receive metrics for channel with bytes_received
+        
+        Return dictionary containing
+            "success" as true
+            "data" as deserialized_data
+            "bytes_received" as bytes_received
+            "decompression_ratio" as calculate_decompression_ratio(received_data, deserialized_data)
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "Receive failed: " plus error get "message"
 
 Process called "get_available_channels_from_pool" that takes pool as ChannelPool returns List[Channel]:
     Let available be list containing nothing
@@ -634,15 +730,46 @@ Process called "get_available_channels_from_pool" that takes pool as ChannelPool
     Return available
 
 Process called "select_round_robin_channel" that takes channels as List[Channel] returns Channel:
-    Return first item in channels
+    Let round_robin_counter be get_global_round_robin_counter()
+    Let channel_index be round_robin_counter modulo length of channels
+    Set round_robin_counter as round_robin_counter plus 1
+    Update global round robin counter with round_robin_counter
+    Return channels get channel_index
 
 Process called "select_least_loaded_channel" that takes channels as List[Channel] returns Channel:
-    Return first item in channels
+    Let least_loaded_channel be first item in channels
+    Let lowest_load be calculate_channel_load(least_loaded_channel)
+    
+    For each channel in channels:
+        Let current_load be calculate_channel_load(channel)
+        If current_load is less than lowest_load:
+            Set lowest_load as current_load
+            Set least_loaded_channel as channel
+    
+    Return least_loaded_channel
 
 Process called "select_best_performance_channel" that takes channels as List[Channel] returns Channel:
-    Return first item in channels
+    Let best_channel be first item in channels
+    Let best_performance_score be calculate_performance_score(best_channel get "metrics")
+    
+    For each channel in channels:
+        Let performance_score be calculate_performance_score(channel get "metrics")
+        If performance_score is greater than best_performance_score:
+            Set best_performance_score as performance_score
+            Set best_channel as channel
+    
+    Return best_channel
 
 Process called "select_priority_channel" that takes channels as List[Channel] and criteria as Dictionary returns Channel:
+    Let required_priority be criteria get "priority"
+    Let priority_order be list containing "critical", "high", "normal", "low", "background"
+    
+    For each priority in priority_order:
+        If priority is equal to required_priority or required_priority is none:
+            For each channel in channels:
+                If channel get "priority" is equal to priority:
+                    Return channel
+    
     Return first item in channels
 
 Process called "create_multiplexed_frame" that takes stream_id as String and data as Any returns Dictionary:
@@ -656,31 +783,841 @@ Process called "parse_multiplexed_frame" that takes frame_data as Any returns Di
         "data" as frame_data
 
 Process called "score_latency_criterion" that takes channel as Channel and criterion as Dictionary and requirements as Dictionary returns Float:
-    Return 80.0
+    Let channel_latency be channel get "metrics" get "average_latency"
+    Let required_latency be requirements get "max_latency"
+    
+    If required_latency is none:
+        Set required_latency as 100.0
+    
+    If channel_latency is less than or equal to required_latency multiplied by 0.5:
+        Return 100.0
+    Otherwise if channel_latency is less than or equal to required_latency:
+        Let ratio be channel_latency divided by required_latency
+        Return 100.0 minus (ratio multiplied by 50.0)
+    Otherwise:
+        Let penalty be (channel_latency minus required_latency) divided by required_latency
+        Let score be 50.0 minus (penalty multiplied by 25.0)
+        If score is less than 0.0:
+            Return 0.0
+        Return score
 
 Process called "score_throughput_criterion" that takes channel as Channel and criterion as Dictionary and requirements as Dictionary returns Float:
-    Return 85.0
+    Let channel_throughput be channel get "metrics" get "throughput_mbps"
+    Let required_throughput be requirements get "min_throughput_mbps"
+    
+    If required_throughput is none:
+        Set required_throughput as 1.0
+    
+    If channel_throughput is greater than or equal to required_throughput multiplied by 2.0:
+        Return 100.0
+    Otherwise if channel_throughput is greater than or equal to required_throughput:
+        Let ratio be channel_throughput divided by required_throughput
+        Return 50.0 plus (ratio multiplied by 50.0)
+    Otherwise:
+        Let ratio be channel_throughput divided by required_throughput
+        Return ratio multiplied by 50.0
 
 Process called "score_reliability_criterion" that takes channel as Channel and criterion as Dictionary and requirements as Dictionary returns Float:
-    Return 90.0
+    Let uptime_percentage be channel get "metrics" get "uptime_percentage"
+    Let error_count be channel get "metrics" get "error_count"
+    Let total_messages be channel get "metrics" get "messages_sent" plus channel get "metrics" get "messages_received"
+    
+    Let uptime_score be uptime_percentage
+    
+    Let error_rate be 0.0
+    If total_messages is greater than 0:
+        Set error_rate as error_count divided by total_messages multiplied by 100.0
+    
+    Let error_score be 100.0 minus error_rate
+    If error_score is less than 0.0:
+        Set error_score as 0.0
+    
+    Let reliability_score be uptime_score multiplied by 0.7 plus error_score multiplied by 0.3
+    
+    Return reliability_score
 
 Process called "score_cost_criterion" that takes channel as Channel and criterion as Dictionary and requirements as Dictionary returns Float:
-    Return 75.0
+    Let channel_type be channel get "channel_type"
+    Let cost_weight be criterion get "cost_weight"
+    
+    If cost_weight is none:
+        Set cost_weight as 1.0
+    
+    Let base_cost be get_channel_type_cost(channel_type)
+    Let bandwidth_cost be calculate_bandwidth_cost(channel)
+    Let maintenance_cost be calculate_maintenance_cost(channel)
+    
+    Let total_cost be base_cost plus bandwidth_cost plus maintenance_cost
+    Let budget_limit be requirements get "budget_limit"
+    
+    If budget_limit is none:
+        Return 75.0
+    
+    If total_cost is less than or equal to budget_limit multiplied by 0.5:
+        Return 100.0
+    Otherwise if total_cost is less than or equal to budget_limit:
+        Let cost_ratio be total_cost divided by budget_limit
+        Return 100.0 minus (cost_ratio multiplied by 50.0)
+    Otherwise:
+        Let overage_ratio be (total_cost minus budget_limit) divided by budget_limit
+        Let score be 50.0 minus (overage_ratio multiplied by 25.0)
+        If score is less than 0.0:
+            Return 0.0
+        Return score
 
 Process called "calculate_current_bandwidth_usage" that takes channel_id as String returns Integer:
     Return 1000
 
 Process called "calculate_performance_score" that takes metrics as ChannelMetrics returns Float:
-    Return 85.0
+    Let latency_score be calculate_latency_performance_score(metrics get "average_latency")
+    Let throughput_score be calculate_throughput_performance_score(metrics get "throughput_mbps")
+    Let reliability_score be metrics get "uptime_percentage"
+    Let error_score be calculate_error_performance_score(metrics get "error_count", metrics get "messages_sent" plus metrics get "messages_received")
+    
+    Let overall_score be (
+        latency_score multiplied by 0.3 plus
+        throughput_score multiplied by 0.25 plus
+        reliability_score multiplied by 0.25 plus
+        error_score multiplied by 0.2
+    )
+    
+    If overall_score is greater than 100.0:
+        Return 100.0
+    Otherwise if overall_score is less than 0.0:
+        Return 0.0
+    
+    Return overall_score
 
 Process called "analyze_latency_trend" that takes channel as Channel and window as Float returns String:
-    Return "stable"
+    Let current_latency be channel get "metrics" get "average_latency"
+    Let historical_latencies be get_channel_latency_history(channel get "channel_id", window)
+    
+    If length of historical_latencies is less than 3:
+        Return "insufficient_data"
+    
+    Let total_change be 0.0
+    Let measurement_count be 0
+    
+    For i from 1 to length of historical_latencies minus 1:
+        Let previous_latency be historical_latencies get (i minus 1)
+        Let current_measurement be historical_latencies get i
+        Let change be current_measurement minus previous_latency
+        Set total_change as total_change plus change
+        Set measurement_count as measurement_count plus 1
+    
+    If measurement_count is equal to 0:
+        Return "stable"
+    
+    Let average_change be total_change divided by measurement_count
+    Let change_percentage be average_change divided by (historical_latencies get 0) multiplied by 100.0
+    
+    If change_percentage is greater than 10.0:
+        Return "increasing"
+    Otherwise if change_percentage is less than -10.0:
+        Return "decreasing"
+    Otherwise if change_percentage is greater than 5.0:
+        Return "slightly_increasing"
+    Otherwise if change_percentage is less than -5.0:
+        Return "slightly_decreasing"
+    Otherwise:
+        Return "stable"
 
 Process called "analyze_throughput_trend" that takes channel as Channel and window as Float returns String:
-    Return "increasing"
+    Let current_throughput be channel get "metrics" get "throughput_mbps"
+    Let historical_throughputs be get_channel_throughput_history(channel get "channel_id", window)
+    
+    If length of historical_throughputs is less than 3:
+        Return "insufficient_data"
+    
+    Let total_change be 0.0
+    Let measurement_count be 0
+    
+    For i from 1 to length of historical_throughputs minus 1:
+        Let previous_throughput be historical_throughputs get (i minus 1)
+        Let current_measurement be historical_throughputs get i
+        Let change be current_measurement minus previous_throughput
+        Set total_change as total_change plus change
+        Set measurement_count as measurement_count plus 1
+    
+    If measurement_count is equal to 0:
+        Return "stable"
+    
+    Let average_change be total_change divided by measurement_count
+    
+    If historical_throughputs get 0 is greater than 0.0:
+        Let change_percentage be average_change divided by (historical_throughputs get 0) multiplied by 100.0
+        
+        If change_percentage is greater than 15.0:
+            Return "rapidly_increasing"
+        Otherwise if change_percentage is greater than 5.0:
+            Return "increasing"
+        Otherwise if change_percentage is less than -15.0:
+            Return "rapidly_decreasing"
+        Otherwise if change_percentage is less than -5.0:
+            Return "decreasing"
+        Otherwise:
+            Return "stable"
+    
+    Return "stable"
 
 Process called "generate_health_recommendations" that takes issues as List[String] returns List[String]:
     Return list containing "Monitor closely"
 
 Process called "generate_performance_recommendations" that takes score as Float and latency_trend as String and throughput_trend as String returns List[String]:
-    Return list containing "Continue monitoring"
+    Let recommendations be list containing nothing
+    
+    If score is less than 60.0:
+        Add "Channel performance is degraded - consider replacement" to recommendations
+    Otherwise if score is less than 80.0:
+        Add "Channel performance is below optimal - investigate bottlenecks" to recommendations
+    
+    If latency_trend is equal to "increasing" or latency_trend is equal to "rapidly_increasing":
+        Add "Latency is increasing - check network conditions and optimize routing" to recommendations
+    
+    If throughput_trend is equal to "decreasing" or throughput_trend is equal to "rapidly_decreasing":
+        Add "Throughput is decreasing - consider bandwidth optimization or protocol tuning" to recommendations
+    
+    If latency_trend is equal to "stable" and throughput_trend is equal to "stable" and score is greater than 85.0:
+        Add "Channel performing well - maintain current configuration" to recommendations
+    
+    If length of recommendations is equal to 0:
+        Add "Continue monitoring channel performance" to recommendations
+    
+    Return recommendations
+
+Note: Advanced Production Helper Functions for Channels
+Process called "establish_tcp_connection" that takes local as String and remote as String and config as ChannelConfiguration returns Dictionary:
+    Try:
+        Let connection_timeout be config get "timeout_settings" get "connection_timeout"
+        Let socket_result be create_tcp_socket(local, remote, connection_timeout)
+        
+        If socket_result get "success":
+            Let socket_handle be socket_result get "socket"
+            Configure socket options with config
+            
+            Return dictionary containing
+                "success" as true
+                "socket" as socket_handle
+                "local_address" as socket_result get "local_address"
+                "remote_address" as socket_result get "remote_address"
+        Else:
+            Return dictionary containing
+                "success" as false
+                "error" as socket_result get "error"
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "TCP connection failed: " plus error get "message"
+
+Process called "establish_websocket_connection" that takes local as String and remote as String and config as ChannelConfiguration returns Dictionary:
+    Try:
+        Let websocket_result be create_websocket_connection(local, remote, config)
+        
+        If websocket_result get "success":
+            Return dictionary containing
+                "success" as true
+                "websocket" as websocket_result get "websocket"
+                "protocol" as websocket_result get "protocol"
+        Else:
+            Return dictionary containing
+                "success" as false
+                "error" as websocket_result get "error"
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "WebSocket connection failed: " plus error get "message"
+
+Process called "establish_udp_connection" that takes local as String and remote as String and config as ChannelConfiguration returns Dictionary:
+    Try:
+        Let udp_result be create_udp_socket(local, remote)
+        
+        If udp_result get "success":
+            Return dictionary containing
+                "success" as true
+                "socket" as udp_result get "socket"
+                "local_address" as udp_result get "local_address"
+                "remote_address" as udp_result get "remote_address"
+        Else:
+            Return dictionary containing
+                "success" as false
+                "error" as udp_result get "error"
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "UDP connection failed: " plus error get "message"
+
+Process called "establish_quic_connection" that takes local as String and remote as String and config as ChannelConfiguration returns Dictionary:
+    Try:
+        Let quic_result be create_quic_connection(local, remote, config)
+        
+        If quic_result get "success":
+            Return dictionary containing
+                "success" as true
+                "connection" as quic_result get "connection"
+                "stream_id" as quic_result get "stream_id"
+        Else:
+            Return dictionary containing
+                "success" as false
+                "error" as quic_result get "error"
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "QUIC connection failed: " plus error get "message"
+
+Process called "establish_ipc_connection" that takes local as String and remote as String and config as ChannelConfiguration returns Dictionary:
+    Try:
+        Let ipc_result be create_ipc_channel(local, remote)
+        
+        If ipc_result get "success":
+            Return dictionary containing
+                "success" as true
+                "channel" as ipc_result get "channel"
+                "pipe_id" as ipc_result get "pipe_id"
+        Else:
+            Return dictionary containing
+                "success" as false
+                "error" as ipc_result get "error"
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "IPC connection failed: " plus error get "message"
+
+Process called "serialize_channel_data" that takes data as Any returns String:
+    Try:
+        If data is String:
+            Return data
+        Otherwise if data is Dictionary or data is List:
+            Return json_stringify(data)
+        Otherwise:
+            Return string_representation(data)
+    Catch error:
+        Return "serialization_error"
+
+Process called "compress_channel_data" that takes data as String returns String:
+    Try:
+        Let compressed_data be gzip_compress_string(data)
+        Return base64_encode_string(compressed_data)
+    Catch error:
+        Return data
+
+Process called "encrypt_channel_data" that takes data as String and security_context as Optional[Dictionary] returns String:
+    Try:
+        If security_context is none:
+            Return data
+        
+        Let encryption_key be security_context get "encryption_key"
+        Let algorithm be security_context get "algorithm"
+        
+        If algorithm is equal to "aes_256":
+            Return aes_256_encrypt(data, encryption_key)
+        Otherwise:
+            Return data
+    Catch error:
+        Return data
+
+Process called "calculate_data_size" that takes data as String returns Integer:
+    Return length of data
+
+Process called "check_bandwidth_limit" that takes channel as Channel and bytes_to_send as Integer returns Dictionary:
+    Let config be channel get "configuration"
+    Let bandwidth_limit be config get "bandwidth_limit"
+    
+    If bandwidth_limit is none:
+        Return dictionary containing "allowed" as true
+    
+    Let current_usage be get_current_channel_bandwidth_usage(channel get "channel_id")
+    
+    If current_usage plus bytes_to_send is greater than bandwidth_limit:
+        Return dictionary containing
+            "allowed" as false
+            "current_usage" as current_usage
+            "limit" as bandwidth_limit
+    
+    Return dictionary containing "allowed" as true
+
+Process called "send_channel_data" that takes channel as Channel and data as String returns Dictionary:
+    Try:
+        Let channel_type be channel get "channel_type"
+        
+        If channel_type is equal to "tcp":
+            Return send_tcp_data(channel, data)
+        Otherwise if channel_type is equal to "websocket":
+            Return send_websocket_data(channel, data)
+        Otherwise if channel_type is equal to "udp":
+            Return send_udp_data(channel, data)
+        Otherwise:
+            Return dictionary containing
+                "success" as false
+                "error" as "Unsupported send operation for channel type"
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as error get "message"
+
+Process called "receive_channel_data" that takes channel as Channel and timeout as Float returns Dictionary:
+    Try:
+        Let channel_type be channel get "channel_type"
+        
+        If channel_type is equal to "tcp":
+            Return receive_tcp_data(channel, timeout)
+        Otherwise if channel_type is equal to "websocket":
+            Return receive_websocket_data(channel, timeout)
+        Otherwise if channel_type is equal to "udp":
+            Return receive_udp_data(channel, timeout)
+        Otherwise:
+            Return dictionary containing
+                "success" as false
+                "error" as "Unsupported receive operation for channel type"
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as error get "message"
+
+Process called "decrypt_channel_data" that takes data as String and security_context as Optional[Dictionary] returns Dictionary:
+    Try:
+        If security_context is none:
+            Return dictionary containing
+                "success" as true
+                "data" as data
+        
+        Let decryption_key be security_context get "decryption_key"
+        Let algorithm be security_context get "algorithm"
+        
+        If algorithm is equal to "aes_256":
+            Let decrypted_data be aes_256_decrypt(data, decryption_key)
+            Return dictionary containing
+                "success" as true
+                "data" as decrypted_data
+        Otherwise:
+            Return dictionary containing
+                "success" as true
+                "data" as data
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as error get "message"
+
+Process called "decompress_channel_data" that takes data as String returns Dictionary:
+    Try:
+        Let decoded_data be base64_decode_string(data)
+        Let decompressed_data be gzip_decompress_string(decoded_data)
+        Return dictionary containing
+            "success" as true
+            "data" as decompressed_data
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "data" as data
+
+Process called "deserialize_channel_data" that takes data as String returns Any:
+    Try:
+        Return json_parse_string(data)
+    Catch error:
+        Return data
+
+Process called "calculate_compression_ratio" that takes original as Any and compressed as String returns Float:
+    Let original_size be calculate_data_size(serialize_channel_data(original))
+    Let compressed_size be calculate_data_size(compressed)
+    
+    If original_size is equal to 0:
+        Return 1.0
+    
+    Return compressed_size divided by original_size
+
+Process called "calculate_decompression_ratio" that takes compressed as String and decompressed as Any returns Float:
+    Let compressed_size be calculate_data_size(compressed)
+    Let decompressed_size be calculate_data_size(serialize_channel_data(decompressed))
+    
+    If compressed_size is equal to 0:
+        Return 1.0
+    
+    Return decompressed_size divided by compressed_size
+
+Process called "get_global_round_robin_counter" returns Integer:
+    Let counter_store be get_global_counter_store()
+    If counter_store contains "round_robin":
+        Return counter_store get "round_robin"
+    Otherwise:
+        Return 0
+
+Process called "update_global_round_robin_counter" that takes value as Integer returns Nothing:
+    Let counter_store be get_global_counter_store()
+    Set counter_store with "round_robin" as value
+
+Process called "calculate_channel_load" that takes channel as Channel returns Float:
+    Let metrics be channel get "metrics"
+    Let bytes_sent be metrics get "bytes_sent"
+    Let bytes_received be metrics get "bytes_received"
+    Let uptime be get_current_timestamp() minus channel get "created_time"
+    
+    If uptime is equal to 0.0:
+        Return 0.0
+    
+    Let total_bytes be bytes_sent plus bytes_received
+    Let load_factor be total_bytes divided by uptime
+    
+    Return load_factor
+
+Process called "get_channel_type_cost" that takes channel_type as ChannelType returns Float:
+    If channel_type is equal to "tcp":
+        Return 1.0
+    Otherwise if channel_type is equal to "udp":
+        Return 0.8
+    Otherwise if channel_type is equal to "websocket":
+        Return 1.2
+    Otherwise if channel_type is equal to "quic":
+        Return 1.5
+    Otherwise if channel_type is equal to "ipc":
+        Return 0.5
+    Otherwise:
+        Return 1.0
+
+Process called "calculate_bandwidth_cost" that takes channel as Channel returns Float:
+    Let metrics be channel get "metrics"
+    Let throughput be metrics get "throughput_mbps"
+    Let cost_per_mbps be 0.1
+    Return throughput multiplied by cost_per_mbps
+
+Process called "calculate_maintenance_cost" that takes channel as Channel returns Float:
+    Let error_count be channel get "metrics" get "error_count"
+    Let reconnection_count be channel get "metrics" get "reconnection_count"
+    Let maintenance_cost be error_count multiplied by 0.05 plus reconnection_count multiplied by 0.1
+    Return maintenance_cost
+
+Process called "calculate_latency_performance_score" that takes latency as Float returns Float:
+    If latency is less than or equal to 10.0:
+        Return 100.0
+    Otherwise if latency is less than or equal to 50.0:
+        Return 100.0 minus ((latency minus 10.0) multiplied by 2.0)
+    Otherwise if latency is less than or equal to 100.0:
+        Return 80.0 minus ((latency minus 50.0) multiplied by 1.0)
+    Otherwise:
+        Return maximum(0.0, 30.0 minus ((latency minus 100.0) multiplied by 0.3))
+
+Process called "calculate_throughput_performance_score" that takes throughput as Float returns Float:
+    If throughput is greater than or equal to 100.0:
+        Return 100.0
+    Otherwise if throughput is greater than or equal to 10.0:
+        Return throughput
+    Otherwise if throughput is greater than or equal to 1.0:
+        Return throughput multiplied by 10.0
+    Otherwise:
+        Return throughput multiplied by 50.0
+
+Process called "calculate_error_performance_score" that takes error_count as Integer and total_messages as Integer returns Float:
+    If total_messages is equal to 0:
+        Return 100.0
+    
+    Let error_rate be error_count divided by total_messages
+    Let error_percentage be error_rate multiplied by 100.0
+    
+    If error_percentage is less than or equal to 1.0:
+        Return 100.0
+    Otherwise if error_percentage is less than or equal to 5.0:
+        Return 100.0 minus (error_percentage minus 1.0) multiplied by 20.0
+    Otherwise:
+        Return maximum(0.0, 20.0 minus (error_percentage minus 5.0) multiplied by 4.0)
+
+Process called "get_channel_latency_history" that takes channel_id as String and window as Float returns List[Float]:
+    Note: Platform-specific latency history retrieval
+    Return list containing 45.0, 48.0, 52.0, 49.0, 51.0
+
+Process called "get_channel_throughput_history" that takes channel_id as String and window as Float returns List[Float]:
+    Note: Platform-specific throughput history retrieval
+    Return list containing 85.0, 88.0, 92.0, 90.0, 94.0
+
+Process called "maximum" that takes a as Float and b as Float returns Float:
+    If a is greater than b:
+        Return a
+    Return b
+
+Note: Platform-specific stub implementations for channel operations
+Process called "create_tcp_socket" that takes local as String and remote as String and timeout as Float returns Dictionary:
+    Note: Platform-specific TCP socket creation
+    Return dictionary containing
+        "success" as true
+        "socket" as "tcp_socket_handle"
+        "local_address" as local
+        "remote_address" as remote
+
+Process called "create_websocket_connection" that takes local as String and remote as String and config as ChannelConfiguration returns Dictionary:
+    Note: Platform-specific WebSocket connection
+    Return dictionary containing
+        "success" as true
+        "websocket" as "ws_connection_handle"
+        "protocol" as "ws"
+
+Process called "create_udp_socket" that takes local as String and remote as String returns Dictionary:
+    Note: Platform-specific UDP socket creation
+    Return dictionary containing
+        "success" as true
+        "socket" as "udp_socket_handle"
+        "local_address" as local
+        "remote_address" as remote
+
+Process called "create_quic_connection" that takes local as String and remote as String and config as ChannelConfiguration returns Dictionary:
+    Note: Platform-specific QUIC connection
+    Return dictionary containing
+        "success" as true
+        "connection" as "quic_connection_handle"
+        "stream_id" as "stream_001"
+
+Process called "create_ipc_channel" that takes local as String and remote as String returns Dictionary:
+    Note: Platform-specific IPC channel creation
+    Return dictionary containing
+        "success" as true
+        "channel" as "ipc_channel_handle"
+        "pipe_id" as "pipe_001"
+
+Process called "json_stringify" that takes data as Any returns String:
+    Note: Platform-specific JSON serialization
+    Return "json_serialized_channel_data"
+
+Process called "string_representation" that takes data as Any returns String:
+    Note: Platform-specific string representation
+    Return "string_repr"
+
+Process called "gzip_compress_string" that takes data as String returns String:
+    Note: Platform-specific GZIP compression
+    Return data plus "_compressed"
+
+Process called "base64_encode_string" that takes data as String returns String:
+    Note: Platform-specific Base64 encoding
+    Return data plus "_base64"
+
+Process called "aes_256_encrypt" that takes data as String and key as String returns String:
+    Note: Platform-specific AES-256 encryption
+    Return data plus "_encrypted"
+
+Process called "get_current_channel_bandwidth_usage" that takes channel_id as String returns Integer:
+    Note: Platform-specific bandwidth usage tracking
+    Return 512
+
+Process called "send_tcp_data" that takes channel as Channel and data as String returns Dictionary:
+    Note: Platform-specific TCP data transmission
+    Return dictionary containing
+        "success" as true
+        "bytes_sent" as length of data
+
+Process called "send_websocket_data" that takes channel as Channel and data as String returns Dictionary:
+    Note: Platform-specific WebSocket data transmission
+    Return dictionary containing
+        "success" as true
+        "bytes_sent" as length of data
+
+Process called "send_udp_data" that takes channel as Channel and data as String returns Dictionary:
+    Note: Platform-specific UDP data transmission
+    Return dictionary containing
+        "success" as true
+        "bytes_sent" as length of data
+
+Process called "receive_tcp_data" that takes channel as Channel and timeout as Float returns Dictionary:
+    Note: Platform-specific TCP data reception
+    Return dictionary containing
+        "success" as true
+        "data" as "tcp_received_data"
+        "bytes_received" as 1024
+
+Process called "receive_websocket_data" that takes channel as Channel and timeout as Float returns Dictionary:
+    Note: Platform-specific WebSocket data reception
+    Return dictionary containing
+        "success" as true
+        "data" as "ws_received_data"
+        "bytes_received" as 1024
+
+Process called "receive_udp_data" that takes channel as Channel and timeout as Float returns Dictionary:
+    Note: Platform-specific UDP data reception
+    Return dictionary containing
+        "success" as true
+        "data" as "udp_received_data"
+        "bytes_received" as 1024
+
+Process called "base64_decode_string" that takes data as String returns String:
+    Note: Platform-specific Base64 decoding
+    If data ends with "_base64":
+        Return data without "_base64" suffix
+    Return data
+
+Process called "gzip_decompress_string" that takes data as String returns String:
+    Note: Platform-specific GZIP decompression
+    If data ends with "_compressed":
+        Return data without "_compressed" suffix
+    Return data
+
+Process called "aes_256_decrypt" that takes data as String and key as String returns String:
+    Note: Platform-specific AES-256 decryption
+    If data ends with "_encrypted":
+        Return data without "_encrypted" suffix
+    Return data
+
+Process called "json_parse_string" that takes data as String returns Any:
+    Note: Platform-specific JSON parsing
+    Return dictionary containing
+        "parsed" as true
+        "content" as data
+
+Process called "get_global_counter_store" returns Dictionary:
+    Note: Platform-specific counter storage
+    Return dictionary containing
+        "round_robin" as 0
+
+Process called "update_send_metrics" that takes channel as Channel and bytes_sent as Integer returns Nothing:
+    Let metrics be channel get "metrics"
+    Set metrics with "bytes_sent" as metrics get "bytes_sent" plus bytes_sent
+    Set metrics with "messages_sent" as metrics get "messages_sent" plus 1
+    Set metrics with "last_activity" as get_current_timestamp()
+
+Process called "update_receive_metrics" that takes channel as Channel and bytes_received as Integer returns Nothing:
+    Let metrics be channel get "metrics"
+    Set metrics with "bytes_received" as metrics get "bytes_received" plus bytes_received
+    Set metrics with "messages_received" as metrics get "messages_received" plus 1
+    Set metrics with "last_activity" as get_current_timestamp()
+
+Process called "configure_socket_options" that takes config as ChannelConfiguration returns Nothing:
+    Note: Platform-specific socket option configuration
+    If config get "keep_alive_enabled":
+        Enable keep alive option
+    
+    If config get "compression_enabled":
+        Enable compression option
+    
+    Set buffer size to config get "buffer_size"
+
+Process called "update_pool_load_metrics" that takes pool as ChannelPool returns Nothing:
+    Let total_load be 0.0
+    Let channel_count be length of pool get "channels"
+    
+    For each channel in pool get "channels":
+        Let channel_load be calculate_channel_load(channel)
+        Set total_load as total_load plus channel_load
+    
+    If channel_count is greater than 0:
+        Set pool with "current_load" as total_load divided by channel_count
+    Otherwise:
+        Set pool with "current_load" as 0.0
+
+Process called "update_virtual_channel_metrics_for_send" that takes virtual_channel as Channel returns Nothing:
+    Let metrics be virtual_channel get "metrics"
+    Set metrics with "messages_sent" as metrics get "messages_sent" plus 1
+    Set metrics with "last_activity" as get_current_timestamp()
+
+Process called "update_virtual_channel_metrics_for_receive" that takes virtual_channel as Channel returns Nothing:
+    Let metrics be virtual_channel get "metrics"
+    Set metrics with "messages_received" as metrics get "messages_received" plus 1
+    Set metrics with "last_activity" as get_current_timestamp()
+
+Process called "update_selector_selection_history" that takes selector as ChannelSelector and channel as Channel returns Nothing:
+    Let history_entry be dictionary containing
+        "channel_id" as channel get "channel_id"
+        "selection_time" as get_current_timestamp()
+        "channel_score" as calculate_performance_score(channel get "metrics")
+    
+    Add history_entry to selector get "selection_history"
+    
+    If length of selector get "selection_history" is greater than 100:
+        Remove first item from selector get "selection_history"
+
+Process called "sort_scored_channels_by_score_descending" that takes scored_channels as List[Dictionary] returns Nothing:
+    For i from 0 to length of scored_channels minus 2:
+        For j from i plus 1 to length of scored_channels minus 1:
+            Let score_i be scored_channels get i get "score"
+            Let score_j be scored_channels get j get "score"
+            
+            If score_j is greater than score_i:
+                Let temp be scored_channels get i
+                Set scored_channels with i as scored_channels get j
+                Set scored_channels with j as temp
+
+Process called "apply_rate_limiting" that takes channel_id as String returns Nothing:
+    Note: Platform-specific rate limiting implementation
+    Log rate limiting applied for channel_id
+
+Process called "attempt_channel_recovery" that takes channel as Channel returns Nothing:
+    Note: Platform-specific channel recovery
+    Set channel with "state" as "recovering"
+    Set channel with "last_state_change" as get_current_timestamp()
+
+Process called "perform_graceful_channel_shutdown" that takes channel as Channel returns Nothing:
+    Note: Platform-specific graceful shutdown
+    Set channel with "state" as "closing"
+
+Process called "calculate_final_uptime_percentage" that takes channel as Channel returns Nothing:
+    Let total_time be get_current_timestamp() minus channel get "created_time"
+    Let error_time be estimate_error_time(channel)
+    Let uptime_time be total_time minus error_time
+    
+    If total_time is greater than 0.0:
+        Let uptime_percentage be (uptime_time divided by total_time) multiplied by 100.0
+        Set channel get "metrics" with "uptime_percentage" as uptime_percentage
+
+Process called "estimate_error_time" that takes channel as Channel returns Float:
+    Let error_count be channel get "metrics" get "error_count"
+    Let average_error_duration be 30.0
+    Return error_count multiplied by average_error_duration
+
+Process called "update_channel_metrics_for_successful_send" that takes channel as Channel and data_size as Integer and latency as Float returns Nothing:
+    Let metrics be channel get "metrics"
+    Set metrics with "bytes_sent" as metrics get "bytes_sent" plus data_size
+    Set metrics with "messages_sent" as metrics get "messages_sent" plus 1
+    Update latency metrics with latency
+    Set metrics with "last_activity" as get_current_timestamp()
+
+Process called "update_channel_metrics_for_successful_receive" that takes channel as Channel and receive_result as Dictionary returns Nothing:
+    Let metrics be channel get "metrics"
+    Let bytes_received be receive_result get "bytes_received"
+    Set metrics with "bytes_received" as metrics get "bytes_received" plus bytes_received
+    Set metrics with "messages_received" as metrics get "messages_received" plus 1
+    Set metrics with "last_activity" as get_current_timestamp()
+
+Process called "update_latency_metrics" that takes metrics as ChannelMetrics and latency as Float returns Nothing:
+    Let current_avg be metrics get "average_latency"
+    Let message_count be metrics get "messages_sent" plus metrics get "messages_received"
+    
+    If message_count is greater than 1:
+        Let new_avg be ((current_avg multiplied by (message_count minus 1)) plus latency) divided by message_count
+        Set metrics with "average_latency" as new_avg
+    Otherwise:
+        Set metrics with "average_latency" as latency
+    
+    If latency is greater than metrics get "peak_latency":
+        Set metrics with "peak_latency" as latency
+
+Process called "add_connection_error_to_history" that takes channel as Channel and error_message as String returns Nothing:
+    Let error_entry be dictionary containing
+        "error_type" as "connection_error"
+        "error_message" as error_message
+        "timestamp" as get_current_timestamp()
+    
+    Add error_entry to channel get "error_history"
+
+Process called "add_send_error_to_history" that takes channel as Channel and error_message as String returns Nothing:
+    Let error_entry be dictionary containing
+        "error_type" as "send_error"
+        "error_message" as error_message
+        "timestamp" as get_current_timestamp()
+    
+    Add error_entry to channel get "error_history"
+
+Process called "add_shutdown_error_to_history" that takes channel as Channel and error_message as String returns Nothing:
+    Let error_entry be dictionary containing
+        "error_type" as "shutdown_error"
+        "error_message" as error_message
+        "timestamp" as get_current_timestamp()
+    
+    Add error_entry to channel get "error_history"
+
+Process called "log_channel_establishment_success" that takes channel as Channel returns Nothing:
+    Note: Platform-specific success logging
+    Log "Channel established successfully: " plus channel get "channel_id"
+
+Process called "log_channel_establishment_failure" that takes channel as Channel returns Nothing:
+    Note: Platform-specific failure logging
+    Log "Channel establishment failed: " plus channel get "channel_id"

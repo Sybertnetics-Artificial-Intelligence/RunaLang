@@ -77,19 +77,7 @@ Process called "ChooseDataStructure" that takes size:
         Return BTree with size as size
 ```
 
-**Purpose**: Allows Brain to express uncertainty and Hat to make informed decisions or request clarification.
-
-#### @Request_Clarification Block
-Enables Hat to request additional information from Brain.
-
-```runa
-@Request_Clarification:
-    Need specification for activation functions between neural network layers
-    Options: [ReLU, Sigmoid, Tanh, LeakyReLU]
-    Context: Building image classification model for medical imaging
-    Impact: Affects convergence speed and accuracy
-@End_Request
-```
+**Purpose**: Allows developers to express uncertainty and make informed decisions about implementation choices.
 
 ### 3. Knowledge and Context Annotations
 
@@ -122,7 +110,7 @@ Provides situational context for implementation decisions.
 ### 4. Task and Specification Annotations
 
 #### @Task Block
-Formal task specification from Brain to Hat.
+Formal task specification for AI-assisted development.
 
 ```runa
 @Task:
@@ -304,7 +292,7 @@ Optimization guidance for implementation.
 ### 8. Communication Flow Annotations
 
 #### @Progress Block
-Real-time progress reporting from Hat to Brain.
+Real-time progress reporting for development tracking.
 
 ```runa
 @Progress:
@@ -320,28 +308,6 @@ Real-time progress reporting from Hat to Brain.
     }
     confidence_level: 0.9
 @End_Progress
-```
-
-#### @Feedback Block
-Hat's feedback to Brain about implementation challenges.
-
-```runa
-@Feedback:
-    implementation_status: "partial_complete"
-    challenges_encountered: [
-        "Memory constraint too restrictive for current algorithm",
-        "External library compatibility issue with Python 3.11"
-    ]
-    suggested_modifications: [
-        "Increase memory limit to 512MB",
-        "Switch to alternative library 'fast-algo' instead of 'slow-lib'"
-    ]
-    alternative_approaches: [
-        "Streaming algorithm to reduce memory usage",
-        "Two-pass algorithm with intermediate storage"
-    ]
-    confidence_in_current_approach: 0.6
-@End_Feedback
 ```
 
 ### 9. Translation and Target-Specific Annotations
@@ -406,23 +372,6 @@ Comprehensive error management strategy.
 ## Advanced Communication Patterns
 
 ### Multi-Agent Collaboration
-
-#### @Collaboration Block
-Coordination between multiple Hat AIs.
-
-```runa
-@Collaboration:
-    participating_agents: ["SecurityHat", "PerformanceHat", "TestingHat"]
-    coordination_strategy: "sequential_review"
-    handoff_criteria: {
-        "SecurityHat": "security_audit_complete",
-        "PerformanceHat": "performance_benchmarks_met",
-        "TestingHat": "test_coverage_above_90%"
-    }
-    conflict_resolution: "brain_arbitration"
-    shared_resources: ["test_database", "staging_environment"]
-@End_Collaboration
-```
 
 ### Iterative Refinement
 
@@ -513,7 +462,7 @@ Support for iterative development cycles.
     ]
 @End_Requirements
 
-# Hat Implementation with Feedback
+# Implementation Example
 @Implementation:
     Process called "authenticate_user" that takes email and password:
         @Verify:
@@ -548,30 +497,7 @@ Support for iterative development cycles.
     }
 @End_Progress
 
-@Feedback:
-    implementation_status: "nearly_complete"
-    challenges_encountered: [
-        "JWT library requires additional configuration for RS256",
-        "Password hashing slower than expected"
-    ]
-    suggested_modifications: [
-        "Switch to bcrypt for password hashing",
-        "Use HS256 for JWT signing to simplify deployment"
-    ]
-    confidence_in_current_approach: 0.85
-@End_Feedback
 
-# Brain Response
-@Clarification:
-    approved_modifications: [
-        "Switch to bcrypt approved",
-        "HS256 acceptable for initial deployment"
-    ]
-    additional_requirements: [
-        "Add rate limiting for authentication attempts",
-        "Log failed authentication attempts for security monitoring"
-    ]
-@End_Clarification
 ```
 
 ## Best Practices
@@ -620,4 +546,4 @@ Support for iterative development cycles.
 - **Quality Assessment**: Measure annotation effectiveness
 - **Evolution Tracking**: Monitor annotation usage over time
 
-This protocol represents a fundamental advancement in AI-to-AI communication, enabling unprecedented collaboration between reasoning and implementation agents while maintaining semantic fidelity and preserving human oversight capabilities.
+This protocol represents a fundamental advancement in AI-assisted development, enabling enhanced code documentation, reasoning, and intelligent analysis while maintaining semantic fidelity and preserving human oversight capabilities.

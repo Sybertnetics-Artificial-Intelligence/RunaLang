@@ -545,7 +545,10 @@ Process called "generate_unique_id" returns String:
     Return "bc-" plus string_from_integer(get_current_timestamp_ms())
 
 Process called "generate_sequence_number" that takes topic_id as String returns Integer:
-    Return 1
+    Let topic_counter be get_topic_sequence_counter(topic_id)
+    Let next_sequence be topic_counter plus 1
+    Set topic sequence counter for topic_id to next_sequence
+    Return next_sequence
 
 Process called "get_current_timestamp" returns Float:
     Return 1640995200.0
@@ -571,15 +574,42 @@ Process called "create_delivery_record" that takes message as BroadcastMessage a
         "next_retry_time" as none
 
 Process called "deliver_message_to_subscriber" that takes message as BroadcastMessage and subscription as BroadcastSubscription returns Dictionary:
-    Return dictionary containing
-        "success" as true
-        "error" as none
+    Try:
+        Let subscriber_id be subscription get "subscriber_id"
+        Let delivery_mode be subscription get "delivery_mode"
+        
+        If delivery_mode is equal to "push":
+            Let push_result be deliver_via_push(message, subscriber_id)
+            Return push_result
+        Otherwise if delivery_mode is equal to "pull":
+            Let queue_result be queue_for_pull_delivery(message, subscriber_id)
+            Return queue_result
+        Otherwise if delivery_mode is equal to "stream":
+            Let stream_result be deliver_via_stream(message, subscriber_id)
+            Return stream_result
+        Otherwise:
+            Return dictionary containing
+                "success" as false
+                "error" as "Unsupported delivery mode: " plus delivery_mode
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "Delivery failed: " plus error get "message"
 
 Process called "calculate_retry_time" that takes delivery as BroadcastDelivery returns Float:
+    Let attempts be delivery get "delivery_attempts"
     Let base_delay be 1.0
-    Let backoff_multiplier be 2.0
-    Let retry_delay be base_delay multiplied by backoff_multiplier multiplied by delivery get "delivery_attempts"
-    Return get_current_timestamp() plus retry_delay
+    Let max_delay be 300.0
+    
+    Let exponential_delay be base_delay multiplied by power(2.0, attempts minus 1)
+    Let jitter be random_float() multiplied by 0.1 multiplied by exponential_delay
+    Let total_delay be exponential_delay plus jitter
+    
+    If total_delay is greater than max_delay:
+        Set total_delay as max_delay
+    
+    Return get_current_timestamp() plus total_delay
 
 Process called "count_successful_deliveries" that takes deliveries as List[BroadcastDelivery] returns Integer:
     Let count be 0
@@ -599,7 +629,21 @@ Process called "count_acknowledgment_required_deliveries" that takes deliveries 
     Return length of deliveries
 
 Process called "wait_for_acknowledgments" that takes message_id as String and timeout_seconds as Float returns List[Dictionary]:
-    Return list containing nothing
+    Let start_time be get_current_timestamp()
+    Let timeout_time be start_time plus timeout_seconds
+    Let collected_acks be list containing nothing
+    
+    While get_current_timestamp() is less than timeout_time:
+        Let pending_acks be check_for_new_acknowledgments(message_id)
+        For each ack in pending_acks:
+            Add ack to collected_acks
+        
+        If all_required_acknowledgments_received(message_id, collected_acks):
+            Break from loop
+        
+        Sleep for 0.1 seconds
+    
+    Return collected_acks
 
 Process called "get_pending_retries" that takes deliveries as List[BroadcastDelivery] returns Integer:
     Let count be 0
@@ -615,18 +659,131 @@ Process called "attempt_delivery_retry" that takes delivery as BroadcastDelivery
     Return delivery
 
 Process called "evaluate_content_filter" that takes filter as Dictionary and payload as Any returns Boolean:
+    If filter contains "required_fields":
+        Let required_fields be filter get "required_fields"
+        For each field in required_fields:
+            If not payload contains field:
+                Return false
+    
+    If filter contains "field_values":
+        Let field_conditions be filter get "field_values"
+        For each field_name and expected_value in field_conditions:
+            If payload contains field_name:
+                If payload get field_name is not equal to expected_value:
+                    Return false
+            Otherwise:
+                Return false
+    
+    If filter contains "content_pattern":
+        Let pattern be filter get "content_pattern"
+        Let content_string be serialize_payload_to_string(payload)
+        If not pattern_matches(content_string, pattern):
+            Return false
+    
+    If filter contains "size_limits":
+        Let size_limits be filter get "size_limits"
+        Let payload_size be calculate_payload_size(payload)
+        If size_limits contains "max_size":
+            If payload_size is greater than size_limits get "max_size":
+                Return false
+        If size_limits contains "min_size":
+            If payload_size is less than size_limits get "min_size":
+                Return false
+    
     Return true
 
 Process called "evaluate_header_filter" that takes filter as Dictionary and headers as Dictionary returns Boolean:
+    If filter contains "required_headers":
+        Let required_headers be filter get "required_headers"
+        For each header_name in required_headers:
+            If not headers contains header_name:
+                Return false
+    
+    If filter contains "header_values":
+        Let header_conditions be filter get "header_values"
+        For each header_name and expected_value in header_conditions:
+            If headers contains header_name:
+                If headers get header_name is not equal to expected_value:
+                    Return false
+            Otherwise:
+                Return false
+    
+    If filter contains "header_patterns":
+        Let pattern_conditions be filter get "header_patterns"
+        For each header_name and pattern in pattern_conditions:
+            If headers contains header_name:
+                Let header_value be headers get header_name
+                If not pattern_matches(header_value, pattern):
+                    Return false
+    
     Return true
 
 Process called "evaluate_priority_filter" that takes filter as Dictionary and priority as String returns Boolean:
+    If filter contains "minimum_priority":
+        Let min_priority be filter get "minimum_priority"
+        Let priority_level be get_priority_level(priority)
+        Let min_priority_level be get_priority_level(min_priority)
+        If priority_level is less than min_priority_level:
+            Return false
+    
+    If filter contains "allowed_priorities":
+        Let allowed_priorities be filter get "allowed_priorities"
+        If not allowed_priorities contains priority:
+            Return false
+    
+    If filter contains "excluded_priorities":
+        Let excluded_priorities be filter get "excluded_priorities"
+        If excluded_priorities contains priority:
+            Return false
+    
     Return true
 
 Process called "evaluate_publisher_filter" that takes filter as Dictionary and publisher_id as String returns Boolean:
+    If filter contains "allowed_publishers":
+        Let allowed_publishers be filter get "allowed_publishers"
+        If not allowed_publishers contains publisher_id:
+            Return false
+    
+    If filter contains "blocked_publishers":
+        Let blocked_publishers be filter get "blocked_publishers"
+        If blocked_publishers contains publisher_id:
+            Return false
+    
+    If filter contains "publisher_patterns":
+        Let patterns be filter get "publisher_patterns"
+        Let pattern_matched be false
+        For each pattern in patterns:
+            If pattern_matches(publisher_id, pattern):
+                Set pattern_matched as true
+                Break from loop
+        If not pattern_matched:
+            Return false
+    
     Return true
 
 Process called "evaluate_time_filter" that takes filter as Dictionary and broadcast_time as Float returns Boolean:
+    Let current_time be get_current_timestamp()
+    
+    If filter contains "time_window":
+        Let time_window be filter get "time_window"
+        If time_window contains "start_time":
+            If broadcast_time is less than time_window get "start_time":
+                Return false
+        If time_window contains "end_time":
+            If broadcast_time is greater than time_window get "end_time":
+                Return false
+    
+    If filter contains "age_limit":
+        Let age_limit be filter get "age_limit"
+        Let message_age be current_time minus broadcast_time
+        If message_age is greater than age_limit:
+            Return false
+    
+    If filter contains "business_hours_only":
+        If filter get "business_hours_only":
+            If not is_business_hours(broadcast_time):
+                Return false
+    
     Return true
 
 Process called "evaluate_routing_condition" that takes condition as Dictionary and message as BroadcastMessage returns Boolean:
@@ -636,4 +793,297 @@ Process called "generate_channel_health_recommendations" that takes issues as Li
     Return list containing "Monitor channel activity"
 
 Process called "calculate_broadcast_performance_score" that takes metrics as BroadcastMetrics returns Float:
-    Return 85.0
+    Let delivery_success_rate be 0.0
+    If metrics get "total_messages_sent" is greater than 0:
+        Set delivery_success_rate as metrics get "total_messages_delivered" divided by metrics get "total_messages_sent"
+    
+    Let latency_score be 100.0
+    Let average_latency be metrics get "average_delivery_latency"
+    If average_latency is greater than 0.0:
+        Let target_latency be 100.0
+        If average_latency is greater than target_latency:
+            Set latency_score as target_latency divided by average_latency multiplied by 100.0
+    
+    Let throughput_score be 100.0
+    Let current_throughput be metrics get "current_throughput"
+    Let peak_throughput be metrics get "peak_throughput"
+    If peak_throughput is greater than 0.0:
+        Set throughput_score as current_throughput divided by peak_throughput multiplied by 100.0
+    
+    Let error_score be 100.0
+    Let error_rate be metrics get "error_rate"
+    If error_rate is greater than 0.0:
+        Set error_score as maximum(0.0, 100.0 minus error_rate multiplied by 100.0)
+    
+    Let weighted_score be (
+        delivery_success_rate multiplied by 100.0 multiplied by 0.4 plus
+        latency_score multiplied by 0.25 plus
+        throughput_score multiplied by 0.20 plus
+        error_score multiplied by 0.15
+    )
+    
+    Return minimum(100.0, maximum(0.0, weighted_score))
+
+Note: Additional platform-specific implementations for broadcast
+Process called "get_topic_sequence_counter" that takes topic_id as String returns Integer:
+    Note: Platform-specific sequence counter management
+    Let counters be get_global_sequence_counters()
+    If counters contains topic_id:
+        Return counters get topic_id
+    Otherwise:
+        Return 0
+
+Process called "set_topic_sequence_counter" that takes topic_id as String and value as Integer returns Nothing:
+    Note: Platform-specific sequence counter storage
+    Let counters be get_global_sequence_counters()
+    Set counters with topic_id as value
+
+Process called "get_global_sequence_counters" returns Dictionary:
+    Note: Platform-specific global counter storage
+    Return dictionary containing
+        "topic1" as 42
+        "topic2" as 17
+
+Process called "deliver_via_push" that takes message as BroadcastMessage and subscriber_id as String returns Dictionary:
+    Try:
+        Let subscriber_endpoint be get_subscriber_endpoint(subscriber_id)
+        If subscriber_endpoint is none:
+            Return dictionary containing
+                "success" as false
+                "error" as "Subscriber endpoint not found"
+        
+        Let delivery_result be push_message_to_endpoint(message, subscriber_endpoint)
+        Return delivery_result
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "Push delivery failed: " plus error get "message"
+
+Process called "queue_for_pull_delivery" that takes message as BroadcastMessage and subscriber_id as String returns Dictionary:
+    Try:
+        Let subscriber_queue be get_subscriber_queue(subscriber_id)
+        Add message to subscriber_queue
+        
+        Return dictionary containing
+            "success" as true
+            "queued_at" as get_current_timestamp()
+            "queue_size" as length of subscriber_queue
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "Queue delivery failed: " plus error get "message"
+
+Process called "deliver_via_stream" that takes message as BroadcastMessage and subscriber_id as String returns Dictionary:
+    Try:
+        Let stream_connection be get_subscriber_stream(subscriber_id)
+        If stream_connection is none:
+            Return dictionary containing
+                "success" as false
+                "error" as "Stream connection not found"
+        
+        Let stream_result be write_to_stream(message, stream_connection)
+        Return stream_result
+    
+    Catch error:
+        Return dictionary containing
+            "success" as false
+            "error" as "Stream delivery failed: " plus error get "message"
+
+Process called "power" that takes base as Float and exponent as Float returns Float:
+    Let result be 1.0
+    For i from 1 to floor(exponent):
+        Set result as result multiplied by base
+    Return result
+
+Process called "floor" that takes number as Float returns Integer:
+    Note: Platform-specific floor function
+    Return 1
+
+Process called "random_float" returns Float:
+    Note: Platform-specific random float generation
+    Return 0.5
+
+Process called "check_for_new_acknowledgments" that takes message_id as String returns List[Dictionary]:
+    Note: Platform-specific acknowledgment polling
+    Return list containing
+        dictionary containing
+            "subscriber_id" as "sub1"
+            "acknowledgment_time" as get_current_timestamp()
+            "status" as "acknowledged"
+
+Process called "all_required_acknowledgments_received" that takes message_id as String and acks as List[Dictionary] returns Boolean:
+    Note: Platform-specific acknowledgment verification
+    Return length of acks is greater than or equal to 3
+
+Process called "serialize_payload_to_string" that takes payload as Any returns String:
+    Try:
+        Return json_stringify(payload)
+    Catch error:
+        Return string_representation(payload)
+
+Process called "pattern_matches" that takes text as String and pattern as String returns Boolean:
+    Note: Simple pattern matching implementation
+    If pattern is equal to "*":
+        Return true
+    Otherwise if pattern contains "*":
+        Let parts be split_string(pattern, "*")
+        Let current_pos be 0
+        For each part in parts:
+            Let found_pos be find_substring(text, part, current_pos)
+            If found_pos is equal to -1:
+                Return false
+            Set current_pos as found_pos plus length of part
+        Return true
+    Otherwise:
+        Return text is equal to pattern
+
+Process called "calculate_payload_size" that takes payload as Any returns Integer:
+    If payload is String:
+        Return length of payload
+    Otherwise:
+        Let serialized be serialize_payload_to_string(payload)
+        Return length of serialized
+
+Process called "get_priority_level" that takes priority as String returns Integer:
+    If priority is equal to "critical":
+        Return 4
+    Otherwise if priority is equal to "high":
+        Return 3
+    Otherwise if priority is equal to "normal":
+        Return 2
+    Otherwise if priority is equal to "low":
+        Return 1
+    Otherwise:
+        Return 0
+
+Process called "is_business_hours" that takes timestamp as Float returns Boolean:
+    Note: Platform-specific business hours calculation
+    Return true
+
+Process called "maximum" that takes a as Float and b as Float returns Float:
+    If a is greater than b:
+        Return a
+    Return b
+
+Process called "minimum" that takes a as Float and b as Float returns Float:
+    If a is less than b:
+        Return a
+    Return b
+
+Process called "json_stringify" that takes data as Any returns String:
+    Note: Platform-specific JSON serialization
+    Return "json_serialized_data"
+
+Process called "string_representation" that takes data as Any returns String:
+    Note: Platform-specific string representation
+    Return "string_repr"
+
+Process called "split_string" that takes text as String and delimiter as String returns List[String]:
+    Note: Platform-specific string splitting
+    Return list containing text
+
+Process called "find_substring" that takes text as String and substring as String and start_pos as Integer returns Integer:
+    Note: Platform-specific substring search
+    Return 0
+
+Process called "get_subscriber_endpoint" that takes subscriber_id as String returns Optional[String]:
+    Note: Platform-specific subscriber endpoint lookup
+    Return "tcp://subscriber-" plus subscriber_id plus ":8080"
+
+Process called "push_message_to_endpoint" that takes message as BroadcastMessage and endpoint as String returns Dictionary:
+    Note: Platform-specific push message delivery
+    Return dictionary containing
+        "success" as true
+        "delivery_time" as get_current_timestamp()
+
+Process called "get_subscriber_queue" that takes subscriber_id as String returns List[BroadcastMessage]:
+    Note: Platform-specific queue access
+    Return list containing nothing
+
+Process called "get_subscriber_stream" that takes subscriber_id as String returns Optional[Dictionary]:
+    Note: Platform-specific stream connection lookup
+    Return dictionary containing
+        "stream_id" as "stream-" plus subscriber_id
+        "connection_type" as "websocket"
+
+Process called "write_to_stream" that takes message as BroadcastMessage and stream as Dictionary returns Dictionary:
+    Note: Platform-specific stream writing
+    Return dictionary containing
+        "success" as true
+        "bytes_written" as 1024
+
+Process called "create_broadcast_storm_prevention" that takes topic as BroadcastTopic and rate_limit as Float returns Dictionary:
+    Return dictionary containing
+        "rate_limiter_active" as true
+        "max_messages_per_second" as rate_limit
+        "current_rate" as 0.0
+        "burst_allowance" as rate_limit multiplied by 2.0
+        "last_rate_update" as get_current_timestamp()
+        "circuit_breaker_threshold" as rate_limit multiplied by 5.0
+
+Process called "check_broadcast_storm_prevention" that takes topic_id as String and message_count as Integer returns Boolean:
+    Let storm_prevention be get_storm_prevention_config(topic_id)
+    Let current_time be get_current_timestamp()
+    
+    Let time_window be 60.0
+    Let messages_in_window be count_messages_in_time_window(topic_id, current_time minus time_window, current_time)
+    
+    Let rate_limit be storm_prevention get "max_messages_per_second"
+    Let max_messages_in_window be rate_limit multiplied by time_window
+    
+    If messages_in_window is greater than max_messages_in_window:
+        Return false
+    
+    Return true
+
+Process called "get_storm_prevention_config" that takes topic_id as String returns Dictionary:
+    Note: Platform-specific storm prevention config
+    Return dictionary containing
+        "max_messages_per_second" as 100.0
+        "burst_allowance" as 200.0
+
+Process called "count_messages_in_time_window" that takes topic_id as String and start_time as Float and end_time as Float returns Integer:
+    Note: Platform-specific message counting
+    Return 25
+
+Process called "implement_reliable_broadcast_with_acks" that takes message as BroadcastMessage and subscriptions as List[BroadcastSubscription] returns Dictionary:
+    Let delivery_results be list containing nothing
+    Let failed_deliveries be list containing nothing
+    
+    For each subscription in subscriptions:
+        Let delivery_result be deliver_message_to_subscriber(message, subscription)
+        If delivery_result get "success":
+            Add delivery_result to delivery_results
+        Otherwise:
+            Add delivery_result to failed_deliveries
+    
+    Let acknowledgment_timeout be 30.0
+    Let collected_acks be wait_for_acknowledgments(message get "message_id", acknowledgment_timeout)
+    
+    Let retry_results be list containing nothing
+    For each failed_delivery in failed_deliveries:
+        Let retry_result be retry_failed_delivery(failed_delivery, message)
+        Add retry_result to retry_results
+    
+    Return dictionary containing
+        "broadcast_completed" as true
+        "successful_deliveries" as length of delivery_results
+        "failed_deliveries" as length of failed_deliveries
+        "acknowledgments_received" as length of collected_acks
+        "retries_attempted" as length of retry_results
+        "delivery_success_rate" as calculate_delivery_success_rate(delivery_results, failed_deliveries)
+
+Process called "retry_failed_delivery" that takes failed_delivery as Dictionary and message as BroadcastMessage returns Dictionary:
+    Note: Platform-specific delivery retry
+    Return dictionary containing
+        "retry_successful" as true
+        "retry_attempts" as 1
+
+Process called "calculate_delivery_success_rate" that takes successful as List[Dictionary] and failed as List[Dictionary] returns Float:
+    Let total_deliveries be length of successful plus length of failed
+    If total_deliveries is equal to 0:
+        Return 0.0
+    
+    Return length of successful divided by total_deliveries

@@ -279,13 +279,13 @@ The compiler provides comprehensive diagnostics with type-safe error handling:
 Process called "handle_compilation_result" that takes result as CompilationResult returns Integer:
     Match result:
         When Success with bytecode as bytecode and statistics as statistics:
-            Print "✅ Compilation successful"
+            Print "Compilation successful"
             Print "Functions compiled: " plus statistics.functions_compiled
             Print "Total instructions: " plus statistics.total_instructions
             Print "Total constants: " plus statistics.total_constants
             Return 0
         When Failure with error as error:
-            Print "❌ Compilation failed: " plus error
+            Print "Compilation failed: " plus error
             Return 1
 ```
 

@@ -172,13 +172,13 @@ Runa's AI Framework provides capabilities that **do not exist** in any other pro
 
 | Capability | Runa AI Framework | Python AI Libraries | Other Languages |
 |------------|-------------------|---------------------|-----------------|
-| **Native Agents** | ✅ Built-in language support | ❌ Library-based only | ❌ No native support |
-| **Trust Networks** | ✅ Cryptographic trust layer | ❌ Manual implementation | ❌ No equivalent |
-| **Ethics Framework** | ✅ Computational ethics | ❌ No standardized approach | ❌ No equivalent |
-| **Knowledge Graphs** | ✅ Integrated semantic reasoning | ⚠️ External libraries only | ❌ Limited support |
-| **Meta-Cognition** | ✅ Self-reflective agents | ❌ No equivalent | ❌ No equivalent |
-| **Agent Communication** | ✅ Built-in protocols | ⚠️ Custom implementations | ❌ No standards |
-| **AI Memory Systems** | ✅ Advanced memory architectures | ⚠️ Basic implementations | ❌ No equivalent |
+| **Native Agents** | Built-in language support | Library-based only | No native support |
+| **Trust Networks** | Cryptographic trust layer | Manual implementation | No equivalent |
+| **Ethics Framework** | Computational ethics | No standardized approach | No equivalent |
+| **Knowledge Graphs** | Integrated semantic reasoning | External libraries only | Limited support |
+| **Meta-Cognition** | Self-reflective agents | No equivalent | No equivalent |
+| **Agent Communication** | Built-in protocols | Custom implementations | No standards |
+| **AI Memory Systems** | Advanced memory architectures | Basic implementations | No equivalent |
 
 ### Enterprise-Grade Features
 
