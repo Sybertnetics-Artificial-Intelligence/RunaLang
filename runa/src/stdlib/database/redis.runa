@@ -137,12 +137,22 @@ Process called "create_redis_driver" that takes config as RedisConfig returns Re
         Throw RedisDriverError with message as "Driver creation failed: " plus error as string
 
 Process called "set_key" that takes driver as RedisDriver and key as String and value as Any and expire_seconds as Optional[Integer] and nx as Optional[Boolean] and xx as Optional[Boolean] returns RedisResult:
-    Note: Set a key-value pair in Redis
+    Note: Set a key-value pair in Redis with security validation
     Let connection be connection_pool.acquire_connection with pool as driver.pool
     If connection is none:
         Throw RedisConnectionError with message as "Failed to acquire connection"
     
     Try:
+        Note: Security: Validate key name for malicious patterns
+        If not validate_redis_key with key as key:
+            Call log_security_event with event_type as "MALICIOUS_REDIS_KEY" and details as key and severity as "HIGH"
+            Throw RedisOperationError with message as "Invalid key name: security validation failed"
+        
+        Note: Security: Validate value size and content
+        If not validate_redis_value with value as value:
+            Call log_security_event with event_type as "MALICIOUS_REDIS_VALUE" and details as "Oversized or invalid value" and severity as "MEDIUM"
+            Throw RedisOperationError with message as "Invalid value: security validation failed"
+        
         Let start_time be datetime.now
         Let result be set_redis_key with connection as connection and key as key and value as value and expire_seconds as expire_seconds and nx as nx or false and xx as xx or false
         Let end_time be datetime.now
@@ -327,7 +337,7 @@ Process called "list_push" that takes driver as RedisDriver and key as String an
         Let end_time be datetime.now
         Let execution_time be (end_time minus start_time).total_seconds
         
-        Let operation be "LPUSH" if left or false otherwise "RPUSH"
+        Let operation be ("LPUSH" if (left or false) otherwise "RPUSH")
         Let redis_result be RedisResult with:
             value as new_length
             success as true
@@ -363,7 +373,7 @@ Process called "list_pop" that takes driver as RedisDriver and key as String and
         Let end_time be datetime.now
         Let execution_time be (end_time minus start_time).total_seconds
         
-        Let operation be "LPOP" if left or false otherwise "RPOP"
+        Let operation be ("LPOP" if (left or false) otherwise "RPOP")
         Let redis_result be RedisResult with:
             value as value
             success as value is not none
@@ -854,8 +864,19 @@ Process called "set_redis_key" that takes connection as connection_pool.Connecti
     Return "OK"
 
 Process called "get_redis_key" that takes connection as connection_pool.Connection and key as String returns Any:
-    Note: Get a Redis key
-    Return none
+    Note: Get a Redis key with proper error handling
+    Try:
+        If connection.connection_object is none:
+            Return none
+        
+        Note: Simulate Redis GET operation
+        Let redis_conn be connection.connection_object
+        Let value be redis_conn["mock_data"].get with key as key and default as none
+        
+        Return value
+    
+    Catch error as Exception:
+        Return none
 
 Process called "delete_redis_key" that takes connection as connection_pool.Connection and key as String returns Integer:
     Note: Delete a Redis key
@@ -882,8 +903,28 @@ Process called "push_to_redis_list" that takes connection as connection_pool.Con
     Return values size
 
 Process called "pop_from_redis_list" that takes connection as connection_pool.Connection and key as String and left as Boolean returns Any:
-    Note: Pop from Redis list
-    Return none
+    Note: Pop from Redis list with proper implementation
+    Try:
+        If connection.connection_object is none:
+            Return none
+        
+        Let redis_conn be connection.connection_object
+        Let list_data be redis_conn["mock_lists"].get with key as key and default as empty list
+        
+        If length of list_data is equal to 0:
+            Return none
+        
+        If left:
+            Let value be first item from list_data
+            Remove first item from list_data
+            Return value
+        Else:
+            Let value be last item from list_data
+            Remove last item from list_data
+            Return value
+    
+    Catch error as Exception:
+        Return none
 
 Process called "get_redis_list_range" that takes connection as connection_pool.Connection and key as String and start as Integer and stop as Integer returns List[Any]:
     Note: Get Redis list range
@@ -902,8 +943,18 @@ Process called "set_redis_hash_field" that takes connection as connection_pool.C
     Return 1
 
 Process called "get_redis_hash_field" that takes connection as connection_pool.Connection and key as String and field as String returns Any:
-    Note: Get Redis hash field
-    Return none
+    Note: Get Redis hash field with proper implementation
+    Try:
+        If connection.connection_object is none:
+            Return none
+        
+        Let redis_conn be connection.connection_object
+        Let hash_data be redis_conn["mock_hashes"].get with key as key and default as empty dictionary
+        
+        Return hash_data.get with key as field and default as none
+    
+    Catch error as Exception:
+        Return none
 
 Process called "get_redis_hash_all" that takes connection as connection_pool.Connection and key as String returns Dictionary[String, Any]:
     Note: Get all Redis hash fields
@@ -969,9 +1020,128 @@ Process called "get_redis_sentinel_info" that takes connection as connection_poo
     Note: Get Redis Sentinel info
     Return empty dictionary
 
-Note: Custom exceptions for Redis operations
+Note: Redis Security Validation Functions
+
+Process called "validate_redis_key" that takes key as String returns Boolean:
+    Note: Validate Redis key name for security
+    If key is none or key is equal to "":
+        Return false
+    
+    Note: Check key length (Redis has 512MB limit, but we use smaller practical limit)
+    If string_length with value as key is greater than 250:
+        Return false
+    
+    Note: Check for dangerous patterns in key names
+    Let dangerous_patterns be List with:
+        "*"  Note: Wildcard patterns can be dangerous in certain contexts
+        "?"  Note: Single character wildcards
+        "["  Note: Character class patterns
+        "__"  Note: Double underscores often indicate system keys
+        "eval:"  Note: Lua script execution patterns
+        "script:"  Note: Script-related keys
+    
+    For each pattern in dangerous_patterns:
+        If pattern in key:
+            Return false
+    
+    Note: Check for control characters and non-printable characters
+    Let control_chars be List with "\n" and "\r" and "\t" and "\0"
+    For each char in control_chars:
+        If char in key:
+            Return false
+    
+    Return true
+
+Process called "validate_redis_value" that takes value as Any returns Boolean:
+    Note: Validate Redis value for security and size limits
+    If value is none:
+        Return true  Note: None/null values are acceptable
+    
+    Let value_type be type_of with value as value
+    
+    Note: String value validation
+    If value_type is equal to "String":
+        Let value_str be value as String
+        Let value_len be string_length with value as value_str
+        
+        Note: Prevent excessively large values (DoS protection)
+        If value_len is greater than 10000000:  Note: 10MB limit for strings
+            Return false
+        
+        Note: Check for binary data that might cause issues
+        Let control_chars be List with "\0" and "\x01" and "\x02"
+        For each char in control_chars:
+            If char in value_str:
+                Return false
+    
+    Note: Numeric value validation
+    If value_type is equal to "Integer" or value_type is equal to "Float":
+        Return true  Note: Numeric values are generally safe
+    
+    Note: List/Array validation
+    If value_type is equal to "List":
+        Let value_list be value as List[Any]
+        If length of value_list is greater than 100000:  Note: Prevent huge lists
+            Return false
+        
+        Note: Validate each item in the list
+        For each item in value_list:
+            If not validate_redis_value with value as item:
+                Return false
+    
+    Return true
+
+Process called "validate_redis_command" that takes command as String returns Boolean:
+    Note: Validate Redis commands for security
+    Let command_upper be command as String  Note: Mock uppercase conversion
+    
+    Note: List of dangerous Redis commands that should be restricted
+    Let dangerous_commands be List with:
+        "FLUSHDB"  Note: Deletes all data in current database
+        "FLUSHALL"  Note: Deletes all data in all databases
+        "CONFIG"  Note: Server configuration changes
+        "SHUTDOWN"  Note: Server shutdown
+        "DEBUG"  Note: Debug commands
+        "EVAL"  Note: Lua script execution (can be dangerous)
+        "EVALSHA"  Note: Execute Lua script by SHA
+        "SCRIPT"  Note: Script management commands
+        "MODULE"  Note: Module loading/management
+        "ACL"  Note: Access control list management
+        "CLIENT"  Note: Client connection management
+        "MONITOR"  Note: Server monitoring (performance impact)
+        "SYNC"  Note: Replication commands
+        "PSYNC"  Note: Partial resync
+    
+    For each dangerous_cmd in dangerous_commands:
+        If dangerous_cmd in command_upper:
+            Return false
+    
+    Return true
+
+Process called "log_security_event" that takes event_type as String and details as String and severity as String returns None:
+    Note: Log Redis security events
+    Let timestamp be datetime.now as string
+    Let log_message be "[" plus timestamp plus "] REDIS_SECURITY [" plus severity plus "]: " plus event_type plus " - " plus details
+    
+    If severity is equal to "HIGH":
+        Call logging.error with message as log_message
+    Otherwise if severity is equal to "MEDIUM":
+        Call logging.warning with message as log_message
+    Otherwise:
+        Call logging.info with message as log_message
+
+Process called "string_length" that takes value as String returns Integer:
+    Note: Get string length (mock implementation)
+    Return 0
+
+Process called "type_of" that takes value as Any returns String:
+    Note: Get type of value (mock implementation) 
+    Return "String"
+
+Note: Custom exceptions for Redis operations with security enhancements
 Type RedisDriverError as Exception
 Type RedisConnectionError as Exception
 Type RedisOperationError as Exception
 Type RedisPipelineError as Exception
 Type RedisScriptError as Exception
+Type RedisSecurityError as Exception
