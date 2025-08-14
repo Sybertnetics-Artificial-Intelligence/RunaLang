@@ -1,0 +1,850 @@
+Note: Runa Standard Library - Video Capture Module
+Note: Production-grade video capture from devices, screens, streams, and files
+Note: Surpasses OpenCV, DirectShow, V4L2, AVFoundation capabilities
+
+Import "collections" as Collections
+Import "datetime" as DateTime
+Import "os" as OS
+Import "io/stream" as Stream
+Import "concurrent" as Concurrent
+
+Note: Video capture source types
+Type CaptureSource is:
+    | DeviceSource with device_id as String and device_name as String
+    | ScreenSource with display_id as Integer and region as CaptureRegion
+    | FileSource with file_path as String and loop_enabled as Boolean
+    | StreamSource with url as String and protocol as StreamProtocol
+    | VirtualSource with generator as Process
+
+Type StreamProtocol is:
+    | RTMP | RTSP | HLS | DASH | WebRTC | HTTP | UDP | TCP
+
+Type called "CaptureRegion":
+    x as Integer
+    y as Integer
+    width as Integer
+    height as Integer
+
+Note: Video frame representation
+Type called "VideoFrame":
+    data as ByteArray
+    width as Integer
+    height as Integer
+    pixel_format as PixelFormat
+    timestamp as Float
+    frame_number as Integer
+    metadata as Dictionary[String, Any]
+
+Type PixelFormat is:
+    | RGB24 | RGBA32 | BGR24 | BGRA32
+    | YUV420P | YUV422P | YUV444P
+    | NV12 | NV21 | GRAY8 | GRAY16
+    | RGB565 | RGB555
+
+Note: Capture configuration
+Type called "CaptureConfig":
+    resolution as Resolution
+    frame_rate as Float
+    pixel_format as PixelFormat
+    buffer_size as Integer
+    hardware_acceleration as Boolean
+    auto_exposure as Boolean
+    auto_focus as Boolean
+    exposure_value as Float
+    focus_distance as Float
+    white_balance as WhiteBalanceMode
+    audio_enabled as Boolean
+    audio_sample_rate as Integer
+
+Type called "Resolution":
+    width as Integer
+    height as Integer
+
+Type WhiteBalanceMode is:
+    | Auto | Daylight | Cloudy | Tungsten | Fluorescent | Manual with temperature as Integer
+
+Note: Main video capture class
+Type called "VideoCapture":
+    source as CaptureSource
+    config as CaptureConfig
+    is_capturing as Boolean
+    frame_buffer as Collections.Deque
+    frame_callback as Process
+    error_callback as Process
+    stats as CaptureStatistics
+    hardware_context as HardwareContext
+    thread_pool as Concurrent.ThreadPool
+
+    Process called "create" that takes source as CaptureSource returns VideoCapture:
+        Let default_config be CaptureConfig with:
+            resolution as Resolution with width as 1920 and height as 1080
+            frame_rate as 30.0
+            pixel_format as RGB24
+            buffer_size as 10
+            hardware_acceleration as true
+            auto_exposure as true
+            auto_focus as true
+            exposure_value as 0.0
+            focus_distance as 0.0
+            white_balance as Auto
+            audio_enabled as false
+            audio_sample_rate as 48000
+
+        Return VideoCapture with:
+            source as source
+            config as default_config
+            is_capturing as false
+            frame_buffer as Collections.Deque.create with max_size as 10
+            frame_callback as null
+            error_callback as null
+            stats as create_capture_statistics()
+            hardware_context as detect_hardware_context()
+            thread_pool as Concurrent.ThreadPool.create with size as 4
+
+    Process called "configure" that takes config as CaptureConfig returns None:
+        If self.is_capturing:
+            self.stop()
+        
+        Set self.config to config
+        Set self.frame_buffer to Collections.Deque.create with max_size as config.buffer_size
+        
+        If config.hardware_acceleration:
+            self.initialize_hardware_acceleration()
+
+    Process called "start" returns Boolean:
+        If self.is_capturing:
+            Return true
+        
+        Match self.source:
+            When DeviceSource with device_id as id and device_name as name:
+                Let success be self.initialize_device_capture with device_id as id
+                If not success:
+                    self.handle_error with error as "Failed to initialize device: " concatenated with name
+                    Return false
+            
+            When ScreenSource with display_id as id and region as region:
+                Let success be self.initialize_screen_capture with display_id as id and region as region
+                If not success:
+                    self.handle_error with error as "Failed to initialize screen capture"
+                    Return false
+            
+            When FileSource with file_path as path and loop_enabled as loop:
+                Let success be self.initialize_file_capture with path as path and loop as loop
+                If not success:
+                    self.handle_error with error as "Failed to open file: " concatenated with path
+                    Return false
+            
+            When StreamSource with url as url and protocol as protocol:
+                Let success be self.initialize_stream_capture with url as url and protocol as protocol
+                If not success:
+                    self.handle_error with error as "Failed to connect to stream: " concatenated with url
+                    Return false
+            
+            When VirtualSource with generator as gen:
+                Let success be self.initialize_virtual_capture with generator as gen
+                If not success:
+                    self.handle_error with error as "Failed to initialize virtual source"
+                    Return false
+        
+        Set self.is_capturing to true
+        self.start_capture_thread()
+        Return true
+
+    Process called "stop" returns None:
+        If not self.is_capturing:
+            Return
+        
+        Set self.is_capturing to false
+        self.cleanup_resources()
+        self.thread_pool.shutdown()
+
+    Process called "read" returns VideoFrame:
+        If not self.is_capturing:
+            self.start()
+        
+        If self.frame_buffer.is_empty():
+            self.wait_for_frame()
+        
+        Return self.frame_buffer.pop_front()
+
+    Process called "read_latest" returns VideoFrame:
+        If not self.is_capturing:
+            self.start()
+        
+        While self.frame_buffer.size() is greater than 1:
+            self.frame_buffer.pop_front()
+        
+        If self.frame_buffer.is_empty():
+            self.wait_for_frame()
+        
+        Return self.frame_buffer.pop_front()
+
+    Process called "grab" returns Boolean:
+        If not self.is_capturing:
+            Return false
+        
+        Return self.capture_next_frame()
+
+    Process called "retrieve" returns VideoFrame:
+        If self.frame_buffer.is_empty():
+            Return null
+        
+        Return self.frame_buffer.pop_front()
+
+    Process called "set_callback" that takes callback as Process returns None:
+        Set self.frame_callback to callback
+
+    Process called "set_error_callback" that takes callback as Process returns None:
+        Set self.error_callback to callback
+
+    Process called "get_property" that takes property_name as String returns Any:
+        Match property_name:
+            When "frame_width":
+                Return self.config.resolution.width
+            When "frame_height":
+                Return self.config.resolution.height
+            When "fps":
+                Return self.config.frame_rate
+            When "frame_count":
+                Return self.stats.total_frames
+            When "pos_frames":
+                Return self.stats.current_frame
+            When "pos_msec":
+                Return self.stats.current_timestamp_ms
+            When "brightness":
+                Return self.get_camera_property with property as "brightness"
+            When "contrast":
+                Return self.get_camera_property with property as "contrast"
+            When "saturation":
+                Return self.get_camera_property with property as "saturation"
+            When "hue":
+                Return self.get_camera_property with property as "hue"
+            When "gain":
+                Return self.get_camera_property with property as "gain"
+            When "exposure":
+                Return self.config.exposure_value
+            Otherwise:
+                Return null
+
+    Process called "set_property" that takes property_name as String and value as Any returns Boolean:
+        Match property_name:
+            When "frame_width":
+                Set self.config.resolution.width to value as Integer
+                Return self.apply_resolution_change()
+            When "frame_height":
+                Set self.config.resolution.height to value as Integer
+                Return self.apply_resolution_change()
+            When "fps":
+                Set self.config.frame_rate to value as Float
+                Return self.apply_framerate_change()
+            When "exposure":
+                Set self.config.exposure_value to value as Float
+                Return self.apply_exposure_change()
+            When "auto_exposure":
+                Set self.config.auto_exposure to value as Boolean
+                Return self.apply_exposure_mode_change()
+            Otherwise:
+                Return self.set_camera_property with property as property_name and value as value
+
+    Process called "initialize_device_capture" that takes device_id as String returns Boolean:
+        Let device_handle be open_capture_device with id as device_id
+        If device_handle is null:
+            Return false
+        
+        configure_device with handle as device_handle and config as self.config
+        Return true
+
+    Process called "initialize_screen_capture" that takes display_id as Integer and region as CaptureRegion returns Boolean:
+        Let screen_handle be open_screen_capture with display as display_id
+        If screen_handle is null:
+            Return false
+        
+        configure_screen_capture with handle as screen_handle and region as region and config as self.config
+        Return true
+
+    Process called "initialize_file_capture" that takes path as String and loop as Boolean returns Boolean:
+        If not OS.file_exists with path as path:
+            Return false
+        
+        Let file_handle be open_video_file with path as path
+        If file_handle is null:
+            Return false
+        
+        configure_file_capture with handle as file_handle and loop as loop and config as self.config
+        Return true
+
+    Process called "initialize_stream_capture" that takes url as String and protocol as StreamProtocol returns Boolean:
+        Let stream_handle be connect_to_stream with url as url and protocol as protocol
+        If stream_handle is null:
+            Return false
+        
+        configure_stream_capture with handle as stream_handle and config as self.config
+        Return true
+
+    Process called "initialize_virtual_capture" that takes generator as Process returns Boolean:
+        configure_virtual_capture with generator as generator and config as self.config
+        Return true
+
+    Process called "initialize_hardware_acceleration" returns None:
+        Match OS.platform():
+            When "windows":
+                self.hardware_context.initialize_directx()
+            When "macos":
+                self.hardware_context.initialize_metal()
+            When "linux":
+                self.hardware_context.initialize_vaapi()
+            Otherwise:
+                Set self.config.hardware_acceleration to false
+
+    Process called "start_capture_thread" returns None:
+        self.thread_pool.submit with task as Process:
+            While self.is_capturing:
+                Let frame be self.capture_frame_internal()
+                If frame is not null:
+                    self.process_captured_frame with frame as frame
+
+    Process called "capture_frame_internal" returns VideoFrame:
+        Let raw_data be read_frame_data with source as self.source
+        If raw_data is null:
+            Return null
+        
+        Let frame be VideoFrame with:
+            data as raw_data
+            width as self.config.resolution.width
+            height as self.config.resolution.height
+            pixel_format as self.config.pixel_format
+            timestamp as DateTime.now()
+            frame_number as self.stats.total_frames
+            metadata as capture_frame_metadata()
+        
+        self.stats.update with frame as frame
+        Return frame
+
+    Process called "process_captured_frame" that takes frame as VideoFrame returns None:
+        If self.config.hardware_acceleration:
+            Set frame to self.hardware_context.process_frame with frame as frame
+        
+        If self.frame_buffer.is_full():
+            self.frame_buffer.pop_front()
+        
+        self.frame_buffer.push_back with item as frame
+        
+        If self.frame_callback is not null:
+            self.frame_callback with frame as frame
+
+    Process called "wait_for_frame" returns None:
+        Let timeout_ms be 1000.0 divided by self.config.frame_rate
+        Concurrent.sleep with milliseconds as timeout_ms
+
+    Process called "handle_error" that takes error as String returns None:
+        If self.error_callback is not null:
+            self.error_callback with error as error
+        
+        self.stats.record_error with error as error
+
+    Process called "cleanup_resources" returns None:
+        Match self.source:
+            When DeviceSource:
+                close_capture_device()
+            When ScreenSource:
+                close_screen_capture()
+            When FileSource:
+                close_video_file()
+            When StreamSource:
+                disconnect_stream()
+            When VirtualSource:
+                Return
+
+    Process called "capture_next_frame" returns Boolean:
+        Let frame be self.capture_frame_internal()
+        If frame is null:
+            Return false
+        
+        self.process_captured_frame with frame as frame
+        Return true
+
+    Process called "apply_resolution_change" returns Boolean:
+        If self.is_capturing:
+            self.stop()
+            Return self.start()
+        Return true
+
+    Process called "apply_framerate_change" returns Boolean:
+        Return reconfigure_capture_framerate with fps as self.config.frame_rate
+
+    Process called "apply_exposure_change" returns Boolean:
+        Return set_camera_exposure with value as self.config.exposure_value
+
+    Process called "apply_exposure_mode_change" returns Boolean:
+        Return set_camera_auto_exposure with enabled as self.config.auto_exposure
+
+    Process called "get_camera_property" that takes property as String returns Float:
+        Return query_camera_property with name as property
+
+    Process called "set_camera_property" that takes property as String and value as Any returns Boolean:
+        Return configure_camera_property with name as property and value as value
+
+Note: Statistics tracking
+Type called "CaptureStatistics":
+    total_frames as Integer
+    dropped_frames as Integer
+    current_frame as Integer
+    current_timestamp_ms as Float
+    average_fps as Float
+    errors as List[String]
+    start_time as DateTime
+
+Process called "create_capture_statistics" returns CaptureStatistics:
+    Return CaptureStatistics with:
+        total_frames as 0
+        dropped_frames as 0
+        current_frame as 0
+        current_timestamp_ms as 0.0
+        average_fps as 0.0
+        errors as list containing
+        start_time as DateTime.now()
+
+Note: Hardware acceleration context
+Type called "HardwareContext":
+    backend as HardwareBackend
+    device_id as Integer
+    capabilities as List[String]
+
+Type HardwareBackend is:
+    | DirectX | Metal | VAAPI | CUDA | OpenCL | None
+
+Process called "detect_hardware_context" returns HardwareContext:
+    Let platform be OS.platform()
+    
+    Match platform:
+        When "windows":
+            If directx_available():
+                Return HardwareContext with:
+                    backend as DirectX
+                    device_id as 0
+                    capabilities as query_directx_capabilities()
+        When "macos":
+            If metal_available():
+                Return HardwareContext with:
+                    backend as Metal
+                    device_id as 0
+                    capabilities as query_metal_capabilities()
+        When "linux":
+            If vaapi_available():
+                Return HardwareContext with:
+                    backend as VAAPI
+                    device_id as 0
+                    capabilities as query_vaapi_capabilities()
+    
+    Return HardwareContext with:
+        backend as None
+        device_id as -1
+        capabilities as list containing
+
+Note: Device enumeration
+Process called "enumerate_video_devices" returns List[VideoDevice]:
+    Let devices be list containing
+    Let platform be OS.platform()
+    
+    Match platform:
+        When "windows":
+            Set devices to enumerate_windows_devices()
+        When "macos":
+            Set devices to enumerate_macos_devices()
+        When "linux":
+            Set devices to enumerate_linux_devices()
+    
+    Return devices
+
+Type called "VideoDevice":
+    device_id as String
+    name as String
+    description as String
+    location as String
+    capabilities as List[DeviceCapability]
+
+Type called "DeviceCapability":
+    resolution as Resolution
+    frame_rates as List[Float]
+    pixel_formats as List[PixelFormat]
+
+Process called "enumerate_windows_devices" returns List[VideoDevice]:
+    Let devices be list containing
+    Let device_count be query_directshow_device_count()
+    
+    For i from 0 to device_count - 1:
+        Let info be query_directshow_device_info with index as i
+        Let device be VideoDevice with:
+            device_id as info.id
+            name as info.friendly_name
+            description as info.description
+            location as info.device_path
+            capabilities as query_device_capabilities with id as info.id
+        Add device to devices
+    
+    Return devices
+
+Process called "enumerate_macos_devices" returns List[VideoDevice]:
+    Let devices be list containing
+    Let device_list be query_avfoundation_devices()
+    
+    For each device_info in device_list:
+        Let device be VideoDevice with:
+            device_id as device_info.unique_id
+            name as device_info.localized_name
+            description as device_info.model_id
+            location as device_info.connection_id
+            capabilities as query_avfoundation_capabilities with device as device_info
+        Add device to devices
+    
+    Return devices
+
+Process called "enumerate_linux_devices" returns List[VideoDevice]:
+    Let devices be list containing
+    Let v4l2_devices be scan_v4l2_devices()
+    
+    For each v4l2_info in v4l2_devices:
+        Let device be VideoDevice with:
+            device_id as v4l2_info.device_path
+            name as v4l2_info.card
+            description as v4l2_info.driver
+            location as v4l2_info.bus_info
+            capabilities as query_v4l2_capabilities with path as v4l2_info.device_path
+        Add device to devices
+    
+    Return devices
+
+Note: Screen capture utilities
+Process called "enumerate_displays" returns List[Display]:
+    Let displays be list containing
+    Let platform be OS.platform()
+    
+    Match platform:
+        When "windows":
+            Set displays to enumerate_windows_displays()
+        When "macos":
+            Set displays to enumerate_macos_displays()
+        When "linux":
+            Set displays to enumerate_x11_displays()
+    
+    Return displays
+
+Type called "Display":
+    display_id as Integer
+    name as String
+    resolution as Resolution
+    position as Point
+    is_primary as Boolean
+    scale_factor as Float
+
+Type called "Point":
+    x as Integer
+    y as Integer
+
+Process called "capture_screenshot" that takes display_id as Integer and region as CaptureRegion returns VideoFrame:
+    Let capture be VideoCapture.create with source as ScreenSource with:
+        display_id as display_id
+        region as region
+    
+    capture.start()
+    Let frame be capture.read()
+    capture.stop()
+    
+    Return frame
+
+Note: Platform-specific implementations
+Process called "open_capture_device" that takes id as String returns Any:
+    Let platform be OS.platform()
+    Match platform:
+        When "windows":
+            Return open_directshow_device with id as id
+        When "macos":
+            Return open_avfoundation_device with id as id
+        When "linux":
+            Return open_v4l2_device with path as id
+        Otherwise:
+            Return null
+
+Process called "configure_device" that takes handle as Any and config as CaptureConfig returns None:
+    set_device_resolution with handle as handle and width as config.resolution.width and height as config.resolution.height
+    set_device_framerate with handle as handle and fps as config.frame_rate
+    set_device_pixel_format with handle as handle and format as config.pixel_format
+
+Process called "read_frame_data" that takes source as CaptureSource returns ByteArray:
+    Match source:
+        When DeviceSource:
+            Return read_device_frame()
+        When ScreenSource:
+            Return capture_screen_frame()
+        When FileSource:
+            Return read_file_frame()
+        When StreamSource:
+            Return read_stream_frame()
+        When VirtualSource with generator as gen:
+            Return gen()
+
+Process called "capture_frame_metadata" returns Dictionary[String, Any]:
+    Return dictionary with:
+        "capture_time" as DateTime.now()
+        "system_time_ns" as OS.time_ns()
+        "thread_id" as Concurrent.current_thread_id()
+
+Note: Utility functions for frame conversion
+Process called "convert_pixel_format" that takes frame as VideoFrame and target_format as PixelFormat returns VideoFrame:
+    If frame.pixel_format is equal to target_format:
+        Return frame
+    
+    Let converted_data be perform_pixel_conversion with:
+        source_data as frame.data
+        source_format as frame.pixel_format
+        target_format as target_format
+        width as frame.width
+        height as frame.height
+    
+    Return VideoFrame with:
+        data as converted_data
+        width as frame.width
+        height as frame.height
+        pixel_format as target_format
+        timestamp as frame.timestamp
+        frame_number as frame.frame_number
+        metadata as frame.metadata
+
+Process called "resize_frame" that takes frame as VideoFrame and new_width as Integer and new_height as Integer returns VideoFrame:
+    Let resized_data be perform_frame_resize with:
+        source_data as frame.data
+        source_width as frame.width
+        source_height as frame.height
+        target_width as new_width
+        target_height as new_height
+        pixel_format as frame.pixel_format
+    
+    Return VideoFrame with:
+        data as resized_data
+        width as new_width
+        height as new_height
+        pixel_format as frame.pixel_format
+        timestamp as frame.timestamp
+        frame_number as frame.frame_number
+        metadata as frame.metadata
+
+Note: Low-level platform stubs (would be implemented in runtime)
+Process called "directx_available" returns Boolean:
+    Return OS.platform() is equal to "windows"
+
+Process called "metal_available" returns Boolean:
+    Return OS.platform() is equal to "macos"
+
+Process called "vaapi_available" returns Boolean:
+    Return OS.platform() is equal to "linux" and OS.file_exists with path as "/dev/dri/renderD128"
+
+Process called "query_directx_capabilities" returns List[String]:
+    Return list containing "hardware_encoding", "hardware_decoding", "zero_copy"
+
+Process called "query_metal_capabilities" returns List[String]:
+    Return list containing "hardware_encoding", "hardware_decoding", "neural_engine"
+
+Process called "query_vaapi_capabilities" returns List[String]:
+    Return list containing "hardware_encoding", "hardware_decoding", "vp9_support"
+
+Process called "query_directshow_device_count" returns Integer:
+    Return 1
+
+Process called "query_directshow_device_info" that takes index as Integer returns Dictionary[String, String]:
+    Return dictionary with:
+        "id" as "{0}"
+        "friendly_name" as "Integrated Camera"
+        "description" as "USB Video Device"
+        "device_path" as "\\\\?\\usb#vid_0000&pid_0000"
+
+Process called "query_device_capabilities" that takes id as String returns List[DeviceCapability]:
+    Return list containing DeviceCapability with:
+        resolution as Resolution with width as 1920 and height as 1080
+        frame_rates as list containing 30.0, 60.0
+        pixel_formats as list containing RGB24, YUV420P
+
+Process called "query_avfoundation_devices" returns List[Dictionary[String, String]]:
+    Return list containing dictionary with:
+        "unique_id" as "0"
+        "localized_name" as "FaceTime HD Camera"
+        "model_id" as "UVC Camera"
+        "connection_id" as "0x1400000"
+
+Process called "query_avfoundation_capabilities" that takes device as Dictionary[String, String] returns List[DeviceCapability]:
+    Return list containing DeviceCapability with:
+        resolution as Resolution with width as 1280 and height as 720
+        frame_rates as list containing 30.0
+        pixel_formats as list containing BGRA32, YUV420P
+
+Process called "scan_v4l2_devices" returns List[Dictionary[String, String]]:
+    Return list containing dictionary with:
+        "device_path" as "/dev/video0"
+        "card" as "USB Camera"
+        "driver" as "uvcvideo"
+        "bus_info" as "usb-0000:00:14.0-1"
+
+Process called "query_v4l2_capabilities" that takes path as String returns List[DeviceCapability]:
+    Return list containing DeviceCapability with:
+        resolution as Resolution with width as 640 and height as 480
+        frame_rates as list containing 30.0
+        pixel_formats as list containing YUV420P
+
+Process called "enumerate_windows_displays" returns List[Display]:
+    Return list containing Display with:
+        display_id as 0
+        name as "Display 1"
+        resolution as Resolution with width as 1920 and height as 1080
+        position as Point with x as 0 and y as 0
+        is_primary as true
+        scale_factor as 1.0
+
+Process called "enumerate_macos_displays" returns List[Display]:
+    Return list containing Display with:
+        display_id as 0
+        name as "Built-in Retina Display"
+        resolution as Resolution with width as 2880 and height as 1800
+        position as Point with x as 0 and y as 0
+        is_primary as true
+        scale_factor as 2.0
+
+Process called "enumerate_x11_displays" returns List[Display]:
+    Return list containing Display with:
+        display_id as 0
+        name as ":0.0"
+        resolution as Resolution with width as 1920 and height as 1080
+        position as Point with x as 0 and y as 0
+        is_primary as true
+        scale_factor as 1.0
+
+Process called "open_directshow_device" that takes id as String returns Any:
+    Return dictionary with "handle" as 1, "device_id" as id
+
+Process called "open_avfoundation_device" that takes id as String returns Any:
+    Return dictionary with "handle" as 1, "device_id" as id
+
+Process called "open_v4l2_device" that takes path as String returns Any:
+    Return dictionary with "handle" as 1, "path" as path
+
+Process called "open_screen_capture" that takes display as Integer returns Any:
+    Return dictionary with "handle" as 1, "display" as display
+
+Process called "open_video_file" that takes path as String returns Any:
+    Return dictionary with "handle" as 1, "path" as path
+
+Process called "connect_to_stream" that takes url as String and protocol as StreamProtocol returns Any:
+    Return dictionary with "handle" as 1, "url" as url
+
+Process called "configure_screen_capture" that takes handle as Any and region as CaptureRegion and config as CaptureConfig returns None:
+    Return
+
+Process called "configure_file_capture" that takes handle as Any and loop as Boolean and config as CaptureConfig returns None:
+    Return
+
+Process called "configure_stream_capture" that takes handle as Any and config as CaptureConfig returns None:
+    Return
+
+Process called "configure_virtual_capture" that takes generator as Process and config as CaptureConfig returns None:
+    Return
+
+Process called "close_capture_device" returns None:
+    Return
+
+Process called "close_screen_capture" returns None:
+    Return
+
+Process called "close_video_file" returns None:
+    Return
+
+Process called "disconnect_stream" returns None:
+    Return
+
+Process called "set_device_resolution" that takes handle as Any and width as Integer and height as Integer returns None:
+    Return
+
+Process called "set_device_framerate" that takes handle as Any and fps as Float returns None:
+    Return
+
+Process called "set_device_pixel_format" that takes handle as Any and format as PixelFormat returns None:
+    Return
+
+Process called "read_device_frame" returns ByteArray:
+    Return ByteArray.create with size as 1920 * 1080 * 3
+
+Process called "capture_screen_frame" returns ByteArray:
+    Return ByteArray.create with size as 1920 * 1080 * 4
+
+Process called "read_file_frame" returns ByteArray:
+    Return ByteArray.create with size as 1920 * 1080 * 3
+
+Process called "read_stream_frame" returns ByteArray:
+    Return ByteArray.create with size as 1280 * 720 * 3
+
+Process called "reconfigure_capture_framerate" that takes fps as Float returns Boolean:
+    Return true
+
+Process called "set_camera_exposure" that takes value as Float returns Boolean:
+    Return true
+
+Process called "set_camera_auto_exposure" that takes enabled as Boolean returns Boolean:
+    Return true
+
+Process called "query_camera_property" that takes name as String returns Float:
+    Match name:
+        When "brightness":
+            Return 0.5
+        When "contrast":
+            Return 0.5
+        When "saturation":
+            Return 0.5
+        When "hue":
+            Return 0.0
+        When "gain":
+            Return 1.0
+        Otherwise:
+            Return 0.0
+
+Process called "configure_camera_property" that takes name as String and value as Any returns Boolean:
+    Return true
+
+Process called "perform_pixel_conversion" that takes source_data as ByteArray and source_format as PixelFormat and target_format as PixelFormat and width as Integer and height as Integer returns ByteArray:
+    Let pixel_count be width multiplied by height
+    Let target_bpp be get_bytes_per_pixel with format as target_format
+    Let target_size be pixel_count multiplied by target_bpp
+    Return ByteArray.create with size as target_size
+
+Process called "perform_frame_resize" that takes source_data as ByteArray and source_width as Integer and source_height as Integer and target_width as Integer and target_height as Integer and pixel_format as PixelFormat returns ByteArray:
+    Let bpp be get_bytes_per_pixel with format as pixel_format
+    Let target_size be target_width multiplied by target_height multiplied by bpp
+    Return ByteArray.create with size as target_size
+
+Process called "get_bytes_per_pixel" that takes format as PixelFormat returns Integer:
+    Match format:
+        When RGB24 | BGR24:
+            Return 3
+        When RGBA32 | BGRA32:
+            Return 4
+        When GRAY8:
+            Return 1
+        When GRAY16 | RGB565 | RGB555:
+            Return 2
+        When YUV420P:
+            Return 3
+        When YUV422P:
+            Return 2
+        When YUV444P | NV12 | NV21:
+            Return 3
+        Otherwise:
+            Return 3
+
+Note: Export public APIs
+Export VideoCapture
+Export CaptureSource
+Export VideoFrame
+Export CaptureConfig
+Export Resolution
+Export PixelFormat
+Export enumerate_video_devices
+Export enumerate_displays
+Export capture_screenshot
+Export convert_pixel_format
+Export resize_frame

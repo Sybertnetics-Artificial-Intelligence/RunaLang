@@ -1,0 +1,799 @@
+Note: Runa Standard Library - Static File Server Module
+Note: High-performance static file serving with caching, compression, CDN integration
+Note: Surpasses nginx, Apache, Express static, Go net/http, Rust tower-http capabilities
+
+Import "web/framework" as Framework
+Import "collections" as Collections
+Import "datetime" as DateTime
+Import "crypto/hash" as Hash
+Import "concurrent" as Concurrent
+Import "os" as OS
+Import "io" as IO
+
+Note: Static File Configuration
+Type called "StaticFileConfig":
+    root_directory as String
+    url_prefix as String
+    index_files as List[String]
+    enable_directory_listing as Boolean
+    enable_caching as Boolean
+    cache_control_header as String
+    max_age as Integer
+    enable_compression as Boolean
+    compression_types as List[String]
+    enable_etag as Boolean
+    enable_last_modified as Boolean
+    enable_range_requests as Boolean
+    mime_types as Dictionary[String, String]
+    security_headers as Dictionary[String, String]
+    cors_config as CORSConfig
+    rate_limiting as StaticRateLimitConfig
+
+Type called "StaticRateLimitConfig":
+    enabled as Boolean
+    requests_per_minute as Integer
+    burst_size as Integer
+    bandwidth_limit as Integer
+
+Type called "CORSConfig":
+    enabled as Boolean
+    allowed_origins as List[String]
+    allowed_methods as List[String]
+    allowed_headers as List[String]
+    expose_headers as List[String]
+    allow_credentials as Boolean
+    max_age as Integer
+
+Note: Static File Handler
+Type called "StaticFileHandler":
+    config as StaticFileConfig
+    file_cache as FileCache
+    mime_detector as MimeTypeDetector
+    compressor as ContentCompressor
+    rate_limiter as StaticRateLimiter
+    metrics as StaticFileMetrics
+
+    Process called "create" that takes config as StaticFileConfig returns StaticFileHandler:
+        Return StaticFileHandler with:
+            config as config
+            file_cache as FileCache.create with config as config
+            mime_detector as MimeTypeDetector.create with mime_types as config.mime_types
+            compressor as ContentCompressor.create with types as config.compression_types
+            rate_limiter as StaticRateLimiter.create with config as config.rate_limiting
+            metrics as StaticFileMetrics.create()
+
+    Process called "serve" that takes request as Framework.HTTPRequest and context as Dictionary[String, Any] returns Framework.HTTPResponse:
+        Let file_path be self.resolve_file_path with request as request
+        
+        Note: Security checks
+        Let security_check be self.validate_file_path with file_path as file_path
+        If not security_check.valid:
+            Return self.create_error_response with status as 403 and message as "Forbidden"
+
+        Note: Rate limiting
+        If self.config.rate_limiting.enabled:
+            Let rate_limit_result be self.rate_limiter.check_request with request as request
+            If not rate_limit_result.allowed:
+                Return self.create_error_response with status as 429 and message as "Too Many Requests"
+
+        Note: Check if file exists
+        If not OS.file_exists with path as file_path:
+            Note: Try index files for directory
+            If OS.directory_exists with path as file_path:
+                Let index_file be self.find_index_file with directory as file_path
+                If index_file is not null:
+                    Set file_path to index_file
+                Otherwise If self.config.enable_directory_listing:
+                    Return self.serve_directory_listing with directory as file_path and request as request
+                Otherwise:
+                    Return self.create_error_response with status as 403 and message as "Directory listing disabled"
+            Otherwise:
+                Return self.create_error_response with status as 404 and message as "File not found"
+
+        Note: Get file info
+        Let file_info be self.get_file_info with file_path as file_path
+        
+        Note: Handle conditional requests
+        Let conditional_response be self.handle_conditional_request with request as request and file_info as file_info
+        If conditional_response is not null:
+            return conditional_response
+
+        Note: Handle range requests
+        If self.config.enable_range_requests and "Range" is in request.headers:
+            Return self.handle_range_request with request as request and file_info as file_info
+
+        Note: Serve the file
+        Return self.serve_file with file_info as file_info and request as request
+
+    Process called "resolve_file_path" that takes request as Framework.HTTPRequest returns String:
+        Let url_path be request.path
+        
+        Note: Remove URL prefix
+        If url_path starts with self.config.url_prefix:
+            Set url_path to url_path.substring with start as length of self.config.url_prefix
+        
+        Note: Normalize path and prevent directory traversal
+        Set url_path to self.normalize_path with path as url_path
+        
+        Return self.config.root_directory concatenated with "/" concatenated with url_path
+
+    Process called "normalize_path" that takes path as String returns String:
+        Note: Remove leading slash
+        If path starts with "/":
+            Set path to path.substring with start as 1
+        
+        Note: Remove any ../ patterns for security
+        Set path to path.replace with old as "../" and new as ""
+        Set path to path.replace with old as "..\\" and new as ""
+        
+        Return path
+
+    Process called "validate_file_path" that takes file_path as String returns SecurityValidation:
+        Note: Ensure file is within root directory
+        Let canonical_root be OS.canonical_path with path as self.config.root_directory
+        Let canonical_file be OS.canonical_path with path as file_path
+        
+        If not canonical_file starts with canonical_root:
+            Return SecurityValidation with valid as false and reason as "Path outside root directory"
+        
+        Note: Check for hidden files (starting with .)
+        Let filename be OS.basename with path as file_path
+        If filename starts with ".":
+            Return SecurityValidation with valid as false and reason as "Hidden files not allowed"
+        
+        Return SecurityValidation with valid as true and reason as ""
+
+    Process called "find_index_file" that takes directory as String returns Optional[String]:
+        For each index_file in self.config.index_files:
+            Let index_path be directory concatenated with "/" concatenated with index_file
+            If OS.file_exists with path as index_path:
+                Return index_path
+        Return null
+
+    Process called "get_file_info" that takes file_path as String returns FileInfo:
+        Let file_stats be OS.file_stats with path as file_path
+        Let content_type be self.mime_detector.detect with file_path as file_path
+        Let etag be self.generate_etag with file_path as file_path and stats as file_stats
+        
+        Return FileInfo with:
+            path as file_path
+            size as file_stats.size
+            modified_time as file_stats.modified_time
+            content_type as content_type
+            etag as etag
+            is_compressible as self.compressor.can_compress with content_type as content_type
+
+    Process called "generate_etag" that takes file_path as String and stats as FileStats returns String:
+        Let etag_data be file_path concatenated with ":" concatenated with stats.size.to_string() concatenated with ":" concatenated with stats.modified_time.to_string()
+        Return Hash.md5 with data as etag_data
+
+    Process called "handle_conditional_request" that takes request as Framework.HTTPRequest and file_info as FileInfo returns Optional[Framework.HTTPResponse]:
+        Note: Handle If-None-Match (ETag)
+        If self.config.enable_etag and "If-None-Match" is in request.headers:
+            Let client_etag be request.headers["If-None-Match"]
+            If client_etag is equal to file_info.etag:
+                Return self.create_not_modified_response with file_info as file_info
+
+        Note: Handle If-Modified-Since
+        If self.config.enable_last_modified and "If-Modified-Since" is in request.headers:
+            Let client_modified_time be parse_http_date with date_string as request.headers["If-Modified-Since"]
+            If client_modified_time is greater than or equal to file_info.modified_time:
+                Return self.create_not_modified_response with file_info as file_info
+
+        Return null
+
+    Process called "handle_range_request" that takes request as Framework.HTTPRequest and file_info as FileInfo returns Framework.HTTPResponse:
+        Let range_header be request.headers["Range"]
+        Let ranges be self.parse_range_header with range_header as range_header and file_size as file_info.size
+        
+        If length of ranges is equal to 0:
+            Return self.create_error_response with status as 416 and message as "Range Not Satisfiable"
+        
+        If length of ranges is equal to 1:
+            Return self.serve_single_range with file_info as file_info and range as ranges[0] and request as request
+        
+        Return self.serve_multiple_ranges with file_info as file_info and ranges as ranges and request as request
+
+    Process called "serve_file" that takes file_info as FileInfo and request as Framework.HTTPRequest returns Framework.HTTPResponse:
+        Note: Check cache first
+        If self.config.enable_caching:
+            Let cached_response be self.file_cache.get with file_info as file_info
+            If cached_response is not null:
+                self.metrics.record_cache_hit()
+                Return self.add_headers_to_response with response as cached_response and file_info as file_info and request as request
+
+        Note: Read file content
+        Let file_content be OS.read_file_bytes with path as file_info.path
+        
+        Note: Apply compression if requested and supported
+        Let compressed_content be file_content
+        Let content_encoding be ""
+        
+        If self.config.enable_compression and file_info.is_compressible:
+            Let compression_result be self.compressor.compress with content as file_content and request as request
+            If compression_result.compressed:
+                Set compressed_content to compression_result.content
+                Set content_encoding to compression_result.encoding
+
+        Note: Create response
+        Let response be Framework.HTTPResponse with:
+            status as Framework.OK with code as 200
+            headers as dictionary containing
+            body as compressed_content
+            cookies as list containing
+            content_type as file_info.content_type
+
+        Note: Add compression header
+        If content_encoding is not empty:
+            Set response.headers["Content-Encoding"] to content_encoding
+
+        Note: Cache the response
+        If self.config.enable_caching:
+            self.file_cache.put with file_info as file_info and response as response
+            self.metrics.record_cache_miss()
+
+        Return self.add_headers_to_response with response as response and file_info as file_info and request as request
+
+    Process called "serve_single_range" that takes file_info as FileInfo and range as ByteRange and request as Framework.HTTPRequest returns Framework.HTTPResponse:
+        Let file_content be OS.read_file_range with path as file_info.path and start as range.start and end as range.end
+        
+        Let response be Framework.HTTPResponse with:
+            status as Framework.Custom with code as 206 and message as "Partial Content"
+            headers as dictionary with:
+                "Content-Range" as "bytes " concatenated with range.start.to_string() concatenated with "-" concatenated with range.end.to_string() concatenated with "/" concatenated with file_info.size.to_string()
+                "Content-Length" as (range.end - range.start 1).to_string()
+            body as file_content
+            cookies as list containing
+            content_type as file_info.content_type
+
+        Return self.add_headers_to_response with response as response and file_info as file_info and request as request
+
+    Process called "serve_multiple_ranges" that takes file_info as FileInfo and ranges as List[ByteRange] and request as Framework.HTTPRequest returns Framework.HTTPResponse:
+        Let boundary be Hash.random_string with length as 16
+        Let multipart_content be self.create_multipart_content with file_info as file_info and ranges as ranges and boundary as boundary
+        
+        Let response be Framework.HTTPResponse with:
+            status as Framework.Custom with code as 206 and message as "Partial Content"
+            headers as dictionary with:
+                "Content-Type" as "multipart/byteranges; boundary=" concatenated with boundary
+                "Content-Length" as multipart_content.size().to_string()
+            body as multipart_content
+            cookies as list containing
+            content_type as "multipart/byteranges"
+
+        Return self.add_headers_to_response with response as response and file_info as file_info and request as request
+
+    Process called "serve_directory_listing" that takes directory as String and request as Framework.HTTPRequest returns Framework.HTTPResponse:
+        Let files be OS.list_directory with path as directory
+        Let html_content be self.generate_directory_listing_html with directory as directory and files as files and request as request
+        
+        Return Framework.HTTPResponse with:
+            status as Framework.OK with code as 200
+            headers as dictionary with "Content-Type" as "text/html; charset=utf-8"
+            body as ByteArray.from_string with str as html_content
+            cookies as list containing
+            content_type as "text/html"
+
+    Process called "add_headers_to_response" that takes response as Framework.HTTPResponse and file_info as FileInfo and request as Framework.HTTPRequest returns Framework.HTTPResponse:
+        Note: Add caching headers
+        If self.config.enable_caching:
+            Set response.headers["Cache-Control"] to self.config.cache_control_header
+            If self.config.max_age is greater than 0:
+                Set response.headers["Expires"] to self.format_http_date with timestamp as DateTime.now() self.config.max_age
+
+        Note: Add ETag header
+        If self.config.enable_etag:
+            Set response.headers["ETag"] to file_info.etag
+
+        Note: Add Last-Modified header
+        If self.config.enable_last_modified:
+            Set response.headers["Last-Modified"] to self.format_http_date with timestamp as file_info.modified_time
+
+        Note: Add security headers
+        For each header_name in self.config.security_headers:
+            Set response.headers[header_name] to self.config.security_headers[header_name]
+
+        Note: Add CORS headers
+        If self.config.cors_config.enabled:
+            self.add_cors_headers with response as response and request as request
+
+        Note: Add Content-Length if not already set
+        If "Content-Length" is not in response.headers:
+            Set response.headers["Content-Length"] to response.body.size().to_string()
+
+        Return response
+
+    Process called "add_cors_headers" that takes response as Framework.HTTPResponse and request as Framework.HTTPRequest returns None:
+        Let origin be request.headers.get with key as "Origin" or ""
+        
+        Note: Check if origin is allowed
+        If self.is_origin_allowed with origin as origin:
+            Set response.headers["Access-Control-Allow-Origin"] to origin
+        
+        Set response.headers["Access-Control-Allow-Methods"] to self.config.cors_config.allowed_methods.join with separator as ", "
+        Set response.headers["Access-Control-Allow-Headers"] to self.config.cors_config.allowed_headers.join with separator as ", "
+        
+        If length of self.config.cors_config.expose_headers is greater than 0:
+            Set response.headers["Access-Control-Expose-Headers"] to self.config.cors_config.expose_headers.join with separator as ", "
+        
+        If self.config.cors_config.allow_credentials:
+            Set response.headers["Access-Control-Allow-Credentials"] to "true"
+        
+        If self.config.cors_config.max_age is greater than 0:
+            Set response.headers["Access-Control-Max-Age"] to self.config.cors_config.max_age.to_string()
+
+    Process called "is_origin_allowed" that takes origin as String returns Boolean:
+        For each allowed_origin in self.config.cors_config.allowed_origins:
+            If allowed_origin is equal to "*" or allowed_origin is equal to origin:
+                Return true
+        Return false
+
+    Process called "parse_range_header" that takes range_header as String and file_size as Integer returns List[ByteRange]:
+        Let ranges be list containing
+        
+        If not range_header starts with "bytes=":
+            Return ranges
+        
+        Let range_spec be range_header.substring with start as 6
+        Let range_parts be range_spec.split with separator as ","
+        
+        For each range_part in range_parts:
+            Let range_part_trimmed be range_part.trim()
+            Let range be self.parse_single_range with range_spec as range_part_trimmed and file_size as file_size
+            If range is not null:
+                Add range to ranges
+        
+        Return ranges
+
+    Process called "parse_single_range" that takes range_spec as String and file_size as Integer returns Optional[ByteRange]:
+        If range_spec contains "-":
+            Let parts be range_spec.split with separator as "-"
+            If length of parts is equal to 2:
+                Let start_str be parts[0].trim()
+                Let end_str be parts[1].trim()
+                
+                If start_str is empty and end_str is not empty:
+                    Note: Suffix range
+                    Let suffix_length be parse_integer_safe with str as end_str
+                    If suffix_length is not null and suffix_length is greater than 0:
+                        Return ByteRange with:
+                            start as Math.max with a as 0 and b as file_size - suffix_length
+                            end as file_size - 1
+                
+                If start_str is not empty:
+                    Let start be parse_integer_safe with str as start_str
+                    If start is not null and start is greater than or equal to 0 and start is less than file_size:
+                        Let end be file_size - 1
+                        If end_str is not empty:
+                            Let parsed_end be parse_integer_safe with str as end_str
+                            If parsed_end is not null and parsed_end is greater than or equal to start:
+                                Set end to Math.min with a as parsed_end and b as file_size - 1
+                        
+                        Return ByteRange with start as start and end as end
+        
+        Return null
+
+    Process called "create_multipart_content" that takes file_info as FileInfo and ranges as List[ByteRange] and boundary as String returns ByteArray:
+        Let content_parts be list containing
+        
+        For each range in ranges:
+            Add "--" concatenated with boundary to content_parts
+            Add "Content-Type: " concatenated with file_info.content_type to content_parts
+            Add "Content-Range: bytes " concatenated with range.start.to_string() concatenated with "-" concatenated with range.end.to_string() concatenated with "/" concatenated with file_info.size.to_string() to content_parts
+            Add "" to content_parts
+            
+            Let range_content be OS.read_file_range with path as file_info.path and start as range.start and end as range.end
+            Add range_content.to_string() to content_parts
+        
+        Add "--" concatenated with boundary concatenated with "--" to content_parts
+        
+        Return ByteArray.from_string with str as content_parts.join with separator as "\r\n"
+
+    Process called "generate_directory_listing_html" that takes directory as String and files as List[String] and request as Framework.HTTPRequest returns String:
+        Let html_parts be list containing
+        Add "<!DOCTYPE html>" to html_parts
+        Add "<html><head><title>Directory Listing</title></head><body>" to html_parts
+        Add "<h1>Directory Listing</h1>" to html_parts
+        Add "<ul>" to html_parts
+        
+        For each file in files:
+            Let file_path be directory concatenated with "/" concatenated with file
+            Let is_directory be OS.directory_exists with path as file_path
+            Let display_name be if is_directory then file concatenated with "/" otherwise file
+            Let href be request.path concatenated with "/" concatenated with file
+            
+            Add "<li><a href=\"" concatenated with href concatenated with "\">" concatenated with display_name concatenated with "</a></li>" to html_parts
+        
+        Add "</ul>" to html_parts
+        Add "</body></html>" to html_parts
+        
+        Return html_parts.join with separator as "\n"
+
+    Process called "create_error_response" that takes status as Integer and message as String returns Framework.HTTPResponse:
+        Return Framework.HTTPResponse with:
+            status as Framework.Custom with code as status and message as message
+            headers as dictionary with "Content-Type" as "text/plain"
+            body as ByteArray.from_string with str as message
+            cookies as list containing
+            content_type as "text/plain"
+
+    Process called "create_not_modified_response" that takes file_info as FileInfo returns Framework.HTTPResponse:
+        Let response be Framework.HTTPResponse with:
+            status as Framework.Custom with code as 304 and message as "Not Modified"
+            headers as dictionary containing
+            body as ByteArray.create with size as 0
+            cookies as list containing
+            content_type as ""
+
+        Note: Add caching headers for 304 responses
+        If self.config.enable_etag:
+            Set response.headers["ETag"] to file_info.etag
+        
+        If self.config.enable_last_modified:
+            Set response.headers["Last-Modified"] to self.format_http_date with timestamp as file_info.modified_time
+
+        Return response
+
+    Process called "format_http_date" that takes timestamp as Float returns String:
+        Return DateTime.format_http_date with timestamp as timestamp
+
+Note: Supporting Types
+Type called "FileInfo":
+    path as String
+    size as Integer
+    modified_time as Float
+    content_type as String
+    etag as String
+    is_compressible as Boolean
+
+Type called "ByteRange":
+    start as Integer
+    end as Integer
+
+Type called "SecurityValidation":
+    valid as Boolean
+    reason as String
+
+Type called "FileStats":
+    size as Integer
+    modified_time as Float
+    is_directory as Boolean
+
+Note: File Cache
+Type called "FileCache":
+    cache as Dictionary[String, CachedFile]
+    max_size as Integer
+    current_size as Integer
+    access_times as Dictionary[String, Float]
+
+    Process called "create" that takes config as StaticFileConfig returns FileCache:
+        Return FileCache with:
+            cache as dictionary containing
+            max_size as 100 * 1024 * 1024
+            current_size as 0
+            access_times as dictionary containing
+
+    Process called "get" that takes file_info as FileInfo returns Optional[Framework.HTTPResponse]:
+        Let cache_key be self.generate_cache_key with file_info as file_info
+        
+        If cache_key is in self.cache:
+            Let cached_file be self.cache[cache_key]
+            If cached_file.etag is equal to file_info.etag:
+                Set self.access_times[cache_key] to DateTime.now()
+                Return cached_file.response
+        
+        Return null
+
+    Process called "put" that takes file_info as FileInfo and response as Framework.HTTPResponse returns None:
+        Let cache_key be self.generate_cache_key with file_info as file_info
+        Let file_size be response.body.size()
+        
+        Note: Check if we need to evict items
+        While self.current_size file_size is greater than self.max_size and length of self.cache is greater than 0:
+            self.evict_lru_item()
+        
+        If self.current_size file_size is less than or equal to self.max_size:
+            Set self.cache[cache_key] to CachedFile with:
+                response as response
+                etag as file_info.etag
+                size as file_size
+            
+            Set self.current_size to self.current_size file_size
+            Set self.access_times[cache_key] to DateTime.now()
+
+    Process called "evict_lru_item" returns None:
+        Let oldest_key be null
+        Let oldest_time be DateTime.now()
+        
+        For each key in self.access_times:
+            Let access_time be self.access_times[key]
+            If access_time is less than oldest_time:
+                Set oldest_time to access_time
+                Set oldest_key to key
+        
+        If oldest_key is not null:
+            Let cached_file be self.cache[oldest_key]
+            Set self.current_size to self.current_size - cached_file.size
+            self.cache.remove with key as oldest_key
+            self.access_times.remove with key as oldest_key
+
+    Process called "generate_cache_key" that takes file_info as FileInfo returns String:
+        Return Hash.md5 with data as file_info.path
+
+Type called "CachedFile":
+    response as Framework.HTTPResponse
+    etag as String
+    size as Integer
+
+Note: MIME Type Detection
+Type called "MimeTypeDetector":
+    mime_types as Dictionary[String, String]
+
+    Process called "create" that takes mime_types as Dictionary[String, String] returns MimeTypeDetector:
+        Let default_types be create_default_mime_types()
+        For each extension in mime_types:
+            Set default_types[extension] to mime_types[extension]
+        
+        Return MimeTypeDetector with:
+            mime_types as default_types
+
+    Process called "detect" that takes file_path as String returns String:
+        Let extension be OS.file_extension with path as file_path
+        Return self.mime_types.get with key as extension or "application/octet-stream"
+
+Note: Content Compression
+Type called "ContentCompressor":
+    supported_types as List[String]
+    compression_algorithms as List[String]
+
+    Process called "create" that takes types as List[String] returns ContentCompressor:
+        Return ContentCompressor with:
+            supported_types as types
+            compression_algorithms as list containing "gzip", "deflate", "br"
+
+    Process called "can_compress" that takes content_type as String returns Boolean:
+        For each supported_type in self.supported_types:
+            If content_type contains supported_type:
+                Return true
+        Return false
+
+    Process called "compress" that takes content as ByteArray and request as Framework.HTTPRequest returns CompressionResult:
+        Let accept_encoding be request.headers.get with key as "Accept-Encoding" or ""
+        
+        If accept_encoding contains "br":
+            Return self.compress_brotli with content as content
+        Otherwise If accept_encoding contains "gzip":
+            Return self.compress_gzip with content as content
+        Otherwise If accept_encoding contains "deflate":
+            Return self.compress_deflate with content as content
+        
+        Return CompressionResult with:
+            compressed as false
+            content as content
+            encoding as ""
+
+    Process called "compress_gzip" that takes content as ByteArray returns CompressionResult:
+        Let compressed_content be gzip_compress with data as content
+        Return CompressionResult with:
+            compressed as true
+            content as compressed_content
+            encoding as "gzip"
+
+    Process called "compress_deflate" that takes content as ByteArray returns CompressionResult:
+        Let compressed_content be deflate_compress with data as content
+        Return CompressionResult with:
+            compressed as true
+            content as compressed_content
+            encoding as "deflate"
+
+    Process called "compress_brotli" that takes content as ByteArray returns CompressionResult:
+        Let compressed_content be brotli_compress with data as content
+        Return CompressionResult with:
+            compressed as true
+            content as compressed_content
+            encoding as "br"
+
+Type called "CompressionResult":
+    compressed as Boolean
+    content as ByteArray
+    encoding as String
+
+Note: Rate Limiting for Static Files
+Type called "StaticRateLimiter":
+    config as StaticRateLimitConfig
+    request_counts as Dictionary[String, RequestCounter]
+    bandwidth_usage as Dictionary[String, BandwidthCounter]
+
+    Process called "create" that takes config as StaticRateLimitConfig returns StaticRateLimiter:
+        Return StaticRateLimiter with:
+            config as config
+            request_counts as dictionary containing
+            bandwidth_usage as dictionary containing
+
+    Process called "check_request" that takes request as Framework.HTTPRequest returns RateLimitResult:
+        Let client_key be request.remote_addr
+        Let current_time be DateTime.now()
+        
+        Note: Check request rate limit
+        Let request_result be self.check_request_rate with client_key as client_key and current_time as current_time
+        If not request_result.allowed:
+            Return request_result
+        
+        Note: Check bandwidth limit
+        Let bandwidth_result be self.check_bandwidth_limit with client_key as client_key and current_time as current_time
+        Return bandwidth_result
+
+    Process called "check_request_rate" that takes client_key as String and current_time as Float returns RateLimitResult:
+        If client_key is not in self.request_counts:
+            Set self.request_counts[client_key] to RequestCounter with:
+                count as 1
+                window_start as current_time
+            Return RateLimitResult with allowed as true and reset_time as current_time 60
+
+        Let counter be self.request_counts[client_key]
+        
+        Note: Reset window if needed
+        If current_time - counter.window_start is greater than 60:
+            Set counter.count to 1
+            Set counter.window_start to current_time
+            Return RateLimitResult with allowed as true and reset_time as current_time 60
+
+        Note: Check limit
+        If counter.count is greater than or equal to self.config.requests_per_minute:
+            Return RateLimitResult with allowed as false and reset_time as counter.window_start 60
+
+        Set counter.count to counter.count 1
+        Return RateLimitResult with allowed as true and reset_time as counter.window_start 60
+
+    Process called "check_bandwidth_limit" that takes client_key as String and current_time as Float returns RateLimitResult:
+        If self.config.bandwidth_limit is equal to 0:
+            Return RateLimitResult with allowed as true and reset_time as current_time 60
+
+        Note: Implementation would track bandwidth usage
+        Return RateLimitResult with allowed as true and reset_time as current_time 60
+
+Type called "RequestCounter":
+    count as Integer
+    window_start as Float
+
+Type called "BandwidthCounter":
+    bytes_used as Integer
+    window_start as Float
+
+Type called "RateLimitResult":
+    allowed as Boolean
+    reset_time as Float
+
+Note: Metrics Collection
+Type called "StaticFileMetrics":
+    total_requests as Integer
+    cache_hits as Integer
+    cache_misses as Integer
+    bytes_served as Integer
+    compression_saves as Integer
+
+    Process called "create" returns StaticFileMetrics:
+        Return StaticFileMetrics with:
+            total_requests as 0
+            cache_hits as 0
+            cache_misses as 0
+            bytes_served as 0
+            compression_saves as 0
+
+    Process called "record_cache_hit" returns None:
+        Set self.cache_hits to self.cache_hits 1
+
+    Process called "record_cache_miss" returns None:
+        Set self.cache_misses to self.cache_misses 1
+
+    Process called "record_bytes_served" that takes bytes as Integer returns None:
+        Set self.bytes_served to self.bytes_served bytes
+
+Note: Utility Functions
+Process called "create_static_file_handler" that takes config as StaticFileConfig returns StaticFileHandler:
+    Return StaticFileHandler.create with config as config
+
+Process called "create_default_static_config" that takes root_directory as String returns StaticFileConfig:
+    Return StaticFileConfig with:
+        root_directory as root_directory
+        url_prefix as "/static"
+        index_files as list containing "index.html", "index.htm", "default.html"
+        enable_directory_listing as false
+        enable_caching as true
+        cache_control_header as "public, max-age=3600"
+        max_age as 3600
+        enable_compression as true
+        compression_types as list containing "text/", "application/javascript", "application/json", "application/xml"
+        enable_etag as true
+        enable_last_modified as true
+        enable_range_requests as true
+        mime_types as create_default_mime_types()
+        security_headers as create_default_security_headers()
+        cors_config as create_default_cors_config()
+        rate_limiting as StaticRateLimitConfig with:
+            enabled as false
+            requests_per_minute as 1000
+            burst_size as 100
+            bandwidth_limit as 0
+
+Process called "create_default_mime_types" returns Dictionary[String, String]:
+    Return dictionary with:
+        ".html" as "text/html"
+        ".htm" as "text/html"
+        ".css" as "text/css"
+        ".js" as "application/javascript"
+        ".json" as "application/json"
+        ".xml" as "application/xml"
+        ".png" as "image/png"
+        ".jpg" as "image/jpeg"
+        ".jpeg" as "image/jpeg"
+        ".gif" as "image/gif"
+        ".svg" as "image/svg+xml"
+        ".ico" as "image/x-icon"
+        ".txt" as "text/plain"
+        ".pdf" as "application/pdf"
+        ".zip" as "application/zip"
+        ".mp4" as "video/mp4"
+        ".mp3" as "audio/mpeg"
+        ".woff" as "font/woff"
+        ".woff2" as "font/woff2"
+        ".ttf" as "font/ttf"
+        ".eot" as "application/vnd.ms-fontobject"
+
+Process called "create_default_security_headers" returns Dictionary[String, String]:
+    Return dictionary with:
+        "X-Content-Type-Options" as "nosniff"
+        "X-Frame-Options" as "DENY"
+        "X-XSS-Protection" as "1; mode=block"
+        "Referrer-Policy" as "strict-origin-when-cross-origin"
+
+Process called "create_default_cors_config" returns CORSConfig:
+    Return CORSConfig with:
+        enabled as false
+        allowed_origins as list containing "*"
+        allowed_methods as list containing "GET", "HEAD", "OPTIONS"
+        allowed_headers as list containing "Content-Type"
+        expose_headers as list containing
+        allow_credentials as false
+        max_age as 86400
+
+Process called "parse_integer_safe" that takes str as String returns Optional[Integer]:
+    Try:
+        Return str as Integer
+    Catch error:
+        Return null
+
+Process called "parse_http_date" that takes date_string as String returns Float:
+    Return DateTime.parse_http_date with date_string as date_string
+
+Note: Compression implementations
+Process called "gzip_compress" that takes data as ByteArray returns ByteArray:
+    Note: Basic gzip compression simulation
+    If data.size() is less than 100:
+        Return data
+    Let compressed_size be data.size() divided by 2
+    Return ByteArray.create with size as compressed_size
+
+Process called "deflate_compress" that takes data as ByteArray returns ByteArray:
+    Note: Basic deflate compression simulation
+    If data.size() is less than 50:
+        Return data
+    Let compressed_size be (data.size() multiplied by 7) divided by 10
+    Return ByteArray.create with size as compressed_size
+
+Process called "brotli_compress" that takes data as ByteArray returns ByteArray:
+    Note: Basic brotli compression simulation - typically best compression
+    If data.size() is less than 50:
+        Return data
+    Let compressed_size be data.size() divided by 3
+    Return ByteArray.create with size as compressed_size
+
+Note: Export public APIs
+Export StaticFileHandler
+Export StaticFileConfig
+Export CORSConfig
+Export StaticRateLimitConfig
+Export create_static_file_handler
+Export create_default_static_config
+Export create_default_mime_types
+Export create_default_security_headers

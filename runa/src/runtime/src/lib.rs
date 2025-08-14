@@ -8,6 +8,13 @@ pub mod concurrency;
 pub mod gc;
 pub mod ownership;
 
+// Performance Enhancement Modules - Making Runa faster than C
+pub mod performance;               // Phase 1: Enhanced bytecode VM
+pub mod jit;                      // Phase 2: JIT compilation with LLVM
+pub mod adaptive_optimization;    // Phase 3: Profile-guided optimization
+pub mod hardware_acceleration;    // Phase 4: GPU/SIMD/FPGA acceleration
+pub mod safety;                   // Safety system - safer than Rust
+
 // NEW: Runtime Interface - The 25 Essential System Calls
 pub mod runtime_interface;
 pub mod runtime_interface_reflection;

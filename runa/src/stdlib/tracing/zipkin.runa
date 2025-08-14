@@ -1,0 +1,577 @@
+Note: Zipkin Distributed Tracing Implementation
+Note: Twitter's open-source distributed tracing system implementation
+
+Import "collections" as Collections
+Import "datetime" as DateTime
+Import "concurrent" as Concurrent
+Import "serialization/json" as JSON
+Import "tracing/opentracing" as OpenTracing
+Import "tracing/utils" as Utils
+Import "tracing/http_interface" as HTTP
+
+Note: Zipkin-specific configuration and types
+
+Type called "ZipkinConfig":
+    service_name as String
+    endpoint as String
+    local_endpoint as ZipkinEndpoint
+    sample_rate as Float
+    flush_interval as Integer
+    max_batch_size as Integer
+    timeout as Integer
+    compression as Boolean
+    
+    Process called "default_config" that takes service_name as String returns ZipkinConfig:
+        Return ZipkinConfig with:
+            service_name as service_name
+            endpoint as "http://localhost:9411/api/v2/spans"
+            local_endpoint as ZipkinEndpoint with:
+                service_name as service_name
+                ipv4 as Utils.get_local_ip()
+                port as Utils.get_local_port()
+            sample_rate as 1.0
+            flush_interval as 1000
+            max_batch_size as 100
+            timeout as 10
+            compression as true
+
+Type called "ZipkinEndpoint":
+    service_name as String
+    ipv4 as Optional[String]
+    ipv6 as Optional[String]
+    port as Optional[Integer]
+    
+Type called "ZipkinSpan":
+    trace_id as String
+    parent_id as Optional[String]
+    id as String
+    kind as Optional[String]
+    name as String
+    timestamp as Optional[Integer]
+    duration as Optional[Integer]
+    debug as Optional[Boolean]
+    shared as Optional[Boolean]
+    local_endpoint as Optional[ZipkinEndpoint]
+    remote_endpoint as Optional[ZipkinEndpoint]
+    annotations as List[ZipkinAnnotation]
+    tags as Dictionary[String, String]
+    
+Type called "ZipkinAnnotation":
+    timestamp as Integer
+    value as String
+
+Type SpanKind is:
+    | Client
+    | Server  
+    | Producer
+    | Consumer
+
+Type called "ZipkinTracer":
+    config as ZipkinConfig
+    reporter as ZipkinReporter
+    sampler as ZipkinSampler
+    active_spans as Dictionary[String, ZipkinSpan]
+    metrics as ZipkinMetrics
+    
+    Process called "create_zipkin_tracer" that takes config as ZipkinConfig returns ZipkinTracer:
+        Let reporter be ZipkinReporter.create_from_config with config as config
+        Let sampler be ZipkinSampler with sample_rate as config.sample_rate
+        
+        Return ZipkinTracer with:
+            config as config
+            reporter as reporter
+            sampler as sampler
+            active_spans as dictionary containing
+            metrics as ZipkinMetrics.create()
+    
+    Process called "start_span" that takes operation_name as String returns OpenTracing.SpanBuilder:
+        Return ZipkinSpanBuilder with:
+            tracer as self
+            operation_name as operation_name
+            references as list containing
+            tags as dictionary containing
+            start_time as None
+            ignore_active_span as false
+            span_kind as None
+    
+    Process called "inject" that takes span_context as OpenTracing.SpanContext and format as String and carrier as Any returns None:
+        Match format:
+            When "text_map":
+                carrier["x-trace-id"] = span_context.trace_id
+                carrier["x-span-id"] = span_context.span_id
+                If span_context.sampling_decision:
+                    carrier["x-sampled"] = "1"
+                For each key and value in span_context.baggage:
+                    carrier[f"x-baggage-{key}"] = value
+            When "http_headers":
+                carrier["X-Trace-Id"] = span_context.trace_id
+                carrier["X-Span-Id"] = span_context.span_id
+                If span_context.sampling_decision:
+                    carrier["X-Sampled"] = "1"
+                For each key and value in span_context.baggage:
+                    carrier[f"X-Baggage-{key}"] = value
+            When "b3":
+                carrier["X-B3-TraceId"] = span_context.trace_id
+                carrier["X-B3-SpanId"] = span_context.span_id
+                If span_context.sampling_decision:
+                    carrier["X-B3-Sampled"] = "1"
+    
+    Process called "extract" that takes format as String and carrier as Any returns Optional[OpenTracing.SpanContext]:
+        Try:
+            Match format:
+                When "text_map":
+                    Return extract_from_text_map with carrier as carrier
+                When "http_headers":
+                    Return extract_from_http_headers with carrier as carrier
+                When "b3":
+                    Return extract_from_b3_headers with carrier as carrier
+            Return None
+        Catch extraction_error:
+            Return None
+    
+    Process called "report_span" that takes span as ZipkinSpan returns None:
+        self.reporter.report_span with span as span
+        self.metrics.increment_spans_finished()
+    
+    Process called "close" returns None:
+        self.reporter.close()
+
+Type called "ZipkinSpanBuilder":
+    tracer as ZipkinTracer
+    operation_name as String
+    references as List[OpenTracing.SpanReference]
+    tags as Dictionary[String, Any]
+    start_time as Optional[DateTime]
+    ignore_active_span as Boolean
+    span_kind as Optional[SpanKind]
+    
+    Process called "with_span_kind" that takes kind as SpanKind returns ZipkinSpanBuilder:
+        Set self.span_kind to Some with value as kind
+        Return self
+    
+    Process called "start" returns OpenTracing.Span:
+        Let actual_start_time be if self.start_time is not None:
+            self.start_time  Note: Get the value from the Optional
+        Otherwise:
+            DateTime.now()
+        
+        Note: Determine parent context and sampling decision
+        Let parent_context be determine_parent_context with references as self.references
+        Let sampling_decision be self.tracer.sampler.should_sample()
+        
+        Let span_context be create_zipkin_span_context with:
+            parent_context as parent_context
+            sampling_decision as sampling_decision
+        
+        Let zipkin_span be ZipkinSpan with:
+            trace_id as span_context.trace_id
+            parent_id as get_parent_span_id_from_context with context as parent_context
+            id as span_context.span_id
+            kind as convert_span_kind_to_string with kind as self.span_kind
+            name as self.operation_name
+            timestamp as Some with value as Utils.datetime_to_microseconds with time as actual_start_time
+            duration as None
+            debug as None
+            shared as None
+            local_endpoint as Some with value as self.tracer.config.local_endpoint
+            remote_endpoint as None
+            annotations as list containing
+            tags as convert_tags_to_zipkin with tags as self.tags
+        
+        Let span be create_opentracing_span_for_zipkin with:
+            zipkin_span as zipkin_span
+            tracer as self.tracer
+            context as span_context
+        
+        Return span
+
+Type called "ZipkinReporter":
+    config as ZipkinConfig
+    transport as ZipkinTransport
+    batch as List[ZipkinSpan]
+    metrics as ZipkinMetrics
+    flush_timer as Optional[Timer]
+    
+    Process called "create_from_config" that takes config as ZipkinConfig returns ZipkinReporter:
+        Let transport be ZipkinTransport.create_from_config with config as config
+        
+        Return ZipkinReporter with:
+            config as config
+            transport as transport
+            batch as list containing
+            metrics as ZipkinMetrics.create()
+            flush_timer as None
+    
+    Process called "report_span" that takes span as ZipkinSpan returns None:
+        Add span to self.batch
+        
+        If length of self.batch is greater than or equal to self.config.max_batch_size:
+            self.flush()
+    
+    Process called "flush" returns None:
+        If length of self.batch is greater than 0:
+            Try:
+                self.transport.send_spans with spans as self.batch
+                self.metrics.increment_spans_sent with count as length of self.batch
+                Set self.batch to list containing
+            Catch transport_error:
+                self.metrics.increment_spans_dropped with count as length of self.batch
+                Set self.batch to list containing
+    
+    Process called "close" returns None:
+        self.flush()
+        self.transport.close()
+
+Type called "ZipkinTransport":
+    endpoint as String
+    timeout as Integer
+    compression as Boolean
+    http_client as Optional[HTTP.SimpleHTTPClient]
+    pending_spans as List[ZipkinSpan]
+    connection_pool as Optional[Any]
+    
+    Process called "create_from_config" that takes config as ZipkinConfig returns ZipkinTransport:
+        Let http_client be HTTP.create_client()
+        Return ZipkinTransport with:
+            endpoint as config.endpoint
+            timeout as config.timeout
+            compression as config.compression
+            http_client as Some with value as http_client
+            pending_spans as list containing
+            connection_pool as None
+    
+    Process called "send_spans" that takes spans as List[ZipkinSpan] returns None:
+        Let json_data be serialize_zipkin_spans with spans as spans
+        
+        Let headers be dictionary with:
+            "Content-Type" as "application/json"
+            "User-Agent" as "runa-zipkin-client/1.0"
+        
+        Let data be if self.compression:
+            Utils.compress_data with data as json_data
+        Otherwise:
+            json_data
+        If self.compression:
+            Set headers["Content-Encoding"] to "gzip"
+        
+        Let response be HTTP.post with:
+            url as self.endpoint
+            data as data
+            headers as headers
+            timeout as self.timeout
+        
+        If response.status_code is not equal to 202:
+            Throw ZipkinTransportError with:
+                message as f"Failed to send spans: HTTP {response.status_code}"
+                status_code as response.status_code
+    
+    Process called "close" returns None:
+        Note: Close HTTP connections and clean up resources
+        Try:
+            Note: Flush any pending spans before closing
+            If length of self.pending_spans is greater than 0:
+                self.flush_pending_spans()
+            
+            Note: Close HTTP client if it exists
+            If self.http_client is not None:
+                self.http_client.close()
+                Set self.http_client to None
+            
+            Note: Clear any cached data
+            Set self.pending_spans to list containing
+            Set self.connection_pool to None
+        Catch cleanup_error:
+            Note: Log error but don't fail the close operation
+            Display "Warning: Error during transport cleanup: " with message cleanup_error.message
+    
+    Process called "flush_pending_spans" returns None:
+        For each span in self.pending_spans:
+            Try:
+                self.send_spans with spans as list containing span
+            Catch send_error:
+                Display "Warning: Failed to send pending span: " with message send_error.message
+        Set self.pending_spans to list containing
+
+Type called "ZipkinSampler":
+    sample_rate as Float
+    
+    Process called "should_sample" returns Boolean:
+        If self.sample_rate is greater than or equal to 1.0:
+            Return true
+        If self.sample_rate is less than or equal to 0.0:
+            Return false
+        Return Utils.random_float() is less than self.sample_rate
+
+Type called "ZipkinMetrics":
+    spans_started as Integer
+    spans_finished as Integer
+    spans_sent as Integer
+    spans_dropped as Integer
+    
+    Process called "create" returns ZipkinMetrics:
+        Return ZipkinMetrics with:
+            spans_started as 0
+            spans_finished as 0
+            spans_sent as 0
+            spans_dropped as 0
+    
+    Process called "increment_spans_started" returns None:
+        Set self.spans_started to self.spans_started 1
+    
+    Process called "increment_spans_finished" returns None:
+        Set self.spans_finished to self.spans_finished 1
+    
+    Process called "increment_spans_sent" that takes count as Integer returns None:
+        Set self.spans_sent to self.spans_sent count
+    
+    Process called "increment_spans_dropped" that takes count as Integer returns None:
+        Set self.spans_dropped to self.spans_dropped count
+    
+    Process called "get_metrics" returns Dictionary[String, Integer]:
+        Return dictionary with:
+            "spans_started" as self.spans_started
+            "spans_finished" as self.spans_finished
+            "spans_sent" as self.spans_sent
+            "spans_dropped" as self.spans_dropped
+
+Note: Zipkin-specific utility functions
+
+Process called "extract_from_b3_headers" that takes carrier as Dictionary[String, String] returns Optional[OpenTracing.SpanContext]:
+    If "X-B3-TraceId" is in carrier and "X-B3-SpanId" is in carrier:
+        Let sampling_decision be "X-B3-Sampled" is in carrier and carrier["X-B3-Sampled"] is equal to "1"
+        
+        Return Some with value as OpenTracing.SpanContext with:
+            trace_id as carrier["X-B3-TraceId"]
+            span_id as carrier["X-B3-SpanId"]
+            baggage as dictionary containing
+            sampling_decision as sampling_decision
+    Return None
+
+Process called "extract_from_text_map" that takes carrier as Dictionary[String, String] returns Optional[OpenTracing.SpanContext]:
+    If "x-trace-id" is in carrier and "x-span-id" is in carrier:
+        Let sampling_decision be "x-sampled" is in carrier and carrier["x-sampled"] is equal to "1"
+        Let baggage be dictionary containing
+        
+        For each key and value in carrier:
+            If key starts with "x-baggage-":
+                Let baggage_key be key.substring with start as 10
+                Set baggage[baggage_key] to value
+        
+        Return Some with value as OpenTracing.SpanContext with:
+            trace_id as carrier["x-trace-id"]
+            span_id as carrier["x-span-id"]
+            baggage as baggage
+            sampling_decision as sampling_decision
+    Return None
+
+Process called "extract_from_http_headers" that takes carrier as Dictionary[String, String] returns Optional[OpenTracing.SpanContext]:
+    If "X-Trace-Id" is in carrier and "X-Span-Id" is in carrier:
+        Let sampling_decision be "X-Sampled" is in carrier and carrier["X-Sampled"] is equal to "1"
+        Let baggage be dictionary containing
+        
+        For each key and value in carrier:
+            If key starts with "X-Baggage-":
+                Let baggage_key be key.substring with start as 10
+                Set baggage[baggage_key] to value
+        
+        Return Some with value as OpenTracing.SpanContext with:
+            trace_id as carrier["X-Trace-Id"]
+            span_id as carrier["X-Span-Id"]
+            baggage as baggage
+            sampling_decision as sampling_decision
+    Return None
+
+Process called "serialize_zipkin_spans" that takes spans as List[ZipkinSpan] returns String:
+    Let serialized_spans be list containing
+    For each span in spans:
+        Add serialize_zipkin_span with span as span to serialized_spans
+    Return JSON.encode with data as serialized_spans
+
+Process called "serialize_zipkin_span" that takes span as ZipkinSpan returns Dictionary[String, Any]:
+    Let span_data be dictionary with:
+        "traceId" as span.trace_id
+        "id" as span.id
+        "name" as span.name
+    
+    If span.parent_id is not None:
+        Set span_data["parentId"] to span.parent_id
+    
+    If span.kind is not None:
+        Set span_data["kind"] to span.kind
+    
+    If span.timestamp is not None:
+        Set span_data["timestamp"] to span.timestamp
+    
+    If span.duration is not None:
+        Set span_data["duration"] to span.duration
+    
+    If span.debug is not None:
+        Set span_data["debug"] to span.debug
+    
+    If span.shared is not None:
+        Set span_data["shared"] to span.shared
+    
+    If span.local_endpoint is not None:
+        Set span_data["localEndpoint"] to serialize_zipkin_endpoint with endpoint as span.local_endpoint
+    
+    If span.remote_endpoint is not None:
+        Set span_data["remoteEndpoint"] to serialize_zipkin_endpoint with endpoint as span.remote_endpoint
+    
+    If length of span.annotations is greater than 0:
+        Set span_data["annotations"] to serialize_zipkin_annotations with annotations as span.annotations
+    
+    If length of span.tags is greater than 0:
+        Set span_data["tags"] to span.tags
+    
+    Return span_data
+
+Process called "serialize_zipkin_endpoint" that takes endpoint as ZipkinEndpoint returns Dictionary[String, Any]:
+    Let endpoint_data be dictionary with:
+        "serviceName" as endpoint.service_name
+    
+    If endpoint.ipv4 is not None:
+        Set endpoint_data["ipv4"] to endpoint.ipv4
+    
+    If endpoint.ipv6 is not None:
+        Set endpoint_data["ipv6"] to endpoint.ipv6
+    
+    If endpoint.port is not None:
+        Set endpoint_data["port"] to endpoint.port
+    
+    Return endpoint_data
+
+Process called "serialize_zipkin_annotations" that takes annotations as List[ZipkinAnnotation] returns List[Dictionary[String, Any]]:
+    Let serialized_annotations be list containing
+    For each annotation in annotations:
+        Add dictionary with:
+            "timestamp" as annotation.timestamp
+            "value" as annotation.value
+        to serialized_annotations
+    Return serialized_annotations
+
+Process called "convert_tags_to_zipkin" that takes tags as Dictionary[String, Any] returns Dictionary[String, String]:
+    Let zipkin_tags be dictionary containing
+    For each key and value in tags:
+        Set zipkin_tags[key] to convert_value_to_string with value as value
+    Return zipkin_tags
+
+Process called "convert_value_to_string" that takes value as Any returns String:
+    If value is of type String:
+        Return value
+    If value is of type Integer:
+        Return Utils.integer_to_string with value as value
+    If value is of type Float:
+        Return Utils.float_to_string with value as value
+    If value is of type Boolean:
+        Return if value:
+            "true"
+        Otherwise:
+            "false"
+    Return "unknown"
+
+Process called "convert_span_kind_to_string" that takes kind as Optional[SpanKind] returns Optional[String]:
+    If kind is None:
+        Return None
+    
+    Let kind_value be kind
+    Let kind_string be match kind_value:
+        When Client:
+            "CLIENT"
+        When Server:
+            "SERVER"
+        When Producer:
+            "PRODUCER"
+        When Consumer:
+            "CONSUMER"
+    
+    Return Some with value as kind_string
+
+Process called "Utils.datetime_to_microseconds" that takes time as DateTime returns Integer:
+    Note: Convert datetime to microseconds since Unix epoch
+    Return time.timestamp() multiplied by 1000000
+
+Process called "get_local_ip" returns String:
+    Note: Get local IP address - simplified implementation
+    Return "127.0.0.1"
+
+Process called "get_local_port" returns Integer:
+    Note: Get local port - simplified implementation
+    Return 8080
+
+Process called "random_float" returns Float:
+    Note: Generate random float between 0.0 and 1.0
+    Return random_integer with min as 0 and max as 1000000 divided by 1000000.0
+
+Process called "Utils.compress_data" that takes data as String returns String:
+    Note: Simple compression implementation - in practice would use gzip
+    Return data
+
+Note: High-level convenience functions
+
+Process called "init_zipkin_tracer" that takes service_name as String returns OpenTracing.Tracer:
+    Let config be ZipkinConfig.default_config with service_name as service_name
+    Return init_zipkin_tracer_with_config with config as config
+
+Process called "init_zipkin_tracer_with_config" that takes config as ZipkinConfig returns OpenTracing.Tracer:
+    Let zipkin_tracer be ZipkinTracer.create_zipkin_tracer with config as config
+    
+    Note: Set as global tracer
+    OpenTracing.set_global_tracer with tracer as zipkin_tracer
+    
+    Return zipkin_tracer
+
+Process called "create_zipkin_config" that takes service_name as String returns ZipkinConfig:
+    Return ZipkinConfig.default_config with service_name as service_name
+
+Process called "with_zipkin_tracing" that takes service_name as String and func as Function returns Any:
+    Let tracer be init_zipkin_tracer with service_name as service_name
+    Try:
+        Return func()
+    Finally:
+        tracer.close()
+
+Process called "trace_zipkin_span" that takes operation_name as String and span_kind as SpanKind and func as Function returns Any:
+    Let tracer be OpenTracing.global_tracer()
+    Let builder be tracer.start_span with operation_name as operation_name
+    
+    If tracer is of type ZipkinTracer:
+        Set builder to builder.with_span_kind with kind as span_kind
+    
+    Let span be builder.start()
+    Try:
+        Return func()
+    Catch span_error:
+        span.set_tag with key as "error" and value as true
+        span.log with message as f"Error: {span_error.message}"
+        Throw span_error
+    Finally:
+        span.finish()
+
+Note: Error types
+
+Type called "ZipkinTransportError":
+    message as String
+    status_code as Integer
+
+Type called "ZipkinConfigError":
+    message as String
+
+Note: Export all public types and functions
+Export ZipkinConfig
+Export ZipkinEndpoint
+Export ZipkinSpan
+Export ZipkinAnnotation
+Export SpanKind
+Export ZipkinTracer
+Export ZipkinSpanBuilder
+Export ZipkinReporter
+Export ZipkinTransport
+Export ZipkinSampler
+Export ZipkinMetrics
+Export ZipkinTransportError
+Export ZipkinConfigError
+Export init_zipkin_tracer
+Export init_zipkin_tracer_with_config
+Export create_zipkin_config
+Export with_zipkin_tracing
+Export trace_zipkin_span

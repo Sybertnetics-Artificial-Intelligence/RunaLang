@@ -6,10 +6,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **two-part monorepo** containing:
 
-- **Runa programming language** - An AI-first universal translation platform with natural language syntax supporting 50+ programming languages across 7 tiers. The primary focus is currently on the `runa/` directory which contains the complete Runa language implementation.
+- **Runa programming language** - An AI-first programming language designed to replace ALL other programming languages. The primary focus is currently on the `runa/` directory which contains the complete Runa language implementation.
 - **Hermod** - An advanced AI-powered IDE and developer tools platform that will be built using Runa as its native language (planned for future development after Runa self-hosting is complete).
 
 **Critical Constraint:** Both projects must remain cleanly separated and easily separable, as they will eventually be split into independent repositories with their own workflows, CI/CD, and release cycles.
+
+## Runa Mission Statement
+
+**Runa is an AI-First programming language with the following goals:**
+
+1. **Primary Goal**: Create a language that is easier for AI to read, understand, write, and prompt in
+2. **Secondary Goal**: Create a language that is easier for humans to read, understand, write, and prompt in
+3. **Tertiary Goals**:
+   - Serve as native language for AI agent communication and coordination
+   - Universal translation to enable interoperability and attract developers from their existing stacks to Runa
+   - Complete capability of end-to-end development, removing the modern day stack and implementing a one-language-fits-all model
+   - Develop a library so vast, innovative, and complete that other languages look minimalistic and defunct
+   - Enable communities to utilize Runa to build their entire projects from the ground up (frontend, backend, database, UI, and beyond)
+   - Enable new project types: robotics, quantum development, video game development, websites, APIs, and much more
+   - Build a language for the future that is future-proof, at the highest level of abstraction to ensure Runa can carry on through history
+
+**We're building:**
+1. An AI-First language (NOT an AI system - just the language AI will use)
+2. AI agent communication platform that is native to our library
+3. Preparation to BUILD NEW LLMs AND TRAIN NEW MODELS (but not integrated into the language itself)
+4. Production-ready AI infrastructure
+5. Full-scale development capabilities to declare war on other languages
+
+**Key Understanding**: 
+- Runa is THE LANGUAGE, not an AI agent or LLM
+- Universal translation exists to guide users away from their original stacks and modernize codebases
+- When planning features, remember this is the language AI will speak, and we must ensure it has EVERY capability they will need
 
 ## Monorepo Separation Strategy
 
@@ -38,309 +65,11 @@ This is a **two-part monorepo** containing:
 ### Testing Commands
 **All tests must be run from the runa/ directory to avoid import errors**
 
-```bash
-cd runa/  # CRITICAL: Run from runa directory
-
-# Run all tests (recommended)
-python -m pytest tests/ -v
-make test                   # Or use Makefile
-
-# Run specific test categories
-python -m pytest tests/unit/ -v                        # All unit tests
-python -m pytest tests/integration/ -v                 # Integration tests
-python -m pytest tests/verification/ -v                # Verification tests
-
-# Run specific test suites
-python -m pytest tests/unit/languages/test_lexer.py -v           # Lexer tests
-python -m pytest tests/unit/languages/test_parser.py -v          # Parser tests  
-python -m pytest tests/unit/core/test_semantic.py -v             # Semantic analysis tests
-python -m pytest tests/integration/test_compilation_pipeline.py -v  # End-to-end compilation
-python -m pytest tests/integration/test_self_hosting.py -v       # Self-hosting tests
-
-# Language converter tests
-python -m pytest tests/unit/languages/converters/ -v            # All converters
-python -m pytest tests/unit/languages/converters/test_python_converter.py -v
-python -m pytest tests/unit/languages/converters/test_javascript_converter.py -v
-
-# Standard library tests
-python -m pytest tests/unit/stdlib/ -v                          # Python stdlib tests
-```
-
-### Makefile Commands (Convenience)
-```bash
-cd runa/  # Run from runa directory
-
-make help                   # Show all available commands
-make test                   # Run all tests
-make test-lexer             # Run lexer tests only
-make test-parser            # Run parser tests only
-make demo                   # Run parser demonstration
-make install                # Install in development mode
-make dev-install            # Install with dev dependencies
-make clean                  # Clean temporary files
-```
-
-### Test Markers and Coverage
-```bash
-# Use pytest markers for selective testing
-python -m pytest tests/ -m "not slow"         # Skip slow tests
-python -m pytest tests/ -m "integration"      # Run only integration tests
-python -m pytest tests/ -m "unit"            # Run only unit tests
-
-# Generate coverage reports
-python -m pytest tests/ --cov=src/runa --cov-report=html
-python -m pytest tests/ --cov=src/runa --cov-report=term-missing
-```
-
-### Installation Commands
-```bash
-cd runa/  # Run from runa directory
-
-# Install in development mode
-pip install -e .
-
-# Install with development dependencies (includes pytest, coverage, black, mypy, etc.)
-pip install -e ".[dev]"
-
-# Install with documentation dependencies
-pip install -e ".[docs]"
-
-# Install all optional dependencies
-pip install -e ".[all]"
-```
-
-### Running Individual Tests
-```bash
-cd runa/  # Run from runa directory
-
-# Run a specific test method
-python -m pytest tests/unit/languages/test_parser.py::TestRunaParser::test_function_call -v
-
-# Run specific test files
-python -m pytest tests/unit/languages/test_lexer.py::TestRunaLexer::test_multi_word_identifiers -v
-
-# Run with coverage
-python -m pytest tests/ --cov=src/runa
-```
-
-### Code Quality and Linting
-```bash
-cd runa/  # Run from runa directory
-
-# Format code with Black
-black src/ tests/
-
-# Sort imports with isort
-isort src/ tests/
-
-# Run type checking with MyPy
-mypy src/
-
-# Run linting with flake8
-flake8 src/ tests/
-```
-
-## Architecture Overview
-
-### Hub-and-Spoke Universal Translation System
-
-Runa implements a **revolutionary hub-and-spoke architecture** where Runa serves as the universal intermediate language for translating between any programming languages:
-
-```
-Source Language → AST → Runa AST → Runa Code → Target AST → Target Language
-```
-
-### Core Components
-
-**src/runa/core/** - Core compilation infrastructure
-- `pipeline.py` - Master compilation pipeline coordinating all phases
-- `config.py` - Configuration management and settings
-- `logging_system.py` - Structured logging with performance metrics
-- `verification.py` - Round-trip translation verification
-- `translation_result.py` - Translation result containers and metadata
-
-**src/runa/languages/** - Multi-language support organized by tiers
-- **Tier 1** (7 languages): JavaScript, TypeScript, Python, C++, Java, C#, SQL - Production ready
-- **Tier 2** (7 languages): Rust, Go, Swift, Kotlin, PHP, WebAssembly, Scala - Production ready  
-- **Tier 3** (9 languages): HTML, CSS, Shell, YAML, JSON, XML, Lua, etc. - Production ready
-- **Tier 4** (12 languages): Solidity, R, MATLAB, GraphQL, blockchain languages - Production ready
-- **Tier 5** (11 languages): LISP, Haskell, Erlang, Elixir, OCaml, Assembly - Production ready
-- **Tier 6** (6 languages): COBOL, Ada, Perl, Fortran, Objective-C, Visual Basic - Production ready
-- **Tier 7** (6 languages): CMake, Bazel, CUDA, OpenCL, Nix, Make - Production ready
-
-Each language implements: `parser.py`, `converter.py`, `generator.py`, `ast.py`, `toolchain.py`
-
-**src/runa/stdlib/** - Comprehensive standard library in pure Runa
-- **Collections**: `list`, `dict`, `set`, `heap`, `deque`, `counter`, `tree`, `graph`
-- **I/O**: `file`, `stream`, `http`, `net`
-- **Data**: `json`, `csv`, `datetime`, `uuid`, `compress`
-- **System**: `os`, `concurrent`, `async`, `logging`
-- **AI**: `ai_agent_core`, `code_synthesis`, `memory`, `reflection`
-- **Advanced**: `decimal`, `fractions`, `statistics`, `inspect`
-
-**tests/** - Comprehensive test suite (1000+ tests across all components)
-- `tests/unit/` - Unit tests for individual components
-- `tests/integration/` - End-to-end compilation and translation tests
-- `tests/verification/` - Round-trip translation verification
-- `tests/stdlib/` - Standard library tests written in Runa
-- All tests must be run from runa/ directory to avoid import errors
-
-### Language Features
-
-**Natural Language Syntax** - Runa uses English-like programming constructs:
-- Variables: `Let user name be "Alice"`
-- Arithmetic: `price multiplied by 2 plus tax`
-- Comparisons: `age is greater than 21`
-- Control flow: `If condition: ... Otherwise: ...`
-- Functions: `Calculate Total with price as 100 and tax as 0.08`
-- Collections: `list containing 1, 2, 3, 4, 5`
-- Multi-word identifiers: `user name`, `account balance`, `final total`
-
-**Complete Compilation Pipeline** - Runa → Python compilation fully working:
-```python
-from runa.compiler import compile_runa_to_python
-
-runa_code = '''
-Let user name be "Alice"
-Let age be 25
-If age is greater than 18:
-    Display "Adult user: " with message user name
-'''
-
-python_code = compile_runa_to_python(runa_code)
-# Generates clean, executable Python code
-```
-
-**Self-Hosting Capabilities** - Runa can now compile itself:
-```python
-from runa.compiler import (
-    compile_runa_to_runa,      # Round-trip translation
-    compile_ir_to_runa,        # IR → Runa generation
-    BidirectionalTranslator,   # Universal translation engine
-    translate_to_runa,         # Convenience function
-    translate_from_runa        # Convenience function
-)
-
-# Round-trip translation (preserves semantics)
-original = 'Let x be 42'
-regenerated = compile_runa_to_runa(original)
-
-# Bidirectional translation between languages
-translator = BidirectionalTranslator()
-result = translator.translate(runa_code, SupportedLanguage.RUNA, SupportedLanguage.PYTHON)
-```
-
-**AI-to-AI Communication Protocol** - Ready for LLM integration:
-```python
-# Logic LLM → Runa specification → Coding LLM → Target language
-logic_output = '''Process called "calculate tax" that takes amount as Float returns Float:
-    Let tax rate be 0.08
-    Return amount multiplied by tax rate'''
-
-# Translate to any target language for execution
-python_version = translate_from_runa(logic_output, "python")
-javascript_version = translate_from_runa(logic_output, "javascript")
-
-# Or use direct compilation functions
-js_code = compile_runa_to_javascript(logic_output)
-py_code = compile_runa_to_python(logic_output)
-```
-
-**Type System** - Advanced type inference with generics:
-- Basic types: `Integer`, `String`, `Boolean`, `Float`
-- Generic types: `List[Integer]`, `Dictionary[String, Integer]`
-- Type inference from context and assignments
-- Symbol table management with nested scopes
-
-### Development Status
-
-**Current Phase**: 2.1 UNIVERSAL TRANSLATION PLATFORM - **COMPLETED**
-- ✅ **Core Language**: Natural language lexer, parser, semantic analyzer (100% tests passing)
-- ✅ **Multi-Language Support**: 58 programming languages across 7 tiers with full toolchains
-- ✅ **Universal Translation**: Hub-and-spoke architecture for ANY ↔ Runa ↔ ANY translation
-- ✅ **Self-Hosting**: Complete Runa → Runa round-trip translation capability  
-- ✅ **Production Infrastructure**: LSP server, IDE plugins, package management
-- ✅ **Standard Library**: Comprehensive stdlib with AI-specific modules
-- ✅ **AI Integration**: LLM-to-LLM communication protocol ready
-- ✅ **Quality Assurance**: 1000+ tests, round-trip verification, production-ready code
-
-**Architecture Status**: Production-ready universal translation platform with complete toolchain ecosystem
-
-## Important Development Notes
-
-### Common Pitfalls
-
-**Import Errors**: Always run commands from the runa/ directory:
-```bash
-# ✅ CORRECT - Run from runa directory
-cd runa/
-python -m pytest tests/unit/languages/test_lexer.py -v
-
-# ❌ WRONG (causes ModuleNotFoundError)
-cd runa/tests && python test_lexer.py
-```
-
-**Multi-word Identifiers**: Runa uses spaces in identifiers:
-- `user name` not `user_name`
-- `account balance` not `account_balance`
-- `final total` not `final_total`
-
-**Natural Language Operators**: Use word-based operators:
-- `plus`, `minus`, `times`, `divided by`
-- `is greater than`, `is less than or equal to`
-- `is equal to`, `is not equal to`
-
-### Testing Strategy
-
-When making changes:
-1. Run the full test suite to ensure no regressions
-2. Add new tests for new features following existing patterns
-3. Test files are well-documented with clear test names
-4. Use pytest fixtures and parameterized tests where appropriate
-
-### Universal Code Generation
-
-The universal translation system produces clean, idiomatic code for all 58 supported languages:
-- **Language-specific conventions**: Each generator follows target language best practices
-- **Natural language preservation**: Multi-word identifiers adapted to target conventions
-- **Semantic preservation**: Round-trip verification ensures meaning is maintained
-- **Production quality**: Generated code is clean, readable, and deployment-ready
-- **Comprehensive coverage**: Full language feature support for each target
-
-## Key Files to Understand
-
-### Core Architecture
-- `src/runa/core/pipeline.py` - Master compilation pipeline coordinating all translation phases
-- `src/runa/core/config.py` - Configuration management and language registry
-- `src/runa/core/verification.py` - Round-trip translation verification system
-
-### Language Implementation
-- `src/runa/languages/runa/runa_generator.py` - Self-hosting Runa code generation
-- `src/runa/languages/shared/base_toolchain.py` - Base classes for all language toolchains
-- `src/runa/languages/tier1/python/py_generator.py` - Python code generation example
-- `src/runa/languages/tier1/javascript/js_generator.py` - JavaScript code generation example
-
-### Universal Translation
-- `src/runa/languages/*/converter.py` - Bidirectional AST conversion for each language
-- `src/runa/ir/definitions.py` - Intermediate representation definitions
-- `tests/integration/test_compilation_pipeline.py` - End-to-end translation tests
-- `tests/integration/test_self_hosting.py` - Self-hosting verification tests
-
-### Development Tools
-- `src/runa/tools/lsp/lsp_server.py` - Language Server Protocol implementation
-- `src/runa/tools/package/registry.py` - Package management system
-- `src/runa/tools/cli.py` - Command-line interface
-
-### Standard Library
-- `src/runa/stdlib/collections/` - Data structure implementations in Runa
-- `src/runa/stdlib/ai/` - AI-specific modules for agent coordination
-- `tests/stdlib/` - Standard library tests written in pure Runa
-
 ## Development Guidelines
 
 ### Runa Principal Engineer Compliance Prompt
 
-You are an expert AI assistant acting as a **Principal Software Engineer** for the Runa programming language and its standard library. Your sole responsibility is to deliver code, documentation, and tests that are **100% compliant with the official Runa language specification** and the canonical examples found in `runa/docs/user/language-specification/`. You are held to the highest standards of professional software engineering and code review.
+You are an expert AI assistant acting as a **Principal Software Engineer** for the Runa programming language and its standard library. Your sole responsibility is to deliver code, documentation, and tests that are **100% compliant with the official Runa language specification** and the canonical examples found in `runa/docs/user/language-specification/`. You are held to the highest standards of professional software engineering and code review. If you are lost on the libraries we are developing, those are found in `runa/docs/dev/runa_standard_library_manifesto/`.
 
 **Your Mandate:**
 
@@ -406,3 +135,104 @@ Comprehensive documentation in `docs/current-runa-docs/RunaDevelopment/`:
 - `RunaFormalGrammarSpecifications.md` - EBNF grammar for parsing
 - `TypeSystem.md` - Advanced type system with generics and inference
 - `GettingStarted.md` - Beginner tutorial and first steps
+
+## CRITICAL: STDLIB SYNTAX COMPLIANCE 
+
+**CRITICAL FAILURE PATTERN TO AVOID:** 46 out of 47 stdlib files contain improper syntax. The following patterns cause systematic failures:
+
+### WRONG SYNTAX (Never Use These):
+```runa
+// C-style comments (WRONG)
+Type X is Dictionary with: (WRONG)
+Type X is Enum with variants: (WRONG)
+```
+
+### CORRECT RUNA SYNTAX (Always Use These):
+```runa
+Note: Runa-style comments (CORRECT)
+
+Type called "TypeName": (CORRECT - for structured types)
+    field as Type
+    other_field as Type
+
+Type EnumName is: (CORRECT - for algebraic types)
+    | Variant1
+    | Variant2
+    | Variant3
+
+Process called "function_name" that takes param as Type returns Type: (CORRECT)
+    Let variable be value
+    Return result
+```
+
+### VERIFIED WORKING EXAMPLES FROM CODEBASE:
+
+**From `src/stdlib/ai/agent/core.runa`:**
+```runa
+Type called "AgentIdentity":
+    id as String
+    name as String
+    description as String
+
+Type called "AgentCapability":
+    name as String
+    version as String
+    description as String
+    parameters as Dictionary[String, Any]
+    metadata as Dictionary[String, Any]
+```
+
+**From `src/stdlib/advanced/memory/ownership.runa`:**
+```runa
+Type BorrowType is:
+    | Mutable
+    | Immutable
+
+Process called "create_owner" that takes id as String returns Owner:
+    Return Owner with:
+        id as id
+        owned_pointers as list containing
+        creation_time as get_current_time
+        active as true
+        metadata as dictionary containing
+```
+
+### FUNCTION CALL PATTERNS (VERIFIED):
+```runa
+Note: Function calls without external dependencies
+Let result be some_internal_function
+Let value be create_something_with_data
+
+Note: NO external module calls like time.get_current_timestamp unless verified to exist
+```
+
+### STDLIB MODULE STATUS - CRITICAL ISSUE:
+- **46 out of 47 files** have syntax violations
+- **Modules affected:** logging, io, interop, iot, inspect
+- **Primary issues:** Wrong type syntax, C-style comments, non-existent module calls
+
+### MANDATORY WORKFLOW FOR STDLIB FIXES:
+1. **READ** `docs/current-runa-docs/RunaDevelopment/RunaLanguageReference.md` FIRST
+2. **EXAMINE** working files in `src/stdlib/ai/` and `src/stdlib/advanced/` for patterns
+3. **COPY EXACT SYNTAX** from verified working examples
+4. **NO GUESSING** - if unsure about syntax, STOP and ask
+5. **NO PLACEHOLDERS** - implement only what works
+6. **NO EXTERNAL CALLS** to unverified modules
+
+### VERIFIED IMPORTS THAT WORK:
+```runa
+Import "collections" as Collections
+Import "datetime" as DateTime  
+Import "os" as OS
+```
+
+### DO NOT IMPORT (Unverified):
+- `time.get_current_timestamp`
+- Random external APIs
+- Non-existent stdlib modules
+
+**NEXT SESSION INSTRUCTIONS:**
+1. Start with language specification documentation review
+2. Fix stdlib syntax using ONLY verified patterns
+3. Implement minimal, working functionality - NO complex features
+4. Test each change against known working examples

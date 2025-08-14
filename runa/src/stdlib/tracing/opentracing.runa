@@ -1,0 +1,431 @@
+Note: OpenTracing Standard Implementation for Distributed Tracing
+Note: Provides vendor-neutral APIs for distributed tracing across microservices
+
+Import "collections" as Collections
+Import "datetime" as DateTime
+Import "concurrent" as Concurrent
+Import "tracing/utils" as Utils
+
+Note: Core tracing types and interfaces
+
+Type called "SpanContext":
+    trace_id as String
+    span_id as String
+    baggage as Dictionary[String, String]
+    sampling_decision as Boolean
+    
+    Process called "get_trace_id" returns String:
+        Return self.trace_id
+    
+    Process called "get_span_id" returns String:
+        Return self.span_id
+    
+    Process called "get_baggage_item" that takes key as String returns Optional[String]:
+        If key is in self.baggage:
+            Return Some with value as self.baggage[key]
+        Return None
+    
+    Process called "with_baggage_item" that takes key as String and value as String returns SpanContext:
+        Let new_baggage be self.baggage.clone()
+        Set new_baggage[key] to value
+        Return SpanContext with:
+            trace_id as self.trace_id
+            span_id as self.span_id
+            baggage as new_baggage
+            sampling_decision as self.sampling_decision
+
+Type called "SpanReference":
+    reference_type as String
+    referenced_context as SpanContext
+    
+Type ReferenceType is:
+    | ChildOf
+    | FollowsFrom
+
+Type called "LogField":
+    key as String
+    value as Any
+    
+Type called "Tag":
+    key as String
+    value as Any
+
+Type called "Span":
+    operation_name as String
+    context as SpanContext
+    start_time as DateTime
+    finish_time as Optional[DateTime]
+    tags as Dictionary[String, Any]
+    logs as List[Dictionary[String, Any]]
+    references as List[SpanReference]
+    finished as Boolean
+    
+    Process called "set_operation_name" that takes name as String returns Span:
+        Set self.operation_name to name
+        Return self
+    
+    Process called "set_tag" that takes key as String and value as Any returns Span:
+        Set self.tags[key] to value
+        Return self
+    
+    Process called "set_baggage_item" that takes key as String and value as String returns Span:
+        Set self.context to self.context.with_baggage_item with key as key and value as value
+        Return self
+    
+    Process called "get_baggage_item" that takes key as String returns Optional[String]:
+        Return self.context.get_baggage_item with key as key
+    
+    Process called "log_kv" that takes fields as Dictionary[String, Any] returns Span:
+        Let log_entry be dictionary with:
+            "timestamp" as DateTime.now()
+            "fields" as fields
+        Add log_entry to self.logs
+        Return self
+    
+    Process called "log" that takes message as String returns Span:
+        Let fields be dictionary with:
+            "message" as message
+        Return self.log_kv with fields as fields
+    
+    Process called "finish" returns None:
+        If not self.finished:
+            Set self.finish_time to Some with value as DateTime.now()
+            Set self.finished to true
+
+Type called "SpanBuilder":
+    tracer as Tracer
+    operation_name as String
+    references as List[SpanReference]
+    tags as Dictionary[String, Any]
+    start_time as Optional[DateTime]
+    ignore_active_span as Boolean
+    
+    Process called "as_child_of" that takes parent_context as SpanContext returns SpanBuilder:
+        Let reference be SpanReference with:
+            reference_type as "child_of"
+            referenced_context as parent_context
+        Add reference to self.references
+        Return self
+    
+    Process called "follows_from" that takes preceding_context as SpanContext returns SpanBuilder:
+        Let reference be SpanReference with:
+            reference_type as "follows_from"
+            referenced_context as preceding_context
+        Add reference to self.references
+        Return self
+    
+    Process called "with_tag" that takes key as String and value as Any returns SpanBuilder:
+        Set self.tags[key] to value
+        Return self
+    
+    Process called "with_start_timestamp" that takes timestamp as DateTime returns SpanBuilder:
+        Set self.start_time to Some with value as timestamp
+        Return self
+    
+    Process called "ignore_active_span" returns SpanBuilder:
+        Set self.ignore_active_span to true
+        Return self
+    
+    Process called "start" returns Span:
+        Let actual_start_time be if self.start_time is not None:
+            self.start_time  Note: Get the value from the Optional
+        Otherwise:
+            DateTime.now()
+        
+        Note: Generate new span context
+        Let span_context be self.tracer.create_span_context with references as self.references
+        
+        Let span be Span with:
+            operation_name as self.operation_name
+            context as span_context
+            start_time as actual_start_time
+            finish_time as None
+            tags as self.tags.clone()
+            logs as list containing
+            references as self.references.clone()
+            finished as false
+        
+        Note: Set span as active if not ignoring active span
+        If not self.ignore_active_span:
+            self.tracer.set_active_span with span as span
+        
+        Return span
+
+Type called "Tracer":
+    service_name as String
+    active_span as Optional[Span]
+    scope_manager as ScopeManager
+    
+    Process called "start_span" that takes operation_name as String returns SpanBuilder:
+        Return SpanBuilder with:
+            tracer as self
+            operation_name as operation_name
+            references as list containing
+            tags as dictionary containing
+            start_time as None
+            ignore_active_span as false
+    
+    Process called "start_active_span" that takes operation_name as String returns ActiveSpan:
+        Let span be self.start_span with operation_name as operation_name
+        Return self.scope_manager.activate with span as span
+    
+    Process called "inject" that takes span_context as SpanContext and format as String and carrier as Any returns None:
+        Note: Inject span context into carrier for propagation
+        Match format:
+            When "text_map":
+                carrier["x-trace-id"] = span_context.trace_id
+                carrier["x-span-id"] = span_context.span_id
+                For each key and value in span_context.baggage:
+                    carrier[f"x-baggage-{key}"] = value
+            When "http_headers":
+                carrier["X-Trace-ID"] = span_context.trace_id
+                carrier["X-Span-ID"] = span_context.span_id
+                For each key and value in span_context.baggage:
+                    carrier[f"X-Baggage-{key}"] = value
+            When "binary":
+                Note: Binary format injection implementation
+                Let binary_data be self.serialize_span_context with context as span_context
+                carrier["span_context"] = binary_data
+    
+    Process called "extract" that takes format as String and carrier as Any returns Optional[SpanContext]:
+        Try:
+            Match format:
+                When "text_map":
+                    If "x-trace-id" is in carrier and "x-span-id" is in carrier:
+                        Let baggage be dictionary containing
+                        For each key and value in carrier:
+                            If key starts with "x-baggage-":
+                                Let baggage_key be key.substring with start as 10
+                                Set baggage[baggage_key] to value
+                        Return Some with value as SpanContext with:
+                            trace_id as carrier["x-trace-id"]
+                            span_id as carrier["x-span-id"]
+                            baggage as baggage
+                            sampling_decision as true
+                When "http_headers":
+                    If "X-Trace-ID" is in carrier and "X-Span-ID" is in carrier:
+                        Let baggage be dictionary containing
+                        For each key and value in carrier:
+                            If key starts with "X-Baggage-":
+                                Let baggage_key be key.substring with start as 10
+                                Set baggage[baggage_key] to value
+                        Return Some with value as SpanContext with:
+                            trace_id as carrier["X-Trace-ID"]
+                            span_id as carrier["X-Span-ID"]
+                            baggage as baggage
+                            sampling_decision as true
+                When "binary":
+                    If "span_context" is in carrier:
+                        Return self.deserialize_span_context with data as carrier["span_context"]
+            Return None
+        Catch extraction_error:
+            Return None
+    
+    Process called "set_active_span" that takes span as Span returns None:
+        Set self.active_span to Some with value as span
+    
+    Process called "get_active_span" returns Optional[Span]:
+        Return self.active_span
+    
+    Process called "create_span_context" that takes references as List[SpanReference] returns SpanContext:
+        Note: Generate unique trace and span IDs
+        Let trace_id be Utils.generate_trace_id()
+        Let span_id be Utils.generate_span_id()
+        Let baggage be dictionary containing
+        
+        Note: Handle parent relationships
+        For each reference in references:
+            If reference.reference_type is equal to "child_of":
+                Set trace_id to reference.referenced_context.trace_id
+                Note: Inherit baggage from parent
+                For each key and value in reference.referenced_context.baggage:
+                    Set baggage[key] to value
+        
+        Return SpanContext with:
+            trace_id as trace_id
+            span_id as span_id
+            baggage as baggage
+            sampling_decision as true
+    
+    Process called "serialize_span_context" that takes context as SpanContext returns String:
+        Let data be dictionary with:
+            "trace_id" as context.trace_id
+            "span_id" as context.span_id
+            "baggage" as context.baggage
+            "sampling_decision" as context.sampling_decision
+        Return Utils.encode_json with data as data
+    
+    Process called "deserialize_span_context" that takes data as String returns Optional[SpanContext]:
+        Try:
+            Let parsed_data be Utils.decode_json with json_string as data
+            Return Some with value as SpanContext with:
+                trace_id as parsed_data["trace_id"]
+                span_id as parsed_data["span_id"]
+                baggage as parsed_data["baggage"]
+                sampling_decision as parsed_data["sampling_decision"]
+        Catch parse_error:
+            Return None
+
+Type called "ScopeManager":
+    active_scopes as List[Scope]
+    
+    Process called "activate" that takes span as Span returns ActiveSpan:
+        Let scope be Scope with:
+            span as span
+            to_restore as self.get_active_scope()
+        Add scope to self.active_scopes
+        Return ActiveSpan with:
+            span as span
+            scope as scope
+    
+    Process called "get_active_scope" returns Optional[Scope]:
+        If length of self.active_scopes is greater than 0:
+            Return Some with value as self.active_scopes[length of self.active_scopes - 1]
+        Return None
+    
+    Process called "deactivate" that takes scope as Scope returns None:
+        If length of self.active_scopes is greater than 0:
+            Let last_scope be pop from self.active_scopes
+            If scope.to_restore is not None:
+                Add scope.to_restore to self.active_scopes
+
+Type called "Scope":
+    span as Span
+    to_restore as Optional[Scope]
+
+Type called "ActiveSpan":
+    span as Span
+    scope as Scope
+    
+    Process called "close" returns None:
+        self.span.finish()
+        self.scope.manager.deactivate with scope as self.scope
+
+Note: Global tracer registry and factory functions
+
+Let global_tracer be mutable Optional[Tracer] with value as None
+
+Process called "set_global_tracer" that takes tracer as Tracer returns None:
+    Set global_tracer to Some with value as tracer
+
+Process called "global_tracer" returns Tracer:
+    If global_tracer is not None:
+        Return global_tracer
+    Return create_noop_tracer()
+
+Process called "create_tracer" that takes service_name as String returns Tracer:
+    Return Tracer with:
+        service_name as service_name
+        active_span as None
+        scope_manager as ScopeManager with:
+            active_scopes as list containing
+
+Process called "create_noop_tracer" returns Tracer:
+    Note: No-operation tracer for testing or when tracing is disabled
+    Return create_tracer with service_name as "noop"
+
+Note: Utility functions for ID generation
+
+Process called "generate_trace_id" returns String:
+    Note: Generate 128-bit trace ID as hexadecimal string
+    Let bytes_list be list containing
+    For i from 0 to 15:
+        Add Utils.random_byte() to bytes_list
+    Return Utils.bytes_to_hex with bytes as bytes_list
+
+Process called "generate_span_id" returns String:
+    Note: Generate 64-bit span ID as hexadecimal string  
+    Let bytes_list be list containing
+    For i from 0 to 7:
+        Add Utils.random_byte() to bytes_list
+    Return Utils.bytes_to_hex with bytes as bytes_list
+
+Process called "random_byte" returns Integer:
+    Note: Generate random byte (0-255)
+    Return random_integer with min as 0 and max as 255
+
+Process called "bytes_to_hex" that takes bytes as List[Integer] returns String:
+    Let hex_chars be list containing
+    For each byte in bytes:
+        Let hex_value be Utils.integer_to_hex with value as byte
+        If length of hex_value is equal to 1:
+            Set hex_value to "0" concatenated with hex_value
+        Add hex_value to hex_chars
+    Return join with separator as "" and items as hex_chars
+
+Process called "Utils.integer_to_hex" that takes value as Integer returns String:
+    Note: Convert integer to hexadecimal string
+    If value is equal to 0:
+        Return "0"
+    
+    Let hex_digits be "0123456789abcdef"
+    Let result be ""
+    Let num be value
+    
+    While num is greater than 0:
+        Let remainder be num modulo 16
+        Set result to hex_digits[remainder] concatenated with result
+        Set num to num divided by 16
+    
+    Return result
+
+Note: Context propagation utilities
+
+Process called "inject_to_http_headers" that takes span_context as SpanContext and headers as Dictionary[String, String] returns None:
+    Let tracer be global_tracer()
+    tracer.inject with span_context as span_context and format as "http_headers" and carrier as headers
+
+Process called "extract_from_http_headers" that takes headers as Dictionary[String, String] returns Optional[SpanContext]:
+    Let tracer be global_tracer()
+    Return tracer.extract with format as "http_headers" and carrier as headers
+
+Process called "start_span_from_context" that takes operation_name as String and context as Optional[SpanContext] returns Span:
+    Let tracer be global_tracer()
+    Let builder be tracer.start_span with operation_name as operation_name
+    
+    If context is not None:
+        Set builder to builder.as_child_of with parent_context as context
+    
+    Return builder.start()
+
+Note: Tracing decorators and context managers
+
+Process called "trace_function" that takes operation_name as String and func as Function returns Any:
+    Let tracer be global_tracer()
+    Let span be tracer.start_span with operation_name as operation_name
+    Let active_span be tracer.start_active_span with operation_name as operation_name
+    
+    Try:
+        Let result be func()
+        active_span.span.set_tag with key as "result.success" and value as true
+        Return result
+    Catch function_error:
+        active_span.span.set_tag with key as "result.success" and value as false
+        active_span.span.set_tag with key as "error.message" and value as function_error.message
+        active_span.span.log with message as f"Function error: {function_error.message}"
+        Throw function_error
+    Finally:
+        active_span.close()
+
+Note: Export all types and functions
+Export SpanContext
+Export SpanReference
+Export ReferenceType
+Export LogField
+Export Tag
+Export Span
+Export SpanBuilder
+Export Tracer
+Export ScopeManager
+Export Scope
+Export ActiveSpan
+Export set_global_tracer
+Export global_tracer
+Export create_tracer
+Export create_noop_tracer
+Export generate_trace_id
+Export generate_span_id
+Export inject_to_http_headers
+Export extract_from_http_headers
+Export start_span_from_context
+Export trace_function
