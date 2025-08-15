@@ -267,7 +267,9 @@ not_expression        ::= "not" not_expression | comparison_expression
 
 comparison_expression ::= additive_expression (comparison_op additive_expression)*
 
-comparison_op         ::= "is" "equal" "to"
+comparison_op         ::= "equals"
+                        | "is" "equal" "to"   Note: Deprecated; use "equals"
+                        | "does" "not" "equal"
                         | "is" "not" "equal" "to"
                         | "is" "greater" "than"
                         | "is" "less" "than"
@@ -2065,13 +2067,45 @@ Let length be length of greeting
 Let uppercase be greeting converted to uppercase
 ```
 
+### Operators
+
+Runa supports **dual syntax** for operators - both symbolic and natural language forms are equally valid and interchangeable.
+
+#### Arithmetic Operators
+Both forms are fully supported and equivalent:
+
+- `+` ↔ `plus`
+- `-` ↔ `minus`
+- `*` ↔ `multiplied by`
+- `/` ↔ `divided by`
+- `%` ↔ `modulo`
+
+#### Comparison Operators
+Both forms are fully supported:
+
+- `<` ↔ `is less than`
+- `>` ↔ `is greater than`
+- `<=` ↔ `is less than or equal to`
+- `>=` ↔ `is greater than or equal to`
+- `!=` ↔ `is not equal to` / `does not equal`
+
+#### Equality
+Equality uses "equals" as the canonical form. The `=` and `==` symbols are NOT used for comparison to avoid ambiguity with assignment.
+
+Design Principle: **Both symbolic and word operators are first-class citizens in Runa**. Choose based on context:
+- Symbolic operators (`+`, `-`, `*`, `/`) are concise for mathematical expressions
+- Word operators are clearer for business logic and AI comprehension
+
 ### Mathematical Operations
 
 ```runa
-Note: Basic arithmetic
-Let total be price plus tax
-Let discount be price multiplied by 0.1
-Let average be sum divided by count
+Note: Both syntaxes are valid - choose based on readability
+Let total be price + tax                    Note: Symbolic form
+Let total be price plus tax                 Note: Word form
+Let discount be price * 0.1                 Note: Symbolic form  
+Let discount be price multiplied by 0.1     Note: Word form
+Let average be sum / count                  Note: Symbolic form
+Let average be sum divided by count         Note: Word form
 
 Note: Advanced math
 Let sqrt_value be sqrt(16.0)
