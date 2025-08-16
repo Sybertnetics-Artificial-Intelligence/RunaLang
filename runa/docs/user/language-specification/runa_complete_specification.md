@@ -1,5 +1,8 @@
 # Runa Programming Language: Complete Specification
-*Version 2.1 - AI-First Programming Language*
+*Version 2.1 - AI-First Programming Language with Mathematical Symbol Enforcement*
+
+**Last Updated**: 2025-08-15  
+**Implementation Status**: Mathematical symbol enforcement active, dual operator support implemented, symbol-to-word conversion available
 
 ## Table of Contents
 
@@ -30,6 +33,7 @@ Runa is a revolutionary programming language designed to bridge human thought pa
 
 - **Human-Readable**: Syntax that mirrors natural language for intuitive understanding
 - **AI-First**: Built specifically for AI-assisted development and code generation
+- **Symbol Enforcement**: Mathematical symbols restricted to mathematical contexts only
 - **Type-Safe**: Strong static typing with inference to prevent errors
 - **Memory-Safe**: Automatic memory management with hybrid ARC/GC system
 - **Modular**: Comprehensive module system for large-scale development
@@ -38,6 +42,8 @@ Runa is a revolutionary programming language designed to bridge human thought pa
 ### Key Features
 
 - Natural language syntax with minimal punctuation
+- Mathematical symbol enforcement with context validation
+- Automatic symbol-to-word conversion during formatting
 - Advanced type system with generics and algebraic data types
 - Hybrid memory management combining ARC and garbage collection
 - Comprehensive error handling with exceptions and result types
@@ -477,7 +483,7 @@ Runa's type inference system reduces the need for explicit annotations:
 
 ```runa
 Note: Type is inferred as Dictionary[String, Integer]
-Let scores be dictionary with:
+Let scores be dictionary containing:
     "Alice" as 95
     "Bob" as 87
     "Charlie" as 92
@@ -1077,14 +1083,14 @@ Process called "resolve_dependencies" that takes packages as List[PackageSpec] r
 Process called "is_compatible" that takes version as Version and constraint as VersionConstraint returns Boolean:
     Match constraint.type:
         When "exact":
-            Return version is equal to constraint.version
+            Return version equals constraint.version
         When "caret":  Note: ^1.2.3 allows >=1.2.3 and <2.0.0
             Return version is greater than or equal to constraint.version and
-                   version.major is equal to constraint.version.major
+                   version.major equals constraint.version.major
         When "tilde":  Note: ~1.2.3 allows >=1.2.3 and <1.3.0  
             Return version is greater than or equal to constraint.version and
-                   version.major is equal to constraint.version.major and
-                   version.minor is equal to constraint.version.minor
+                   version.major equals constraint.version.major and
+                   version.minor equals constraint.version.minor
         When "range":  Note: 1.0.0 - 2.0.0
             Return version is greater than or equal to constraint.min_version and
                    version is less than or equal to constraint.max_version
@@ -2052,7 +2058,7 @@ Process called "safe_string_pass" that takes text as String returns String:
 Note: List operations
 Let numbers be list containing 1, 2, 3, 4, 5
 Let doubled be Map over numbers using lambda x: x multiplied by 2
-Let evens be Filter numbers where lambda x: x modulo 2 is equal to 0
+Let evens be Filter numbers where lambda x: x modulo 2 equals 0
 Let sum be Reduce numbers using lambda acc and x: acc plus x
 
 Note: Dictionary operations
@@ -2069,48 +2075,118 @@ Let uppercase be greeting converted to uppercase
 
 ### Operators
 
-Runa supports **dual syntax** for operators - both symbolic and natural language forms are equally valid and interchangeable.
+Runa supports **dual syntax** for operators with **mathematical symbol enforcement** - mathematical symbols are restricted to mathematical contexts only.
+
+#### Mathematical Symbol Enforcement
+
+**IMPORTANT**: Mathematical symbols (`+`, `-`, `*`, `/`, `%`, `<`, `>`, `<=`, `>=`, `!=`) are **ONLY** permitted in mathematical contexts. The compiler enforces this restriction.
+
+**Valid Mathematical Contexts**:
+- Arithmetic expressions with numeric operands
+- Mathematical comparisons between numbers
+- Mathematical operations in expressions
+
+**Invalid Non-Mathematical Contexts**:
+- String operations (use "concatenated with")
+- Boolean logic (use "and", "or", "not")
+- Assignment operations (use "be", "as", "to")
 
 #### Arithmetic Operators
-Both forms are fully supported and equivalent:
+Both forms supported (symbols restricted to mathematical contexts):
 
-- `+` ↔ `plus`
-- `-` ↔ `minus`
-- `*` ↔ `multiplied by`
-- `/` ↔ `divided by`
-- `%` ↔ `modulo`
+- `+` ↔ `plus` (mathematical only)
+- `-` ↔ `minus` (mathematical only)
+- `*` ↔ `multiplied by` (mathematical only)
+- `/` ↔ `divided by` (mathematical only)
+- `%` ↔ `modulo` (mathematical only)
 
 #### Comparison Operators
-Both forms are fully supported:
+Both forms supported (symbols restricted to mathematical contexts):
 
-- `<` ↔ `is less than`
-- `>` ↔ `is greater than`
-- `<=` ↔ `is less than or equal to`
-- `>=` ↔ `is greater than or equal to`
-- `!=` ↔ `is not equal to` / `does not equal`
+- `<` ↔ `is less than` (mathematical comparison only)
+- `>` ↔ `is greater than` (mathematical comparison only)
+- `<=` ↔ `is less than or equal to` (mathematical comparison only)
+- `>=` ↔ `is greater than or equal to` (mathematical comparison only)
+- `!=` ↔ `does not equal` (mathematical comparison only)
 
-#### Equality
-Equality uses "equals" as the canonical form. The `=` and `==` symbols are NOT used for comparison to avoid ambiguity with assignment.
+#### Equality Operators
+Runa provides a dual-syntax approach for equality that balances natural language readability with technical efficiency:
 
-Design Principle: **Both symbolic and word operators are first-class citizens in Runa**. Choose based on context:
-- Symbolic operators (`+`, `-`, `*`, `/`) are concise for mathematical expressions
-- Word operators are clearer for business logic and AI comprehension
+**Canonical Natural Language Syntax (Recommended):**
+- `is equal to` - The primary operator for non-mathematical equality comparisons
+- Example: `If name is equal to "Admin"` or `If the day is equal to "Monday"`
+
+**Technical Shorthand (Alternative):**
+- `equals` - Concise, functionally identical alternative for experienced developers
+- Example: `If name is equal to "Admin"` or `If the day is equal to "Monday"`
+
+Both operators produce identical results and can be used interchangeably. The canonical syntax emphasizes natural language readability, while the technical shorthand provides conciseness for rapid development.
+
+#### Identity and Type Operators
+The `is` keyword is reserved exclusively for identity, type, and state checks. It does **not** perform general value equality comparisons.
+
+**Identity Checks:**
+- `is None` - Check if a value is the null reference
+- `is empty` - Check if a collection or string is empty
+- `is null` - Alternative null check (synonym for `is None`)
+
+**Type Checks:**
+- `is of type String` - Check if a value is of a specific type
+- `is of type Integer` - Type validation for integers
+- `is of type Boolean` - Boolean type checking
+
+**State Checks:**
+- `is empty` - Check if a collection has no elements
+- `is valid` - Check if a value is in a valid state
+- `is ready` - Check if a resource is ready for use
+
+**Important:** The `is` operator performs reference equality and type checking, not value equality. For value comparisons, use `is equal to` or `equals`.
+
+#### Operator Type Classifications
+
+- **Mathematical**: `+`, `-`, `*`, `/`, `%`, `plus`, `minus`, `multiplied by`, `divided by`, `modulo`, `power of`
+- **Mathematical Comparison**: `<`, `>`, `<=`, `>=`, `!=`, `is greater than`, `is less than`, `is greater than or equal to`, `is less than or equal to`, `does not equal`
+- **Equality Comparison**: `is equal to`, `equals`, `contains`, `is in`
+- **Identity and Type**: `is of type`, `is None`, `is empty`, `is null`, `is valid`, `is ready`
+- **Bitwise**: `bitwise and`, `bitwise or`, `bitwise xor`, `bitwise not`, `shifted left by`, `shifted right by`
+- **Logical**: `and`, `or`, `not`, `logical and`, `logical or`, `logical not`
+- **String**: `concatenated with`
 
 ### Mathematical Operations
 
 ```runa
-Note: Both syntaxes are valid - choose based on readability
-Let total be price + tax                    Note: Symbolic form
-Let total be price plus tax                 Note: Word form
-Let discount be price * 0.1                 Note: Symbolic form  
-Let discount be price multiplied by 0.1     Note: Word form
-Let average be sum / count                  Note: Symbolic form
-Let average be sum divided by count         Note: Word form
+Note: Mathematical symbols ONLY in mathematical contexts
+Let total be price + tax                    Note: Valid - mathematical context
+Let total be price plus tax                 Note: Always valid - natural language
+Let discount be price * 0.1                 Note: Valid - mathematical context  
+Let discount be price multiplied by 0.1     Note: Always valid - natural language
+Let average be sum / count                  Note: Valid - mathematical context
+Let average be sum divided by count         Note: Always valid - natural language
 
 Note: Advanced math
 Let sqrt_value be sqrt(16.0)
 Let power_value be 2 to the power of 8
-Let sin_value be sin(3.14159 divided by 2)
+Let sin_value be sin(3.14159 / 2)           Note: Valid - mathematical context
+Let sin_value be sin(3.14159 divided by 2)  Note: Always valid - natural language
+
+Note: NON-mathematical contexts must use natural language
+Let full_name be first_name concatenated with " " concatenated with last_name
+Note: Using + for strings would be INVALID
+```
+
+### Symbol-to-Word Conversion
+
+The formatter automatically converts mathematical symbols to natural language unless configured otherwise:
+
+```runa
+Note: Formatter conversion rules
++ → plus
+- → minus
+* → multiplied by
+/ → divided by
+<= → is less than or equal to
+>= → is greater than or equal to
+!= → does not equal
 ```
 
 ### I/O Operations

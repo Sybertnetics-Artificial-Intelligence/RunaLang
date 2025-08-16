@@ -1,20 +1,26 @@
 # Runa Implementation Guide
 *Complete Guide for Language Implementers and Tool Builders*
 
+**Last Updated**: 2025-08-15  
+**Implementation Status**: Mathematical symbol enforcement active, dual operator support implemented
+
 ## Overview
 
 This implementation guide provides comprehensive instructions for building Runa language processors, including compilers, interpreters, transpilers, and development tools. It covers the complete implementation pipeline from lexical analysis through code generation and runtime support.
+
+**CRITICAL IMPLEMENTATION REQUIREMENT**: Mathematical symbols (`+`, `-`, `*`, `/`, `%`, `<`, `>`, `<=`, `>=`, `!=`) are **ONLY** permitted in mathematical contexts. Implementers must enforce this restriction through context analysis in the lexer and parser.
 
 ## Architecture Overview
 
 ### Core Components
 
-1. **Lexer** - Tokenizes Runa source code
-2. **Parser** - Builds Abstract Syntax Tree (AST)
-3. **Semantic Analyzer** - Performs type checking and validation
+1. **Lexer** - Tokenizes Runa source code with mathematical symbol enforcement
+2. **Parser** - Builds Abstract Syntax Tree (AST) with operator context validation
+3. **Semantic Analyzer** - Performs type checking and validation with operator type classification
 4. **IR Generator** - Converts AST to intermediate representation
 5. **Runtime** - Executes compiled bytecode
 6. **Standard Library** - Provides essential functions and types
+7. **Formatter** - Symbol-to-word conversion for deployment
 
 ### Language Keywords vs Standard Library
 
@@ -116,6 +122,7 @@ class TokenType(Enum):
     MULTIPLIED_BY = auto() # "multiplied by"
     DIVIDED_BY = auto()    # "divided by"
     IS_EQUAL_TO = auto()   # "is equal to"
+    EQUALS = auto()        # "equals" (technical shorthand)
     # ... (all other operators)
     
     # Punctuation
@@ -243,12 +250,16 @@ class RunaLexer:
         self.tokens = []
         self.indent_stack = [0]  # Track indentation levels
         
-        # Multi-word operator patterns
+        # Multi-word operator patterns (UPDATED for mathematical symbol enforcement)
         self.multi_word_patterns = [
             (r'multiplied\s+by', TokenType.MULTIPLIED_BY),
             (r'divided\s+by', TokenType.DIVIDED_BY),
-            (r'is\s+equal\s+to', TokenType.IS_EQUAL_TO),
-            (r'is\s+not\s+equal\s+to', TokenType.IS_NOT_EQUAL_TO),
+            (r'plus', TokenType.PLUS),
+            (r'minus', TokenType.MINUS),
+            (r'modulo', TokenType.MODULO),
+            (r'is\s+equal\s+to', TokenType.IS_EQUAL_TO),  # Canonical natural language equality
+            (r'equals', TokenType.EQUALS),  # Technical shorthand equality
+            (r'does\s+not\s+equal', TokenType.DOES_NOT_EQUAL),
             (r'is\s+greater\s+than\s+or\s+equal\s+to', TokenType.IS_GREATER_THAN_OR_EQUAL_TO),
             (r'is\s+less\s+than\s+or\s+equal\s+to', TokenType.IS_LESS_THAN_OR_EQUAL_TO),
             (r'is\s+greater\s+than', TokenType.IS_GREATER_THAN),
@@ -257,6 +268,20 @@ class RunaLexer:
             (r'to\s+the\s+power\s+of', TokenType.TO_THE_POWER_OF),
             # ... add all multi-word operators
         ]
+        
+        # Mathematical symbols (RESTRICTED to mathematical contexts)
+        self.mathematical_symbols = {
+            '+': TokenType.MATHEMATICAL_PLUS,
+            '-': TokenType.MATHEMATICAL_MINUS,
+            '*': TokenType.MATHEMATICAL_MULTIPLY,
+            '/': TokenType.MATHEMATICAL_DIVIDE,
+            '%': TokenType.MATHEMATICAL_MODULO,
+            '<': TokenType.MATHEMATICAL_LESS,
+            '>': TokenType.MATHEMATICAL_GREATER,
+            '<=': TokenType.MATHEMATICAL_LESS_EQUAL,
+            '>=': TokenType.MATHEMATICAL_GREATER_EQUAL,
+            '!=': TokenType.MATHEMATICAL_NOT_EQUAL
+        }
         
         # Keyword mapping
         self.keywords = {
@@ -278,6 +303,26 @@ class RunaLexer:
             'nil': TokenType.NULL,
             # ... add all keywords
         }
+    
+    def validate_mathematical_symbol_context(self, symbol: str, position: int) -> bool:
+        """
+        CRITICAL: Validate mathematical symbols are only used in mathematical contexts
+        """
+        # Context analysis implementation required
+        # Check previous and next tokens for mathematical context
+        # Return False if symbol is used in non-mathematical context
+        return self._is_mathematical_context(symbol, position)
+    
+    def _is_mathematical_context(self, symbol: str, position: int) -> bool:
+        """
+        Analyze surrounding context to determine if mathematical symbol usage is valid
+        """
+        # Implementation details:
+        # - Check if operands are numeric types
+        # - Verify not in string concatenation context
+        # - Validate mathematical expression context
+        # This is a CRITICAL implementation requirement
+        pass  # Implementation required
     
     def tokenize(self) -> List[Token]:
         while not self._at_end():
@@ -1150,7 +1195,7 @@ class TypeInferenceEngine:
                   right_type.is_assignable_to(BasicType("Float"))):
                 return BasicType("Float")
         
-        elif expr.operator in ["is equal to", "is not equal to", 
+        elif expr.operator in ["is equal to", "equals", "is not equal to", 
                              "is greater than", "is less than"]:
             return BasicType("Boolean")
         
@@ -1369,20 +1414,40 @@ class PythonCodeGenerator(CodeGenerator):
         left = self.generate_expression(expr.left)
         right = self.generate_expression(expr.right)
         
-        # Map Runa operators to Python operators
+        # Map Runa operators to Python operators (UPDATED for canonical forms)
         operator_map = {
+            # Mathematical operators (natural language canonical)
             "plus": "+",
             "minus": "-",
             "multiplied by": "*",
             "divided by": "/",
             "modulo": "%",
             "to the power of": "**",
-            "is equal to": "==",
-            "is not equal to": "!=",
+            
+            # Mathematical symbols (when used in mathematical contexts)
+            "+": "+",
+            "-": "-",
+            "*": "*",
+            "/": "/",
+            "%": "%",
+            
+            # Comparison operators (updated canonical forms)
+            "is equal to": "==",  # Canonical natural language equality
+            "equals": "==",  # Technical shorthand equality
+            "does not equal": "!=",  # Updated canonical form
             "is greater than": ">",
             "is less than": "<",
             "is greater than or equal to": ">=",
             "is less than or equal to": "<=",
+            
+            # Mathematical comparison symbols (when in mathematical contexts)
+            "<": "<",
+            ">": ">",
+            "<=": ">=",
+            ">=": ">=",
+            "!=": "!=",
+            
+            # Logical operators
             "and": "and",
             "or": "or",
             "concatenated with": "+"

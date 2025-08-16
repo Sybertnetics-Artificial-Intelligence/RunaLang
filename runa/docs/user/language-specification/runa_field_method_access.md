@@ -1,8 +1,13 @@
 # Field and Method Access in Runa
 
+**Last Updated**: 2025-08-15  
+**Note**: This documentation reflects the current implementation with mathematical symbol enforcement.
+
 ## Overview
 
 Runa supports dual syntax for accessing fields and methods: **natural language** for accessibility and **technical syntax** for efficiency. This approach ensures Runa is approachable for non-developers while remaining powerful for experienced programmers.
+
+**Mathematical Symbol Note**: Mathematical operations in method examples use natural language operators (`multiplied by`, `plus`, `minus`) which are always valid. Mathematical symbols (`*`, `+`, `-`) are restricted to mathematical contexts only.
 
 ## Field Access
 
@@ -77,7 +82,7 @@ Let last_item be the last item of list
 ## Type Definitions with Methods
 
 ```runa
-Type Circle is Dictionary with:
+Type called "Circle":
     radius as Float
 
     Process called "area" returns Float:

@@ -1001,11 +1001,11 @@ For each config_key in ordered_keys:
     Display "  ✓ Setting " concatenated with config_key concatenated with " = " concatenated with config_value
     
     Note: Simulate configuration application with order dependency
-    If config_key is equal to "security_key":
+                    If config_key is equal to "security_key":
         Display "    → Security layer initialized"
-    Otherwise if config_key is equal to "database_url":
+                    Otherwise if config_key is equal to "database_url":
         Display "    → Database connection established"  
-    Otherwise if config_key is equal to "redis_cluster":
+                    Otherwise if config_key is equal to "redis_cluster":
         Display "    → Cache layer connected"
 
 Note: Environment-specific overrides
@@ -2179,7 +2179,7 @@ Skip lists provide O(log n) expected time complexity for search, insertion, and 
 ```runa
 Note: Create and configure skip list
 Let create_result be create_skip_list with max_level as 16 and probability as 0.5
-Assert create_result["success"] is equal to true
+Assert create_result["success"] equals true
 Let skip_list be create_result["skip_list"]
 
 Note: Insert key-value pairs
@@ -2312,7 +2312,7 @@ Suffix arrays enable efficient string algorithms with O(log n) pattern search an
 Note: Create suffix array for text analysis
 Let document_text be "the quick brown fox jumps over the lazy dog"
 Let create_result be create_suffix_array with text as document_text
-Assert create_result["success"] is equal to true
+Assert create_result["success"] equals true
 Let suffix_array be create_result["suffix_array"]
 
 Display "Text length: " with message suffix_array["text_length"]

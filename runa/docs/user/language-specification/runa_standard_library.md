@@ -1,9 +1,14 @@
 # Runa Standard Library Reference
 *Comprehensive Guide to Runa's Built-in Functions and Modules*
 
+**Last Updated**: 2025-08-15  
+**Note**: This documentation reflects the current implementation with mathematical symbol enforcement.
+
 ## Overview
 
 The Runa Standard Library provides a comprehensive set of built-in functions, types, and modules that enable rapid development while maintaining the language's natural syntax philosophy. The library is designed to be intuitive, with function names and operations that read like natural language.
+
+**Mathematical Symbol Note**: All examples use natural language operators (`plus`, `minus`, `multiplied by`, `divided by`) which are always valid. Mathematical symbols (`+`, `-`, `*`, `/`) are restricted to mathematical contexts only.
 
 ## Core Modules
 
@@ -30,7 +35,7 @@ Remove item at index 0 from numbers         Note: Removes by index: [1, 2, 4, 5,
 
 Note: Functional operations
 Let doubled be Map over numbers using lambda x: x multiplied by 2
-Let evens be Filter numbers where lambda x: x modulo 2 is equal to 0
+Let evens be Filter numbers where lambda x: x modulo 2 equals 0
 Let sum be Reduce numbers using lambda acc and x: acc plus x
 Let sorted_numbers be Sort numbers                              Note: Ascending order
 Let reverse_sorted be Sort numbers in descending order
@@ -408,7 +413,7 @@ Let numbers be list containing 1, 2, 3, 4, 5
 
 Note: Map, Filter, Reduce
 Let doubled be Map over numbers using lambda x: x multiplied by 2
-Let evens be Filter numbers where lambda x: x modulo 2 is equal to 0
+Let evens be Filter numbers where lambda x: x modulo 2 equals 0
 Let sum be Reduce numbers using lambda acc and x: acc plus x
 
 Note: Function composition
@@ -537,12 +542,12 @@ Import module "testing"
 Note: Unit tests
 Test "addition works correctly":
     Let result be 2 plus 3
-    Assert result is equal to 5
+    Assert result equals 5
 
 Test "list operations":
     Let numbers be list containing 1, 2, 3
     Add 4 to numbers
-    Assert length of numbers is equal to 4
+    Assert length of numbers equals 4
     Assert numbers contains 4
 
 Note: Test fixtures
@@ -560,7 +565,7 @@ Note: Mocking
 Test "external API call":
     Mock http_get to return fake_response
     Let result be fetch_user_data with id as 123
-    Assert result["name"] is equal to "Mocked User"
+    Assert result["name"] equals "Mocked User"
     Verify http_get was called with url "https://api.example.com/users/123"
 ```
 
@@ -1582,7 +1587,7 @@ Test "agent_skill_execution":
     Let test_agent be create_test_agent with skills as list containing "test_skill"
     Let result be execute_skill "test_skill" with agent test_agent and input test_data
     Assert result is not None
-    Assert result["status"] is equal to "success"
+    Assert result["status"] equals "success"
 
 Note: Integration testing for multi-agent systems
 Test "multi_agent_coordination":
@@ -1592,7 +1597,7 @@ Test "multi_agent_coordination":
         coordinator as agent1
         workers as list containing agent2
         task as test_task
-    Assert coordination_result["status"] is equal to "completed"
+    Assert coordination_result["status"] equals "completed"
 
 Note: Property-based testing
 Test "data_processing_properties":
@@ -1856,7 +1861,7 @@ Process called "validate_credit_card" that takes card_number as String returns B
     Note: Luhn algorithm implementation
     Let digits be convert card_number to digit list
     Let checksum be calculate_luhn_checksum with digits as digits
-    Return checksum modulo 10 is equal to 0
+    Return checksum modulo 10 equals 0
 ```
 
 ### 3. Plugin System

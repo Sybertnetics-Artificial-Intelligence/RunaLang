@@ -57,11 +57,13 @@ Display total with message "Final result:"
 - **Function Calls**: Named parameter syntax with natural language
 - **Data Types**: Strings, integers, floats, booleans, lists
 - **Expressions**: Full arithmetic and comparison with proper precedence
+- **Mathematical Symbol Enforcement**: Symbols (`+`, `-`, `*`, `/`, `<`, `>`, `<=`, `>=`, `!=`) ONLY for mathematical operations
 - **Error Handling**: Comprehensive error reporting with line/column info
 
 ### Technical Excellence
 - **Recursive Descent Parser**: Clean, maintainable architecture
 - **Complete AST Generation**: Full syntax tree construction
+- **Strict Symbol Enforcement**: Mathematical symbols restricted to mathematical contexts only
 - **Production Ready**: 100% test coverage, deployment-ready code
 - **Self-hosting Designed**: Architecture ready for bootstrapping
 

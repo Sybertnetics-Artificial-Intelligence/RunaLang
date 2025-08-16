@@ -1,9 +1,14 @@
 # Runa Type System Reference
 *Comprehensive Guide to Runa's Advanced Type System*
 
+**Last Updated**: 2025-08-15  
+**Note**: This documentation reflects the current implementation with mathematical symbol enforcement.
+
 ## Overview
 
 Runa's type system is designed to provide the safety and expressiveness of modern statically-typed languages while maintaining the natural, human-readable syntax that makes Runa unique. The type system supports gradual typing, powerful inference, generics, algebraic data types, and sophisticated constraint systems.
+
+**Mathematical Symbol Enforcement**: The type system works with the compiler's mathematical symbol enforcement, where mathematical operators (`+`, `-`, `*`, `/`, `%`, `<`, `>`, `<=`, `>=`, `!=`) are restricted to mathematical contexts only. Type checking validates operator usage based on operand types and contexts.
 
 ## Core Principles
 
@@ -638,8 +643,8 @@ Note: Refinement type union
 Type ValidInput is PositiveInteger OR NonEmptyString
 
 Note: Refinement type parameters
-Type BoundedList[T, N] is List[T] where length is equal to N
-Type Matrix[Rows, Cols] is List[List[Float]] where length is equal to Rows and all items satisfy length is equal to Cols
+Type BoundedList[T, N] is List[T] where length equals N
+Type Matrix[Rows, Cols] is List[List[Float]] where length equals Rows and all items satisfy length equals Cols
 
 Note: Refinement type functions
 Process called "validate_age" that takes age as Integer returns Age:
@@ -725,8 +730,8 @@ Dependent types allow types to depend on values, enabling precise specifications
 
 ```runa
 Note: Dependent type examples
-Type Vector[N: Integer] is List[Float] where length is equal to N
-Type Matrix[Rows: Integer, Cols: Integer] is List[Vector[Cols]] where length is equal to Rows
+Type Vector[N: Integer] is List[Float] where length equals N
+Type Matrix[Rows: Integer, Cols: Integer] is List[Vector[Cols]] where length equals Rows
 
 Note: Dependent type usage
 Process called "vector_add" that takes v1 as Vector[N] and v2 as Vector[N] returns Vector[N]:

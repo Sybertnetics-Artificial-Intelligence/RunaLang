@@ -62,6 +62,14 @@ keyword               ::= "Let" | "Define" | "Set" | "If" | "Otherwise" | "Unles
                         | "False" | "None" | "Null" | "Nil"
 ```
 
+### Mathematical Symbol Operators
+
+```ebnf
+mathematical_symbol_operator ::= '+' | '-' | '*' | '/' | '%' | '<' | '>' | '<=' | '>=' | '!='
+```
+
+Note: Mathematical symbols are restricted to mathematical contexts only. The compiler enforces this restriction and provides automatic conversion to natural language equivalents during formatting.
+
 ### Literals
 
 ```ebnf
@@ -371,23 +379,31 @@ not_expression        ::= "not" not_expression | comparison_expression
 
 comparison_expression ::= additive_expression (comparison_op additive_expression)*
 
-comparison_op         ::= "is" "equal" "to"
-                        | "is" "not" "equal" "to"
+comparison_op         ::= equality_operator
+                        | "does" "not" "equal"
                         | "is" "greater" "than"
                         | "is" "less" "than"
                         | "is" "greater" "than" "or" "equal" "to"
                         | "is" "less" "than" "or" "equal" "to"
                         | "contains"
                         | "is" "in"
-                        | "is" "of" "type"
+                        | "is" "of" "type" type_expression
+                        | mathematical_symbol_operator
+
+# Equality operators - both forms produce identical results
+equality_operator     ::= "is" "equal" "to"    # Canonical natural language form
+                        | "equals"              # Technical shorthand form
+
+# Identity and type operators - use 'is' for identity/type/state checks, not equality
+# Note: "is of type" is now properly handled in comparison_op for type checking expressions
 
 additive_expression   ::= multiplicative_expression (additive_op multiplicative_expression)*
 
-additive_op           ::= "plus" | "minus" | "concatenated" "with"
+additive_op           ::= "plus" | "minus" | "concatenated" "with" | mathematical_symbol_operator
 
 multiplicative_expression ::= unary_expression (multiplicative_op unary_expression)*
 
-multiplicative_op     ::= "multiplied" "by" | "divided" "by" | "modulo"
+multiplicative_op     ::= "multiplied" "by" | "divided" "by" | "modulo" | mathematical_symbol_operator
 
 unary_expression      ::= unary_op unary_expression | power_expression
 
@@ -492,7 +508,12 @@ assert_statement      ::= "Assert" expression ("with" "message" expression)?
 ## Resource Management
 
 ```ebnf
-with_statement        ::= "With" expression "as" identifier ':' block
+with_statement        ::= "With" with_expression "as" identifier ':' block
+
+with_expression       ::= natural_language_call | function_call
+
+natural_language_call ::= identifier (identifier)* ("with" identifier "as" expression)*
+function_call         ::= identifier '(' argument_list? ')'
 
 delete_statement      ::= "Delete" expression
 ```
@@ -597,15 +618,29 @@ dict_entry            ::= identifier "as" expression
 1. Primary expressions (literals, identifiers, parentheses)
 2. Postfix operators (member access, indexing, function calls)
 3. Unary operators (negative, positive, not)
-4. Power operator (to the power of)
-5. Multiplicative operators (multiplied by, divided by, modulo)
-6. Additive operators (plus, minus, concatenated with)
-7. Comparison operators (is equal to, is greater than, etc.)
-8. Logical NOT (not)
-9. Logical AND (and)
-10. Logical OR (or)
-11. Ternary conditional (if...else)
-12. Assignment operators (be, as, to)
+4. Power operator (power of, **)
+5. Multiplicative operators (multiplied by, divided by, modulo, *, /, %)
+6. Additive operators (plus, minus, concatenated with, +, -)
+7. Bitwise shift operators (shifted left by, shifted right by)
+8. Comparison operators (equals, is greater than, <, >, <=, >=, !=)
+9. Bitwise AND (bitwise and, &)
+10. Bitwise XOR (bitwise xor, ^)
+11. Bitwise OR (bitwise or, |)
+12. Logical NOT (not, logical not)
+13. Logical AND (and, logical and)
+14. Logical OR (or, logical or)
+15. Ternary conditional (if...else)
+16. Assignment operators (be, as, to)
+
+## Operator Type Classifications
+
+The compiler enforces operator usage based on context:
+
+- **Mathematical**: `+`, `-`, `*`, `/`, `%`, `plus`, `minus`, `multiplied by`, `divided by`, `modulo`, `power of`
+- **Mathematical Comparison**: `<`, `>`, `<=`, `>=`, `!=`, `is greater than`, `is less than`, `is greater than or equal to`, `is less than or equal to`, `does not equal`
+- **General Comparison**: `equals`, `contains`, `is in`, `is of type`
+- **Bitwise**: `bitwise and`, `bitwise or`, `bitwise xor`, `bitwise not`, `shifted left by`, `shifted right by`
+- **Logical**: `and`, `or`, `not`, `logical and`, `logical or`, `logical not`
 
 ## Grammar Notes
 
@@ -616,12 +651,22 @@ Runa supports multi-word identifiers separated by spaces:
 - `account balance` is a valid identifier
 - `final total` is a valid identifier
 
-### Natural Language Operators
+### Dual Operator System
 
-Operators use natural language constructs:
+Runa supports both natural language and mathematical symbols:
+
+**Natural Language (Canonical)**:
 - Arithmetic: `plus`, `minus`, `multiplied by`, `divided by`
-- Comparison: `is equal to`, `is greater than`, `is less than or equal to`
+- Comparison: `equals`, `is greater than`, `is less than or equal to`
 - Logical: `and`, `or`, `not`
+
+**Mathematical Symbols (Restricted)**:
+- Arithmetic: `+`, `-`, `*`, `/`, `%`
+- Comparison: `<`, `>`, `<=`, `>=`, `!=`
+- Note: Symbols are only permitted in mathematical contexts
+
+**Symbol-to-Word Conversion**:
+The formatter automatically converts symbols to natural language during deployment unless configured otherwise.
 
 ### Indentation-Based Blocks
 
@@ -652,6 +697,8 @@ Parsers should implement error recovery strategies:
 2. **Keyword Disambiguation**: Distinguish keywords from identifiers in context
 3. **Indentation Tracking**: Generate INDENT/DEDENT tokens based on whitespace
 4. **String Interpolation**: Handle format expressions within f-strings
+5. **Mathematical Symbol Enforcement**: Validate mathematical symbols are only used in mathematical contexts
+6. **Dual Operator Support**: Recognize both symbolic and natural language operators
 
 ### Parser Requirements
 
@@ -659,6 +706,8 @@ Parsers should implement error recovery strategies:
 2. **Operator Precedence**: Implement precedence climbing for expressions
 3. **Error Recovery**: Graceful handling of syntax errors
 4. **AST Generation**: Rich AST nodes with source location information
+5. **Operator Context Validation**: Enforce mathematical symbol usage restrictions
+6. **Type-aware Operator Resolution**: Handle operator overloading based on operand types
 
 ### Semantic Analysis
 
@@ -666,6 +715,27 @@ Parsers should implement error recovery strategies:
 2. **Type Checking**: Strong static typing with inference
 3. **Generic Resolution**: Type parameter substitution and constraint checking
 4. **Pattern Exhaustiveness**: Ensure all match cases are covered
+5. **Mathematical Context Analysis**: Validate mathematical symbol usage in expressions
+6. **Operator Type Classification**: Enforce operator usage based on context (mathematical, comparison, logical, bitwise)
+
+### Formatter Integration
+
+The grammar works in conjunction with the formatter for operator canonicalization:
+
+```ebnf
+formatted_source ::= canonicalize_operators(source_code)
+canonical_form   ::= natural_language_operators | symbolic_operators_in_math_context
+```
+
+**Conversion Rules**:
+- `+` → `plus` (in mathematical contexts)
+- `-` → `minus` (in mathematical contexts)  
+- `*` → `multiplied by` (in mathematical contexts)
+- `/` → `divided by` (in mathematical contexts)
+- `<=` → `is less than or equal to` (in comparison contexts)
+- `>=` → `is greater than or equal to` (in comparison contexts)
+- `!=` → `does not equal` (in comparison contexts)
+
 
 This grammar specification provides the complete formal definition of Runa's syntax and serves as the foundation for all language tooling and implementations.
 
@@ -674,10 +744,19 @@ This grammar specification provides the complete formal definition of Runa's syn
 context_block ::= "With" identifier "as" identifier ":" block
 block         ::= INDENT statement* DEDENT
 
-# Example:
-# With heap as h:
-#     Let first be pop
-#     Let second be pop
+# Examples showing both canonical and technical syntax:
+# 
+# Canonical syntax (recommended):
+# With open file with path as "data.txt" for reading as data_file:
+#     Let content be read_all from data_file
+#     Display content
+#
+# Technical shorthand (alternative):
+# With open_file("data.txt") as data_file:
+#     Let content be read_all from data_file
+#     Display content
+#
+# Both syntaxes are functionally identical and produce the same target language output.
 
 # --- Imperative Assignment Idiom (PLANNED) ---
 
@@ -701,4 +780,9 @@ index_expression ::= primary_expression '[' expression ']'
 
 Note:
 For asynchronous context management, use 'Async:' blocks with 'With' inside, as 'AsyncWith' is not yet a language keyword. See the context manager protocol in the standard library documentation for details and idiomatic usage.
+
+**Mathematical Symbol Enforcement Note**:
+Mathematical symbols (+, -, *, /, %, <, >, <=, >=, !=) are restricted to mathematical contexts only. The compiler performs context analysis to ensure symbols are not used inappropriately (e.g., in string concatenation or non-mathematical operations). Use natural language operators for non-mathematical contexts.
+
+**Grammar Version**: This grammar reflects the current implementation with mathematical symbol enforcement, dual operator support, and symbol-to-word conversion capabilities.
 :End Note

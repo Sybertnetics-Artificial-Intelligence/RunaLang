@@ -32,7 +32,7 @@ Any type implementing these protocols can be used with the `With` statement for 
 ### Example: Synchronous Lock Context
 ```runa
 Let lock be create_lock
-With enter_context with lock as lock_resource:
+With acquire lock with lock as lock_resource:
     Note: Critical section
     Display "Lock acquired!"
     Let released be release_lock with lock as lock_resource
@@ -103,8 +103,8 @@ Async:
 ```runa
 Let lock1 be create_lock
 Let lock2 be create_lock
-With enter_context with lock1 as l1:
-    With enter_context with lock2 as l2:
+With acquire lock with lock1 as l1:
+    With acquire lock with lock2 as l2:
         Try:
             Display "Both locks acquired"
         Catch exception as e:

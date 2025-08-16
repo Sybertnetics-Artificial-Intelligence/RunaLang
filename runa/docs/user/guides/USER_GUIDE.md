@@ -102,7 +102,7 @@ Display x
 ### Natural Language Keywords
 Runa uses English words instead of symbols:
 - `be` instead of `=`
-- `is equal to` instead of `==`
+- `equals` instead of `==`
 - `is greater than` instead of `>`
 - `and` / `or` instead of `&&` / `||`
 

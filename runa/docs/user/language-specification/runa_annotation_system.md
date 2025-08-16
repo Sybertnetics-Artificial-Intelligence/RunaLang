@@ -1,9 +1,14 @@
 # Runa Code Annotation System
 *Structured Annotations for Enhanced Code Documentation and AI Interaction*
 
+**Last Updated**: 2025-08-15  
+**Note**: This documentation reflects the current implementation with mathematical symbol enforcement.
+
 ## Overview
 
 Runa includes a comprehensive annotation system that allows developers to embed structured metadata, reasoning, and context directly in their code. These annotations serve multiple purposes: improving code documentation, enabling AI-assisted development, facilitating code review, and supporting automated analysis tools.
+
+**Mathematical Symbol Note**: All annotation examples use natural language operators (`plus`, `minus`, `is less than`) which are always valid. Mathematical symbols are restricted to mathematical contexts only.
 
 ## Core Concepts
 
