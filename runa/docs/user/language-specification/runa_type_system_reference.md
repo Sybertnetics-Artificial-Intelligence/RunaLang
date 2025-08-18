@@ -10,6 +10,16 @@ Runa's type system is designed to provide the safety and expressiveness of moder
 
 **Mathematical Symbol Enforcement**: The type system works with the compiler's mathematical symbol enforcement, where mathematical operators (`+`, `-`, `*`, `/`, `%`, `<`, `>`, `<=`, `>=`, `!=`) are restricted to mathematical contexts only. Type checking validates operator usage based on operand types and contexts.
 
+Note: Operator Tokens and Concatenation
+The bootstrap lexer/parser provide a dedicated concatenation operator token for strings using the phrase "joined with". Examples:
+
+```runa
+Let greeting be "Hello, " joined with user_name
+Let path be base joined with "/" joined with filename
+```
+
+Use natural language for non-math operations; mathematical symbols are rejected outside numeric contexts.
+
 ## Core Principles
 
 ### 1. Gradual Typing
@@ -119,7 +129,7 @@ Process called "calculate_grade"
 
 Note: Parameter types with inferred return type
 Process called "format_name" that takes first as String and last as String:
-    Return first followed by " " followed by last  Note: Return type inferred as String
+    Return first joined with " " joined with last  Note: Return type inferred as String
 
 Note: Generic function with type parameters
 Process called "find_maximum"[T: Comparable] 
@@ -301,12 +311,12 @@ Process called "sum_values"[T: Addable] that takes values as List[T] returns T:
 ```runa
 Note: Generic function
 Process called "process_data"[T] that takes data as T returns String:
-    Return "Processing: " followed by (data to string)
+    Return "Processing: " joined with (data to string)
 
 Note: Specialized version for specific type
 Process called "process_data" that takes data as List[Integer] returns String:
     Let sum be sum of data
-    Return "Processing list with sum: " followed by (sum to string)
+    Return "Processing list with sum: " joined with (sum to string)
 ```
 
 ## Union and Intersection Types
@@ -502,10 +512,10 @@ Process called "handle_result"[T] that takes result as Result[T] returns String:
     Match result:
         When Success with value as v:
             Note: v has type T here
-            Return "Success: " followed by (v to string)
+            Return "Success: " joined with (v to string)
         When Failure with error as e:
             Note: e has type String here
-            Return "Error: " followed by e
+            Return "Error: " joined with e
 ```
 
 ### Exhaustiveness Checking
@@ -603,7 +613,7 @@ Process called "safe_division" that takes numerator as Integer and denominator a
     Return numerator divided by denominator  Note: Type system ensures denominator > 0
 
 Process called "process_non_empty" that takes items as NonEmptyString returns String:
-    Return "Processing: " followed by items  Note: Type system ensures items is not empty
+    Return "Processing: " joined with items  Note: Type system ensures items is not empty
 
 Note: Refinement type construction
 Let positive_number be 42 as PositiveInteger  Note: Runtime check: 42 > 0
@@ -651,7 +661,7 @@ Process called "validate_age" that takes age as Integer returns Age:
     If age is greater than or equal to 0 and age is less than or equal to 150:
         Return age as Age
     Otherwise:
-        Raise "Invalid age: " followed by (age to string)
+        Raise "Invalid age: " joined with (age to string)
 
 Process called "validate_email" that takes email as String returns ValidEmail:
     If matches_email_pattern with input as email:

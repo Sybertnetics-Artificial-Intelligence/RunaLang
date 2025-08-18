@@ -118,6 +118,9 @@ static MULTI_WORD_OPERATORS: &[(&str, TokenType)] = &[
     
     // String concatenation operators
     ("followed by", TokenType::FollowedBy),
+    ("concatenated with", TokenType::FollowedBy),
+    ("joined with", TokenType::FollowedBy),
+
     
     // Function call syntax
     ("called with", TokenType::CalledWith),

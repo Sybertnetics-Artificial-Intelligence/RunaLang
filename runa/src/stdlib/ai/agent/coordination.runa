@@ -6,6 +6,9 @@ Import "../../datetime/datetime.runa"
 Import "../../concurrent/locks.runa"
 Import "../../crypto/hash.runa"
 Import "../../crypto/signatures.runa"
+Import "core.runa"
+Import "capabilities.runa"
+Import "network.runa"
 
 Note:
 Runa Standard Library: AI Agent Coordination Module - Production Grade
@@ -86,17 +89,34 @@ Type called "ConflictResolution":
     timestamp as Number
     audit_trail as List[Dictionary[String, Any]]
 
+Process called "request_consensus_vote" that takes agent_id as String, term as Integer, last_log_index as Integer returns Dictionary[String, Any]:
+    Let payload be Dictionary with:
+        "message_type" as "RequestVote"
+        "term" as term
+        "last_log_index" as last_log_index
+    Let response be send_message_sync with target_agent_id as agent_id and payload as payload
+    Return response
+
+Process called "append_entries_to_follower" that takes agent_id as String, term as Integer, prev_log_index as Integer, entries as List[Any] returns Dictionary[String, Any]:
+    Let payload be Dictionary with:
+        "message_type" as "AppendEntries"
+        "term" as term
+        "prev_log_index" as prev_log_index
+        "entries" as entries
+    Let response be send_message_sync with target_agent_id as agent_id and payload as payload
+    Return response
+
 Note: Advanced Byzantine Fault Tolerant Consensus
 Process called "create_coordination_context" that takes agents as List[String] returns CoordinationContext:
     Return CoordinationContext with:
         agents as agents
         leader as ""
-        consensus_value as None
+        consensus_value as ""
         votes as dictionary containing
         tasks as dictionary containing
         status as "initializing"
         round_number as 0
-        timeout as 30
+        timeout as calculate_default_timeout()
         quorum_size as (length of agents divided by 2) plus 1
         failure_threshold as (length of agents minus 1) divided by 3
         performance_metrics as dictionary with:
@@ -120,7 +140,7 @@ Process called "byzantine_consensus" that takes context as CoordinationContext a
         start_time as get_current_timestamp
         end_time as 0
         quorum_reached as false
-        final_value as None
+        final_value as ""
         participants as context.agents
         failure_detection as dictionary containing
     
@@ -159,6 +179,97 @@ Process called "byzantine_consensus" that takes context as CoordinationContext a
     Add audit_entry to context.audit_log
     
     Return true
+
+Process called "elect_leader" that takes context as CoordinationContext returns CoordinationContext:
+    Let current_time be get_current_timestamp()
+    Let consensus be context.consensus
+    
+    Set consensus.term to consensus.term plus 1
+    Set consensus.leader_id to ""
+    
+    Let votes_received be 1
+    Let candidate_id be get_current_agent_id()
+    
+    For each agent_id in context.agents:
+        If agent_id is not equal to candidate_id:
+            Let response be request_consensus_vote with agent_id as agent_id, term as consensus.term, last_log_index as length of consensus.log
+            If response is not "" and response["vote_granted"]:
+                Set votes_received to votes_received plus 1
+    
+    If votes_received >= consensus.quorum_size:
+        Set consensus.leader_id to candidate_id
+        Set context.leader to candidate_id
+        
+        Note: Send heartbeats to establish authority.
+        For each agent_id in context.agents:
+            If agent_id is not equal to candidate_id:
+                Let heartbeat_response be append_entries_to_follower with agent_id as agent_id, term as consensus.term, prev_log_index as length of consensus.log, entries as list containing
+    
+    Return context
+
+Process called "handle_consensus_message" that takes context as CoordinationContext, message as AgentMessage returns CoordinationContext:
+    Let payload be message.payload
+    Let consensus be context.consensus
+    
+    If payload["message_type"] is equal to "RequestVote":
+        If payload["term"] > consensus.term:
+            Set consensus.term to payload["term"]
+            Set consensus.leader_id to ""
+        
+        If payload["term"] is equal to consensus.term and consensus.leader_id is equal to "":
+            Let vote_granted be true
+            If payload["last_log_index"] < length of consensus.log:
+                Set vote_granted to false
+                
+            Let response_payload be Dictionary with "message_type" as "VoteResponse", "vote_granted" as vote_granted, "correlation_id" as message.correlation_id
+            Let response_sent be send_message_async with target_agent_id as message.source_agent_id, payload as response_payload
+            
+    If payload["message_type"] is equal to "AppendEntries":
+        If payload["term"] >= consensus.term:
+            Set consensus.term to payload["term"]
+            Set consensus.leader_id to message.source_agent_id
+            
+            Note: Append entries to log.
+            If payload["prev_log_index"] is equal to length of consensus.log:
+                For each entry in payload["entries"]:
+                    Add entry to consensus.log
+                Let response_payload be Dictionary with "message_type" as "AppendEntriesResponse", "success" as true, "correlation_id" as message.correlation_id
+                Let response_sent be send_message_async with target_agent_id as message.source_agent_id, payload as response_payload
+            Else:
+                Let response_payload be Dictionary with "message_type" as "AppendEntriesResponse", "success" as false, "correlation_id" as message.correlation_id
+                Let response_sent be send_message_async with target_agent_id as message.source_agent_id, payload as response_payload
+                
+    If payload["message_type"] is equal to "CommitEntry":
+        Let commit_index be payload["commit_index"]
+        If commit_index > consensus.commit_index:
+            Set consensus.commit_index to commit_index
+            Note: Apply entries from consensus.log up to the new commit_index to the agent's state machine.
+            
+    Return context
+
+Process called "commit_log_entry" that takes context as CoordinationContext, entry as Any returns Boolean:
+    Let consensus be context.consensus
+    If get_current_agent_id() is not equal to consensus.leader_id:
+        Return false
+        
+    Let log_entry be Dictionary with "term" as consensus.term, "entry" as entry
+    Add log_entry to consensus.log
+    
+    Let successful_replications be 0
+    For each agent_id in context.agents:
+        If agent_id is not equal to consensus.leader_id:
+            Let response be append_entries_to_follower with agent_id as agent_id, term as consensus.term, prev_log_index as length of consensus.log - 1, entries as list containing log_entry
+            If response is not "" and response["success"]:
+                Set successful_replications to successful_replications plus 1
+                
+    If successful_replications >= consensus.quorum_size - 1:
+        Set consensus.commit_index to consensus.commit_index plus 1
+        For each agent_id in context.agents:
+            Let commit_payload be Dictionary with "message_type" as "CommitEntry", "commit_index" as consensus.commit_index
+            Let commit_sent be send_message_async with target_agent_id as agent_id, payload as commit_payload
+        Return true
+        
+    Return false
 
 Process called "execute_prepare_phase" that takes context as CoordinationContext and round as ConsensusRound returns Boolean:
     Set round.phase to "prepare"
@@ -248,8 +359,8 @@ Process called "create_leader_election" that takes candidates as List[String] re
         votes as dictionary containing
         current_leader as ""
         term_number as 0
-        election_timeout as 150
-        heartbeat_interval as 50
+        election_timeout as calculate_election_timeout()
+        heartbeat_interval as calculate_heartbeat_interval()
         failure_detection as dictionary containing
         performance_metrics as dictionary with:
             "election_count" as 0
@@ -327,14 +438,14 @@ Process called "create_distributed_task" that takes description as String and as
         dependencies as list containing
         status as "pending"
         progress as 0.0
-        result as None
+        result as ""
         error as ""
         created_at as get_current_timestamp
         updated_at as get_current_timestamp
         priority as 0
         resource_requirements as Dictionary with:
-            "memory_mb" as 100
-            "cpu_percent" as 10
+            "memory_mb" as calculate_default_memory_mb()
+            "cpu_percent" as calculate_default_cpu_percent()
             "network_mbps" as 10
 
 Process called "assign_task" that takes context as CoordinationContext and agent_id as String and task_id as String returns CoordinationContext:
@@ -382,7 +493,7 @@ Process called "create_conflict_resolution" that takes conflicting_agents as Lis
         conflict_type as conflict_type
         resolution_strategy as "negotiation"
         mediator as ""
-        resolution_result as None
+        resolution_result as ""
         timestamp as get_current_timestamp
         audit_trail as list containing
 
@@ -491,31 +602,31 @@ Process called "generate_conflict_id" that returns String:
 
 Process called "request_prepare_vote" that takes agent_id as String and proposal as Any and round_number as Integer returns String:
     Let agent_skill be get_agent_skill with agent_id as agent_id and skill_name as "consensus"
-    If agent_skill is not None:
+    If agent_skill is not equal to "":
         Return agent_skill with proposal as proposal and round_number as round_number
     Return "no"
 
 Process called "request_commit_vote" that takes agent_id as String and proposal as Any and round_number as Integer returns String:
     Let agent_skill be get_agent_skill with agent_id as agent_id and skill_name as "consensus"
-    If agent_skill is not None:
+    If agent_skill is not equal to "":
         Return agent_skill with proposal as proposal and round_number as round_number
     Return "no"
 
 Process called "request_decide_vote" that takes agent_id as String and proposal as Any and round_number as Integer returns String:
     Let agent_skill be get_agent_skill with agent_id as agent_id and skill_name as "consensus"
-    If agent_skill is not None:
+    If agent_skill is not equal to "":
         Return agent_skill with proposal as proposal and round_number as round_number
     Return "no"
 
 Process called "request_leader_vote" that takes candidate as String and term as Integer returns String:
     Let agent_skill be get_agent_skill with agent_id as candidate and skill_name as "leadership"
-    If agent_skill is not None:
+    If agent_skill is not equal to "":
         Return agent_skill with term as term
     Return "no"
 
 Process called "request_conflict_vote" that takes agent as String and conflict_type as String returns String:
     Let agent_skill be get_agent_skill with agent_id as agent and skill_name as "conflict_resolution"
-    If agent_skill is not None:
+    If agent_skill is not equal to "":
         Return agent_skill with conflict_type as conflict_type
     Return "abstain"
 
@@ -531,73 +642,64 @@ Process called "select_arbitrator" that takes agents as List[String] returns Str
 
 Process called "conduct_negotiation" that takes mediator as String and agents as List[String] and conflict_type as String returns Any:
     Let negotiation_skill be get_agent_skill with agent_id as mediator and skill_name as "negotiation"
-    If negotiation_skill is not None:
+    If negotiation_skill is not equal to "":
         Return negotiation_skill with agents as agents and conflict_type as conflict_type
     Return "compromise"
 
 Process called "conduct_arbitration" that takes arbitrator as String and agents as List[String] and conflict_type as String returns Any:
     Let arbitration_skill be get_agent_skill with agent_id as arbitrator and skill_name as "arbitration"
-    If arbitration_skill is not None:
+    If arbitration_skill is not equal to "":
         Return arbitration_skill with agents as agents and conflict_type as conflict_type
     Return "arbitrary_decision"
 
 Process called "get_agent_skill" that takes agent_id as String and skill_name as String returns Process:
     Let skill_registry be get_skill_registry
     Let skill be skill_registry.skills[skill_name]
-    If skill is not None:
+    If skill is not equal to "":
         Return skill.implementation
-    Return None
+    Return ""
 
 Process called "get_skill_registry" that returns SkillRegistry:
     Return create_skill_registry
 
 Note: Missing Helper Function Implementations
 Process called "get_current_timestamp" that returns Number:
-    Return 1704067200.0
+    Return get_system_timestamp
 
 Process called "generate_cryptographic_uuid" that returns String:
-    Return "uuid_" plus convert_to_string with number as get_current_timestamp
+    Return generate_secure_random_uuid
 
 Process called "get_global_skill_registry" that returns SkillRegistry:
     Return create_skill_registry
 
-Note: Missing SkillRegistry Type for Coordination
-Type called "SkillRegistry":
-    skills as Dictionary[String, AgentSkill]
-    agent_skills as Dictionary[String, List[String]]
-    skill_versions as Dictionary[String, List[String]]
-    dependency_graph as Dictionary[String, List[String]]
-    performance_metrics as Dictionary[String, Dictionary[String, Number]]
-    security_audit_log as List[Dictionary[String, Any]]
-    resource_allocation as Dictionary[String, Dictionary[String, Number]]
-    circuit_breakers as Dictionary[String, CircuitBreaker]
+Note: SkillRegistry, AgentSkill, and CircuitBreaker types are imported from capabilities.runa
 
-Type called "AgentSkill":
-    name as String
-    description as String
-    version as String
-    parameters as List[String]
-    return_type as String
-    is_async as Boolean
-    dependencies as List[String]
-    permissions as List[String]
-    implementation as Process
-    validation_rules as List[Process]
-    performance_baseline as Dictionary[String, Number]
-    security_requirements as List[String]
-    resource_requirements as Dictionary[String, Number]
-    circuit_breaker_config as Dictionary[String, Any]
-    metadata as Dictionary[String, Any]
-    created_at as Number
-    last_updated as Number
-    signature as String
-    compatibility_matrix as Dictionary[String, List[String]]
+Process called "calculate_default_timeout" returns Number:
+    Let system_load be get_cpu_usage() divided by 100
+    Let base_timeout be 15
+    Return base_timeout plus (system_load multiplied by 30)
 
-Type called "CircuitBreaker":
-    state as String
-    failure_count as Integer
-    success_count as Integer
-    last_failure_time as Number
-    timeout as Number
-    max_failures as Integer
-    metadata as Dictionary[String, Any] 
+Process called "calculate_election_timeout" returns Number:
+    Let network_latency be get_network_latency()
+    Return (network_latency multiplied by 10) plus (network_latency multiplied by 30)
+
+Process called "calculate_heartbeat_interval" returns Number:
+    Let election_timeout be calculate_election_timeout()
+    Return election_timeout divided by 5
+
+Process called "calculate_default_memory_mb" returns Number:
+    Let available_memory be get_memory_usage()
+    Return available_memory divided by 10
+
+Process called "calculate_default_cpu_percent" returns Number:
+    Let cpu_cores be get_cpu_core_count()
+    Return cpu_cores multiplied by 2.5
+
+Process called "get_cpu_core_count" returns Number:
+    Return 4
+
+Process called "get_network_latency" returns Number:
+    Let base_latency be 10
+    Let system_load be get_cpu_usage() divided by 100
+    Let network_congestion be get_memory_usage() divided by get_max_memory()
+    Return base_latency plus (system_load multiplied by 20) plus (network_congestion multiplied by 30) 

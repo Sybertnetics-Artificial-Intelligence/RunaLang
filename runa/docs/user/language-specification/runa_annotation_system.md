@@ -10,6 +10,38 @@ Runa includes a comprehensive annotation system that allows developers to embed 
 
 **Mathematical Symbol Note**: All annotation examples use natural language operators (`plus`, `minus`, `is less than`) which are always valid. Mathematical symbols are restricted to mathematical contexts only.
 
+### Implementation Conformance (Bootstrap Compiler)
+
+The bootstrap parser currently recognizes and parses the following top-level annotation blocks:
+
+- @Reasoning ... @End_Reasoning
+- @Implementation ... @End_Implementation
+- @Uncertainty ... @End_Uncertainty
+- @Request_Clarification ... @End_Request_Clarification
+- @KnowledgeReference ... @End_KnowledgeReference
+- @TestCases ... @End_TestCases
+- @Resource_Constraints ... @End_Resource_Constraints
+- @Security_Scope ... @End_Security_Scope
+- @Execution_Model ... @End_Execution_Model
+- @Performance_Hints ... @End_Performance_Hints
+- @Progress ... @End_Progress
+- @Feedback ... @End_Feedback
+- @Translation_Note ... @End_Translation_Note
+- @Error_Handling ... @End_Error_Handling
+
+Specified but not yet routed by the bootstrap parser as top-level blocks (reserved and recognized by the lexer, but not consumed as annotation blocks yet):
+
+- @Task, @End_Task
+- @Requirements, @End_Requirements
+- @Verify, @End_Verify
+- @Request, @End_Request
+- @Context, @End_Context
+- @Collaboration, @End_Collaboration
+- @Iteration, @End_Iteration
+- @Clarification, @End_Clarification
+
+These remain part of the language specification and are supported in the annotation type system; parser routing will be enabled in a subsequent bootstrap update. Until then, keep these blocks in code for forward-compatibility, or place their content inside parsed blocks (e.g., within @Implementation) if immediate parsing is required.
+
 ## Core Concepts
 
 ### Annotation Categories

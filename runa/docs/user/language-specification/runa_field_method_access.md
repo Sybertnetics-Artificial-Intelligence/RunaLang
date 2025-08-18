@@ -67,6 +67,7 @@ Let item be my_list[0]
 Let element be array at index 5
 Let first_item be list at index 0
 Let last_item be list at index length of list minus 1
+Let value2 be my_dict at key "id"
 ```
 
 ### Natural Language for Collections

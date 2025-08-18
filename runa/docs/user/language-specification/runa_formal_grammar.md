@@ -34,6 +34,7 @@ EOF                   ::= end of file
 
 ```ebnf
 comment               ::= "Note:" [^\n]* NEWLINE
+                      | "Note:" NEWLINE (/.*/ NEWLINE)* ":End Note" NEWLINE
 ```
 
 ### Identifiers
@@ -92,7 +93,8 @@ float_literal         ::= digit+ '.' digit+ ('_' digit+)*
 string_literal        ::= normal_string | raw_string | formatted_string
 normal_string         ::= '"' string_content '"' | "'" string_content "'"
 raw_string            ::= 'r"' raw_string_content '"' | "r'" raw_string_content "'"
-formatted_string      ::= 'f"' format_string_content '"' | "f'" format_string_content "'"
+formatted_string      ::= '"' format_string_content '"' | "'" format_string_content "'"
+                       | 'f"' format_string_content '"' | "f'" format_string_content "'"
 
 string_content        ::= (string_char | escape_sequence)*
 raw_string_content    ::= [^"']* | [^']*
@@ -258,14 +260,14 @@ protocol_member       ::= "Process" "called" identifier
 ## Function Definitions
 
 ```ebnf
-function_definition   ::= "Async"? "Process" "called" identifier generic_params?
+function_definition   ::= "Async"? "Process" "called" string_literal generic_params?
                          ("that" "takes" parameter_list)?
                          ("returns" type_expression)?
                          ':' block
 
-parameter_list        ::= parameter (',' parameter)*
+parameter_list        ::= parameter (("and" | ',') parameter)*
 
-parameter             ::= identifier type_annotation? ("defaults" "to" expression)?
+parameter             ::= identifier ("as" type_expression)? ("defaults" "to" expression)?
 
 external_function_declaration ::= "External" "Process" "called" identifier
                                  ("that" "takes" parameter_list)?
@@ -399,7 +401,7 @@ equality_operator     ::= "is" "equal" "to"    # Canonical natural language form
 
 additive_expression   ::= multiplicative_expression (additive_op multiplicative_expression)*
 
-additive_op           ::= "plus" | "minus" | "concatenated" "with" | mathematical_symbol_operator
+additive_op           ::= "plus" | "minus" | "joined" "with" | mathematical_symbol_operator
 
 multiplicative_expression ::= unary_expression (multiplicative_op unary_expression)*
 
@@ -447,6 +449,7 @@ natural_method_access ::= "the" identifier "of" expression
 
 index_access          ::= '[' expression ']'
                         | "at" "index" expression
+                        | "at" "key" expression
 
 slice_access          ::= '[' expression? ':' expression? (':' expression)? ']'
 ```
@@ -546,14 +549,18 @@ atomic_block          ::= "Atomic" ':' block
 ```ebnf
 ai_annotation         ::= reasoning_annotation
                         | implementation_annotation
-                        | task_annotation
+                        | uncertainty_annotation
+                        | request_clarification_annotation
                         | knowledge_annotation
+                        | testcases_annotation
+                        | task_annotation
+                        | requirements_annotation
                         | verification_annotation
                         | resource_annotation
                         | security_annotation
                         | execution_annotation
-                        | uncertainty_annotation
                         | progress_annotation
+                        | feedback_annotation
                         | translation_annotation
                         | error_handling_annotation
 
@@ -575,7 +582,15 @@ execution_annotation  ::= "@Execution_Model:" execution_params "@End_Execution_M
 
 uncertainty_annotation ::= "@Uncertainty:" uncertainty_content "@End_Uncertainty"
 
+request_clarification_annotation ::= "@Request_Clarification:" annotation_content "@End_Request_Clarification"
+
+testcases_annotation  ::= "@TestCases:" structured_content "@End_TestCases"
+
+requirements_annotation ::= "@Requirements:" structured_content "@End_Requirements"
+
 progress_annotation   ::= "@Progress:" progress_content "@End_Progress"
+
+feedback_annotation   ::= "@Feedback:" annotation_content "@End_Feedback"
 
 translation_annotation ::= "@Translation_Note:" translation_content "@End_Translation_Note"
 
@@ -620,7 +635,7 @@ dict_entry            ::= identifier "as" expression
 3. Unary operators (negative, positive, not)
 4. Power operator (power of, **)
 5. Multiplicative operators (multiplied by, divided by, modulo, *, /, %)
-6. Additive operators (plus, minus, concatenated with, +, -)
+6. Additive operators (plus, minus, joined with, +, -)
 7. Bitwise shift operators (shifted left by, shifted right by)
 8. Comparison operators (equals, is greater than, <, >, <=, >=, !=)
 9. Bitwise AND (bitwise and, &)
@@ -643,6 +658,13 @@ The compiler enforces operator usage based on context:
 - **Logical**: `and`, `or`, `not`, `logical and`, `logical or`, `logical not`
 
 ## Grammar Notes
+
+### Bootstrap Compiler Conformance
+
+- Function/process names are parsed as string literals after the keyword sequence: `Process called "name" ...`.
+- Natural indexing supports both `at index` and `at key` forms, and bracket indexing `[]` is supported.
+- String concatenation uses the phrase `joined with` (tokenized as a dedicated operator).
+- AI annotations recognized by the lexer include: @Reasoning, @Implementation, @Uncertainty, @Request_Clarification, @KnowledgeReference, @TestCases, @Resource_Constraints, @Security_Scope, @Execution_Model, @Performance_Hints, @Progress, @Feedback, @Translation_Note, @Error_Handling, @Request, @Context, @Task, @Requirements, @Verify, @Collaboration, @Iteration, @Clarification. The parser currently routes a subset (see complete specification). Remaining forms are reserved and will be routed in a subsequent update.
 
 ### Multi-word Identifiers
 

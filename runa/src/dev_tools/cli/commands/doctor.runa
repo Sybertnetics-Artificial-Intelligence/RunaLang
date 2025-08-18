@@ -9,6 +9,7 @@ Import "../../../stdlib/io/console" as Console
 Import "../../../stdlib/ai/reasoning/engine" as ReasoningEngine
 Import "../../../stdlib/ai/agent/core" as Agent
 Import "../../../compiler/semantic/semantic_analyzer" as Analyzer
+Import "../../../stdlib/string/regex" as Regex
 
 Type called "AnalysisResult":
     file_path as String
@@ -42,6 +43,7 @@ Process called "execute" that takes context as Dictionary returns Integer:
     Let flags be context get "flags"
     Let deep_analysis be flags get "deep-ai"
     Let explain_mode be flags get "explain"
+    Let auto_fix be flags get "fix"
     
     Console.print("🔍 Runa Doctor - AI-Powered Code Analysis")
     Console.print("=========================================")
@@ -98,6 +100,9 @@ Process called "execute" that takes context as Dictionary returns Integer:
             
             Console.print("")
         
+        If auto_fix:
+            Let fixed be apply_autofixes(file_path)
+        
         Set project_score to project_score plus analysis get "score"
     
     Note: Calculate overall project health
@@ -127,6 +132,27 @@ Process called "execute" that takes context as Dictionary returns Integer:
         Console.print("⚠️  Consider addressing the issues above to improve code quality")
     
     Return 0 if total_issues is equal to 0 else 1
+Process called "apply_autofixes" that takes file_path as String returns Boolean:
+    Let content be File.read_text(file_path)
+    Let fixed be content
+    
+    Note: Autofix 1: Replace ' is equal to ' → ' equals '
+    Set fixed to replace_all with string as fixed and old as " is equal to " and new as " equals "
+    
+    Note: Autofix 2: Safe string concat rewrites near literals
+    Set fixed to regex_replace_all with string as fixed and pattern as '"([^"\\]|\\.)*"\s*\+\s*' and replacement as '"$1" joined with '
+    Set fixed to regex_replace_all with string as fixed and pattern as '"([^"\\]|\\.)*"\s+plus\s+' and replacement as '"$1" joined with '
+    Set fixed to regex_replace_all with string as fixed and pattern as '\s\+\s*"([^"\\]|\\.)*"' and replacement as ' joined with "$1"'
+    Set fixed to regex_replace_all with string as fixed and pattern as '\splus\s+"([^"\\]|\\.)*"' and replacement as ' joined with "$1"'
+    
+    Note: Autofix 3: Canonicalize legacy concat phrases
+    Set fixed to replace_all with string as fixed and old as " concatenated with " and new as " joined with "
+    Set fixed to replace_all with string as fixed and old as " followed by " and new as " joined with "
+    
+    If fixed is not equal to content:
+        File.write_text(file_path, fixed)
+        Return true
+    Return false
 
 Process called "analyze_file" that takes file_path as String and engine as ReasoningEngine and deep as Boolean returns AnalysisResult:
     Let content be File.read_text(file_path)
@@ -146,8 +172,12 @@ Process called "analyze_file" that takes file_path as String and engine as Reaso
     Let session_id be ReasoningEngine.submit_reasoning_query(engine, query)
     Let reasoning_result be ReasoningEngine.execute_reasoning_session(engine, session_id)
     
-    Note: Extract issues and suggestions from AI analysis
-    Let issues be extract_issues_from_reasoning(reasoning_result)
+    Note: Gather issues: static lints + AI
+    Let issues be list containing nothing
+    Let static_issues be run_static_lints(file_path, content)
+    For each i in static_issues: Add i to issues
+    Let ai_issues be extract_issues_from_reasoning(reasoning_result)
+    For each i in ai_issues: Add i to issues
     Let suggestions be extract_suggestions_from_reasoning(reasoning_result)
     
     Note: Calculate complexity and score
@@ -160,6 +190,82 @@ Process called "analyze_file" that takes file_path as String and engine as Reaso
         "suggestions" as suggestions
         "score" as score
         "complexity" as complexity
+
+Process called "run_static_lints" that takes file_path as String and content as String returns List[Issue]:
+    Let issues be list containing nothing
+    Note: Lint 1: '=' used outside assignment context → suggest 'equals' or 'is equal to'
+    For each (line_text, line_num) in enumerate_lines(content):
+        If looks_like_comparison_with_equals(line_text):
+            Let issue be dictionary with:
+                "severity" as "warning"
+                "line" as line_num
+                "column" as 1
+                "message" as "Use 'equals' instead of '=' for comparisons in natural syntax"
+                "fix_suggestion" as suggest_equality_fix(line_text)
+                "confidence" as 0.9
+            Add issue to issues
+        
+        Note: Lint 2: '+' or 'plus' with obvious strings → suggest 'joined with'
+        If contains_string_concat_with_plus(line_text):
+            Let issue be dictionary with:
+                "severity" as "warning"
+                "line" as line_num
+                "column" as 1
+                "message" as "Use 'joined with' for string concatenation instead of '+' or 'plus'"
+                "fix_suggestion" as suggest_joined_with_fix(line_text)
+                "confidence" as 0.9
+            Add issue to issues
+        
+        Note: Lint 3: chained '+' with mixed strings
+        If contains_mixed_string_numeric_concat(line_text):
+            Let issue be dictionary with:
+                "severity" as "warning"
+                "line" as line_num
+                "column" as 1
+                "message" as "Prefer a single 'joined with' chain for string building"
+                "fix_suggestion" as suggest_joined_with_chain_fix(line_text)
+                "confidence" as 0.8
+            Add issue to issues
+    
+    Return issues
+
+Process called "enumerate_lines" that takes text as String returns List[Tuple[String, Integer]]:
+    Let lines be split text by "\n"
+    Let out be list containing nothing
+    Let idx be 1
+    For each ln in lines:
+        Add tuple containing ln, idx to out
+        Set idx to idx plus 1
+    Return out
+
+Process called "looks_like_comparison_with_equals" that takes line as String returns Boolean:
+    Note: Heuristic: '=' flanked by non-quote words and not part of ":" or annotation
+    If line contains ":": Return false
+    If line contains "@": Return false
+    If Regex.match(line, "[A-Za-z0-9_\]\)"]\s*=\s*[A-Za-z0-9_\("']"): Return true
+    Return false
+
+Process called "suggest_equality_fix" that takes line as String returns String:
+    Return "Replace '=' with 'equals' or 'is equal to'"
+
+Process called "contains_string_concat_with_plus" that takes line as String returns Boolean:
+    If Regex.match(line, '"[^"\\]*(?:\\.[^"\\]*)*"\s*(\+|plus)\s*'):
+        Return true
+    If Regex.match(line, '(\+|plus)\s*"[^"\\]*(?:\\.[^"\\]*)*"'):
+        Return true
+    Return false
+
+Process called "suggest_joined_with_fix" that takes line as String returns String:
+    Return "Rewrite as 'joined with' (formatter can auto-fix simple cases)"
+
+Process called "contains_mixed_string_numeric_concat" that takes line as String returns Boolean:
+    If contains_string_concat_with_plus(line): Return true
+    If Regex.match(line, '"[^"\\]*(?:\\.[^"\\]*)*"\s*(\+|plus)\s*[A-Za-z_]') and Regex.match(line, '[A-Za-z_]\s*(\+|plus)\s*[0-9]'):
+        Return true
+    Return false
+
+Process called "suggest_joined_with_chain_fix" that takes line as String returns String:
+    Return "Use 'joined with' consistently for string building chains"
 
 Process called "extract_issues_from_reasoning" that takes result as Dictionary returns List[Issue]:
     Let issues be list containing nothing

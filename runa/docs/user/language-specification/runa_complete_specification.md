@@ -205,13 +205,13 @@ infinite_loop         ::= "Loop" "forever" ":" block
 ### Function Definitions
 
 ```ebnf
-function_definition   ::= "Async"? "Process" "called" identifier
+function_definition   ::= "Async"? "Process" "called" string_literal
                          ("that" "takes" parameter_list)?
                          ("returns" type_expression)?
                          ":" block
 
-parameter_list        ::= parameter ("," parameter)*
-parameter             ::= identifier type_annotation? ("defaults" "to" expression)?
+parameter_list        ::= parameter (("and" | ",") parameter)*
+parameter             ::= identifier ("as" type_expression)? ("defaults" "to" expression)?
 ```
 
 ### Type Definitions
@@ -287,7 +287,7 @@ comparison_op         ::= "equals"
 
 additive_expression   ::= multiplicative_expression (additive_op multiplicative_expression)*
 
-additive_op           ::= "plus" | "minus" | "concatenated" "with"
+additive_op           ::= "plus" | "minus" | "joined" "with"
 
 multiplicative_expression ::= unary_expression (multiplicative_op unary_expression)*
 
@@ -358,11 +358,12 @@ Let sum be add with a as a and b as b
 
 #### Collection Access
 
-**Bracket Notation (For Dictionaries and Lists):**
+**Bracket/Natural Notation (For Dictionaries and Lists):**
 ```runa
 Let value be my_dict["key"]
 Let item be my_list[0]
 Let element be array at index 5
+Let value2 be my_dict at key "id"
 ```
 
 **Natural Language for Collections:**
@@ -1521,6 +1522,9 @@ Let message be Receive from channel
 
 Runa includes a comprehensive annotation system for AI-assisted development, enabling enhanced code documentation, reasoning, and intelligent code analysis.
 
+Note: Bootstrap Compiler Conformance
+The current bootstrap implementation routes the following annotation blocks as first-class statements: @Reasoning, @Implementation, @Uncertainty, @Request_Clarification, @KnowledgeReference, @TestCases, @Resource_Constraints, @Security_Scope, @Execution_Model, @Performance_Hints, @Progress, @Feedback, @Translation_Note, and @Error_Handling. Additional specified blocks (@Task, @Requirements, @Verify, @Request, @Context, @Collaboration, @Iteration, @Clarification) are recognized by the lexer and annotation type system and will be fully routed by the parser in a subsequent update. Keep using them for forward compatibility.
+
 ### Semantic Annotations
 
 #### Reasoning Blocks
@@ -2068,7 +2072,7 @@ Let user be dictionary with:
     "email" as "alice@example.com"
 
 Note: String operations
-Let greeting be "Hello, " followed by user["name"]
+Let greeting be "Hello, " joined with user["name"]
 Let length be length of greeting
 Let uppercase be greeting converted to uppercase
 ```
@@ -2087,7 +2091,7 @@ Runa supports **dual syntax** for operators with **mathematical symbol enforceme
 - Mathematical operations in expressions
 
 **Invalid Non-Mathematical Contexts**:
-- String operations (use "concatenated with")
+- String operations (use "joined with")
 - Boolean logic (use "and", "or", "not")
 - Assignment operations (use "be", "as", "to")
 
@@ -2150,7 +2154,7 @@ The `is` keyword is reserved exclusively for identity, type, and state checks. I
 - **Identity and Type**: `is of type`, `is None`, `is empty`, `is null`, `is valid`, `is ready`
 - **Bitwise**: `bitwise and`, `bitwise or`, `bitwise xor`, `bitwise not`, `shifted left by`, `shifted right by`
 - **Logical**: `and`, `or`, `not`, `logical and`, `logical or`, `logical not`
-- **String**: `concatenated with`
+- **String**: `joined with`
 
 ### Mathematical Operations
 
@@ -2170,7 +2174,7 @@ Let sin_value be sin(3.14159 / 2)           Note: Valid - mathematical context
 Let sin_value be sin(3.14159 divided by 2)  Note: Always valid - natural language
 
 Note: NON-mathematical contexts must use natural language
-Let full_name be first_name concatenated with " " concatenated with last_name
+Let full_name be first_name joined with " " joined with last_name
 Note: Using + for strings would be INVALID
 ```
 

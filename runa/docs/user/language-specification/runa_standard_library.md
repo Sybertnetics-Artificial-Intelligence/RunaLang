@@ -97,7 +97,7 @@ Remove "blue" from colors1
 Note: String creation and basic operations
 Let greeting be "Hello, World!"
 Let name be "Alice"
-Let formatted_greeting be "Hello, " followed by name followed by "!"
+Let formatted_greeting be "Hello, " joined with name joined with "!"
 
 Note: String properties
 Let length be length of greeting             Note: Returns 13
@@ -517,7 +517,7 @@ Note: Basic logging
 Log info message "Application started"
 Log warning message "Configuration file not found, using defaults"
 Log error message "Failed to connect to database"
-Log debug message "Processing user request with ID: " followed by user_id
+Log debug message "Processing user request with ID: " joined with user_id
 
 Note: Structured logging
 Log info with data as dictionary with:

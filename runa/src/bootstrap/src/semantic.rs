@@ -366,18 +366,20 @@ impl AstVisitor for SemanticAnalyzer {
 
         match expr.operator.token_type {
             TokenType::Plus => {
-                if (left_type == RunaType::Integer || left_type == RunaType::Float) && 
-                   (right_type == RunaType::Integer || right_type == RunaType::Float) {
-                    // Integer + Integer = Integer, otherwise Float
+                // Enforce math-only: '+' is only for numbers. Suggest 'joined with' for strings.
+                let left_is_num = left_type == RunaType::Integer || left_type == RunaType::Float;
+                let right_is_num = right_type == RunaType::Integer || right_type == RunaType::Float;
+
+                if left_is_num && right_is_num {
                     if left_type == RunaType::Integer && right_type == RunaType::Integer {
                         Ok(RunaType::Integer)
                     } else {
                         Ok(RunaType::Float)
                     }
                 } else if left_type == RunaType::String || right_type == RunaType::String {
-                    Ok(RunaType::String)
+                    Err("Use 'joined with' for string concatenation instead of '+'.".to_string())
                 } else {
-                    Err("Addition requires both operands to be numbers (integer/float) or at least one to be a string.".to_string())
+                    Err("'+' requires numeric operands (integer/float).".to_string())
                 }
             }
             TokenType::Minus | TokenType::MultipliedBy | TokenType::DividedBy | TokenType::Modulo => {
@@ -409,11 +411,11 @@ impl AstVisitor for SemanticAnalyzer {
                 }
             }
             TokenType::FollowedBy => {
-                // "followed by" is flexible string concatenation - converts right operand to string
+                // String concatenation - canonical in natural syntax ('joined with' / 'concatenated with' aliases)
                 if left_type == RunaType::String {
                     Ok(RunaType::String)
                 } else {
-                    Err("String concatenation with 'followed by' requires left operand to be a string.".to_string())
+                    Err("String concatenation requires the left operand to be a string. Use 'joined with'.".to_string())
                 }
             }
             _ => Err("Unsupported binary operator.".to_string()),
