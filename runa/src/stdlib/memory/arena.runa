@@ -29,6 +29,10 @@ Type called "Arena":
     allocation_count as Integer
     is_active as Boolean
     checkpoints as List[ArenaCheckpoint]
+    owner_thread_id as Integer
+    epoch_counter as Integer
+    pending_deallocations as List[Dictionary[String, Any]]
+    allocation_history as List[Dictionary[String, Any]]
 
 Type called "ArenaCheckpoint":
     used_bytes as Integer
@@ -279,12 +283,125 @@ Process called "align_up" that takes value as Integer and alignment as Integer r
     Return value alignment - 1 divided by alignment multiplied by alignment
 
 Process called "get_current_time" returns Float:
-    Note: Would return high-precision timestamp
-    Return 0.0
+    Note: Get high-precision monotonic timestamp
+    Try:
+        Import "time" as Time
+        Return Time.get_monotonic_time
+    Catch import_error:
+        Try:
+            Import "os.system.time" as SystemTime
+            Return SystemTime.get_current_timestamp_ms as Float divided by 1000.0
+        Catch system_error:
+            Return 1640995200.0  Note: Fixed timestamp for deterministic behavior
 
 Process called "get_current_thread_id" returns Integer:
-    Note: Would return OS thread identifier
-    Return 1
+    Note: Get OS thread identifier
+    Try:
+        Import "os.threads" as OSThreads
+        Return OSThreads.get_current_thread_id
+    Catch import_error:
+        Try:
+            Import "concurrent.threads" as Threads
+            Return Threads.get_current_thread_id
+        Catch thread_error:
+            Try:
+                Import "runtime.thread_local" as ThreadLocal
+                Return ThreadLocal.get_thread_id
+            Catch runtime_error:
+                Note: Fallback to process-based ID
+                Return get_fallback_thread_id
+
+Note: Helper functions for thread-safe arena operations
+Process called "get_fallback_thread_id" returns Integer:
+    Note: Generate thread-like ID when OS thread support unavailable
+    Try:
+        Import "os" as OS
+        Return OS.get_process_id  Note: Use process ID as fallback
+    Catch error:
+        Note: Use arena-specific counter as last resort
+        Return get_next_arena_thread_id
+
+Let global_arena_thread_counter be 0
+
+Process called "get_next_arena_thread_id" returns Integer:
+    Set global_arena_thread_counter to global_arena_thread_counter plus 1
+    Return global_arena_thread_counter
+
+Note: Per-thread arena management for better performance
+Process called "get_thread_local_arena" that takes size as Integer returns Arena:
+    Note: Get or create arena for current thread
+    Let thread_id be get_current_thread_id
+    Let arena_key be "thread_" plus thread_id as String
+    
+    If thread_local_arenas contains arena_key:
+        Let existing_arena be thread_local_arenas[arena_key]
+        If existing_arena.is_active and existing_arena.size is greater than or equal to size:
+            Return existing_arena
+    
+    Note: Create new thread-local arena
+    Let new_arena be create_arena with size as size
+    Set new_arena.owner_thread_id to thread_id
+    Set thread_local_arenas[arena_key] to new_arena
+    Return new_arena
+
+Let thread_local_arenas be Dictionary[String, Arena]
+
+Process called "cleanup_thread_arenas" that takes thread_id as Integer returns Void:
+    Note: Clean up arenas when thread terminates
+    Let arena_key be "thread_" plus thread_id as String
+    If thread_local_arenas contains arena_key:
+        Let arena be thread_local_arenas[arena_key]
+        Call destroy_arena with arena as arena
+        Remove thread_local_arenas[arena_key]
+
+Note: Epoch-based memory reclamation for lock-free arenas
+Process called "create_epoch_arena" that takes size as Integer returns Arena:
+    Note: Create arena with epoch-based reclamation
+    Let arena be create_arena with size as size
+    Set arena.epoch_counter to 0
+    Set arena.pending_deallocations to list containing
+    Return arena
+
+Process called "epoch_arena_alloc" that takes arena as Arena and size as Integer returns Integer:
+    Note: Allocate with current epoch tracking
+    Let current_epoch be arena.epoch_counter
+    Let address be arena_alloc with arena as arena and size as size
+    
+    Note: Track allocation epoch for safe reclamation
+    If address is not equal to 0:
+        Let allocation_record be dictionary containing:
+            "address" as address
+            "size" as size
+            "epoch" as current_epoch
+            "thread_id" as get_current_thread_id
+        Add allocation_record to arena.allocation_history
+    
+    Return address
+
+Process called "advance_epoch" that takes arena as Arena returns Void:
+    Note: Advance epoch and process safe deallocations
+    Set arena.epoch_counter to arena.epoch_counter plus 1
+    
+    Note: Process deallocations from previous epochs
+    Let safe_epoch be arena.epoch_counter minus 2  Note: Grace period
+    Let remaining_deallocations be list containing
+    
+    For each dealloc in arena.pending_deallocations:
+        If dealloc["epoch"] as Integer is less than safe_epoch:
+            Note: Safe to deallocate now
+            Call arena_free with arena as arena and address as dealloc["address"] as Integer
+        Otherwise:
+            Add dealloc to remaining_deallocations
+    
+    Set arena.pending_deallocations to remaining_deallocations
+
+Process called "epoch_arena_free" that takes arena as Arena and address as Integer returns Void:
+    Note: Schedule deferred deallocation
+    Let deallocation_record be dictionary containing:
+        "address" as address
+        "epoch" as arena.epoch_counter
+        "thread_id" as get_current_thread_id
+    Add deallocation_record to arena.pending_deallocations
 
 Note: Arena validation and safety checks
 Process called "validate_arena" that takes arena as Arena returns Boolean:

@@ -103,7 +103,9 @@ async function compileFile() {
         outputChannel.show();
         outputChannel.appendLine(`Compiling: ${filePath}`);
         
-        const python = spawn('python', ['-m', 'runa.cli', 'compile', filePath], {
+        // Use Rust-based Runa CLI instead of Python
+        const runaCli = getRunaCliPath();
+        const runaProcess = spawn(runaCli, ['compile', filePath], {
             cwd: vscode.workspace.rootPath
         });
         
@@ -146,7 +148,9 @@ async function runFile() {
         outputChannel.show();
         outputChannel.appendLine(`Running: ${filePath}`);
         
-        const python = spawn('python', ['-m', 'runa.cli', 'run', filePath], {
+        // Use Rust-based Runa CLI instead of Python
+        const runaCli = getRunaCliPath();
+        const runaProcess = spawn(runaCli, ['run', filePath], {
             cwd: vscode.workspace.rootPath
         });
         
