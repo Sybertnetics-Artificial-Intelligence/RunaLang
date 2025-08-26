@@ -527,7 +527,7 @@ impl Parser {
             Ok(Stmt::For(ForStmt {
                 variable,
                 start: Box::new(collection),
-                end: Box::new(Expr::Literal(LiteralExpr { value: Token { token_type: TokenType::Integer, lexeme: "0".to_string(), line: 0, column: 0 } })),
+                end: Box::new(Expr::Literal(LiteralExpr { value: runa_common::ast::LiteralValue::Integer(0) })),
                 step: None,
                 body,
             }))
@@ -862,14 +862,23 @@ impl Parser {
 
     // primary_expression → literal | identifier | "(" expression ")"
     fn primary_expression(&mut self) -> Result<Expr, String> {
-        if self.match_token(TokenType::Integer) || self.match_token(TokenType::Float) {
-            Ok(Expr::Literal(LiteralExpr { value: self.previous().clone() }))
+        if self.match_token(TokenType::Integer) {
+            let token = self.previous();
+            let int_val = token.lexeme.parse::<i64>().map_err(|_| "Invalid integer")?;
+            Ok(Expr::Literal(LiteralExpr { value: runa_common::ast::LiteralValue::Integer(int_val) }))
+        } else if self.match_token(TokenType::Float) {
+            let token = self.previous();
+            let float_val = token.lexeme.parse::<f64>().map_err(|_| "Invalid float")?;
+            Ok(Expr::Literal(LiteralExpr { value: runa_common::ast::LiteralValue::Float(float_val) }))
         } else if self.match_token(TokenType::String) {
-            Ok(Expr::Literal(LiteralExpr { value: self.previous().clone() }))
+            let token = self.previous();
+            Ok(Expr::Literal(LiteralExpr { value: runa_common::ast::LiteralValue::String(token.lexeme.clone()) }))
         } else if self.match_token(TokenType::InterpolatedString) {
             self.parse_interpolated_string()
         } else if self.match_token(TokenType::Boolean) {
-            Ok(Expr::Literal(LiteralExpr { value: self.previous().clone() }))
+            let token = self.previous();
+            let bool_val = token.lexeme == "true";
+            Ok(Expr::Literal(LiteralExpr { value: runa_common::ast::LiteralValue::Boolean(bool_val) }))
         } else if self.match_token(TokenType::List) {
             // Parse "list containing element1, element2, ..."
             self.consume(TokenType::Containing, "Expect 'containing' after 'list'.")?;
@@ -1159,7 +1168,7 @@ impl Parser {
                 // Parse the expression content as a mini Runa expression
                 if !expr_content.is_empty() {
                     let expr = self.parse_expression_from_string(&expr_content)?;
-                    parts.push(InterpolatedStringPart::Expression(expr));
+                    parts.push(InterpolatedStringPart::Expression(Box::new(expr)));
                 }
             } else {
                 current_str.push(ch);
@@ -1265,9 +1274,8 @@ impl Parser {
         
         // Create an annotation statement to represent the note comment
         Ok(Stmt::Annotation(AnnotationStmt {
-            annotation_type: runa_common::annotations::AnnotationType::Context,
+            annotation_type: "Context".to_string(),
             content: format!("Comment: {}", comment_content),
-            structured_data: std::collections::HashMap::new(),
             location: runa_common::annotations::SourceLocation {
                 start_line: 0,
                 start_column: 0,
@@ -1335,9 +1343,8 @@ impl Parser {
         structured_data = self.parse_annotation_structured_data(&content, &annotation_type)?;
         
         Ok(Stmt::Annotation(runa_common::ast::AnnotationStmt {
-            annotation_type,
+            annotation_type: format!("{:?}", annotation_type),
             content: content.trim().to_string(),
-            structured_data,
             location,
         }))
     }
@@ -1465,12 +1472,7 @@ impl Parser {
             
             let collection = self.expression()?;
             let first_index = Expr::Literal(LiteralExpr {
-                value: Token {
-                    token_type: TokenType::Integer,
-                    lexeme: "0".to_string(),
-                    line: self.previous().line,
-                    column: self.previous().column,
-                }
+                value: runa_common::ast::LiteralValue::Integer(0)
             });
             
             Ok(Expr::Index(IndexAccessExpr {
@@ -1484,12 +1486,7 @@ impl Parser {
             
             let collection = self.expression()?;
             let last_index = Expr::Literal(LiteralExpr {
-                value: Token {
-                    token_type: TokenType::Integer,
-                    lexeme: "-1".to_string(),
-                    line: self.previous().line,
-                    column: self.previous().column,
-                }
+                value: runa_common::ast::LiteralValue::Integer(-1)
             });
             
             Ok(Expr::Index(IndexAccessExpr {

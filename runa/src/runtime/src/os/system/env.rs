@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, LazyLock};
 
 // Global storage for environment variable strings to prevent deallocation
-static ENV_BUFFERS: LazyLock<Mutex<HashMap<usize, Vec<u8>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static ENV_BUFFERS: LazyLock<Mutex<HashMap<usize, Vec<u8>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static mut ENV_COUNTER: usize = 0;
 
 /// Gets an environment variable by name
@@ -120,17 +120,92 @@ pub fn free_env_buffer(ptr: *const c_char) {
 /// Returns a pointer to an array of key-value pairs, or null on error
 /// The array is terminated with a null pointer
 pub fn get_all() -> *const *const c_char {
-    // This is a simplified implementation
-    // In a real system, we'd need to manage the memory properly
-    std::ptr::null()
+    let env_vars: Vec<(String, String)> = std::env::vars().collect();
+    
+    if env_vars.is_empty() {
+        return std::ptr::null();
+    }
+    
+    // Calculate total size needed: array of pointers + all strings
+    let num_vars = env_vars.len();
+    let ptr_array_size = (num_vars + 1) * std::mem::size_of::<*const c_char>(); // +1 for null terminator
+    
+    // Calculate string storage size
+    let mut total_string_size = 0;
+    for (key, value) in &env_vars {
+        total_string_size += key.len() + 1 + value.len() + 1; // key=value\0
+    }
+    
+    let total_layout = Layout::from_size_align(ptr_array_size + total_string_size, std::mem::align_of::<*const c_char>()).unwrap();
+    let base_ptr = unsafe { alloc(total_layout) };
+    
+    if base_ptr.is_null() {
+        return std::ptr::null();
+    }
+    
+    // Set up pointer array at the beginning
+    let ptr_array = base_ptr as *mut *const c_char;
+    // String storage comes after the pointer array
+    let string_storage = unsafe { base_ptr.add(ptr_array_size) };
+    
+    let mut string_offset = 0;
+    
+    for (i, (key, value)) in env_vars.iter().enumerate() {
+        // Format as "key=value"
+        let env_string = format!("{}={}", key, value);
+        let env_bytes = env_string.as_bytes();
+        
+        // Copy string to storage
+        let string_ptr = unsafe { string_storage.add(string_offset) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(env_bytes.as_ptr(), string_ptr, env_bytes.len());
+            std::ptr::write(string_ptr.add(env_bytes.len()), 0u8); // null terminator
+        }
+        
+        // Set pointer in array
+        unsafe {
+            std::ptr::write(ptr_array.add(i), string_ptr as *const c_char);
+        }
+        
+        string_offset += env_bytes.len() + 1;
+    }
+    
+    // Null terminate the pointer array
+    unsafe {
+        std::ptr::write(ptr_array.add(num_vars), std::ptr::null());
+    }
+    
+    // Store the buffer to prevent deallocation
+    let buffer_id = unsafe {
+        ENV_COUNTER += 1;
+        ENV_COUNTER
+    };
+    
+    if let Ok(mut buffers) = ENV_BUFFERS.lock() {
+        // Store a reference to prevent deallocation
+        buffers.insert(buffer_id, vec![base_ptr as usize as u8]);
+    }
+    
+    ptr_array as *const *const c_char
 }
 
 /// Clears all environment variables
 /// Returns 0 on success, -1 on error
 pub fn clear_all() -> i32 {
-    // This is a simplified implementation
-    // In a real system, we'd clear all environment variables
-    -1
+    // Get all current environment variables
+    let env_vars: Vec<String> = std::env::vars().map(|(key, _)| key).collect();
+    
+    // Remove each environment variable
+    for var_name in env_vars {
+        std::env::remove_var(&var_name);
+    }
+    
+    // Clear our internal buffer storage as well
+    if let Ok(mut buffers) = ENV_BUFFERS.lock() {
+        buffers.clear();
+    }
+    
+    0
 }
 
 #[cfg(test)]
@@ -171,5 +246,40 @@ mod tests {
         let name = std::ffi::CString::new("NONEXISTENT_VAR").unwrap();
         let result = get(name.as_ptr());
         assert!(result.is_null());
+    }
+    
+    #[test]
+    fn test_get_all_env_vars() {
+        // Set a test environment variable
+        std::env::set_var("TEST_GET_ALL", "test_value");
+        
+        // Get all environment variables
+        let all_vars = get_all();
+        assert!(!all_vars.is_null());
+        
+        // Check that we can find our test variable
+        let mut found_test_var = false;
+        let mut i = 0;
+        
+        loop {
+            let env_ptr = unsafe { *all_vars.add(i) };
+            if env_ptr.is_null() {
+                break; // End of array
+            }
+            
+            let env_str = unsafe { CStr::from_ptr(env_ptr).to_str().unwrap() };
+            if env_str.starts_with("TEST_GET_ALL=") {
+                found_test_var = true;
+                assert!(env_str.contains("test_value"));
+                break;
+            }
+            
+            i += 1;
+        }
+        
+        assert!(found_test_var, "Should find the test environment variable");
+        
+        // Clean up
+        std::env::remove_var("TEST_GET_ALL");
     }
 } 

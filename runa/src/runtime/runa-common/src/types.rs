@@ -2,11 +2,30 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunaType {
-    Number,
+    // Primitive types
+    Integer,
+    Float, 
+    Number, // Legacy alias for numeric values
     String,
     Boolean,
-    Function, // Represents function types
+    Null,
+    Nil, // Legacy alias for Null
+    Any, // Dynamic type for untyped values
+    
+    // Function types
+    Function {
+        params: Vec<RunaType>,
+        return_type: Box<RunaType>,
+    },
+    
+    // Collection types  
     List(Box<RunaType>), // Represents list types with element type
-    Dictionary(Box<RunaType>, Box<RunaType>), // Represents dictionary types with key and value types
-    Nil, // Represents the absence of a value, e.g., an uninitialized variable
+    Dictionary {
+        key: Box<RunaType>,
+        value: Box<RunaType>, 
+    }, // Represents dictionary types with key and value types
+    
+    // Object types
+    Class(String),
+    Object(String),
 } 

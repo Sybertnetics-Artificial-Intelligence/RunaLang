@@ -8,7 +8,7 @@ use std::sync::{Mutex, LazyLock};
 use crate::{runa_file_handle, os::{SeekWhence, FileInfo}};
 
 // Global file handle registry
-static FILE_HANDLES: LazyLock<Mutex<HashMap<usize, File>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static FILE_HANDLES: LazyLock<Mutex<HashMap<usize, File>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static mut HANDLE_COUNTER: usize = 0;
 
 /// Opens a file with the given path and mode

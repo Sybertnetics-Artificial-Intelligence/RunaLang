@@ -10,16 +10,25 @@ pub mod ownership;
 
 // Performance Enhancement Modules - Making Runa faster than C
 pub mod performance;               // Phase 1: Enhanced bytecode VM
-pub mod jit;                      // Phase 2: JIT compilation with LLVM
+pub mod aott;                     // Phase 2: AoTT compilation with LLVM
 pub mod adaptive_optimization;    // Phase 3: Profile-guided optimization
 pub mod hardware_acceleration;    // Phase 4: GPU/SIMD/FPGA acceleration
 pub mod safety;                   // Safety system - safer than Rust
 
-// NEW: Runtime Interface - The 25 Essential System Calls
-pub mod runtime_interface;
-pub mod runtime_interface_reflection;
-pub mod runtime_interface_crypto;
-pub mod runtime_exports;
+// Async Runtime System - Making Runa more concurrent than Go
+pub mod r#async;                  // Phase 1.2: High-performance async runtime with AI-guided scheduling
+
+// Bytecode generation for LIR to bytecode translation
+pub mod bytecode_generator;
+
+// Language Server Protocol Bridge - IDE Integration
+pub mod lsp_bridge;
+
+// Tests for core functionality
+#[cfg(test)]
+mod test_modules;
+
+// Individual module tests are in their respective files
 
 use std::ffi::{c_char, c_void};
 

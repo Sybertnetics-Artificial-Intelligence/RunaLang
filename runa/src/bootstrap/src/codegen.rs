@@ -65,6 +65,9 @@ trait AstVisitorCodegen {
     fn visit_function_stmt(&mut self, stmt: &FunctionStmt) -> Result<(), String>;
     fn visit_print_stmt(&mut self, stmt: &PrintStmt) -> Result<(), String>;
     fn visit_annotation_stmt(&mut self, stmt: &AnnotationStmt) -> Result<(), String>;
+    fn visit_match_stmt(&mut self, stmt: &MatchStmt) -> Result<(), String>;
+    fn visit_type_def_stmt(&mut self, stmt: &TypeDefStmt) -> Result<(), String>;
+    fn visit_enum_def_stmt(&mut self, stmt: &EnumDefStmt) -> Result<(), String>;
     
     // ... Expressions ...
     fn visit_expr(&mut self, expr: &Expr) -> Result<(), String>;
@@ -160,42 +163,6 @@ impl<'a> CodeGenerator<'a> {
         self.emit_byte((value & 0xFF) as u8);
     }
     
-    fn emit_jump(&mut self, instruction: OpCode) -> usize {
-        self.emit_byte(instruction as u8);
-        // Emit placeholder bytes for jump offset (will be patched later)
-        self.emit_byte(0xff);
-        self.emit_byte(0xff);
-        // Return the offset where the jump bytes start (for patching)
-        let offset = self.chunk.code.len() - 2;
-        
-        // Track this jump for validation
-        let description = format!("{:?} at offset {}", instruction, offset);
-        self.pending_jumps.push((offset, description));
-        
-        offset
-    }
-    
-    fn patch_jump(&mut self, offset: usize) {
-        // Validate the offset is within bounds
-        if offset >= self.chunk.code.len() - 1 {
-            panic!("Invalid jump offset: {} (chunk size: {})", offset, self.chunk.code.len());
-        }
-        
-        // Calculate the jump offset from the current position
-        let jump = self.chunk.code.len() - offset - 2;
-        
-        // Validate jump size
-        if jump > u16::MAX as usize {
-            panic!("Jump too large: {} bytes (max: {})", jump, u16::MAX);
-        }
-        
-        // Patch the two bytes at the given offset with the real jump distance
-        self.chunk.code[offset] = ((jump >> 8) & 0xff) as u8;
-        self.chunk.code[offset + 1] = (jump & 0xff) as u8;
-        
-        // Remove from pending jumps
-        self.pending_jumps.retain(|(pending_offset, _)| *pending_offset != offset);
-    }
 
     fn emit_loop(&mut self, loop_start: usize) {
         self.emit_byte(OpCode::Loop as u8);
@@ -245,6 +212,9 @@ impl<'a> AstVisitorCodegen for CodeGenerator<'a> {
             Stmt::Annotation(s) => {
                 self.visit_annotation_stmt(s)
             },
+            Stmt::Match(s) => self.visit_match_stmt(s),
+            Stmt::TypeDef(s) => self.visit_type_def_stmt(s),
+            Stmt::EnumDef(s) => self.visit_enum_def_stmt(s),
         }
     }
     
@@ -312,16 +282,16 @@ impl<'a> AstVisitorCodegen for CodeGenerator<'a> {
             let else_jump = self.emit_jump(OpCode::Jump);
             
             // Backpatch the first jump to point to the instruction right after the 'then' branch.
-            self.patch_jump(then_jump);
+            self.patch_jump(then_jump)?;
 
             // Compile the 'else' branch
             self.visit_stmt(else_branch)?;
             
             // Backpatch the second jump to point to the instruction right after the 'else' branch.
-            self.patch_jump(else_jump);
+            self.patch_jump(else_jump)?;
         } else {
             // If there's no 'else' branch, just patch the first jump.
-            self.patch_jump(then_jump);
+            self.patch_jump(then_jump)?;
         }
 
         Ok(())
@@ -335,7 +305,7 @@ impl<'a> AstVisitorCodegen for CodeGenerator<'a> {
         self.visit_stmt(&Stmt::Block(stmt.body.clone()))?;
         self.emit_loop(loop_start);
 
-        self.patch_jump(exit_jump);
+        self.patch_jump(exit_jump)?;
         Ok(())
     }
 
@@ -343,7 +313,7 @@ impl<'a> AstVisitorCodegen for CodeGenerator<'a> {
         // Check if this is a for-each loop (end is dummy literal 0) or C-style loop
         let is_foreach = match stmt.end.as_ref() {
             Expr::Literal(lit) => {
-                lit.value.lexeme == "0" && matches!(lit.value.token_type, runa_common::token::TokenType::Integer)
+                matches!(lit.value, runa_common::ast::LiteralValue::Integer(0))
             },
             _ => false,
         };
@@ -507,25 +477,29 @@ impl<'a> AstVisitorCodegen for CodeGenerator<'a> {
     }
 
     fn visit_literal_expr(&mut self, expr: &LiteralExpr) -> Result<(), String> {
-        match expr.value.token_type {
-            TokenType::Integer | TokenType::Float => {
-                let value = expr.value.lexeme.parse::<f64>().unwrap();
-                let const_index = self.chunk.add_constant(Value::Float(value));
+        match &expr.value {
+            runa_common::ast::LiteralValue::Integer(val) => {
+                let const_index = self.chunk.add_constant(Value::Integer(*val));
                 self.emit_byte(OpCode::Constant as u8);
                 self.emit_short(const_index as u16);
             }
-            TokenType::String => {
-                // Remove quotes from the string literal
-                let value = expr.value.lexeme.trim_matches('"').to_string();
-                let const_index = self.chunk.add_constant(Value::String(value));
+            runa_common::ast::LiteralValue::Float(val) => {
+                let const_index = self.chunk.add_constant(Value::Float(*val));
                 self.emit_byte(OpCode::Constant as u8);
                 self.emit_short(const_index as u16);
             }
-            TokenType::Boolean => {
-                let value = expr.value.lexeme.parse::<bool>().unwrap();
-                let const_index = self.chunk.add_constant(Value::Boolean(value));
+            runa_common::ast::LiteralValue::String(val) => {
+                let const_index = self.chunk.add_constant(Value::String(val.clone()));
                 self.emit_byte(OpCode::Constant as u8);
                 self.emit_short(const_index as u16);
+            }
+            runa_common::ast::LiteralValue::Boolean(val) => {
+                let const_index = self.chunk.add_constant(Value::Boolean(*val));
+                self.emit_byte(OpCode::Constant as u8);
+                self.emit_short(const_index as u16);
+            }
+            runa_common::ast::LiteralValue::Nil => {
+                self.emit_byte(OpCode::Null as u8);
             }
             _ => return Err("This literal type is not yet supported.".to_string()),
         };
@@ -673,7 +647,7 @@ impl<'a> AstVisitorCodegen for CodeGenerator<'a> {
         // Handle special case for "last item" (index -1)
         // Check if this is a literal -1 (used for "get last item from my list")
         if let Expr::Literal(literal) = expr.index.as_ref() {
-            if literal.value.lexeme == "-1" {
+            if matches!(literal.value, runa_common::ast::LiteralValue::Integer(-1)) {
                 // For "last item", we need to:
                 // 1. Get the length of the collection
                 // 2. Subtract 1 to get the last index
@@ -698,6 +672,100 @@ impl<'a> AstVisitorCodegen for CodeGenerator<'a> {
         
         // Emit the GetItem opcode to perform the indexing
         self.emit_byte(OpCode::GetItem as u8);
+        
+        Ok(())
+    }
+
+    fn visit_match_stmt(&mut self, stmt: &MatchStmt) -> Result<(), String> {
+        // Compile the expression to match against
+        self.visit_expr(&stmt.expr)?;
+        
+        let mut case_jumps = Vec::new();
+        let mut end_jumps = Vec::new();
+        
+        // Generate code for each match case
+        for case in &stmt.cases {
+            // Duplicate the match expression for comparison
+            self.emit_byte(OpCode::Dup as u8);
+            
+            // Compile the pattern
+            self.visit_expr(&case.pattern)?;
+            
+            // Compare pattern with match expression
+            self.emit_byte(OpCode::IsEqualTo as u8);
+            
+            // Jump to next case if not equal
+            let case_jump = self.emit_jump(OpCode::JumpIfFalse);
+            case_jumps.push(case_jump);
+            
+            // Pop the match expression (we found a match)
+            self.emit_byte(OpCode::Pop as u8);
+            
+            // Compile the case body
+            self.visit_block_stmt(&case.body)?;
+            
+            // Jump to end after executing case body
+            let end_jump = self.emit_jump(OpCode::Jump);
+            end_jumps.push(end_jump);
+            
+            // Patch the case jump to jump here if pattern didn't match
+            self.patch_jump(case_jumps.pop().unwrap())?;
+        }
+        
+        // Handle default case if present
+        if let Some(default_case) = &stmt.default_case {
+            // Pop the match expression
+            self.emit_byte(OpCode::Pop as u8);
+            
+            // Compile the default case body
+            self.visit_block_stmt(default_case)?;
+        } else {
+            // No default case - pop the match expression
+            self.emit_byte(OpCode::Pop as u8);
+        }
+        
+        // Patch all end jumps to jump here
+        for end_jump in end_jumps {
+            self.patch_jump(end_jump)?;
+        }
+        
+        Ok(())
+    }
+
+    fn visit_type_def_stmt(&mut self, _stmt: &TypeDefStmt) -> Result<(), String> {
+        // Type definitions are compile-time constructs and don't generate runtime code
+        // The semantic analyzer has already registered the type
+        Ok(())
+    }
+
+    fn visit_enum_def_stmt(&mut self, _stmt: &EnumDefStmt) -> Result<(), String> {
+        // Enum definitions are compile-time constructs and don't generate runtime code  
+        // The semantic analyzer has already registered the enum type and variants
+        Ok(())
+    }
+
+}
+
+// Helper methods implementation for CodeGenerator
+impl<'a> CodeGenerator<'a> {
+    fn emit_jump(&mut self, instruction: OpCode) -> usize {
+        self.emit_byte(instruction as u8);
+        self.emit_byte(0xff); // Placeholder for jump offset high byte
+        self.emit_byte(0xff); // Placeholder for jump offset low byte
+        self.chunk.code.len() - 2 // Return the address of the jump offset
+    }
+
+    fn patch_jump(&mut self, offset: usize) -> Result<(), String> {
+        // Calculate jump distance
+        let jump = self.chunk.code.len() - offset - 2;
+        
+        if jump > u16::MAX as usize {
+            return Err("Too much code to jump over".to_string());
+        }
+        
+        // Patch the jump offset
+        self.chunk.code[offset] = ((jump >> 8) & 0xff) as u8;
+        self.chunk.code[offset + 1] = (jump & 0xff) as u8;
         
         Ok(())
     }

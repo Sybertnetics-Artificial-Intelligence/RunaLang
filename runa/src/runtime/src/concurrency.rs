@@ -5,11 +5,12 @@ use std::thread;
 use std::collections::HashMap;
 use crate::{runa_thread_handle, runa_mutex_handle, runa_condvar_handle, runa_channel_handle};
 
-// Global registries for concurrency objects
-static THREAD_REGISTRY: LazyLock<StdMutex<HashMap<usize, thread::JoinHandle<()>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
-static MUTEX_REGISTRY: LazyLock<StdMutex<HashMap<usize, Arc<StdMutex<()>>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
-static CONDVAR_REGISTRY: LazyLock<StdMutex<HashMap<usize, Arc<StdCondvar>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
-static CHANNEL_REGISTRY: LazyLock<StdMutex<HashMap<usize, Arc<mpsc::SyncSender<()>>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+// Simplified mutex tracking with separate lock state
+pub static THREAD_REGISTRY: LazyLock<StdMutex<HashMap<usize, thread::JoinHandle<()>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+pub static MUTEX_REGISTRY: LazyLock<StdMutex<HashMap<usize, Arc<StdMutex<u64>>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+pub static CONDVAR_REGISTRY: LazyLock<StdMutex<HashMap<usize, Arc<StdCondvar>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+pub static CHANNEL_REGISTRY: LazyLock<StdMutex<HashMap<usize, mpsc::Receiver<Vec<u8>>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+pub static CHANNEL_SENDERS: LazyLock<StdMutex<HashMap<usize, mpsc::Sender<Vec<u8>>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 static mut COUNTER: usize = 0;
 
@@ -79,10 +80,16 @@ pub fn detach_thread(handle: runa_thread_handle) -> i32 {
 
 /// Gets the current thread ID
 pub fn get_current_thread_id() -> u64 {
-    // This is a simplified implementation
-    // In a real system, we'd use platform-specific APIs
-    // For now, return a placeholder value
-    1
+    use std::sync::atomic::{AtomicU64, Ordering};
+    
+    thread_local! {
+        static THREAD_ID: u64 = {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        };
+    }
+    
+    THREAD_ID.with(|&id| id)
 }
 
 /// Yields the current thread
@@ -103,7 +110,8 @@ pub fn create_mutex() -> runa_mutex_handle {
         COUNTER
     };
 
-    let mutex = Arc::new(StdMutex::new(()));
+    // Mutex contains thread ID of owner (0 = unlocked)
+    let mutex = Arc::new(StdMutex::new(0u64));
 
     if let Ok(mut registry) = MUTEX_REGISTRY.lock() {
         registry.insert(mutex_id, mutex);
@@ -121,11 +129,36 @@ pub fn lock_mutex(handle: runa_mutex_handle) -> i32 {
     }
 
     let mutex_id = handle as usize;
+    let current_thread = get_current_thread_id();
+    
     if let Ok(registry) = MUTEX_REGISTRY.lock() {
-        if let Some(_mutex) = registry.get(&mutex_id) {
-            // In a real implementation, we'd actually lock the mutex
-            // For now, we'll just return success
-            0
+        if let Some(mutex) = registry.get(&mutex_id) {
+            let mutex_clone = Arc::clone(mutex);
+            drop(registry); // Release registry lock before blocking
+            
+            // Actually lock the mutex
+            match mutex_clone.lock() {
+                Ok(mut owner) => {
+                    if *owner == 0 {
+                        // Mutex is free, acquire it
+                        *owner = current_thread;
+                        0
+                    } else if *owner == current_thread {
+                        // Already owned by this thread (recursive lock)
+                        0
+                    } else {
+                        // Owned by another thread, wait
+                        while *owner != 0 && *owner != current_thread {
+                            drop(owner);
+                            thread::yield_now();
+                            owner = mutex_clone.lock().unwrap();
+                        }
+                        *owner = current_thread;
+                        0
+                    }
+                }
+                Err(_) => -1,
+            }
         } else {
             -1
         }
@@ -142,11 +175,30 @@ pub fn unlock_mutex(handle: runa_mutex_handle) -> i32 {
     }
 
     let mutex_id = handle as usize;
+    let current_thread = get_current_thread_id();
+    
     if let Ok(registry) = MUTEX_REGISTRY.lock() {
-        if let Some(_mutex) = registry.get(&mutex_id) {
-            // In a real implementation, we'd need to track the lock
-            // For now, we'll just return success
-            0
+        if let Some(mutex) = registry.get(&mutex_id) {
+            let mutex_clone = Arc::clone(mutex);
+            drop(registry);
+            
+            // Actually unlock the mutex
+            match mutex_clone.lock() {
+                Ok(mut owner) => {
+                    if *owner == current_thread {
+                        // Only the owning thread can unlock
+                        *owner = 0; // Release the lock
+                        0
+                    } else if *owner == 0 {
+                        // Already unlocked
+                        0
+                    } else {
+                        // Another thread owns the lock
+                        -1
+                    }
+                }
+                Err(_) => -1,
+            }
         } else {
             -1
         }
@@ -201,20 +253,43 @@ pub fn wait_condvar(handle: runa_condvar_handle, mutex_handle: runa_mutex_handle
 
     let condvar_id = handle as usize;
     let mutex_id = mutex_handle as usize;
+    let current_thread = get_current_thread_id();
 
-    if let Ok(condvar_registry) = CONDVAR_REGISTRY.lock() {
-        if let Ok(mutex_registry) = MUTEX_REGISTRY.lock() {
-            if let Some(_condvar) = condvar_registry.get(&condvar_id) {
-                if let Some(_mutex) = mutex_registry.get(&mutex_id) {
-                    // In a real implementation, we'd wait on the condition variable
-                    // For now, we'll just return success
-                    return 0;
-                }
+    // Get references to both condvar and mutex
+    let (condvar, mutex) = match (CONDVAR_REGISTRY.lock(), MUTEX_REGISTRY.lock()) {
+        (Ok(condvar_registry), Ok(mutex_registry)) => {
+            match (condvar_registry.get(&condvar_id), mutex_registry.get(&mutex_id)) {
+                (Some(condvar), Some(mutex)) => (condvar.clone(), mutex.clone()),
+                _ => return -1,
             }
         }
-    }
+        _ => return -1,
+    };
 
-    -1
+    // Actually wait on the condition variable
+    match mutex.lock() {
+        Ok(mut owner_guard) => {
+            if *owner_guard != current_thread {
+                return -1; // Must own the mutex to wait
+            }
+            
+            // Release mutex ownership while waiting
+            *owner_guard = 0;
+            drop(owner_guard);
+            
+            // Wait on condition variable with mutex
+            let _unused = condvar.wait(mutex.lock().unwrap()).unwrap();
+            
+            // Reacquire mutex ownership
+            if let Ok(mut owner) = mutex.lock() {
+                *owner = current_thread;
+                0
+            } else {
+                -1
+            }
+        }
+        Err(_) => -1,
+    }
 }
 
 /// Signals a condition variable
@@ -284,28 +359,38 @@ pub fn create_channel() -> runa_channel_handle {
         COUNTER
     };
 
-    let (sender, _receiver) = mpsc::sync_channel(1); // Bounded channel with capacity 1
-    let sender = Arc::new(sender);
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
 
-    if let Ok(mut registry) = CHANNEL_REGISTRY.lock() {
-        registry.insert(channel_id, sender);
-        channel_id as runa_channel_handle
-    } else {
-        std::ptr::null_mut()
+    // Store both sender and receiver
+    let registry_result = CHANNEL_REGISTRY.lock();
+    let sender_registry_result = CHANNEL_SENDERS.lock();
+    
+    match (registry_result, sender_registry_result) {
+        (Ok(mut registry), Ok(mut sender_registry)) => {
+            registry.insert(channel_id, receiver);
+            sender_registry.insert(channel_id, sender);
+            channel_id as runa_channel_handle
+        }
+        _ => std::ptr::null_mut(),
     }
 }
 
 /// Sends a message through a channel
 /// Returns 0 on success, -1 on error
-pub fn send_channel(handle: runa_channel_handle) -> i32 {
+pub fn send_channel(handle: runa_channel_handle, message: *const u8, message_len: usize) -> i32 {
     if handle.is_null() {
         return -1;
     }
 
     let channel_id = handle as usize;
-    if let Ok(registry) = CHANNEL_REGISTRY.lock() {
+    if let Ok(registry) = CHANNEL_SENDERS.lock() {
         if let Some(sender) = registry.get(&channel_id) {
-            match sender.send(()) {
+            let data = if message.is_null() || message_len == 0 {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(message, message_len).to_vec() }
+            };
+            match sender.send(data) {
                 Ok(_) => 0,
                 Err(_) => -1,
             }
@@ -318,15 +403,37 @@ pub fn send_channel(handle: runa_channel_handle) -> i32 {
 }
 
 /// Receives a message from a channel
-/// Returns 0 on success, -1 on error
+/// Returns 0 on success, -1 on error  
 pub fn receive_channel(handle: runa_channel_handle) -> i32 {
     if handle.is_null() {
         return -1;
     }
 
-    // In a real implementation, we'd need to track receivers
-    // For now, we'll just return success
-    0
+    let channel_id = handle as usize;
+    
+    // Actually receive from the channel
+    if let Ok(mut registry) = CHANNEL_REGISTRY.lock() {
+        if let Some(receiver) = registry.get_mut(&channel_id) {
+            match receiver.try_recv() {
+                Ok(_data) => {
+                    // Successfully received data
+                    0
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // No data available, but channel is still open
+                    -1
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Channel has been closed
+                    -1
+                }
+            }
+        } else {
+            -1
+        }
+    } else {
+        -1
+    }
 }
 
 /// Destroys a channel

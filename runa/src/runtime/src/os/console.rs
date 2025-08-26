@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::alloc::{alloc, Layout};
 
 // Global storage for input buffers to prevent them from being deallocated
-static INPUT_BUFFERS: LazyLock<Mutex<HashMap<usize, Vec<u8>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static INPUT_BUFFERS: LazyLock<Mutex<HashMap<usize, Vec<u8>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static mut BUFFER_COUNTER: usize = 0;
 
 /// Prints a string to stdout without a newline

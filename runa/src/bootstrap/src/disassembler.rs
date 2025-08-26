@@ -128,6 +128,8 @@ fn constant_instruction(op_code: OpCode, chunk: &Chunk, offset: usize) -> Result
         Value::WeakReference(w) => format!("<WeakReference {}>", w),
         Value::Error(e) => format!("<Error: {}>", e.message),
         Value::NativeFunction(_) => "<NativeFunction>".to_string(),
+        Value::Number(n) => format!("{}", n),
+        Value::Nil => "nil".to_string(),
     };
     
     println!("{:?} {:4} {}", op_code, constant_index, value_str);

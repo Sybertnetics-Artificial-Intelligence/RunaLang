@@ -1,6 +1,12 @@
 //! Time-related operations for the Runa runtime.
 
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::alloc::{alloc, Layout};
+use std::ffi::CString;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+
+#[cfg(unix)]
+extern crate libc;
 
 /// Gets the current time as seconds since Unix epoch
 pub fn get_current_time() -> u64 {
@@ -74,9 +80,8 @@ pub fn format_time(timestamp: u64) -> *const std::ffi::c_char {
     use std::alloc::{alloc, Layout};
     use std::ffi::CString;
     
-    let datetime = chrono::DateTime::from_timestamp(timestamp as i64, 0).map(|dt| dt.naive_local());
-    if let Some(dt) = datetime {
-        let formatted = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    if let Some(datetime) = DateTime::from_timestamp(timestamp as i64, 0) {
+        let formatted = datetime.naive_local().format("%Y-%m-%d %H:%M:%S").to_string();
         if let Ok(c_str) = CString::new(formatted) {
             let bytes = c_str.as_bytes_with_nul();
             let size = bytes.len();
@@ -114,8 +119,8 @@ pub fn parse_time(time_str: *const std::ffi::c_char) -> u64 {
         ];
         
         for format in &formats {
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, format) {
-                return dt.and_utc().timestamp() as u64;
+            if let Ok(dt) = NaiveDateTime::parse_from_str(s, format) {
+                return Utc.from_utc_datetime(&dt).timestamp() as u64;
             }
         }
     }
@@ -125,24 +130,216 @@ pub fn parse_time(time_str: *const std::ffi::c_char) -> u64 {
 
 /// Gets the current timezone offset in seconds
 pub fn get_timezone_offset() -> i32 {
-    // This is a simplified implementation
-    // In a real system, we'd use platform-specific APIs
-    0
+    #[cfg(unix)]
+    {
+        unsafe {
+            let mut tv: libc::timeval = std::mem::zeroed();
+            if libc::gettimeofday(&mut tv, std::ptr::null_mut()) == 0 {
+                // Use localtime vs gmtime to calculate timezone offset
+                let local_time = libc::localtime(&tv.tv_sec);
+                let gm_time = libc::gmtime(&tv.tv_sec);
+                if !local_time.is_null() && !gm_time.is_null() {
+                    // Calculate the difference between local time and GMT
+                    let local_seconds = (*local_time).tm_hour * 3600 + (*local_time).tm_min * 60 + (*local_time).tm_sec;
+                    let gm_seconds = (*gm_time).tm_hour * 3600 + (*gm_time).tm_min * 60 + (*gm_time).tm_sec;
+                    let mut offset = local_seconds - gm_seconds;
+                    
+                    // Handle day boundary crossings
+                    if offset > 43200 { // More than 12 hours
+                        offset -= 86400;
+                    } else if offset < -43200 { // Less than -12 hours
+                        offset += 86400;
+                    }
+                    
+                    return offset;
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetTimeZoneInformation(lpTimeZoneInformation: *mut TIME_ZONE_INFORMATION) -> u32;
+        }
+        
+        #[repr(C)]
+        struct TIME_ZONE_INFORMATION {
+            bias: i32,
+            standard_name: [u16; 32],
+            standard_date: SYSTEMTIME,
+            standard_bias: i32,
+            daylight_name: [u16; 32],
+            daylight_date: SYSTEMTIME,
+            daylight_bias: i32,
+        }
+        
+        #[repr(C)]
+        struct SYSTEMTIME {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        
+        let mut tz_info: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+        let result = unsafe { GetTimeZoneInformation(&mut tz_info) };
+        
+        if result != 0xFFFFFFFF {
+            return -(tz_info.bias * 60); // Convert minutes to seconds, negate for correct sign
+        }
+    }
+    
+    0 // UTC fallback
 }
 
 /// Gets the current timezone name
 /// Returns a pointer to a null-terminated string, or null on error
 pub fn get_timezone_name() -> *const std::ffi::c_char {
-    // This is a simplified implementation
-    // In a real system, we'd use platform-specific APIs
-    std::ptr::null()
+    // Try environment variables first
+    if let Ok(tz) = std::env::var("TZ") {
+        if !tz.is_empty() {
+            return allocate_string(&tz);
+        }
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        // Try to read from /etc/timezone
+        if let Ok(contents) = std::fs::read_to_string("/etc/timezone") {
+            let tz = contents.trim();
+            if !tz.is_empty() {
+                return allocate_string(tz);
+            }
+        }
+        
+        // Fallback: parse /etc/localtime symlink
+        if let Ok(link) = std::fs::read_link("/etc/localtime") {
+            if let Some(tz_path) = link.to_str() {
+                if let Some(tz_start) = tz_path.find("/zoneinfo/") {
+                    let tz = &tz_path[tz_start + 10..];
+                    if !tz.is_empty() {
+                        return allocate_string(tz);
+                    }
+                }
+            }
+        }
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        // Try to read macOS timezone
+        if let Ok(output) = std::process::Command::new("readlink")
+            .arg("/etc/localtime")
+            .output()
+        {
+            if let Ok(output_str) = String::from_utf8(output.stdout) {
+                let output_str = output_str.trim();
+                if let Some(tz_start) = output_str.find("/zoneinfo/") {
+                    let tz = &output_str[tz_start + 10..];
+                    if !tz.is_empty() {
+                        return allocate_string(tz);
+                    }
+                }
+            }
+        }
+    }
+    
+    #[cfg(windows)]
+    {
+        // Try Windows time zone
+        use std::process::Command;
+        
+        if let Ok(output) = Command::new("powershell")
+            .args(&["-Command", "(Get-TimeZone).Id"])
+            .output()
+        {
+            if let Ok(output_str) = String::from_utf8(output.stdout) {
+                let tz = output_str.trim();
+                if !tz.is_empty() {
+                    return allocate_string(tz);
+                }
+            }
+        }
+    }
+    
+    // Fallback to UTC
+    allocate_string("UTC")
 }
 
 /// Checks if daylight saving time is in effect
 pub fn is_dst() -> bool {
-    // This is a simplified implementation
-    // In a real system, we'd use platform-specific APIs
+    #[cfg(unix)]
+    {
+        
+        unsafe {
+            let now = libc::time(std::ptr::null_mut());
+            let tm = libc::localtime(&now);
+            if !tm.is_null() {
+                return (*tm).tm_isdst > 0;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetTimeZoneInformation(lpTimeZoneInformation: *mut TIME_ZONE_INFORMATION) -> u32;
+        }
+        
+        #[repr(C)]
+        struct TIME_ZONE_INFORMATION {
+            bias: i32,
+            standard_name: [u16; 32],
+            standard_date: SYSTEMTIME,
+            standard_bias: i32,
+            daylight_name: [u16; 32],
+            daylight_date: SYSTEMTIME,
+            daylight_bias: i32,
+        }
+        
+        #[repr(C)]
+        struct SYSTEMTIME {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        
+        let mut tz_info: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+        let result = unsafe { GetTimeZoneInformation(&mut tz_info) };
+        
+        // TIME_ZONE_ID_DAYLIGHT = 2
+        return result == 2;
+    }
+    
     false
+}
+
+/// Helper function to allocate a string and return a C pointer
+fn allocate_string(s: &str) -> *const std::ffi::c_char {
+    if let Ok(c_str) = CString::new(s) {
+        let bytes = c_str.as_bytes_with_nul();
+        let size = bytes.len();
+        
+        let layout = Layout::from_size_align(size, std::mem::align_of::<u8>()).unwrap();
+        let ptr = unsafe { alloc(layout) };
+        
+        if !ptr.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, size);
+            }
+            return ptr as *const std::ffi::c_char;
+        }
+    }
+    
+    std::ptr::null()
 }
 
 #[cfg(test)]

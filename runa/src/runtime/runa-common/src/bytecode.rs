@@ -164,6 +164,9 @@ pub enum OpCode {
     /// Calls a function with the given argument count
     /// Operand: 8-bit argument count
     Call,
+    /// Calls a native function
+    /// Operand: 16-bit native function index
+    CallNative,
     /// Calls a method on an object
     /// Operand: 8-bit argument count, 16-bit method name constant index
     CallMethod,
@@ -277,12 +280,26 @@ pub enum OpCode {
     /// Records a profiling event
     /// Operand: 16-bit event type constant index
     Profile,
+    
+    // --- Missing variants ---
+    /// Defines a function
+    DefineFunction,
+    /// Checks if value is none/null
+    IsNone,
+    /// Checks if value is not none/null
+    IsNotNone,
+    /// Loads a constant by index (alias for Constant)
+    LoadConstant,
+    /// Loads a local variable
+    LoadLocal,
+    /// Stores a local variable
+    StoreLocal,
 }
 
 // Production-ready value representation for Runa language
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     // Primitive types
     Integer(i64),
@@ -290,6 +307,10 @@ pub enum Value {
     Boolean(bool),
     String(String),
     Null,
+    
+    // Legacy aliases for compatibility
+    Number(f64),  // Alias for numeric values (can represent both int and float)
+    Nil,          // Alias for Null
     
     // Function types
     Function(Box<Function>),
@@ -316,6 +337,9 @@ pub enum Value {
     // Memory management
     Reference(ReferenceId),
     WeakReference(WeakReferenceId),
+    
+    // Error handling
+    Error(RuntimeError),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +362,14 @@ pub type ChannelId = u64;
 pub type ReferenceId = u64;
 pub type WeakReferenceId = u64;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeError {
+    pub message: String,
+    pub error_type: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -346,6 +378,8 @@ impl fmt::Display for Value {
             Value::Boolean(b) => write!(f, "{}", b),
             Value::String(s) => write!(f, "{}", s),
             Value::Null => write!(f, "null"),
+            Value::Number(n) => write!(f, "{}", n),
+            Value::Nil => write!(f, "nil"),
             Value::Function(func) => write!(f, "<function {}>", func.name),
             Value::NativeFunction(_) => write!(f, "<native function>"),
             Value::List(items) => {
@@ -390,6 +424,7 @@ impl fmt::Display for Value {
             Value::Channel(id) => write!(f, "<channel {}>", id),
             Value::Reference(id) => write!(f, "<ref {}>", id),
             Value::WeakReference(id) => write!(f, "<weak_ref {}>", id),
+            Value::Error(err) => write!(f, "Error: {}", err.message),
         }
     }
 }
@@ -401,6 +436,8 @@ pub struct Chunk {
     pub constants: Vec<Value>,
     pub lines: Vec<usize>,  // Line number for each instruction
     pub source_map: Vec<SourceLocation>,  // Source location for each instruction
+    pub instructions: Vec<OpCode>,
+    pub bytecode: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -416,7 +453,9 @@ impl Chunk {
             code: Vec::new(),
             constants: Vec::new(),
             lines: Vec::new(),
+            instructions: Vec::new(),
             source_map: Vec::new(),
+            bytecode: Vec::new(),
         }
     }
 
@@ -818,6 +857,78 @@ impl Chunk {
             _ => {
                 println!("UNKNOWN_OPCODE {}", instruction);
                 offset + 1
+            }
+        }
+    }
+}
+
+// Custom trait implementations for Value to handle floating point numbers
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Integer(a), Integer(b)) => a == b,
+            (Float(a), Float(b)) => a.to_bits() == b.to_bits(), // Handle NaN correctly
+            (Number(a), Number(b)) => a.to_bits() == b.to_bits(),
+            (Boolean(a), Boolean(b)) => a == b,
+            (String(a), String(b)) => a == b,
+            (Null, Null) | (Nil, Nil) => true,
+            (List(a), List(b)) => a == b,
+            (Dictionary(a), Dictionary(b)) => a == b,
+            (Set(a), Set(b)) => a == b,
+            (Tuple(a), Tuple(b)) => a == b,
+            _ => false, // Simplified for other complex types
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use Value::*;
+        match self {
+            Integer(i) => {
+                0u8.hash(state);
+                i.hash(state);
+            }
+            Float(f) => {
+                1u8.hash(state);
+                f.to_bits().hash(state); // Hash the bits representation
+            }
+            Number(f) => {
+                2u8.hash(state);
+                f.to_bits().hash(state);
+            }
+            Boolean(b) => {
+                3u8.hash(state);
+                b.hash(state);
+            }
+            String(s) => {
+                4u8.hash(state);
+                s.hash(state);
+            }
+            Null => 5u8.hash(state),
+            Nil => 6u8.hash(state),
+            List(v) => {
+                7u8.hash(state);
+                v.hash(state);
+            }
+            Dictionary(v) => {
+                8u8.hash(state);
+                v.hash(state);
+            }
+            Set(v) => {
+                9u8.hash(state);
+                v.hash(state);
+            }
+            Tuple(v) => {
+                10u8.hash(state);
+                v.hash(state);
+            }
+            _ => {
+                // For complex types, hash a discriminant
+                std::mem::discriminant(self).hash(state);
             }
         }
     }

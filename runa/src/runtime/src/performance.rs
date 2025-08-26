@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Performance profiling data for hot path detection
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ProfileData {
     pub instruction_count: AtomicU64,
     pub execution_time_ns: AtomicU64,
@@ -15,6 +15,19 @@ pub struct ProfileData {
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
     pub branch_predictions: HashMap<usize, BranchPrediction>,
+}
+
+impl Clone for ProfileData {
+    fn clone(&self) -> Self {
+        Self {
+            instruction_count: AtomicU64::new(self.instruction_count.load(std::sync::atomic::Ordering::Relaxed)),
+            execution_time_ns: AtomicU64::new(self.execution_time_ns.load(std::sync::atomic::Ordering::Relaxed)),
+            call_count: AtomicU64::new(self.call_count.load(std::sync::atomic::Ordering::Relaxed)),
+            cache_hits: AtomicU64::new(self.cache_hits.load(std::sync::atomic::Ordering::Relaxed)),
+            cache_misses: AtomicU64::new(self.cache_misses.load(std::sync::atomic::Ordering::Relaxed)),
+            branch_predictions: self.branch_predictions.clone(),
+        }
+    }
 }
 
 /// Branch prediction for conditional jumps
@@ -73,10 +86,12 @@ pub struct CompiledCode {
     pub entry_point: usize,
     pub optimization_level: OptimizationLevel,
     pub compilation_time: Duration,
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum OptimizationLevel {
+    O0,         // No optimization (debug mode)
     None,
     Basic,      // Simple peephole optimizations
     Standard,   // Inlining, constant folding
@@ -160,52 +175,270 @@ impl SimdProcessor {
 
     /// Vectorized addition of two arrays
     pub fn vector_add(&mut self, a: &[f64], b: &[f64], result: &mut [f64]) {
-        if self.can_use_avx2 && a.len() >= 8 {
-            // Process 8 elements at a time using SIMD
-            let chunks = a.len() / 8;
-            for i in 0..chunks {
-                let start = i * 8;
-                let end = start + 8;
-                
-                // In real implementation, this would use intrinsics
-                for j in start..end {
-                    result[j] = a[j] + b[j];
+        let len = a.len().min(b.len()).min(result.len());
+        
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.can_use_avx2 && len >= 4 {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    
+                    // Process 4 doubles at a time using AVX2
+                    let chunks = len / 4;
+                    for i in 0..chunks {
+                        let offset = i * 4;
+                        
+                        // Load 4 f64 values from a and b
+                        let va = _mm256_loadu_pd(a.as_ptr().add(offset));
+                        let vb = _mm256_loadu_pd(b.as_ptr().add(offset));
+                        
+                        // Perform vectorized addition
+                        let vresult = _mm256_add_pd(va, vb);
+                        
+                        // Store result
+                        _mm256_storeu_pd(result.as_mut_ptr().add(offset), vresult);
+                    }
+                    
+                    // Handle remaining elements
+                    for i in (chunks * 4)..len {
+                        result[i] = a[i] + b[i];
+                    }
+                    
+                    return;
+                }
+            } else if std::is_x86_feature_detected!("sse2") && len >= 2 {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    
+                    // Process 2 doubles at a time using SSE2
+                    let chunks = len / 2;
+                    for i in 0..chunks {
+                        let offset = i * 2;
+                        
+                        // Load 2 f64 values from a and b
+                        let va = _mm_loadu_pd(a.as_ptr().add(offset));
+                        let vb = _mm_loadu_pd(b.as_ptr().add(offset));
+                        
+                        // Perform vectorized addition
+                        let vresult = _mm_add_pd(va, vb);
+                        
+                        // Store result
+                        _mm_storeu_pd(result.as_mut_ptr().add(offset), vresult);
+                    }
+                    
+                    // Handle remaining element
+                    if len % 2 != 0 {
+                        result[len - 1] = a[len - 1] + b[len - 1];
+                    }
+                    
+                    return;
                 }
             }
-            
-            // Handle remaining elements
-            for i in (chunks * 8)..a.len() {
-                result[i] = a[i] + b[i];
-            }
-        } else {
-            // Fallback to scalar operations
-            for i in 0..a.len() {
-                result[i] = a[i] + b[i];
-            }
+        }
+        
+        // Fallback to scalar operations for non-x86 or when SIMD is not available
+        for i in 0..len {
+            result[i] = a[i] + b[i];
         }
     }
 
     /// Vectorized multiplication
     pub fn vector_multiply(&mut self, a: &[f64], b: &[f64], result: &mut [f64]) {
-        if self.can_use_avx2 && a.len() >= 8 {
-            let chunks = a.len() / 8;
-            for i in 0..chunks {
-                let start = i * 8;
-                let end = start + 8;
-                
-                for j in start..end {
-                    result[j] = a[j] * b[j];
+        let len = a.len().min(b.len()).min(result.len());
+        
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.can_use_avx2 && len >= 4 {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    
+                    // Process 4 doubles at a time using AVX2
+                    let chunks = len / 4;
+                    for i in 0..chunks {
+                        let offset = i * 4;
+                        
+                        // Load 4 f64 values from a and b
+                        let va = _mm256_loadu_pd(a.as_ptr().add(offset));
+                        let vb = _mm256_loadu_pd(b.as_ptr().add(offset));
+                        
+                        // Perform vectorized multiplication
+                        let vresult = _mm256_mul_pd(va, vb);
+                        
+                        // Store result
+                        _mm256_storeu_pd(result.as_mut_ptr().add(offset), vresult);
+                    }
+                    
+                    // Handle remaining elements
+                    for i in (chunks * 4)..len {
+                        result[i] = a[i] * b[i];
+                    }
+                    
+                    return;
+                }
+            } else if std::is_x86_feature_detected!("sse2") && len >= 2 {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    
+                    // Process 2 doubles at a time using SSE2
+                    let chunks = len / 2;
+                    for i in 0..chunks {
+                        let offset = i * 2;
+                        
+                        // Load 2 f64 values from a and b
+                        let va = _mm_loadu_pd(a.as_ptr().add(offset));
+                        let vb = _mm_loadu_pd(b.as_ptr().add(offset));
+                        
+                        // Perform vectorized multiplication
+                        let vresult = _mm_mul_pd(va, vb);
+                        
+                        // Store result
+                        _mm_storeu_pd(result.as_mut_ptr().add(offset), vresult);
+                    }
+                    
+                    // Handle remaining element
+                    if len % 2 != 0 {
+                        result[len - 1] = a[len - 1] * b[len - 1];
+                    }
+                    
+                    return;
                 }
             }
-            
-            for i in (chunks * 8)..a.len() {
-                result[i] = a[i] * b[i];
-            }
-        } else {
-            for i in 0..a.len() {
-                result[i] = a[i] * b[i];
+        }
+        
+        // Fallback to scalar operations for non-x86 or when SIMD is not available
+        for i in 0..len {
+            result[i] = a[i] * b[i];
+        }
+    }
+    
+    /// Vectorized dot product
+    pub fn vector_dot_product(&mut self, a: &[f64], b: &[f64]) -> f64 {
+        let len = a.len().min(b.len());
+        let mut sum = 0.0;
+        
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.can_use_avx2 && len >= 4 {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    
+                    // Accumulator for the dot product
+                    let mut acc = _mm256_setzero_pd();
+                    
+                    // Process 4 doubles at a time
+                    let chunks = len / 4;
+                    for i in 0..chunks {
+                        let offset = i * 4;
+                        
+                        // Load 4 f64 values from a and b
+                        let va = _mm256_loadu_pd(a.as_ptr().add(offset));
+                        let vb = _mm256_loadu_pd(b.as_ptr().add(offset));
+                        
+                        // Multiply and accumulate
+                        acc = _mm256_fmadd_pd(va, vb, acc);
+                    }
+                    
+                    // Horizontal sum of the accumulator
+                    let mut result = [0.0f64; 4];
+                    _mm256_storeu_pd(result.as_mut_ptr(), acc);
+                    sum = result[0] + result[1] + result[2] + result[3];
+                    
+                    // Handle remaining elements
+                    for i in (chunks * 4)..len {
+                        sum += a[i] * b[i];
+                    }
+                    
+                    return sum;
+                }
+            } else if std::is_x86_feature_detected!("sse2") && len >= 2 {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    
+                    // Accumulator for the dot product
+                    let mut acc = _mm_setzero_pd();
+                    
+                    // Process 2 doubles at a time
+                    let chunks = len / 2;
+                    for i in 0..chunks {
+                        let offset = i * 2;
+                        
+                        // Load 2 f64 values from a and b
+                        let va = _mm_loadu_pd(a.as_ptr().add(offset));
+                        let vb = _mm_loadu_pd(b.as_ptr().add(offset));
+                        
+                        // Multiply and add to accumulator
+                        let prod = _mm_mul_pd(va, vb);
+                        acc = _mm_add_pd(acc, prod);
+                    }
+                    
+                    // Extract and sum the two elements
+                    let mut result = [0.0f64; 2];
+                    _mm_storeu_pd(result.as_mut_ptr(), acc);
+                    sum = result[0] + result[1];
+                    
+                    // Handle remaining element
+                    if len % 2 != 0 {
+                        sum += a[len - 1] * b[len - 1];
+                    }
+                    
+                    return sum;
+                }
             }
         }
+        
+        // Fallback to scalar operations
+        for i in 0..len {
+            sum += a[i] * b[i];
+        }
+        sum
+    }
+    
+    /// Vectorized sum reduction
+    pub fn vector_sum(&mut self, a: &[f64]) -> f64 {
+        let len = a.len();
+        let mut sum = 0.0;
+        
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.can_use_avx2 && len >= 4 {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    
+                    // Accumulator for the sum
+                    let mut acc = _mm256_setzero_pd();
+                    
+                    // Process 4 doubles at a time
+                    let chunks = len / 4;
+                    for i in 0..chunks {
+                        let offset = i * 4;
+                        
+                        // Load 4 f64 values
+                        let va = _mm256_loadu_pd(a.as_ptr().add(offset));
+                        
+                        // Add to accumulator
+                        acc = _mm256_add_pd(acc, va);
+                    }
+                    
+                    // Horizontal sum of the accumulator
+                    let mut result = [0.0f64; 4];
+                    _mm256_storeu_pd(result.as_mut_ptr(), acc);
+                    sum = result[0] + result[1] + result[2] + result[3];
+                    
+                    // Handle remaining elements
+                    for i in (chunks * 4)..len {
+                        sum += a[i];
+                    }
+                    
+                    return sum;
+                }
+            }
+        }
+        
+        // Fallback to scalar operations
+        for i in 0..len {
+            sum += a[i];
+        }
+        sum
     }
 }
 
@@ -386,6 +619,7 @@ impl TypeSpecializer {
             entry_point: 0,
             optimization_level: OptimizationLevel::Standard,
             compilation_time: Duration::from_millis(0),
+            metadata: HashMap::new(),
         }
     }
 }

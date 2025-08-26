@@ -439,7 +439,7 @@ impl OwnershipTracker {
     
     /// Get ownership statistics
     pub fn get_stats(&self) -> OwnershipStats {
-        self.stats.lock().unwrap_or_default().clone()
+        self.stats.lock().map(|stats| stats.clone()).unwrap_or_default()
     }
     
     /// Enable or disable ownership validation
@@ -603,7 +603,12 @@ pub extern "C" fn runa_register_object(
         std::ffi::CStr::from_ptr(type_id).to_string_lossy().to_string()
     };
     
-    tracker.register_object(non_null_ptr, owner_str, size, type_id_str).is_ok()
+    let u8_ptr = NonNull::new(non_null_ptr.as_ptr() as *mut u8);
+    if let Some(ptr) = u8_ptr {
+        tracker.register_object(ptr, owner_str, size, type_id_str).is_ok()
+    } else {
+        false
+    }
 }
 
 #[no_mangle]
@@ -626,7 +631,12 @@ pub extern "C" fn runa_borrow_immutable(
         std::ffi::CStr::from_ptr(borrower).to_string_lossy().to_string()
     };
     
-    tracker.borrow_immutable(non_null_ptr, borrower_str).is_ok()
+    let u8_ptr = NonNull::new(non_null_ptr.as_ptr() as *mut u8);
+    if let Some(ptr) = u8_ptr {
+        tracker.borrow_immutable(ptr, borrower_str).is_ok()
+    } else {
+        false
+    }
 }
 
 #[no_mangle]
@@ -649,7 +659,12 @@ pub extern "C" fn runa_borrow_mutable(
         std::ffi::CStr::from_ptr(borrower).to_string_lossy().to_string()
     };
     
-    tracker.borrow_mutable(non_null_ptr, borrower_str).is_ok()
+    let u8_ptr = NonNull::new(non_null_ptr.as_ptr() as *mut u8);
+    if let Some(ptr) = u8_ptr {
+        tracker.borrow_mutable(ptr, borrower_str).is_ok()
+    } else {
+        false
+    }
 }
 
 #[no_mangle]
@@ -672,7 +687,12 @@ pub extern "C" fn runa_end_borrow(
         std::ffi::CStr::from_ptr(borrower).to_string_lossy().to_string()
     };
     
-    tracker.end_borrow(non_null_ptr, borrower_str).is_ok()
+    let u8_ptr = NonNull::new(non_null_ptr.as_ptr() as *mut u8);
+    if let Some(ptr) = u8_ptr {
+        tracker.end_borrow(ptr, borrower_str).is_ok()
+    } else {
+        false
+    }
 }
 
 #[no_mangle]
@@ -687,7 +707,12 @@ pub extern "C" fn runa_mark_moved(tracker: *mut OwnershipTracker, ptr: runa_obje
         None => return false,
     };
     
-    tracker.mark_moved(non_null_ptr).is_ok()
+    let u8_ptr = NonNull::new(non_null_ptr.as_ptr() as *mut u8);
+    if let Some(ptr) = u8_ptr {
+        tracker.mark_moved(ptr).is_ok()
+    } else {
+        false
+    }
 }
 
 #[no_mangle]
@@ -702,7 +727,12 @@ pub extern "C" fn runa_mark_freed(tracker: *mut OwnershipTracker, ptr: runa_obje
         None => return false,
     };
     
-    tracker.mark_freed(non_null_ptr).is_ok()
+    let u8_ptr = NonNull::new(non_null_ptr.as_ptr() as *mut u8);
+    if let Some(ptr) = u8_ptr {
+        tracker.mark_freed(ptr).is_ok()
+    } else {
+        false
+    }
 }
 
 #[no_mangle]

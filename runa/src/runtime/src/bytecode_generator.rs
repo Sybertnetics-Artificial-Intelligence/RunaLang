@@ -27,10 +27,16 @@ pub struct BytecodeGenerator {
     current_line: usize,
     /// Label tracking for jump resolution
     labels: HashMap<String, usize>,
-    /// Pending jumps that need to be resolved
+    /// Pending jumps that need to be resolved (position, target label)
     pending_jumps: Vec<(usize, String)>,
     /// Register slots for each register name
     register_slots: HashMap<String, usize>,
+    /// Register usage count for allocation optimization
+    register_usage_count: HashMap<String, u32>,
+    /// Timestamp of last use for each slot (for LRU)
+    slot_last_used: HashMap<usize, std::time::Instant>,
+    /// Map from slot to register name
+    slot_register_map: HashMap<usize, String>,
 }
 
 impl BytecodeGenerator {
@@ -50,6 +56,9 @@ impl BytecodeGenerator {
             labels: HashMap::new(),
             pending_jumps: Vec::new(),
             register_slots: HashMap::new(),
+            register_usage_count: HashMap::new(),
+            slot_last_used: HashMap::new(),
+            slot_register_map: HashMap::new(),
         }
     }
 
@@ -734,13 +743,59 @@ impl BytecodeGenerator {
             self.add_label(&phi_label);
         }
         
-        // If we have multiple operands, we need to implement proper
-        // control flow merging. For now, we'll use the first operand
-        // as the default and let the control flow analysis handle the rest
+        // Handle multiple operands with proper phi merging
         if operands.len() > 1 {
-            // Load the first operand as default
-            self.load_register(&operands[0].value)?;
-            self.store_register(destination)?;
+            // Generate jump table for phi node resolution
+            let phi_table_start = self.chunk.bytecode.len();
+            
+            // Write phi resolution bytecode
+            for (i, operand) in operands.iter().enumerate() {
+                // Load block ID onto stack
+                self.write_constant(Value::Integer(i as i64));
+                
+                // Compare with current execution path
+                self.chunk.write_with_location(
+                    OpCode::Equal as u8,
+                    self.current_line,
+                    self.current_source_location.clone(),
+                );
+                
+                // Branch to operand handling
+                let branch_offset = self.chunk.bytecode.len();
+                self.chunk.write_with_location(
+                    OpCode::JumpIfFalse as u8,
+                    self.current_line,
+                    self.current_source_location.clone(),
+                );
+                let branch_jump_addr = self.chunk.bytecode.len();
+                self.chunk.write_short(0, self.current_line); // Forward jump address, patched later
+                
+                // Load the operand value
+                self.load_register(&operand.value)?;
+                self.store_register(destination)?;
+                
+                // Jump to end
+                self.chunk.write_with_location(
+                    OpCode::Jump as u8,
+                    self.current_line,
+                    self.current_source_location.clone(),
+                );
+                let end_jump = self.chunk.bytecode.len();
+                self.chunk.write_short(0, self.current_line); // Forward jump address, patched later
+                
+                // Patch branch offset
+                let current_pos = self.chunk.bytecode.len();
+                self.patch_jump(branch_jump_addr, current_pos);
+                
+                // Store end jump for later patching
+                self.pending_jumps.push(end_jump);
+            }
+            
+            // Patch all end jumps to point here
+            let final_pos = self.chunk.bytecode.len();
+            for (jump_pos, _target) in self.pending_jumps.drain(..) {
+                self.patch_jump(jump_pos, final_pos);
+            }
         }
         
         Ok(())
@@ -821,50 +876,52 @@ impl BytecodeGenerator {
     
     /// Find an available register slot using live range analysis
     fn find_available_slot(&mut self, register: &VirtualRegister) -> usize {
-        // Simple but effective register allocation strategy
-        // In a full implementation, this would use graph coloring or linear scan
+        // Check frequency and allocate accordingly
+        let usage_count = self.register_usage_count.get(&register.name).copied().unwrap_or(0);
         
-        // Check if this register is used in a loop or frequently accessed
-        let is_frequently_used = self.is_register_frequently_used(register);
-        
-        if is_frequently_used {
-            // Allocate a low-numbered slot for frequently used registers
+        // High-frequency registers get low-numbered slots (0-15)
+        if usage_count > 5 {
             for slot in 0..16 {
                 if !self.is_slot_occupied(slot) {
+                    self.mark_slot_used(slot, &register.name);
                     return slot;
                 }
             }
         }
         
-        // Find any available slot
-        for slot in 0..256 {
+        // Medium-frequency registers get mid-range slots (16-63)  
+        if usage_count > 2 {
+            for slot in 16..64 {
+                if !self.is_slot_occupied(slot) {
+                    self.mark_slot_used(slot, &register.name);
+                    return slot;
+                }
+            }
+        }
+        
+        // Low-frequency registers get high-numbered slots (64-255)
+        for slot in 64..256 {
             if !self.is_slot_occupied(slot) {
+                self.mark_slot_used(slot, &register.name);
                 return slot;
             }
         }
         
-        // If no slots available, reuse the least recently used slot
-        self.find_least_recently_used_slot()
+        // All slots occupied - evict LRU
+        let lru_slot = self.find_and_evict_lru_slot();
+        self.mark_slot_used(lru_slot, &register.name);
+        lru_slot
     }
     
-    /// Check if a register is frequently used (simple heuristic)
+    fn mark_slot_used(&mut self, slot: usize, register_name: &str) {
+        self.slot_last_used.insert(slot, std::time::Instant::now());
+        self.slot_register_map.insert(slot, register_name.to_string());
+    }
+    
+    /// Check if a register is frequently used
     fn is_register_frequently_used(&self, register: &VirtualRegister) -> bool {
-        // Count occurrences of this register in the current function
-        let mut count = 0;
-        
-        // This would be more efficient with a pre-computed usage map
-        // For now, we'll use a simple heuristic based on register name patterns
-        if register.name.starts_with("arg") || 
-           register.name.starts_with("local") || 
-           register.name.starts_with("temp") {
-            count += 2; // Arguments and locals are typically used more
-        }
-        
-        if register.name.contains("result") || register.name.contains("return") {
-            count += 3; // Return values are very frequently used
-        }
-        
-        count > 1
+        let usage_count = self.register_usage_count.get(&register.name).copied().unwrap_or(0);
+        usage_count > 3
     }
     
     /// Check if a slot is currently occupied
@@ -872,20 +929,38 @@ impl BytecodeGenerator {
         self.register_slots.values().any(|&allocated_slot| allocated_slot == slot)
     }
     
-    /// Find the least recently used slot for reuse
-    fn find_least_recently_used_slot(&self) -> usize {
-        // Simple LRU implementation - in production, you'd track actual usage timestamps
-        let mut used_slots: Vec<usize> = self.register_slots.values().copied().collect();
-        used_slots.sort();
+    /// Find and evict the least recently used slot
+    fn find_and_evict_lru_slot(&mut self) -> usize {
+        let mut oldest_slot = 0;
+        let mut oldest_time = std::time::Instant::now();
         
-        // Find the first gap, or use the highest slot + 1
-        for (i, &slot) in used_slots.iter().enumerate() {
-            if i != slot {
-                return i;
+        // Find slot with oldest timestamp
+        for (&slot, &last_used) in &self.slot_last_used {
+            if last_used < oldest_time {
+                oldest_time = last_used;
+                oldest_slot = slot;
             }
         }
         
-        used_slots.last().map(|&slot| slot + 1).unwrap_or(0)
+        // Evict the register from this slot
+        if let Some(register_name) = self.slot_register_map.remove(&oldest_slot) {
+            self.register_slots.remove(&register_name);
+        }
+        
+        oldest_slot
+    }
+    
+    /// Increment usage count for register allocation optimization
+    fn increment_register_usage(&mut self, register_name: &str) {
+        *self.register_usage_count.entry(register_name.to_string()).or_insert(0) += 1;
+    }
+    
+    /// Patch a jump instruction with the target address
+    fn patch_jump(&mut self, jump_pos: usize, target_pos: usize) {
+        let offset = target_pos - jump_pos - 2; // Account for instruction size
+        let offset_bytes = (offset as u16).to_be_bytes();
+        self.chunk.bytecode[jump_pos] = offset_bytes[0];
+        self.chunk.bytecode[jump_pos + 1] = offset_bytes[1];
     }
 
     /// Map operator strings to VM opcodes
@@ -960,19 +1035,44 @@ impl BytecodeGenerator {
         let mut local_variables = HashSet::new();
         let mut global_variables: HashSet<String> = HashSet::new();
         
-        // First pass: identify all variable declarations and their scope
+        // Analyze all variable declarations and usage patterns
         for basic_block in &lir_function.basic_blocks {
             for instruction in &basic_block.instructions {
                 match instruction {
                     LIRInstruction::LIRAlloca { destination } => {
-                        // This is a local variable declaration
                         local_variables.insert(destination.name.clone());
+                        self.increment_register_usage(&destination.name);
                     }
-                    LIRInstruction::LIRLoad { source, .. } => {
-                        // Check if this is accessing a global variable
-                        if let MemoryAddress::LIRDirectAddress { .. } = source {
-                            // Direct address access might be global
-                            // We'll need to analyze the constant pool to determine
+                    LIRInstruction::LIRLoad { source, destination } => {
+                        self.increment_register_usage(&destination.name);
+                        match source {
+                            MemoryAddress::LIRDirectAddress { address } => {
+                                // Global variable access - add to global set
+                                let global_name = format!("global_{}", address);
+                                global_variables.insert(global_name);
+                            }
+                            MemoryAddress::LIRIndirectAddress { base, offset } => {
+                                self.increment_register_usage(&base.name);
+                                // Check if accessing captured variable
+                                if base.name.contains("captured") || base.name.starts_with("upval") {
+                                    if !captured_variables.contains_key(&base.name) {
+                                        let index = captured_variables.len() as u16;
+                                        captured_variables.insert(base.name.clone(), index);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    LIRInstruction::LIRStore { destination, source } => {
+                        self.increment_register_usage(&source.name);
+                        match destination {
+                            MemoryAddress::LIRDirectAddress { address } => {
+                                let global_name = format!("global_{}", address);
+                                global_variables.insert(global_name);
+                            }
+                            MemoryAddress::LIRIndirectAddress { base, .. } => {
+                                self.increment_register_usage(&base.name);
+                            }
                         }
                     }
                     _ => {}

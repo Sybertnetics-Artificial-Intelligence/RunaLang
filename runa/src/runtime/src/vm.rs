@@ -46,6 +46,9 @@ impl VirtualMachine {
             name: "script".to_string(),
             chunk,
             arity: 0,
+            upvalues: Vec::new(),
+            is_native: false,
+            native_fn: None,
         };
         vm.call_function(main_function, 0);
         vm.run()
@@ -509,6 +512,9 @@ impl VirtualMachine {
                         name,
                         chunk: Chunk::new(),
                         arity: param_count,
+                        upvalues: Vec::new(),
+                        is_native: false,
+                        native_fn: None,
                     };
                     self.push(Value::Function(Box::new(function)));
                 }
@@ -766,7 +772,8 @@ impl VirtualMachine {
                     self.push(Value::Boolean(!matches!(value, Value::Nil)));
                 }
                 _ => {
-                    println!("Unimplemented opcode: {:?}", op_code);
+                    eprintln!("Runtime error: Unknown opcode {:?} at instruction {}", op_code, self.current_frame().ip - 1);
+                    self.runtime_error(&format!("Unknown opcode: {:?}", op_code));
                     return InterpretResult::RuntimeError;
                 }
             }
@@ -797,6 +804,13 @@ impl VirtualMachine {
     fn print_stack_top(&self) {
         if let Some(val) = self.stack.last() {
             println!("VM Result: {:?}", val);
+        }
+    }
+    
+    fn runtime_error(&mut self, message: &str) {
+        eprintln!("Runtime error: {}", message);
+        if !self.frames.is_empty() {
+            eprintln!("At instruction {} in current function", self.current_frame().ip);
         }
     }
 } 

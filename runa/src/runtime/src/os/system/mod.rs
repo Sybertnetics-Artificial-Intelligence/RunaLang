@@ -59,9 +59,24 @@ pub fn get_argv(index: i32) -> *const c_char {
         return std::ptr::null();
     }
 
-    // Note: This is a simplified implementation
-    // In a real system, we'd need to manage the memory properly
-    std::ptr::null()
+    args.get(index as usize)
+        .map(|arg| {
+            // Allocate memory for the string and return pointer
+            if let Ok(c_str) = std::ffi::CString::new(arg.as_str()) {
+                let bytes = c_str.as_bytes_with_nul();
+                let layout = std::alloc::Layout::from_size_align(bytes.len(), std::mem::align_of::<u8>()).unwrap();
+                let ptr = unsafe { std::alloc::alloc(layout) };
+                
+                if !ptr.is_null() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                    }
+                    return ptr as *const c_char;
+                }
+            }
+            std::ptr::null()
+        })
+        .unwrap_or(std::ptr::null())
 }
 
 /// Exits the program with the given exit code
@@ -76,23 +91,17 @@ pub fn abort() -> ! {
 
 /// Gets the system page size
 pub fn get_page_size() -> usize {
-    // This is a simplified implementation
-    // In a real system, we'd use platform-specific APIs
-    4096
+    info::get_page_size()
 }
 
 /// Gets the total system memory in bytes
 pub fn get_total_memory() -> u64 {
-    // This is a simplified implementation
-    // In a real system, we'd use platform-specific APIs
-    8 * 1024 * 1024 * 1024 // 8GB default
+    info::get_total_memory()
 }
 
 /// Gets the available system memory in bytes
 pub fn get_available_memory() -> u64 {
-    // This is a simplified implementation
-    // In a real system, we'd use platform-specific APIs
-    4 * 1024 * 1024 * 1024 // 4GB default
+    info::get_available_memory()
 }
 
 /// Gets the number of CPU cores

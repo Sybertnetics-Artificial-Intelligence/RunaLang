@@ -6,6 +6,7 @@ pub enum TokenType {
     Integer,
     Float,
     String,
+    InterpolatedString,
     Boolean,
     Identifier,
 
@@ -58,16 +59,23 @@ pub enum TokenType {
     And,
     Or,
     Not,
+    IsNot,
     Of,
     The,
     A,
     An,
     Else,
+    Get,
+    Key,
+    FollowedBy,
 
     // Keywords - Types and Data Structures
     Type,
     Struct,
     Enum,
+    List,
+    Dictionary,
+    Containing,
     Is,
     Are,
 
@@ -115,6 +123,66 @@ pub enum TokenType {
     Dedent,
     Newline,
 
+    // Keywords - Data access and indexing
+    Item,
+    First,
+    Last,
+    Index,
+    Value,
+    
+    // Keywords - Annotations
+    Note,
+    End,
+    
+    // Special Keywords
+    AtWord, // For @ symbol followed by word
+    
+    // Annotation tokens
+    AtReasoning,
+    AtEndReasoning, 
+    AtImplementation,
+    AtEndImplementation,
+    AtUncertainty,
+    AtEndUncertainty,
+    AtTestCases,
+    AtEndTestCases,
+    AtResourceConstraints,
+    AtEndResourceConstraints,
+    AtSecurityScope,
+    AtEndSecurityScope,
+    AtExecutionModel,
+    AtEndExecutionModel,
+    AtPerformanceHints,
+    AtEndPerformanceHints,
+    AtProgress,
+    AtEndProgress,
+    AtFeedback,
+    AtEndFeedback,
+    AtTranslationNote,
+    AtEndTranslationNote,
+    AtErrorHandling,
+    AtEndErrorHandling,
+    AtRequest,
+    AtEndRequest,
+    AtContext,
+    AtEndContext,
+    AtTask,
+    AtEndTask,
+    AtRequirements,
+    AtEndRequirements,
+    AtVerify,
+    AtEndVerify,
+    AtCollaboration,
+    AtEndCollaboration,
+    AtIteration,
+    AtEndIteration,
+    AtClarification,
+    AtEndClarification,
+    AtRequestClarification,
+    AtEndRequestClarification,
+    AtKnowledgeReference,
+    AtEndKnowledgeReference,
+    
     // Misc
     Comment,
     Wildcard,
@@ -129,4 +197,11 @@ pub struct Token {
     pub lexeme: String,
     pub line: usize,
     pub column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceLocation {
+    pub line: usize,
+    pub column: usize,
+    pub file: String,
 } 

@@ -9,6 +9,8 @@ pub struct SemanticAnalyzer {
     // A stack of scopes. Each scope is a HashMap of variable names to a tuple
     // indicating (is_initialized, type).
     scopes: Vec<HashMap<String, (bool, RunaType)>>,
+    // Global scope for types and global functions
+    globals: HashMap<String, (bool, RunaType)>,
     // Track whether we're currently inside a function
     in_function: bool,
 }
@@ -28,6 +30,9 @@ trait AstVisitor {
     fn visit_function_stmt(&mut self, stmt: &FunctionStmt) -> Result<(), String>;
     fn visit_print_stmt(&mut self, stmt: &PrintStmt) -> Result<(), String>;
     fn visit_annotation_stmt(&mut self, stmt: &AnnotationStmt) -> Result<(), String>;
+    fn visit_match_stmt(&mut self, stmt: &MatchStmt) -> Result<(), String>;
+    fn visit_type_def_stmt(&mut self, stmt: &TypeDefStmt) -> Result<(), String>;
+    fn visit_enum_def_stmt(&mut self, stmt: &EnumDefStmt) -> Result<(), String>;
     
     fn visit_variable_expr(&mut self, expr: &VariableExpr) -> Result<RunaType, String>;
     fn visit_assign_expr(&mut self, expr: &AssignExpr) -> Result<RunaType, String>;
@@ -46,6 +51,7 @@ impl SemanticAnalyzer {
     pub fn new() -> Self {
         SemanticAnalyzer {
             scopes: vec![HashMap::new()],
+            globals: HashMap::new(),
             in_function: false,
         }
     }
@@ -214,6 +220,9 @@ impl AstVisitor for SemanticAnalyzer {
             Stmt::Function(s) => self.visit_function_stmt(s),
             Stmt::Print(s) => self.visit_print_stmt(s),
             Stmt::Annotation(s) => self.visit_annotation_stmt(s),
+            Stmt::Match(s) => self.visit_match_stmt(s),
+            Stmt::TypeDef(s) => self.visit_type_def_stmt(s),  
+            Stmt::EnumDef(s) => self.visit_enum_def_stmt(s),
         }
     }
     
@@ -449,12 +458,12 @@ impl AstVisitor for SemanticAnalyzer {
     }
 
     fn visit_literal_expr(&mut self, expr: &LiteralExpr) -> Result<RunaType, String> {
-        match expr.value.token_type {
-            TokenType::Integer => Ok(RunaType::Integer),
-            TokenType::Float => Ok(RunaType::Float),
-            TokenType::String => Ok(RunaType::String),
-            TokenType::Boolean => Ok(RunaType::Boolean),
-            _ => Ok(RunaType::Null), // Should not happen with valid syntax
+        match &expr.value {
+            runa_common::ast::LiteralValue::Integer(_) => Ok(RunaType::Integer),
+            runa_common::ast::LiteralValue::Float(_) => Ok(RunaType::Float),
+            runa_common::ast::LiteralValue::String(_) => Ok(RunaType::String),
+            runa_common::ast::LiteralValue::Boolean(_) => Ok(RunaType::Boolean),
+            runa_common::ast::LiteralValue::Nil => Ok(RunaType::Null),
         }
     }
 
@@ -608,14 +617,160 @@ impl AstVisitor for SemanticAnalyzer {
                 InterpolatedStringPart::Expression(expr) => {
                     // Analyze the expression and ensure it can be converted to string
                     let expr_type = self.visit_expr(expr)?;
-                    // For now, allow any type to be interpolated (they'll be converted to strings at runtime)
-                    // In a stricter implementation, we could require string conversion methods
-                    let _ = expr_type; // Just to use the variable
+                    
+                    // Check if the type can be converted to string
+                    if !self.can_convert_to_string(&expr_type) {
+                        return Err(format!("Expression of type {:?} cannot be converted to string for interpolation", expr_type));
+                    }
                 }
             }
         }
         
         // Interpolated strings always result in String type
         Ok(RunaType::String)
+    }
+
+    fn visit_match_stmt(&mut self, stmt: &MatchStmt) -> Result<(), String> {
+        // Analyze the expression being matched
+        let match_expr_type = self.visit_expr(&stmt.expr)?;
+        
+        // Check all match cases
+        for case in &stmt.cases {
+            // Analyze the pattern - should be compatible with the match expression type
+            let pattern_type = self.visit_expr(&case.pattern)?;
+            if !self.types_compatible(&match_expr_type, &pattern_type) {
+                return Err(format!("Pattern type {:?} is not compatible with match expression type {:?}", pattern_type, match_expr_type));
+            }
+            
+            // Analyze the case body
+            self.visit_block_stmt(&case.body)?;
+        }
+        
+        // Check default case if present
+        if let Some(default_case) = &stmt.default_case {
+            self.visit_block_stmt(default_case)?;
+        }
+        
+        Ok(())
+    }
+
+    fn visit_type_def_stmt(&mut self, stmt: &TypeDefStmt) -> Result<(), String> {
+        // Register the new type in the global scope
+        let type_name = &stmt.name.lexeme;
+        
+        // Check if type already exists
+        if self.globals.contains_key(type_name) {
+            return Err(format!("Type '{}' already defined", type_name));
+        }
+        
+        // Create a type representation and store it
+        let user_type = RunaType::Class(type_name.clone());
+        self.globals.insert(type_name.clone(), (true, user_type));
+        
+        // Validate all field types exist
+        for field in &stmt.fields {
+            let field_type_name = &field.field_type.lexeme;
+            if !self.is_valid_type(field_type_name) {
+                return Err(format!("Unknown type '{}' for field '{}'", field_type_name, field.name.lexeme));
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn visit_enum_def_stmt(&mut self, stmt: &EnumDefStmt) -> Result<(), String> {
+        // Register the new enum type in the global scope
+        let enum_name = &stmt.name.lexeme;
+        
+        // Check if type already exists
+        if self.globals.contains_key(enum_name) {
+            return Err(format!("Enum '{}' already defined", enum_name));
+        }
+        
+        // Create an enum type representation and store it
+        let enum_type = RunaType::Class(enum_name.clone());
+        self.globals.insert(enum_name.clone(), (true, enum_type));
+        
+        // Register each enum variant as a global constant
+        for variant in &stmt.variants {
+            let variant_name = &variant.lexeme;
+            if self.globals.contains_key(variant_name) {
+                return Err(format!("Enum variant '{}' conflicts with existing identifier", variant_name));
+            }
+            
+            // Enum variants have the enum type
+            self.globals.insert(variant_name.clone(), (true, RunaType::Class(enum_name.clone())));
+        }
+        
+        Ok(())
+    }
+
+}
+
+// Helper methods implementation  
+impl SemanticAnalyzer {
+    fn types_compatible(&self, expected: &RunaType, actual: &RunaType) -> bool {
+        match (expected, actual) {
+            // Exact matches
+            (RunaType::Integer, RunaType::Integer) => true,
+            (RunaType::Float, RunaType::Float) => true,
+            (RunaType::String, RunaType::String) => true,
+            (RunaType::Boolean, RunaType::Boolean) => true,
+            (RunaType::Null, RunaType::Null) => true,
+            (RunaType::Any, _) | (_, RunaType::Any) => true,
+            
+            // Numeric compatibility
+            (RunaType::Integer, RunaType::Float) | (RunaType::Float, RunaType::Integer) => true,
+            (RunaType::Number, RunaType::Integer) | (RunaType::Integer, RunaType::Number) => true,
+            (RunaType::Number, RunaType::Float) | (RunaType::Float, RunaType::Number) => true,
+            
+            // Null compatibility  
+            (RunaType::Null, RunaType::Nil) | (RunaType::Nil, RunaType::Null) => true,
+            
+            // Collection compatibility
+            (RunaType::List(a), RunaType::List(b)) => self.types_compatible(a, b),
+            
+            // Dictionary compatibility
+            (RunaType::Dictionary { key: k1, value: v1 }, RunaType::Dictionary { key: k2, value: v2 }) => {
+                self.types_compatible(k1, k2) && self.types_compatible(v1, v2)
+            }
+            
+            // Class compatibility (exact match for now)
+            (RunaType::Class(a), RunaType::Class(b)) => a == b,
+            
+            _ => false,
+        }
+    }
+
+    fn is_valid_type(&self, type_name: &str) -> bool {
+        match type_name {
+            // Built-in types
+            "Integer" | "Float" | "String" | "Boolean" | "Any" | "Null" => true,
+            
+            // Check if it's a user-defined type
+            _ => self.globals.contains_key(type_name),
+        }
+    }
+
+    fn can_convert_to_string(&self, type_info: &RunaType) -> bool {
+        match type_info {
+            // Primitive types can all be converted to string
+            RunaType::Integer | RunaType::Float | RunaType::Number => true,
+            RunaType::String => true, // Already a string
+            RunaType::Boolean => true,
+            RunaType::Null | RunaType::Nil => true, // "null" or "nil"
+            RunaType::Any => true, // Dynamic type, assume convertible at runtime
+            
+            // Collections can be converted to string representation
+            RunaType::List(_) => true, // [item1, item2, ...]
+            RunaType::Dictionary { .. } => true, // {key1: value1, key2: value2, ...}
+            
+            // User-defined types and classes can have string representations
+            RunaType::Class(_) => true,
+            RunaType::Object(_) => true,
+            
+            // Functions have string representations  
+            RunaType::Function { .. } => true, // "<function name>"
+        }
     }
 } 

@@ -250,32 +250,137 @@ impl CompilerIntegration {
         self.used_constants.insert(constant_name.to_string());
     }
     
-    /// Analyze dependencies of a constant
+    /// Analyze dependencies of a constant by examining its value
     fn analyze_constant_dependencies(&self, constant_name: &str) -> Option<Vec<String>> {
-        // This would analyze the constant's value to find other constants it depends on
-        // For now, we'll use a simple heuristic based on constant name patterns
         let mut dependencies = Vec::new();
         
-        // Check if this constant references other constants
-        if constant_name.contains("::") {
-            // Module-qualified constant
-            if let Some(module_name) = constant_name.split("::").next() {
-                dependencies.push(module_name.to_string());
+        // Get the constant value for analysis
+        if let Some(constant_value) = self.globals.get(constant_name) {
+            match constant_value {
+                Value::String(s) => {
+                    // Parse string literals for constant references
+                    self.extract_string_constant_refs(s, &mut dependencies);
+                }
+                Value::Integer(_) | Value::Float(_) | Value::Boolean(_) => {
+                    // Primitive values have no dependencies
+                }
+                _ => {
+                    // Complex values might have dependencies
+                    self.extract_complex_constant_refs(constant_value, &mut dependencies);
+                }
             }
         }
         
-        // Check for common dependency patterns
-        if constant_name.contains("base") || constant_name.contains("parent") {
-            // This constant might depend on a base class or parent module
-            if let Some(base_name) = constant_name.split("_").next() {
-                dependencies.push(format!("{}_base", base_name));
+        // Module-qualified constants depend on their module
+        if constant_name.contains("::") {
+            let parts: Vec<&str> = constant_name.split("::").collect();
+            if parts.len() > 1 {
+                // Add module dependency
+                dependencies.push(parts[0].to_string());
+                
+                // Check for nested module dependencies
+                for i in 1..parts.len()-1 {
+                    let nested_module = parts[0..=i].join("::");
+                    dependencies.push(nested_module);
+                }
             }
         }
+        
+        // Check existing dependency graph
+        if let Some(cached_deps) = self.constant_dependencies.get(constant_name) {
+            for dep in cached_deps {
+                if !dependencies.contains(dep) {
+                    dependencies.push(dep.clone());
+                }
+            }
+        }
+        
+        // Remove self-references and duplicates
+        dependencies.retain(|dep| dep != constant_name);
+        dependencies.sort();
+        dependencies.dedup();
         
         if dependencies.is_empty() {
             None
         } else {
             Some(dependencies)
+        }
+    }
+    
+    fn extract_string_constant_refs(&self, s: &str, dependencies: &mut Vec<String>) {
+        // Parse string for constant reference patterns manually
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        
+        while i < chars.len() {
+            // Look for ${CONST_NAME} pattern
+            if i + 2 < chars.len() && chars[i] == '$' && chars[i + 1] == '{' {
+                i += 2; // Skip "${"
+                let start = i;
+                
+                // Find closing brace
+                while i < chars.len() && chars[i] != '}' {
+                    i += 1;
+                }
+                
+                if i < chars.len() && chars[i] == '}' {
+                    let const_name: String = chars[start..i].iter().collect();
+                    if self.is_valid_constant_name(&const_name) && self.globals.contains_key(&const_name) {
+                        dependencies.push(const_name);
+                    }
+                }
+            }
+            // Look for @CONST_NAME pattern
+            else if chars[i] == '@' && i + 1 < chars.len() && chars[i + 1].is_ascii_uppercase() {
+                i += 1; // Skip "@"
+                let start = i;
+                
+                // Read constant name (letters, digits, underscore)
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == ':') {
+                    i += 1;
+                }
+                
+                let const_name: String = chars[start..i].iter().collect();
+                if self.is_valid_constant_name(&const_name) && self.globals.contains_key(&const_name) {
+                    dependencies.push(const_name);
+                }
+                continue; // Don't increment i again
+            }
+            
+            i += 1;
+        }
+    }
+    
+    fn is_valid_constant_name(&self, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        
+        // Check if it starts with uppercase letter or underscore
+        let first_char = name.chars().next().unwrap();
+        if !first_char.is_ascii_uppercase() && first_char != '_' {
+            return false;
+        }
+        
+        // Check remaining characters
+        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    }
+    
+    fn extract_complex_constant_refs(&self, value: &Value, dependencies: &mut Vec<String>) {
+        // Analyze complex values for constant references
+        match value {
+            Value::String(s) => {
+                // String values may contain constant references
+                self.extract_string_constant_refs(s, dependencies);
+            }
+            Value::Integer(_) | Value::Float(_) | Value::Boolean(_) => {
+                // Primitive values contain no references
+            }
+            _ => {
+                // For other value types, convert to string and analyze
+                let value_str = format!("{:?}", value);
+                self.extract_string_constant_refs(&value_str, dependencies);
+            }
         }
     }
 

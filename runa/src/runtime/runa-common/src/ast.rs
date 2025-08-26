@@ -1,6 +1,7 @@
 //! Defines the Abstract Syntax Tree (AST) for the Runa language.
 
 use crate::token::Token;
+use crate::bytecode::Value;
 
 // Using Box<Expr> for recursive enum variants
 // See: https://doc.rust-lang.org/book/ch15-01-box.html#enabling-recursive-types-with-boxes
@@ -15,6 +16,43 @@ pub enum Expr {
     Variable(VariableExpr),
     Call(CallExpr),
     Index(IndexAccessExpr),
+    List(ListExpr),
+    InterpolatedString(InterpolatedStringExpr),
+}
+
+// Legacy ASTNode type for compatibility with AOTT compiler
+#[derive(Debug, PartialEq, Clone)]
+pub enum ASTNode {
+    Literal(Value),
+    Identifier(String),
+    BinaryOp {
+        left: Box<ASTNode>,
+        op: String,
+        right: Box<ASTNode>,
+    },
+    UnaryOp {
+        op: String,
+        operand: Box<ASTNode>,
+    },
+    FunctionCall {
+        name: String,
+        args: Vec<ASTNode>,
+    },
+    Block(Vec<ASTNode>),
+    Assignment {
+        name: String,
+        value: Box<ASTNode>,
+    },
+    If {
+        condition: Box<ASTNode>,
+        then_branch: Box<ASTNode>,
+        else_branch: Option<Box<ASTNode>>,
+    },
+    While {
+        condition: Box<ASTNode>,
+        body: Box<ASTNode>,
+    },
+    Return(Option<Box<ASTNode>>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -37,9 +75,16 @@ pub struct GroupingExpr {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct LiteralExpr {
-    // We can use an enum for different literal types later
-    // e.g., String, Number, Bool, Nil
-    pub value: Token, 
+    pub value: LiteralValue,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum LiteralValue {
+    String(String),
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+    Nil,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -66,6 +111,22 @@ pub struct IndexAccessExpr {
     pub index: Box<Expr>,
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct ListExpr {
+    pub elements: Vec<Expr>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct InterpolatedStringExpr {
+    pub parts: Vec<InterpolatedStringPart>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum InterpolatedStringPart {
+    String(String),
+    Expression(Box<Expr>),
+}
+
 // === STATEMENTS ===
 
 #[derive(Debug, PartialEq, Clone)]
@@ -82,6 +143,7 @@ pub enum Stmt {
     Match(MatchStmt),
     TypeDef(TypeDefStmt),
     EnumDef(EnumDefStmt),
+    Annotation(AnnotationStmt),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -168,4 +230,11 @@ pub struct TypeField {
 pub struct EnumDefStmt {
     pub name: Token,
     pub variants: Vec<Token>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct AnnotationStmt {
+    pub annotation_type: String,
+    pub content: String,
+    pub location: crate::annotations::SourceLocation,
 } 
