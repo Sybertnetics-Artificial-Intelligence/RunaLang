@@ -33,7 +33,26 @@ impl Parser {
             // 3. Parse one statement.
             // Use a synchronizing error recovery mechanism here.
             match self.declaration() {
-                Ok(stmt) => statements.push(stmt),
+                Ok(stmt) => {
+                    statements.push(stmt);
+                    
+                    // Check for inline Note comment after the statement
+                    if let Some(inline_comment) = self.try_parse_inline_comment() {
+                        // Create an inline comment annotation
+                        let inline_stmt = Stmt::Annotation(AnnotationStmt {
+                            annotation_type: "Context".to_string(),
+                            content: format!("InlineComment: {}", inline_comment),
+                            location: runa_common::annotations::SourceLocation {
+                                start_line: 0,
+                                start_column: 0,
+                                end_line: 0,
+                                end_column: 0,
+                                file_path: Some("current".to_string()),
+                            },
+                        });
+                        statements.push(inline_stmt);
+                    }
+                },
                 Err(e) => {
                     // If parsing a statement fails, don't just stop.
                     // Call a recovery function that advances the parser to the
@@ -150,7 +169,27 @@ impl Parser {
             println!("DEBUG: Successfully parsed return type: '{}'", _return_type.lexeme);
         }
         self.consume(TokenType::Colon, "Expect ':' after function signature.")?;
-        self.consume(TokenType::Newline, "Expect newline after function signature.")?;
+        
+        // Handle inline comments before newline - for function declarations, we need special handling
+        // since we need to continue parsing the function body after the inline comment
+        if self.check(TokenType::Note) {
+            println!("DEBUG: Found Note token for inline comment after function signature, parsing it now");
+            // Parse the inline comment ourselves rather than leaving it for main loop
+            // since we need to continue with function body parsing
+            if let Some(_inline_comment) = self.try_parse_inline_comment() {
+                println!("DEBUG: Successfully parsed inline comment in function signature");
+            }
+        }
+        
+        // Now expect newline and indent
+        if !self.check(TokenType::Newline) && !self.check(TokenType::Indent) {
+            return Err("Expect newline after function signature.".to_string());
+        }
+        
+        if self.check(TokenType::Newline) {
+            self.advance(); // consume newline
+        }
+        
         self.consume(TokenType::Indent, "Expect indent for function body.")?;
         let mut body = Vec::new();
         while !self.check(TokenType::Dedent) && !self.is_at_end() {
@@ -223,13 +262,16 @@ impl Parser {
         let initializer = Some(self.expression()?);
         println!("DEBUG: Parsed expression, next token is {:?} '{}'", self.peek().token_type, self.peek().lexeme);
         
-        // Accept either newline or dedent (end of indented block) after let declaration
+        // Accept either newline, dedent, or Note (for inline comments) after let declaration
         if self.check(TokenType::Newline) {
             self.advance();
             println!("DEBUG: Successfully consumed newline");
         } else if self.check(TokenType::Dedent) {
             // Don't consume dedent here - let the block parser handle it
             println!("DEBUG: Found dedent, letting block parser handle it");
+        } else if self.check(TokenType::Note) {
+            // Don't consume Note here - let the main loop handle inline comments
+            println!("DEBUG: Found Note token for inline comment, letting main loop handle it");
         } else if !self.is_at_end() {
             return Err("Expect newline or end of block after let declaration.".to_string());
         }
@@ -308,6 +350,10 @@ impl Parser {
         }
         if self.match_token(TokenType::Display) {
             return self.display_statement();
+        }
+        if self.match_token(TokenType::Note) {
+            println!("DEBUG: statement() - matched Note, calling note_comment");
+            return self.note_comment();
         }
         println!("DEBUG: statement() - falling through to expression_statement");
         self.expression_statement()
@@ -1256,26 +1302,84 @@ impl Parser {
         self.consume(TokenType::Colon, "Expect ':' after 'Note'.")?;
         
         let mut comment_content = String::new();
+        let mut is_multiline = false;
         
-        // Simple single-line comment processing only
-        // Consume all tokens on the current line until newline
-        while !self.is_at_end() && !self.check(TokenType::Newline) && !self.check(TokenType::Eof) {
-            let token = self.advance();
-            if !comment_content.is_empty() {
-                comment_content.push(' ');
+        // Check if this is a single-line comment (has content on same line)
+        // or multi-line comment (Note: followed by newline)
+        if self.check(TokenType::Newline) {
+            // Multi-line comment: Note: followed immediately by newline
+            is_multiline = true;
+            self.advance(); // consume the newline
+            
+            // Parse multi-line content until ":End Note"
+            while !self.is_at_end() {
+                // Check for ":End Note" pattern
+                if self.check(TokenType::Colon) {
+                    let colon_pos = self.current;
+                    self.advance(); // consume ':'
+                    
+                    if self.check(TokenType::End) {
+                        self.advance(); // consume 'End'
+                        if self.check(TokenType::Note) {
+                            self.advance(); // consume 'Note'
+                            // Found ":End Note" - end of multi-line comment
+                            break;
+                        } else {
+                            // False alarm, backtrack and include the colon and End in content
+                            self.current = colon_pos;
+                            let token = self.advance();
+                            if !comment_content.is_empty() {
+                                comment_content.push(' ');
+                            }
+                            comment_content.push_str(&token.lexeme);
+                        }
+                    } else {
+                        // False alarm, backtrack and include the colon in content  
+                        self.current = colon_pos;
+                        let token = self.advance();
+                        if !comment_content.is_empty() {
+                            comment_content.push(' ');
+                        }
+                        comment_content.push_str(&token.lexeme);
+                    }
+                } else {
+                    // Regular content token
+                    let token = self.advance();
+                    if !comment_content.is_empty() && !comment_content.ends_with('\n') {
+                        if token.token_type == TokenType::Newline {
+                            comment_content.push('\n');
+                        } else {
+                            comment_content.push(' ');
+                        }
+                    }
+                    if token.token_type != TokenType::Newline {
+                        comment_content.push_str(&token.lexeme);
+                    } else {
+                        comment_content.push('\n');
+                    }
+                }
             }
-            comment_content.push_str(&token.lexeme);
-        }
-        
-        // Consume the newline if present
-        if self.match_token(TokenType::Newline) {
-            // Newline consumed
+        } else {
+            // Single-line comment: consume all tokens until newline
+            while !self.is_at_end() && !self.check(TokenType::Newline) && !self.check(TokenType::Eof) {
+                let token = self.advance();
+                if !comment_content.is_empty() {
+                    comment_content.push(' ');
+                }
+                comment_content.push_str(&token.lexeme);
+            }
+            
+            // Consume the newline if present
+            if self.match_token(TokenType::Newline) {
+                // Newline consumed
+            }
         }
         
         // Create an annotation statement to represent the note comment
+        let comment_type = if is_multiline { "MultilineComment" } else { "Comment" };
         Ok(Stmt::Annotation(AnnotationStmt {
             annotation_type: "Context".to_string(),
-            content: format!("Comment: {}", comment_content),
+            content: format!("{}: {}", comment_type, comment_content.trim()),
             location: runa_common::annotations::SourceLocation {
                 start_line: 0,
                 start_column: 0,
@@ -1284,6 +1388,37 @@ impl Parser {
                 file_path: Some("current".to_string()),
             },
         }))
+    }
+
+    // Helper function to check for and parse inline Note comments
+    fn try_parse_inline_comment(&mut self) -> Option<String> {
+        // Check if we have "Note:" after some content on the same line
+        if self.check(TokenType::Note) {
+            let note_pos = self.current;
+            self.advance(); // consume 'Note'
+            
+            if self.check(TokenType::Colon) {
+                self.advance(); // consume ':'
+                
+                let mut comment_content = String::new();
+                // Consume rest of line as inline comment
+                while !self.is_at_end() && !self.check(TokenType::Newline) && !self.check(TokenType::Eof) {
+                    let token = self.advance();
+                    if !comment_content.is_empty() {
+                        comment_content.push(' ');
+                    }
+                    comment_content.push_str(&token.lexeme);
+                }
+                
+                Some(comment_content.trim().to_string())
+            } else {
+                // Not a Note: comment, backtrack
+                self.current = note_pos;
+                None
+            }
+        } else {
+            None
+        }
     }
 
     fn check_annotation_start(&self) -> bool {
