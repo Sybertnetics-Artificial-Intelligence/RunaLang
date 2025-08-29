@@ -1,200 +1,299 @@
-# Runa - AI-First Universal Translation Platform
+# Runa - The Universal Programming Language
 
-## 🌟 Natural Language Programming Language
+## 🌍 **One Language. Everything. Everyone.**
 
-Runa is a revolutionary programming language designed with **natural language syntax** that reads like English while maintaining the power and precision of traditional programming languages. Built from the ground up for AI-first development and universal code translation.
+Runa is the world's first truly universal programming language. Whether you're a complete beginner, an experienced developer, or an AI system, Runa speaks your language. Write once, run anywhere - from web apps to databases, from audio processing to AI systems.
 
-## ✅ Current Status: **Phase 1.3 INITIAL SEMANTIC ANALYSIS COMPLETED**
+## 🚀 **Why Runa Changes Everything**
 
-🎉 100% SUCCESS: All 50 tests passing across lexer, parser, loops, and semantic analyzer!
+### **For Beginners:**
+- **Read like English, write like English** - No more cryptic symbols or syntax
+- **One language for everything** - Learn once, build anything
+- **Natural thinking** - Code flows like your thoughts
 
-### ✅ Lexer: 16/16 tests (100%)
-- Complete natural language token recognition
-- Multi-word operators and identifiers  
-- All data types and constructs
+### **For Developers:**
+- **Dual syntax system** - Natural language OR technical syntax
+- **Universal libraries** - Frontend, backend, databases, AI - all in Runa
+- **Tooling that adapts** - Switch between natural and technical views instantly
 
-### ✅ Parser: 27/27 tests (100%)
-- Full AST generation from natural language syntax
-- Complete expression parsing with precedence
-- All control flow and language constructs
+### **For AI Systems:**
+- **AI-to-AI communication** - Built from the ground up for AI understanding
+- **English parsing instead of token guessing** - No more complex symbol combinations to decode
+- **Intent-driven annotations** - AI understands reasoning, intent, and implementation before execution
+- **Universal translation** - Convert between any programming paradigm
+- **Self-evolving** - Language that grows with AI capabilities
 
-### ✅ Semantic Analyzer: 7/7 tests (100%)
-- Symbol table implementation with scoping
-- Type inference and compatibility checking  
-- Semantic validation and error reporting
+## 💡 **See the Difference**
 
-## 🚀 Current Capabilities
+### **Traditional Programming (Python):**
+```python
+def process_user_data(users, filters=None, sort_by='name', limit=None, include_inactive=False):
+    if filters is None:
+        filters = {}
+    
+    filtered_users = []
+    for user in users:
+        if all(user.get(key) == value for key, value in filters.items()):
+            if include_inactive or user.get('status') != 'inactive':
+                filtered_users.append(user)
+    
+    if sort_by == 'name':
+        filtered_users.sort(key=lambda x: x.get('name', '').lower())
+    elif sort_by == 'age':
+        filtered_users.sort(key=lambda x: x.get('age', 0))
+    elif sort_by == 'last_login':
+        filtered_users.sort(key=lambda x: x.get('last_login', ''), reverse=True)
+    
+    if limit:
+        filtered_users = filtered_users[:limit]
+    
+    return filtered_users
 
-Runa can now successfully parse and understand complete natural language programs:
+# Usage example
+active_users = process_user_data(
+    user_list, 
+    filters={'role': 'admin', 'verified': True}, 
+    sort_by='last_login', 
+    limit=10, 
+    include_inactive=False
+)
+```
+
+### **Runa - Natural Syntax:**
+```runa
+Process called "process user data" that takes users as List and filters as Optional Dictionary and sort by as String and limit as Optional Integer and include inactive as Boolean returns List:
+    Note: If no filters provided, start with empty filter set
+    If filters is nothing:
+        Let filters be empty dictionary
+    
+    Note: Filter users based on criteria and status
+    Let filtered users be empty list
+    For each user in users:
+        If all filter conditions match user data:
+            If include inactive is true or user status is not "inactive":
+                Add user to filtered users
+    
+    Note: Sort users by specified criteria
+    If sort by equals "name":
+        Sort filtered users by user name in alphabetical order
+    Otherwise if sort by equals "age":
+        Sort filtered users by user age in ascending order
+    Otherwise if sort by equals "last login":
+        Sort filtered users by last login time in descending order
+    
+    Note: Apply limit if specified
+    If limit is not nothing:
+        Let filtered users be first limit items from filtered users
+    
+    Return filtered users
+
+Note: Usage example - much clearer what we're doing!
+Let active users be Process User Data with:
+    users as user list
+    filters as dictionary with role as "admin" and verified as true
+    sort by as "last login"
+    limit as 10
+    include inactive as false
+```
+
+### **Runa - Technical Syntax:**
+```runa
+Process called process_user_data(users as List, filters as Optional[Dictionary], sort_by as String, limit as Optional[Integer], include_inactive as Boolean) returns List:
+    Note: If no filters provided, start with empty filter set
+    If filters is None:
+        Let filters be {}
+    
+    Note: Filter users based on criteria and status
+    Let filtered_users be []
+    For each user in users:
+        If all(filters.get(key) = value for key, value in filters.items()):
+            If include_inactive or user.get('status') != 'inactive':
+                filtered_users.append(user)
+    
+    Note: Sort users by specified criteria
+    If sort_by = "name":
+        filtered_users.sort(key=lambda x: x.get('name', '').lower())
+    Elif sort_by = "age":
+        filtered_users.sort(key=lambda x: x.get('age', 0))
+    Elif sort_by = "last_login":
+        filtered_users.sort(key=lambda x: x.get('last_login', ''), reverse=True)
+    
+    Note: Apply limit if specified
+    If limit:
+        filtered_users = filtered_users[:limit]
+    
+    Return filtered_users
+
+Note: Usage example
+Let active_users be process_user_data(
+    user_list, 
+    filters as {'role': 'admin', 'verified': True}, 
+    sort_by as 'last_login', 
+    limit as 10, 
+    include_inactive as False
+)
+```
+
+## 🔄 **Dual Syntax System**
+
+Runa's revolutionary dual syntax means you can:
+
+- **Write naturally** - Use English-like syntax that reads like documentation
+- **Write technically** - Use traditional programming syntax when you prefer
+- **Switch instantly** - Use `--viewer` mode to see natural syntax, `--developer` mode for technical
+- **Learn gradually** - Start with natural syntax, evolve to technical as you grow
+
+## 🌟 **What You Can Build (Literally Everything)**
+
+### **Web Development**
+```runa
+Process called "create user dashboard" that takes user_id as String returns HTML:
+    Let user_data be Get User Data with id as user_id
+    Let dashboard be Generate Dashboard with data as user_data
+    Return dashboard
+```
+
+### **Database Operations**
+```runa
+Let new_user be Create User with:
+    name as "Alice Johnson"
+    email as "alice@example.com"
+    age as 28
+    preferences as list containing "python", "runa", "ai"
+```
+
+### **AI Integration**
+```runa
+@Task: Request authentication implementation advice from AI system @End_Task
+
+@Reasoning: We need to ask an AI for guidance on implementing user authentication in our web application. This requires clear context about our project and specific questions about best practices. @End_Reasoning
+
+@Implementation: We'll use the Ask AI function with structured parameters for question, context, and model selection. This provides the AI with all necessary information to give relevant advice. @End_Implementation
+
+Let ai_response be Ask AI with:
+    question as "What is the best way to implement user authentication?"
+    context as "Building a web application in Runa"
+    model as "gpt-4"
+
+@Verify: AI response contains actionable authentication implementation steps @End_Verify
+```
+
+**Why this matters for AI:** Instead of parsing cryptic symbols like `ai.ask(q="auth?", ctx="web", m="gpt4")`, AI systems read natural English with explicit annotations that explain reasoning, intent, and implementation details before execution begins.
+
+### **Audio/Video Processing**
+```runa
+Let processed_audio be Process Audio with:
+    file as "input.wav"
+    effects as list containing "noise_reduction", "normalization"
+    output_format as "mp3"
+```
+
+## 🛠️ **Current Status**
+
+**⚠️ Important Update:** Due to a catastrophic failure during development, our standard libraries are currently being reworked from the ground up. Expected completion: **7-10 days**.
+
+**What's Working Now:**
+- ✅ **Complete language parser** - Understands all Runa syntax
+- ✅ **Dual syntax system** - Natural and technical syntax fully supported
+- ✅ **Core language features** - Variables, functions, control flow, data types
+- ✅ **Tooling** - Viewer/developer mode switching
+- ✅ **IDE support** - VS Code and Cursor extensions ready
+
+**What's Coming (7-10 days):**
+- 🚧 **Universal standard library** - Libraries for every domain
+- 🚧 **Runtime environment** - Execute Runa programs
+- 🚧 **Package manager** - Install and manage Runa libraries
+- 🚧 **Documentation** - Complete guides for every use case
+
+## 🚀 **Getting Started (Right Now)**
+
+### **1. Install the Extension**
+- **VS Code**: Search for "Runa Language Support" in Extensions
+- **Cursor**: Same extension works in Cursor
+- **Other editors**: Coming soon
+
+### **2. Create Your First Runa File**
+Create a file with `.runa` extension and start coding:
 
 ```runa
-Let user name be "Alex"
-Let user age be 28
+Note: My first Runa program!
 
-If user age is greater than 21:
-    Display "User is an adult"
-    Set adult status to true
-Otherwise:
-    Display "User is a minor"
-    Set adult status to false
+Let my_name be "World"
+Display "Hello, " followed by my_name followed by "!"
 
 Let numbers be list containing 1, 2, 3, 4, 5
-Let total be Calculate Sum with values as numbers and multiplier as 2
-Display total with message "Final result:"
+Let total be 0
+
+For each number in numbers:
+    Set total to total plus number
+
+Display "Sum of numbers: " followed by total
+
+Note: 
+This is a multi
+line comment
+block
+:End Note
+
+Process called "example" Note: this is an inline comment
+Note: This is a single line comment.
 ```
 
-## 🌟 Key Features Implemented
+### **3. Experience the Magic**
+- **Syntax highlighting** - See your code come to life
+- **Intelligent completion** - Get suggestions as you type
+- **Error detection** - Catch mistakes before they happen
+- **Format switching** - Use `--viewer` and `--developer` modes
 
-### Natural Language Syntax
-- **English-like Keywords**: `Let`, `Define`, `Set`, `If`, `Otherwise`
-- **Natural Operators**: `is greater than`, `multiplied by`, `divided by`
-- **Multi-word Identifiers**: `user name`, `tax rate`, `final total`
-- **Readable Constructs**: `list containing`, `with message`
+## 🌐 **The Vision: One Language to Rule Them All**
 
-### Advanced Language Features
-- **Variable Declarations**: Let/Define with optional type annotations
-- **Control Flow**: If/Otherwise/Otherwise if with indented blocks
-- **Function Calls**: Named parameter syntax with natural language
-- **Data Types**: Strings, integers, floats, booleans, lists
-- **Expressions**: Full arithmetic and comparison with proper precedence
-- **Mathematical Symbol Enforcement**: Symbols (`+`, `-`, `*`, `/`, `<`, `>`, `<=`, `>=`, `!=`) ONLY for mathematical operations
-- **Error Handling**: Comprehensive error reporting with line/column info
+Runa isn't just another programming language. It's the **end of programming language fragmentation**.
 
-### Technical Excellence
-- **Recursive Descent Parser**: Clean, maintainable architecture
-- **Complete AST Generation**: Full syntax tree construction
-- **Strict Symbol Enforcement**: Mathematical symbols restricted to mathematical contexts only
-- **Production Ready**: 100% test coverage, deployment-ready code
-- **Self-hosting Designed**: Architecture ready for bootstrapping
+### **Why This Matters:**
+- **No more learning 10 languages** for one project
+- **Universal code sharing** - Runa code works everywhere
+- **AI-native development** - Built for the AI-first future
+- **Democratized coding** - Anyone can build anything
 
-## 🏗️ Architecture
+### **The Future:**
+- **Self-hosting** - Runa will eventually write itself
+- **Universal translation** - Convert any code to Runa
+- **AI collaboration** - Humans and AIs coding together seamlessly
+- **Global accessibility** - Programming in any natural language
 
-### Lexer (`runa/compiler/lexer.py`)
-- 80+ token types covering complete Runa grammar
-- Multi-word token recognition with longest-match algorithm
-- Indentation-based scoping with INDENT/DEDENT generation
-- Comprehensive error handling with position tracking
+## 🎯 **Who Should Use Runa?**
 
-### Parser (`runa/compiler/parser.py`)
-- Recursive descent parser for natural language grammar
-- Complete AST node generation for all language constructs
-- Operator precedence handling for complex expressions
-- Graceful error recovery and detailed reporting
+- **Complete beginners** - Start coding without learning cryptic syntax
+- **Web developers** - Build full-stack applications in one language
+- **Data scientists** - Process data with natural language commands
+- **AI researchers** - Create AI systems that understand code naturally
+- **Business users** - Automate workflows with readable code
+- **Students** - Learn programming concepts without syntax barriers
+- **Enterprise teams** - Standardize on one language across all projects
 
-### AST Nodes (`runa/compiler/ast_nodes.py`)
-- 30+ AST node types covering entire language
-- Visitor pattern support for extensibility
-- Complete type system integration
-- Pattern matching and control flow support
+## 🔮 **What's Next?**
 
-## 📊 Development Progress
+1. **Standard libraries complete** (7-10 days)
+2. **Runtime environment** (2 weeks)
+3. **Package ecosystem** (1 month)
+4. **AI integration tools** (2 months)
+5. **Self-hosting capability** (6 months)
+6. **Universal translation** (1 year)
 
-| Phase | Component | Status | Tests |
-|-------|-----------|--------|-------|
-| 1.1 | **Lexer** | ✅ **COMPLETED** | 16/16 (100%) |
-| 1.2 | **Parser** | ✅ **COMPLETED** | 27/27 (100%) |
-| 1.3 | **Semantic Analysis** | ✅ **INITIAL COMPLETE** | 7/7 (100%) |
-| 1.4 | Code Generation | 📋 Planned | - |
+## 🤝 **Join the Revolution**
 
-## 🎯 Next Steps (Phase 1.4)
+Runa is more than a programming language. It's a movement toward **universal programming accessibility**.
 
-### Code Generation Kick-off
-- Design intermediate representation (IR) and bytecode format
-- Implement basic Python code generator for proof-of-concept
-- Incrementally translate validated AST nodes into IR and target code
+- **No more language barriers**
+- **No more syntax complexity**
+- **No more platform limitations**
+- **Just one language for everything**
 
-### Semantic Enhancements (Ongoing)
-- Complete loop semantics (condition type checks, iterable validation)
-- Add function/process definition semantics with argument/type checking
-- Integrate pattern matching exhaustiveness analysis
+**Ready to code the future? Start with Runa.**
 
-## 🚀 Example Programs
+---
 
-### Variable Operations
-```runa
-Let price be 100.00
-Let tax rate be 0.08
-Let total price be price multiplied by (1 plus tax rate)
-Display total price with message "Total cost:"
-```
+**Runa - The Universal Programming Language**  
+*One language. Everything. Everyone.*
 
-### Control Flow
-```runa
-Let age be 25
-
-If age is greater than or equal to 18:
-    Display "Adult user"
-    Set voting eligible to true
-Otherwise:
-    Display "Minor user"
-    Set voting eligible to false
-```
-
-### Function Calls
-```runa
-Let result be Calculate Interest with principal as 1000 and rate as 0.05 and years as 3
-Display result
-```
-
-### Data Structures
-```runa
-Let scores be list containing 85, 92, 78, 96, 88
-Let average be Calculate Average with numbers as scores
-```
-
-## 🛠️ Development
-
-### Running Tests
-```bash
-# Run all tests
-python -m pytest runa/tests/ -v
-
-# Run specific components
-python -m pytest runa/tests/test_lexer.py -v
-python -m pytest runa/tests/test_parser.py -v
-```
-
-### Code Structure
-```
-runa/
-├── compiler/
-│   ├── lexer.py       # Natural language tokenization
-│   ├── parser.py      # Recursive descent parser
-│   ├── semantic.py    # Semantic analyzer
-│   ├── tokens.py      # Token definitions
-│   └── ast_nodes.py   # AST node hierarchy
-├── tests/
-│   ├── test_lexer.py          # Lexer test suite (16 tests)
-│   ├── test_parser.py         # Parser test suite (24 tests)
-│   ├── test_parser_loops.py   # Loop parser tests (3 tests)
-│   ├── test_semantic.py       # Semantic analyzer tests (5 tests)
-│   └── test_semantic_types.py # Semantic type system tests (2 tests)
-└── examples/
-    └── basic_program.runa # Example Runa programs
-```
-
-## 🌐 Vision: Universal Translation Platform
-
-Runa is designed as the foundation for an **AI-First Universal Translation Platform** that will:
-
-1. **Parse Natural Language**: Understand English-like programming syntax
-2. **Generate Universal ASTs**: Create language-agnostic representations  
-3. **Target Multiple Languages**: Translate to Python, JavaScript, Go, Rust, etc.
-4. **AI Integration**: Support LLM-based code generation and optimization
-5. **Self-Hosting**: Eventually bootstrap itself and eliminate external dependencies
-
-## 📈 Technical Achievements
-
-- ✅ **100% Natural Language Syntax**: Complete English-like programming
-- ✅ **Multi-word Constructs**: Full support for natural identifiers and operators
-- ✅ **Robust Error Handling**: Comprehensive error reporting and recovery
-- ✅ **Production Quality**: Deployment-ready code with full test coverage
-- ✅ **Extensible Architecture**: Clean design for adding new features
-
-## 🎉 Milestone Completed
-
-**Phase 1.3: Semantic Analysis - 100% COMPLETE**
-
-All core language parsing functionality is now operational with comprehensive test coverage. The foundation is solid for advancing to code generation phases.
-
-**Ready for Phase 1.4: Code Generation** 🚀 
+*Built with ❤️ by Sybertnetics*
