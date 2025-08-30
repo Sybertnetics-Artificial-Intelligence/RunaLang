@@ -1,299 +1,287 @@
-# Runa - The Universal Programming Language
+# Runa Programming Language
+*The Universal Bridge Between Human Thinking and Machine Execution*
 
-## 🌍 **One Language. Everything. Everyone.**
+[![License: RPLL](https://img.shields.io/badge/License-RPLL-blue.svg)](LICENSE.md)
+[![Language](https://img.shields.io/badge/Language-Runa-blue.svg)](https://sybertnetics.com/Runa)
+[![Status](https://img.shields.io/badge/Status-Open%20Source%20Preview-green.svg)](https://github.com/Sybertnetics-Artificial-Intelligence/RunaLang)
+[![Creator](https://img.shields.io/badge/Created%20by-Sybertnetics%20AI-purple.svg)](https://sybertnetics.com)
 
-Runa is the world's first truly universal programming language. Whether you're a complete beginner, an experienced developer, or an AI system, Runa speaks your language. Write once, run anywhere - from web apps to databases, from audio processing to AI systems.
+## What is Runa?
 
-## 🚀 **Why Runa Changes Everything**
+Runa is a revolutionary programming language that reads like natural English but executes with the precision of traditional code. Named after Norse runes that encoded knowledge and meaning, Runa bridges the gap between human reasoning and machine execution, making programming accessible to domain experts while remaining powerful enough for complex AI systems.
 
-### **For Beginners:**
-- **Read like English, write like English** - No more cryptic symbols or syntax
-- **One language for everything** - Learn once, build anything
-- **Natural thinking** - Code flows like your thoughts
+**If you can read this sentence, you can read Runa code.**
 
-### **For Developers:**
-- **Dual syntax system** - Natural language OR technical syntax
-- **Universal libraries** - Frontend, backend, databases, AI - all in Runa
-- **Tooling that adapts** - Switch between natural and technical views instantly
+## The Problem Runa Solves
 
-### **For AI Systems:**
-- **AI-to-AI communication** - Built from the ground up for AI understanding
-- **English parsing instead of token guessing** - No more complex symbol combinations to decode
-- **Intent-driven annotations** - AI understands reasoning, intent, and implementation before execution
-- **Universal translation** - Convert between any programming paradigm
-- **Self-evolving** - Language that grows with AI capabilities
+Traditional programming languages force humans to think like machines. Runa does the opposite - it lets machines understand human-like instructions.
 
-## 💡 **See the Difference**
+### Compare These Examples
 
-### **Traditional Programming (Python):**
+**Traditional Python** (Complex data processing):
 ```python
-def process_user_data(users, filters=None, sort_by='name', limit=None, include_inactive=False):
-    if filters is None:
-        filters = {}
+def process_user_analytics(users, start_date, end_date, metrics=['engagement', 'retention']):
+    filtered_users = [u for u in users if start_date <= u.last_activity <= end_date]
     
-    filtered_users = []
-    for user in users:
-        if all(user.get(key) == value for key, value in filters.items()):
-            if include_inactive or user.get('status') != 'inactive':
-                filtered_users.append(user)
+    results = {}
+    for metric in metrics:
+        if metric == 'engagement':
+            results[metric] = {
+                'avg_sessions': sum(u.sessions for u in filtered_users) / len(filtered_users),
+                'top_users': sorted(filtered_users, key=lambda u: u.engagement_score, reverse=True)[:10]
+            }
+        elif metric == 'retention':
+            results[metric] = len([u for u in filtered_users if u.is_retained]) / len(filtered_users)
     
-    if sort_by == 'name':
-        filtered_users.sort(key=lambda x: x.get('name', '').lower())
-    elif sort_by == 'age':
-        filtered_users.sort(key=lambda x: x.get('age', 0))
-    elif sort_by == 'last_login':
-        filtered_users.sort(key=lambda x: x.get('last_login', ''), reverse=True)
-    
-    if limit:
-        filtered_users = filtered_users[:limit]
-    
-    return filtered_users
-
-# Usage example
-active_users = process_user_data(
-    user_list, 
-    filters={'role': 'admin', 'verified': True}, 
-    sort_by='last_login', 
-    limit=10, 
-    include_inactive=False
-)
+    return results
 ```
 
-### **Runa - Natural Syntax:**
+**Runa** (Same functionality):
 ```runa
-Process called "process user data" that takes users as List and filters as Optional Dictionary and sort by as String and limit as Optional Integer and include inactive as Boolean returns List:
-    Note: If no filters provided, start with empty filter set
-    If filters is nothing:
-        Let filters be empty dictionary
+Process called "analyze user behavior" that takes users and date range and metrics
+    Let active users be Filter users where last activity is within date range
     
-    Note: Filter users based on criteria and status
-    Let filtered users be empty list
-    For each user in users:
-        If all filter conditions match user data:
-            If include inactive is true or user status is not "inactive":
-                Add user to filtered users
+    For each metric in metrics:
+        When metric is "engagement":
+            Let average sessions be the average of sessions from active users
+            Let top performers be the top 10 users sorted by engagement score
+            
+        When metric is "retention":
+            Let retention rate be the percentage of active users who are retained
     
-    Note: Sort users by specified criteria
-    If sort by equals "name":
-        Sort filtered users by user name in alphabetical order
-    Otherwise if sort by equals "age":
-        Sort filtered users by user age in ascending order
-    Otherwise if sort by equals "last login":
-        Sort filtered users by last login time in descending order
-    
-    Note: Apply limit if specified
-    If limit is not nothing:
-        Let filtered users be first limit items from filtered users
-    
-    Return filtered users
-
-Note: Usage example - much clearer what we're doing!
-Let active users be Process User Data with:
-    users as user list
-    filters as dictionary with role as "admin" and verified as true
-    sort by as "last login"
-    limit as 10
-    include inactive as false
+    Return analysis results
 ```
 
-### **Runa - Technical Syntax:**
+**The difference is striking:** The Python code requires deep programming knowledge to understand the logic. The Runa code can be read and understood by anyone who speaks English - product managers, data scientists, business analysts, or domain experts.
+
+## Why Runa Matters
+
+### 🧠 **Human-First Design**
+- **Readable by Anyone**: If you can read English, you can understand Runa code
+- **Domain Expert Friendly**: Business logic can be written directly by those who understand the domain
+- **Natural Flow**: Code follows the same patterns as human thinking
+
+### 🤖 **AI-Native Architecture**
+- **Built for AI Agents**: Native support for multi-agent systems, reasoning, and coordination
+- **LLM Integration**: Seamless integration with language models for intelligent code generation
+- **Neural Network Support**: First-class support for machine learning workflows
+
+### 🌐 **Universal Translation**
+- **Any Language to Any Language**: Translates between 50+ programming languages using Runa as the intermediate representation
+- **Preserve Meaning**: Maintains semantic correctness across translations
+- **Legacy Code Revival**: Breathes new life into COBOL, Fortran, and other legacy systems
+
+### 📈 **Production Ready**
+- **Type Safety**: Advanced type system with inference prevents runtime errors
+- **Performance**: Compiles to efficient native code or transpiles to target languages
+- **Scalability**: Designed for enterprise-level applications and systems
+
+## Quick Examples
+
+### Business Logic
 ```runa
-Process called process_user_data(users as List, filters as Optional[Dictionary], sort_by as String, limit as Optional[Integer], include_inactive as Boolean) returns List:
-    Note: If no filters provided, start with empty filter set
-    If filters is None:
-        Let filters be {}
+Process called "calculate shipping cost" that takes order and destination:
+    Let base cost be order total multiplied by 0.08
     
-    Note: Filter users based on criteria and status
-    Let filtered_users be []
-    For each user in users:
-        If all(filters.get(key) = value for key, value in filters.items()):
-            If include_inactive or user.get('status') != 'inactive':
-                filtered_users.append(user)
+    When destination is "international":
+        Let customs fee be base cost multiplied by 0.15
+        Return base cost plus customs fee
     
-    Note: Sort users by specified criteria
-    If sort_by = "name":
-        filtered_users.sort(key=lambda x: x.get('name', '').lower())
-    Elif sort_by = "age":
-        filtered_users.sort(key=lambda x: x.get('age', 0))
-    Elif sort_by = "last_login":
-        filtered_users.sort(key=lambda x: x.get('last_login', ''), reverse=True)
-    
-    Note: Apply limit if specified
-    If limit:
-        filtered_users = filtered_users[:limit]
-    
-    Return filtered_users
-
-Note: Usage example
-Let active_users be process_user_data(
-    user_list, 
-    filters as {'role': 'admin', 'verified': True}, 
-    sort_by as 'last_login', 
-    limit as 10, 
-    include_inactive as False
-)
+    Otherwise:
+        Return base cost
 ```
 
-## 🔄 **Dual Syntax System**
-
-Runa's revolutionary dual syntax means you can:
-
-- **Write naturally** - Use English-like syntax that reads like documentation
-- **Write technically** - Use traditional programming syntax when you prefer
-- **Switch instantly** - Use `--viewer` mode to see natural syntax, `--developer` mode for technical
-- **Learn gradually** - Start with natural syntax, evolve to technical as you grow
-
-## 🌟 **What You Can Build (Literally Everything)**
-
-### **Web Development**
+### AI Agent Coordination
 ```runa
-Process called "create user dashboard" that takes user_id as String returns HTML:
-    Let user_data be Get User Data with id as user_id
-    Let dashboard be Generate Dashboard with data as user_data
-    Return dashboard
+Let data processor be Agent with:
+    skills as list containing "data analysis", "report generation"
+    goals as list containing "process daily reports"
+
+Send task "analyze user engagement" to data processor with:
+    priority as "high"
+    deadline as "2 hours"
+    data as user engagement metrics
 ```
 
-### **Database Operations**
+### Data Processing Pipeline
 ```runa
-Let new_user be Create User with:
-    name as "Alice Johnson"
-    email as "alice@example.com"
-    age as 28
-    preferences as list containing "python", "runa", "ai"
+Let user data be load data from "users.csv"
+Let clean data be Filter user data where age is greater than 0
+Let processed data be Map over clean data using standardize user record
+Let insights be analyze patterns in processed data
+
+Display "Found " with message length of insights with message " key insights"
 ```
 
-### **AI Integration**
+### Machine Learning Workflow
 ```runa
-@Task: Request authentication implementation advice from AI system @End_Task
+Let model be create neural network with:
+    layers as list containing:
+        Dense layer with 128 units and activation "relu"
+        Dense layer with 64 units and activation "relu" 
+        Dense layer with 10 units and activation "softmax"
 
-@Reasoning: We need to ask an AI for guidance on implementing user authentication in our web application. This requires clear context about our project and specific questions about best practices. @End_Reasoning
+Train model with:
+    data as training data
+    epochs as 100
+    validation data as test data
 
-@Implementation: We'll use the Ask AI function with structured parameters for question, context, and model selection. This provides the AI with all necessary information to give relevant advice. @End_Implementation
-
-Let ai_response be Ask AI with:
-    question as "What is the best way to implement user authentication?"
-    context as "Building a web application in Runa"
-    model as "gpt-4"
-
-@Verify: AI response contains actionable authentication implementation steps @End_Verify
+Let predictions be model predict with input as new data
 ```
 
-**Why this matters for AI:** Instead of parsing cryptic symbols like `ai.ask(q="auth?", ctx="web", m="gpt4")`, AI systems read natural English with explicit annotations that explain reasoning, intent, and implementation details before execution begins.
+## Key Features
 
-### **Audio/Video Processing**
+### 📖 **Natural Language Syntax**
+- Multi-word identifiers: `user name`, `account balance`, `processing status`
+- English operators: `is greater than`, `multiplied by`, `concatenated with`
+- Intuitive control flow: `If...Otherwise`, `For each...in`, `When...`
+
+### 🔧 **Advanced Language Features**
+- **Powerful Type System**: Gradual typing with sophisticated inference
+- **Pattern Matching**: Elegant handling of complex data structures
+- **Memory Safety**: Automatic memory management with performance optimization
+- **Concurrency**: Actor-model based concurrent programming
+- **Error Handling**: Comprehensive exception system with recovery strategies
+
+### 🤝 **AI-to-AI Communication**
+- **Reasoning Blocks**: Document the "why" behind implementation decisions
+- **Task Specifications**: Formal communication between AI agents
+- **Knowledge References**: Link implementations to external knowledge sources
+- **Verification Framework**: Embedded testing and validation criteria
+
+### 🔄 **Universal Code Translation**
+Translate seamlessly between languages:
+- **High-Level**: Python, JavaScript, Java, C#, Go, Rust
+- **Systems**: C++, C, Assembly
+- **Legacy**: COBOL, Fortran, Pascal, Ada
+- **Specialized**: SQL, MATLAB, R, Julia
+- **Modern**: Swift, Kotlin, Dart, TypeScript
+
+### 🏗️ **Enterprise Ready**
+- **Module System**: Comprehensive dependency management and versioning
+- **Foreign Function Interface**: Seamless integration with existing codebases
+- **Development Tools**: Complete IDE support, debugger, profiler, and testing framework
+- **Security**: Built-in sandboxing and capability-based security model
+
+## Getting Started
+
+### Installation
+```bash
+# Install Runa (coming soon)
+curl -sSf https://get.runa-lang.org | sh
+```
+
+### Your First Runa Program
 ```runa
-Let processed_audio be Process Audio with:
-    file as "input.wav"
-    effects as list containing "noise_reduction", "normalization"
-    output_format as "mp3"
+Note: A simple greeting program
+Let user name be input with prompt "What's your name? "
+Let greeting be "Hello, " followed by user name followed by "!"
+
+Display greeting
+Display "Welcome to Runa programming!"
 ```
 
-## 🛠️ **Current Status**
+### Try the Online Playground
+Visit [playground.runa-lang.org](https://playground.runa-lang.org) to experiment with Runa in your browser.
 
-**⚠️ Important Update:** Due to a catastrophic failure during development, our standard libraries are currently being reworked from the ground up. Expected completion: **7-10 days**.
+## Use Cases
 
-**What's Working Now:**
-- ✅ **Complete language parser** - Understands all Runa syntax
-- ✅ **Dual syntax system** - Natural and technical syntax fully supported
-- ✅ **Core language features** - Variables, functions, control flow, data types
-- ✅ **Tooling** - Viewer/developer mode switching
-- ✅ **IDE support** - VS Code and Cursor extensions ready
+### 🏢 **Business Applications**
+- **Domain-Specific Logic**: Rules engines, workflow automation, business process modeling
+- **Financial Systems**: Risk calculations, trading algorithms, compliance systems
+- **Healthcare**: Treatment protocols, clinical decision support, patient management
 
-**What's Coming (7-10 days):**
-- 🚧 **Universal standard library** - Libraries for every domain
-- 🚧 **Runtime environment** - Execute Runa programs
-- 🚧 **Package manager** - Install and manage Runa libraries
-- 🚧 **Documentation** - Complete guides for every use case
+### 🤖 **AI and Machine Learning**
+- **Multi-Agent Systems**: Coordinated AI agents for complex problem solving
+- **LLM Applications**: ChatGPT-style applications with sophisticated reasoning
+- **Neural Network Development**: From research prototypes to production deployment
 
-## 🚀 **Getting Started (Right Now)**
+### 📊 **Data Science and Analytics**
+- **ETL Pipelines**: Extract, transform, and load data with readable logic
+- **Statistical Analysis**: Complex statistical models expressed in natural language
+- **Reporting Systems**: Automated report generation with business logic
 
-### **1. Install the Extension**
-- **VS Code**: Search for "Runa Language Support" in Extensions
-- **Cursor**: Same extension works in Cursor
-- **Other editors**: Coming soon
+### 🔧 **Legacy System Modernization**
+- **COBOL Migration**: Translate legacy mainframe code to modern languages
+- **Code Documentation**: Generate human-readable documentation from any codebase
+- **System Integration**: Bridge different programming paradigms and languages
 
-### **2. Create Your First Runa File**
-Create a file with `.runa` extension and start coding:
+## Documentation
 
-```runa
-Note: My first Runa program!
+- **[Language Reference](docs/language-reference.md)**: Complete syntax and semantics guide
+- **[Standard Library](docs/standard-library.md)**: Built-in functions and modules
+- **[AI Integration Guide](docs/ai-integration.md)**: Building AI-powered applications
+- **[Translation Guide](docs/translation.md)**: Converting between programming languages
+- **[Examples Gallery](examples/)**: Real-world Runa applications
 
-Let my_name be "World"
-Display "Hello, " followed by my_name followed by "!"
+## Community and Support
 
-Let numbers be list containing 1, 2, 3, 4, 5
-Let total be 0
+- **[Discord Community](https://discord.gg/sybertnetics-runa)**: Join fellow Runa developers
+- **[GitHub Discussions](https://github.com/Sybertnetics-Artificial-Intelligence/RunaLang/discussions)**: Ask questions and share ideas
+- **[Stack Overflow](https://stackoverflow.com/questions/tagged/runa-lang)**: Get help with specific problems
+- **[Official Blog](https://sybertnetics.com/blog/runa)**: Latest news and tutorials
+- **[Documentation Hub](https://docs.sybertnetics.com/runa)**: Comprehensive guides and references
 
-For each number in numbers:
-    Set total to total plus number
+## Contributing
 
-Display "Sum of numbers: " followed by total
+We welcome contributions from developers, linguists, AI researchers, and domain experts! By contributing to Runa, you help build the future of programming while your contributions remain protected under the RPLL license.
 
-Note: 
-This is a multi
-line comment
-block
-:End Note
+See our [Contributing Guide](CONTRIBUTING.md) for details on:
+- **Code contributions**: How to submit improvements and new features
+- **License agreement**: Understanding the contributor license agreement
+- **Quality standards**: Ensuring contributions meet Runa's standards
+- **Attribution**: How your contributions will be recognized
 
-Process called "example" Note: this is an inline comment
-Note: This is a single line comment.
-```
+### Areas Where We Need Help
+- **Language Translation**: Adding support for more programming languages
+- **Standard Library**: Expanding built-in functions and modules
+- **Documentation**: Tutorials, examples, and guides
+- **Testing**: Edge cases, performance testing, and validation
+- **Tooling**: IDE plugins, debugging tools, and development utilities
 
-### **3. Experience the Magic**
-- **Syntax highlighting** - See your code come to life
-- **Intelligent completion** - Get suggestions as you type
-- **Error detection** - Catch mistakes before they happen
-- **Format switching** - Use `--viewer` and `--developer` modes
+## The Vision
 
-## 🌐 **The Vision: One Language to Rule Them All**
+Runa represents a fundamental shift in how we think about programming. Instead of forcing humans to learn machine languages, we're teaching machines to understand human language. This democratizes programming, making it accessible to:
 
-Runa isn't just another programming language. It's the **end of programming language fragmentation**.
+- **Domain Experts** who understand the problem but not programming syntax
+- **AI Systems** that can reason about code semantically rather than syntactically  
+- **Business Stakeholders** who need to understand and validate complex logic
+- **Students and Newcomers** who can learn programming concepts without syntax barriers
 
-### **Why This Matters:**
-- **No more learning 10 languages** for one project
-- **Universal code sharing** - Runa code works everywhere
-- **AI-native development** - Built for the AI-first future
-- **Democratized coding** - Anyone can build anything
+## License and Usage
 
-### **The Future:**
-- **Self-hosting** - Runa will eventually write itself
-- **Universal translation** - Convert any code to Runa
-- **AI collaboration** - Humans and AIs coding together seamlessly
-- **Global accessibility** - Programming in any natural language
+Runa is open source software released under the **[Runa Programming Language License (RPLL)](LICENSE.md)**, a custom license designed to protect the Runa brand and maintain quality standards while enabling broad commercial and non-commercial use.
 
-## 🎯 **Who Should Use Runa?**
+### What You Can Do
+✅ **Use Runa freely** for any commercial or non-commercial purpose  
+✅ **Build applications** and tools in Runa  
+✅ **Offer Runa services** including development, training, and consulting  
+✅ **Create development tools** like IDEs, debuggers, and plugins  
+✅ **Modify and contribute** improvements back to the project  
 
-- **Complete beginners** - Start coding without learning cryptic syntax
-- **Web developers** - Build full-stack applications in one language
-- **Data scientists** - Process data with natural language commands
-- **AI researchers** - Create AI systems that understand code naturally
-- **Business users** - Automate workflows with readable code
-- **Students** - Learn programming concepts without syntax barriers
-- **Enterprise teams** - Standardize on one language across all projects
+### What You Cannot Do
+❌ **Create derivative programming languages** using Runa's codebase  
+❌ **Use "Runa" or similar names** for competing programming languages  
+❌ **Claim invention** of Runa's concepts or innovations  
+❌ **Distribute modified versions** without clear attribution and labeling  
 
-## 🔮 **What's Next?**
+The license ensures Runa remains open and accessible while protecting against misuse, maintaining quality standards, and preserving the integrity of the Runa brand.
 
-1. **Standard libraries complete** (7-10 days)
-2. **Runtime environment** (2 weeks)
-3. **Package ecosystem** (1 month)
-4. **AI integration tools** (2 months)
-5. **Self-hosting capability** (6 months)
-6. **Universal translation** (1 year)
+## Acknowledgments
 
-## 🤝 **Join the Revolution**
+**Runa Programming Language** is created and maintained by **Sybertnetics Artificial Intelligence Solutions**.
 
-Runa is more than a programming language. It's a movement toward **universal programming accessibility**.
-
-- **No more language barriers**
-- **No more syntax complexity**
-- **No more platform limitations**
-- **Just one language for everything**
-
-**Ready to code the future? Start with Runa.**
+Runa is built upon decades of foundational research in computer science and programming language theory. We're particularly inspired by and grateful for:
+- **Natural Language Processing** advances that make human-like syntax possible
+- **Type Theory** research that enables safe, expressive type systems
+- **AI Research** that drives our agent-based architecture
+- **Programming Language Design** principles developed by the broader research community
+- **The Open Source Community** that makes collaborative development possible
 
 ---
 
-**Runa - The Universal Programming Language**  
-*One language. Everything. Everyone.*
+**Ready to bridge the gap between human thinking and machine execution?**
 
-*Built with ❤️ by Sybertnetics*
+*Runa™ is a trademark of Sybertnetics Artificial Intelligence*
+
+[Get Started(Coming Soon)](https://sybertnetics.com/runa/get-started) | [Try Online(Coming Soon)](https://playground.sybertnetics.com/runa) | [Join Community(Coming Soon)](https://discord.gg/sybertnetics-runa)
