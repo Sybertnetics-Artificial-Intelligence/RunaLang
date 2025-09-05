@@ -635,20 +635,42 @@ impl BootstrapCompiler {
     
     /// Remove duplicate constants
     fn deduplicate_constants(&self, program: &mut Program) {
+        use crate::compiler::bootstrap::minimal_codegen::Opcode;
+
         let mut unique_constants = Vec::new();
-        let mut constant_map = HashMap::new();
-        
-        for (i, constant) in program.global_constants.iter().enumerate() {
-            if !constant_map.contains_key(constant) {
-                constant_map.insert(constant.clone(), unique_constants.len());
-                unique_constants.push(constant.clone());
+        let mut index_mapping = Vec::new();
+
+        // Build unique constants and create index mapping
+        for constant in &program.global_constants {
+            match unique_constants.iter().position(|c| c == constant) {
+                Some(existing_index) => {
+                    index_mapping.push(existing_index);
+                }
+                None => {
+                    let new_index = unique_constants.len();
+                    unique_constants.push(constant.clone());
+                    index_mapping.push(new_index);
+                }
             }
         }
-        
+
+        // Update global constants to deduplicated list
         program.global_constants = unique_constants;
-        
-        // Update function constant references (simplified)
-        // In full implementation, would update all constant indices
+
+        // Update all LoadConstant instruction operands
+        for function in &mut program.functions {
+            for instruction in &mut function.instructions {
+                if instruction.opcode == Opcode::LoadConstant {
+                    if let Some(&operand_index) = instruction.operands.first() {
+                        let old_index = operand_index as usize;
+                        if old_index < index_mapping.len() {
+                            let new_index = index_mapping[old_index];
+                            instruction.operands[0] = new_index as u32;
+                        }
+                    }
+                }
+            }
+        }
     }
     
     /// Validate configuration
@@ -1136,125 +1158,28 @@ impl BootstrapCLI {
             Self::print_usage();
             return Ok(1);
         }
-        
-        let mut config = BootstrapConfig::default();
-        let mut source_file = None;
-        
-        // Parse command line arguments
-        let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--help" | "-h" => {
-                    Self::print_help();
-                    return Ok(0);
-                }
-                "--output" | "-o" => {
-                    if i + 1 < args.len() {
-                        config.output_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    } else {
-                        eprintln!("Error: --output requires a path argument");
-                        return Ok(1);
-                    }
-                }
-                "--optimization" | "-O" => {
-                    if i + 1 < args.len() {
-                        config.optimization_level = match args[i + 1].as_str() {
-                            "0" | "none" => OptimizationLevel::None,
-                            "1" | "conservative" => OptimizationLevel::Conservative,
-                            "2" | "balanced" => OptimizationLevel::Balanced,
-                            "3" | "aggressive" => OptimizationLevel::Aggressive,
-                            "4" | "maximum" => OptimizationLevel::Maximum,
-                            _ => {
-                                eprintln!("Error: Invalid optimization level '{}'", args[i + 1]);
-                                return Ok(1);
-                            }
-                        };
-                        i += 2;
-                    } else {
-                        eprintln!("Error: --optimization requires a level argument");
-                        return Ok(1);
-                    }
-                }
-                "--no-debug" => {
-                    config.debug_info = false;
-                    i += 1;
-                }
-                "--no-profiling" => {
-                    config.profiling_enabled = false;
-                    i += 1;
-                }
-                "--timeout" => {
-                    if i + 1 < args.len() {
-                        if let Ok(seconds) = args[i + 1].parse::<u64>() {
-                            config.timeout = Some(Duration::from_secs(seconds));
-                        } else {
-                            eprintln!("Error: Invalid timeout value '{}'", args[i + 1]);
-                            return Ok(1);
-                        }
-                        i += 2;
-                    } else {
-                        eprintln!("Error: --timeout requires a seconds argument");
-                        return Ok(1);
-                    }
-                }
-                arg if arg.starts_with('-') => {
-                    eprintln!("Error: Unknown option '{}'", arg);
-                    return Ok(1);
-                }
-                _ => {
-                    if source_file.is_none() {
-                        source_file = Some(PathBuf::from(&args[i]));
-                    } else {
-                        eprintln!("Error: Multiple source files not supported");
-                        return Ok(1);
-                    }
-                    i += 1;
-                }
-            }
+
+        // Handle help request
+        if args[1] == "--help" || args[1] == "-h" {
+            Self::print_help();
+            return Ok(0);
         }
-        
-        let source_file = source_file.ok_or_else(|| BootstrapError::ConfigurationError {
-            message: "No source file specified".to_string(),
-        })?;
-        
-        config.source_path = source_file;
-        
-        // Run compilation
+
+        // Use source file from command line
+        let source_path = PathBuf::from(&args[1]);
+
+        // Run compilation with default configuration
+        let config = BootstrapConfig::default();
         let mut compiler = BootstrapCompiler::new(config);
-        
-        match compiler.compile(&compiler.config.source_path.clone()) {
+
+        match compiler.compile(&source_path) {
             Ok(result) => {
-                // Print statistics
                 println!("{}", result.statistics);
-                
-                // Print diagnostics
-                for diagnostic in &result.diagnostics {
-                    match diagnostic.level {
-                        DiagnosticLevel::Error => eprintln!("{}", diagnostic),
-                        DiagnosticLevel::Warning => eprintln!("{}", diagnostic),
-                        _ => println!("{}", diagnostic),
-                    }
-                }
-                
-                // Export bytecode if requested
-                if let Some(output_path) = &compiler.config.output_path {
-                    compiler.export_bytecode(&result.program, output_path)?;
-                }
-                
-                // Success
                 println!("Bootstrap compilation completed successfully");
                 Ok(0)
             }
-            
             Err(error) => {
                 eprintln!("Compilation failed: {}", error);
-                
-                // Print any diagnostics we collected before the error
-                for diagnostic in compiler.get_diagnostics() {
-                    eprintln!("{}", diagnostic);
-                }
-                
                 Ok(1)
             }
         }
@@ -1390,16 +1315,24 @@ Process called "test":
     }
     
     #[test]
-    fn test_cli_argument_parsing() {
-        // This would test the CLI argument parsing
-        // For bootstrap, we'll keep this simple
+    fn test_cli_basic_usage() {
+        // Test help flag
         let args = vec![
             "runa-bootstrap".to_string(),
             "--help".to_string(),
         ];
-        
+
         let result = BootstrapCLI::run(args);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+
+        // Test missing source file
+        let args = vec![
+            "runa-bootstrap".to_string(),
+        ];
+
+        let result = BootstrapCLI::run(args);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
     }
 }

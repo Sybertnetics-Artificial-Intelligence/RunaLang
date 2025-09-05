@@ -66,7 +66,7 @@ keyword               ::= "Let" | "Define" | "Set" | "If" | "Otherwise" | "Unles
 ### Mathematical Symbol Operators
 
 ```ebnf
-mathematical_symbol_operator ::= '+' | '-' | '*' | '/' | '%' | '<' | '>' | '<=' | '>=' | '!='
+mathematical_symbol_operator ::= '+' | '-' | '*' | '/' | '%' | '**' | '<' | '>' | '<=' | '>=' | '!=' | '=='
 ```
 
 Note: Mathematical symbols are restricted to mathematical contexts only. The compiler enforces this restriction and provides automatic conversion to natural language equivalents during formatting.
@@ -632,10 +632,10 @@ dict_entry            ::= identifier "as" expression
 
 1. Primary expressions (literals, identifiers, parentheses)
 2. Postfix operators (member access, indexing, function calls)
-3. Unary operators (negative, positive, not)
-4. Power operator (power of, **)
-5. Multiplicative operators (multiplied by, divided by, modulo, *, /, %)
-6. Additive operators (plus, minus, joined with, +, -)
+3. Unary operators (negative, positive, not) - **Precedence 7**
+4. Power operator (to the power of, **) - **Precedence 6, Right associative**
+5. Multiplicative operators (multiplied by, divided by, modulo, *, /, %) - **Precedence 5, Left associative**
+6. Additive operators (plus, minus, joined with, +, -) - **Precedence 4, Left associative**
 7. Bitwise shift operators (shifted left by, shifted right by)
 8. Comparison operators (equals, is greater than, <, >, <=, >=, !=)
 9. Bitwise AND (bitwise and, &)
@@ -683,8 +683,8 @@ Runa supports both natural language and mathematical symbols:
 - Logical: `and`, `or`, `not`
 
 **Mathematical Symbols (Restricted)**:
-- Arithmetic: `+`, `-`, `*`, `/`, `%`
-- Comparison: `<`, `>`, `<=`, `>=`, `!=`
+- Arithmetic: `+`, `-`, `*`, `/`, `%`, `**`
+- Comparison: `<`, `>`, `<=`, `>=`, `!=`, `==`
 - Note: Symbols are only permitted in mathematical contexts
 
 **Symbol-to-Word Conversion**:
@@ -804,7 +804,7 @@ Note:
 For asynchronous context management, use 'Async:' blocks with 'With' inside, as 'AsyncWith' is not yet a language keyword. See the context manager protocol in the standard library documentation for details and idiomatic usage.
 
 **Mathematical Symbol Enforcement Note**:
-Mathematical symbols (+, -, *, /, %, <, >, <=, >=, !=) are restricted to mathematical contexts only. The compiler performs context analysis to ensure symbols are not used inappropriately (e.g., in string concatenation or non-mathematical operations). Use natural language operators for non-mathematical contexts.
+Mathematical symbols (+, -, *, /, %, **, <, >, <=, >=, !=, ==) are restricted to mathematical contexts only. The compiler performs context analysis to ensure symbols are not used inappropriately (e.g., in string concatenation or non-mathematical operations). Use natural language operators for non-mathematical contexts.
 
 **Grammar Version**: This grammar reflects the current implementation with mathematical symbol enforcement, dual operator support, and symbol-to-word conversion capabilities.
 :End Note

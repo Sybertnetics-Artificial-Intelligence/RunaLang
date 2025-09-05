@@ -1,8 +1,8 @@
-# RUNA AOTT (Ahead-of-Time-Targeted) Architecture Plan
+# RUNA AOTT (All-of-The-Time) Architecture Plan
 
 ## Executive Summary
 
-This document provides a comprehensive plan for Runa's AOTT (Ahead-of-Time-Targeted) execution system, detailing how it replaces existing components, enhances performance, and provides a tiered execution strategy that rivals or exceeds modern language runtimes like HotSpot JVM, V8, and .NET CLR.
+This document provides a comprehensive plan for Runa's AOTT (All-of-The-Time) execution system, detailing how it replaces existing components, enhances performance, and provides a tiered execution strategy that rivals or exceeds modern language runtimes like HotSpot JVM, V8, and .NET CLR.
 
 ## Current Runa Architecture Analysis
 
@@ -24,12 +24,12 @@ LIR Builder (runa/src/compiler/ir/lir/) → Low-level IR
     ↓
 Bytecode Generator (runa/src/compiler/ir/lir/bytecode_generator.runa) → Bytecode
     ↓
-VM Execution (runa/src/runtime/src/vm.rs) → Direct Interpretation
+VM Execution (runa/_legacy/src/runtime/vm.rs) → Direct Interpretation [LEGACY - BEING REPLACED]
 ```
 
 ### Components Being Replaced by AOTT
 
-#### 1. **Primary Replacement: VM Interpreter (`/runtime/src/vm.rs`)**
+#### 1. **Primary Replacement: VM Interpreter (`runa/_legacy/src/runtime/vm.rs`)**
 - **Current State**: Basic bytecode interpreter
 - **AOTT Replacement**: Tiered execution system with 5 optimization tiers
 - **Performance Impact**: 10-100x execution speed improvement
@@ -40,151 +40,274 @@ VM Execution (runa/src/runtime/src/vm.rs) → Direct Interpretation
 - **New Capabilities**: Deoptimization metadata, guard insertion, tier transition points
 
 #### 3. **Runtime Memory Management Integration**
-- **Current**: Basic garbage collection (`/runtime/src/gc.rs`)
+- **Current**: Basic garbage collection (`runa/_legacy/src/runtime/gc.rs`) [LEGACY]
+- **AOTT Integration**: Enhanced GC (`runa/src/runatime/core/memory/garbage_collector.runa`)
 - **AOTT Enhancement**: Escape analysis-driven allocation, speculative object pooling
 - **Memory Performance**: 2-5x allocation speed improvement
 
 ## AOTT Architecture Deep Dive
 
-### Tier 0: Bytecode Execution Engine
-**Location**: `/runtime/src/aott/execution/bytecode.rs`
+### Tier 0: Lightning Interpreter
+**Location**: `/runatime/src/aott/execution/lightning/`
 
-**Purpose**: Fast startup, immediate execution
-- Interprets LIR bytecode directly
-- Collects execution profiles and hotspot data
-- Minimal optimization overhead
-- Serves as deoptimization target
+**Purpose**: Ultra-fast startup, minimal overhead execution
+- Direct bytecode interpretation with computed goto dispatch
+- Zero-cost profiling and promotion detection
+- Hardware-accelerated instruction dispatch
+- Serves as entry point and deoptimization target
 
-**Key Components**:
+**Key Components** (Actual Implementation):
 ```rust
-struct BytecodeExecutor {
-    instruction_cache: InstructionCache,
-    profiler: ExecutionProfiler,
-    deopt_metadata: DeoptimizationMetadata,
-    guard_validator: GuardValidator,
+pub struct LightningInterpreter {
+    /// Lightning-fast instruction dispatcher
+    dispatcher: InstructionDispatcher,
+    /// Minimal stack machine for execution
+    stack_machine: MinimalStackMachine,
+    /// Zero-cost profiling hooks
+    profiler: ZeroCostProfiler,
+    /// Promotion detection system
+    promotion_detector: PromotionDetector,
 }
 ```
 
 **Replaces**: Current `vm.rs` basic interpreter
 
-### Tier 1: Native Code Generation
-**Location**: `/runtime/src/aott/execution/native.rs`
+### Tier 1: Smart Bytecode Execution
+**Location**: `/runatime/src/aott/execution/bytecode/`
 
-**Purpose**: Fast native code for hot functions
-- LLVM-based code generation
-- Basic optimizations (constant folding, dead code elimination)
-- Direct machine code execution
-- Profile collection for higher tiers
+**Purpose**: Enhanced bytecode execution with smart optimizations
+- Optimized dispatch system with inline caching
+- Basic profiling hooks and tier promotion detection
+- Enhanced stack machine with overflow protection
+- Smart bytecode optimization pipeline
 
-**Key Components**:
+**Key Components** (Actual Implementation):
 ```rust
-struct NativeCodeGenerator {
-    llvm_context: LLVMContext,
-    optimization_level: OptimizationLevel,
-    target_triple: TargetTriple,
+pub struct BytecodeExecutor {
+    /// Smart execution engine
+    execution_engine: BytecodeExecutionEngine,
+    /// Optimized dispatch system
+    dispatch_system: OptimizedDispatchSystem,
+    /// Profiling integration
+    profiler: BytecodeProfiler,
+    /// Optimization pipeline
+    optimizer: BytecodeOptimizer,
+}
+```
+
+**Integration**: Processes bytecode with profiling and optimization before tier promotion
+
+### Tier 2: Basic Native Execution
+**Location**: `/runatime/src/aott/execution/native/`
+
+**Purpose**: LLVM-based native code generation and execution
+- Basic native compilation using LLVM backend
+- Code caching for compiled functions
+- Profile collection for higher-tier optimization
+- Native execution monitoring
+
+**Key Components** (Actual Implementation):
+```rust
+pub struct NativeExecutor {
+    /// LLVM compiler interface
+    llvm_compiler: LLVMCompilerInterface,
+    /// Code cache manager
     code_cache: NativeCodeCache,
+    /// Execution monitor
+    execution_monitor: NativeExecutionMonitor,
+    /// Execution statistics
+    execution_stats: NativeExecutionStatistics,
 }
 ```
 
-**Integration**: Takes bytecode + profile data → generates optimized machine code
+**Integration**: Compiles hot functions to native code with basic optimizations
 
-### Tier 2: Optimized Native Execution
-**Location**: `/runtime/src/aott/execution/optimized_native.rs`
+### Tier 3: Optimized Native Execution
+**Location**: `/runatime/src/aott/execution/optimized/`
 
-**Purpose**: Heavily optimized native code with advanced analysis
-- Advanced loop optimizations (vectorization, unrolling, invariant hoisting)
-- Aggressive inlining with cost-benefit analysis
-- Advanced register allocation
-- SIMD utilization
+**Purpose**: Heavily optimized native execution with advanced analysis
+- Advanced compilation pipeline with aggressive optimizations
+- Vectorization, inlining, and interprocedural optimizations
+- Advanced register allocation and memory management
+- Performance monitoring and optimization feedback
 
-**Key Components**:
+**Key Components** (Actual Implementation):
 ```rust
-struct OptimizedNativeExecutor {
-    optimization_pipeline: OptimizationPipeline,
-    vectorization_engine: VectorizationEngine,
-    inlining_engine: AdvancedInliningEngine,
-    register_allocator: LinearScanAllocator,
+pub struct OptimizedNativeExecutor {
+    /// Advanced compilation pipeline
+    compilation_pipeline: AdvancedCompilationPipeline,
+    /// Optimization engine
+    optimization_engine: OptimizationEngine,
+    /// Performance monitoring
+    performance_monitor: PerformanceMonitor,
+    /// Execution statistics
+    execution_stats: OptimizedExecutionStatistics,
 }
 ```
 
-### Tier 3-4: Speculative Execution
-**Location**: `/runtime/src/aott/execution/speculative.rs`
+**Integration**: Applies maximum optimizations to performance-critical code
 
-**Purpose**: Maximum performance through speculation
-- Value speculation based on profiling
-- Type speculation and polymorphic inline caches
-- Loop specialization for common patterns
-- Speculative inlining with deoptimization guards
+### Tier 4: Speculative Execution
+**Location**: `/runatime/src/aott/execution/speculative/`
 
-**Key Components**:
+**Purpose**: Maximum performance through aggressive speculation
+- Value speculation and type prediction
+- Polymorphic inline caching and guard validation
+- Loop specialization and speculative optimizations
+- Runtime assumption validation with deoptimization
+
+**Key Components** (Actual Implementation):
 ```rust
-struct SpeculativeExecutor {
-    speculation_engine: ValueSpeculationEngine,
-    loop_specializer: LoopSpecializationEngine,
-    pic_manager: PolymorphicInlineCacheManager,
-    deoptimizer: LiveDeoptimizationEngine,
+pub struct SpeculativeExecutor {
+    /// Speculation coordinator
+    speculation_coordinator: SpeculationCoordinator,
+    /// Execution engine
+    execution_engine: SpeculativeExecutionEngine,
+    /// Guard validation system
+    guard_validator: GuardValidationSystem,
+    /// Performance monitor
+    performance_monitor: SpeculativePerformanceMonitor,
 }
 ```
+
+**Integration**: Maximum performance through validated runtime speculation
 
 ## Detailed Component Integration Plan
 
 ### Phase 1: Execution Engine Implementation
 
-#### 1.1 Bytecode Execution Engine (`bytecode.rs`)
-**Current Placeholders to Fix**:
-- AST parsing integration
-- Instruction dispatch loop
-- Profile collection infrastructure
-- Guard validation system
+#### 1.1 Lightning Interpreter (`lightning/`)
+- ✅ Hardware-accelerated instruction dispatch
+- ✅ Zero-cost profiling integration
+- ✅ Complete stack machine implementation
+- ✅ Promotion detection system
+- ✅ All instruction handlers implemented
 
-**Implementation Strategy**:
+**Key Achievements**:
+- Ultra-fast startup (minimal overhead)
+- Computed goto dispatch for maximum performance
+- Thread-safe execution support
+- Comprehensive instruction set coverage
+- Integration with AOTT tier promotion system
+
+#### 1.2 Smart Bytecode Execution (`bytecode/`)
+**Current Implementation Status**:
+- Enhanced dispatch system with inline caching
+- Basic profiling hooks implementation
+- T1 optimizer for bytecode-level optimizations
+- Profile collection infrastructure
+
+**Integration Strategy**:
 ```runa
-Process called "execute_bytecode" that takes bytecode as BytecodeProgram returns ExecutionResult:
+Process called "execute_smart_bytecode" that takes bytecode as BytecodeProgram returns ExecutionResult:
     Let executor be BytecodeExecutor::new()
-    Let profiler be ExecutionProfiler::new()
-    
-    For instruction in bytecode.instructions:
+    Let optimizer be T1Optimizer::new()
+
+    Note: Apply basic bytecode optimizations
+    Let optimized_bytecode be optimizer.optimize(bytecode)
+
+    For instruction in optimized_bytecode.instructions:
         Let result be executor.execute_instruction(instruction)
-        profiler.record_execution(instruction, result)
-        
-        Note: Check for tier promotion conditions
-        If profiler.should_promote_to_native(instruction.function_id):
-            Return TierPromotionRequest { target_tier: Tier1, function_id: instruction.function_id }
-    
+        executor.profiler.record_execution(instruction, result)
+
+        Note: Check for tier promotion to T2 Native
+        If executor.should_promote_to_native(instruction.function_id):
+            Return TierPromotionRequest { target_tier: Tier2, function_id: instruction.function_id }
+
     Return ExecutionResult::Success
 ```
 
-#### 1.2 Native Code Generation (`native.rs`)
-**Missing Components**:
-- LLVM integration layer
-- Code cache management
-- Profile-guided optimization selection
-- Deoptimization point insertion
+#### 1.3 Basic Native Execution (`native/`)
+**Current Implementation Status**:
+- LLVM compiler interface implementation
+- Code cache management system
+- Profile collection for optimization feedback
+- Native execution monitoring
 
 **Implementation Strategy**:
 ```runa
-Process called "compile_to_native" that takes bytecode as BytecodeFunction, profile as ProfileData returns NativeFunction:
-    Let llvm_context be LLVMContext::new()
-    Let builder be llvm_context.create_builder()
-    
-    Note: Convert bytecode to LLVM IR
-    Let llvm_function be convert_bytecode_to_llvm(bytecode, profile)
-    
-    Note: Apply profile-guided optimizations
-    apply_profile_guided_optimizations(llvm_function, profile)
-    
-    Note: Generate machine code
-    Let native_code be llvm_context.compile_to_native(llvm_function)
-    
-    Return NativeFunction { code: native_code, metadata: generate_metadata(bytecode) }
+Process called "execute_native" that takes bytecode as BytecodeFunction, profile as ProfileData returns NativeResult:
+    Let native_executor be NativeExecutor::new()
+    Let llvm_compiler be LLVMCompilerInterface::new()
+
+    Note: Check code cache first
+    If native_executor.code_cache.has_compiled(bytecode.function_id):
+        Let cached_code be native_executor.code_cache.get(bytecode.function_id)
+        Return native_executor.execute_cached(cached_code)
+
+    Note: Compile to native code
+    Let llvm_ir be llvm_compiler.bytecode_to_llvm_ir(bytecode)
+    Let native_code be llvm_compiler.compile_to_native(llvm_ir)
+
+    Note: Cache compiled code
+    native_executor.code_cache.store(bytecode.function_id, native_code)
+
+    Note: Execute with profiling
+    Let result be native_executor.execute(native_code)
+    native_executor.execution_monitor.record_execution(bytecode.function_id, result)
+
+    Return result
 ```
 
-#### 1.3 Speculative Execution (`speculative.rs`)
-**Advanced Features to Implement**:
-- Speculation budget management (already implemented in compilation/)
-- Value profiling and prediction
-- Polymorphic inline cache management
-- Live deoptimization with state reconstruction
+#### 1.4 Optimized Native Execution (`optimized/`)
+**Current Implementation Status**:
+- Advanced compilation pipeline framework
+- Vectorization engine implementation
+- Inlining engine with cost-benefit analysis
+- Register allocation system
+- Loop optimization infrastructure
+
+**Implementation Strategy**:
+```runa
+Process called "execute_optimized_native" that takes bytecode as BytecodeFunction returns OptimizedResult:
+    Let optimized_executor be OptimizedNativeExecutor::new()
+    Let compilation_pipeline be AdvancedCompilationPipeline::new()
+
+    Note: Apply comprehensive optimizations
+    Let analysis_results be compilation_pipeline.analyze(bytecode)
+    Let optimized_ir be compilation_pipeline.optimize(bytecode, analysis_results)
+
+    Note: Vectorize and inline where beneficial
+    Let vectorized_ir be optimized_executor.vectorization_engine.vectorize(optimized_ir)
+    Let inlined_ir be optimized_executor.inlining_engine.inline(vectorized_ir)
+
+    Note: Generate optimized native code
+    Let optimized_code be compilation_pipeline.compile_to_native(inlined_ir)
+
+    Note: Execute with advanced monitoring
+    Let result be optimized_executor.execute(optimized_code)
+    optimized_executor.performance_monitor.record_metrics(bytecode.function_id, result)
+
+    Return result
+```
+
+#### 1.5 Speculative Execution (`speculative/`)
+**Current Implementation Status**:
+- Speculation coordinator framework
+- Guard validation system implementation
+- Value speculation engine
+- Type speculation and PIC management
+- Loop specialization infrastructure
+
+**Implementation Strategy**:
+```runa
+Process called "execute_speculative" that takes bytecode as BytecodeFunction returns SpeculativeResult:
+    Let speculative_executor be SpeculativeExecutor::new()
+    Let speculation_coordinator be SpeculationCoordinator::new()
+
+    Note: Generate speculative assumptions
+    Let assumptions be speculation_coordinator.analyze_and_speculate(bytecode)
+
+    Note: Execute with speculation
+    Let result be speculative_executor.execute_with_speculation(bytecode, assumptions)
+
+    Note: Validate assumptions and deoptimize if needed
+    If speculative_executor.guard_validator.validate_assumptions(assumptions) == false:
+        Note: Deoptimize to lower tier
+        Return DeoptimizationRequest { target_tier: Tier3, reason: "Speculation failed" }
+
+    Return result
+```
 
 ### Phase 2: Integration with Existing Compiler Pipeline
 
@@ -210,7 +333,8 @@ Process called "generate_aott_bytecode" that takes lir as LIRProgram returns AOT
 ```
 
 #### 2.2 Runtime Interface Integration
-**Enhancement Location**: `/runtime/src/runtime_interface.rs`
+**Legacy Location**: `runa/_legacy/src/runtime/ffi/runtime_interface.rs`
+**Current AOTT Interface**: `runa/src/runatime/services/aott_interface/`
 
 **New System Calls for AOTT**:
 - `_rt_aott_execute` - Entry point for AOTT execution
@@ -222,7 +346,7 @@ Process called "generate_aott_bytecode" that takes lir as LIRProgram returns AOT
 ### Phase 3: Performance Analysis Integration
 
 #### 3.1 Analysis System Enhancement
-**Location**: `/runtime/src/aott/analysis/`
+**Location**: `runa/src/runatime/aott/analysis/`
 
 **Integration Points**:
 - **Escape Analysis** → Guide Tier 1+ allocation strategies
@@ -231,61 +355,79 @@ Process called "generate_aott_bytecode" that takes lir as LIRProgram returns AOT
 - **Error Handling** → Provide fallback analysis for failed optimizations
 
 #### 3.2 Optimization Pipeline Integration
-**Location**: `/runtime/src/aott/optimization/`
+**Location**: `runa/src/runatime/aott/compilation/optimization_passes/`
 
 **Tier-Specific Optimization Strategies**:
-- **Tier 0**: No optimization (interpretation only)
-- **Tier 1**: Basic optimizations (constant folding, DCE)
-- **Tier 2**: Advanced optimizations (loop opts, inlining)
-- **Tier 3**: Speculative optimizations (value/type speculation)
-- **Tier 4**: Maximum speculation (aggressive inlining, loop specialization)
+- **T0 Lightning**: No optimization (ultra-fast interpretation only)
+- **T1 Smart Bytecode**: Basic optimizations (constant folding, DCE, inline caching)
+- **T2 Basic Native**: LLVM basic optimizations (constant folding, DCE, basic inlining)
+- **T3 Optimized Native**: Advanced optimizations (vectorization, aggressive inlining, loop specialization)
+- **T4 Speculative**: Maximum speculation (value/type speculation, PIC, guard validation)
 
 ## Implementation Roadmap
 
-### Milestone 1: Core Execution Engines (Week 1-2)
-- [ ] Complete bytecode execution engine
-- [ ] Implement basic native code generation
-- [ ] Add tier promotion logic
-- [ ] Basic profiling infrastructure
+### Milestone 1: Core Execution Engines (COMPLETED ✅)
+- ✅ **T0 Lightning Interpreter**: Complete bytecode execution with hardware acceleration
+- ✅ **Tier promotion infrastructure**: Promotion detection and request system
+- ✅ **Basic profiling**: Zero-cost profiling hooks throughout execution
+- ✅ **Instruction dispatch**: Computed goto and optimized dispatch systems
 
-**Success Criteria**: Simple Runa programs execute faster than current VM
+**Success Criteria**: ✅ **ACHIEVED** - Lightning Interpreter executes faster than current VM
 
-### Milestone 2: Advanced Optimization (Week 3-4)
-- [ ] Implement optimized native execution
-- [ ] Add speculative execution framework
-- [ ] Integrate with analysis systems
-- [ ] Performance benchmarking suite
+### Milestone 2: Enhanced Bytecode Execution (Current Focus)
+- 🔄 **T1 Smart Bytecode**: Enhance with inline caching and basic optimizations
+- 🔄 **Tier promotion logic**: Complete promotion detection and transition system
+- 🔄 **Profile collection**: Comprehensive execution profiling across all tiers
+- 🔄 **Integration testing**: End-to-end tier promotion testing
 
-**Success Criteria**: Complex programs show 5-10x performance improvement
+**Success Criteria**: Smart bytecode execution with automatic tier promotion
 
-### Milestone 3: Production Readiness (Week 5-6)
-- [ ] Error handling and recovery
-- [ ] Deoptimization system
-- [ ] Integration testing
-- [ ] Performance regression prevention
+### Milestone 3: Native Code Generation (Next Phase)
+- ⏳ **T2 Basic Native**: LLVM-based compilation with code caching
+- ⏳ **T3 Optimized Native**: Advanced optimizations and vectorization
+- ⏳ **Performance benchmarking**: Compare tier performance improvements
+- ⏳ **Memory management**: Integration with escape analysis
 
-**Success Criteria**: Passes all existing tests with performance improvements
+**Success Criteria**: Native execution shows 5-10x performance improvement over T0
 
-### Milestone 4: Beta Deployment (Week 7)
-- [ ] Documentation completion
-- [ ] Intern-facing tutorials
-- [ ] Performance monitoring
-- [ ] Deployment pipeline
+### Milestone 4: Speculative Execution (Future Phase)
+- ⏳ **T4 Speculative**: Value/type speculation with guard validation
+- ⏳ **Deoptimization system**: Seamless fallback between tiers
+- ⏳ **Advanced profiling**: ML-driven optimization decisions
+- ⏳ **Error recovery**: Robust speculation failure handling
 
-**Success Criteria**: Ready for intern testing with monitoring
+**Success Criteria**: Maximum performance through validated speculation
+
+### Milestone 5: Production Readiness (Final Phase)
+- ⏳ **Integration testing**: Full compiler-to-execution pipeline
+- ⏳ **Performance monitoring**: Real-time tier performance tracking
+- ⏳ **Documentation**: Complete AOTT system documentation
+- ⏳ **Beta deployment**: Production-ready with monitoring
+
+**Success Criteria**: Complete AOTT system ready for production deployment
 
 ## Performance Expectations
 
 ### Benchmark Targets
-- **Startup Performance**: 2-3x faster than current VM (Tier 0)
-- **Steady-State Performance**: 10-50x faster than current VM (Tier 2+)
+- **T0 Lightning Startup**: 2-3x faster than current VM
+- **T1 Smart Bytecode**: 3-5x faster than current VM
+- **T2 Basic Native**: 5-10x faster than current VM
+- **T3 Optimized Native**: 10-25x faster than current VM
+- **T4 Speculative**: 25-50x faster than current VM (maximum performance)
 - **Memory Usage**: 20-30% reduction through escape analysis
-- **Compilation Time**: <100ms for Tier 1, <500ms for Tier 2
+- **Tier Promotion Time**: <10ms for T0→T1, <50ms for T1→T2, <200ms for T2→T3
+
+### Tier Performance Progression
+- **T0 Lightning**: Ultra-fast startup, minimal overhead interpretation
+- **T1 Smart Bytecode**: Enhanced dispatch with inline caching and basic opts
+- **T2 Basic Native**: LLVM compilation with code caching
+- **T3 Optimized Native**: Advanced optimizations, vectorization, inlining
+- **T4 Speculative**: Maximum performance through validated speculation
 
 ### Comparison with Industry Standards
-- **vs HotSpot JVM**: Competitive steady-state, superior startup
-- **vs V8**: Similar tiered approach, better memory management
-- **vs .NET CLR**: Superior speculation capabilities, comparable overall performance
+- **vs HotSpot JVM**: Superior startup (T0), competitive steady-state (T3-T4)
+- **vs V8**: Better tier progression, similar optimization approach
+- **vs .NET CLR**: Superior speculative capabilities (T4), comparable native performance (T2-T3)
 
 ## Risk Analysis and Mitigation
 

@@ -1516,10 +1516,13 @@ mod tests {
         
         match ast {
             AstNode::Program { items, .. } => {
-                assert_eq!(items.len(), 1);
-                assert!(matches!(items[0], AstNode::ProcessDefinition { .. }));
+                assert_eq!(items.len(), 1, "Program should contain exactly one top-level item");
+                assert!(matches!(items[0], AstNode::ProcessDefinition { .. }),
+                       "Top-level item should be a process definition");
             }
-            _ => panic!("Expected program node"),
+            _ => {
+                panic!("Expected AstNode::Program, but got: {:?}", ast);
+            }
         }
     }
     
@@ -1537,10 +1540,13 @@ mod tests {
         
         match ast {
             AstNode::Program { items, .. } => {
-                assert_eq!(items.len(), 1);
-                assert!(matches!(items[0], AstNode::TypeDefinition { .. }));
+                assert_eq!(items.len(), 1, "Program should contain exactly one top-level item");
+                assert!(matches!(items[0], AstNode::TypeDefinition { .. }),
+                       "Top-level item should be a type definition");
             }
-            _ => panic!("Expected program node"),
+            _ => {
+                panic!("Expected AstNode::Program, but got: {:?}", ast);
+            }
         }
     }
     
@@ -1559,13 +1565,28 @@ mod tests {
         // Verify the expression was parsed with correct precedence
         match ast {
             AstNode::Program { items, .. } => {
-                if let AstNode::ProcessDefinition { body, .. } = &items[0] {
-                    if let AstNode::Block { statements, .. } = body.as_ref() {
-                        assert_eq!(statements.len(), 2);
+                assert_eq!(items.len(), 1, "Program should contain exactly one top-level item");
+
+                match &items[0] {
+                    AstNode::ProcessDefinition { body, .. } => {
+                        match body.as_ref() {
+                            AstNode::Block { statements, .. } => {
+                                assert_eq!(statements.len(), 2,
+                                          "Process body should contain exactly 2 statements (Let and Return)");
+                            }
+                            _ => {
+                                panic!("Expected process body to be a Block, but got: {:?}", body);
+                            }
+                        }
+                    }
+                    _ => {
+                        panic!("Expected first item to be ProcessDefinition, but got: {:?}", items[0]);
                     }
                 }
             }
-            _ => panic!("Expected program with process definition"),
+            _ => {
+                panic!("Expected AstNode::Program, but got: {:?}", ast);
+            }
         }
     }
     

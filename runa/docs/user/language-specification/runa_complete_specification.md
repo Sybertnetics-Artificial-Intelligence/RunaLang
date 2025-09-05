@@ -2083,7 +2083,7 @@ Runa supports **dual syntax** for operators with **mathematical symbol enforceme
 
 #### Mathematical Symbol Enforcement
 
-**IMPORTANT**: Mathematical symbols (`+`, `-`, `*`, `/`, `%`, `<`, `>`, `<=`, `>=`, `!=`) are **ONLY** permitted in mathematical contexts. The compiler enforces this restriction.
+**IMPORTANT**: Mathematical symbols (`+`, `-`, `*`, `/`, `%`, `**`, `<`, `>`, `<=`, `>=`, `!=`, `==`) are **ONLY** permitted in mathematical contexts. The compiler enforces this restriction.
 
 **Valid Mathematical Contexts**:
 - Arithmetic expressions with numeric operands
@@ -2103,6 +2103,7 @@ Both forms supported (symbols restricted to mathematical contexts):
 - `*` ↔ `multiplied by` (mathematical only)
 - `/` ↔ `divided by` (mathematical only)
 - `%` ↔ `modulo` (mathematical only)
+- `**` ↔ `to the power of` (mathematical only)
 
 #### Comparison Operators
 Both forms supported (symbols restricted to mathematical contexts):
@@ -2112,6 +2113,7 @@ Both forms supported (symbols restricted to mathematical contexts):
 - `<=` ↔ `is less than or equal to` (mathematical comparison only)
 - `>=` ↔ `is greater than or equal to` (mathematical comparison only)
 - `!=` ↔ `does not equal` (mathematical comparison only)
+- `==` ↔ `is equal to` (mathematical comparison only)
 
 #### Equality Operators
 Runa provides a dual-syntax approach for equality that balances natural language readability with technical efficiency:
@@ -2148,8 +2150,8 @@ The `is` keyword is reserved exclusively for identity, type, and state checks. I
 
 #### Operator Type Classifications
 
-- **Mathematical**: `+`, `-`, `*`, `/`, `%`, `plus`, `minus`, `multiplied by`, `divided by`, `modulo`, `power of`
-- **Mathematical Comparison**: `<`, `>`, `<=`, `>=`, `!=`, `is greater than`, `is less than`, `is greater than or equal to`, `is less than or equal to`, `does not equal`
+- **Mathematical**: `+`, `-`, `*`, `/`, `%`, `**`, `plus`, `minus`, `multiplied by`, `divided by`, `modulo`, `to the power of`
+- **Mathematical Comparison**: `<`, `>`, `<=`, `>=`, `!=`, `==`, `is greater than`, `is less than`, `is greater than or equal to`, `is less than or equal to`, `does not equal`, `is equal to`
 - **Equality Comparison**: `is equal to`, `equals`, `contains`, `is in`
 - **Identity and Type**: `is of type`, `is None`, `is empty`, `is null`, `is valid`, `is ready`
 - **Bitwise**: `bitwise and`, `bitwise or`, `bitwise xor`, `bitwise not`, `shifted left by`, `shifted right by`

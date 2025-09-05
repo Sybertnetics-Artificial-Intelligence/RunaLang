@@ -232,39 +232,142 @@ pub enum OverflowAction {
 }
 
 /// Stack operation result
+pub type StackResult<T> = Result<T, StackError>;
+
+/// Stack error types
 #[derive(Debug)]
-pub enum StackResult<T> {
-    Success(T),
+pub enum StackError {
     StackOverflow,
     StackUnderflow,
     OutOfMemory,
     InvalidOperation,
+    InvalidLocalSlot(usize),
 }
 
 /// Implementation of MinimalStackMachine
 impl MinimalStackMachine {
     /// Create a new minimal stack machine
     pub fn new(config: StackConfig) -> Self {
-        // TODO: Implement stack machine creation
-        todo!("Stack machine creation not yet implemented")
+        MinimalStackMachine {
+            stack: ExecutionStack {
+                memory: Vec::with_capacity(config.initial_size),
+                sp: 0,
+                max_depth: config.max_size,
+            },
+            call_stack: CallStack {
+                frames: Vec::new(),
+                current_frame: None,
+            },
+            locals: LocalStorage {
+                slots: HashMap::new(),
+                next_slot: 0,
+            },
+            config,
+            statistics: StackStatistics::default(),
+            overflow_guard: OverflowGuard {
+                enabled: config.overflow_detection,
+                threshold: (config.max_size as f64 * 0.9) as usize,
+            },
+        }
     }
     
     /// Initialize the stack machine
     pub fn initialize(&mut self) -> Result<(), String> {
-        // TODO: Implement stack initialization
-        todo!("Stack initialization not yet implemented")
+        // Clear and reset the stack
+        self.stack.memory.clear();
+        self.stack.memory.reserve(self.stack.max_depth);
+        self.stack.sp = 0;
+
+        // Reset call stack
+        self.call_stack.frames.clear();
+        self.call_stack.current_frame = None;
+
+        // Reset local storage
+        self.locals.slots.clear();
+        self.locals.next_slot = 0;
+
+        // Reset statistics
+        self.statistics = StackStatistics::default();
+
+        // Reset overflow guard
+        self.overflow_guard.threshold = (self.stack.max_depth as f64 * 0.9) as usize;
+
+        // Reset deoptimization state
+        self.deoptimization_state = DeoptimizationState::default();
+
+        Ok(())
     }
     
     /// Push value onto stack
     pub fn push(&mut self, value: Value) -> StackResult<()> {
-        // TODO: Implement high-performance stack push
-        todo!("High-performance stack push not yet implemented")
+        // Check for overflow
+        if self.stack.sp >= self.stack.max_depth {
+            return Err(StackError::StackOverflow);
+        }
+
+        // Check overflow guard
+        if self.stack.sp >= self.overflow_guard.threshold {
+            // TODO: Trigger overflow protection mechanism
+        }
+
+        // Push value
+        if self.stack.sp >= self.stack.memory.len() {
+            // Stack needs to grow
+            self.stack.memory.push(value);
+        } else {
+            self.stack.memory[self.stack.sp] = value;
+        }
+
+        self.stack.sp += 1;
+        self.statistics.push_operations += 1;
+
+        Ok(())
     }
     
     /// Pop value from stack
     pub fn pop(&mut self) -> StackResult<Value> {
-        // TODO: Implement high-performance stack pop
-        todo!("High-performance stack pop not yet implemented")
+        if self.stack.sp == 0 {
+            return Err(StackError::StackUnderflow);
+        }
+
+        self.stack.sp -= 1;
+        let value = self.stack.memory[self.stack.sp].clone();
+        self.statistics.pop_operations += 1;
+
+        Ok(value)
+    }
+
+    /// Peek at top of stack without popping (mutable version)
+    pub fn peek_mut(&mut self) -> StackResult<Value> {
+        if self.stack.sp == 0 {
+            return Err(StackError::StackUnderflow);
+        }
+
+        Ok(self.stack.memory[self.stack.sp - 1].clone())
+    }
+
+    /// Load local variable from slot
+    pub fn load_local(&mut self, slot: usize) -> StackResult<Value> {
+        match self.locals.slots.get(&slot) {
+            Some(value) => {
+                self.statistics.local_loads += 1;
+                Ok(value.clone())
+            }
+            None => Err(StackError::InvalidLocalSlot(slot)),
+        }
+    }
+
+    /// Store local variable to slot
+    pub fn store_local(&mut self, slot: usize, value: Value) -> StackResult<()> {
+        self.locals.slots.insert(slot, value);
+        self.statistics.local_stores += 1;
+
+        // Update next slot if this extends the locals
+        if slot >= self.locals.next_slot {
+            self.locals.next_slot = slot + 1;
+        }
+
+        Ok(())
     }
     
     /// Peek at top stack value without popping

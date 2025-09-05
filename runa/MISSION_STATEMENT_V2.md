@@ -154,7 +154,7 @@ If implementation quality drops:
 - **SAFER** than Rust's approach
 - **COMPLETE** with no placeholders
 
-We're building the world's most powerful stdlib, not just another implementation.
+We're building the world's most powerful stdlib for the world's most powerful language, not just another implementation.
 
 **Current standard: Best-in-class or don't implement.**
 ---

@@ -457,8 +457,14 @@ macro_rules! profile_instruction {
 impl ZeroCostProfiler {
     /// Create a new zero-cost profiler
     pub fn new(config: ProfilerConfig) -> Self {
-        // TODO: Implement zero-cost profiler creation
-        todo!("Zero-cost profiler creation not yet implemented")
+        ZeroCostProfiler {
+            config,
+            collector: ProfileDataCollector::new(),
+            sampler: SamplingController::new(config.sampling_rate),
+            hardware_counters: HardwareCounterIntegration::new(),
+            thread_profilers: ThreadLocalProfilers::new(),
+            aggregator: ProfileAggregator::new(),
+        }
     }
     
     /// Initialize profiler (zero-cost when disabled)
@@ -466,8 +472,27 @@ impl ZeroCostProfiler {
         if !self.config.enabled {
             return Ok(());
         }
-        // TODO: Implement profiler initialization
-        todo!("Profiler initialization not yet implemented")
+
+        // Initialize profile data collector
+        self.collector = ProfileDataCollector::new();
+
+        // Initialize sampling controller
+        self.sampler = SamplingController::new(self.config.sampling_rate);
+
+        // Initialize hardware counters if enabled
+        if self.config.hardware_counters_enabled {
+            self.hardware_counters = HardwareCounterIntegration::new();
+        }
+
+        // Initialize thread-local profilers if enabled
+        if self.config.thread_local_enabled {
+            self.thread_profilers = ThreadLocalProfilers::new();
+        }
+
+        // Initialize profile aggregator
+        self.aggregator = ProfileAggregator::new();
+
+        Ok(())
     }
     
     /// Record function entry (zero-cost when disabled)

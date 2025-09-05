@@ -946,15 +946,52 @@ mod tests {
         let source = r#"Process called "test" that takes x as Integer returns Integer:
             Let result be x + 1
             Return result"#;
-        
+
         let mut lexer = MinimalLexer::new(source.to_string());
         let tokens = lexer.tokenize().expect("Failed to tokenize");
-        
+
         // Verify we have tokens
         assert!(!tokens.is_empty());
-        
+
+        // Should have more than just EOF
+        assert!(tokens.len() > 1);
+
         // Last token should be EOF
         assert!(matches!(tokens.last().unwrap().token_type, TokenType::EndOfFile));
+
+        // Check for key tokens that should be present
+        let has_process = tokens.iter().any(|t| matches!(t.token_type, TokenType::Keyword(ref k) if k == "Process"));
+        assert!(has_process, "Should contain Process keyword");
+
+        let has_string = tokens.iter().any(|t| matches!(t.token_type, TokenType::StringLiteral(_)));
+        assert!(has_string, "Should contain string literal 'test'");
+
+        let has_identifier = tokens.iter().any(|t| matches!(t.token_type, TokenType::Identifier(ref s) if s == "x"));
+        assert!(has_identifier, "Should contain identifier 'x'");
+
+        let has_plus = tokens.iter().any(|t| matches!(t.token_type, TokenType::Plus));
+        assert!(has_plus, "Should contain Plus operator");
+
+        let has_integer_literal = tokens.iter().any(|t| matches!(t.token_type, TokenType::IntegerLiteral(1)));
+        assert!(has_integer_literal, "Should contain integer literal 1");
+
+        // Check for keyword tokens
+        let keyword_count = tokens.iter()
+            .filter(|t| matches!(t.token_type, TokenType::Keyword(_)))
+            .count();
+        assert!(keyword_count >= 6, "Should have at least 6 keywords: Process, called, that, takes, as, returns, Let, Return");
+
+        // Check for newlines (significant in Runa)
+        let newline_count = tokens.iter()
+            .filter(|t| matches!(t.token_type, TokenType::Newline))
+            .count();
+        assert!(newline_count >= 2, "Should have at least 2 newlines");
+
+        // Verify token positions are reasonable
+        for (i, token) in tokens.iter().enumerate() {
+            assert!(token.position.line >= 1, "Token {} should have valid line number", i);
+            assert!(token.position.column >= 1, "Token {} should have valid column number", i);
+        }
     }
     
     #[test]
