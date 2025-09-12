@@ -233,7 +233,8 @@ See our [Contributing Guide](CONTRIBUTING.md) for details on:
 - **Attribution**: How your contributions will be recognized
 
 ### Areas Where We Need Help
-- **Language Translation**: Adding support for more programming languages
+- **Language Translation**: Adding support for more spoken languages
+- **Platform Translation**: Adding support for more programming languages
 - **Standard Library**: Expanding built-in functions and modules
 - **Documentation**: Tutorials, examples, and guides
 - **Testing**: Edge cases, performance testing, and validation
@@ -248,24 +249,7 @@ Runa represents a fundamental shift in how we think about programming. Instead o
 - **Business Stakeholders** who need to understand and validate complex logic
 - **Students and Newcomers** who can learn programming concepts without syntax barriers
 
-## License and Usage
-
-Runa is open source software released under the **[Runa Programming Language License (RPLL)](LICENSE.md)**, a custom license designed to protect the Runa brand and maintain quality standards while enabling broad commercial and non-commercial use.
-
-### What You Can Do
-✅ **Use Runa freely** for any commercial or non-commercial purpose  
-✅ **Build applications** and tools in Runa  
-✅ **Offer Runa services** including development, training, and consulting  
-✅ **Create development tools** like IDEs, debuggers, and plugins  
-✅ **Modify and contribute** improvements back to the project  
-
-### What You Cannot Do
-❌ **Create derivative programming languages** using Runa's codebase  
-❌ **Use "Runa" or similar names** for competing programming languages  
-❌ **Claim invention** of Runa's concepts or innovations  
-❌ **Distribute modified versions** without clear attribution and labeling  
-
-The license ensures Runa remains open and accessible while protecting against misuse, maintaining quality standards, and preserving the integrity of the Runa brand.
+ 
 
 ## Acknowledgments
 
