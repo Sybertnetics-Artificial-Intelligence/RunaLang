@@ -1,7 +1,7 @@
 # Runa Programming Language License (RPLL)
 **Version 1.0**
 
-Copyright (c) 2024 Sybertnetics Artificial Intelligence Solutions  
+Copyright (c) 2025 Sybertnetics Artificial Intelligence Solutions  
 All rights reserved.
 
 ## Preamble
@@ -153,7 +153,7 @@ Upon termination:
 ## 9. Enforcement and Jurisdiction
 
 ### 9.1 Governing Law
-This license shall be governed by the laws of [Your Jurisdiction], without regard to conflict of law principles.
+This license shall be governed by the laws of Florida, without regard to conflict of law principles.
 
 ### 9.2 Dispute Resolution
 Any disputes arising under this license shall be resolved through:
@@ -181,4 +181,4 @@ If any provision of this license is held invalid or unenforceable, the remaining
 
 **Runa Programming Language**  
 Created and maintained by Sybertnetics Artificial Intelligence Solutions  
-© 2024 All Rights Reserved
+© 2025 All Rights Reserved
