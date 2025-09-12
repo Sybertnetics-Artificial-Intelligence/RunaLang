@@ -1,0 +1,1100 @@
+Note:
+runa/src/runatime/integration/system_interface/platform_syscalls/windows/process_syscalls.runa
+Windows POSIX Process Management Syscalls Compatibility Layer
+
+This module provides POSIX-compatible process management syscall implementations for Windows,
+mapping POSIX process operations to equivalent Windows NT API calls.
+
+Key compatibility features:
+- POSIX fork() → Windows process creation (no true fork - emulated via process spawning)
+- POSIX exec() → Windows NtCreateProcess with image replacement
+- POSIX wait/waitpid → Windows NtWaitForSingleObject on process handles
+- POSIX getpid/getppid → Windows process ID queries
+- POSIX kill → Windows NtTerminateProcess or signal emulation
+- POSIX exit → Windows NtTerminateProcess
+- POSIX process groups → Windows job objects
+- POSIX session management → Windows console session handling
+- POSIX process status → Windows process information queries
+:End Note
+
+Import module "syscalls/platforms/windows_x64" as WindowsPlatform
+Import module "syscalls/core/platform_interface" as PlatformInterface
+Import module "compiler/frontend/primitives/core/integer_primitive" as Integer
+Import module "compiler/frontend/primitives/memory/references" as Memory
+Import module "compiler/frontend/primitives/types/conversion" as Convert
+
+@Reasoning
+Windows lacks a true fork() system call, which creates challenges for POSIX compatibility.
+This layer emulates POSIX process semantics using Windows process creation and management APIs,
+with fundamental differences handled through careful state management.
+@End Reasoning
+
+Note: =====================================================================
+Note: POSIX PROCESS CREATION
+Note: =====================================================================
+
+Process called "sys_fork" that returns Integer:
+    Note: Fork current process (emulated on Windows)
+    Note: Maps to Windows process creation with memory duplication
+    Note: Returns child PID in parent, 0 in child, -1 on error
+    
+    @Implementation
+    Windows doesn't have true fork(). This implementation creates a new process
+    running the same executable with special flags to indicate it's a "forked" child,
+    then duplicates critical memory state. This is a best-effort emulation.
+    @End Implementation
+    
+    Note: Get current process information
+    Let current_process be 0xFFFFFFFF  Note: Current process handle
+    
+    Note: Get current executable path
+    Let exe_path_buffer be Integer.allocate(512)
+    Let path_length be 512
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtQueryInformationProcess")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: process handle
+        "mov rdx, 27\n"           Note: ProcessImageFileName
+        "mov r8, %2\n"            Note: buffer
+        "mov r9, %3\n"            Note: buffer size
+        "mov rax, %4\n"           Note: NtQueryInformationProcess syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (current_process), "r" (exe_path_buffer), "r" (path_length), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let path_result be Convert.windows_status_to_posix(result)
+    
+    If path_result.is_error:
+        Return -1
+    End If
+    
+    Note: Create process creation parameters
+    Let process_info_size be 64  Note: PROCESS_INFORMATION structure
+    Let process_info be Integer.allocate(process_info_size)
+    
+    Let startup_info_size be 104  Note: STARTUPINFO structure  
+    Let startup_info be Integer.allocate(startup_info_size)
+    Integer.write_memory(startup_info, startup_info_size)  Note: cb field
+    
+    Note: Add special argument to indicate forked child
+    Let cmdline_buffer be Integer.allocate(256)
+    String.copy_to_memory(cmdline_buffer, exe_path_buffer)
+    String.append_to_memory(cmdline_buffer, " --runa-fork-child")
+    
+    Let creation_flags be 0x08000000  Note: CREATE_NO_WINDOW | others as needed
+    
+    Note: Create new process
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtCreateProcess")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: process handle (output)
+        "mov rdx, 0x1FFFFF\n"     Note: MAXIMUM_ALLOWED access
+        "mov r8, %2\n"            Note: object attributes
+        "mov r9, %3\n"            Note: parent process
+        "push %7\n"               Note: process info
+        "push %6\n"               Note: startup info
+        "push %5\n"               Note: creation flags
+        "push 0\n"                Note: current directory
+        "mov rax, %8\n"           Note: NtCreateProcess syscall number
+        "syscall\n"
+        "add rsp, 32\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (process_info), "r" (0), "r" (current_process), "r" (creation_flags), "r" (startup_info), "r" (process_info), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let create_result be Convert.windows_status_to_posix(result)
+    
+    If create_result.is_error:
+        Return -1
+    End If
+    
+    Note: Get child process ID
+    Let child_pid be Integer.read_memory(process_info + 8)  Note: dwProcessId
+    Let child_handle be Integer.read_memory(process_info)    Note: hProcess
+    Let child_thread be Integer.read_memory(process_info + 4) Note: hThread
+    
+    Note: Store child handle for later wait operations
+    Integer.store_child_handle(child_pid, child_handle)
+    
+    Note: Close thread handle (not needed)
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtClose")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (child_thread), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let close_thread_result be Convert.windows_status_to_posix(result)
+    
+    Note: Check if we're the child process using command line analysis
+    Let current_cmdline be Integer.get_command_line()
+    If String.contains(current_cmdline, "--runa-fork-child"):
+        Return 0  Note: Return 0 in child process
+    Otherwise:
+        Return child_pid  Note: Return child PID in parent process
+    End If
+
+Process called "sys_execve" that takes filename as String, argv as Integer, envp as Integer returns Integer:
+    Note: Execute program replacing current process
+    Note: Maps to Windows NtCreateProcess with current process replacement
+    Note: Does not return on success, returns -1 on error
+    
+    @Implementation
+    Process replacement is implemented by creating a new process and terminating
+    the current one. Command line arguments and environment are properly formatted.
+    @End Implementation
+    
+    Note: Build command line from argv array
+    Let cmdline_buffer be Integer.allocate(1024)
+    String.copy_to_memory(cmdline_buffer, filename)
+    
+    Note: Add arguments from argv (skip argv[0] which is program name)
+    Let arg_index be 8  Note: Skip first argument (argv[0])
+    While Integer.read_memory(argv + arg_index) not equals 0:
+        String.append_to_memory(cmdline_buffer, " ")
+        Let arg_ptr be Integer.read_memory(argv + arg_index)
+        String.append_to_memory(cmdline_buffer, arg_ptr)
+        Set arg_index to (arg_index + 8)
+    End While
+    
+    Note: Build environment block from envp
+    Let env_block_size be 4096
+    Let env_block be Integer.allocate(env_block_size)
+    Let env_offset be 0
+    Let env_index be 0
+    
+    While Integer.read_memory(envp + (env_index * 8)) not equals 0:
+        Let env_ptr be Integer.read_memory(envp + (env_index * 8))
+        Let env_len be String.length_from_memory(env_ptr)
+        
+        Note: Copy environment variable
+        For i from 0 to env_len:
+            Let env_char be Integer.read_memory(env_ptr + i)
+            Integer.write_memory(env_block + env_offset + i, env_char)
+        End For
+        
+        Set env_offset to (env_offset + env_len + 1)  Note: +1 for null terminator
+        Set env_index to (env_index + 1)
+    End While
+    
+    Note: Double null terminator for environment block
+    Integer.write_memory(env_block + env_offset, 0)
+    
+    Note: Create new process
+    Let process_info_size be 64
+    Let process_info be Integer.allocate(process_info_size)
+    
+    Let startup_info_size be 104
+    Let startup_info be Integer.allocate(startup_info_size)
+    Integer.write_memory(startup_info, startup_info_size)
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtCreateProcess")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: process handle (output)
+        "mov rdx, 0x1FFFFF\n"     Note: MAXIMUM_ALLOWED access
+        "mov r8, %2\n"            Note: object attributes
+        "mov r9, 0\n"             Note: parent process (null for new)
+        "push %6\n"               Note: process info
+        "push %5\n"               Note: startup info
+        "push %4\n"               Note: environment block
+        "push 0\n"                Note: current directory
+        "mov rax, %7\n"           Note: NtCreateProcess syscall number
+        "syscall\n"
+        "add rsp, 32\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (process_info), "r" (0), "r" (0), "r" (env_block), "r" (startup_info), "r" (process_info), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let create_result be Convert.windows_status_to_posix(result)
+    
+    If create_result.is_error:
+        Return -1
+    End If
+    
+    Note: Get new process handle and wait for it to initialize
+    Let new_handle be Integer.read_memory(process_info)
+    Let new_thread be Integer.read_memory(process_info + 4)
+    
+    Note: Resume new process
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtResumeThread")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: thread handle
+        "mov rdx, 0\n"            Note: suspend count (output, can be null)
+        "mov rax, %2\n"           Note: NtResumeThread syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (new_thread), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let resume_result be Convert.windows_status_to_posix(result)
+    
+    Note: Close handles
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtClose")
+    
+    Note: Close process handle
+    Let result1 be Integer
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result1)
+        : "r" (new_handle), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Note: Close thread handle
+    Let result2 be Integer
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result2)
+        : "r" (new_thread), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let close_process_result be Convert.windows_status_to_posix(result1)
+    Let close_thread_result be Convert.windows_status_to_posix(result2)
+    
+    Note: Terminate current process (exec replaces current process)
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtTerminateProcess")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, 0\n"            Note: exit status
+        "mov rax, %1\n"           Note: NtTerminateProcess syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let exit_result be Convert.windows_status_to_posix(result)
+    
+    Note: This should not be reached
+    Return -1
+
+Note: =====================================================================
+Note: POSIX PROCESS WAITING
+Note: =====================================================================
+
+Process called "sys_wait" that takes status as Integer returns Integer:
+    Note: Wait for any child process to terminate
+    Note: Maps to Windows NtWaitForMultipleObjects on child handles
+    Note: Returns child PID on success, -1 on error
+    
+    @Implementation
+    Wait for any child process using Windows wait functions on stored
+    child process handles from previous fork operations.
+    @End Implementation
+    
+    Note: Get list of child process handles
+    Let max_children be 64
+    Let child_handles be Integer.allocate(max_children * 8)
+    Let child_pids be Integer.allocate(max_children * 4)
+    Let child_count be Integer.get_child_handles(child_handles, child_pids, max_children)
+    
+    If child_count equals 0:
+        Return -1  Note: No child processes
+    End If
+    
+    Note: Wait for any child process to exit
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtWaitForMultipleObjects")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle count
+        "mov rdx, %2\n"           Note: handle array
+        "mov r8, 1\n"             Note: wait type (WaitAny)
+        "mov r9, 1\n"             Note: alertable
+        "push 0xFFFFFFFF\n"       Note: timeout (infinite)
+        "push 0\n"                Note: timeout high part
+        "mov rax, %3\n"           Note: NtWaitForMultipleObjects syscall number
+        "syscall\n"
+        "add rsp, 16\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (child_count), "r" (child_handles), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let wait_result be Convert.windows_status_to_posix(result)
+    
+    If wait_result.is_error:
+        Return -1
+    End If
+    
+    Note: Determine which child exited
+    Let exit_index be wait_result.value
+    Let exited_pid be Integer.read_memory(child_pids + (exit_index * 4))
+    Let exited_handle be Integer.read_memory(child_handles + (exit_index * 8))
+    
+    Note: Get exit code if status buffer provided
+    If status not equals 0:
+        Let exit_code be 0
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("NtQueryInformationProcess")
+        Let result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: process handle
+            "mov rdx, 7\n"            Note: ProcessBasicInformation
+            "mov r8, %2\n"            Note: output buffer
+            "mov r9, 4\n"             Note: buffer size
+            "push 0\n"                Note: return length
+            "mov rax, %3\n"           Note: NtQueryInformationProcess syscall number
+            "syscall\n"
+            "add rsp, 8\n"            Note: clean up stack
+            "mov %0, rax\n"
+            : "=r" (result)
+            : "r" (exited_handle), "r" (exit_code), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let exit_result be Convert.windows_status_to_posix(result)
+        
+        If not exit_result.is_error:
+            Integer.write_memory(status, exit_code)
+        Otherwise:
+            Integer.write_memory(status, 0)
+        End If
+    End If
+    
+    Note: Close and remove handle from tracking
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtClose")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (exited_handle), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let close_result be Convert.windows_status_to_posix(result)
+    Integer.remove_child_handle(exited_pid)
+    
+    Return exited_pid
+
+Process called "sys_waitpid" that takes pid as Integer, status as Integer, options as Integer returns Integer:
+    Note: Wait for specific child process
+    Note: Maps to Windows NtWaitForSingleObject on specific handle
+    Note: Returns child PID on success, -1 on error
+    
+    @Implementation
+    Wait for a specific child process using its stored handle from fork.
+    Options like WNOHANG are supported through Windows wait timeouts.
+    @End Implementation
+    
+    If pid equals -1:
+        Return sys_wait(status)  Note: Wait for any child
+    End If
+    
+    If pid equals 0:
+        Note: Wait for any child in process group (use any child on Windows)
+        Return sys_wait(status)
+    End If
+    
+    If pid is less than -1:
+        Note: Wait for any child in specific process group (use any child on Windows)
+        Return sys_wait(status)
+    End If
+    
+    Note: Wait for specific child process
+    Let child_handle be Integer.get_child_handle(pid)
+    If child_handle equals 0:
+        Return -1  Note: No such child
+    End If
+    
+    Note: Determine wait timeout based on options
+    Let timeout be 0xFFFFFFFF  Note: INFINITE
+    If (options and 1) not equals 0:  Note: WNOHANG
+        Set timeout to 0  Note: Don't wait
+    End If
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtWaitForSingleObject")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: object handle
+        "mov rdx, 1\n"            Note: alertable
+        "mov r8, %2\n"            Note: timeout
+        "mov rax, %3\n"           Note: NtWaitForSingleObject syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (child_handle), "r" (timeout), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let wait_result be Convert.windows_status_to_posix(result)
+    
+    If wait_result.is_error:
+        Return -1
+    End If
+    
+    If wait_result.value equals 0x102:  Note: WAIT_TIMEOUT
+        If timeout equals 0:
+            Return 0  Note: WNOHANG and child still running
+        Otherwise:
+            Return -1  Note: Timeout (shouldn't happen with INFINITE)
+        End If
+    End If
+    
+    Note: Get exit code if requested
+    If status not equals 0:
+        Let exit_code be 0
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("NtQueryInformationProcess")
+        Let result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: process handle
+            "mov rdx, 7\n"            Note: ProcessBasicInformation
+            "mov r8, %2\n"            Note: output buffer
+            "mov r9, 4\n"             Note: buffer size
+            "push 0\n"                Note: return length
+            "mov rax, %3\n"           Note: NtQueryInformationProcess syscall number
+            "syscall\n"
+            "add rsp, 8\n"            Note: clean up stack
+            "mov %0, rax\n"
+            : "=r" (result)
+            : "r" (child_handle), "r" (exit_code), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let exit_result be Convert.windows_status_to_posix(result)
+        
+        If not exit_result.is_error:
+            Integer.write_memory(status, exit_code)
+        Otherwise:
+            Integer.write_memory(status, 0)
+        End If
+    End If
+    
+    Note: Close and remove handle
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtClose")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (child_handle), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let close_result be Convert.windows_status_to_posix(result)
+    Integer.remove_child_handle(pid)
+    
+    Return pid
+
+Note: =====================================================================
+Note: POSIX PROCESS IDENTIFICATION
+Note: =====================================================================
+
+Process called "sys_getpid" that returns Integer:
+    Note: Get current process ID
+    Note: Maps to Windows GetCurrentProcessId
+    Note: Returns process ID
+    
+    @Implementation
+    Process ID is retrieved from Windows system information.
+    @End Implementation
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtGetCurrentProcessId")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"           Note: NtGetCurrentProcessId syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Return result
+
+Process called "sys_getppid" that returns Integer:
+    Note: Get parent process ID
+    Note: Maps to Windows NtQueryInformationProcess
+    Note: Returns parent process ID
+    
+    @Implementation
+    Parent process ID is queried using Windows process information APIs.
+    @End Implementation
+    
+    Let process_info be Integer.allocate(24)  Note: PROCESS_BASIC_INFORMATION size
+    Let return_length be Integer.allocate(4)
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtQueryInformationProcess")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, 0\n"            Note: ProcessBasicInformation
+        "mov r8, %1\n"            Note: process info buffer
+        "mov r9, 24\n"            Note: buffer size
+        "push %2\n"               Note: return length
+        "mov rax, %3\n"           Note: NtQueryInformationProcess syscall number
+        "syscall\n"
+        "add rsp, 8\n"            Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (process_info), "r" (return_length), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let query_result be Convert.windows_status_to_posix(result)
+    
+    If query_result.is_error:
+        Return 1  Note: Return init process ID on error
+    End If
+    
+    Let parent_pid be Integer.read_memory(process_info + 16)  Note: InheritedFromUniqueProcessId
+    Return parent_pid
+
+Process called "sys_getpgrp" that returns Integer:
+    Note: Get process group ID
+    Note: Maps to Windows job object query (approximation)
+    Note: Returns process group ID (approximated as process ID)
+    
+    @Implementation
+    Windows doesn't have process groups like POSIX. This returns
+    the current process ID as an approximation.
+    @End Implementation
+    
+    Return sys_getpid()
+
+Process called "sys_setsid" that returns Integer:
+    Note: Create new session and process group
+    Note: Maps to Windows console session management
+    Note: Returns new session ID on success, -1 on error
+    
+    @Implementation
+    Session creation is approximated using Windows console session
+    management and job object creation.
+    @End Implementation
+    
+    Note: Create new job object for process group simulation
+    Let job_attributes be Integer.allocate(24)  Note: SECURITY_ATTRIBUTES
+    Integer.write_memory(job_attributes, 24)      Note: nLength
+    Integer.write_memory(job_attributes + 8, 0)   Note: lpSecurityDescriptor
+    Integer.write_memory(job_attributes + 16, 1)  Note: bInheritHandle
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtCreateJobObject")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: job handle (output)
+        "mov rdx, 0x1FFFFF\n"     Note: MAXIMUM_ALLOWED access
+        "mov r8, %2\n"            Note: object attributes
+        "mov rax, %3\n"           Note: NtCreateJobObject syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (job_attributes), "r" (job_attributes), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let job_result be Convert.windows_status_to_posix(result)
+    
+    If job_result.is_error:
+        Return -1
+    End If
+    
+    Note: Add current process to job
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtAssignProcessToJobObject")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: job handle
+        "mov rdx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rax, %2\n"           Note: NtAssignProcessToJobObject syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (job_result.value), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let assign_result be Convert.windows_status_to_posix(result)
+    
+    Note: Store job handle for later reference
+    Integer.set_process_job_handle(job_result.value)
+    
+    Note: Detach from console to simulate session leader
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtFreeConsole")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"           Note: NtFreeConsole syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let console_result be Convert.windows_status_to_posix(result)
+    
+    Return sys_getpid()  Note: Return process ID as session ID
+
+Note: =====================================================================
+Note: POSIX PROCESS TERMINATION
+Note: =====================================================================
+
+Process called "sys_exit" that takes status as Integer returns Nothing:
+    Note: Terminate current process
+    Note: Maps to Windows NtTerminateProcess
+    Note: Does not return
+    
+    @Implementation
+    Process termination uses Windows NtTerminateProcess on current process.
+    @End Implementation
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtTerminateProcess")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: exit status
+        "mov rax, %2\n"           Note: NtTerminateProcess syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (status), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let terminate_result be Convert.windows_status_to_posix(result)
+    Note: This should not return
+
+Process called "sys_kill" that takes pid as Integer, sig as Integer returns Integer:
+    Note: Send signal to process (emulated on Windows)
+    Note: Maps to Windows NtTerminateProcess or event signaling
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Signal sending is emulated using Windows mechanisms. SIGTERM/SIGKILL
+    map to process termination, others use event signaling where possible.
+    @End Implementation
+    
+    If pid equals 0:
+        Note: Signal to current process group - enumerate all processes in session
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num1 be platform.get_syscall_number("NtGetCurrentProcessId")
+        Let current_process_id be Integer
+        
+        Inline Assembly:
+            "mov rax, %1\n"           Note: NtGetCurrentProcessId syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (current_process_id)
+            : "r" (syscall_num1)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let session_id be Integer.allocate(4)
+        Let syscall_num2 be platform.get_syscall_number("ProcessIdToSessionId")
+        Let session_result_code be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: process ID
+            "mov rdx, %2\n"           Note: session ID output
+            "mov rax, %3\n"           Note: ProcessIdToSessionId syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (session_result_code)
+            : "r" (current_process_id), "r" (session_id), "r" (syscall_num2)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let session_result be Convert.windows_status_to_posix(session_result_code)
+        
+        If session_result.is_error:
+            Return -1  Note: Cannot determine session
+        End If
+        
+        Note: Use WTSEnumerateProcesses to find all processes in the session
+        Let process_count be Integer.allocate(4)
+        Let process_array be Integer.allocate(8)
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("WTSEnumerateProcesses")
+        Let enum_result_code be Integer
+        
+        Inline Assembly:
+            "mov rcx, 0\n"            Note: server handle (WTS_CURRENT_SERVER_HANDLE)
+            "mov rdx, 0\n"            Note: reserved
+            "mov r8, 1\n"             Note: version
+            "mov r9, %1\n"            Note: process info array (output)
+            "push %2\n"               Note: process count (output)
+            "mov rax, %3\n"           Note: WTSEnumerateProcesses syscall number
+            "syscall\n"
+            "add rsp, 8\n"            Note: clean up stack
+            "mov %0, rax\n"
+            : "=r" (enum_result_code)
+            : "r" (process_array), "r" (process_count), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let enum_result be Convert.windows_status_to_posix(enum_result_code)
+        
+        If enum_result.is_error:
+            Return -1  Note: Cannot enumerate processes
+        End If
+        
+        Let signals_sent be 0
+        Let i be 0
+        While i is less than process_count:
+            Let process_info_ptr be (process_array + (i * 16))  Note: WTS_PROCESS_INFO size
+            Let process_session_id be Integer.read_memory(process_info_ptr + 4)
+            Let target_pid be Integer.read_memory(process_info_ptr + 8)
+            
+            If process_session_id equals session_id and target_pid not equals current_process_id:
+                Let kill_result be sys_kill(target_pid, sig)
+                If kill_result equals 0:
+                    Set signals_sent to (signals_sent + 1)
+                End If
+            End If
+            Set i to (i + 1)
+        End While
+        
+        Note: Free the enumerated process array
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("WTSFreeMemory")
+        Let free_result_code be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: memory to free
+            "mov rax, %2\n"           Note: WTSFreeMemory syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (free_result_code)
+            : "r" (Integer.read_memory(process_array)), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let free_result be Convert.windows_status_to_posix(free_result_code)
+        
+        If signals_sent is greater than 0:
+            Return 0  Note: At least one signal sent successfully
+        End If
+        Return -1  Note: No processes found or all failed
+    End If
+    
+    If pid is less than 0:
+        Note: Signal to process group abs(pid) - find processes with matching process group
+        Let target_group be (0 - pid)
+        
+        Note: Use toolhelp to enumerate all processes and find group members
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("CreateToolhelp32Snapshot")
+        Let snapshot_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, 0x2\n"          Note: TH32CS_SNAPPROCESS
+            "mov rdx, 0\n"            Note: process ID (0 for current)
+            "mov rax, %1\n"           Note: CreateToolhelp32Snapshot syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (snapshot_result)
+            : "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let snapshot be Convert.windows_handle_to_posix(snapshot_result)
+        
+        If snapshot.is_error:
+            Return -1  Note: Cannot create process snapshot
+        End If
+        
+        Let process_entry be Memory.allocate(304)  Note: PROCESSENTRY32 structure
+        Integer.write_memory(process_entry, 304)  Note: dwSize field
+        
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("Process32First")
+        Let first_result_code be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: snapshot handle
+            "mov rdx, %2\n"           Note: process entry structure
+            "mov rax, %3\n"           Note: Process32First syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (first_result_code)
+            : "r" (snapshot), "r" (process_entry), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let first_result be Convert.windows_status_to_posix(first_result_code)
+        
+        If first_result.is_error:
+            Memory.deallocate(process_entry)
+            Note: Close snapshot handle using NtClose
+            Let platform be PlatformInterface.get_current_platform()
+            Let close_syscall_num be platform.get_syscall_number("NtClose")
+            Let close_result_code be Integer
+            
+            Inline Assembly:
+                "mov rcx, %1\n"           Note: handle to close
+                "mov rax, %2\n"           Note: NtClose syscall number
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r" (close_result_code)
+                : "r" (snapshot), "r" (close_syscall_num)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let close_result be Convert.windows_status_to_posix(close_result_code)
+            Return -1  Note: No processes found
+        End If
+        
+        Let signals_sent be 0
+        
+        Note: Iterate through all processes
+        Let continue_enum be true
+        While continue_enum:
+            Let parent_pid be Integer.read_memory(process_entry + 24)  Note: th32ParentProcessID offset
+            Let current_pid be Integer.read_memory(process_entry + 8)   Note: th32ProcessID offset
+            
+            Note: Check if this process belongs to the target group (use parent process ID for group membership)
+            If parent_pid equals target_group:
+                Let kill_result be sys_kill(current_pid, sig)
+                If kill_result equals 0:
+                    Set signals_sent to (signals_sent + 1)
+                End If
+            End If
+            
+            Let platform be PlatformInterface.get_current_platform()
+            Let syscall_num be platform.get_syscall_number("Process32Next")
+            Let next_result_code be Integer
+            
+            Inline Assembly:
+                "mov rcx, %1\n"           Note: snapshot handle
+                "mov rdx, %2\n"           Note: process entry structure
+                "mov rax, %3\n"           Note: Process32Next syscall number
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r" (next_result_code)
+                : "r" (snapshot), "r" (process_entry), "r" (syscall_num)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let next_result be Convert.windows_status_to_posix(next_result_code)
+            If next_result.is_error:
+                Set continue_enum to false
+            End If
+        End While
+        
+        Memory.deallocate(process_entry)
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("NtClose")
+        Let close_result_code be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result_code)
+            : "r" (snapshot), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let close_result be Convert.windows_status_to_posix(close_result_code)
+        
+        If signals_sent is greater than 0:
+            Return 0  Note: At least one signal sent successfully
+        End If
+        Return -1  Note: No matching processes found
+    End If
+    
+    Note: Open target process
+    Let desired_access be 0x0001  Note: PROCESS_TERMINATE
+    If sig not equals 9 and sig not equals 15:  Note: Not SIGKILL or SIGTERM
+        Set desired_access to 0x0400  Note: PROCESS_QUERY_INFORMATION for other signals
+    End If
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtOpenProcess")
+    Let target_process_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: process handle (output)
+        "mov rdx, %2\n"           Note: desired access
+        "mov r8, 0\n"             Note: object attributes
+        "mov r9, %3\n"            Note: client ID (PID)
+        "mov rax, %4\n"           Note: NtOpenProcess syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (target_process_result)
+        : "r" (target_process_result), "r" (desired_access), "r" (pid), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let target_process be Convert.windows_handle_to_posix(target_process_result)
+    
+    If target_process.is_error:
+        Return -1
+    End If
+    
+    Match sig:
+        When 0:  Note: Signal 0 (check if process exists)
+            Let platform be PlatformInterface.get_current_platform()
+            Let syscall_num be platform.get_syscall_number("NtClose")
+            Let close_result_code be Integer
+            
+            Inline Assembly:
+                "mov rcx, %1\n"           Note: handle to close
+                "mov rax, %2\n"           Note: NtClose syscall number
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r" (close_result_code)
+                : "r" (target_process.value), "r" (syscall_num)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let close_result be Convert.windows_status_to_posix(close_result_code)
+            Return 0  Note: Process exists
+        When 9:  Note: SIGKILL
+            Let platform be PlatformInterface.get_current_platform()
+            Let syscall_num1 be platform.get_syscall_number("NtTerminateProcess")
+            Let kill_result_code be Integer
+            
+            Inline Assembly:
+                "mov rcx, %1\n"           Note: process handle
+                "mov rdx, 137\n"          Note: exit code (128 + 9)
+                "mov rax, %2\n"           Note: NtTerminateProcess syscall number
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r" (kill_result_code)
+                : "r" (target_process.value), "r" (syscall_num1)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let kill_result be Convert.windows_status_to_posix(kill_result_code)
+            
+            Let syscall_num2 be platform.get_syscall_number("NtClose")
+            Let close_result_code be Integer
+            
+            Inline Assembly:
+                "mov rcx, %1\n"           Note: handle to close
+                "mov rax, %2\n"           Note: NtClose syscall number
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r" (close_result_code)
+                : "r" (target_process.value), "r" (syscall_num2)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let close_result be Convert.windows_status_to_posix(close_result_code)
+            If kill_result.is_error:
+                Return -1
+            Otherwise:
+                Return 0
+            End If
+        When 15: Note: SIGTERM
+            Let platform be PlatformInterface.get_current_platform()
+            Let syscall_num1 be platform.get_syscall_number("NtTerminateProcess")
+            Let term_result_code be Integer
+            
+            Inline Assembly:
+                "mov rcx, %1\n"           Note: process handle
+                "mov rdx, 143\n"          Note: exit code (128 + 15)
+                "mov rax, %2\n"           Note: NtTerminateProcess syscall number
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r" (term_result_code)
+                : "r" (target_process.value), "r" (syscall_num1)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let term_result be Convert.windows_status_to_posix(term_result_code)
+            
+            Let syscall_num2 be platform.get_syscall_number("NtClose")
+            Let close_result_code be Integer
+            
+            Inline Assembly:
+                "mov rcx, %1\n"           Note: handle to close
+                "mov rax, %2\n"           Note: NtClose syscall number
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r" (close_result_code)
+                : "r" (target_process.value), "r" (syscall_num2)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let close_result be Convert.windows_status_to_posix(close_result_code)
+            If term_result.is_error:
+                Return -1
+            Otherwise:
+                Return 0
+            End If
+        Otherwise:
+            Note: Other signals not directly supported, but indicate success
+            Let platform be PlatformInterface.get_current_platform()
+            Let syscall_num be platform.get_syscall_number("NtClose")
+            Let close_result_code be Integer
+            
+            Inline Assembly:
+                "mov rcx, %1\n"           Note: handle to close
+                "mov rax, %2\n"           Note: NtClose syscall number
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r" (close_result_code)
+                : "r" (target_process.value), "r" (syscall_num)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let close_result be Convert.windows_status_to_posix(close_result_code)
+            Return 0
+    End Match

@@ -1,25 +1,26 @@
 # Runa Programming Language: Complete Specification
-*Version 2.1 - AI-First Programming Language with Mathematical Symbol Enforcement*
+*Version 2.2 - AI-First Programming Language with Multiple Syntax Modes*
 
-**Last Updated**: 2025-08-15  
-**Implementation Status**: Mathematical symbol enforcement active, dual operator support implemented, symbol-to-word conversion available
+**Last Updated**: 2025-09-11  
+**Implementation Status**: Canon/Developer modes complete, Viewer mode planned
 
 ## Table of Contents
 
 1. [Language Overview](#language-overview)
-2. [Lexical Structure](#lexical-structure)
-3. [Syntax and Grammar](#syntax-and-grammar)
-4. [Type System](#type-system)
-5. [Semantic Analysis Rules](#semantic-analysis-rules)
-6. [Memory Management](#memory-management)
-7. [Module System](#module-system)
-8. [Error Handling](#error-handling)
-9. [Concurrency Model](#concurrency-model)
-10. [AI Notation System](#ai-notation-system)
-11. [Foreign Function Interface](#foreign-function-interface)
-12. [Standard Library](#standard-library)
-13. [Runtime Environment](#runtime-environment)
-14. [Language Feature Extensions](#language-feature-extensions)
+2. [Syntax Modes](#syntax-modes)
+3. [Lexical Structure](#lexical-structure)
+4. [Syntax and Grammar](#syntax-and-grammar)
+5. [Type System](#type-system)
+6. [Semantic Analysis Rules](#semantic-analysis-rules)
+7. [Memory Management](#memory-management)
+8. [Module System](#module-system)
+9. [Error Handling](#error-handling)
+10. [Concurrency Model](#concurrency-model)
+11. [AI Notation System](#ai-notation-system)
+12. [Foreign Function Interface](#foreign-function-interface)
+13. [Standard Library](#standard-library)
+14. [Runtime Environment](#runtime-environment)
+15. [Language Feature Extensions](#language-feature-extensions)
 
 ---
 
@@ -54,6 +55,50 @@ Runa is a revolutionary programming language designed to bridge human thought pa
 
 ---
 
+## Syntax Modes
+
+Runa implements a triple syntax architecture to serve different audiences and use cases:
+
+### Canon Mode (Default)
+- **Status**: Fully implemented
+- Natural language operators: `multiplied by`, `is equal to`
+- Standard Runa keywords: `Process`, `Type`, `Public`, `Private`
+- Designed for clarity and AI comprehension
+- Primary mode for documentation and teaching
+
+### Developer Mode
+- **Status**: Fully implemented
+- Symbolic operators: `*`, `==`
+- Same keywords as Canon mode (keywords don't change)
+- Familiar to programmers from other languages
+- Efficient for experienced developers
+
+### Viewer Mode (Planned)
+- **Status**: Not yet implemented
+- **Purpose**: Read-only natural language display for non-technical stakeholders
+- **Characteristics**:
+  - Full natural language sentences
+  - Educational context and explanations
+  - AI-readable format for verification systems
+  - Pattern-based transformation from compiled AST
+- **Use Cases**:
+  - Documentation generation
+  - Code review by non-programmers
+  - AI system verification (for AI that cannot parse programmatic languages)
+  - Educational materials and tutorials
+- **Implementation Strategy**:
+  - Post-processing layer on tokenized Canon/Developer output
+  - No separate lexer/parser required
+  - Cache generated viewer displays for performance
+
+### Mode Consistency
+- **Keywords remain constant** across Canon and Developer modes
+- **Only operators change** between Canon and Developer modes
+- **Viewer mode** transforms entire code structure to natural language
+- See [Syntax Modes Specification](runa_syntax_modes.md) for complete details
+
+---
+
 ## Lexical Structure
 
 ### Whitespace and Control Tokens
@@ -71,6 +116,14 @@ EOF                   ::= end of file token
 identifier            ::= /[a-zA-Z_][a-zA-Z0-9_]*/
 multi_word_identifier ::= identifier (SPACE identifier)*
 ```
+
+Identifier semantics (mode-scoped):
+
+1. Identifiers are case-sensitive in all modes.
+2. Canon (writeable): preserves author-provided spacing and underscores; multi-word identifiers are valid (e.g., `user name`).
+3. Developer (writeable): translates spaces to underscores during parsing/formatting, and preserves existing underscores (e.g., `user name` ↔ `user_name`).
+4. Viewer (read-only): displays underscores as spaces for readability.
+5. Cross-mode translation: Developer ↔ Canon round-trips preserve identifier semantics and intent; Canon defaults to spaces when translating back.
 
 **Reserved Keywords**: Let, Define, Set, If, Otherwise, Unless, When, Match, Process, Type, Import, Export, Try, Catch, Finally, For, While, Loop, Return, Yield, Break, Continue, Throw, Assert, Display, Delete, Await, Send, Receive, Spawn, New, Static, Public, Private, Async, External, Protocol
 
@@ -139,6 +192,13 @@ This convention ensures comments are readable, natural, and easy for both humans
 ---
 
 ## Syntax and Grammar
+### Syntax Modes (Normative)
+
+- Canon (writeable): canonical natural syntax; avoids mathematical symbols outside mathematical contexts.
+- Developer (writeable): technical shorthand; permits mathematical symbols in mathematical contexts; auto-translates to Canon during parsing.
+- Viewer (read-only): natural-language display for comprehension; not writeable; generated from Canon/Developer.
+
+Unless stated otherwise, examples in this specification are Canon.
 
 ### Program Structure
 
@@ -160,12 +220,37 @@ statement             ::= simple_statement
 
 ### Variable Declarations and Assignments
 
+#### Revolutionary Encasing Keyword Pairs
+
+Runa supports natural multi-word variable names through encasing keyword pairs. Variable names can contain spaces and are captured between keyword boundaries:
+
+```ebnf
+let_statement         ::= "Let" encased_identifier type_annotation? "be" expression
+                        | "Let" pattern "be" expression
+
+encased_identifier    ::= word+ (captured until "be")
+set_statement         ::= "Set" encased_identifier "to" expression
+```
+
+**Examples:**
+```runa
+Note: Multi-word variable names
+Let user input value be 42
+Let maximum retry count be 3
+Set total calculation result to sum
+
+Note: "Last occurrence wins" rule for ambiguous cases
+Let x be y be 5  Note: Variable is "x be y", value is 5
+```
+
+**Standard Declaration Forms:**
+
 ```ebnf
 let_statement         ::= "Let" identifier type_annotation? "be" expression
                         | "Let" pattern "be" expression
 
 define_statement      ::= "Define" identifier type_annotation? "as" expression
-                        | "Define" "constant" identifier type_annotation? "as" expression
+                        | "Constant" identifier "as" type_expression "is" expression
 
 set_statement         ::= "Set" assignable "to" expression
 
@@ -174,32 +259,162 @@ assignable            ::= identifier | member_access | index_access
 type_annotation       ::= "(" type_expression ")"
 ```
 
+#### Examples
+
+```runa
+Note: Variable declarations (mutable)
+Let count be 0
+Let name be "Alice"
+Let user be User()
+
+Note: Constant declarations (immutable)
+Constant PI as Float is 3.14159
+Constant MAX_SIZE as Integer is 1000
+Constant APP_NAME as String is "MyApplication"
+
+Note: Variable assignment (mutation)
+Set count to count plus 1
+Set user.name to "Bob"
+```
+
+### Object Creation and Constructors
+
+Runa provides an explicit and unambiguous syntax for object creation that clearly distinguishes constructors from other expressions.
+
+#### Constructor Syntax
+
+```ebnf
+constructor_expression ::= "a" "value" "of" "type" type_identifier constructor_fields?
+                         | "of" "type" type_identifier constructor_fields?  // Shortened form
+
+constructor_fields     ::= "with" field_initializers
+
+field_initializers     ::= field_initializer ("and" field_initializer)*
+                         | field_initializer ("," field_initializer)*
+
+field_initializer      ::= identifier "as" expression
+```
+
+#### Rationale
+
+The `a value of type` pattern provides complete disambiguation between:
+- Object construction (creating new instances)
+- Function calls (invoking processes)
+- Simple variable assignments
+- Expression evaluations
+
+This syntax is:
+1. **Completely unambiguous**: The parser immediately recognizes the pattern
+2. **Self-documenting**: Reads as natural English
+3. **AI-friendly**: Easy for language models to generate and parse
+4. **Philosophically aligned**: Prioritizes clarity over brevity
+
+#### Examples
+
+```runa
+Note: Default constructor (no field initialization)
+Let args be a value of type CommandLineArgs
+
+Note: Constructor with field initialization
+Let point be a value of type Point with x as 10 and y as 20
+
+Note: Complex type construction
+Let user be a value of type User with
+    name as "Alice",
+    age as 30,
+    email as "alice@example.com"
+
+Note: Shortened form (optional)
+Let config be of type Configuration with debug as true
+
+Note: Contrast with function calls
+Let result be calculate with radius as 5        Note: Function call
+Let circle be a value of type Circle with radius as 5  Note: Constructor
+```
+
+#### Type Resolution
+
+When the compiler encounters `a value of type TypeName`, it:
+1. Verifies that `TypeName` is a valid type in scope
+2. Generates or calls the appropriate constructor function
+3. Allocates memory for the new instance
+4. Initializes fields (if provided) or sets defaults
+5. Returns a reference to the newly created instance
+
+#### Default Field Values
+
+If fields are not specified in the constructor:
+- Numeric types default to 0
+- Boolean types default to false  
+- String types default to ""
+- Reference types default to null/None
+- Collections default to empty
+
+```runa
+Note: These are equivalent
+Let config1 be a value of type Config
+Let config2 be a value of type Config with
+    debug as false,
+    verbosity as 0,
+    output_file as ""
+```
+
+### Imperative Statement Patterns
+
+Runa supports natural language imperative statements for common operations:
+
+#### Compound Assignment Statements
+
+These statements modify variables in place using natural English:
+
+```ebnf
+increase_statement    ::= "Increase" encased_identifier "by" expression
+decrease_statement    ::= "Decrease" encased_identifier "by" expression
+multiply_statement    ::= "Multiply" encased_identifier "by" expression
+divide_statement      ::= "Divide" encased_identifier "by" expression
+```
+
+**Examples:**
+```runa
+Note: Imperative compound assignments
+Increase count by 1
+Decrease health points by damage
+Multiply price by discount factor
+Divide total cost by number of items
+
+Note: These are equivalent to:
+Set count to count gets increased by 1
+Set health points to health points gets decreased by damage
+Set price to price gets multiplied by discount factor
+Set total cost to total cost gets divided by number of items
+```
+
 ### Control Structures
 
 ```ebnf
 if_statement          ::= "If" expression ":" block 
                          ("Otherwise" "if" expression ":" block)*
-                         ("Otherwise" ":" block)?
+                         ("Otherwise" ":" block)? "End" "If"
 
-unless_statement      ::= "Unless" expression ":" block
+unless_statement      ::= "Unless" expression ":" block "End" "Unless"
 
-when_statement        ::= "When" expression ":" block
+when_statement        ::= "When" expression ":" block "End" "When"
 
-match_statement       ::= "Match" expression ":" INDENT match_cases DEDENT
+match_statement       ::= "Match" expression ":" INDENT match_cases DEDENT "End" "Match"
 
 match_cases           ::= match_case+
 match_case            ::= "When" pattern guard? ":" block
 guard                 ::= "where" expression
 
 for_loop              ::= for_each_loop | for_range_loop
-for_each_loop         ::= "For" "each" identifier "in" expression ":" block
+for_each_loop         ::= "For" "each" identifier "in" expression ":" block "End" "For"
 for_range_loop        ::= "For" identifier "from" expression "to" expression 
-                         ("by" expression)? ":" block
+                         ("by" expression)? ":" block "End" "For"
 
-while_loop            ::= "While" expression ":" block
-do_while_loop         ::= "Do" ":" block "While" expression
-repeat_loop           ::= "Repeat" expression "times" ":" block
-infinite_loop         ::= "Loop" "forever" ":" block
+while_loop            ::= "While" expression ":" block "End" "While"
+do_while_loop         ::= "Do" ":" block "While" expression "End" "Do"
+repeat_loop           ::= "Repeat" expression "times" ":" block "End" "Repeat"
+infinite_loop         ::= "Loop" "forever" ":" block "End" "Loop"
 ```
 
 ### Function Definitions
@@ -208,7 +423,7 @@ infinite_loop         ::= "Loop" "forever" ":" block
 function_definition   ::= "Async"? "Process" "called" string_literal
                          ("that" "takes" parameter_list)?
                          ("returns" type_expression)?
-                         ":" block
+                         ":" block "End" "Process"
 
 parameter_list        ::= parameter (("and" | ",") parameter)*
 parameter             ::= identifier ("as" type_expression)? ("defaults" "to" expression)?
@@ -224,9 +439,9 @@ generic_params        ::= "[" identifier ("," identifier)* "]"
 type_body             ::= record_definition | adt_definition | type_alias
 
 record_definition     ::= "Dictionary" "with" inheritance_clause? protocol_conformance_clause? ":"
-                         INDENT (field_declaration | method_definition | static_member_definition)+ DEDENT
+                         INDENT (field_declaration | method_definition | static_member_definition)+ DEDENT "End" "Type"
 
-adt_definition        ::= ":" INDENT ("|" adt_variant)+ DEDENT
+adt_definition        ::= ":" INDENT ("|" adt_variant)+ DEDENT "End" "Type"
 adt_variant           ::= identifier ("with" variant_fields)? NEWLINE
 
 type_alias            ::= type_expression
@@ -263,7 +478,7 @@ as_pattern            ::= pattern "as" identifier
 ```ebnf
 expression            ::= ternary_expression
 
-ternary_expression    ::= or_expression ("if" or_expression "else" or_expression)?
+ternary_expression    ::= or_expression ("If" or_expression "Otherwise" or_expression)?
 
 or_expression         ::= and_expression ("or" and_expression)*
 
@@ -274,7 +489,7 @@ not_expression        ::= "not" not_expression | comparison_expression
 comparison_expression ::= additive_expression (comparison_op additive_expression)*
 
 comparison_op         ::= "equals"
-                        | "is" "equal" "to"   Note: Deprecated; use "equals"
+                        | "is" "equal" "to"
                         | "does" "not" "equal"
                         | "is" "not" "equal" "to"
                         | "is" "greater" "than"
@@ -316,9 +531,13 @@ primary_expression    ::= literal
                         | sizeof_expression
 ```
 
-### Field and Method Access
+### Field and Method Access (Mode-Scoped)
 
-Runa supports both natural language and technical syntax for accessing fields and methods of objects, records, and types. This dual approach ensures accessibility for non-developers while providing efficiency for experienced programmers.
+Runa supports both natural language and technical syntax for accessing fields and methods. Usage is scoped by mode:
+
+- Canon: use natural phrases like "the name of user" and "the area of circle".
+- Developer: may use dot notation (e.g., `user.name`, `circle.area`) as a technical shorthand.
+- Viewer: displays natural phrases; dot notation is not shown.
 
 #### Field Access
 
@@ -330,7 +549,7 @@ Let width be the width of rectangle
 Let value be the value of counter
 ```
 
-**Technical Syntax (For Advanced/Backend Development):**
+**Developer Mode Technical Syntax:**
 ```runa
 Let radius be circle.radius
 Let name be user.name
@@ -356,9 +575,9 @@ Let result be process with self as value
 Let sum be add with a as a and b as b
 ```
 
-#### Collection Access
+#### Collection Access (Mode-Scoped)
 
-**Bracket/Natural Notation (For Dictionaries and Lists):**
+**Developer Mode Bracket Notation (Dictionaries and Lists):**
 ```runa
 Let value be my_dict["key"]
 Let item be my_list[0]
@@ -366,7 +585,7 @@ Let element be array at index 5
 Let value2 be my_dict at key "id"
 ```
 
-**Natural Language for Collections:**
+**Canon/Viewer Natural Language for Collections:**
 ```runa
 Let value be the value of my_dict at key
 Let item be the first item of my_list
@@ -394,6 +613,42 @@ Type called "Circle":
 2. **Advanced/Backend Development**: Use technical syntax for efficiency and familiarity
 3. **Documentation**: Always provide natural language examples first, with technical syntax as alternatives
 4. **Consistency**: Choose one style per project or module for consistency
+
+### Function Calls Without Parentheses
+
+Runa supports natural function invocation without parentheses in Canon mode. The lexer uses context to determine if an identifier is a function call:
+
+#### Context-Based Recognition
+
+When the lexer encounters an identifier that matches a known function name, it treats it as a function call:
+
+```runa
+Note: Zero-argument functions
+Let time be current timestamp      Note: Calls current_timestamp()
+Let area be calculate area         Note: Calls calculate_area()
+
+Note: Functions with arguments use "with" or "given"
+Let result be calculate area with radius
+Let sum be add numbers with first and second
+Let output be process data given input
+```
+
+#### Parentheses in Developer Mode
+
+Developer mode may use traditional parentheses:
+
+```runa
+Let time be current_timestamp()
+Let area be calculate_area(radius)
+Let sum be add_numbers(first, second)
+```
+
+#### Disambiguation Rules
+
+1. **Known Functions**: If identifier matches a function in scope, treat as call
+2. **With/Given Keywords**: Presence of "with" or "given" indicates function call with arguments
+3. **Parentheses**: Always indicates function call regardless of mode
+4. **Context**: Parser uses surrounding context to resolve ambiguity
 
 #### Examples by Audience
 
@@ -969,7 +1224,7 @@ Every Runa file is implicitly a module. Modules can export declarations and impo
 
 ```runa
 Note: geometry.runa
-Export Define constant PI as 3.14159
+Export Constant PI as Float is 3.14159
 
 Export Type called "Circle":
     radius as Float
@@ -985,20 +1240,25 @@ Process called "internal_helper":
 ### Import System
 
 ```ebnf
-import_statement      ::= "Import" "module" string_literal ("as" identifier)?
-                        | "Import" "{" import_list "}" "from" "module" string_literal
+import_statement      ::= "Import" "Module" string_literal "as" identifier
+                        | "Import" "{" import_list "}" "from" "Module" string_literal
+                        | "Import" import_list "from" identifier
 
 import_list           ::= identifier ("as" identifier)? ("," identifier ("as" identifier)?)*
 ```
 
 ```runa
-Note: Import entire module
-Import module "geometry"
-Let c be New geometry.Circle with radius as 10
+Note: Import entire module (canonical form)
+Import Module "geometry" as geometry
+Let c be New Circle from geometry with radius as 10
 
 Note: Import specific items
-Import { PI, Circle } from module "geometry"
+Import { PI, Circle } from Module "geometry"
 Let c2 be New Circle with radius as 5
+
+Note: Using member access operators
+Let area be area of circle
+Let pi_value be PI from Math
 ```
 
 ### Package Management and Versioning
@@ -2079,7 +2339,7 @@ Let uppercase be greeting converted to uppercase
 
 ### Operators
 
-Runa supports **dual syntax** for operators with **mathematical symbol enforcement** - mathematical symbols are restricted to mathematical contexts only.
+Within the triple-syntax system, operators have dual forms (natural and symbolic) with **mathematical symbol enforcement** — symbols are restricted to mathematical contexts only.
 
 #### Mathematical Symbol Enforcement
 
@@ -2112,8 +2372,9 @@ Both forms supported (symbols restricted to mathematical contexts):
 - `>` ↔ `is greater than` (mathematical comparison only)
 - `<=` ↔ `is less than or equal to` (mathematical comparison only)
 - `>=` ↔ `is greater than or equal to` (mathematical comparison only)
-- `!=` ↔ `does not equal` (mathematical comparison only)
+- `!=` ↔ `is not equal to` (mathematical comparison only)
 - `==` ↔ `is equal to` (mathematical comparison only)
+- `=` ↔ `equals` (assignment only)
 
 #### Equality Operators
 Runa provides a dual-syntax approach for equality that balances natural language readability with technical efficiency:
@@ -2148,10 +2409,106 @@ The `is` keyword is reserved exclusively for identity, type, and state checks. I
 
 **Important:** The `is` operator performs reference equality and type checking, not value equality. For value comparisons, use `is equal to` or `equals`.
 
+#### Compound Assignment Operators
+
+Runa provides natural language forms for compound assignments that modify variables in place:
+
+**Infix Forms (modify and return new value):**
+- `+=` ↔ `gets increased by` - Increases the variable by a value
+- `-=` ↔ `gets decreased by` - Decreases the variable by a value
+- `*=` ↔ `gets multiplied by` - Multiplies the variable by a value
+- `/=` ↔ `gets divided by` - Divides the variable by a value
+
+**Imperative Statement Forms (also available):**
+- `Increase <variable> by <value>` - Equivalent to variable += value
+- `Decrease <variable> by <value>` - Equivalent to variable -= value
+- `Multiply <variable> by <value>` - Equivalent to variable *= value
+- `Divide <variable> by <value>` - Equivalent to variable /= value
+
+Examples:
+```runa
+Note: Infix forms
+Set count to count gets increased by 1
+Set total to total gets multiplied by tax_rate
+
+Note: Imperative forms
+Increase count by 1
+Decrease health by damage
+Multiply price by discount_factor
+Divide total by num_items
+```
+
+#### Member Access Operators
+
+Runa provides two natural language forms for member access, both equivalent to the dot operator:
+
+- `.` ↔ `of` - Suggests possession or property
+- `.` ↔ `from` - Suggests source or origin
+
+Examples:
+```runa
+Note: Using 'of' for properties
+Let area be area of circle
+Let name be name of student
+
+Note: Using 'from' for module/namespace access
+Let pi be PI from Math
+Let list be List from collections
+
+Note: Symbol form in developer mode
+Let area be circle.area
+Let pi be Math.PI
+```
+
+#### Range Operators
+
+Runa provides natural language forms for creating ranges:
+
+- `..` ↔ `through` - Creates a range excluding the end value
+- `..=` ↔ `up to and including` - Creates a range including the end value
+
+Examples:
+```runa
+Note: Exclusive range (1, 2, 3, 4)
+For i in 1 through 5:
+    Display i
+End For
+
+Note: Inclusive range (1, 2, 3, 4, 5)
+For i in 1 up to and including 5:
+    Display i
+End For
+```
+
+#### Index Access Operator
+
+For array and dictionary indexing:
+
+- `[]` ↔ `at` - Accesses element at index or key
+
+Examples:
+```runa
+Note: Array indexing
+Let first be array at 0
+Let last be array at (length of array) minus 1
+
+Note: Dictionary access
+Let value be config at "setting"
+Let user be users at user_id
+
+Note: Symbol form in developer mode
+Let first be array[0]
+Let value be config["setting"]
+```
+
 #### Operator Type Classifications
 
 - **Mathematical**: `+`, `-`, `*`, `/`, `%`, `**`, `plus`, `minus`, `multiplied by`, `divided by`, `modulo`, `to the power of`
-- **Mathematical Comparison**: `<`, `>`, `<=`, `>=`, `!=`, `==`, `is greater than`, `is less than`, `is greater than or equal to`, `is less than or equal to`, `does not equal`, `is equal to`
+- **Mathematical Comparison**: `<`, `>`, `<=`, `>=`, `!=`, `==`, `is greater than`, `is less than`, `is greater than or equal to`, `is less than or equal to`, `is not equal to`, `is equal to`
+- **Compound Assignment**: `+=`, `-=`, `*=`, `/=`, `gets increased by`, `gets decreased by`, `gets multiplied by`, `gets divided by`
+- **Member Access**: `.`, `of`, `from`
+- **Range**: `..`, `..=`, `through`, `up to and including`
+- **Index Access**: `[]`, `at`
 - **Equality Comparison**: `is equal to`, `equals`, `contains`, `is in`
 - **Identity and Type**: `is of type`, `is None`, `is empty`, `is null`, `is valid`, `is ready`
 - **Bitwise**: `bitwise and`, `bitwise or`, `bitwise xor`, `bitwise not`, `shifted left by`, `shifted right by`
@@ -2192,7 +2549,9 @@ Note: Formatter conversion rules
 / → divided by
 <= → is less than or equal to
 >= → is greater than or equal to
-!= → does not equal
+!= → is not equal to
+== → is equal to
+= → equals
 ```
 
 ### I/O Operations
@@ -2224,15 +2583,19 @@ Let tomorrow be current_time plus 1 day
 
 ## Runtime Environment
 
-### Execution Model
+### Execution Model (AOTT - All-of-The-Time)
 
-Runa supports multiple execution models depending on the target platform:
+Runa uses the AOTT execution architecture as the single execution model. Transpilation or compilation are implementation strategies, whereas execution semantics are defined by AOTT’s tiered system:
 
-1. **Transpilation Mode**: Runa source → Target Language → Native execution
-2. **Bytecode Mode**: Runa source → Runa Bytecode → Virtual Machine execution
-3. **Hybrid Mode**: Critical paths compiled, dynamic features interpreted
+1. Tier 0: Lightning Interpreter (fast startup, profiling hooks)
+2. Tier 1: Smart Bytecode Execution (inline caching, basic optimizations)
+3. Tier 2: Basic Native Execution (LLVM-based, code caching)
+4. Tier 3: Optimized Native Execution (aggressive optimizations)
+5. Tier 4: Speculative Execution (validated speculation with deoptimization)
 
-### Runa Virtual Machine (RunaVM)
+See `docs/plans/RUNA_AOTT_ARCHITECTURE_PLAN.md` for authoritative architecture details.
+
+### Bytecode and Engines in AOTT
 
 #### Bytecode Format Specification
 
@@ -2508,7 +2871,7 @@ Incremental Compilation:
 - Hot reloading in development mode
 ```
 
-#### Runtime Performance
+#### Runtime Performance (AOTT)
 
 ```
 Execution Performance Targets:
@@ -2518,12 +2881,12 @@ Execution Performance Targets:
 - Function Call Overhead: < 5ns for direct calls
 - Message Passing: < 100ns per message
 
-Optimization Techniques:
-- Just-in-time compilation for hot code paths
-- Profile-guided optimization
+Optimization Characteristics under AOTT:
+- Tier promotion based on profiles
 - Devirtualization of polymorphic calls
 - Dead code elimination
 - Constant folding and propagation
+- Speculative optimization with guard validation and deoptimization
 ```
 
 ---
@@ -3024,19 +3387,19 @@ Pop with heap as h and set as first
 ## Future Expansion
 - As the language matures, additional idioms may be added. All new idioms will be documented with grammar, examples, and style guidelines.
 
-## Bracket Indexing
+## Bracket Indexing (Mode-Scoped)
 
-Runa supports bracket indexing for lists, dictionaries, and other indexable types. Bracket indexing is equivalent to calling the appropriate process (e.g., get_at_index, get_value).
+Developer mode supports bracket indexing for lists, dictionaries, and other indexable types. In Canon and Viewer, prefer natural forms like "at index" and "at key". Bracket indexing is equivalent to calling the appropriate process (e.g., get_at_index, get_value).
 
-Examples:
+Examples (Developer mode):
 
     Let first be numbers[0]
     Let value be dict["key"]
     Let char be text[5]
 
-Bracket indexing is concise and idiomatic for programmatic code. For natural language or AI-generated code, process calls or context blocks may be preferred.
+Bracket indexing is concise and idiomatic for programmatic code in Developer mode. For Canon or AI-focused readability, prefer process calls or natural language.
 
-Note: Runa supports both natural language syntax (e.g., "the name of user") and dot notation (e.g., user.name) for field access. Natural language is recommended for basic/intermediate examples, while dot notation is preferred for advanced/backend development.
+Note: Mode guidance — Canon uses natural syntax; Developer may use dot notation; Viewer displays natural descriptions.
 
 ## Context Management Protocol (Standard Library)
 

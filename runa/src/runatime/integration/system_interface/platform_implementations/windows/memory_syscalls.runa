@@ -1,0 +1,743 @@
+Note:
+runa/src/runatime/integration/system_interface/platform_syscalls/windows/memory_syscalls.runa
+Windows POSIX Memory Management Syscalls Compatibility Layer
+
+This module provides POSIX-compatible memory management syscall implementations for Windows,
+mapping POSIX memory operations to equivalent Windows NT API calls.
+
+Key compatibility features:
+- POSIX mmap/munmap → Windows VirtualAlloc/VirtualFree and file mapping
+- POSIX mprotect → Windows VirtualProtect
+- POSIX mlock/munlock → Windows VirtualLock/VirtualUnlock
+- POSIX madvise → Windows memory advice (where supported)
+- POSIX brk/sbrk → Windows heap management
+- POSIX memory allocation → Windows virtual memory
+- POSIX shared memory → Windows memory sections
+- POSIX memory barriers → Windows memory barriers
+- POSIX page size queries → Windows system info
+:End Note
+
+Import module "syscalls/platforms/windows_x64" as WindowsPlatform
+Import module "syscalls/core/platform_interface" as PlatformInterface
+Import module "compiler/frontend/primitives/core/integer_primitive" as Integer
+Import module "compiler/frontend/primitives/memory/references" as Memory
+Import module "compiler/frontend/primitives/types/conversion" as Convert
+
+@Reasoning
+Windows memory management differs significantly from POSIX in allocation
+mechanisms, protection flags, and memory mapping semantics. This layer
+provides POSIX-compatible interfaces while using Windows NT memory APIs.
+@End Reasoning
+
+Note: =====================================================================
+Note: POSIX MEMORY MAPPING
+Note: =====================================================================
+
+Process called "sys_mmap" that takes addr as Integer, length as Integer, prot as Integer, flags as Integer, fd as Integer, offset as Integer returns Integer:
+    Note: Map memory with POSIX semantics
+    Note: Maps to Windows VirtualAlloc or memory section mapping
+    Note: Returns mapped address on success, MAP_FAILED (-1) on error
+    
+    @Implementation
+    POSIX mmap is implemented using Windows VirtualAlloc for anonymous mappings
+    or NtMapViewOfSection for file-backed mappings. Protection flags are
+    converted from POSIX to Windows format.
+    @End Implementation
+    
+    Note: Convert POSIX protection flags to Windows protection
+    Let win_protect be 0x01  Note: PAGE_NOACCESS (default)
+    
+    If (prot and 0x01) not equals 0:  Note: PROT_READ
+        Set win_protect to 0x02  Note: PAGE_READONLY
+    End If
+    If (prot and 0x02) not equals 0:  Note: PROT_WRITE
+        If (prot and 0x01) not equals 0:
+            Set win_protect to 0x04  Note: PAGE_READWRITE
+        Otherwise:
+            Set win_protect to 0x04  Note: PAGE_READWRITE (Windows doesn't have write-only)
+        End If
+    End If
+    If (prot and 0x04) not equals 0:  Note: PROT_EXEC
+        Match win_protect:
+            When 0x02:  Note: PAGE_READONLY
+                Set win_protect to 0x20  Note: PAGE_EXECUTE_READ
+            When 0x04:  Note: PAGE_READWRITE
+                Set win_protect to 0x40  Note: PAGE_EXECUTE_READWRITE
+            Otherwise:
+                Set win_protect to 0x10  Note: PAGE_EXECUTE
+        End Match
+    End If
+    
+    Note: Handle different mapping types
+    Let is_anonymous be ((flags and 0x20) not equals 0)  Note: MAP_ANONYMOUS
+    Let is_fixed be ((flags and 0x10) not equals 0)      Note: MAP_FIXED
+    Let is_private be ((flags and 0x02) not equals 0)    Note: MAP_PRIVATE
+    
+    If is_anonymous:
+        Note: Anonymous mapping using VirtualAlloc
+        Let allocation_type be 0x3000  Note: MEM_COMMIT | MEM_RESERVE
+        Let base_address be addr
+        
+        If not is_fixed:
+            Set base_address to 0  Note: Let Windows choose address
+        End If
+        
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("NtAllocateVirtualMemory")
+        Let result be Integer
+        
+        Inline Assembly:
+            "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+            "mov rdx, %1\n"           Note: base address (in/out)
+            "mov r8, 0\n"             Note: zero bits
+            "mov r9, %2\n"            Note: region size (in/out)
+            "push %4\n"               Note: protection
+            "push %3\n"               Note: allocation type
+            "mov rax, %5\n"           Note: NtAllocateVirtualMemory syscall number
+            "syscall\n"
+            "add rsp, 16\n"           Note: clean up stack
+            "mov %0, rax\n"
+            : "=r" (result)
+            : "r" (base_address), "r" (length), "r" (allocation_type), "r" (win_protect), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let syscall_result be Convert.windows_status_to_posix(result)
+        
+        If syscall_result.is_error:
+            Return -1
+        Otherwise:
+            Return syscall_result.value
+        End If
+    Otherwise:
+        Note: File-backed mapping using memory sections
+        If fd is less than 0:
+            Return -1  Note: Invalid file descriptor
+        End If
+        
+        Note: Create section from file
+        Let section_handle as Integer
+        Let max_size_high be 0
+        Let max_size_low be (offset + length)
+        
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("NtCreateSection")
+        Let result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: section handle (output)
+            "mov rdx, 0x10000000\n"   Note: SECTION_ALL_ACCESS
+            "mov r8, 0\n"             Note: object attributes
+            "mov r9, %2\n"            Note: maximum size
+            "push %4\n"               Note: section page protection
+            "push 0x8000000\n"        Note: SEC_COMMIT
+            "push %3\n"               Note: file handle
+            "mov rax, %5\n"           Note: NtCreateSection syscall number
+            "syscall\n"
+            "add rsp, 24\n"           Note: clean up stack
+            "mov %0, rax\n"
+            : "=r" (result)
+            : "r" (section_handle), "r" (max_size_low), "r" (fd), "r" (win_protect), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let section_result be Convert.windows_status_to_posix(result)
+        
+        If section_result.is_error:
+            Return -1
+        End If
+        
+        Set section_handle to section_result.value
+        
+        Note: Map view of section
+        Let base_address be addr
+        If not is_fixed:
+            Set base_address to 0
+        End If
+        
+        Let zero_bits be 0
+        Let commit_size be 0
+        Let section_offset be offset
+        Let view_size be length
+        Let inherit_disposition be 1  Note: ViewShare (for MAP_SHARED)
+        
+        If is_private:
+            Set inherit_disposition to 2  Note: ViewUnmap (copy-on-write)
+        End If
+        
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("NtMapViewOfSection")
+        Let result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: section handle
+            "mov rdx, 0xFFFFFFFF\n"   Note: current process handle
+            "mov r8, %2\n"            Note: base address (in/out)
+            "mov r9, %3\n"            Note: zero bits
+            "push %6\n"               Note: inherit disposition
+            "push %5\n"               Note: commit size (in/out)
+            "push %4\n"               Note: section offset (in/out)
+            "push %7\n"               Note: view size (in/out)
+            "mov rax, %8\n"           Note: NtMapViewOfSection syscall number
+            "syscall\n"
+            "add rsp, 32\n"           Note: clean up stack
+            "mov %0, rax\n"
+            : "=r" (result)
+            : "r" (section_handle), "r" (base_address), "r" (zero_bits), "r" (section_offset), "r" (commit_size), "r" (inherit_disposition), "r" (view_size), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let map_result be Convert.windows_status_to_posix(result)
+        
+        Note: Close section handle (no longer needed)
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("NtClose")
+        Let result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (result)
+            : "r" (section_handle), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let close_result be Convert.windows_status_to_posix(result)
+        
+        If map_result.is_error:
+            Return -1
+        Otherwise:
+            Return map_result.value
+        End If
+    End If
+
+Process called "sys_munmap" that takes addr as Integer, length as Integer returns Integer:
+    Note: Unmap memory region
+    Note: Maps to Windows VirtualFree or NtUnmapViewOfSection
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Memory unmapping uses Windows VirtualFree for anonymous mappings
+    or NtUnmapViewOfSection for file-backed mappings.
+    @End Implementation
+    
+    Note: Try section unmapping first (for file-backed mappings)
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtUnmapViewOfSection")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: base address
+        "mov rax, %2\n"           Note: NtUnmapViewOfSection syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (addr), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let unmap_result be Convert.windows_status_to_posix(result)
+    
+    If not unmap_result.is_error:
+        Return 0
+    End If
+    
+    Note: Try VirtualFree for anonymous mappings
+    Let free_type be 0x8000  Note: MEM_RELEASE
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtFreeVirtualMemory")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: base address (in/out)
+        "mov r8, %2\n"            Note: region size (in/out)
+        "mov r9, %3\n"            Note: free type
+        "mov rax, %4\n"           Note: NtFreeVirtualMemory syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (addr), "r" (length), "r" (free_type), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let free_result be Convert.windows_status_to_posix(result)
+    
+    If free_result.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Note: =====================================================================
+Note: POSIX MEMORY PROTECTION
+Note: =====================================================================
+
+Process called "sys_mprotect" that takes addr as Integer, len as Integer, prot as Integer returns Integer:
+    Note: Change memory protection
+    Note: Maps to Windows VirtualProtect
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Memory protection changes use Windows VirtualProtect with
+    converted protection flags from POSIX to Windows format.
+    @End Implementation
+    
+    Note: Convert POSIX protection to Windows protection
+    Let new_protect be 0x01  Note: PAGE_NOACCESS
+    
+    If (prot and 0x01) not equals 0:  Note: PROT_READ
+        Set new_protect to 0x02  Note: PAGE_READONLY
+    End If
+    If (prot and 0x02) not equals 0:  Note: PROT_WRITE
+        If (prot and 0x01) not equals 0:
+            Set new_protect to 0x04  Note: PAGE_READWRITE
+        Otherwise:
+            Set new_protect to 0x04  Note: Windows requires read for write
+        End If
+    End If
+    If (prot and 0x04) not equals 0:  Note: PROT_EXEC
+        Match new_protect:
+            When 0x02:
+                Set new_protect to 0x20  Note: PAGE_EXECUTE_READ
+            When 0x04:
+                Set new_protect to 0x40  Note: PAGE_EXECUTE_READWRITE
+            Otherwise:
+                Set new_protect to 0x10  Note: PAGE_EXECUTE
+        End Match
+    End If
+    
+    Let old_protect be Integer.allocate(4)
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtProtectVirtualMemory")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: base address (in/out)
+        "mov r8, %2\n"            Note: region size (in/out)
+        "mov r9, %3\n"            Note: new protection
+        "push %4\n"               Note: old protection (output)
+        "mov rax, %5\n"           Note: NtProtectVirtualMemory syscall number
+        "syscall\n"
+        "add rsp, 8\n"            Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (addr), "r" (len), "r" (new_protect), "r" (old_protect), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_result be Convert.windows_status_to_posix(result)
+    
+    If syscall_result.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Note: =====================================================================
+Note: POSIX MEMORY LOCKING
+Note: =====================================================================
+
+Process called "sys_mlock" that takes addr as Integer, len as Integer returns Integer:
+    Note: Lock memory pages in RAM
+    Note: Maps to Windows VirtualLock
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Memory locking prevents pages from being paged to disk.
+    Windows VirtualLock provides equivalent functionality.
+    @End Implementation
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtLockVirtualMemory")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: base address (in/out)
+        "mov r8, %2\n"            Note: region size (in/out)
+        "mov r9, 1\n"             Note: lock operation
+        "mov rax, %3\n"           Note: NtLockVirtualMemory syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (addr), "r" (len), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_result be Convert.windows_status_to_posix(result)
+    
+    If syscall_result.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Process called "sys_munlock" that takes addr as Integer, len as Integer returns Integer:
+    Note: Unlock memory pages
+    Note: Maps to Windows VirtualUnlock
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Unlocks previously locked memory pages, allowing them to be paged.
+    @End Implementation
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtUnlockVirtualMemory")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: base address (in/out)
+        "mov r8, %2\n"            Note: region size (in/out)
+        "mov r9, 1\n"             Note: unlock operation
+        "mov rax, %3\n"           Note: NtUnlockVirtualMemory syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (addr), "r" (len), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_result be Convert.windows_status_to_posix(result)
+    
+    If syscall_result.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Process called "sys_mlockall" that takes flags as Integer returns Integer:
+    Note: Lock all pages in memory
+    Note: Maps to Windows SetProcessWorkingSetSize
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Locking all process pages is approximated using Windows working set
+    management to encourage keeping all pages in memory.
+    @End Implementation
+    
+    Note: Set working set to maximum to keep pages in memory
+    Let min_size be 0xFFFFFFFF  Note: Use current size as minimum
+    Let max_size be 0xFFFFFFFF  Note: Use current size as maximum
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtSetInformationProcess")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, 0x17\n"         Note: ProcessWorkingSetInformation
+        "mov r8, %1\n"            Note: process information
+        "mov r9, 16\n"            Note: process information length
+        "mov rax, %2\n"           Note: NtSetInformationProcess syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (min_size), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_result be Convert.windows_status_to_posix(result)
+    
+    If syscall_result.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Process called "sys_munlockall" that returns Integer:
+    Note: Unlock all pages
+    Note: Maps to Windows SetProcessWorkingSetSize reset
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Reset working set limits to allow normal paging behavior.
+    @End Implementation
+    
+    Note: Reset working set to default behavior
+    Let min_size be 0xFFFFFFFF  Note: Let system determine
+    Let max_size be 0xFFFFFFFF  Note: Let system determine
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtSetInformationProcess")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, 0x17\n"         Note: ProcessWorkingSetInformation
+        "mov r8, %1\n"            Note: process information
+        "mov r9, 16\n"            Note: process information length
+        "mov rax, %2\n"           Note: NtSetInformationProcess syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (min_size), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_result be Convert.windows_status_to_posix(result)
+    
+    If syscall_result.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Note: =====================================================================
+Note: POSIX MEMORY ADVICE
+Note: =====================================================================
+
+Process called "sys_madvise" that takes addr as Integer, length as Integer, advice as Integer returns Integer:
+    Note: Give memory usage advice
+    Note: Maps to Windows memory management hints where possible
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Memory advice is partially supported through Windows mechanisms.
+    Some POSIX advice types have no Windows equivalent and are ignored.
+    @End Implementation
+    
+    Match advice:
+        When 0:  Note: MADV_NORMAL
+            Note: No specific action needed
+            Return 0
+        When 1:  Note: MADV_RANDOM
+            Note: Could use PrefetchVirtualMemory with random pattern (Windows 8+)
+            Return 0
+        When 2:  Note: MADV_SEQUENTIAL
+            Note: Could use PrefetchVirtualMemory with sequential pattern
+            Return 0
+        When 3:  Note: MADV_WILLNEED
+            Note: Touch pages to bring into memory
+            For page_offset from 0 to (length - 1) step 4096:
+                Let page_addr be (addr + page_offset)
+                Note: Touch page by reading first byte
+                Let page_byte be Integer.read_memory(page_addr)
+            End For
+            Return 0
+        When 4:  Note: MADV_DONTNEED
+            Note: Use VirtualAlloc with MEM_RESET to discard content
+            Let platform be PlatformInterface.get_current_platform()
+            Let syscall_num be platform.get_syscall_number("NtAllocateVirtualMemory")
+            Let result be Integer
+            
+            Inline Assembly:
+                "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+                "mov rdx, %1\n"           Note: base address (in/out)
+                "mov r8, 0\n"             Note: zero bits
+                "mov r9, %2\n"            Note: region size (in/out)
+                "push 0x04\n"             Note: PAGE_READWRITE protection
+                "push 0x80000\n"          Note: MEM_RESET allocation type
+                "mov rax, %3\n"           Note: NtAllocateVirtualMemory syscall number
+                "syscall\n"
+                "add rsp, 16\n"           Note: clean up stack
+                "mov %0, rax\n"
+                : "=r" (result)
+                : "r" (addr), "r" (length), "r" (syscall_num)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let reset_result be Convert.windows_status_to_posix(result)
+            If reset_result.is_error:
+                Return -1
+            Otherwise:
+                Return 0
+            End If
+        When 8:  Note: MADV_FREE
+            Note: Similar to DONTNEED on Windows
+            Let platform be PlatformInterface.get_current_platform()
+            Let syscall_num be platform.get_syscall_number("NtAllocateVirtualMemory")
+            Let result be Integer
+            
+            Inline Assembly:
+                "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+                "mov rdx, %1\n"           Note: base address (in/out)
+                "mov r8, 0\n"             Note: zero bits
+                "mov r9, %2\n"            Note: region size (in/out)
+                "push 0x04\n"             Note: PAGE_READWRITE protection
+                "push 0x80000\n"          Note: MEM_RESET allocation type
+                "mov rax, %3\n"           Note: NtAllocateVirtualMemory syscall number
+                "syscall\n"
+                "add rsp, 16\n"           Note: clean up stack
+                "mov %0, rax\n"
+                : "=r" (result)
+                : "r" (addr), "r" (length), "r" (syscall_num)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let reset_result be Convert.windows_status_to_posix(result)
+            If reset_result.is_error:
+                Return -1
+            Otherwise:
+                Return 0
+            End If
+        Otherwise:
+            Note: Unsupported advice, return success but do nothing
+            Return 0
+    End Match
+
+Note: =====================================================================
+Note: POSIX HEAP MANAGEMENT
+Note: =====================================================================
+
+Process called "sys_brk" that takes addr as Integer returns Integer:
+    Note: Change program break (heap end)
+    Note: Maps to Windows heap management
+    Note: Returns new break on success, -1 on error
+    
+    @Implementation
+    POSIX brk is emulated using a simulated heap with Windows virtual memory.
+    A global heap break pointer is maintained for compatibility.
+    @End Implementation
+    
+    Note: Get current heap break (stored in a global variable)
+    Let current_break be Integer.get_global_heap_break()
+    
+    If addr equals 0:
+        Note: Query current break
+        Return current_break
+    End If
+    
+    If addr is greater than current_break:
+        Note: Expand heap
+        Let expand_size be (addr - current_break)
+        Let allocation_type be 0x3000  Note: MEM_COMMIT | MEM_RESERVE
+        
+        Let platform be PlatformInterface.get_current_platform()
+        Let syscall_num be platform.get_syscall_number("NtAllocateVirtualMemory")
+        Let result be Integer
+        
+        Inline Assembly:
+            "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+            "mov rdx, %1\n"           Note: base address (in/out)
+            "mov r8, 0\n"             Note: zero bits
+            "mov r9, %2\n"            Note: region size (in/out)
+            "push 0x04\n"             Note: PAGE_READWRITE protection
+            "push %3\n"               Note: allocation type
+            "mov rax, %4\n"           Note: NtAllocateVirtualMemory syscall number
+            "syscall\n"
+            "add rsp, 16\n"           Note: clean up stack
+            "mov %0, rax\n"
+            : "=r" (result)
+            : "r" (current_break), "r" (expand_size), "r" (allocation_type), "r" (syscall_num)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let expand_result be Convert.windows_status_to_posix(result)
+        
+        If expand_result.is_error:
+            Return -1
+        End If
+        
+        Integer.set_global_heap_break(addr)
+        Return addr
+    Otherwise:
+        If addr is less than current_break:
+            Note: Shrink heap
+            Let shrink_size be (current_break - addr)
+            Let free_type be 0x4000  Note: MEM_DECOMMIT
+            
+            Let platform be PlatformInterface.get_current_platform()
+            Let syscall_num be platform.get_syscall_number("NtFreeVirtualMemory")
+            Let result be Integer
+            
+            Inline Assembly:
+                "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+                "mov rdx, %1\n"           Note: base address (in/out)
+                "mov r8, %2\n"            Note: region size (in/out)
+                "mov r9, %3\n"            Note: free type
+                "mov rax, %4\n"           Note: NtFreeVirtualMemory syscall number
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r" (result)
+                : "r" (addr), "r" (shrink_size), "r" (free_type), "r" (syscall_num)
+                : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+            End Assembly
+            
+            Let shrink_result be Convert.windows_status_to_posix(result)
+            
+            If shrink_result.is_error:
+                Return -1
+            End If
+            
+            Integer.set_global_heap_break(addr)
+            Return addr
+        Otherwise:
+            Note: No change needed
+            Return addr
+        End If
+    End If
+
+Process called "sys_sbrk" that takes increment as Integer returns Integer:
+    Note: Increment program break
+    Note: Maps to Windows heap management via brk
+    Note: Returns old break on success, -1 on error
+    
+    @Implementation
+    POSIX sbrk is implemented in terms of brk by getting current
+    break and setting new break based on increment.
+    @End Implementation
+    
+    Let current_break be sys_brk(0)
+    If current_break equals -1:
+        Return -1
+    End If
+    
+    If increment equals 0:
+        Return current_break
+    End If
+    
+    Let new_break be (current_break + increment)
+    Let result be sys_brk(new_break)
+    
+    If result equals -1:
+        Return -1
+    Otherwise:
+        Return current_break  Note: Return old break value
+    End If
+
+Note: =====================================================================
+Note: POSIX MEMORY INFORMATION
+Note: =====================================================================
+
+Process called "sys_getpagesize" that returns Integer:
+    Note: Get system page size
+    Note: Maps to Windows GetSystemInfo
+    Note: Returns page size in bytes
+    
+    @Implementation
+    Page size is queried from Windows system information structure.
+    @End Implementation
+    
+    Let system_info be Integer.allocate(48)  Note: SYSTEM_INFO structure size
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtQuerySystemInformation")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0\n"            Note: SystemBasicInformation
+        "mov rdx, %1\n"           Note: system information buffer
+        "mov r8, 48\n"            Note: system information length
+        "mov r9, 0\n"             Note: return length (optional)
+        "mov rax, %2\n"           Note: NtQuerySystemInformation syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (system_info), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_result be Convert.windows_status_to_posix(result)
+    
+    If syscall_result.is_error:
+        Return 4096  Note: Default page size if query fails
+    Otherwise:
+        Let page_size be Integer.read_memory(system_info + 4)  Note: dwPageSize field
+        Return page_size
+    End If

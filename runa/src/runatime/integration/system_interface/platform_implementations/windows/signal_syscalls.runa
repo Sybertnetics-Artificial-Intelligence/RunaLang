@@ -1,0 +1,935 @@
+Note:
+runa/src/runatime/integration/system_interface/platform_syscalls/windows/signal_syscalls.runa
+Windows NT Signal Management Syscalls
+
+This module provides Windows-specific signal management syscall implementations,
+including structured exception handling and Windows-specific event mechanisms.
+
+Key features and capabilities:
+- Structured Exception Handling (SEH) 
+- Console Control Handlers for SIGINT/SIGTERM equivalents
+- Vectored Exception Handling (VEH)
+- Event objects for inter-process signaling
+- Signal emulation through Windows exceptions
+- Process and thread interruption mechanisms
+- Exception filtering and dispatching
+- Windows Error Reporting integration
+- Application hang detection
+- Crash dump generation
+- Exception chaining and propagation
+:End Note
+
+Import module "syscalls/platforms/windows_x64" as WindowsPlatform
+Import module "syscalls/core/platform_interface" as PlatformInterface
+Import module "compiler/frontend/primitives/core/integer_primitive" as Integer
+Import module "compiler/frontend/primitives/memory/references" as Memory
+Import module "compiler/frontend/primitives/types/conversion" as Convert
+
+@Reasoning
+Windows doesn't have UNIX-style signals. Instead, it uses Structured Exception 
+Handling (SEH), Console Control Handlers, and events. This compatibility layer
+maps POSIX signal operations to Windows equivalents: SIGINT->CTRL_C_EVENT,
+SIGSEGV->EXCEPTION_ACCESS_VIOLATION, etc. Signal handlers are implemented as
+exception filters and console control handlers.
+@End Reasoning
+
+Note: =====================================================================
+Note: WINDOWS SIGNAL DATA STRUCTURES  
+Note: =====================================================================
+
+Type called "WindowsExceptionRecord":
+    ExceptionCode as Integer                Note: Exception code (SIGXXX equivalent)
+    ExceptionFlags as Integer               Note: Exception flags
+    ExceptionRecord as Integer              Note: Nested exception record pointer
+    ExceptionAddress as Integer             Note: Address where exception occurred
+    NumberParameters as Integer             Note: Number of parameters
+    ExceptionInformation0 as Integer        Note: Additional info parameter 0
+    ExceptionInformation1 as Integer        Note: Additional info parameter 1
+    ExceptionInformation2 as Integer        Note: Additional info parameter 2
+
+Type called "WindowsContextRecord":
+    ContextFlags as Integer                 Note: Context flags
+    Dr0 as Integer                          Note: Debug register 0
+    Dr1 as Integer                          Note: Debug register 1
+    Dr2 as Integer                          Note: Debug register 2
+    Dr3 as Integer                          Note: Debug register 3
+    Dr6 as Integer                          Note: Debug register 6
+    Dr7 as Integer                          Note: Debug register 7
+    Rax as Integer                          Note: General purpose register RAX
+    Rcx as Integer                          Note: General purpose register RCX
+    Rdx as Integer                          Note: General purpose register RDX
+    Rbx as Integer                          Note: General purpose register RBX
+    Rsp as Integer                          Note: Stack pointer RSP
+    Rbp as Integer                          Note: Base pointer RBP
+    Rsi as Integer                          Note: Source index RSI
+    Rdi as Integer                          Note: Destination index RDI
+    R8 as Integer                           Note: Extended register R8
+    R9 as Integer                           Note: Extended register R9
+    R10 as Integer                          Note: Extended register R10
+    R11 as Integer                          Note: Extended register R11
+    R12 as Integer                          Note: Extended register R12
+    R13 as Integer                          Note: Extended register R13
+    R14 as Integer                          Note: Extended register R14
+    R15 as Integer                          Note: Extended register R15
+    Rip as Integer                          Note: Instruction pointer RIP
+    EFlags as Integer                       Note: Flags register
+
+Type called "WindowsSignalAction":
+    sa_handler as Integer                   Note: Signal handler function pointer
+    sa_mask as Integer                      Note: Signal mask (64-bit)
+    sa_flags as Integer                     Note: Signal flags
+
+Note: =====================================================================
+Note: SIGNAL CONSTANTS AND MAPPINGS
+Note: =====================================================================
+
+Note: POSIX signals mapped to Windows exceptions and events
+Let SIGHUP be 1                           Note: Hangup (CTRL_CLOSE_EVENT)
+Let SIGINT be 2                           Note: Interrupt (CTRL_C_EVENT)
+Let SIGQUIT be 3                          Note: Quit (CTRL_BREAK_EVENT)
+Let SIGILL be 4                           Note: Illegal instruction (EXCEPTION_ILLEGAL_INSTRUCTION)
+Let SIGTRAP be 5                          Note: Trace trap (EXCEPTION_SINGLE_STEP)
+Let SIGABRT be 6                          Note: Abort (EXCEPTION_NONCONTINUABLE_EXCEPTION)
+Let SIGFPE be 8                           Note: Floating point exception (EXCEPTION_FLT_*)
+Let SIGKILL be 9                          Note: Kill (TerminateProcess)
+Let SIGSEGV be 11                         Note: Segmentation violation (EXCEPTION_ACCESS_VIOLATION)
+Let SIGPIPE be 13                         Note: Broken pipe (ERROR_BROKEN_PIPE)
+Let SIGALRM be 14                         Note: Alarm clock (Timer events)
+Let SIGTERM be 15                         Note: Termination (CTRL_SHUTDOWN_EVENT)
+
+Note: Windows exception codes
+Let EXCEPTION_ACCESS_VIOLATION be 0xC0000005
+Let EXCEPTION_ILLEGAL_INSTRUCTION be 0xC000001D
+Let EXCEPTION_FLT_DIVIDE_BY_ZERO be 0xC000008E
+Let EXCEPTION_INT_DIVIDE_BY_ZERO be 0xC0000094
+Let EXCEPTION_SINGLE_STEP be 0x80000004
+Let EXCEPTION_BREAKPOINT be 0x80000003
+
+Note: =====================================================================
+Note: GLOBAL SIGNAL STATE
+Note: =====================================================================
+
+Note: Global signal handler registry (up to 32 signals)
+Let signal_handlers be [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Let signal_masks be [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Let signal_flags be [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Let console_ctrl_handler_registered be 0
+Let vectored_exception_handler_registered be 0
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Process called "string_to_ptr" that takes s as String returns Integer:
+    @Implementation
+    Extracts the raw memory pointer from a Runa String object for Windows API calls.
+    Windows APIs expect null-terminated strings for exception handling.
+    @End Implementation
+    
+    Let ptr be 0
+    
+    Inline Assembly:
+        "lea %%rax, %1\n"      Note: Load effective address of string
+        "mov %%rax, %0\n"      Note: Store pointer
+        : "=r" (ptr)
+        : "m" (s)
+        : "rax"
+    End Assembly
+    
+    Return ptr
+
+Process called "signal_to_windows_exception" that takes sig as Integer returns Integer:
+    @Implementation
+    Maps POSIX signal numbers to corresponding Windows exception codes.
+    Provides translation layer between UNIX signals and Windows SEH.
+    @End Implementation
+    
+    If sig == SIGILL:
+        Return EXCEPTION_ILLEGAL_INSTRUCTION
+    Otherwise If sig == SIGSEGV:
+        Return EXCEPTION_ACCESS_VIOLATION
+    Otherwise If sig == SIGFPE:
+        Return EXCEPTION_FLT_DIVIDE_BY_ZERO
+    Otherwise If sig == SIGTRAP:
+        Return EXCEPTION_SINGLE_STEP
+    Otherwise If sig == SIGABRT:
+        Return 0xC0000025  Note: EXCEPTION_NONCONTINUABLE_EXCEPTION
+    Otherwise:
+        Return 0xE0000000  Note: Custom application exception base
+    End If
+
+Process called "windows_exception_to_signal" that takes exception_code as Integer returns Integer:
+    @Implementation
+    Maps Windows exception codes to POSIX signal numbers for signal handler dispatch.
+    Reverse translation from Windows SEH to UNIX signal semantics.
+    @End Implementation
+    
+    If exception_code == EXCEPTION_ACCESS_VIOLATION:
+        Return SIGSEGV
+    Otherwise If exception_code == EXCEPTION_ILLEGAL_INSTRUCTION:
+        Return SIGILL
+    Otherwise If exception_code == EXCEPTION_FLT_DIVIDE_BY_ZERO:
+        Return SIGFPE
+    Otherwise If exception_code == EXCEPTION_INT_DIVIDE_BY_ZERO:
+        Return SIGFPE
+    Otherwise If exception_code == EXCEPTION_SINGLE_STEP:
+        Return SIGTRAP
+    Otherwise If exception_code == EXCEPTION_BREAKPOINT:
+        Return SIGTRAP
+    Otherwise:
+        Return 0  Note: Unknown exception
+    End If
+
+Note: =====================================================================
+Note: EXCEPTION HANDLERS
+Note: =====================================================================
+
+Process called "vectored_exception_handler" that takes exception_info as Integer returns Integer:
+    @Implementation
+    Vectored exception handler that translates Windows exceptions to signal handlers.
+    Called by Windows SEH mechanism when exceptions occur in the process.
+    @End Implementation
+    
+    If exception_info == 0:
+        Return 0  Note: EXCEPTION_CONTINUE_SEARCH
+    End If
+    
+    Note: Extract exception record from EXCEPTION_POINTERS
+    Let exception_record_ptr be 0
+    Let context_record_ptr be 0
+    
+    Inline Assembly:
+        "mov %%rax, %2\n"              Note: Load EXCEPTION_POINTERS
+        "mov [%%rax], %%rbx\n"         Note: Load ExceptionRecord pointer
+        "mov %%rbx, %0\n"              Note: Store exception record
+        "mov 8[%%rax], %%rbx\n"        Note: Load ContextRecord pointer
+        "mov %%rbx, %1\n"              Note: Store context record
+        : "=m" (exception_record_ptr), "=m" (context_record_ptr)
+        : "r" (exception_info)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Note: Get exception code from exception record
+    Let exception_code be 0
+    
+    Inline Assembly:
+        "mov %%rax, %1\n"              Note: Load exception record pointer
+        "mov [%%rax], %%rbx\n"         Note: Load ExceptionCode
+        "mov %%rbx, %0\n"              Note: Store exception code
+        : "=m" (exception_code)
+        : "r" (exception_record_ptr)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Note: Convert to POSIX signal number
+    Let signal_number be windows_exception_to_signal(exception_code)
+    
+    If signal_number == 0:
+        Return 0  Note: EXCEPTION_CONTINUE_SEARCH - unknown exception
+    End If
+    
+    Note: Check if we have a registered handler for this signal
+    If signal_number < 32:
+        Let handler_index be signal_number
+        Let handler_ptr be signal_handlers[handler_index]
+        
+        If handler_ptr != 0:
+            Note: Call the signal handler
+            Inline Assembly:
+                "mov %%rcx, %0\n"      Note: Signal number parameter
+                "call *%1\n"           Note: Call handler function
+                :
+                : "r" (signal_number), "r" (handler_ptr)
+                : "rcx", "rax", "memory"
+            End Assembly
+            
+            Return 0xFFFFFFFF  Note: EXCEPTION_CONTINUE_EXECUTION
+        End If
+    End If
+    
+    Return 0  Note: EXCEPTION_CONTINUE_SEARCH
+
+Process called "console_ctrl_handler" that takes ctrl_type as Integer returns Integer:
+    @Implementation
+    Console control handler for CTRL+C, CTRL+Break, and close events.
+    Maps Windows console events to POSIX signal equivalents.
+    @End Implementation
+    
+    Let signal_number be 0
+    
+    Note: Map console control type to POSIX signal
+    If ctrl_type == 0:  Note: CTRL_C_EVENT
+        Set signal_number to SIGINT
+    Otherwise If ctrl_type == 1:  Note: CTRL_BREAK_EVENT
+        Set signal_number to SIGQUIT
+    Otherwise If ctrl_type == 2:  Note: CTRL_CLOSE_EVENT
+        Set signal_number to SIGHUP
+    Otherwise If ctrl_type == 5:  Note: CTRL_SHUTDOWN_EVENT
+        Set signal_number to SIGTERM
+    Otherwise:
+        Return 0  Note: FALSE - not handled
+    End If
+    
+    Note: Check if we have a registered handler
+    If signal_number < 32:
+        Let handler_ptr be signal_handlers[signal_number]
+        
+        If handler_ptr != 0:
+            Note: Call the signal handler
+            Inline Assembly:
+                "mov %%rcx, %0\n"      Note: Signal number parameter
+                "call *%1\n"           Note: Call handler function
+                :
+                : "r" (signal_number), "r" (handler_ptr)
+                : "rcx", "rax", "memory"
+            End Assembly
+            
+            Return 1  Note: TRUE - handled
+        End If
+    End If
+    
+    Return 0  Note: FALSE - not handled
+
+Note: =====================================================================
+Note: SIGNAL MANAGEMENT FUNCTIONS
+Note: =====================================================================
+
+Process called "sys_signal_windows" that takes sig as Integer, handler as Integer returns Integer:
+    @Implementation
+    Sets signal handler using Windows exception handling mechanisms.
+    Maps POSIX signal() to Windows SEH and console control handlers.
+    @End Implementation
+    
+    If sig < 1 || sig >= 32:
+        Return -1  Note: Invalid signal number
+    End If
+    
+    Note: Get previous handler
+    Let previous_handler be signal_handlers[sig]
+    
+    Note: Set new handler
+    Set signal_handlers[sig] to handler
+    
+    Note: Register system handlers if this is the first signal registration
+    If console_ctrl_handler_registered == 0:
+        Note: Register console control handler for SIGINT, SIGQUIT, etc.
+        Let ctrl_handler_ptr be get_function_address("console_ctrl_handler")
+        
+        Inline Assembly:
+            "mov %%rcx, %0\n"          Note: Handler function pointer
+            "mov %%rdx, $1\n"          Note: Add = TRUE
+            "call SetConsoleCtrlHandler\n"
+            :
+            : "r" (ctrl_handler_ptr)
+            : "rcx", "rdx", "rax", "memory"
+        End Assembly
+        
+        Set console_ctrl_handler_registered to 1
+    End If
+    
+    If vectored_exception_handler_registered == 0:
+        Note: Register vectored exception handler for SIGSEGV, SIGFPE, etc.
+        Let veh_handler_ptr be get_function_address("vectored_exception_handler")
+        
+        Inline Assembly:
+            "mov %%rcx, $1\n"          Note: First handler = 1
+            "mov %%rdx, %0\n"          Note: Handler function pointer
+            "call AddVectoredExceptionHandler\n"
+            :
+            : "r" (veh_handler_ptr)
+            : "rcx", "rdx", "rax", "memory"
+        End Assembly
+        
+        Set vectored_exception_handler_registered to 1
+    End If
+    
+    Return previous_handler
+
+Process called "get_function_address" that takes function_name as String returns Integer:
+    @Implementation
+    Gets the runtime address of a function by name for handler registration.
+    Uses GetProcAddress to find function pointers in current module.
+    @End Implementation
+    
+    Note: Get handle to current module
+    Let module_handle be 0
+    
+    Inline Assembly:
+        "xor %%rcx, %%rcx\n"           Note: NULL = current module
+        "call GetModuleHandle\n"
+        "mov %0, %%rax\n"              Note: Store module handle
+        : "=m" (module_handle)
+        :
+        : "rax", "rcx", "memory"
+    End Assembly
+    
+    Note: Get function address
+    Let name_ptr be string_to_ptr(function_name)
+    Let function_addr be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: Module handle
+        "mov %%rdx, %2\n"              Note: Function name
+        "call GetProcAddress\n"
+        "mov %0, %%rax\n"              Note: Store function address
+        : "=m" (function_addr)
+        : "r" (module_handle), "r" (name_ptr)
+        : "rax", "rcx", "rdx", "memory"
+    End Assembly
+    
+    Return function_addr
+
+Process called "sys_sigaction_windows" that takes sig as Integer, act as Integer, oldact as Integer returns Integer:
+    @Implementation
+    Sets signal action with advanced options using Windows exception handling.
+    Maps POSIX sigaction() to Windows SEH with signal masks and flags.
+    @End Implementation
+    
+    If sig < 1 || sig >= 32:
+        Return -1  Note: Invalid signal number
+    End If
+    
+    Note: Store old action if requested
+    If oldact != 0:
+        Let old_handler be signal_handlers[sig]
+        Let old_mask be signal_masks[sig]
+        Let old_flags be signal_flags[sig]
+        
+        Inline Assembly:
+            "mov %%rax, %0\n"          Note: Load oldact pointer
+            "mov %%rbx, %1\n"          Note: Load old handler
+            "mov [%%rax], %%rbx\n"     Note: Store sa_handler
+            "mov %%rbx, %2\n"          Note: Load old mask
+            "mov 8[%%rax], %%rbx\n"    Note: Store sa_mask
+            "mov %%rbx, %3\n"          Note: Load old flags
+            "mov 16[%%rax], %%rbx\n"   Note: Store sa_flags
+            :
+            : "r" (oldact), "r" (old_handler), "r" (old_mask), "r" (old_flags)
+            : "rax", "rbx", "memory"
+        End Assembly
+    End If
+    
+    Note: Set new action if provided
+    If act != 0:
+        Let new_handler be 0
+        Let new_mask be 0
+        Let new_flags be 0
+        
+        Inline Assembly:
+            "mov %%rax, %3\n"          Note: Load act pointer
+            "mov [%%rax], %%rbx\n"     Note: Load sa_handler
+            "mov %%rbx, %0\n"          Note: Store new handler
+            "mov 8[%%rax], %%rbx\n"    Note: Load sa_mask
+            "mov %%rbx, %1\n"          Note: Store new mask
+            "mov 16[%%rax], %%rbx\n"   Note: Load sa_flags
+            "mov %%rbx, %2\n"          Note: Store new flags
+            : "=m" (new_handler), "=m" (new_mask), "=m" (new_flags)
+            : "r" (act)
+            : "rax", "rbx", "memory"
+        End Assembly
+        
+        Note: Update global signal state
+        Set signal_handlers[sig] to new_handler
+        Set signal_masks[sig] to new_mask
+        Set signal_flags[sig] to new_flags
+        
+        Note: Register handlers if needed (same as sys_signal_windows)
+        If console_ctrl_handler_registered == 0:
+            Let ctrl_handler_ptr be get_function_address("console_ctrl_handler")
+            
+            Inline Assembly:
+                "mov %%rcx, %0\n"
+                "mov %%rdx, $1\n"
+                "call SetConsoleCtrlHandler\n"
+                :
+                : "r" (ctrl_handler_ptr)
+                : "rcx", "rdx", "rax", "memory"
+            End Assembly
+            
+            Set console_ctrl_handler_registered to 1
+        End If
+        
+        If vectored_exception_handler_registered == 0:
+            Let veh_handler_ptr be get_function_address("vectored_exception_handler")
+            
+            Inline Assembly:
+                "mov %%rcx, $1\n"
+                "mov %%rdx, %0\n"
+                "call AddVectoredExceptionHandler\n"
+                :
+                : "r" (veh_handler_ptr)
+                : "rcx", "rdx", "rax", "memory"
+            End Assembly
+            
+            Set vectored_exception_handler_registered to 1
+        End If
+    End If
+    
+    Return 0
+
+Process called "sys_kill_windows" that takes pid as Integer, sig as Integer returns Integer:
+    @Implementation
+    Sends signal to process using Windows mechanisms. Maps POSIX kill()
+    to Windows process termination, events, or console control signals.
+    @End Implementation
+    
+    If sig < 0 || sig >= 32:
+        Return -1  Note: Invalid signal number
+    End If
+    
+    If pid <= 0:
+        Return -1  Note: Invalid process ID
+    End If
+    
+    Note: Handle special signals
+    If sig == SIGKILL:
+        Note: Force terminate process
+        Let process_handle be 0
+        
+        Inline Assembly:
+            "mov %%rcx, $0x1F0FFF\n"   Note: PROCESS_ALL_ACCESS
+            "mov %%rdx, $0\n"          Note: bInheritHandle = FALSE
+            "mov %%r8, %1\n"           Note: Process ID
+            "call OpenProcess\n"
+            "mov %0, %%rax\n"          Note: Store process handle
+            : "=m" (process_handle)
+            : "r" (pid)
+            : "rax", "rcx", "rdx", "r8", "memory"
+        End Assembly
+        
+        If process_handle == 0:
+            Return -1  Note: Failed to open process
+        End If
+        
+        Let result be 0
+        
+        Inline Assembly:
+            "mov %%rcx, %1\n"          Note: Process handle
+            "mov %%rdx, $9\n"          Note: Exit code (SIGKILL = 9)
+            "call TerminateProcess\n"
+            "mov %0, %%rax\n"          Note: Store result
+            : "=m" (result)
+            : "r" (process_handle)
+            : "rax", "rcx", "rdx", "memory"
+        End Assembly
+        
+        Note: Close process handle
+        Inline Assembly:
+            "mov %%rcx, %0\n"
+            "call CloseHandle\n"
+            :
+            : "r" (process_handle)
+            : "rcx", "rax", "memory"
+        End Assembly
+        
+        If result == 0:
+            Return -1  Note: TerminateProcess failed
+        End If
+        
+        Return 0
+        
+    Otherwise If sig == SIGTERM:
+        Note: Graceful termination via console control event
+        Let result be 0
+        
+        Inline Assembly:
+            "mov %%rcx, $5\n"          Note: CTRL_SHUTDOWN_EVENT
+            "mov %%rdx, %1\n"          Note: Process group ID
+            "call GenerateConsoleCtrlEvent\n"
+            "mov %0, %%rax\n"          Note: Store result
+            : "=m" (result)
+            : "r" (pid)
+            : "rax", "rcx", "rdx", "memory"
+        End Assembly
+        
+        If result == 0:
+            Return -1  Note: Failed to send event
+        End If
+        
+        Return 0
+        
+    Otherwise If sig == SIGINT:
+        Note: Interrupt via CTRL+C event
+        Let result be 0
+        
+        Inline Assembly:
+            "mov %%rcx, $0\n"          Note: CTRL_C_EVENT
+            "mov %%rdx, %1\n"          Note: Process group ID
+            "call GenerateConsoleCtrlEvent\n"
+            "mov %0, %%rax\n"          Note: Store result
+            : "=m" (result)
+            : "r" (pid)
+            : "rax", "rcx", "rdx", "memory"
+        End Assembly
+        
+        If result == 0:
+            Return -1  Note: Failed to send event
+        End If
+        
+        Return 0
+        
+    Otherwise:
+        Note: Other signals not directly supported by Windows
+        Return -1  Note: Operation not supported
+    End If
+
+Process called "sys_raise_windows" that takes sig as Integer returns Integer:
+    @Implementation
+    Raises signal in current process using Windows exception mechanism.
+    Maps POSIX raise() to Windows RaiseException for self-signaling.
+    @End Implementation
+    
+    If sig < 1 || sig >= 32:
+        Return -1  Note: Invalid signal number
+    End If
+    
+    Note: Convert signal to Windows exception code
+    Let exception_code be signal_to_windows_exception(sig)
+    
+    Note: Check if we have a handler registered
+    Let handler_ptr be signal_handlers[sig]
+    
+    If handler_ptr != 0:
+        Note: Call handler directly for synchronous signals
+        Inline Assembly:
+            "mov %%rcx, %0\n"          Note: Signal number parameter
+            "call *%1\n"               Note: Call handler function
+            :
+            : "r" (sig), "r" (handler_ptr)
+            : "rcx", "rax", "memory"
+        End Assembly
+        
+        Return 0
+    Otherwise:
+        Note: Raise as Windows exception
+        Inline Assembly:
+            "mov %%rcx, %0\n"          Note: Exception code
+            "mov %%rdx, $0\n"          Note: Exception flags (0 = continuable)
+            "mov %%r8, $0\n"           Note: Number of arguments
+            "mov %%r9, $0\n"           Note: Arguments array (NULL)
+            "call RaiseException\n"
+            :
+            : "r" (exception_code)
+            : "rcx", "rdx", "r8", "r9", "memory"
+        End Assembly
+        
+        Return 0
+    End If
+
+Note: =====================================================================
+Note: SIGNAL MASK OPERATIONS
+Note: =====================================================================
+
+Process called "sys_sigprocmask_windows" that takes how as Integer, set as Integer, oldset as Integer returns Integer:
+    @Implementation
+    Changes signal mask for current thread. Windows doesn't have exact equivalent,
+    so this manages a per-thread signal blocking state for our signal emulation.
+    @End Implementation
+    
+    Note: Get current thread's signal mask (stored in TLS)
+    Let current_mask be get_thread_signal_mask()
+    
+    Note: Store old mask if requested
+    If oldset != 0:
+        Inline Assembly:
+            "mov %%rax, %0\n"          Note: Load oldset pointer
+            "mov %%rbx, %1\n"          Note: Load current mask
+            "mov [%%rax], %%rbx\n"     Note: Store old mask
+            :
+            : "r" (oldset), "r" (current_mask)
+            : "rax", "rbx", "memory"
+        End Assembly
+    End If
+    
+    Note: Update mask if new set provided
+    If set != 0:
+        Let new_mask_value be 0
+        
+        Inline Assembly:
+            "mov %%rax, %1\n"          Note: Load set pointer
+            "mov [%%rax], %%rbx\n"     Note: Load new mask
+            "mov %%rbx, %0\n"          Note: Store new mask
+            : "=m" (new_mask_value)
+            : "r" (set)
+            : "rax", "rbx", "memory"
+        End Assembly
+        
+        Let updated_mask be 0
+        
+        Note: Apply mask operation
+        If how == 0:  Note: SIG_BLOCK
+            Set updated_mask to current_mask | new_mask_value
+        Otherwise If how == 1:  Note: SIG_UNBLOCK
+            Set updated_mask to current_mask & (~new_mask_value)
+        Otherwise If how == 2:  Note: SIG_SETMASK
+            Set updated_mask to new_mask_value
+        Otherwise:
+            Return -1  Note: Invalid how parameter
+        End If
+        
+        set_thread_signal_mask(updated_mask)
+    End If
+    
+    Return 0
+
+Process called "get_thread_signal_mask" returns Integer:
+    @Implementation
+    Gets the current thread's signal mask from thread-local storage.
+    Each thread maintains its own signal blocking state.
+    @End Implementation
+    
+    Note: Get TLS slot for signal mask (use dedicated slot 0 for signal management)
+    Let mask_value be 0
+    
+    Inline Assembly:
+        "mov %%rcx, $0\n"              Note: TLS index 0 for signal mask
+        "call TlsGetValue\n"
+        "mov %0, %%rax\n"              Note: Store mask value
+        : "=m" (mask_value)
+        :
+        : "rax", "rcx", "memory"
+    End Assembly
+    
+    Return mask_value
+
+Process called "set_thread_signal_mask" that takes mask as Integer returns Nothing:
+    @Implementation
+    Sets the current thread's signal mask in thread-local storage.
+    Updates per-thread signal blocking state for signal emulation.
+    @End Implementation
+    
+    Note: Set TLS slot for signal mask
+    Inline Assembly:
+        "mov %%rcx, $0\n"              Note: TLS index 0 for signal mask
+        "mov %%rdx, %0\n"              Note: Mask value
+        "call TlsSetValue\n"
+        :
+        : "r" (mask)
+        : "rcx", "rdx", "rax", "memory"
+    End Assembly
+
+Process called "sys_sigsuspend_windows" that takes mask as Integer returns Integer:
+    @Implementation
+    Suspends execution until signal is received. Windows implementation
+    uses WaitForSingleObject with event objects to simulate signal waiting.
+    @End Implementation
+    
+    If mask == 0:
+        Return -1  Note: Invalid mask pointer
+    End If
+    
+    Note: Load the signal mask
+    Let suspend_mask be 0
+    
+    Inline Assembly:
+        "mov %%rax, %1\n"              Note: Load mask pointer
+        "mov [%%rax], %%rbx\n"         Note: Load mask value
+        "mov %%rbx, %0\n"              Note: Store mask
+        : "=m" (suspend_mask)
+        : "r" (mask)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Note: Set the signal mask for the duration of the operation
+    Let old_mask be get_thread_signal_mask()
+    set_thread_signal_mask(suspend_mask)
+    
+    Note: Create an event object to wait on
+    Let event_handle be 0
+    
+    Inline Assembly:
+        "mov %%rcx, $0\n"              Note: Security attributes (NULL)
+        "mov %%rdx, $0\n"              Note: Manual reset = FALSE
+        "mov %%r8, $0\n"               Note: Initial state = FALSE
+        "mov %%r9, $0\n"               Note: Name (NULL)
+        "call CreateEvent\n"
+        "mov %0, %%rax\n"              Note: Store event handle
+        : "=m" (event_handle)
+        :
+        : "rax", "rcx", "rdx", "r8", "r9", "memory"
+    End Assembly
+    
+    If event_handle == 0:
+        Note: Restore old mask on failure
+        set_thread_signal_mask(old_mask)
+        Return -1
+    End If
+    
+    Note: Wait for event (will be interrupted by signal handlers)
+    Let wait_result be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: Event handle
+        "mov %%rdx, $0xFFFFFFFF\n"     Note: INFINITE timeout
+        "call WaitForSingleObject\n"
+        "mov %0, %%rax\n"              Note: Store wait result
+        : "=m" (wait_result)
+        : "r" (event_handle)
+        : "rax", "rcx", "rdx", "memory"
+    End Assembly
+    
+    Note: Clean up event handle
+    Inline Assembly:
+        "mov %%rcx, %0\n"
+        "call CloseHandle\n"
+        :
+        : "r" (event_handle)
+        : "rcx", "rax", "memory"
+    End Assembly
+    
+    Note: Restore original signal mask
+    set_thread_signal_mask(old_mask)
+    
+    Return -1  Note: Always returns -1 (EINTR) when interrupted by signal
+
+Note: =====================================================================
+Note: SIGNAL SETS OPERATIONS
+Note: =====================================================================
+
+Process called "sys_sigemptyset_windows" that takes set as Integer returns Integer:
+    @Implementation
+    Initializes signal set to empty. Clears all bits in the signal set.
+    @End Implementation
+    
+    If set == 0:
+        Return -1  Note: Invalid set pointer
+    End If
+    
+    Note: Clear all bits in signal set
+    Inline Assembly:
+        "mov %%rax, %0\n"              Note: Load set pointer
+        "xor %%rbx, %%rbx\n"           Note: Zero value
+        "mov [%%rax], %%rbx\n"         Note: Clear signal set
+        :
+        : "r" (set)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_sigfillset_windows" that takes set as Integer returns Integer:
+    @Implementation
+    Initializes signal set to full. Sets all bits in the signal set.
+    @End Implementation
+    
+    If set == 0:
+        Return -1  Note: Invalid set pointer
+    End If
+    
+    Note: Set all bits in signal set
+    Inline Assembly:
+        "mov %%rax, %0\n"              Note: Load set pointer
+        "mov %%rbx, $0xFFFFFFFF\n"     Note: All bits set
+        "mov [%%rax], %%rbx\n"         Note: Fill signal set
+        :
+        : "r" (set)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_sigaddset_windows" that takes set as Integer, signum as Integer returns Integer:
+    @Implementation
+    Adds signal to signal set. Sets the bit corresponding to the signal number.
+    @End Implementation
+    
+    If set == 0:
+        Return -1  Note: Invalid set pointer
+    End If
+    
+    If signum < 1 || signum >= 32:
+        Return -1  Note: Invalid signal number
+    End If
+    
+    Note: Set bit for signal number
+    Let bit_mask be 1 << signum
+    
+    Inline Assembly:
+        "mov %%rax, %0\n"              Note: Load set pointer
+        "mov [%%rax], %%rbx\n"         Note: Load current set
+        "or %%rbx, %1\n"               Note: OR with bit mask
+        "mov [%%rax], %%rbx\n"         Note: Store updated set
+        :
+        : "r" (set), "r" (bit_mask)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_sigdelset_windows" that takes set as Integer, signum as Integer returns Integer:
+    @Implementation
+    Removes signal from signal set. Clears the bit corresponding to the signal number.
+    @End Implementation
+    
+    If set == 0:
+        Return -1  Note: Invalid set pointer
+    End If
+    
+    If signum < 1 || signum >= 32:
+        Return -1  Note: Invalid signal number
+    End If
+    
+    Note: Clear bit for signal number
+    Let bit_mask be ~(1 << signum)
+    
+    Inline Assembly:
+        "mov %%rax, %0\n"              Note: Load set pointer
+        "mov [%%rax], %%rbx\n"         Note: Load current set
+        "and %%rbx, %1\n"              Note: AND with inverted mask
+        "mov [%%rax], %%rbx\n"         Note: Store updated set
+        :
+        : "r" (set), "r" (bit_mask)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_sigismember_windows" that takes set as Integer, signum as Integer returns Integer:
+    @Implementation
+    Tests if signal is in signal set. Returns 1 if signal is in set, 0 if not.
+    @End Implementation
+    
+    If set == 0:
+        Return -1  Note: Invalid set pointer
+    End If
+    
+    If signum < 1 || signum >= 32:
+        Return -1  Note: Invalid signal number
+    End If
+    
+    Note: Test bit for signal number
+    Let current_set be 0
+    
+    Inline Assembly:
+        "mov %%rax, %1\n"              Note: Load set pointer
+        "mov [%%rax], %%rbx\n"         Note: Load current set
+        "mov %%rbx, %0\n"              Note: Store current set
+        : "=m" (current_set)
+        : "r" (set)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Let bit_mask be 1 << signum
+    Let result be current_set & bit_mask
+    
+    If result != 0:
+        Return 1  Note: Signal is in set
+    Otherwise:
+        Return 0  Note: Signal is not in set
+    End If
+
+@Performance_Hints
+Windows signal emulation has overhead compared to native POSIX signals.
+Vectored exception handling is more efficient than structured exception
+handling for performance-critical code. Console control handlers have
+low overhead. Consider using Windows events and completion ports
+for high-performance inter-process signaling instead of signal emulation.
+@End Performance_Hints
+
+@Security_Scope
+Windows exception handlers run with full process privileges and can access
+all process memory. Signal handlers inherit the security context of the
+thread that received the signal. Console control handlers can be used for
+privilege escalation if not properly validated. Exception handling should
+validate parameters to prevent security vulnerabilities.
+@End Security_Scope

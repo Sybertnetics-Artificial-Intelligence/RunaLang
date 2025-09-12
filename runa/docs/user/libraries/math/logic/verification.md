@@ -355,7 +355,7 @@ Let potentially_non_terminating be Verify.parse_program("""
     while x > 0 ∧ y > 0 do
         if random_choice() then
             x := x - 1
-        else
+        otherwise
             y := y - 1
         endif
     end

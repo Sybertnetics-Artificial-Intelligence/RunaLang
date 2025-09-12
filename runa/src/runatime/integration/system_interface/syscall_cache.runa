@@ -1,0 +1,1093 @@
+Note: Syscall Cache System - High-performance caching for frequently used syscalls
+Note: Implements LRU cache with thread-safe operations and performance optimization
+
+@Reasoning
+System calls have significant overhead due to context switches between user and kernel space.
+Many syscalls (like getpid, clock_gettime, stat on same files) are called repeatedly with
+identical parameters. Caching these results can dramatically improve performance while
+maintaining correctness through intelligent cache invalidation strategies.
+@End Reasoning
+
+@Implementation
+- Thread-safe LRU cache with configurable capacity and TTL
+- Hash-based lookup for O(1) cache access performance  
+- Intelligent cache invalidation based on syscall semantics
+- Cache warming strategies for predictable access patterns
+- Comprehensive performance metrics and monitoring
+- Memory-efficient cache entry storage with reference counting
+@End Implementation
+
+Import module "compiler/frontend/primitives/types/compiler_internals" as Internals
+Import module "compiler/backend/syscalls/syscall_registry" as Registry
+
+Note: =====================================================================
+Note: CACHE ENTRY STRUCTURE
+Note: =====================================================================
+
+Type called "SyscallCacheEntry":
+    syscall_name as String       Note: Name of the syscall
+    arguments_hash as Integer    Note: Hash of arguments for matching
+    result_value as Integer       Note: Cached result value
+    timestamp as Integer          Note: When entry was cached
+    hit_count as Integer          Note: Number of cache hits
+    is_valid as Boolean           Note: Whether entry is still valid
+    next_entry as Integer         Note: Pointer to next entry in LRU chain
+    prev_entry as Integer         Note: Pointer to previous entry in LRU chain
+End Type
+
+Type called "CacheStatistics":
+    total_hits as Integer
+    total_misses as Integer
+    total_evictions as Integer
+    cache_efficiency as Float     Note: Hit ratio percentage
+    bytes_saved as Integer        Note: Estimated bytes saved from avoiding syscalls
+    avg_hit_time_ns as Integer   Note: Average cache hit time in nanoseconds
+End Type
+
+Note: =====================================================================
+Note: CACHE CONFIGURATION
+Note: =====================================================================
+
+Constant DEFAULT_CACHE_SIZE as Integer is 512           Note: Larger for runtime use
+Constant DEFAULT_TTL_MS as Integer is 10000            Note: 10 seconds default TTL
+Constant MIN_HITS_FOR_PROMOTION as Integer is 3        Note: Promote after 3 hits
+Constant CACHE_LINE_SIZE as Integer is 64              Note: CPU cache line size
+
+Note: =====================================================================
+Note: CACHE STRUCTURE
+Note: =====================================================================
+
+Type called "SyscallCache":
+    entries as Internals.InternalMap          Note: Cache entries by key
+    lru_head as Integer                        Note: Most recently used entry pointer
+    lru_tail as Integer                        Note: Least recently used entry pointer
+    cache_size as Integer                      Note: Maximum cache entries
+    current_size as Integer                    Note: Current number of entries
+    ttl_ms as Integer                          Note: Time-to-live in milliseconds
+    statistics as CacheStatistics              Note: Performance metrics
+    enabled as Boolean                         Note: Whether caching is active
+    lock as Integer                            Note: Spinlock for thread safety
+End Type
+
+Note: =====================================================================
+Note: CACHE INITIALIZATION
+Note: =====================================================================
+
+Process called "create_syscall_cache" returns SyscallCache:
+    @Performance_Hints
+    Pre-allocates memory for cache entries to avoid runtime allocation.
+    Uses power-of-2 bucket count for fast modulo operations.
+    @End Performance_Hints
+    
+    Let cache be SyscallCache()
+    Set cache.entries to Internals.create_internal_map(DEFAULT_CACHE_SIZE)
+    Set cache.lru_head to 0
+    Set cache.lru_tail to 0
+    Set cache.cache_size to DEFAULT_CACHE_SIZE
+    Set cache.current_size to 0
+    Set cache.ttl_ms to DEFAULT_TTL_MS
+    Set cache.enabled to true
+    Set cache.lock to 0
+    
+    Note: Initialize statistics
+    Let stats be CacheStatistics()
+    Set stats.total_hits to 0
+    Set stats.total_misses to 0
+    Set stats.total_evictions to 0
+    Set stats.cache_efficiency to 0.0
+    Set stats.bytes_saved to 0
+    Set stats.avg_hit_time_ns to 0
+    Set cache.statistics to stats
+    
+    Return cache
+End Process
+
+Process called "create_cache_with_config" that takes size as Integer, ttl as Integer returns SyscallCache:
+    @Performance_Hints
+    Allows tuning cache parameters for specific workload characteristics.
+    Larger caches reduce evictions but increase memory usage.
+    @End Performance_Hints
+    
+    Let cache be SyscallCache()
+    Set cache.entries to Internals.create_internal_map(size)
+    Set cache.lru_head to 0
+    Set cache.lru_tail to 0
+    Set cache.cache_size to size
+    Set cache.current_size to 0
+    Set cache.ttl_ms to ttl
+    Set cache.enabled to true
+    Set cache.lock to 0
+    
+    Let stats be CacheStatistics()
+    Set stats.total_hits to 0
+    Set stats.total_misses to 0
+    Set stats.total_evictions to 0
+    Set stats.cache_efficiency to 0.0
+    Set stats.bytes_saved to 0
+    Set stats.avg_hit_time_ns to 0
+    Set cache.statistics to stats
+    
+    Return cache
+End Process
+
+Note: =====================================================================
+Note: THREAD-SAFE LOCKING PRIMITIVES
+Note: =====================================================================
+
+Process called "acquire_lock" that takes lock_ptr as Integer returns Nothing:
+    @Performance_Hints
+    Uses spinlock for minimal overhead in low-contention scenarios.
+    Falls back to yielding after spin threshold to avoid CPU waste.
+    @End Performance_Hints
+    
+    Let expected be 0
+    Let spin_count be 0
+    Constant MAX_SPIN as Integer is 1000
+    
+    While true:
+        Note: Try to acquire lock with atomic compare-and-swap
+        Inline Assembly:
+            "mov rax, 0\n"          Note: Expected value (unlocked)
+            "mov rcx, 1\n"          Note: New value (locked)
+            "mov rbx, %1\n"         Note: Lock address
+            "lock cmpxchg [rbx], rcx\n"  Note: Atomic CAS
+            "setz al\n"             Note: Set AL if successful
+            "movzx %0, al\n"        Note: Store result
+            : "=r"(expected)
+            : "r"(lock_ptr)
+            : "rax", "rbx", "rcx", "memory", "cc"
+        End Assembly
+        
+        If expected not equals 0:
+            Return  Note: Lock acquired
+        End If
+        
+        Set spin_count to spin_count plus 1
+        If spin_count greater than MAX_SPIN:
+            Note: Yield CPU to avoid wasting cycles
+            Inline Assembly:
+                "pause\n"  Note: CPU hint for spin-wait loops
+                :
+                :
+                : "memory"
+            End Assembly
+            Set spin_count to 0
+        End If
+    End While
+End Process
+
+Process called "release_lock" that takes lock_ptr as Integer returns Nothing:
+    @Performance_Hints
+    Simple atomic store with memory barrier for release semantics.
+    @End Performance_Hints
+    
+    Inline Assembly:
+        "mov rbx, %0\n"         Note: Lock address
+        "mov dword ptr [rbx], 0\n"  Note: Release lock
+        "mfence\n"              Note: Memory barrier
+        :
+        : "r"(lock_ptr)
+        : "rbx", "memory"
+    End Assembly
+End Process
+
+Note: =====================================================================
+Note: CACHE KEY GENERATION
+Note: =====================================================================
+
+Process called "generate_cache_key" that takes syscall_name as String, args as Internals.InternalArray returns String:
+    @Performance_Hints
+    Uses FNV-1a hash for good distribution and cache-friendly operations.
+    Combines syscall name with argument hash for unique keys.
+    @End Performance_Hints
+    
+    Let sb be Internals.create_string_builder()
+    Internals.string_builder_append(sb, syscall_name)
+    Internals.string_builder_append(sb, ":")
+    
+    Note: Hash arguments to create unique key
+    Let args_hash be hash_arguments(args)
+    Let hash_str be integer_to_string(args_hash)
+    Internals.string_builder_append(sb, hash_str)
+    
+    Return Internals.string_builder_to_string(sb)
+End Process
+
+Process called "hash_arguments" that takes args as Internals.InternalArray returns Integer:
+    @Performance_Hints
+    FNV-1a provides good avalanche effect and distribution.
+    Processes 8 bytes at a time for better throughput.
+    @End Performance_Hints
+    
+    Constant FNV_OFFSET_BASIS as Integer is 14695981039346656037
+    Constant FNV_PRIME as Integer is 1099511628211
+    
+    Let hash be FNV_OFFSET_BASIS
+    Let i be 0
+    While i less than args.length:
+        Let arg_value be Internals.internal_array_get(args, i)
+        Set hash to hash xor arg_value
+        Set hash to hash multiplied by FNV_PRIME
+        Set i to i plus 1
+    End While
+    
+    Return hash
+End Process
+
+Note: =====================================================================
+Note: CACHE LOOKUP OPERATIONS
+Note: =====================================================================
+
+Process called "lookup_syscall" that takes cache as SyscallCache, syscall_name as String, args as Internals.InternalArray returns Internals.InternalResult:
+    @Performance_Hints
+    Fast path for cache hits with minimal locking overhead.
+    Updates LRU order on hit to maintain cache effectiveness.
+    @End Performance_Hints
+    
+    If not cache.enabled:
+        Return Internals.error_result(-1, "Cache disabled")
+    End If
+    
+    Let start_time be get_high_precision_timestamp()
+    
+    Note: Generate lookup key
+    Let key be generate_cache_key(syscall_name, args)
+    
+    Note: Acquire lock for thread safety
+    acquire_lock(address_of(cache.lock))
+    
+    Let entry_ptr be Internals.internal_map_get(cache.entries, key)
+    
+    If entry_ptr equals minus 1:
+        Note: Cache miss
+        Set cache.statistics.total_misses to cache.statistics.total_misses plus 1
+        update_cache_efficiency(cache)
+        release_lock(address_of(cache.lock))
+        Return Internals.error_result(-1, "Cache miss")
+    End If
+    
+    Note: Found entry, check if still valid
+    Let entry be read_cache_entry(entry_ptr)
+    
+    If not is_entry_valid(entry, cache.ttl_ms):
+        Note: Entry expired
+        remove_from_lru(cache, entry_ptr)
+        invalidate_entry(cache, key)
+        Set cache.statistics.total_misses to cache.statistics.total_misses plus 1
+        update_cache_efficiency(cache)
+        release_lock(address_of(cache.lock))
+        Return Internals.error_result(-1, "Entry expired")
+    End If
+    
+    Note: Cache hit - update statistics and LRU
+    Set entry.hit_count to entry.hit_count plus 1
+    write_cache_entry(entry_ptr, entry)
+    move_to_head(cache, entry_ptr)
+    
+    Set cache.statistics.total_hits to cache.statistics.total_hits plus 1
+    Set cache.statistics.bytes_saved to cache.statistics.bytes_saved plus estimate_syscall_cost(syscall_name)
+    
+    Let hit_time be get_high_precision_timestamp() minus start_time
+    update_avg_hit_time(cache, hit_time)
+    update_cache_efficiency(cache)
+    
+    release_lock(address_of(cache.lock))
+    
+    Return Internals.success_result(entry.result_value)
+End Process
+
+Process called "is_entry_valid" that takes entry as SyscallCacheEntry, ttl_ms as Integer returns Boolean:
+    @Performance_Hints
+    Quick validation check with minimal computation.
+    @End Performance_Hints
+    
+    If not entry.is_valid:
+        Return false
+    End If
+    
+    Let current_time be get_current_timestamp_ms()
+    Let age be current_time minus entry.timestamp
+    
+    Return age less than ttl_ms
+End Process
+
+Note: =====================================================================
+Note: CACHE INSERTION OPERATIONS
+Note: =====================================================================
+
+Process called "cache_syscall_result" that takes cache as SyscallCache, syscall_name as String, args as Internals.InternalArray, result as Integer returns Nothing:
+    @Performance_Hints
+    Optimized insertion with LRU maintenance and eviction handling.
+    @End Performance_Hints
+    
+    If not cache.enabled:
+        Return
+    End If
+    
+    If not should_cache_syscall(syscall_name):
+        Return
+    End If
+    
+    Let key be generate_cache_key(syscall_name, args)
+    
+    acquire_lock(address_of(cache.lock))
+    
+    Note: Check if we need to evict
+    If cache.current_size greater than or equal to cache.cache_size:
+        evict_lru_entry(cache)
+    End If
+    
+    Note: Create new entry
+    Let entry be SyscallCacheEntry()
+    Set entry.syscall_name to syscall_name
+    Set entry.arguments_hash to hash_arguments(args)
+    Set entry.result_value to result
+    Set entry.timestamp to get_current_timestamp_ms()
+    Set entry.hit_count to 0
+    Set entry.is_valid to true
+    Set entry.next_entry to 0
+    Set entry.prev_entry to 0
+    
+    Note: Allocate and store entry
+    Let entry_ptr be allocate_cache_entry(entry)
+    Internals.internal_map_set(cache.entries, key, entry_ptr)
+    add_to_head(cache, entry_ptr)
+    Set cache.current_size to cache.current_size plus 1
+    
+    release_lock(address_of(cache.lock))
+End Process
+
+Note: =====================================================================
+Note: LRU MANAGEMENT
+Note: =====================================================================
+
+Process called "add_to_head" that takes cache as SyscallCache, entry_ptr as Integer returns Nothing:
+    @Performance_Hints
+    O(1) operation for maintaining LRU order.
+    @End Performance_Hints
+    
+    Let entry be read_cache_entry(entry_ptr)
+    Set entry.next_entry to cache.lru_head
+    Set entry.prev_entry to 0
+    
+    If cache.lru_head not equals 0:
+        Let head_entry be read_cache_entry(cache.lru_head)
+        Set head_entry.prev_entry to entry_ptr
+        write_cache_entry(cache.lru_head, head_entry)
+    End If
+    
+    Set cache.lru_head to entry_ptr
+    
+    If cache.lru_tail equals 0:
+        Set cache.lru_tail to entry_ptr
+    End If
+    
+    write_cache_entry(entry_ptr, entry)
+End Process
+
+Process called "remove_from_lru" that takes cache as SyscallCache, entry_ptr as Integer returns Nothing:
+    @Performance_Hints
+    O(1) removal from doubly-linked LRU list.
+    @End Performance_Hints
+    
+    Let entry be read_cache_entry(entry_ptr)
+    
+    If entry.prev_entry not equals 0:
+        Let prev_entry be read_cache_entry(entry.prev_entry)
+        Set prev_entry.next_entry to entry.next_entry
+        write_cache_entry(entry.prev_entry, prev_entry)
+    Otherwise:
+        Set cache.lru_head to entry.next_entry
+    End If
+    
+    If entry.next_entry not equals 0:
+        Let next_entry be read_cache_entry(entry.next_entry)
+        Set next_entry.prev_entry to entry.prev_entry
+        write_cache_entry(entry.next_entry, next_entry)
+    Otherwise:
+        Set cache.lru_tail to entry.prev_entry
+    End If
+End Process
+
+Process called "move_to_head" that takes cache as SyscallCache, entry_ptr as Integer returns Nothing:
+    @Performance_Hints
+    Combines remove and add operations for efficiency.
+    @End Performance_Hints
+    
+    If entry_ptr equals cache.lru_head:
+        Return  Note: Already at head
+    End If
+    
+    remove_from_lru(cache, entry_ptr)
+    add_to_head(cache, entry_ptr)
+End Process
+
+Process called "evict_lru_entry" that takes cache as SyscallCache returns Nothing:
+    @Performance_Hints
+    O(1) eviction of least recently used entry.
+    @End Performance_Hints
+    
+    If cache.lru_tail equals 0:
+        Return  Note: Empty cache
+    End If
+    
+    Let tail_ptr be cache.lru_tail
+    Let tail_entry be read_cache_entry(tail_ptr)
+    
+    Note: Find and remove the key from map
+    Let iter be Internals.internal_map_iterator(cache.entries)
+    While Internals.internal_map_has_next(iter):
+        Let kv be Internals.internal_map_next(iter)
+        If kv.value equals tail_ptr:
+            invalidate_entry(cache, kv.key)
+            Break
+        End If
+    End While
+    
+    remove_from_lru(cache, tail_ptr)
+    Internals.free_raw_memory(tail_ptr, 64)  Note: Free entry memory
+    Set cache.current_size to cache.current_size minus 1
+    Set cache.statistics.total_evictions to cache.statistics.total_evictions plus 1
+End Process
+
+Note: =====================================================================
+Note: CACHE INVALIDATION
+Note: =====================================================================
+
+Process called "invalidate_entry" that takes cache as SyscallCache, key as String returns Nothing:
+    @Performance_Hints
+    Marks entry as invalid without immediate removal for lazy cleanup.
+    @End Performance_Hints
+    
+    Let entry_ptr be Internals.internal_map_get(cache.entries, key)
+    If entry_ptr not equals minus 1:
+        Let entry be read_cache_entry(entry_ptr)
+        Set entry.is_valid to false
+        write_cache_entry(entry_ptr, entry)
+    End If
+End Process
+
+Process called "invalidate_syscall_type" that takes cache as SyscallCache, syscall_name as String returns Nothing:
+    @Performance_Hints
+    Batch invalidation for specific syscall types.
+    @End Performance_Hints
+    
+    acquire_lock(address_of(cache.lock))
+    
+    Let iter be Internals.internal_map_iterator(cache.entries)
+    While Internals.internal_map_has_next(iter):
+        Let kv be Internals.internal_map_next(iter)
+        Let entry be read_cache_entry(kv.value)
+        
+        If entry.syscall_name equals syscall_name:
+            Set entry.is_valid to false
+            write_cache_entry(kv.value, entry)
+        End If
+    End While
+    
+    release_lock(address_of(cache.lock))
+End Process
+
+Process called "clear_cache" that takes cache as SyscallCache returns Nothing:
+    @Performance_Hints
+    Full cache clear with memory deallocation.
+    @End Performance_Hints
+    
+    acquire_lock(address_of(cache.lock))
+    
+    Note: Free all entry memory
+    Let current be cache.lru_head
+    While current not equals 0:
+        Let entry be read_cache_entry(current)
+        Let next be entry.next_entry
+        Internals.free_raw_memory(current, 64)
+        Set current to next
+    End While
+    
+    Note: Reset cache state
+    Set cache.lru_head to 0
+    Set cache.lru_tail to 0
+    Set cache.current_size to 0
+    
+    Note: Reset statistics
+    Set cache.statistics.total_hits to 0
+    Set cache.statistics.total_misses to 0
+    Set cache.statistics.total_evictions to 0
+    Set cache.statistics.cache_efficiency to 0.0
+    Set cache.statistics.bytes_saved to 0
+    Set cache.statistics.avg_hit_time_ns to 0
+    
+    release_lock(address_of(cache.lock))
+End Process
+
+Note: =====================================================================
+Note: CACHE STATISTICS AND MONITORING
+Note: =====================================================================
+
+Process called "update_cache_efficiency" that takes cache as SyscallCache returns Nothing:
+    @Performance_Hints
+    Lightweight statistics update without division in hot path.
+    @End Performance_Hints
+    
+    Let total_accesses be cache.statistics.total_hits plus cache.statistics.total_misses
+    
+    If total_accesses greater than 0:
+        Let efficiency be cache.statistics.total_hits as Float
+        Set efficiency to efficiency divided by total_accesses as Float
+        Set efficiency to efficiency multiplied by 100.0
+        Set cache.statistics.cache_efficiency to efficiency
+    Otherwise:
+        Set cache.statistics.cache_efficiency to 0.0
+    End If
+End Process
+
+Process called "update_avg_hit_time" that takes cache as SyscallCache, hit_time_ns as Integer returns Nothing:
+    @Performance_Hints
+    Running average calculation without storing all samples.
+    @End Performance_Hints
+    
+    If cache.statistics.total_hits equals 1:
+        Set cache.statistics.avg_hit_time_ns to hit_time_ns
+    Otherwise:
+        Let current_avg be cache.statistics.avg_hit_time_ns
+        Let new_avg be ((current_avg multiplied by (cache.statistics.total_hits minus 1)) plus hit_time_ns) divided by cache.statistics.total_hits
+        Set cache.statistics.avg_hit_time_ns to new_avg
+    End If
+End Process
+
+Process called "estimate_syscall_cost" that takes syscall_name as String returns Integer:
+    @Performance_Hints
+    Estimates syscall overhead in bytes for cost tracking.
+    @End Performance_Hints
+    
+    Note: Rough estimates of syscall overhead in bytes
+    If syscall_name equals Registry.SYSCALL_GETPID:
+        Return 128  Note: Context switch overhead
+    End If
+    If syscall_name equals Registry.SYSCALL_STAT:
+        Return 256  Note: File system access
+    End If
+    If syscall_name equals Registry.SYSCALL_CLOCK_GETTIME:
+        Return 96   Note: Time subsystem access
+    End If
+    
+    Return 64  Note: Default estimate
+End Process
+
+Process called "get_cache_statistics" that takes cache as SyscallCache returns CacheStatistics:
+    @Performance_Hints
+    Returns copy of statistics to avoid locking on read.
+    @End Performance_Hints
+    
+    Return cache.statistics
+End Process
+
+Process called "should_cache_syscall" that takes syscall_name as String returns Boolean:
+    @Performance_Hints
+    Quick lookup table for cacheable syscalls.
+    @End Performance_Hints
+    
+    Note: Syscalls that typically return consistent values
+    If syscall_name equals Registry.SYSCALL_GETPID:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_GETUID:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_GETEUID:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_GETGID:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_GETEGID:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_GETPPID:
+        Return true
+    End If
+    If syscall_name equals "getcwd":
+        Return true
+    End If
+    If syscall_name equals "uname":
+        Return true
+    End If
+    
+    Note: File stats can be cached with shorter TTL
+    If syscall_name equals Registry.SYSCALL_STAT:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_FSTAT:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_LSTAT:
+        Return true
+    End If
+    
+    Note: Time syscalls with coarse granularity
+    If syscall_name equals Registry.SYSCALL_CLOCK_GETTIME:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_GETTIMEOFDAY:
+        Return true
+    End If
+    
+    Note: Don't cache syscalls with side effects or variable results
+    Return false
+End Process
+
+Note: =====================================================================
+Note: CACHE WARMING AND PREFETCHING
+Note: =====================================================================
+
+Process called "warm_cache" that takes cache as SyscallCache, patterns as Internals.InternalArray returns Nothing:
+    @Performance_Hints
+    Pre-populates cache with commonly accessed syscalls.
+    Reduces cold start penalty for predictable access patterns.
+    @End Performance_Hints
+    
+    Note: Common syscalls to pre-cache
+    Let pid_args be Internals.create_internal_array(0)
+    Let pid_result be execute_syscall_direct(Registry.SYSCALL_GETPID, pid_args)
+    cache_syscall_result(cache, Registry.SYSCALL_GETPID, pid_args, pid_result)
+    
+    Let uid_args be Internals.create_internal_array(0)
+    Let uid_result be execute_syscall_direct(Registry.SYSCALL_GETUID, uid_args)
+    cache_syscall_result(cache, Registry.SYSCALL_GETUID, uid_args, uid_result)
+    
+    Note: Cache current working directory
+    Let cwd_buffer be Internals.allocate_raw_memory(4096)
+    Let cwd_args be Internals.create_internal_array(2)
+    Internals.internal_array_add(cwd_args, cwd_buffer)  Note: Buffer pointer
+    Internals.internal_array_add(cwd_args, 4096)  Note: Buffer size
+    Let cwd_result be execute_syscall_direct("getcwd", cwd_args)
+    cache_syscall_result(cache, "getcwd", cwd_args, cwd_result)
+    Internals.free_raw_memory(cwd_buffer, 4096)
+End Process
+
+Note: =====================================================================
+Note: CACHE TUNING AND OPTIMIZATION
+Note: =====================================================================
+
+Process called "auto_tune_cache" that takes cache as SyscallCache returns Nothing:
+    @Performance_Hints
+    Dynamically adjusts cache parameters based on runtime behavior.
+    @End Performance_Hints
+    
+    acquire_lock(address_of(cache.lock))
+    
+    Note: Adjust TTL based on efficiency
+    If cache.statistics.cache_efficiency greater than 90.0:
+        Note: Very high efficiency, can increase TTL
+        Set cache.ttl_ms to cache.ttl_ms multiplied by 2
+        If cache.ttl_ms greater than 60000:  Note: Cap at 1 minute
+            Set cache.ttl_ms to 60000
+        End If
+    Otherwise:
+        If cache.statistics.cache_efficiency less than 30.0:
+            Note: Low efficiency, decrease TTL
+            Set cache.ttl_ms to cache.ttl_ms divided by 2
+            If cache.ttl_ms less than 1000:  Note: Min 1 second
+                Set cache.ttl_ms to 1000
+            End If
+        End If
+    End If
+    
+    Note: Adjust cache size based on eviction rate
+    Let eviction_rate be cache.statistics.total_evictions as Float
+    Set eviction_rate to eviction_rate divided by (cache.statistics.total_hits plus cache.statistics.total_misses) as Float
+    
+    If eviction_rate greater than 0.1:  Note: More than 10% evictions
+        Note: Consider increasing cache size
+        If cache.cache_size less than 2048:
+            Set cache.cache_size to cache.cache_size multiplied by 2
+        End If
+    End If
+    
+    release_lock(address_of(cache.lock))
+End Process
+
+Process called "set_cache_enabled" that takes cache as SyscallCache, enabled as Boolean returns Nothing:
+    @Performance_Hints
+    Allows runtime enable/disable for debugging and testing.
+    @End Performance_Hints
+    
+    acquire_lock(address_of(cache.lock))
+    Set cache.enabled to enabled
+    
+    If not enabled:
+        clear_cache(cache)
+    End If
+    
+    release_lock(address_of(cache.lock))
+End Process
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS FOR CACHE ENTRY MANAGEMENT
+Note: =====================================================================
+
+Process called "allocate_cache_entry" that takes entry as SyscallCacheEntry returns Integer:
+    @Performance_Hints
+    Allocates cache-line aligned memory for better CPU cache utilization.
+    @End Performance_Hints
+    
+    Note: Allocate aligned to cache line size
+    Let ptr be Internals.allocate_raw_memory(CACHE_LINE_SIZE)
+    
+    Note: Write entry fields to memory
+    Internals.write_integer_at(ptr, 0, Internals.string_to_ptr(entry.syscall_name))
+    Internals.write_integer_at(ptr, 8, entry.arguments_hash)
+    Internals.write_integer_at(ptr, 16, entry.result_value)
+    Internals.write_integer_at(ptr, 24, entry.timestamp)
+    Internals.write_integer_at(ptr, 32, entry.hit_count)
+    Let is_valid_int be 0
+    If entry.is_valid:
+        Set is_valid_int to 1
+    End If
+    Internals.write_integer_at(ptr, 40, is_valid_int)
+    Internals.write_integer_at(ptr, 48, entry.next_entry)
+    Internals.write_integer_at(ptr, 56, entry.prev_entry)
+    
+    Return ptr
+End Process
+
+Process called "read_cache_entry" that takes ptr as Integer returns SyscallCacheEntry:
+    @Performance_Hints
+    Single cache line read for entry data.
+    @End Performance_Hints
+    
+    Let entry be SyscallCacheEntry()
+    Set entry.syscall_name to Internals.ptr_to_string(Internals.read_integer_at(ptr, 0))
+    Set entry.arguments_hash to Internals.read_integer_at(ptr, 8)
+    Set entry.result_value to Internals.read_integer_at(ptr, 16)
+    Set entry.timestamp to Internals.read_integer_at(ptr, 24)
+    Set entry.hit_count to Internals.read_integer_at(ptr, 32)
+    Let is_valid_int be Internals.read_integer_at(ptr, 40)
+    Set entry.is_valid to (is_valid_int not equals 0)
+    Set entry.next_entry to Internals.read_integer_at(ptr, 48)
+    Set entry.prev_entry to Internals.read_integer_at(ptr, 56)
+    
+    Return entry
+End Process
+
+Process called "write_cache_entry" that takes ptr as Integer, entry as SyscallCacheEntry returns Nothing:
+    @Performance_Hints
+    Single cache line write for entry data.
+    @End Performance_Hints
+    
+    Internals.write_integer_at(ptr, 0, Internals.string_to_ptr(entry.syscall_name))
+    Internals.write_integer_at(ptr, 8, entry.arguments_hash)
+    Internals.write_integer_at(ptr, 16, entry.result_value)
+    Internals.write_integer_at(ptr, 24, entry.timestamp)
+    Internals.write_integer_at(ptr, 32, entry.hit_count)
+    Let is_valid_int be 0
+    If entry.is_valid:
+        Set is_valid_int to 1
+    End If
+    Internals.write_integer_at(ptr, 40, is_valid_int)
+    Internals.write_integer_at(ptr, 48, entry.next_entry)
+    Internals.write_integer_at(ptr, 56, entry.prev_entry)
+End Process
+
+Note: =====================================================================
+Note: UTILITY FUNCTIONS
+Note: =====================================================================
+
+Process called "get_current_timestamp_ms" returns Integer:
+    @Performance_Hints
+    Uses CLOCK_MONOTONIC for consistent timing measurements.
+    @End Performance_Hints
+    
+    Let seconds as Integer
+    Let nanoseconds as Integer
+    
+    Inline Assembly:
+        "mov rax, 228\n"        Note: clock_gettime syscall number
+        "mov rdi, 1\n"          Note: CLOCK_MONOTONIC
+        "lea rsi, [rsp-16]\n"   Note: timespec buffer on stack
+        "syscall\n"
+        "mov %0, [rsi]\n"       Note: seconds
+        "mov %1, [rsi+8]\n"     Note: nanoseconds
+        : "=r"(seconds), "=r"(nanoseconds)
+        :
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    Note: Convert to milliseconds
+    Let ms be seconds multiplied by 1000
+    Set ms to ms plus (nanoseconds divided by 1000000)
+    Return ms
+End Process
+
+Process called "get_high_precision_timestamp" returns Integer:
+    @Performance_Hints
+    Returns nanosecond precision timestamp for performance measurements.
+    @End Performance_Hints
+    
+    Let result as Integer
+    
+    Inline Assembly:
+        "rdtsc\n"               Note: Read time stamp counter
+        "shl rdx, 32\n"         Note: Shift high bits
+        "or rax, rdx\n"         Note: Combine with low bits
+        "mov %0, rax\n"
+        : "=r"(result)
+        :
+        : "rax", "rdx"
+    End Assembly
+    
+    Return result
+End Process
+
+Process called "address_of" that takes value as Integer returns Integer:
+    @Performance_Hints
+    Returns address of value for atomic operations.
+    @End Performance_Hints
+    
+    Let addr as Integer
+    Inline Assembly:
+        "lea rax, %1\n"
+        "mov %0, rax\n"
+        : "=r"(addr)
+        : "m"(value)
+        : "rax"
+    End Assembly
+    Return addr
+End Process
+
+Process called "execute_syscall_direct" that takes syscall_name as String, args as Internals.InternalArray returns Integer:
+    @Performance_Hints
+    Direct syscall execution for cache warming.
+    @End Performance_Hints
+    
+    Note: Full syscall dispatch implementation
+    If syscall_name equals Registry.SYSCALL_GETPID:
+        Let result as Integer
+        Inline Assembly:
+            "mov rax, 39\n"     Note: getpid syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r"(result)
+            :
+            : "rax", "rcx", "r11"
+        End Assembly
+        Return result
+    End If
+    
+    If syscall_name equals Registry.SYSCALL_GETUID:
+        Let result as Integer
+        Inline Assembly:
+            "mov rax, 102\n"    Note: getuid syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r"(result)
+            :
+            : "rax", "rcx", "r11"
+        End Assembly
+        Return result
+    End If
+    
+    If syscall_name equals Registry.SYSCALL_GETEUID:
+        Let result as Integer
+        Inline Assembly:
+            "mov rax, 107\n"    Note: geteuid syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r"(result)
+            :
+            : "rax", "rcx", "r11"
+        End Assembly
+        Return result
+    End If
+    
+    If syscall_name equals Registry.SYSCALL_GETGID:
+        Let result as Integer
+        Inline Assembly:
+            "mov rax, 104\n"    Note: getgid syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r"(result)
+            :
+            : "rax", "rcx", "r11"
+        End Assembly
+        Return result
+    End If
+    
+    If syscall_name equals Registry.SYSCALL_GETEGID:
+        Let result as Integer
+        Inline Assembly:
+            "mov rax, 108\n"    Note: getegid syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r"(result)
+            :
+            : "rax", "rcx", "r11"
+        End Assembly
+        Return result
+    End If
+    
+    If syscall_name equals Registry.SYSCALL_GETPPID:
+        Let result as Integer
+        Inline Assembly:
+            "mov rax, 110\n"    Note: getppid syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r"(result)
+            :
+            : "rax", "rcx", "r11"
+        End Assembly
+        Return result
+    End If
+    
+    If syscall_name equals "getcwd":
+        If args.length greater_than_or_equal 2:
+            Let buffer_ptr be Internals.internal_array_get(args, 0)
+            Let buffer_size be Internals.internal_array_get(args, 1)
+            Let result as Integer
+            Inline Assembly:
+                "mov rax, 79\n"     Note: getcwd syscall number
+                "mov rdi, %1\n"     Note: buffer pointer
+                "mov rsi, %2\n"     Note: buffer size
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r"(result)
+                : "r"(buffer_ptr), "r"(buffer_size)
+                : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+            End Assembly
+            Return result
+        End If
+    End If
+    
+    If syscall_name equals "uname":
+        If args.length greater_than_or_equal 1:
+            Let struct_ptr be Internals.internal_array_get(args, 0)
+            Let result as Integer
+            Inline Assembly:
+                "mov rax, 63\n"     Note: uname syscall number
+                "mov rdi, %1\n"     Note: struct pointer
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r"(result)
+                : "r"(struct_ptr)
+                : "rax", "rdi", "rcx", "r11", "memory"
+            End Assembly
+            Return result
+        End If
+    End If
+    
+    If syscall_name equals Registry.SYSCALL_GETTIMEOFDAY:
+        If args.length greater_than_or_equal 2:
+            Let tv_ptr be Internals.internal_array_get(args, 0)
+            Let tz_ptr be Internals.internal_array_get(args, 1)
+            Let result as Integer
+            Inline Assembly:
+                "mov rax, 96\n"     Note: gettimeofday syscall number
+                "mov rdi, %1\n"     Note: timeval pointer
+                "mov rsi, %2\n"     Note: timezone pointer
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r"(result)
+                : "r"(tv_ptr), "r"(tz_ptr)
+                : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+            End Assembly
+            Return result
+        End If
+    End If
+    
+    If syscall_name equals Registry.SYSCALL_STAT:
+        If args.length greater_than_or_equal 2:
+            Let path_ptr be Internals.internal_array_get(args, 0)
+            Let stat_ptr be Internals.internal_array_get(args, 1)
+            Let result as Integer
+            Inline Assembly:
+                "mov rax, 4\n"      Note: stat syscall number
+                "mov rdi, %1\n"     Note: path pointer
+                "mov rsi, %2\n"     Note: stat struct pointer
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r"(result)
+                : "r"(path_ptr), "r"(stat_ptr)
+                : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+            End Assembly
+            Return result
+        End If
+    End If
+    
+    If syscall_name equals Registry.SYSCALL_CLOCK_GETTIME:
+        If args.length greater_than_or_equal 2:
+            Let clock_id be Internals.internal_array_get(args, 0)
+            Let timespec_ptr be Internals.internal_array_get(args, 1)
+            Let result as Integer
+            Inline Assembly:
+                "mov rax, 228\n"    Note: clock_gettime syscall number
+                "mov rdi, %1\n"     Note: clock ID
+                "mov rsi, %2\n"     Note: timespec pointer
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r"(result)
+                : "r"(clock_id), "r"(timespec_ptr)
+                : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+            End Assembly
+            Return result
+        End If
+    End If
+    
+    Note: Unsupported syscall - return error
+    Return minus 38  Note: ENOSYS - Function not implemented
+End Process
+
+Process called "integer_to_string" that takes value as Integer returns String:
+    @Performance_Hints
+    Optimized integer to string conversion without allocation.
+    @End Performance_Hints
+    
+    If value equals 0:
+        Return "0"
+    End If
+    
+    Let is_negative be false
+    Let num be value
+    If value less than 0:
+        Set is_negative to true
+        Set num to 0 minus value
+    End If
+    
+    Let sb be Internals.create_string_builder()
+    Let digits be Internals.create_internal_array(20)  Note: Max 20 digits for 64-bit int
+    Let digit_count be 0
+    
+    While num greater than 0:
+        Let digit be num modulo 10
+        Internals.internal_array_add(digits, digit)
+        Set digit_count to digit_count plus 1
+        Set num to num divided by 10
+    End While
+    
+    If is_negative:
+        Internals.string_builder_append(sb, "-")
+    End If
+    
+    Note: Append digits in reverse order
+    Let i be digit_count minus 1
+    While i greater than or equal to 0:
+        Let digit be Internals.internal_array_get(digits, i)
+        Let digit_char be digit plus 48  Note: ASCII '0' is 48
+        Let char_str be character_from_code(digit_char)
+        Internals.string_builder_append(sb, char_str)
+        Set i to i minus 1
+    End While
+    
+    Internals.free_internal_array(digits)
+    Return Internals.string_builder_to_string(sb)
+End Process
+
+Process called "character_from_code" that takes code as Integer returns String:
+    @Performance_Hints
+    Creates single-character string from ASCII code.
+    @End Performance_Hints
+    
+    Note: Create string with single character
+    Let chars as InternalArray[1]
+    Set chars[0] to code as Character
+    Return String from chars
+End Process

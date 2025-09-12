@@ -8,6 +8,8 @@
 
 The Runa Standard Library provides a comprehensive set of built-in functions, types, and modules that enable rapid development while maintaining the language's natural syntax philosophy. The library is designed to be intuitive, with function names and operations that read like natural language.
 
+Scope note (normative): Language rules (syntax, semantics, grammar, execution model) are defined in the language specification files (e.g., `runa_complete_specification.md`, `runa_formal_grammar.md`). This document is limited to library APIs and behavior. If conflicts arise, language specifications take precedence; this document should reference them rather than restate rules.
+
 **Mathematical Symbol Note**: All examples use natural language operators (`plus`, `minus`, `multiplied by`, `divided by`) which are always valid. Mathematical symbols (`+`, `-`, `*`, `/`) are restricted to mathematical contexts only.
 
 ## Core Modules
@@ -1900,3 +1902,8 @@ Let stats be custom_math.advanced_statistics with data as dataset
 - Provide test fixtures for common scenarios
 
 This standard library provides a solid foundation for Runa development while maintaining the language's philosophy of natural, readable code that bridges human thinking and machine execution.
+
+## Open Issues
+
+1. Ensure all stdlib examples reference the canonical language spec for mode-scoped syntax.
+2. Audit modules for any restated language rules; replace with links to spec sections.

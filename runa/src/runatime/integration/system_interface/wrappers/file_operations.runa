@@ -1,0 +1,764 @@
+Note: File Operations Wrapper - Direct syscall interface for file I/O
+Note: Provides self-contained file operations without stdlib dependencies
+
+@Reasoning
+The file operations wrapper provides direct syscall access for all file-related
+operations. This is essential for the runtime to perform file I/O, directory
+operations, and filesystem queries without relying on any stdlib functionality.
+It forms the foundation for all higher-level file abstractions.
+@End Reasoning
+
+Import module "compiler/frontend/primitives/types/compiler_internals" as "Internals"
+
+Note: =====================================================================
+Note: FILE CONSTANTS
+Note: =====================================================================
+
+Note: File open flags
+Let O_RDONLY be 0x0000     Note: Open for reading only
+Let O_WRONLY be 0x0001     Note: Open for writing only  
+Let O_RDWR be 0x0002       Note: Open for reading and writing
+Let O_CREAT be 0x0040      Note: Create file if it doesn't exist
+Let O_EXCL be 0x0080       Note: Fail if file exists (with O_CREAT)
+Let O_NOCTTY be 0x0100     Note: Don't make terminal controlling tty
+Let O_TRUNC be 0x0200      Note: Truncate file to zero length
+Let O_APPEND be 0x0400     Note: Append mode
+Let O_NONBLOCK be 0x0800   Note: Non-blocking mode
+Let O_SYNC be 0x1000       Note: Synchronous writes
+Let O_ASYNC be 0x2000      Note: Asynchronous I/O
+Let O_DIRECT be 0x4000     Note: Direct I/O (bypass cache)
+Let O_DIRECTORY be 0x10000 Note: Must be a directory
+Let O_NOFOLLOW be 0x20000  Note: Don't follow symlinks
+Let O_CLOEXEC be 0x80000   Note: Close on exec
+
+Note: File permissions
+Let S_IRUSR be 0o400       Note: User read
+Let S_IWUSR be 0o200       Note: User write
+Let S_IXUSR be 0o100       Note: User execute
+Let S_IRGRP be 0o040       Note: Group read
+Let S_IWGRP be 0o020       Note: Group write
+Let S_IXGRP be 0o010       Note: Group execute
+Let S_IROTH be 0o004       Note: Other read
+Let S_IWOTH be 0o002       Note: Other write
+Let S_IXOTH be 0o001       Note: Other execute
+
+Note: Seek whence values
+Let SEEK_SET be 0          Note: Seek from beginning
+Let SEEK_CUR be 1          Note: Seek from current position
+Let SEEK_END be 2          Note: Seek from end
+
+Note: =====================================================================
+Note: FILE STRUCTURES
+Note: =====================================================================
+
+Type called "FileDescriptor":
+    fd as Integer                         Note: File descriptor number
+    flags as Integer                      Note: Open flags
+    mode as Integer                       Note: Permission mode
+    is_open as Boolean                    Note: Whether file is open
+End Type
+
+Type called "FileStat":
+    device as Integer                     Note: Device ID
+    inode as Integer                      Note: Inode number
+    mode as Integer                       Note: File mode (type and permissions)
+    nlink as Integer                      Note: Number of hard links
+    uid as Integer                        Note: User ID
+    gid as Integer                        Note: Group ID
+    rdev as Integer                       Note: Device ID (if special file)
+    size as Integer                       Note: File size in bytes
+    blksize as Integer                    Note: Block size for I/O
+    blocks as Integer                     Note: Number of blocks allocated
+    atime_sec as Integer                  Note: Access time (seconds)
+    atime_nsec as Integer                 Note: Access time (nanoseconds)
+    mtime_sec as Integer                  Note: Modification time (seconds)
+    mtime_nsec as Integer                 Note: Modification time (nanoseconds)
+    ctime_sec as Integer                  Note: Status change time (seconds)
+    ctime_nsec as Integer                 Note: Status change time (nanoseconds)
+End Type
+
+Type called "DirectoryEntry":
+    inode as Integer                      Note: Inode number
+    offset as Integer                     Note: Offset to next entry
+    reclen as Integer                     Note: Length of this record
+    type as Integer                       Note: File type
+    name as String                        Note: Filename
+End Type
+
+Note: =====================================================================
+Note: FILE OPENING AND CLOSING
+Note: =====================================================================
+
+Note: Open file
+Process called "open_file" that takes path as String, flags as Integer, mode as Integer returns FileDescriptor:
+    @Implementation
+    Opens a file using the open syscall with specified flags and mode.
+    Returns a FileDescriptor structure with the file descriptor number.
+    @End Implementation
+    
+    Let fd_struct be FileDescriptor
+    Let path_ptr be get_string_pointer(path)
+    
+    Let fd be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rsi, %2\n"           Note: Flags
+        "mov rdx, %3\n"           Note: Mode
+        "mov rax, 2\n"            Note: open syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(fd)
+        : "r"(path_ptr), "r"(flags), "r"(mode)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11"
+    End Assembly
+    
+    Set fd_struct.fd to fd
+    Set fd_struct.flags to flags
+    Set fd_struct.mode to mode
+    Set fd_struct.is_open to fd >= 0
+    
+    Return fd_struct
+End Process
+
+Note: Open file at directory
+Process called "openat" that takes dirfd as Integer, path as String, flags as Integer, mode as Integer returns FileDescriptor:
+    @Implementation
+    Opens a file relative to a directory file descriptor using openat syscall.
+    @End Implementation
+    
+    Let fd_struct be FileDescriptor
+    Let path_ptr be get_string_pointer(path)
+    
+    Let fd be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Directory FD
+        "mov rsi, %2\n"           Note: Path
+        "mov rdx, %3\n"           Note: Flags
+        "mov r10, %4\n"           Note: Mode
+        "mov rax, 257\n"          Note: openat syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(fd)
+        : "r"(dirfd), "r"(path_ptr), "r"(flags), "r"(mode)
+        : "rax", "rdi", "rsi", "rdx", "r10", "rcx", "r11"
+    End Assembly
+    
+    Set fd_struct.fd to fd
+    Set fd_struct.flags to flags
+    Set fd_struct.mode to mode
+    Set fd_struct.is_open to fd >= 0
+    
+    Return fd_struct
+End Process
+
+Note: Close file
+Process called "close_file" that takes fd as FileDescriptor returns Integer:
+    @Implementation
+    Closes a file descriptor using the close syscall.
+    @End Implementation
+    
+    If not fd.is_open:
+        Return -1
+    End If
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: File descriptor
+        "mov rax, 3\n"            Note: close syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(fd.fd)
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+    
+    If result equals 0:
+        Set fd.is_open to false
+    End If
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: FILE READING AND WRITING
+Note: =====================================================================
+
+Note: Read from file
+Process called "read_file" that takes fd as FileDescriptor, buffer as Integer, count as Integer returns Integer:
+    @Implementation
+    Reads data from a file into a buffer using the read syscall.
+    Returns number of bytes read, or -1 on error.
+    @End Implementation
+    
+    If not fd.is_open:
+        Return -1
+    End If
+    
+    Let bytes_read be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: File descriptor
+        "mov rsi, %2\n"           Note: Buffer
+        "mov rdx, %3\n"           Note: Count
+        "mov rax, 0\n"            Note: read syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(bytes_read)
+        : "r"(fd.fd), "r"(buffer), "r"(count)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return bytes_read
+End Process
+
+Note: Write to file
+Process called "write_file" that takes fd as FileDescriptor, buffer as Integer, count as Integer returns Integer:
+    @Implementation
+    Writes data from a buffer to a file using the write syscall.
+    Returns number of bytes written, or -1 on error.
+    @End Implementation
+    
+    If not fd.is_open:
+        Return -1
+    End If
+    
+    Let bytes_written be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: File descriptor
+        "mov rsi, %2\n"           Note: Buffer
+        "mov rdx, %3\n"           Note: Count
+        "mov rax, 1\n"            Note: write syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(bytes_written)
+        : "r"(fd.fd), "r"(buffer), "r"(count)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return bytes_written
+End Process
+
+Note: Read at specific offset
+Process called "pread" that takes fd as FileDescriptor, buffer as Integer, count as Integer, offset as Integer returns Integer:
+    @Implementation
+    Reads data from a specific offset without changing file position.
+    @End Implementation
+    
+    If not fd.is_open:
+        Return -1
+    End If
+    
+    Let bytes_read be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: File descriptor
+        "mov rsi, %2\n"           Note: Buffer
+        "mov rdx, %3\n"           Note: Count
+        "mov r10, %4\n"           Note: Offset
+        "mov rax, 17\n"           Note: pread64 syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(bytes_read)
+        : "r"(fd.fd), "r"(buffer), "r"(count), "r"(offset)
+        : "rax", "rdi", "rsi", "rdx", "r10", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return bytes_read
+End Process
+
+Note: Write at specific offset
+Process called "pwrite" that takes fd as FileDescriptor, buffer as Integer, count as Integer, offset as Integer returns Integer:
+    @Implementation
+    Writes data at a specific offset without changing file position.
+    @End Implementation
+    
+    If not fd.is_open:
+        Return -1
+    End If
+    
+    Let bytes_written be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: File descriptor
+        "mov rsi, %2\n"           Note: Buffer
+        "mov rdx, %3\n"           Note: Count
+        "mov r10, %4\n"           Note: Offset
+        "mov rax, 18\n"           Note: pwrite64 syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(bytes_written)
+        : "r"(fd.fd), "r"(buffer), "r"(count), "r"(offset)
+        : "rax", "rdi", "rsi", "rdx", "r10", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return bytes_written
+End Process
+
+Note: =====================================================================
+Note: FILE POSITIONING
+Note: =====================================================================
+
+Note: Seek in file
+Process called "seek_file" that takes fd as FileDescriptor, offset as Integer, whence as Integer returns Integer:
+    @Implementation
+    Changes file position using lseek syscall.
+    Whence can be SEEK_SET, SEEK_CUR, or SEEK_END.
+    @End Implementation
+    
+    If not fd.is_open:
+        Return -1
+    End If
+    
+    Let new_position be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: File descriptor
+        "mov rsi, %2\n"           Note: Offset
+        "mov rdx, %3\n"           Note: Whence
+        "mov rax, 8\n"            Note: lseek syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(new_position)
+        : "r"(fd.fd), "r"(offset), "r"(whence)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11"
+    End Assembly
+    
+    Return new_position
+End Process
+
+Note: Get current file position
+Process called "tell_file" that takes fd as FileDescriptor returns Integer:
+    @Implementation
+    Gets current file position by seeking 0 bytes from current position.
+    @End Implementation
+    
+    Return seek_file(fd, 0, SEEK_CUR)
+End Process
+
+Note: =====================================================================
+Note: FILE INFORMATION
+Note: =====================================================================
+
+Note: Get file status
+Process called "stat_file" that takes path as String returns FileStat:
+    @Implementation
+    Gets file status information using stat syscall.
+    @End Implementation
+    
+    Let file_stat be FileStat
+    Let stat_buffer be allocate_stat_buffer()
+    Let path_ptr be get_string_pointer(path)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rsi, %2\n"           Note: Stat buffer
+        "mov rax, 4\n"            Note: stat syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr), "r"(stat_buffer)
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    If result equals 0:
+        parse_stat_buffer(stat_buffer, file_stat)
+    End If
+    
+    Return file_stat
+End Process
+
+Note: Get file status by descriptor
+Process called "fstat_file" that takes fd as FileDescriptor returns FileStat:
+    @Implementation
+    Gets file status information using fstat syscall.
+    @End Implementation
+    
+    Let file_stat be FileStat
+    
+    If not fd.is_open:
+        Return file_stat
+    End If
+    
+    Let stat_buffer be allocate_stat_buffer()
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: File descriptor
+        "mov rsi, %2\n"           Note: Stat buffer
+        "mov rax, 5\n"            Note: fstat syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(fd.fd), "r"(stat_buffer)
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    If result equals 0:
+        parse_stat_buffer(stat_buffer, file_stat)
+    End If
+    
+    Return file_stat
+End Process
+
+Note: Check file access
+Process called "access_file" that takes path as String, mode as Integer returns Boolean:
+    @Implementation
+    Checks file accessibility using access syscall.
+    Mode can be combination of R_OK(4), W_OK(2), X_OK(1), or F_OK(0).
+    @End Implementation
+    
+    Let path_ptr be get_string_pointer(path)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rsi, %2\n"           Note: Mode
+        "mov rax, 21\n"           Note: access syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr), "r"(mode)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result equals 0
+End Process
+
+Note: =====================================================================
+Note: FILE OPERATIONS
+Note: =====================================================================
+
+Note: Rename file
+Process called "rename_file" that takes old_path as String, new_path as String returns Integer:
+    @Implementation
+    Renames a file using rename syscall.
+    @End Implementation
+    
+    Let old_ptr be get_string_pointer(old_path)
+    Let new_ptr be get_string_pointer(new_path)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Old path
+        "mov rsi, %2\n"           Note: New path
+        "mov rax, 82\n"           Note: rename syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(old_ptr), "r"(new_ptr)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Delete file
+Process called "unlink_file" that takes path as String returns Integer:
+    @Implementation
+    Deletes a file using unlink syscall.
+    @End Implementation
+    
+    Let path_ptr be get_string_pointer(path)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rax, 87\n"           Note: unlink syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr)
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Truncate file
+Process called "truncate_file" that takes path as String, length as Integer returns Integer:
+    @Implementation
+    Truncates a file to specified length using truncate syscall.
+    @End Implementation
+    
+    Let path_ptr be get_string_pointer(path)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rsi, %2\n"           Note: Length
+        "mov rax, 76\n"           Note: truncate syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr), "r"(length)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Sync file to disk
+Process called "fsync_file" that takes fd as FileDescriptor returns Integer:
+    @Implementation
+    Syncs file data and metadata to disk using fsync syscall.
+    @End Implementation
+    
+    If not fd.is_open:
+        Return -1
+    End If
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: File descriptor
+        "mov rax, 74\n"           Note: fsync syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(fd.fd)
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: DIRECTORY OPERATIONS
+Note: =====================================================================
+
+Note: Create directory
+Process called "mkdir" that takes path as String, mode as Integer returns Integer:
+    @Implementation
+    Creates a directory using mkdir syscall.
+    @End Implementation
+    
+    Let path_ptr be get_string_pointer(path)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rsi, %2\n"           Note: Mode
+        "mov rax, 83\n"           Note: mkdir syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr), "r"(mode)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Remove directory
+Process called "rmdir" that takes path as String returns Integer:
+    @Implementation
+    Removes an empty directory using rmdir syscall.
+    @End Implementation
+    
+    Let path_ptr be get_string_pointer(path)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rax, 84\n"           Note: rmdir syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr)
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Read directory entries
+Process called "getdents" that takes fd as FileDescriptor, buffer as Integer, count as Integer returns Integer:
+    @Implementation
+    Reads directory entries using getdents64 syscall.
+    @End Implementation
+    
+    If not fd.is_open:
+        Return -1
+    End If
+    
+    Let bytes_read be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: File descriptor
+        "mov rsi, %2\n"           Note: Buffer
+        "mov rdx, %3\n"           Note: Count
+        "mov rax, 217\n"          Note: getdents64 syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(bytes_read)
+        : "r"(fd.fd), "r"(buffer), "r"(count)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return bytes_read
+End Process
+
+Note: =====================================================================
+Note: FILE PERMISSIONS
+Note: =====================================================================
+
+Note: Change file permissions
+Process called "chmod_file" that takes path as String, mode as Integer returns Integer:
+    @Implementation
+    Changes file permissions using chmod syscall.
+    @End Implementation
+    
+    Let path_ptr be get_string_pointer(path)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rsi, %2\n"           Note: Mode
+        "mov rax, 90\n"           Note: chmod syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr), "r"(mode)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Change file ownership
+Process called "chown_file" that takes path as String, uid as Integer, gid as Integer returns Integer:
+    @Implementation
+    Changes file ownership using chown syscall.
+    @End Implementation
+    
+    Let path_ptr be get_string_pointer(path)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rsi, %2\n"           Note: UID
+        "mov rdx, %3\n"           Note: GID
+        "mov rax, 92\n"           Note: chown syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr), "r"(uid), "r"(gid)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Note: Allocate stat buffer
+Process called "allocate_stat_buffer" returns Integer:
+    Let stat_size be 144  Note: sizeof(struct stat)
+    Let buffer be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"
+        "mov rax, 9\n"            Note: mmap
+        "xor rsi, rsi\n"
+        "mov rdx, 3\n"            Note: PROT_READ | PROT_WRITE
+        "mov r10, 0x22\n"         Note: MAP_PRIVATE | MAP_ANONYMOUS
+        "mov r8, -1\n"
+        "xor r9, r9\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(buffer)
+        : "r"(stat_size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return buffer
+End Process
+
+Note: Parse stat buffer
+Process called "parse_stat_buffer" that takes buffer as Integer, stat as FileStat:
+    @Implementation
+    Extracts stat information from buffer into FileStat structure.
+    @End Implementation
+    
+    Set stat.device to read_long_at_offset(buffer, 0)
+    Set stat.inode to read_long_at_offset(buffer, 8)
+    Set stat.nlink to read_long_at_offset(buffer, 16)
+    Set stat.mode to read_int_at_offset(buffer, 24)
+    Set stat.uid to read_int_at_offset(buffer, 28)
+    Set stat.gid to read_int_at_offset(buffer, 32)
+    Set stat.rdev to read_long_at_offset(buffer, 40)
+    Set stat.size to read_long_at_offset(buffer, 48)
+    Set stat.blksize to read_long_at_offset(buffer, 56)
+    Set stat.blocks to read_long_at_offset(buffer, 64)
+    Set stat.atime_sec to read_long_at_offset(buffer, 72)
+    Set stat.atime_nsec to read_long_at_offset(buffer, 80)
+    Set stat.mtime_sec to read_long_at_offset(buffer, 88)
+    Set stat.mtime_nsec to read_long_at_offset(buffer, 96)
+    Set stat.ctime_sec to read_long_at_offset(buffer, 104)
+    Set stat.ctime_nsec to read_long_at_offset(buffer, 112)
+End Process
+
+Note: Read long at offset
+Process called "read_long_at_offset" that takes buffer as Integer, offset as Integer returns Integer:
+    Let value be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"
+        "add rax, %2\n"
+        "mov rbx, [rax]\n"
+        "mov %0, rbx\n"
+        : "=r"(value)
+        : "r"(buffer), "r"(offset)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return value
+End Process
+
+Note: Read int at offset
+Process called "read_int_at_offset" that takes buffer as Integer, offset as Integer returns Integer:
+    Let value be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"
+        "add rax, %2\n"
+        "movsx rbx, dword [rax]\n"
+        "mov %0, rbx\n"
+        : "=r"(value)
+        : "r"(buffer), "r"(offset)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return value
+End Process
+
+Note: Get string pointer
+Process called "get_string_pointer" that takes str as String returns Integer:
+    Let ptr be Integer
+    Inline Assembly:
+        "lea rax, [%1]\n"
+        "mov %0, rax\n"
+        : "=r"(ptr)
+        : "m"(str)
+        : "rax"
+    End Assembly
+    Return ptr
+End Process
+
+Note: Check if file type is directory
+Process called "is_directory" that takes stat as FileStat returns Boolean:
+    Let S_IFMT be 0o170000   Note: File type mask
+    Let S_IFDIR be 0o040000  Note: Directory type
+    Return (stat.mode & S_IFMT) equals S_IFDIR
+End Process
+
+Note: Check if file type is regular file
+Process called "is_regular_file" that takes stat as FileStat returns Boolean:
+    Let S_IFMT be 0o170000   Note: File type mask
+    Let S_IFREG be 0o100000  Note: Regular file type
+    Return (stat.mode & S_IFMT) equals S_IFREG
+End Process
+
+Note: Check if file type is symlink
+Process called "is_symlink" that takes stat as FileStat returns Boolean:
+    Let S_IFMT be 0o170000   Note: File type mask
+    Let S_IFLNK be 0o120000  Note: Symlink type
+    Return (stat.mode & S_IFMT) equals S_IFLNK
+End Process

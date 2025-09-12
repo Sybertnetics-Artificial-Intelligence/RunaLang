@@ -1,0 +1,570 @@
+Note:
+tests/unit/compiler/frontend/lexical/import_resolution_test.runa
+Import Resolution System Tests
+
+This module provides comprehensive tests for the import resolution system,
+validating absolute and relative path resolution, circular dependency detection,
+module discovery, and error handling capabilities.
+
+Key test scenarios covered:
+- Absolute import path resolution
+- Relative import path resolution
+- Circular dependency detection
+- Module discovery and validation
+- Import path validation and error cases
+- Path suggestion functionality
+- Import tokenization integration
+- Performance and edge case testing
+:End Note
+
+Import "tests/framework/test_runner" as TestRunner
+Import "tests/framework/assertions" as Assert
+Import "compiler/frontend/lexical/import_resolver" as ImportResolver
+Import "compiler/frontend/lexical/lexer" as Lexer
+
+Note: =====================================================================
+Note: TEST DATA STRUCTURES
+Note: =====================================================================
+
+@Reasoning
+Test data structures provide controlled environments for testing
+import resolution without depending on actual file system state.
+This enables reliable, repeatable testing of all resolution scenarios.
+@End Reasoning
+
+Type called "MockFileSystem":
+    files as Dictionary[String, String]      Note: file_path -> file_content
+    directories as List[String]              Note: Available directories
+    readable_files as List[String]          Note: Files that can be read
+    project_root as String                   Note: Mock project root directory
+End Type
+
+Type called "TestImportContext":
+    mock_fs as MockFileSystem               Note: Mock file system
+    import_context as ImportResolver.ImportContext Note: Real import context
+End Type
+
+Note: =====================================================================
+Note: MOCK FILE SYSTEM OPERATIONS
+Note: =====================================================================
+
+@Reasoning
+Mock file system operations allow testing import resolution logic
+without actual file I/O. This provides complete control over the
+test environment and enables testing of error conditions.
+@End Reasoning
+
+Process called "create_mock_filesystem" that takes root_dir as String returns MockFileSystem:
+    Let mock_fs be MockFileSystem with
+        files as create_dictionary(),
+        directories as [root_dir, string_concat(root_dir, "/src"), string_concat(root_dir, "/stdlib")],
+        readable_files as [],
+        project_root as root_dir
+    End MockFileSystem
+    
+    Note: Add some standard test files
+    Set mock_fs.files[string_concat(root_dir, "/src/main.runa")] to "Import \"utils/helper\" as Helper"
+    Set mock_fs.files[string_concat(root_dir, "/src/utils/helper.runa")] to "Process called \"help\" returns String: Return \"helpful\" End Process"
+    Set mock_fs.files[string_concat(root_dir, "/stdlib/math/core.runa")] to "Constant PI as Float is 3.14159"
+    
+    Note: Mark all files as readable initially
+    Set mock_fs.readable_files to [
+        string_concat(root_dir, "/src/main.runa"),
+        string_concat(root_dir, "/src/utils/helper.runa"),
+        string_concat(root_dir, "/stdlib/math/core.runa")
+    ]
+    
+    Return mock_fs
+End Process
+
+Process called "add_test_file" that takes mock_fs as MockFileSystem, file_path as String, content as String returns Nothing:
+    Set mock_fs.files[file_path] to content
+    If Not contains(mock_fs.readable_files, file_path):
+        Set mock_fs.readable_files to add_to_list(mock_fs.readable_files, file_path)
+    End If
+End Process
+
+Process called "create_test_import_context" that takes mock_fs as MockFileSystem, current_file as String returns TestImportContext:
+    Let import_context be ImportResolver.ImportContext with
+        current_file as current_file,
+        project_root as mock_fs.project_root,
+        source_directories as [
+            string_concat(mock_fs.project_root, "/src"),
+            string_concat(mock_fs.project_root, "/stdlib")
+        ],
+        resolved_imports as create_dictionary(),
+        dependency_graph as create_dictionary(),
+        circular_dependencies as []
+    End ImportResolver.ImportContext
+    
+    Return TestImportContext with
+        mock_fs as mock_fs,
+        import_context as import_context
+    End TestImportContext
+End Process
+
+Note: =====================================================================
+Note: ABSOLUTE PATH RESOLUTION TESTS
+Note: =====================================================================
+
+@TestCases
+Tests for absolute import path resolution covering:
+- Standard library imports
+- Source module imports  
+- Non-existent module handling
+- Path normalization
+- Error reporting and suggestions
+@End TestCases
+
+Process called "test_absolute_path_resolution" that takes test_runner as TestRunner returns Nothing:
+    Note: Setup test environment
+    Let mock_fs be create_mock_filesystem("/project")
+    Let test_context be create_test_import_context(mock_fs, "/project/src/main.runa")
+    
+    Note: Test 1: Resolve standard library import
+    Let stdlib_stmt be ImportResolver.ImportStatement with
+        import_path as "math/core",
+        alias_name as None,
+        source_file as "/project/src/main.runa",
+        line_number as 1,
+        column_number as 1,
+        is_relative as False,
+        raw_statement as "Import \"math/core\" as Math"
+    End ImportResolver.ImportStatement
+    
+    Let result be ImportResolver.resolve_import(stdlib_stmt, test_context.import_context)
+    
+    Match result:
+        When Success as resolved:
+            Assert.assert_equals(resolved.resolved_path, "/project/stdlib/math/core.runa")
+            Assert.assert_equals(resolved.module_type, ImportResolver.StandardLibrary)
+            Assert.assert_true(resolved.module_exists)
+        When other:
+            Assert.fail("Expected successful resolution for stdlib import")
+    End Match
+    
+    Note: Test 2: Resolve source module import
+    Let src_stmt be ImportResolver.ImportStatement with
+        import_path as "utils/helper",
+        alias_name as Some("Helper"),
+        source_file as "/project/src/main.runa",
+        line_number as 2,
+        column_number as 1,
+        is_relative as False,
+        raw_statement as "Import \"utils/helper\" as Helper"
+    End ImportResolver.ImportStatement
+    
+    Let src_result be ImportResolver.resolve_import(src_stmt, test_context.import_context)
+    
+    Match src_result:
+        When Success as resolved:
+            Assert.assert_equals(resolved.resolved_path, "/project/src/utils/helper.runa")
+            Assert.assert_equals(resolved.module_type, ImportResolver.SourceModule)
+            Assert.assert_true(resolved.module_exists)
+        When other:
+            Assert.fail("Expected successful resolution for source import")
+    End Match
+    
+    Note: Test 3: Non-existent module
+    Let missing_stmt be ImportResolver.ImportStatement with
+        import_path as "nonexistent/module",
+        alias_name as None,
+        source_file as "/project/src/main.runa",
+        line_number as 3,
+        column_number as 1,
+        is_relative as False,
+        raw_statement as "Import \"nonexistent/module\""
+    End ImportResolver.ImportStatement
+    
+    Let missing_result be ImportResolver.resolve_import(missing_stmt, test_context.import_context)
+    
+    Match missing_result:
+        When ModuleNotFound as error:
+            Assert.assert_contains(error.error_message, "not found")
+            Assert.assert_greater_than(list_length(error.suggestions), 0)
+        When other:
+            Assert.fail("Expected ModuleNotFound for non-existent import")
+    End Match
+End Process
+
+Note: =====================================================================
+Note: RELATIVE PATH RESOLUTION TESTS
+Note: =====================================================================
+
+@TestCases
+Tests for relative import path resolution covering:
+- Same directory imports (./)
+- Parent directory imports (../)
+- Nested relative imports
+- Path normalization
+- Relative path validation
+@End TestCases
+
+Process called "test_relative_path_resolution" that takes test_runner as TestRunner returns Nothing:
+    Note: Setup test environment with nested structure
+    Let mock_fs be create_mock_filesystem("/project")
+    add_test_file(mock_fs, "/project/src/utils/string_utils.runa", "Process called \"trim\" returns String")
+    add_test_file(mock_fs, "/project/src/components/ui.runa", "Import \"../utils/string_utils\" as StringUtils")
+    add_test_file(mock_fs, "/project/src/components/forms/input.runa", "Import \"../../utils/helper\" as Helper")
+    
+    Note: Test 1: Same directory relative import
+    Let test_context be create_test_import_context(mock_fs, "/project/src/utils/helper.runa")
+    Let same_dir_stmt be ImportResolver.ImportStatement with
+        import_path as "./string_utils",
+        alias_name as Some("StringUtils"),
+        source_file as "/project/src/utils/helper.runa",
+        line_number as 1,
+        column_number as 1,
+        is_relative as True,
+        raw_statement as "Import \"./string_utils\" as StringUtils"
+    End ImportResolver.ImportStatement
+    
+    Let result be ImportResolver.resolve_import(same_dir_stmt, test_context.import_context)
+    
+    Match result:
+        When Success as resolved:
+            Assert.assert_equals(resolved.resolved_path, "/project/src/utils/string_utils.runa")
+            Assert.assert_true(resolved.module_exists)
+        When other:
+            Assert.fail("Expected successful resolution for same directory import")
+    End Match
+    
+    Note: Test 2: Parent directory relative import
+    Let parent_context be create_test_import_context(mock_fs, "/project/src/components/ui.runa")
+    Let parent_stmt be ImportResolver.ImportStatement with
+        import_path as "../utils/string_utils",
+        alias_name as Some("StringUtils"),
+        source_file as "/project/src/components/ui.runa",
+        line_number as 1,
+        column_number as 1,
+        is_relative as True,
+        raw_statement as "Import \"../utils/string_utils\" as StringUtils"
+    End ImportResolver.ImportStatement
+    
+    Let parent_result be ImportResolver.resolve_import(parent_stmt, parent_context.import_context)
+    
+    Match parent_result:
+        When Success as resolved:
+            Assert.assert_equals(resolved.resolved_path, "/project/src/utils/string_utils.runa")
+            Assert.assert_true(resolved.module_exists)
+        When other:
+            Assert.fail("Expected successful resolution for parent directory import")
+    End Match
+    
+    Note: Test 3: Multi-level parent directory import
+    Let deep_context be create_test_import_context(mock_fs, "/project/src/components/forms/input.runa")
+    Let deep_stmt be ImportResolver.ImportStatement with
+        import_path as "../../utils/helper",
+        alias_name as Some("Helper"),
+        source_file as "/project/src/components/forms/input.runa",
+        line_number as 1,
+        column_number as 1,
+        is_relative as True,
+        raw_statement as "Import \"../../utils/helper\" as Helper"
+    End ImportResolver.ImportStatement
+    
+    Let deep_result be ImportResolver.resolve_import(deep_stmt, deep_context.import_context)
+    
+    Match deep_result:
+        When Success as resolved:
+            Assert.assert_equals(resolved.resolved_path, "/project/src/utils/helper.runa")
+            Assert.assert_true(resolved.module_exists)
+        When other:
+            Assert.fail("Expected successful resolution for multi-level parent import")
+    End Match
+End Process
+
+Note: =====================================================================
+Note: CIRCULAR DEPENDENCY DETECTION TESTS
+Note: =====================================================================
+
+@TestCases
+Tests for circular dependency detection covering:
+- Direct circular dependencies (A -> B -> A)
+- Indirect circular dependencies (A -> B -> C -> A)
+- Self-referential imports
+- Dependency chain reconstruction
+- Circular dependency reporting
+@End TestCases
+
+Process called "test_circular_dependency_detection" that takes test_runner as TestRunner returns Nothing:
+    Note: Setup test environment with circular dependencies
+    Let mock_fs be create_mock_filesystem("/project")
+    add_test_file(mock_fs, "/project/src/module_a.runa", "Import \"module_b\" as B")
+    add_test_file(mock_fs, "/project/src/module_b.runa", "Import \"module_c\" as C")
+    add_test_file(mock_fs, "/project/src/module_c.runa", "Import \"module_a\" as A")
+    add_test_file(mock_fs, "/project/src/self_ref.runa", "Import \"self_ref\" as Self")
+    
+    Note: Test 1: Direct circular dependency (A -> B -> A)
+    add_test_file(mock_fs, "/project/src/direct_a.runa", "Import \"direct_b\" as B")
+    add_test_file(mock_fs, "/project/src/direct_b.runa", "Import \"direct_a\" as A")
+    
+    Let test_context be create_test_import_context(mock_fs, "/project/src/direct_a.runa")
+    Let direct_stmt be ImportResolver.ImportStatement with
+        import_path as "direct_b",
+        alias_name as Some("B"),
+        source_file as "/project/src/direct_a.runa",
+        line_number as 1,
+        column_number as 1,
+        is_relative as False,
+        raw_statement as "Import \"direct_b\" as B"
+    End ImportResolver.ImportStatement
+    
+    Note: First import should succeed
+    Let first_result be ImportResolver.resolve_import(direct_stmt, test_context.import_context)
+    Assert.assert_true(is_success(first_result))
+    
+    Note: Now try to import back from B to A (should detect circular dependency)
+    Let circular_context be create_test_import_context(mock_fs, "/project/src/direct_b.runa")
+    Set circular_context.import_context.dependency_graph to test_context.import_context.dependency_graph
+    
+    Let circular_stmt be ImportResolver.ImportStatement with
+        import_path as "direct_a",
+        alias_name as Some("A"),
+        source_file as "/project/src/direct_b.runa",
+        line_number as 1,
+        column_number as 1,
+        is_relative as False,
+        raw_statement as "Import \"direct_a\" as A"
+    End ImportResolver.ImportStatement
+    
+    Let circular_result be ImportResolver.resolve_import(circular_stmt, circular_context.import_context)
+    
+    Match circular_result:
+        When CircularDependency as circular_dep:
+            Assert.assert_greater_than(list_length(circular_dep.dependency_chain), 1)
+            Assert.assert_contains_item(circular_dep.dependency_chain, "/project/src/direct_a.runa")
+            Assert.assert_contains_item(circular_dep.dependency_chain, "/project/src/direct_b.runa")
+        When other:
+            Assert.fail("Expected circular dependency detection")
+    End Match
+    
+    Note: Test 2: Self-referential import
+    Let self_context be create_test_import_context(mock_fs, "/project/src/self_ref.runa")
+    Let self_stmt be ImportResolver.ImportStatement with
+        import_path as "self_ref",
+        alias_name as Some("Self"),
+        source_file as "/project/src/self_ref.runa",
+        line_number as 1,
+        column_number as 1,
+        is_relative as False,
+        raw_statement as "Import \"self_ref\" as Self"
+    End ImportResolver.ImportStatement
+    
+    Let self_result be ImportResolver.resolve_import(self_stmt, self_context.import_context)
+    
+    Match self_result:
+        When CircularDependency as circular_dep:
+            Assert.assert_equals(list_length(circular_dep.dependency_chain), 1)
+            Assert.assert_contains_item(circular_dep.dependency_chain, "/project/src/self_ref.runa")
+        When other:
+            Assert.fail("Expected self-reference circular dependency detection")
+    End Match
+End Process
+
+Note: =====================================================================
+Note: IMPORT PATH VALIDATION TESTS
+Note: =====================================================================
+
+@TestCases
+Tests for import path validation covering:
+- Invalid characters in paths
+- Path traversal attempts
+- Absolute path rejection
+- Empty path handling
+- Path length limits
+- Malformed import statements
+@End TestCases
+
+Process called "test_import_path_validation" that takes test_runner as TestRunner returns Nothing:
+    Note: Test 1: Empty import path
+    Let empty_validation be ImportResolver.validate_import_path("")
+    Assert.assert_not_equals(empty_validation, "valid")
+    Assert.assert_contains(empty_validation, "empty")
+    
+    Note: Test 2: Invalid characters
+    Let invalid_chars_validation be ImportResolver.validate_import_path("module<>name")
+    Assert.assert_not_equals(invalid_chars_validation, "valid")
+    Assert.assert_contains(invalid_chars_validation, "Invalid character")
+    
+    Note: Test 3: Path traversal attempt
+    Let traversal_validation be ImportResolver.validate_import_path("../../../etc/passwd")
+    Assert.assert_not_equals(traversal_validation, "valid")
+    Assert.assert_contains(traversal_validation, "traversal")
+    
+    Note: Test 4: Absolute Windows path
+    Let windows_validation be ImportResolver.validate_import_path("C:/windows/system32")
+    Assert.assert_not_equals(windows_validation, "valid")
+    Assert.assert_contains(windows_validation, "Absolute Windows")
+    
+    Note: Test 5: Absolute Unix path
+    Let unix_validation be ImportResolver.validate_import_path("/usr/local/bin")
+    Assert.assert_not_equals(unix_validation, "valid")
+    Assert.assert_contains(unix_validation, "Absolute Unix")
+    
+    Note: Test 6: Valid import path
+    Let valid_validation be ImportResolver.validate_import_path("utils/string_helper")
+    Assert.assert_equals(valid_validation, "valid")
+    
+    Note: Test 7: Valid relative path
+    Let relative_validation be ImportResolver.validate_import_path("./local_module")
+    Assert.assert_equals(relative_validation, "valid")
+    
+    Note: Test 8: Excessively long path
+    Let long_path be repeat_string("a", 300)
+    Let long_validation be ImportResolver.validate_import_path(long_path)
+    Assert.assert_not_equals(long_validation, "valid")
+    Assert.assert_contains(long_validation, "too long")
+End Process
+
+Note: =====================================================================
+Note: IMPORT TOKENIZATION INTEGRATION TESTS
+Note: =====================================================================
+
+@TestCases
+Tests for integration between import tokenization and resolution,
+validating that the lexer correctly identifies and processes
+import statements for resolution.
+@End TestCases
+
+Process called "test_import_tokenization_integration" that takes test_runner as TestRunner returns Nothing:
+    Note: Test 1: Simple import statement tokenization
+    Let source_code be "Import \"utils/helper\" as Helper"
+    Let tokens be Lexer.lex_source_code(source_code, "canon", "/project/src/main.runa")
+    
+    Assert.assert_greater_than(TokenStream.token_count(tokens), 0)
+    
+    Let first_token be TokenStream.get_token_at(tokens, 0)
+    Assert.assert_equals(first_token.token_type, "Import")
+    Assert.assert_equals(first_token.value, "utils/helper")
+    
+    Note: Verify import statement is embedded in token
+    Assert.assert_true(is_some(first_token.import_statement))
+    Let import_stmt be unwrap_some(first_token.import_statement)
+    Assert.assert_equals(import_stmt.import_path, "utils/helper")
+    Assert.assert_equals(unwrap_some(import_stmt.alias_name), "Helper")
+    Assert.assert_false(import_stmt.is_relative)
+    
+    Note: Test 2: Relative import statement
+    Let relative_source be "Import \"./local_module\" as Local"
+    Let relative_tokens be Lexer.lex_source_code(relative_source, "canon", "/project/src/components/ui.runa")
+    
+    Let relative_token be TokenStream.get_token_at(relative_tokens, 0)
+    Assert.assert_equals(relative_token.token_type, "Import")
+    Assert.assert_equals(relative_token.value, "./local_module")
+    
+    Let relative_stmt be unwrap_some(relative_token.import_statement)
+    Assert.assert_true(relative_stmt.is_relative)
+    Assert.assert_equals(relative_stmt.source_file, "/project/src/components/ui.runa")
+    
+    Note: Test 3: Import without alias
+    Let no_alias_source be "Import \"math/core\""
+    Let no_alias_tokens be Lexer.lex_source_code(no_alias_source, "canon", "/project/src/main.runa")
+    
+    Let no_alias_token be TokenStream.get_token_at(no_alias_tokens, 0)
+    Let no_alias_stmt be unwrap_some(no_alias_token.import_statement)
+    Assert.assert_true(is_none(no_alias_stmt.alias_name))
+    
+    Note: Test 4: Malformed import statement
+    Let malformed_source be "Import unclosed_quote"
+    Let malformed_tokens be Lexer.lex_source_code(malformed_source, "canon", "/project/src/main.runa")
+    
+    Note: Should have error tokens or error reporting
+    Assert.assert_true(TokenStream.has_errors(malformed_tokens))
+End Process
+
+Note: =====================================================================
+Note: TEST UTILITIES
+Note: =====================================================================
+
+@Reasoning
+Test utilities provide helper functions for common testing operations
+and validation. These reduce code duplication and improve test readability.
+@End Reasoning
+
+Process called "is_success" that takes result as ImportResolver.ImportResolutionResult returns Boolean:
+    Match result:
+        When Success as resolved:
+            Return True
+        When other:
+            Return False
+    End Match
+End Process
+
+Process called "repeat_string" that takes text as String, count as Integer returns String:
+    Let result be ""
+    For i from 1 to count:
+        Set result to string_concat(result, text)
+    End For
+    Return result
+End Process
+
+Process called "create_dictionary" returns Dictionary[String, String]:
+    Note: Platform-specific dictionary creation
+    Return new_dictionary()
+End Process
+
+Process called "unwrap_some" that takes optional as Optional[ImportResolver.ImportStatement] returns ImportResolver.ImportStatement:
+    Match optional:
+        When Some as value:
+            Return value
+        When None:
+            Assert.fail("Expected Some value but got None")
+    End Match
+End Process
+
+Process called "is_some" that takes optional as Optional[ImportResolver.ImportStatement] returns Boolean:
+    Match optional:
+        When Some as value:
+            Return True
+        When None:
+            Return False
+    End Match
+End Process
+
+Process called "is_none" that takes optional as Optional[String] returns Boolean:
+    Match optional:
+        When Some as value:
+            Return False
+        When None:
+            Return True
+    End Match
+End Process
+
+Note: =====================================================================
+Note: TEST RUNNER INTEGRATION
+Note: =====================================================================
+
+@Reasoning
+Test runner integration provides the main entry point for executing
+all import resolution tests. This enables automated testing and
+integration with CI/CD systems.
+@End Reasoning
+
+Process called "run_all_import_resolution_tests" returns TestRunner.TestResult:
+    Let test_runner be TestRunner.create_test_runner("Import Resolution Tests")
+    
+    TestRunner.add_test(test_runner, "Absolute Path Resolution", test_absolute_path_resolution)
+    TestRunner.add_test(test_runner, "Relative Path Resolution", test_relative_path_resolution)
+    TestRunner.add_test(test_runner, "Circular Dependency Detection", test_circular_dependency_detection)
+    TestRunner.add_test(test_runner, "Import Path Validation", test_import_path_validation)
+    TestRunner.add_test(test_runner, "Import Tokenization Integration", test_import_tokenization_integration)
+    
+    Return TestRunner.run_tests(test_runner)
+End Process
+
+@Performance_Hints
+Import resolution testing should focus on:
+- Mocking file system operations to avoid I/O overhead
+- Using representative test data sets for realistic performance testing
+- Testing with various project sizes to validate scalability
+- Measuring resolution time for performance regression detection
+@End Performance_Hints
+
+@Security_Scope
+Import resolution testing must verify security protections:
+- Path traversal prevention in all test scenarios
+- Proper validation of malicious import paths
+- Boundary condition testing for buffer overflows
+- Permission checking validation in mock file system
+@End Security_Scope

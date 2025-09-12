@@ -240,6 +240,7 @@ Display "Continuation from z=0 to z=2: " joined with Series.laurent_series_to_st
 
 ```runa
 Note: Fourier series for periodic functions
+Note: The following quoted expression uses conventional mathematical "if/then/else" notation as data, not Runa control flow keywords.
 Let square_wave = "if -π < x < 0 then -1 else 1"  Note: Square wave on [-π, π]
 Let fourier_square = Series.fourier_series(square_wave, "x", "π")
 

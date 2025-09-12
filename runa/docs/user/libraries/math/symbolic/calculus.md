@@ -540,6 +540,7 @@ Otherwise:
 
 ```runa
 Note: Test function continuity
+Note: The following quoted expression uses conventional mathematical "if/then/else" notation as data, not Runa control flow keywords.
 Let function be "if x ≠ 0 then sin(x)/x else 1"
 Let continuity_at_zero be Calculus.test_continuity(function, "x", "0")
 
@@ -600,6 +601,7 @@ Display "Classification: " joined with classification  Note: local min/max or sa
 
 ```runa
 Note: Compute Fourier series
+Note: The following quoted expression uses conventional mathematical "if/then/else" notation as data, not Runa control flow keywords.
 Let periodic_function be "if -π < x < 0 then -1 else 1"  Note: Square wave
 Let fourier_series be Calculus.fourier_series(periodic_function, "x", "π")
 

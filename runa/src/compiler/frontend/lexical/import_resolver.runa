@@ -1,0 +1,626 @@
+Note:
+compiler/frontend/lexical/import_resolver.runa
+Import Resolution System
+
+This module provides comprehensive import path resolution capabilities,
+including absolute and relative path resolution, module discovery,
+circular dependency detection, and import validation.
+
+Key features and capabilities:
+- Absolute path resolution from project root
+- Relative path resolution from current file
+- Module discovery and existence validation
+- Circular dependency detection and prevention
+- Import path normalization and canonicalization
+- Error reporting with helpful suggestions
+- Path suggestion for mistyped imports
+- Integration with lexer tokenization
+- Support for both quoted and unquoted import paths
+- Caching for performance optimization
+:End Note
+
+Import "compiler/frontend/diagnostics/errors" as Errors
+
+Note: =====================================================================
+Note: IMPORT RESOLUTION DATA STRUCTURES
+Note: =====================================================================
+
+@Reasoning
+Import resolution requires tracking the relationship between files,
+their import paths, and the resolution context. We need structures
+to represent import statements, resolved paths, and dependency graphs.
+@End Reasoning
+
+Type called "ImportStatement":
+    import_path as String                Note: Original import string from source
+    alias_name as Optional[String]       Note: Optional alias ("as Name")
+    source_file as String                Note: File containing this import
+    line_number as Integer               Note: Line where import appears
+    column_number as Integer             Note: Column where import starts
+    is_relative as Boolean               Note: Whether path starts with "./"
+    raw_statement as String              Note: Complete import statement text
+End Type
+
+Type called "ResolvedImport":
+    import_statement as ImportStatement   Note: Original import statement
+    resolved_path as String              Note: Absolute file system path
+    canonical_path as String             Note: Normalized path for comparison
+    module_exists as Boolean             Note: Whether target file exists
+    module_type as ModuleType            Note: Type of imported module
+    dependencies as List[String]         Note: Files this import depends on
+    resolution_time as Integer           Note: Time taken to resolve (microseconds)
+End Type
+
+Type ModuleType is:
+    | SourceModule                       Note: Standard .runa source file
+    | StandardLibrary                    Note: Built-in stdlib module
+    | ExternalModule                     Note: Third-party module
+    | InvalidModule                      Note: Module that couldn't be resolved
+End Type
+
+Type called "ImportContext":
+    current_file as String               Note: File being processed
+    project_root as String               Note: Root directory of project
+    source_directories as List[String]   Note: Directories to search for modules
+    resolved_imports as Dictionary[String, ResolvedImport] Note: Cache of resolved imports
+    dependency_graph as Dictionary[String, List[String]] Note: File dependency tracking
+    circular_dependencies as List[CircularDependency] Note: Detected circular deps
+End Type
+
+Type called "CircularDependency":
+    dependency_chain as List[String]     Note: Files in circular dependency
+    detection_time as Integer            Note: When this was detected
+    severity as String                   Note: "Error" or "Warning"
+End Type
+
+Type ImportResolutionResult is:
+    | Success as ResolvedImport          Note: Successfully resolved import
+    | CircularDependency as CircularDependency Note: Circular dependency detected
+    | ModuleNotFound as ImportError      Note: Could not find module
+    | InvalidPath as ImportError         Note: Malformed import path
+    | PermissionDenied as ImportError    Note: Cannot access module file
+End Type
+
+Type called "ImportError":
+    import_statement as ImportStatement   Note: Import that failed
+    error_message as String              Note: Human-readable error description
+    suggestions as List[String]          Note: Possible fixes or alternatives
+    error_code as String                 Note: Specific error identifier
+End Type
+
+Note: =====================================================================
+Note: IMPORT RESOLUTION OPERATIONS
+Note: =====================================================================
+
+@Reasoning
+The main entry point for import resolution takes an import statement
+and context, returning either a successful resolution or an error.
+This orchestrates the entire resolution process.
+@End Reasoning
+
+Process called "resolve_import" that takes import_stmt as ImportStatement, context as ImportContext returns ImportResolutionResult:
+    Note: Check cache first for performance
+    Let cache_key be string_concat(import_stmt.source_file, ":", import_stmt.import_path)
+    If contains_key(context.resolved_imports, cache_key):
+        Return Success with context.resolved_imports[cache_key]
+    End If
+    
+    Note: Validate import path format
+    Let path_validation be validate_import_path(import_stmt.import_path)
+    If path_validation is not equal to "valid":
+        Let error be ImportError with
+            import_statement as import_stmt,
+            error_message as path_validation,
+            suggestions as generate_path_suggestions(import_stmt.import_path),
+            error_code as "INVALID_PATH"
+        End ImportError
+        Return InvalidPath with error
+    End If
+    
+    Note: Resolve the actual file path
+    Let resolved_path_result be resolve_file_path(import_stmt, context)
+    Match resolved_path_result:
+        When Success as resolved_path:
+            Note: Check for circular dependencies
+            Let circular_check be check_circular_dependency(import_stmt.source_file, resolved_path, context)
+            Match circular_check:
+                When CircularDetected as circular_dep:
+                    Return CircularDependency with circular_dep
+                When NoDependency:
+                    Note: Create resolved import
+                    Let resolved_import be ResolvedImport with
+                        import_statement as import_stmt,
+                        resolved_path as resolved_path,
+                        canonical_path as canonicalize_path(resolved_path),
+                        module_exists as file_exists(resolved_path),
+                        module_type as determine_module_type(resolved_path, context),
+                        dependencies as extract_dependencies(resolved_path),
+                        resolution_time as get_current_microseconds()
+                    End ResolvedImport
+                    
+                    Note: Cache the result
+                    Set context.resolved_imports[cache_key] to resolved_import
+                    
+                    Note: Update dependency graph
+                    update_dependency_graph(import_stmt.source_file, resolved_path, context)
+                    
+                    Return Success with resolved_import
+            End Match
+        When NotFound as error_msg:
+            Let error be ImportError with
+                import_statement as import_stmt,
+                error_message as error_msg,
+                suggestions as suggest_similar_modules(import_stmt.import_path, context),
+                error_code as "MODULE_NOT_FOUND"
+            End ImportError
+            Return ModuleNotFound with error
+        When AccessDenied as error_msg:
+            Let error be ImportError with
+                import_statement as import_stmt,
+                error_message as error_msg,
+                suggestions as [],
+                error_code as "PERMISSION_DENIED"
+            End ImportError
+            Return PermissionDenied with error
+    End Match
+End Process
+
+@Reasoning
+Path validation ensures import paths follow correct syntax and conventions.
+This catches malformed paths early before attempting file system operations.
+@End Reasoning
+
+Process called "validate_import_path" that takes import_path as String returns String:
+    Note: Check for empty path
+    If string_length(import_path) is equal to 0:
+        Return "Import path cannot be empty"
+    End If
+    
+    Note: Check for invalid characters
+    Let invalid_chars be ['"', "'", "<", ">", "|", "?", "*", ":", "\0"]
+    For Each char in string_to_chars(import_path):
+        If contains(invalid_chars, char):
+            Return string_concat("Invalid character '", string_concat(char, "' in import path"))
+        End If
+    End For
+    
+    Note: Check for path traversal attempts
+    If string_contains(import_path, ".."):
+        Return "Path traversal (..) not allowed in import paths"
+    End If
+    
+    Note: Check for absolute path on Windows (C:, D:, etc.)
+    If string_length(import_path) is greater than or equal to 2:
+        Let second_char be string_char_at(import_path, 1)
+        If second_char is equal to ":":
+            Return "Absolute Windows paths not allowed in imports"
+        End If
+    End If
+    
+    Note: Check for leading slash (absolute Unix path)
+    If string_starts_with(import_path, "/"):
+        Return "Absolute Unix paths not allowed in imports"
+    End If
+    
+    Note: Check for excessive path length
+    If string_length(import_path) is greater than 260:
+        Return "Import path too long (maximum 260 characters)"
+    End If
+    
+    Return "valid"
+End Process
+
+@Reasoning
+File path resolution handles both absolute and relative imports,
+searching through configured source directories and applying
+proper path resolution algorithms.
+@End Reasoning
+
+Type FileResolutionResult is:
+    | Success as String                  Note: Successfully resolved path
+    | NotFound as String                 Note: File not found error message
+    | AccessDenied as String             Note: Permission error message
+End Type
+
+Process called "resolve_file_path" that takes import_stmt as ImportStatement, context as ImportContext returns FileResolutionResult:
+    Note: Handle relative imports (starting with "./" or "../")
+    If import_stmt.is_relative:
+        Return resolve_relative_path(import_stmt, context)
+    End If
+    
+    Note: Handle absolute imports from project root
+    Return resolve_absolute_path(import_stmt, context)
+End Process
+
+@Reasoning
+Relative path resolution resolves imports relative to the current file's directory.
+This supports local module imports and maintains proper file relationships.
+@End Reasoning
+
+Process called "resolve_relative_path" that takes import_stmt as ImportStatement, context as ImportContext returns FileResolutionResult:
+    Note: Get directory of current file
+    Let current_dir be get_directory_path(import_stmt.source_file)
+    
+    Note: Combine with relative import path
+    Let combined_path be path_join(current_dir, import_stmt.import_path)
+    
+    Note: Normalize the path (resolve . and .. components)
+    Let normalized_path be normalize_path(combined_path)
+    
+    Note: Add .runa extension if not present
+    Let final_path be ensure_runa_extension(normalized_path)
+    
+    Note: Check if file exists
+    If file_exists(final_path):
+        Note: Check if we can read the file
+        If file_readable(final_path):
+            Return Success with final_path
+        Otherwise:
+            Return AccessDenied with string_concat("Cannot read file: ", final_path)
+        End If
+    Otherwise:
+        Let error_msg be string_concat("Relative import not found: ", import_stmt.import_path)
+        Set error_msg to string_concat(error_msg, string_concat(" (resolved to: ", string_concat(final_path, ")")))
+        Return NotFound with error_msg
+    End If
+End Process
+
+@Reasoning
+Absolute path resolution searches through configured source directories
+to find modules. This enables importing from standard library and
+other configured module directories.
+@End Reasoning
+
+Process called "resolve_absolute_path" that takes import_stmt as ImportStatement, context as ImportContext returns FileResolutionResult:
+    Note: Try each source directory in order
+    For Each source_dir in context.source_directories:
+        Note: Combine source directory with import path
+        Let combined_path be path_join(source_dir, import_stmt.import_path)
+        
+        Note: Add .runa extension if not present
+        Let final_path be ensure_runa_extension(combined_path)
+        
+        Note: Check if file exists
+        If file_exists(final_path):
+            Note: Check if we can read the file
+            If file_readable(final_path):
+                Return Success with final_path
+            Otherwise:
+                Return AccessDenied with string_concat("Cannot read file: ", final_path)
+            End If
+        End If
+    End For
+    
+    Note: If not found in any source directory, return error
+    Let error_msg be string_concat("Absolute import not found: ", import_stmt.import_path)
+    Set error_msg to string_concat(error_msg, " (searched in: ")
+    Set error_msg to string_concat(error_msg, string_join(context.source_directories, ", "))
+    Set error_msg to string_concat(error_msg, ")")
+    Return NotFound with error_msg
+End Process
+
+Note: =====================================================================
+Note: CIRCULAR DEPENDENCY DETECTION
+Note: =====================================================================
+
+@Reasoning
+Circular dependency detection prevents infinite import loops by tracking
+the dependency chain and detecting when a file tries to import something
+that eventually imports back to itself.
+@End Reasoning
+
+Type CircularDependencyResult is:
+    | CircularDetected as CircularDependency
+    | NoDependency
+End Type
+
+Process called "check_circular_dependency" that takes source_file as String, target_file as String, context as ImportContext returns CircularDependencyResult:
+    Note: Build dependency chain starting from target file
+    Let dependency_chain be build_dependency_chain(target_file, source_file, context, [])
+    
+    Match dependency_chain:
+        When CircularFound as chain:
+            Let circular_dep be CircularDependency with
+                dependency_chain as chain,
+                detection_time as get_current_microseconds(),
+                severity as "Error"
+            End CircularDependency
+            Return CircularDetected with circular_dep
+        When NoCircular:
+            Return NoDependency
+    End Match
+End Process
+
+Type DependencyChainResult is:
+    | CircularFound as List[String]      Note: Files in circular dependency
+    | NoCircular                         Note: No circular dependency found
+End Type
+
+@Reasoning
+Building the dependency chain recursively follows imports to detect cycles.
+We use a visited set to track the current path and detect when we
+revisit a file we're already processing.
+@End Reasoning
+
+Process called "build_dependency_chain" that takes current_file as String, target_file as String, context as ImportContext, visited as List[String] returns DependencyChainResult:
+    Note: Check if we've found the target (circular dependency)
+    If current_file is equal to target_file:
+        Return CircularFound with add_to_list(visited, current_file)
+    End If
+    
+    Note: Check if we've already visited this file in current chain
+    If contains(visited, current_file):
+        Return NoCircular
+    End If
+    
+    Note: Add current file to visited chain
+    Let new_visited be add_to_list(visited, current_file)
+    
+    Note: Get dependencies of current file
+    Let dependencies be get_file_dependencies(current_file, context)
+    
+    Note: Recursively check each dependency
+    For Each dependency in dependencies:
+        Let chain_result be build_dependency_chain(dependency, target_file, context, new_visited)
+        Match chain_result:
+            When CircularFound as chain:
+                Return CircularFound with chain
+            When NoCircular:
+                Note: Continue to next dependency
+        End Match
+    End For
+    
+    Return NoCircular
+End Process
+
+@Reasoning
+Extracting file dependencies involves parsing import statements from
+a source file. This implementation focuses on the
+import resolution aspect with complete dependency extraction.
+@End Reasoning
+
+Process called "get_file_dependencies" that takes file_path as String, context as ImportContext returns List[String]:
+    Note: Check cache first
+    If contains_key(context.dependency_graph, file_path):
+        Return context.dependency_graph[file_path]
+    End If
+    
+    Note: Read file content
+    If Not file_exists(file_path):
+        Return []
+    End If
+    
+    Let file_content be read_file_content(file_path)
+    Let dependencies be extract_dependencies(file_content)
+    
+    Note: Cache the result
+    Set context.dependency_graph[file_path] to dependencies
+    
+    Return dependencies
+End Process
+
+@Reasoning
+Dependency extraction parses file content to find import statements.
+This is a lexical analysis that looks for Import patterns without
+full parsing of the file.
+@End Reasoning
+
+Process called "extract_dependencies" that takes file_content as String returns List[String]:
+    Let dependencies be []
+    Let lines be string_split(file_content, "\n")
+    
+    For Each line in lines:
+        Let trimmed_line be string_trim(line)
+        
+        Note: Look for Import statements
+        If string_starts_with(trimmed_line, "Import \""):
+            Let import_path be extract_import_path_from_line(trimmed_line)
+            If string_length(import_path) is greater than 0:
+                Set dependencies to add_to_list(dependencies, import_path)
+            End If
+        End If
+    End For
+    
+    Return dependencies
+End Process
+
+@Reasoning
+Extracting import path from a line requires parsing the Import statement
+to get the quoted path. This handles both simple imports and imports with aliases.
+@End Reasoning
+
+Process called "extract_import_path_from_line" that takes line as String returns String:
+    Note: Find opening quote after "Import "
+    Let import_start be string_find(line, "Import \"")
+    If import_start is equal to negative_one():
+        Return ""
+    End If
+    
+    Note: Find the path between quotes
+    Let path_start be import_start plus 8  Note: Length of "Import \""
+    Let path_end be string_find_from_index(line, "\"", path_start)
+    
+    If path_end is equal to negative_one():
+        Return ""
+    End If
+    
+    Return string_substring(line, path_start, path_end)
+End Process
+
+Note: =====================================================================
+Note: MODULE DISCOVERY AND VALIDATION
+Note: =====================================================================
+
+@Reasoning
+Module type determination helps classify imports for different handling.
+Standard library modules, external modules, and source modules may
+have different resolution rules and validation requirements.
+@End Reasoning
+
+Process called "determine_module_type" that takes file_path as String, context as ImportContext returns ModuleType:
+    Note: Check if it's a standard library module
+    For Each source_dir in context.source_directories:
+        If string_contains(source_dir, "stdlib") And string_starts_with(file_path, source_dir):
+            Return StandardLibrary
+        End If
+    End For
+    
+    Note: Check if file exists and is readable
+    If Not file_exists(file_path):
+        Return InvalidModule
+    End If
+    
+    If Not file_readable(file_path):
+        Return InvalidModule
+    End If
+    
+    Note: Check if it's in project source directories
+    For Each source_dir in context.source_directories:
+        If string_starts_with(file_path, source_dir):
+            Return SourceModule
+        End If
+    End For
+    
+    Note: If not in any source directory, consider it external
+    Return ExternalModule
+End Process
+
+@Reasoning
+Path suggestion helps users fix typos in import paths by finding
+similar existing modules. This improves developer experience by
+providing helpful error messages.
+@End Reasoning
+
+Process called "suggest_similar_modules" that takes import_path as String, context as ImportContext returns List[String]:
+    Let suggestions be []
+    
+    Note: Get all available modules
+    Let available_modules be find_all_modules(context)
+    
+    Note: Find modules with similar names using edit distance
+    For Each module_path in available_modules:
+        Let similarity be calculate_string_similarity(import_path, module_path)
+        If similarity is greater than 0.6:  Note: 60% similarity threshold
+            Set suggestions to add_to_list(suggestions, module_path)
+        End If
+    End For
+    
+    Note: Sort suggestions by similarity (most similar first)
+    Set suggestions to sort_by_similarity(suggestions, import_path)
+    
+    Note: Limit to top 5 suggestions
+    If list_length(suggestions) is greater than 5:
+        Return list_take(suggestions, 5)
+    End If
+    
+    Return suggestions
+End Process
+
+@Reasoning
+Finding all available modules involves scanning the source directories
+for .runa files. This provides the basis for path suggestions and
+module discovery.
+@End Reasoning
+
+Process called "find_all_modules" that takes context as ImportContext returns List[String]:
+    Let all_modules be []
+    
+    For Each source_dir in context.source_directories:
+        Let modules_in_dir be find_runa_files_recursive(source_dir)
+        For Each module_path in modules_in_dir:
+            Note: Convert absolute path to relative import path
+            Let relative_path be make_relative_to_source_dir(module_path, source_dir)
+            Let import_path be remove_runa_extension(relative_path)
+            Set all_modules to add_to_list(all_modules, import_path)
+        End For
+    End For
+    
+    Return all_modules
+End Process
+
+Note: =====================================================================
+Note: UTILITY OPERATIONS
+Note: =====================================================================
+
+@Reasoning
+Path utilities handle file system operations and path manipulations
+needed for import resolution. These abstract away platform-specific
+path handling.
+@End Reasoning
+
+Process called "ensure_runa_extension" that takes file_path as String returns String:
+    If string_ends_with(file_path, ".runa"):
+        Return file_path
+    Otherwise:
+        Return string_concat(file_path, ".runa")
+    End If
+End Process
+
+Process called "remove_runa_extension" that takes file_path as String returns String:
+    If string_ends_with(file_path, ".runa"):
+        Let path_length be string_length(file_path)
+        Return string_substring(file_path, 0, path_length minus 5)
+    Otherwise:
+        Return file_path
+    End If
+End Process
+
+Process called "canonicalize_path" that takes file_path as String returns String:
+    Note: Normalize path separators and resolve . and .. components
+    Let normalized be normalize_path(file_path)
+    
+    Note: Convert to absolute path for consistency
+    Return get_absolute_path(normalized)
+End Process
+
+Process called "path_join" that takes dir_path as String, file_path as String returns String:
+    Note: Handle path separator correctly for platform
+    Let separator be get_path_separator()
+    
+    If string_ends_with(dir_path, separator):
+        Return string_concat(dir_path, file_path)
+    Otherwise:
+        Return string_concat(dir_path, string_concat(separator, file_path))
+    End If
+End Process
+
+Process called "get_directory_path" that takes file_path as String returns String:
+    Let separator be get_path_separator()
+    Let last_separator_index be string_last_index_of(file_path, separator)
+    
+    If last_separator_index is equal to negative_one():
+        Return "."  Note: Current directory
+    Otherwise:
+        Return string_substring(file_path, 0, last_separator_index)
+    End If
+End Process
+
+Process called "update_dependency_graph" that takes source_file as String, target_file as String, context as ImportContext returns Nothing:
+    Note: Add target to source's dependency list
+    If Not contains_key(context.dependency_graph, source_file):
+        Set context.dependency_graph[source_file] to []
+    End If
+    
+    Let current_deps be context.dependency_graph[source_file]
+    If Not contains(current_deps, target_file):
+        Set context.dependency_graph[source_file] to add_to_list(current_deps, target_file)
+    End If
+End Process
+
+@Performance_Hints
+Import resolution can be expensive for large projects. Key optimizations:
+- Cache resolved imports to avoid repeated file system operations
+- Use lazy evaluation for dependency graph construction
+- Implement incremental updates when files change
+- Consider parallel resolution for independent imports
+- Use file system watchers to invalidate cache on changes
+@End Performance_Hints
+
+@Security_Scope
+Import resolution must prevent security vulnerabilities:
+- Block path traversal attempts (../ sequences)
+- Prevent access to files outside configured source directories
+- Validate all file paths before file system access
+- Handle symbolic links carefully to prevent directory escapes
+- Ensure proper permission checking before reading files
+@End Security_Scope

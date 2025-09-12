@@ -1195,7 +1195,7 @@ class TypeInferenceEngine:
                   right_type.is_assignable_to(BasicType("Float"))):
                 return BasicType("Float")
         
-        elif expr.operator in ["is equal to", "equals", "is not equal to", 
+        elif expr.operator in ["is equal to", "is not equal to", 
                              "is greater than", "is less than"]:
             return BasicType("Boolean")
         
@@ -1432,9 +1432,9 @@ class PythonCodeGenerator(CodeGenerator):
             "%": "%",
             
             # Comparison operators (updated canonical forms)
-            "is equal to": "==",  # Canonical natural language equality
-            "equals": "==",  # Technical shorthand equality
-            "does not equal": "!=",  # Updated canonical form
+            "is equal to": "==",  # Canonical natural language comparison
+            "equals": "=",  # Assignment operator
+            "is not equal to": "!=",  # Canonical inequality comparison
             "is greater than": ">",
             "is less than": "<",
             "is greater than or equal to": ">=",

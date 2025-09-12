@@ -433,7 +433,7 @@ Process called "cross_spectral_density" that takes signal1 as List[Float], signa
         
         Let coherence_value be if (auto_psd1 * auto_psd2) > 0.0 
                                then cross_magnitude_squared / (auto_psd1 * auto_psd2) 
-                               else 0.0
+                               Otherwise 0.0
         Call coherence.append(coherence_value)
         
         Note: Compute phase

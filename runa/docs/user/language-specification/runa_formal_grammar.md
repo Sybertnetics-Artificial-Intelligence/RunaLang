@@ -18,24 +18,40 @@ This document provides the complete Extended Backus-Naur Form (EBNF) grammar for
 - `"text"` - Terminal symbol (literal)
 - `UPPERCASE` - Token/terminal defined elsewhere
 
+## Syntax Modes
+
+Runa supports three syntax modes for different audiences:
+- **Canon (writeable)**: Standard natural syntax; avoids symbols outside mathematical contexts
+- **Developer (writeable)**: Technical shorthand with symbols in mathematical contexts; auto-translated to Canon AST during parsing
+- **Viewer (read-only)**: Natural-language display; not writeable; generated from Canon/Developer
+
+Note: Mathematical symbols (`+`, `-`, `*`, `/`, etc.) are NOT part of canonical Runa. They are only permitted in technical mode and are automatically translated to canonical form during compilation.
+
 ## Lexical Structure
 
 ### Whitespace and Control
 
 ```ebnf
 NEWLINE               ::= '\n' | '\r\n' | '\r'
-INDENT                ::= increase in indentation level
-DEDENT                ::= decrease in indentation level
+INDENT                ::= increase in indentation level (optional, for style validation)
+DEDENT                ::= decrease in indentation level (optional, for style validation)
 WHITESPACE            ::= ' ' | '\t'
 EOF                   ::= end of file
 ```
 
+Note: Indentation is recommended for readability but not required for parsing due to explicit `End` keywords.
+
 ### Comments
 
 ```ebnf
-comment               ::= "Note:" [^\n]* NEWLINE
-                      | "Note:" NEWLINE (/.*/ NEWLINE)* ":End Note" NEWLINE
+single_line_comment   ::= "Note:" [^\n]* NEWLINE
+inline_comment        ::= "Note:" [^\n]* NEWLINE     # Can appear inline
+block_comment         ::= "Note:" NEWLINE (/.*/ NEWLINE)* ":End Note" NEWLINE
+
+comment               ::= single_line_comment | inline_comment | block_comment
 ```
+
+Note: Comments are preserved as tokens for documentation generation, LSP features, and mode translation.
 
 ### Identifiers
 
@@ -46,6 +62,14 @@ letter                ::= [a-zA-Z_]
 digit                 ::= [0-9]
 ```
 
+Identifier semantics (mode-scoped, normative):
+
+1. Identifiers are case-sensitive.
+2. Canon preserves spaces and underscores as authored; multi-word identifiers are valid.
+3. Developer translates spaces to underscores and preserves underscores (e.g., `user name` ↔ `user_name`).
+4. Viewer displays underscores as spaces.
+5. Round-trip Canon ↔ Developer preserves identifier intent; Canon defaults to spaces when translating back.
+
 ### Keywords
 
 ```ebnf
@@ -53,7 +77,7 @@ keyword               ::= "Let" | "Define" | "Set" | "If" | "Otherwise" | "Unles
                         | "When" | "Match" | "Process" | "Type" | "Import" | "Export"
                         | "Try" | "Catch" | "Finally" | "For" | "While" | "Loop"
                         | "Return" | "Yield" | "Break" | "Continue" | "Throw"
-                        | "Assert" | "Display" | "Delete" | "Await" | "Send"
+                        | "Assert" | "Alert" | "Display" | "Delete" | "Await" | "Send"
                         | "Receive" | "Spawn" | "New" | "Static" | "Public"
                         | "Private" | "Async" | "External" | "Protocol" | "With"
                         | "As" | "From" | "To" | "By" | "In" | "Of" | "And" | "Or"
@@ -63,13 +87,21 @@ keyword               ::= "Let" | "Define" | "Set" | "If" | "Otherwise" | "Unles
                         | "False" | "None" | "Null" | "Nil"
 ```
 
-### Mathematical Symbol Operators
+### Mathematical Symbol Operators (Technical Mode Only)
 
 ```ebnf
-mathematical_symbol_operator ::= '+' | '-' | '*' | '/' | '%' | '**' | '<' | '>' | '<=' | '>=' | '!=' | '=='
+technical_symbol_operator ::= '+' | '-' | '*' | '/' | '%' | '**' | '<' | '>' | '<=' | '>=' | '!=' | '=='
 ```
 
-Note: Mathematical symbols are restricted to mathematical contexts only. The compiler enforces this restriction and provides automatic conversion to natural language equivalents during formatting.
+**IMPORTANT**: These symbols are NOT part of canonical Runa. They are only permitted in technical mode and are **automatically translated** to canonical natural language form during compilation:
+- `+` → `plus`
+- `-` → `minus` 
+- `*` → `multiplied by`
+- `/` → `divided by`
+- `==` → `is equal to`
+- etc.
+
+The compiler will parse technical symbols but internally convert them to canonical AST nodes.
 
 ### Literals
 
@@ -133,6 +165,7 @@ simple_statement      ::= let_statement
                         | continue_statement
                         | throw_statement
                         | assert_statement
+                        | alert_statement
                         | display_statement
                         | delete_statement
                         | send_statement
@@ -163,11 +196,30 @@ let_statement         ::= "Let" (identifier | pattern) type_annotation? "be" exp
 define_statement      ::= "Define" ["constant"] identifier type_annotation? "as" expression
 
 set_statement         ::= "Set" assignable "to" expression
+                        | "Set" assignable compound_assignment_op expression
+                        | imperative_assignment
+
+compound_assignment_op ::= "gets increased by" | "gets decreased by"
+                        | "gets multiplied by" | "gets divided by"
+                        | "gets remainder from dividing by"
+                        | "gets shifted left by" | "gets shifted right by"
+
+imperative_assignment ::= "Increase" assignable "by" expression
+                        | "Decrease" assignable "by" expression
+                        | "Multiply" assignable "by" expression
+                        | "Divide" assignable "by" expression
 
 assignable            ::= identifier | member_access | index_access
 
-type_annotation       ::= '(' type_expression ')'
+type_annotation       ::= "as" type_expression
 ```
+
+**Key Pattern**: Variable operations use encasing syntax:
+- `Let [variable] be [value]` - Creates new variable
+- `Set [variable] to [value]` - Reassigns existing variable
+- `Define [constant] as [value]` - Creates constant
+
+The variable name is "encased" between the keywords for natural readability.
 
 ## Type System
 
@@ -263,7 +315,7 @@ protocol_member       ::= "Process" "called" identifier
 function_definition   ::= "Async"? "Process" "called" string_literal generic_params?
                          ("that" "takes" parameter_list)?
                          ("returns" type_expression)?
-                         ':' block
+                         ':' block "End" "Process"
 
 parameter_list        ::= parameter (("and" | ',') parameter)*
 
@@ -281,13 +333,13 @@ external_function_declaration ::= "External" "Process" "called" identifier
 ```ebnf
 if_statement          ::= "If" expression ':' block
                          ("Otherwise" "if" expression ':' block)*
-                         ("Otherwise" ':' block)?
+                         ("Otherwise" ':' block)? "End" "If"
 
-unless_statement      ::= "Unless" expression ':' block
+unless_statement      ::= "Unless" expression ':' block "End" "Unless"
 
-when_statement        ::= "When" expression ':' block
+when_statement        ::= "When" expression ':' block "End" "When"
 
-match_statement       ::= "Match" expression ':' INDENT match_cases DEDENT
+match_statement       ::= "Match" expression ':' INDENT match_cases DEDENT "End" "Match"
 
 match_cases           ::= match_case+
 
@@ -295,7 +347,7 @@ match_case            ::= "When" pattern guard? ':' block
 
 guard                 ::= "where" expression
 
-switch_statement      ::= "Switch" expression ':' INDENT switch_cases DEDENT
+switch_statement      ::= "Switch" expression ':' INDENT switch_cases DEDENT "End" "Switch"
 
 switch_cases          ::= switch_case+ default_case?
 
@@ -311,18 +363,18 @@ fallthrough           ::= "Fallthrough"
 ```ebnf
 for_loop              ::= for_each_loop | for_range_loop
 
-for_each_loop         ::= "For" "each" identifier "in" expression ':' block
+for_each_loop         ::= "For" "each" identifier "in" expression ':' block "End" "For"
 
 for_range_loop        ::= "For" identifier "from" expression "to" expression
-                         ("by" expression)? ':' block
+                         ("by" expression)? ':' block "End" "For"
 
-while_loop            ::= "While" expression ':' block
+while_loop            ::= "While" expression ':' block "End" "While"
 
-do_while_loop         ::= "Do" ':' block "While" expression
+do_while_loop         ::= "Do" ':' block "While" expression "End" "Do"
 
-repeat_loop           ::= "Repeat" expression "times" ':' block
+repeat_loop           ::= "Repeat" expression "times" ':' block "End" "Repeat"
 
-infinite_loop         ::= "Loop" "forever" ':' block
+infinite_loop         ::= "Loop" "forever" ':' block "End" "Loop"
 ```
 
 ## Pattern Matching
@@ -371,7 +423,7 @@ pattern_list          ::= pattern (',' pattern)*
 ```ebnf
 expression            ::= ternary_expression
 
-ternary_expression    ::= or_expression ("if" or_expression "else" or_expression)?
+ternary_expression    ::= or_expression ("If" or_expression "Otherwise" or_expression)?
 
 or_expression         ::= and_expression ("or" and_expression)*
 
@@ -379,7 +431,11 @@ and_expression        ::= not_expression ("and" not_expression)*
 
 not_expression        ::= "not" not_expression | comparison_expression
 
-comparison_expression ::= additive_expression (comparison_op additive_expression)*
+comparison_expression ::= range_expression (comparison_op range_expression)*
+
+range_expression      ::= additive_expression (range_op additive_expression)?
+
+range_op              ::= "to" | "through" | "up" "to" "and" "including"
 
 comparison_op         ::= equality_operator
                         | "does" "not" "equal"
@@ -390,22 +446,22 @@ comparison_op         ::= equality_operator
                         | "contains"
                         | "is" "in"
                         | "is" "of" "type" type_expression
-                        | mathematical_symbol_operator
+                        | technical_symbol_operator
 
-# Equality operators - both forms produce identical results
+# Equality operators - canonical form only
 equality_operator     ::= "is" "equal" "to"    # Canonical natural language form
-                        | "equals"              # Technical shorthand form
+                        | "equals"              # Shorthand canonical form
 
 # Identity and type operators - use 'is' for identity/type/state checks, not equality
 # Note: "is of type" is now properly handled in comparison_op for type checking expressions
 
 additive_expression   ::= multiplicative_expression (additive_op multiplicative_expression)*
 
-additive_op           ::= "plus" | "minus" | "joined" "with" | mathematical_symbol_operator
+additive_op           ::= "plus" | "minus" | "joined" "with" | technical_symbol_operator
 
 multiplicative_expression ::= unary_expression (multiplicative_op unary_expression)*
 
-multiplicative_op     ::= "multiplied" "by" | "divided" "by" | "modulo" | mathematical_symbol_operator
+multiplicative_op     ::= "multiplied" "by" | "divided" "by" | "modulo" | technical_symbol_operator
 
 unary_expression      ::= unary_op unary_expression | power_expression
 
@@ -443,13 +499,18 @@ member_access         ::= '.' identifier
                         | natural_method_access
 
 natural_field_access  ::= "the" identifier "of" expression
+                        | "the" identifier "from" expression
+                        | identifier "of" expression
+                        | identifier "from" expression
 
 natural_method_access ::= "the" identifier "of" expression
+                        | "the" identifier "from" expression
                         | identifier "with" "self" "as" expression
 
 index_access          ::= '[' expression ']'
                         | "at" "index" expression
                         | "at" "key" expression
+                        | "at" expression
 
 slice_access          ::= '[' expression? ':' expression? (':' expression)? ']'
 ```
@@ -506,6 +567,8 @@ try_catch_statement   ::= "Try" ':' block
 throw_statement       ::= "Throw" expression
 
 assert_statement      ::= "Assert" expression ("with" "message" expression)?
+
+alert_statement       ::= "Alert" expression
 ```
 
 ## Resource Management
@@ -524,8 +587,8 @@ delete_statement      ::= "Delete" expression
 ## Module System
 
 ```ebnf
-import_statement      ::= "Import" "module" string_literal ("as" identifier)?
-                        | "Import" '{' import_list '}' "from" "module" string_literal
+import_statement      ::= "Import" "Module" identifier ("as" identifier)?
+                        | "Import" '{' import_list '}' "from" "Module" identifier
 
 import_list           ::= import_item (',' import_item)*
 
@@ -644,7 +707,7 @@ dict_entry            ::= identifier "as" expression
 12. Logical NOT (not, logical not)
 13. Logical AND (and, logical and)
 14. Logical OR (or, logical or)
-15. Ternary conditional (if...else)
+15. Ternary conditional (If...Otherwise)
 16. Assignment operators (be, as, to)
 
 ## Operator Type Classifications
@@ -652,8 +715,13 @@ dict_entry            ::= identifier "as" expression
 The compiler enforces operator usage based on context:
 
 - **Mathematical**: `+`, `-`, `*`, `/`, `%`, `plus`, `minus`, `multiplied by`, `divided by`, `modulo`, `power of`
-- **Mathematical Comparison**: `<`, `>`, `<=`, `>=`, `!=`, `is greater than`, `is less than`, `is greater than or equal to`, `is less than or equal to`, `does not equal`
+- **Mathematical Comparison**: `<`, `>`, `<=`, `>=`, `!=`, `is greater than`, `is less than`, `is greater than or equal to`, `is less than or equal to`, `does not equal`, `is equal to`, `is not equal to`
 - **General Comparison**: `equals`, `contains`, `is in`, `is of type`
+- **Compound Assignment**: `gets increased by`, `gets decreased by`, `gets multiplied by`, `gets divided by`, `gets remainder from dividing by`, `gets shifted left by`, `gets shifted right by`
+- **Imperative Statements**: `Increase...by`, `Decrease...by`, `Multiply...by`, `Divide...by`
+- **Member Access**: `of`, `from` (for accessing properties/methods)
+- **Range**: `through`, `up to and including`
+- **Index Access**: `at` (for array/dictionary indexing)
 - **Bitwise**: `bitwise and`, `bitwise or`, `bitwise xor`, `bitwise not`, `shifted left by`, `shifted right by`
 - **Logical**: `and`, `or`, `not`, `logical and`, `logical or`, `logical not`
 
@@ -808,3 +876,9 @@ Mathematical symbols (+, -, *, /, %, **, <, >, <=, >=, !=, ==) are restricted to
 
 **Grammar Version**: This grammar reflects the current implementation with mathematical symbol enforcement, dual operator support, and symbol-to-word conversion capabilities.
 :End Note
+
+## Open Issues
+
+1. Complete parser routing for all reserved annotation blocks; align with `runa_annotation_system.md`.
+2. Specify formal round-trip rules for Canon↔Developer identifiers (edge cases: leading underscores, multiple spaces).
+3. Clarify Viewer generation rules for highly technical constructs to ensure unambiguous display.

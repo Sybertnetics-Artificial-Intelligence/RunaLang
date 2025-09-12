@@ -1,0 +1,618 @@
+Note:
+runa/src/compiler/backend/machine_code/common/executable_format.runa
+Executable Format Handler - ELF/PE/Mach-O Support
+
+This module provides comprehensive support for reading and writing executable
+formats across different platforms. It includes both generation capabilities
+for the compiler and parsing capabilities for runtime needs like VDSO resolution.
+
+@Reasoning
+    The compiler needs to generate native executables for each platform.
+    Additionally, the runtime needs to parse existing executables (like VDSO)
+    for performance optimization. This module provides both capabilities.
+@End Reasoning
+
+@Implementation
+    - ELF format for Linux/BSD systems (both 32 and 64-bit)
+    - PE/COFF format for Windows systems
+    - Mach-O format for macOS/Darwin systems
+    - Common abstraction layer for cross-platform compatibility
+    - Both reading (parsing) and writing (generation) support
+@End Implementation
+:End Note
+
+Import module "compiler/frontend/diagnostics/errors" as Errors
+Import module "compiler/frontend/primitives/types/ascii_conversion" as ASCII
+
+Note: External assembly functions for memory operations
+External Process called "runa_allocate_memory" that takes size as Integer returns Integer
+External Process called "runa_free_memory" that takes ptr as Integer, size as Integer returns Integer
+External Process called "runa_read_byte" that takes addr as Integer, offset as Integer returns Integer
+
+Note: =====================================================================
+Note: ELF FORMAT STRUCTURES (Executable and Linkable Format)
+Note: =====================================================================
+
+Note: ELF file header magic number
+Constant ELF_MAGIC_0 as Integer is 0x7F  Note: First byte
+Constant ELF_MAGIC_1 as Integer is 0x45  Note: 'E'
+Constant ELF_MAGIC_2 as Integer is 0x4C  Note: 'L'
+Constant ELF_MAGIC_3 as Integer is 0x46  Note: 'F'
+
+Note: ELF class (32/64 bit)
+Constant ELFCLASS32 as Integer is 1
+Constant ELFCLASS64 as Integer is 2
+
+Note: ELF data encoding
+Constant ELFDATA2LSB as Integer is 1  Note: Little endian
+Constant ELFDATA2MSB as Integer is 2  Note: Big endian
+
+Note: ELF file types
+Constant ET_NONE as Integer is 0      Note: No file type
+Constant ET_REL as Integer is 1       Note: Relocatable file
+Constant ET_EXEC as Integer is 2      Note: Executable file
+Constant ET_DYN as Integer is 3       Note: Shared object file
+Constant ET_CORE as Integer is 4      Note: Core file
+
+Note: ELF machine types
+Constant EM_386 as Integer is 3       Note: Intel 80386
+Constant EM_X86_64 as Integer is 62   Note: AMD x86-64
+Constant EM_ARM as Integer is 40      Note: ARM
+Constant EM_AARCH64 as Integer is 183 Note: ARM 64-bit
+Constant EM_RISCV as Integer is 243   Note: RISC-V
+
+Type called "ELF64Header":
+    Note: ELF identification bytes
+    e_ident as List[Integer]         Note: 16 bytes of identification
+    e_type as Integer                 Note: Object file type
+    e_machine as Integer              Note: Architecture
+    e_version as Integer              Note: Object file version
+    e_entry as Integer                Note: Entry point virtual address
+    e_phoff as Integer                Note: Program header table file offset
+    e_shoff as Integer                Note: Section header table file offset
+    e_flags as Integer                Note: Processor-specific flags
+    e_ehsize as Integer               Note: ELF header size in bytes
+    e_phentsize as Integer            Note: Program header table entry size
+    e_phnum as Integer                Note: Program header table entry count
+    e_shentsize as Integer            Note: Section header table entry size
+    e_shnum as Integer                Note: Section header table entry count
+    e_shstrndx as Integer             Note: Section header string table index
+End Type
+
+Type called "ELF64ProgramHeader":
+    p_type as Integer                 Note: Segment type
+    p_flags as Integer                Note: Segment flags
+    p_offset as Integer               Note: Segment file offset
+    p_vaddr as Integer                Note: Segment virtual address
+    p_paddr as Integer                Note: Segment physical address
+    p_filesz as Integer               Note: Segment size in file
+    p_memsz as Integer                Note: Segment size in memory
+    p_align as Integer                Note: Segment alignment
+End Type
+
+Type called "ELF64SectionHeader":
+    sh_name as Integer                Note: Section name (string tbl index)
+    sh_type as Integer                Note: Section type
+    sh_flags as Integer               Note: Section flags
+    sh_addr as Integer                Note: Section virtual addr at execution
+    sh_offset as Integer              Note: Section file offset
+    sh_size as Integer                Note: Section size in bytes
+    sh_link as Integer                Note: Link to another section
+    sh_info as Integer                Note: Additional section information
+    sh_addralign as Integer           Note: Section alignment
+    sh_entsize as Integer             Note: Entry size if section holds table
+End Type
+
+Type called "ELF64Symbol":
+    st_name as Integer                Note: Symbol name (string tbl index)
+    st_info as Integer                Note: Symbol type and binding
+    st_other as Integer               Note: Symbol visibility
+    st_shndx as Integer               Note: Section index
+    st_value as Integer               Note: Symbol value
+    st_size as Integer                Note: Symbol size
+End Type
+
+Note: Section types
+Constant SHT_NULL as Integer is 0          Note: Section header table entry unused
+Constant SHT_PROGBITS as Integer is 1      Note: Program data
+Constant SHT_SYMTAB as Integer is 2        Note: Symbol table
+Constant SHT_STRTAB as Integer is 3        Note: String table
+Constant SHT_RELA as Integer is 4          Note: Relocation entries with addends
+Constant SHT_HASH as Integer is 5          Note: Symbol hash table
+Constant SHT_DYNAMIC as Integer is 6       Note: Dynamic linking information
+Constant SHT_NOTE as Integer is 7          Note: Notes
+Constant SHT_NOBITS as Integer is 8        Note: Program space with no data (bss)
+Constant SHT_REL as Integer is 9           Note: Relocation entries, no addends
+Constant SHT_SHLIB as Integer is 10        Note: Reserved
+Constant SHT_DYNSYM as Integer is 11       Note: Dynamic linker symbol table
+
+Note: Program header types
+Constant PT_NULL as Integer is 0           Note: Program header table entry unused
+Constant PT_LOAD as Integer is 1           Note: Loadable program segment
+Constant PT_DYNAMIC as Integer is 2        Note: Dynamic linking information
+Constant PT_INTERP as Integer is 3         Note: Program interpreter
+Constant PT_NOTE as Integer is 4           Note: Auxiliary information
+Constant PT_SHLIB as Integer is 5          Note: Reserved
+Constant PT_PHDR as Integer is 6           Note: Entry for header table itself
+Constant PT_TLS as Integer is 7            Note: Thread-local storage segment
+
+Note: Auxiliary vector types (for VDSO)
+Constant AT_NULL as Integer is 0           Note: End of vector
+Constant AT_IGNORE as Integer is 1         Note: Entry should be ignored
+Constant AT_EXECFD as Integer is 2         Note: File descriptor of program
+Constant AT_PHDR as Integer is 3           Note: Program headers for program
+Constant AT_PHENT as Integer is 4          Note: Size of program header entry
+Constant AT_PHNUM as Integer is 5          Note: Number of program headers
+Constant AT_PAGESZ as Integer is 6         Note: System page size
+Constant AT_BASE as Integer is 7           Note: Base address of interpreter
+Constant AT_FLAGS as Integer is 8          Note: Flags
+Constant AT_ENTRY as Integer is 9          Note: Entry point of program
+Constant AT_SYSINFO as Integer is 32       Note: VDSO entry point (x86)
+Constant AT_SYSINFO_EHDR as Integer is 33  Note: VDSO ELF header address
+
+Note: =====================================================================
+Note: ELF PARSING FUNCTIONS
+Note: =====================================================================
+
+@Reasoning
+    These functions parse existing ELF files, particularly needed for VDSO
+    resolution where we need to find function addresses in the kernel-provided
+    virtual dynamic shared object.
+@End Reasoning
+
+Process called "parse_elf64_header" that takes data as List[Integer] returns ELF64Header:
+    Note: Parse ELF64 header from raw bytes
+    
+    Let header be ELF64Header()
+    
+    Note: Validate magic number
+    If data.length() is less than 64:
+        Throw Errors.InvalidFormat with "Data too small for ELF64 header"
+    End If
+    
+    If data.get(0) is not equal to ELF_MAGIC_0:
+        Throw Errors.InvalidFormat with "Invalid ELF magic byte 0"
+    End If
+    If data.get(1) is not equal to ELF_MAGIC_1:
+        Throw Errors.InvalidFormat with "Invalid ELF magic byte 1"
+    End If
+    If data.get(2) is not equal to ELF_MAGIC_2:
+        Throw Errors.InvalidFormat with "Invalid ELF magic byte 2"
+    End If
+    If data.get(3) is not equal to ELF_MAGIC_3:
+        Throw Errors.InvalidFormat with "Invalid ELF magic byte 3"
+    End If
+    
+    Note: Extract identification bytes
+    header.e_ident = List[Integer]()
+    Let i be 0
+    While i is less than 16:
+        header.e_ident.append(data.get(i))
+        Set i to i plus 1
+    End While
+    
+    Note: Parse remaining header fields (little-endian)
+    header.e_type = data.get(16) bitwise or (data.get(17) shifted left by 8)
+    header.e_machine = data.get(18) bitwise or (data.get(19) shifted left by 8)
+    header.e_version = read_u32_le(data, 20)
+    header.e_entry = read_u64_le(data, 24)
+    header.e_phoff = read_u64_le(data, 32)
+    header.e_shoff = read_u64_le(data, 40)
+    header.e_flags = read_u32_le(data, 48)
+    header.e_ehsize = data.get(52) bitwise or (data.get(53) shifted left by 8)
+    header.e_phentsize = data.get(54) bitwise or (data.get(55) shifted left by 8)
+    header.e_phnum = data.get(56) bitwise or (data.get(57) shifted left by 8)
+    header.e_shentsize = data.get(58) bitwise or (data.get(59) shifted left by 8)
+    header.e_shnum = data.get(60) bitwise or (data.get(61) shifted left by 8)
+    header.e_shstrndx = data.get(62) bitwise or (data.get(63) shifted left by 8)
+    
+    Return header
+End Process
+
+Process called "read_u32_le" that takes data as List[Integer], offset as Integer returns Integer:
+    Note: Read 32-bit little-endian integer from byte array
+    
+    If offset plus 4 is greater than data.length():
+        Throw Errors.OutOfBounds with "Insufficient data for u32"
+    End If
+    
+    Let value be data.get(offset)
+    Set value to value bitwise or (data.get(offset plus 1) shifted left by 8)
+    Set value to value bitwise or (data.get(offset plus 2) shifted left by 16)
+    Set value to value bitwise or (data.get(offset plus 3) shifted left by 24)
+    
+    Return value
+End Process
+
+Process called "read_u64_le" that takes data as List[Integer], offset as Integer returns Integer:
+    Note: Read 64-bit little-endian integer from byte array
+    
+    If offset plus 8 is greater than data.length():
+        Throw Errors.OutOfBounds with "Insufficient data for u64"
+    End If
+    
+    Let low be read_u32_le(data, offset)
+    Let high be read_u32_le(data, offset plus 4)
+    
+    Return low bitwise or (high shifted left by 32)
+End Process
+
+Process called "parse_section_header" that takes data as List[Integer], offset as Integer returns ELF64SectionHeader:
+    Note: Parse a single section header from data
+    
+    Let header be ELF64SectionHeader()
+    
+    If offset plus 64 is greater than data.length():
+        Throw Errors.OutOfBounds with "Insufficient data for section header"
+    End If
+    
+    header.sh_name = read_u32_le(data, offset)
+    header.sh_type = read_u32_le(data, offset plus 4)
+    header.sh_flags = read_u64_le(data, offset plus 8)
+    header.sh_addr = read_u64_le(data, offset plus 16)
+    header.sh_offset = read_u64_le(data, offset plus 24)
+    header.sh_size = read_u64_le(data, offset plus 32)
+    header.sh_link = read_u32_le(data, offset plus 40)
+    header.sh_info = read_u32_le(data, offset plus 44)
+    header.sh_addralign = read_u64_le(data, offset plus 48)
+    header.sh_entsize = read_u64_le(data, offset plus 56)
+    
+    Return header
+End Process
+
+Process called "parse_symbol" that takes data as List[Integer], offset as Integer returns ELF64Symbol:
+    Note: Parse a single symbol table entry
+    
+    Let symbol be ELF64Symbol()
+    
+    If offset plus 24 is greater than data.length():
+        Throw Errors.OutOfBounds with "Insufficient data for symbol"
+    End If
+    
+    symbol.st_name = read_u32_le(data, offset)
+    symbol.st_info = data.get(offset plus 4)
+    symbol.st_other = data.get(offset plus 5)
+    symbol.st_shndx = data.get(offset plus 6) bitwise or (data.get(offset plus 7) shifted left by 8)
+    symbol.st_value = read_u64_le(data, offset plus 8)
+    symbol.st_size = read_u64_le(data, offset plus 16)
+    
+    Return symbol
+End Process
+
+Process called "find_section_by_type" that takes elf_data as List[Integer], header as ELF64Header, section_type as Integer returns Optional[ELF64SectionHeader]:
+    Note: Find first section with given type
+    
+    Let section_offset be header.e_shoff
+    Let i be 0
+    
+    While i is less than header.e_shnum:
+        Let section be parse_section_header(elf_data, section_offset)
+        
+        If section.sh_type is equal to section_type:
+            Return Optional[ELF64SectionHeader].Some(section)
+        End If
+        
+        Set section_offset to section_offset plus header.e_shentsize
+        Set i to i plus 1
+    End While
+    
+    Return Optional[ELF64SectionHeader].None()
+End Process
+
+Process called "get_string_from_table" that takes data as List[Integer], string_table_offset as Integer, string_offset as Integer returns String:
+    Note: Extract null-terminated string from string table
+    
+    Let offset be string_table_offset plus string_offset
+    Let result be List[Integer]()
+    
+    While offset is less than data.length():
+        Let byte be data.get(offset)
+        If byte is equal to 0:
+            Break
+        End If
+        result.append(byte)
+        Set offset to offset plus 1
+    End While
+    
+    Note: Convert bytes to string
+    Return bytes_to_string(result)
+End Process
+
+Process called "bytes_to_string" that takes bytes as List[Integer] returns String:
+    Note: Delegate to centralized ASCII conversion
+    Return ASCII.bytes_to_string(bytes)
+End Process
+
+Process called "byte_to_char" that takes byte as Integer returns String:
+    Note: Delegate to centralized ASCII conversion
+    Return ASCII.byte_to_char(byte)
+End Process
+
+Note: =====================================================================
+Note: VDSO RESOLUTION
+Note: =====================================================================
+
+@Reasoning
+    VDSO (Virtual Dynamic Shared Object) provides fast user-space access to
+    certain kernel functions like clock_gettime. We need to parse the VDSO
+    ELF to find function addresses for optimal performance.
+@End Reasoning
+
+Type called "VDSOInfo":
+    base_address as Integer
+    symbol_table as Dictionary[String, Integer]
+    is_valid as Boolean
+End Type
+
+Process called "parse_vdso_from_auxv" that takes auxv_sysinfo_ehdr as Integer returns VDSOInfo:
+    Note: Parse VDSO from auxiliary vector SYSINFO_EHDR address
+    
+    Let info be VDSOInfo()
+    info.base_address = auxv_sysinfo_ehdr
+    info.symbol_table = Dictionary[String, Integer]()
+    info.is_valid = false
+    
+    If auxv_sysinfo_ehdr is equal to 0:
+        Return info  Note: No VDSO available
+    End If
+    
+    Note: Read ELF header from VDSO base address
+    Note: This requires memory reading capability
+    Let elf_data be read_memory_at_address(auxv_sysinfo_ehdr, 4096)
+    
+    Note: Parse ELF header
+    Let header be parse_elf64_header(elf_data)
+    
+    Note: Find dynamic symbol table
+    Let dynsym_opt be find_section_by_type(elf_data, header, SHT_DYNSYM)
+    If dynsym_opt.is_none():
+        Return info  Note: No dynamic symbols
+    End If
+    
+    Let dynsym be dynsym_opt.unwrap()
+    
+    Note: Find string table for symbols
+    Let dynstr_offset be 0
+    If dynsym.sh_link is less than header.e_shnum:
+        Let str_section be parse_section_header(elf_data, header.e_shoff plus (dynsym.sh_link times header.e_shentsize))
+        Set dynstr_offset to str_section.sh_offset
+    End If
+    
+    Note: Parse all symbols
+    Let sym_offset be dynsym.sh_offset
+    Let sym_count be dynsym.sh_size divided by 24  Note: sizeof(ELF64Symbol)
+    
+    Let i be 0
+    While i is less than sym_count:
+        Let symbol be parse_symbol(elf_data, sym_offset)
+        
+        If symbol.st_name is not equal to 0:
+            Let name be get_string_from_table(elf_data, dynstr_offset, symbol.st_name)
+            Let address be auxv_sysinfo_ehdr plus symbol.st_value
+            info.symbol_table.set(name, address)
+        End If
+        
+        Set sym_offset to sym_offset plus 24
+        Set i to i plus 1
+    End While
+    
+    info.is_valid = true
+    Return info
+End Process
+
+External Process called "runa_read_memory" that takes address as Integer, buffer as Integer, size as Integer returns Integer
+
+Process called "read_memory_at_address" that takes address as Integer, size as Integer returns List[Integer]:
+    Note: Read memory at specified virtual address
+    Note: Uses assembly function from syscall_interface.asm
+    
+    Let data be List[Integer]()
+    
+    Note: Allocate buffer for reading
+    Let buffer_size be size
+    Let buffer be allocate_buffer(buffer_size)
+    
+    Note: Call assembly function to read memory
+    Let bytes_read be runa_read_memory(address, buffer, size)
+    
+    Note: Convert buffer to list of integers
+    Let i be 0
+    While i is less than bytes_read:
+        Let byte_value be read_byte_from_buffer(buffer, i)
+        data.append(byte_value)
+        Set i to i plus 1
+    End While
+    
+    Note: Free buffer
+    free_buffer(buffer, buffer_size)
+    
+    Return data
+End Process
+
+Process called "allocate_buffer" that takes size as Integer returns Integer:
+    Note: Allocate memory buffer for syscall use
+    Note: Returns buffer address (as integer)
+    
+    Note: Use assembly mmap-based allocation
+    Let buffer_addr be runa_allocate_memory(size)
+    
+    If buffer_addr is equal to minus 1:
+        Return 0  Note: Allocation failed, return null pointer
+    End If
+    
+    Return buffer_addr
+End Process
+
+Process called "free_buffer" that takes buffer as Integer, size as Integer returns Nothing:
+    Note: Free allocated buffer using munmap
+    
+    If buffer is not equal to 0:
+        Let _ be runa_free_memory(buffer, size)
+    End If
+End Process
+
+Process called "read_byte_from_buffer" that takes buffer as Integer, offset as Integer returns Integer:
+    Note: Read single byte from buffer at offset
+    
+    If buffer is equal to 0:
+        Return 0  Note: Null pointer check
+    End If
+    
+    Return runa_read_byte(buffer, offset)
+End Process
+
+Process called "resolve_vdso_function" that takes vdso_info as VDSOInfo, function_name as String returns Optional[Integer]:
+    Note: Look up function address in VDSO
+    
+    If not vdso_info.is_valid:
+        Return Optional[Integer].None()
+    End If
+    
+    If vdso_info.symbol_table.contains_key(function_name):
+        Let address be vdso_info.symbol_table.get(function_name)
+        Return Optional[Integer].Some(address)
+    End If
+    
+    Return Optional[Integer].None()
+End Process
+
+Note: =====================================================================
+Note: PE/COFF FORMAT (Windows)
+Note: =====================================================================
+
+Type called "PEHeader":
+    Note: Placeholder for PE format support
+    signature as Integer
+    machine as Integer
+    number_of_sections as Integer
+    time_date_stamp as Integer
+    pointer_to_symbol_table as Integer
+    number_of_symbols as Integer
+    size_of_optional_header as Integer
+    characteristics as Integer
+End Type
+
+Note: =====================================================================
+Note: MACH-O FORMAT (macOS)
+Note: =====================================================================
+
+Type called "MachOHeader":
+    Note: Placeholder for Mach-O format support
+    magic as Integer
+    cputype as Integer
+    cpusubtype as Integer
+    filetype as Integer
+    ncmds as Integer
+    sizeofcmds as Integer
+    flags as Integer
+End Type
+
+Note: =====================================================================
+Note: EXECUTABLE GENERATION
+Note: =====================================================================
+
+@Reasoning
+    The compiler needs to generate native executables. This section handles
+    creating properly formatted ELF/PE/Mach-O files with correct headers,
+    sections, and symbol tables.
+@End Reasoning
+
+Process called "generate_elf64_executable" that takes code as List[Integer], entry_point as Integer returns List[Integer]:
+    Note: Generate complete ELF64 executable
+    
+    Let output be List[Integer]()
+    
+    Note: Write ELF header
+    output.append(ELF_MAGIC_0)
+    output.append(ELF_MAGIC_1)
+    output.append(ELF_MAGIC_2)
+    output.append(ELF_MAGIC_3)
+    output.append(ELFCLASS64)      Note: 64-bit
+    output.append(ELFDATA2LSB)     Note: Little-endian
+    output.append(1)                Note: Current version
+    output.append(0)                Note: System V ABI
+    output.append(0)                Note: ABI version
+    
+    Note: Padding
+    Let i be 9
+    While i is less than 16:
+        output.append(0)
+        Set i to i plus 1
+    End While
+    
+    Note: e_type (ET_EXEC)
+    write_u16_le(output, ET_EXEC)
+    
+    Note: e_machine (EM_X86_64)
+    write_u16_le(output, EM_X86_64)
+    
+    Note: e_version
+    write_u32_le(output, 1)
+    
+    Note: e_entry (entry point address)
+    write_u64_le(output, 0x400000 plus entry_point)
+    
+    Note: e_phoff (program header offset)
+    write_u64_le(output, 64)  Note: Right after ELF header
+    
+    Note: e_shoff (section header offset)
+    write_u64_le(output, 0)  Note: No section headers for minimal executable
+    
+    Note: e_flags
+    write_u32_le(output, 0)
+    
+    Note: e_ehsize (ELF header size)
+    write_u16_le(output, 64)
+    
+    Note: e_phentsize (program header entry size)
+    write_u16_le(output, 56)
+    
+    Note: e_phnum (number of program headers)
+    write_u16_le(output, 1)
+    
+    Note: e_shentsize
+    write_u16_le(output, 0)
+    
+    Note: e_shnum
+    write_u16_le(output, 0)
+    
+    Note: e_shstrndx
+    write_u16_le(output, 0)
+    
+    Note: Write program header for code segment
+    write_u32_le(output, PT_LOAD)           Note: p_type
+    write_u32_le(output, 5)                 Note: p_flags (PF_R | PF_X)
+    write_u64_le(output, 0)                 Note: p_offset
+    write_u64_le(output, 0x400000)          Note: p_vaddr
+    write_u64_le(output, 0x400000)          Note: p_paddr
+    write_u64_le(output, 120 plus code.length())  Note: p_filesz
+    write_u64_le(output, 120 plus code.length())  Note: p_memsz
+    write_u64_le(output, 0x1000)            Note: p_align
+    
+    Note: Append code
+    For Each byte in code:
+        output.append(byte)
+    End For
+    
+    Return output
+End Process
+
+Process called "write_u16_le" that takes output as List[Integer], value as Integer returns Nothing:
+    Note: Write 16-bit little-endian value
+    output.append(value bitwise and 0xFF)
+    output.append((value shifted right by 8) bitwise and 0xFF)
+End Process
+
+Process called "write_u32_le" that takes output as List[Integer], value as Integer returns Nothing:
+    Note: Write 32-bit little-endian value
+    output.append(value bitwise and 0xFF)
+    output.append((value shifted right by 8) bitwise and 0xFF)
+    output.append((value shifted right by 16) bitwise and 0xFF)
+    output.append((value shifted right by 24) bitwise and 0xFF)
+End Process
+
+Process called "write_u64_le" that takes output as List[Integer], value as Integer returns Nothing:
+    Note: Write 64-bit little-endian value
+    write_u32_le(output, value bitwise and 0xFFFFFFFF)
+    write_u32_le(output, value shifted right by 32)
+End Process

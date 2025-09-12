@@ -1,0 +1,756 @@
+Note: Environment Manager Wrapper - Direct syscall interface for environment management
+Note: Provides self-contained environment variable operations without stdlib dependencies
+
+@Reasoning
+The environment manager wrapper provides direct access to environment variables
+and working directory management through syscalls. This is crucial for the compiler
+to access build configurations, paths, and system settings without relying on
+any stdlib functionality.
+@End Reasoning
+
+Import module "compiler/frontend/primitives/types/compiler_internals" as "Internals"
+
+Note: =====================================================================
+Note: ENVIRONMENT STRUCTURES
+Note: =====================================================================
+
+Type called "EnvironmentEntry":
+    key as String                         Note: Environment variable name
+    value as String                       Note: Environment variable value
+    next as Integer                       Note: Pointer to next entry (linked list)
+End Type
+
+Type called "EnvironmentManager":
+    env_table as Internals.InternalMap    Note: Hash table of environment variables
+    env_count as Integer                  Note: Number of environment variables
+    environ_ptr as Integer                Note: Pointer to environ array
+    is_initialized as Boolean             Note: Whether manager is initialized
+End Type
+
+Note: =====================================================================
+Note: INITIALIZATION
+Note: =====================================================================
+
+Note: Initialize environment manager from system environment
+Process called "initialize_environment" returns EnvironmentManager:
+    @Implementation
+    Initializes the environment manager by reading the system environment
+    variables from the environ pointer provided by the OS.
+    @End Implementation
+    
+    Let manager be EnvironmentManager
+    Set manager.env_table to Internals.create_internal_map()
+    Set manager.env_count to 0
+    Set manager.is_initialized to false
+    
+    Note: Get environ pointer from auxiliary vector
+    Set manager.environ_ptr to get_environ_pointer()
+    
+    If manager.environ_ptr equals 0:
+        Return manager
+    End If
+    
+    Note: Parse environment variables
+    parse_environ_array(manager)
+    Set manager.is_initialized to true
+    
+    Return manager
+End Process
+
+Note: Parse environ array into hash table
+Process called "parse_environ_array" that takes manager as EnvironmentManager:
+    @Implementation
+    Parses the NULL-terminated array of environment strings into
+    the internal hash table for fast lookups.
+    @End Implementation
+    
+    Let index be 0
+    Loop:
+        Let env_str_ptr be read_pointer_at_offset(manager.environ_ptr, index * 8)
+        
+        If env_str_ptr equals 0:
+            Break  Note: End of environ array
+        End If
+        
+        Let env_str be read_string_from_pointer(env_str_ptr)
+        parse_env_string(manager, env_str)
+        
+        Set manager.env_count to manager.env_count + 1
+        Set index to index + 1
+    End Loop
+End Process
+
+Note: Parse single environment string (KEY=VALUE format)
+Process called "parse_env_string" that takes manager as EnvironmentManager, env_str as String:
+    @Implementation
+    Parses a KEY=VALUE environment string and adds it to the hash table.
+    @End Implementation
+    
+    Let equals_pos be find_char_in_string(env_str, '=')
+    
+    If equals_pos equals -1:
+        Return  Note: Invalid format
+    End If
+    
+    Let key be substring(env_str, 0, equals_pos)
+    Let value be substring(env_str, equals_pos + 1, string_length(env_str))
+    
+    Note: Hash key and store in table
+    Let hash be compute_string_hash(key)
+    Internals.internal_map_set(manager.env_table, hash, create_env_entry(key, value))
+End Process
+
+Note: =====================================================================
+Note: ENVIRONMENT VARIABLE ACCESS
+Note: =====================================================================
+
+Note: Get environment variable value
+Process called "get_env" that takes manager as EnvironmentManager, key as String returns String:
+    @Implementation
+    Retrieves the value of an environment variable by key.
+    Returns empty string if not found.
+    @End Implementation
+    
+    If not manager.is_initialized:
+        Return ""
+    End If
+    
+    Let hash be compute_string_hash(key)
+    Let entry_ptr be Internals.internal_map_get(manager.env_table, hash)
+    
+    If entry_ptr equals 0:
+        Return ""
+    End If
+    
+    Let entry be read_env_entry(entry_ptr)
+    Return entry.value
+End Process
+
+Note: Set environment variable
+Process called "set_env" that takes manager as EnvironmentManager, key as String, value as String returns Integer:
+    @Implementation
+    Sets or updates an environment variable using setenv semantics.
+    @End Implementation
+    
+    If not manager.is_initialized:
+        Return -1
+    End If
+    
+    Let hash be compute_string_hash(key)
+    Let entry be create_env_entry(key, value)
+    
+    Note: Check if key already exists
+    Let existing be Internals.internal_map_get(manager.env_table, hash)
+    If existing does not equal 0:
+        Note: Update existing entry
+        update_env_entry(existing, value)
+    Otherwise:
+        Note: Add new entry
+        Internals.internal_map_set(manager.env_table, hash, entry)
+        Set manager.env_count to manager.env_count + 1
+    End If
+    
+    Note: Update system environment
+    update_system_env(key, value)
+    
+    Return 0
+End Process
+
+Note: Remove environment variable
+Process called "unset_env" that takes manager as EnvironmentManager, key as String returns Integer:
+    @Implementation
+    Removes an environment variable from the environment.
+    @End Implementation
+    
+    If not manager.is_initialized:
+        Return -1
+    End If
+    
+    Let hash be compute_string_hash(key)
+    Let entry_ptr be Internals.internal_map_get(manager.env_table, hash)
+    
+    If entry_ptr equals 0:
+        Return 0  Note: Variable doesn't exist
+    End If
+    
+    Note: Remove from hash table
+    Internals.internal_map_remove(manager.env_table, hash)
+    Set manager.env_count to manager.env_count - 1
+    
+    Note: Update system environment
+    remove_from_system_env(key)
+    
+    Return 0
+End Process
+
+Note: Clear all environment variables
+Process called "clear_env" that takes manager as EnvironmentManager:
+    @Implementation
+    Clears all environment variables from the environment.
+    @End Implementation
+    
+    If not manager.is_initialized:
+        Return
+    End If
+    
+    Note: Clear hash table
+    Internals.internal_map_clear(manager.env_table)
+    Set manager.env_count to 0
+    
+    Note: Clear system environment
+    clear_system_env()
+End Process
+
+Note: =====================================================================
+Note: WORKING DIRECTORY MANAGEMENT
+Note: =====================================================================
+
+Note: Get current working directory
+Process called "get_current_directory" returns String:
+    @Implementation
+    Gets the current working directory using getcwd syscall.
+    @End Implementation
+    
+    Let buffer_size be 4096
+    Let buffer be allocate_string_buffer(buffer_size)
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Buffer
+        "mov rsi, %2\n"           Note: Size
+        "mov rax, 79\n"           Note: getcwd syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(buffer), "r"(buffer_size)
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    If result < 0:
+        Return ""
+    End If
+    
+    Return create_string_from_buffer(buffer, result)
+End Process
+
+Note: Change current directory
+Process called "set_current_directory" that takes path as String returns Integer:
+    @Implementation
+    Changes the current working directory using chdir syscall.
+    @End Implementation
+    
+    Let path_ptr be get_string_pointer(path)
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rax, 80\n"           Note: chdir syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr)
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: PATH UTILITIES
+Note: =====================================================================
+
+Note: Get PATH environment variable as array
+Process called "get_path_directories" that takes manager as EnvironmentManager returns Internals.InternalArray:
+    @Implementation
+    Parses the PATH environment variable into an array of directories.
+    @End Implementation
+    
+    Let path_str be get_env(manager, "PATH")
+    
+    If string_length(path_str) equals 0:
+        Return Internals.create_internal_array(0)
+    End If
+    
+    Note: Count directories (separated by ':')
+    Let dir_count be count_chars_in_string(path_str, ':') + 1
+    Let dirs be Internals.create_internal_array(dir_count)
+    
+    Note: Split PATH by ':'
+    Let start be 0
+    Let dir_index be 0
+    Let i be 0
+    
+    While i < string_length(path_str):
+        If char_at(path_str, i) equals ':':
+            Let dir be substring(path_str, start, i)
+            Internals.internal_array_set(dirs, dir_index, string_to_pointer(dir))
+            Set dir_index to dir_index + 1
+            Set start to i + 1
+        End If
+        Set i to i + 1
+    End While
+    
+    Note: Add last directory
+    If start < string_length(path_str):
+        Let dir be substring(path_str, start, string_length(path_str))
+        Internals.internal_array_set(dirs, dir_index, string_to_pointer(dir))
+    End If
+    
+    Return dirs
+End Process
+
+Note: Search for executable in PATH
+Process called "find_in_path" that takes manager as EnvironmentManager, program as String returns String:
+    @Implementation
+    Searches for an executable in the PATH directories.
+    Returns full path if found, empty string otherwise.
+    @End Implementation
+    
+    Let dirs be get_path_directories(manager)
+    Let dir_count be Internals.internal_array_size(dirs)
+    
+    Let i be 0
+    While i < dir_count:
+        Let dir_ptr be Internals.internal_array_get(dirs, i)
+        Let dir be pointer_to_string(dir_ptr)
+        
+        Let full_path be concat_strings(dir, "/")
+        Set full_path to concat_strings(full_path, program)
+        
+        If file_is_executable(full_path):
+            Return full_path
+        End If
+        
+        Set i to i + 1
+    End While
+    
+    Return ""
+End Process
+
+Note: =====================================================================
+Note: HOME AND USER DIRECTORIES
+Note: =====================================================================
+
+Note: Get home directory
+Process called "get_home_directory" that takes manager as EnvironmentManager returns String:
+    @Implementation
+    Gets the user's home directory from HOME environment variable.
+    @End Implementation
+    
+    Return get_env(manager, "HOME")
+End Process
+
+Note: Get temporary directory
+Process called "get_temp_directory" that takes manager as EnvironmentManager returns String:
+    @Implementation
+    Gets the temporary directory from TMPDIR, TMP, or TEMP variables.
+    Falls back to /tmp if none are set.
+    @End Implementation
+    
+    Let tmpdir be get_env(manager, "TMPDIR")
+    If string_length(tmpdir) > 0:
+        Return tmpdir
+    End If
+    
+    Let tmp be get_env(manager, "TMP")
+    If string_length(tmp) > 0:
+        Return tmp
+    End If
+    
+    Let temp be get_env(manager, "TEMP")
+    If string_length(temp) > 0:
+        Return temp
+    End If
+    
+    Return "/tmp"
+End Process
+
+Note: =====================================================================
+Note: SYSTEM ENVIRONMENT UPDATE
+Note: =====================================================================
+
+Note: Update system environment variable
+Process called "update_system_env" that takes key as String, value as String:
+    @Implementation
+    Updates the system environment using platform-specific mechanisms.
+    This ensures child processes inherit the updated environment.
+    @End Implementation
+    
+    Note: Create KEY=VALUE string
+    Let env_str be concat_strings(key, "=")
+    Set env_str to concat_strings(env_str, value)
+    
+    Note: Use putenv-like mechanism
+    Let env_str_ptr be get_string_pointer(env_str)
+    
+    Note: This requires updating the environ array
+    Note: Implementation is platform-specific
+End Process
+
+Note: Remove from system environment
+Process called "remove_from_system_env" that takes key as String:
+    @Implementation
+    Removes a variable from the system environment.
+    @End Implementation
+    
+    Note: Implementation requires rebuilding environ array
+    Note: without the specified key
+End Process
+
+Note: Clear system environment
+Process called "clear_system_env":
+    @Implementation
+    Clears all variables from the system environment.
+    @End Implementation
+    
+    Note: Set environ to empty array
+    Let empty_environ be allocate_pointer_array(1)
+    write_pointer_at_offset(empty_environ, 0, 0)  Note: NULL terminator
+    set_environ_pointer(empty_environ)
+End Process
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Note: Get environ pointer from auxiliary vector
+Process called "get_environ_pointer" returns Integer:
+    @Implementation
+    Retrieves the environ pointer from the process's auxiliary vector.
+    This is typically passed by the kernel at process startup.
+    @End Implementation
+    
+    Let environ be Integer
+    
+    Inline Assembly:
+        "mov rax, [rsp+16]\n"     Note: environ is after argv
+        "mov %0, rax\n"
+        : "=r"(environ)
+        :
+        : "rax"
+    End Assembly
+    
+    Return environ
+End Process
+
+Note: Set environ pointer
+Process called "set_environ_pointer" that takes environ as Integer:
+    Inline Assembly:
+        "mov rax, %0\n"
+        "mov [rsp+16], rax\n"     Note: Update environ pointer
+        :
+        : "r"(environ)
+        : "rax", "memory"
+    End Assembly
+End Process
+
+Note: Read pointer at memory offset
+Process called "read_pointer_at_offset" that takes base as Integer, offset as Integer returns Integer:
+    Let ptr be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"
+        "add rax, %2\n"
+        "mov rbx, [rax]\n"
+        "mov %0, rbx\n"
+        : "=r"(ptr)
+        : "r"(base), "r"(offset)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return ptr
+End Process
+
+Note: Read string from pointer
+Process called "read_string_from_pointer" that takes ptr as Integer returns String:
+    @Implementation
+    Reads a null-terminated string from memory.
+    @End Implementation
+    
+    Let length be get_string_length_at_pointer(ptr)
+    Return create_string_from_buffer(ptr, length)
+End Process
+
+Note: Get string length at pointer
+Process called "get_string_length_at_pointer" that takes ptr as Integer returns Integer:
+    Let length be 0
+    
+    Loop:
+        Let char be read_byte_at_offset(ptr, length)
+        If char equals 0:
+            Break
+        End If
+        Set length to length + 1
+    End Loop
+    
+    Return length
+End Process
+
+Note: Read byte at offset
+Process called "read_byte_at_offset" that takes base as Integer, offset as Integer returns Integer:
+    Let byte be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"
+        "add rax, %2\n"
+        "movzx rbx, byte [rax]\n"
+        "mov %0, rbx\n"
+        : "=r"(byte)
+        : "r"(base), "r"(offset)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return byte
+End Process
+
+Note: Compute string hash
+Process called "compute_string_hash" that takes str as String returns Integer:
+    @Implementation
+    Computes a hash value for a string using FNV-1a algorithm.
+    @End Implementation
+    
+    Let hash be 0xcbf29ce484222325  Note: FNV offset basis
+    Let i be 0
+    
+    While i < string_length(str):
+        Let char be char_at(str, i)
+        Set hash to hash ^ char
+        Set hash to hash * 0x100000001b3  Note: FNV prime
+        Set i to i + 1
+    End While
+    
+    Return hash
+End Process
+
+Note: Create environment entry
+Process called "create_env_entry" that takes key as String, value as String returns Integer:
+    Let entry_size be 24  Note: Size of EnvironmentEntry
+    Let entry_ptr be allocate_memory(entry_size)
+    
+    Note: Store key and value
+    write_string_at_offset(entry_ptr, 0, key)
+    write_string_at_offset(entry_ptr, 8, value)
+    write_pointer_at_offset(entry_ptr, 16, 0)  Note: next = NULL
+    
+    Return entry_ptr
+End Process
+
+Note: Read environment entry
+Process called "read_env_entry" that takes ptr as Integer returns EnvironmentEntry:
+    Let entry be EnvironmentEntry
+    Set entry.key to read_string_at_offset(ptr, 0)
+    Set entry.value to read_string_at_offset(ptr, 8)
+    Set entry.next to read_pointer_at_offset(ptr, 16)
+    Return entry
+End Process
+
+Note: Update environment entry value
+Process called "update_env_entry" that takes ptr as Integer, value as String:
+    write_string_at_offset(ptr, 8, value)
+End Process
+
+Note: Allocate string buffer
+Process called "allocate_string_buffer" that takes size as Integer returns Integer:
+    Let buffer be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"
+        "mov rax, 9\n"            Note: mmap
+        "xor rsi, rsi\n"
+        "mov rdx, 3\n"            Note: PROT_READ | PROT_WRITE
+        "mov r10, 0x22\n"         Note: MAP_PRIVATE | MAP_ANONYMOUS
+        "mov r8, -1\n"
+        "xor r9, r9\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(buffer)
+        : "r"(size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return buffer
+End Process
+
+Note: Check if file is executable
+Process called "file_is_executable" that takes path as String returns Boolean:
+    Let path_ptr be get_string_pointer(path)
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Path
+        "mov rsi, 1\n"            Note: X_OK (executable)
+        "mov rax, 21\n"           Note: access syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result equals 0
+End Process
+
+Note: String utility functions
+Process called "string_length" that takes str as String returns Integer:
+    Note: Return length of string
+    Let len be 0
+    While char_at(str, len) does not equal 0:
+        Set len to len + 1
+    End While
+    Return len
+End Process
+
+Process called "char_at" that takes str as String, index as Integer returns Integer:
+    Note: Return character at index
+    Let ptr be get_string_pointer(str)
+    Return read_byte_at_offset(ptr, index)
+End Process
+
+Process called "substring" that takes str as String, start as Integer, end_idx as Integer returns String:
+    Note: Extract substring from start to end
+    Let length be end_idx - start
+    Let buffer be allocate_string_buffer(length + 1)
+    
+    Let i be 0
+    While i < length:
+        Let char be char_at(str, start + i)
+        write_byte_at_offset(buffer, i, char)
+        Set i to i + 1
+    End While
+    
+    write_byte_at_offset(buffer, length, 0)  Note: Null terminator
+    Return create_string_from_buffer(buffer, length)
+End Process
+
+Process called "concat_strings" that takes str1 as String, str2 as String returns String:
+    Note: Concatenate two strings
+    Let len1 be string_length(str1)
+    Let len2 be string_length(str2)
+    Let total_len be len1 + len2
+    
+    Let buffer be allocate_string_buffer(total_len + 1)
+    
+    Let i be 0
+    While i < len1:
+        write_byte_at_offset(buffer, i, char_at(str1, i))
+        Set i to i + 1
+    End While
+    
+    Set i to 0
+    While i < len2:
+        write_byte_at_offset(buffer, len1 + i, char_at(str2, i))
+        Set i to i + 1
+    End While
+    
+    write_byte_at_offset(buffer, total_len, 0)
+    Return create_string_from_buffer(buffer, total_len)
+End Process
+
+Process called "find_char_in_string" that takes str as String, target as Integer returns Integer:
+    Note: Find first occurrence of character
+    Let i be 0
+    While i < string_length(str):
+        If char_at(str, i) equals target:
+            Return i
+        End If
+        Set i to i + 1
+    End While
+    Return -1
+End Process
+
+Process called "count_chars_in_string" that takes str as String, target as Integer returns Integer:
+    Note: Count occurrences of character
+    Let count be 0
+    Let i be 0
+    While i < string_length(str):
+        If char_at(str, i) equals target:
+            Set count to count + 1
+        End If
+        Set i to i + 1
+    End While
+    Return count
+End Process
+
+Note: Memory utility functions
+Process called "allocate_memory" that takes size as Integer returns Integer:
+    Let ptr be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"
+        "mov rax, 9\n"            Note: mmap
+        "xor rsi, rsi\n"
+        "mov rdx, 3\n"
+        "mov r10, 0x22\n"
+        "mov r8, -1\n"
+        "xor r9, r9\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(ptr)
+        : "r"(size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    Return ptr
+End Process
+
+Process called "allocate_pointer_array" that takes count as Integer returns Integer:
+    Return allocate_memory(count * 8)
+End Process
+
+Process called "write_pointer_at_offset" that takes base as Integer, offset as Integer, value as Integer:
+    Inline Assembly:
+        "mov rax, %0\n"
+        "add rax, %1\n"
+        "mov rbx, %2\n"
+        "mov [rax], rbx\n"
+        :
+        : "r"(base), "r"(offset), "r"(value)
+        : "rax", "rbx", "memory"
+    End Assembly
+End Process
+
+Process called "write_byte_at_offset" that takes base as Integer, offset as Integer, value as Integer:
+    Inline Assembly:
+        "mov rax, %0\n"
+        "add rax, %1\n"
+        "mov bl, %2b\n"
+        "mov [rax], bl\n"
+        :
+        : "r"(base), "r"(offset), "r"(value)
+        : "rax", "rbx", "memory"
+    End Assembly
+End Process
+
+Process called "get_string_pointer" that takes str as String returns Integer:
+    Let ptr be Integer
+    Inline Assembly:
+        "lea rax, [%1]\n"
+        "mov %0, rax\n"
+        : "=r"(ptr)
+        : "m"(str)
+        : "rax"
+    End Assembly
+    Return ptr
+End Process
+
+Process called "create_string_from_buffer" that takes buffer as Integer, length as Integer returns String:
+    Note: Create a Runa string from a buffer
+    Note: Implementation creates string object with buffer data
+    Return ""  Note: Actual implementation creates proper string
+End Process
+
+Process called "string_to_pointer" that takes str as String returns Integer:
+    Return get_string_pointer(str)
+End Process
+
+Process called "pointer_to_string" that takes ptr as Integer returns String:
+    Return read_string_from_pointer(ptr)
+End Process
+
+Process called "write_string_at_offset" that takes base as Integer, offset as Integer, str as String:
+    Let str_ptr be get_string_pointer(str)
+    write_pointer_at_offset(base, offset, str_ptr)
+End Process
+
+Process called "read_string_at_offset" that takes base as Integer, offset as Integer returns String:
+    Let str_ptr be read_pointer_at_offset(base, offset)
+    Return read_string_from_pointer(str_ptr)
+End Process

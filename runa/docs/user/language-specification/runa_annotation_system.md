@@ -1,12 +1,12 @@
 # Runa Code Annotation System
-*Structured Annotations for Enhanced Code Documentation and AI Interaction*
+*Structured Annotations for Direct AI Intent and Interaction*
 
-**Last Updated**: 2025-08-15  
+**Last Updated**: 2025-09-08  
 **Note**: This documentation reflects the current implementation with mathematical symbol enforcement.
 
 ## Overview
 
-Runa includes a comprehensive annotation system that allows developers to embed structured metadata, reasoning, and context directly in their code. These annotations serve multiple purposes: improving code documentation, enabling AI-assisted development, facilitating code review, and supporting automated analysis tools.
+Runa’s annotation system encodes developer and architect intent for AI systems. Annotations are not comments; they are machine-parseable directives and context for AI agents and AI-powered tools. All AI engineers should use them, and developers building AI tools should prefer them to ad-hoc comments when intent must be consumed by machines.
 
 **Mathematical Symbol Note**: All annotation examples use natural language operators (`plus`, `minus`, `is less than`) which are always valid. Mathematical symbols are restricted to mathematical contexts only.
 
@@ -44,15 +44,15 @@ These remain part of the language specification and are supported in the annotat
 
 ## Core Concepts
 
-### Annotation Categories
+### Annotation Categories and Intent
 
 Runa provides several types of annotations that can be used individually or in combination:
 
-- **Reasoning Annotations**: Document the "why" behind implementation decisions
-- **Context Annotations**: Provide environmental and situational information
-- **Verification Annotations**: Embed testing and validation criteria
-- **Resource Annotations**: Specify computational and security constraints
-- **Task Annotations**: Define objectives and requirements
+- **Reasoning Annotations**: Convey the why behind decisions to guide AI synthesis and refactoring.
+- **Context Annotations**: Describe environment, constraints, and assumptions for AI planning.
+- **Verification Annotations**: Declare properties the AI must maintain/verify.
+- **Resource/Security Annotations**: Bound what AI may do and under what budgets/capabilities.
+- **Task/Requirements Annotations**: Specify formal objectives for AI agents to implement/check.
 
 ### Design Principles
 
@@ -60,7 +60,20 @@ Runa provides several types of annotations that can be used individually or in c
 2. **Tool Agnostic**: Annotations work with various development tools and AI systems
 3. **Human Readable**: All annotations use natural language for clarity
 4. **Machine Parseable**: Structured format enables automated processing
-5. **Optional**: Annotations enhance code but are never required
+5. **Optional**: Annotations enhance code but are never required (strongly recommended for AI workflows)
+### Usage Guidance (When and Why)
+
+- Use annotations whenever AI agents must consume intent (architecture, constraints, goals, verification) rather than relying on prose.
+- Prefer annotations to free-text comments for machine-facing guidance; use comments for human narration.
+- Co-locate annotations with the code they govern; keep scopes minimal and precise.
+- Treat annotations as normative inputs for AI tooling; conflicting comments yield to annotations.
+
+### Lifecycle and Evaluation Phase
+
+- Parsing: Annotations are parsed at compile-time and made available to tooling.
+- Evaluation: Some annotations have compile-time effects (e.g., verification), others inform runtime systems (e.g., execution model) without overhead.
+- Precedence: File-local overrides module-level; inner blocks override outer; explicit keys override defaults.
+
 6. **Language Agnostic**: Annotation format works across all target programming languages
 
 ## Annotation Categories
@@ -69,6 +82,27 @@ Runa provides several types of annotations that can be used individually or in c
 
 #### @Reasoning Block
 Documents the logical reasoning process and decision rationale behind code implementations.
+
+What this is used for:
+- Capture design rationale, trade-offs, and decision history for AI agents to respect during refactors and generation.
+- Provide auditable context for reviewers and future maintainers.
+
+How to use this:
+- Place immediately above the implementation it governs.
+- Write concise bullet points; prefer measurable criteria and constraints.
+- Reference external sources with @KnowledgeReference when applicable.
+
+Example (ideal structure):
+```runa
+@Reasoning:
+    Goal: Reduce p95 latency below 50ms without increasing error rate
+    Options considered: cache, batch, rewrite
+    Decision: cache because hit-rate > 0.9, memory budget 256MB
+    Risks: staleness; Mitigation: ttl=60s, background refresh
+@End_Reasoning
+```
+
+or
 
 ```runa
 @Reasoning:
@@ -85,13 +119,23 @@ Documents the logical reasoning process and decision rationale behind code imple
 #### @Implementation Block
 Provides detailed implementation notes and guidance.
 
+What this is used for:
+- Specify authoritative implementation structure, invariants, and algorithmic steps the AI should follow.
+- Disambiguate between multiple viable implementations.
+
+How to use this:
+- Co-locate with the target process/type.
+- Use imperative, stepwise instructions; include inputs/outputs and edge-case handling.
+
+Example (ideal structure):
 ```runa
 @Implementation:
-    Process called "QuickSort" that takes data and low and high:
-        If low is less than high:
-            Let pivot_index be Partition with data as data and low as low and high as high
-            QuickSort with data as data and low as low and high as pivot_index minus 1
-            QuickSort with data as data and low as pivot_index plus 1 and high as high
+    Process: "resize_image"
+    Steps:
+        1. Validate format ∈ {png,jpg}; Otherwise throw ValueError
+        2. Compute scale preserving aspect ratio
+        3. Apply bilinear filter; clamp to bounds
+        4. Return new buffer with metadata updated
 @End_Implementation
 ```
 
@@ -102,16 +146,16 @@ Provides detailed implementation notes and guidance.
 #### @Uncertainty Expression
 Represents multiple possible choices with confidence levels.
 
-```runa
-Note: Multiple options with confidence
-Let sorting_algorithm be ?[QuickSort, MergeSort, HeapSort] with confidence 0.8
+What this is used for:
+- Declare alternatives where multiple approaches are acceptable, with a confidence hint for selection.
 
-Note: Single option with lower confidence
-Process called "ChooseDataStructure" that takes size:
-    If size is less than 1000:
-        Return ?HashMap  Note: Uncertain about this choice
-    Otherwise:
-        Return BTree with size as size
+How to use this:
+- Limit to top 2–4 realistic options.
+- Always include a numeric confidence and criteria for promotion/demotion.
+
+Example (ideal structure):
+```runa
+Let hash_strategy be ?[SipHash, Murmur3] with confidence 0.7
 ```
 
 **Purpose**: Allows developers to express uncertainty and make informed decisions about implementation choices.
@@ -120,6 +164,25 @@ Process called "ChooseDataStructure" that takes size:
 
 #### @KnowledgeReference Block
 Links implementation to external knowledge sources.
+
+What this is used for:
+- Bind code decisions to vetted sources (papers, specs, standards) for traceability.
+
+How to use this:
+- Include stable identifiers (DOI, arXiv, version pins).
+- Add a one-line "why relevant" note.
+
+Example (ideal structure):
+```runa
+@KnowledgeReference:
+    concept: "A* Search"
+    reference_id: "doi:10.1145/321105.321114"
+    version: "canonical"
+    relevance: "Optimal pathfinding with admissible heuristics"
+@End_KnowledgeReference
+```
+
+or
 
 ```runa
 @KnowledgeReference:
@@ -133,6 +196,25 @@ Links implementation to external knowledge sources.
 
 #### @Context Block
 Provides situational context for implementation decisions.
+
+What this is used for:
+- Inform agents about deployment constraints, platforms, and business context impacting choices.
+
+How to use this:
+- Keep keys stable across a repository; prefer enums over free text.
+- Scope narrowly (module or file) to avoid stale global context.
+
+Example (ideal structure):
+```runa
+@Context:
+    deployment_environment: "edge_device"
+    latency_budget_ms: 50
+    memory_limit_mb: 256
+    reliability_target: "99.9%"
+@End_Context
+```
+
+or
 
 ```runa
 @Context:
@@ -148,6 +230,25 @@ Provides situational context for implementation decisions.
 
 #### @Task Block
 Formal task specification for AI-assisted development.
+
+What this is used for:
+- Define objective, constraints, and acceptance for an autonomous or assisted task.
+
+How to use this:
+- Be testable: specify inputs/outputs and DONE criteria.
+- Include priority and deadline only if actionable.
+
+Example (ideal structure):
+```runa
+@Task:
+    objective: "Implement LRU cache"
+    inputs: ["capacity:Int", "loader:Function"]
+    outputs: ["get/put interface", "eviction policy"]
+    acceptance: ["O(1) ops", ">=95% hit-rate on Zipf(1.2)"]
+@End_Task
+```
+
+or
 
 ```runa
 @Task:
@@ -169,6 +270,24 @@ Formal task specification for AI-assisted development.
 
 #### @Requirements Block
 Detailed functional and non-functional requirements.
+
+What this is used for:
+- Contract for features and qualities; drives verification and tests.
+
+How to use this:
+- Separate functional vs non-functional; make each requirement verifiable.
+- Cross-link to @Verify and @TestCases.
+
+Example (ideal structure):
+```runa
+@Requirements:
+    functional: ["persist user session", "rotate keys"]
+    non_functional: ["p95<50ms", "error_rate<0.1%"]
+    constraints: ["FIPS140-2", "EU-only data"]
+@End_Requirements
+```
+
+or
 
 ```runa
 @Requirements:
@@ -197,6 +316,23 @@ Detailed functional and non-functional requirements.
 #### @Verify Block
 Embedded verification conditions.
 
+What this is used for:
+- Assert invariants and postconditions that tooling must check.
+
+How to use this:
+- Write assertions using canonical operators; avoid side effects.
+- Keep fast-running; move heavy checks to @TestCases.
+
+Example (ideal structure):
+```runa
+@Verify:
+    Assert cache_size is less than or equal to capacity
+    Assert ttl is greater than 0
+@End_Verify
+```
+
+or
+
 ```runa
 @Verify:
     Assert result is not None
@@ -214,6 +350,24 @@ Process called "ProcessUserData" that takes user_input:
 
 #### @TestCases Block
 Comprehensive test specifications.
+
+What this is used for:
+- Define unit/integration/performance tests that CI can materialize.
+
+How to use this:
+- Provide names, inputs, expected outputs, and time/memory budgets where relevant.
+
+Example (ideal structure):
+```runa
+@TestCases:
+    unit_tests: [
+        { "name": "hit", "input": ["k"], "prepare": "put(""k"",1)", "expected_output": 1 },
+        { "name": "miss", "input": ["z"], "expected_output": null }
+    ]
+@End_TestCases
+```
+
+or
 
 ```runa
 @TestCases:
@@ -254,6 +408,22 @@ Comprehensive test specifications.
 #### @Resource_Constraints Block
 Specifies computational and memory limitations.
 
+What this is used for:
+- Bound resource usage of an operation to protect SLAs and budgets.
+
+How to use this:
+- Prefer explicit units; set max iterations/timeouts; pair with @Execution_Model when needed.
+
+Example (ideal structure):
+```runa
+@Resource_Constraints:
+    memory_limit: "256MB"
+    cpu_limit: "2 cores"
+    execution_timeout: "30 seconds"
+@End_Resource_Constraints
+```
+or
+
 ```runa
 @Resource_Constraints:
     memory_limit: "256MB"
@@ -269,6 +439,24 @@ Specifies computational and memory limitations.
 
 #### @Security_Scope Block
 Defines security capabilities and restrictions.
+
+What this is used for:
+- Declare least-privilege capabilities and forbidden actions for code paths.
+
+How to use this:
+- List positive capabilities first, then forbidden; specify sandbox level and auditing.
+
+Example (ideal structure):
+```runa
+@Security_Scope:
+    capabilities: ["file.read", "crypto.hash"]
+    forbidden: ["net.access"]
+    sandbox_level: "strict"
+    audit_logging: "detailed"
+@End_Security_Scope
+```
+
+or
 
 ```runa
 @Security_Scope:
@@ -297,6 +485,23 @@ Defines security capabilities and restrictions.
 #### @Execution_Model Block
 Specifies how code should be executed.
 
+What this is used for:
+- Communicate execution mode preferences to runtime/tooling (parallelism, scheduling) under AOTT.
+
+How to use this:
+- Choose one mode; specify concurrency and retry policy succinctly; avoid duplicating @Resource_Constraints.
+
+Example (ideal structure):
+```runa
+@Execution_Model:
+    mode: "batch"
+    concurrency: "parallel"
+    parallelism_level: 4
+@End_Execution_Model
+```
+
+or
+
 ```runa
 @Execution_Model:
     mode: "batch"  # or "streaming", "real_time", "interactive"
@@ -312,6 +517,23 @@ Specifies how code should be executed.
 
 #### @Performance_Hints Block
 Optimization guidance for implementation.
+
+What this is used for:
+- Inform compilers/agents about safe optimizations and thresholds.
+
+How to use this:
+- Keep hints orthogonal to correctness; avoid mandatory semantics here (use @Implementation/@Requirements).
+
+Example (ideal structure):
+```runa
+@Performance_Hints:
+    cache_strategy: "aggressive"
+    vectorization: "enabled"
+    parallel_threshold: 1000
+@End_Performance_Hints
+```
+
+or
 
 ```runa
 @Performance_Hints:
@@ -330,6 +552,24 @@ Optimization guidance for implementation.
 
 #### @Progress Block
 Real-time progress reporting for development tracking.
+
+What this is used for:
+- Report status for agents and reviewers; enable dashboards and alerts.
+
+How to use this:
+- Update incrementally; keep blockers and confidence current; avoid marketing language.
+
+Example (ideal structure):
+```runa
+@Progress:
+    completion_percentage: 40
+    current_milestone: "API complete"
+    next_milestone: "Benchmarking"
+    blockers: ["missing fixtures"]
+@End_Progress
+```
+
+or
 
 ```runa
 @Progress:
@@ -351,6 +591,23 @@ Real-time progress reporting for development tracking.
 
 #### @Translation_Note Block
 Language-specific implementation guidance.
+
+What this is used for:
+- Capture target-language adaptations without changing core semantics.
+
+How to use this:
+- List supported targets and per-target notes; avoid prescribing global policy.
+
+Example (ideal structure):
+```runa
+@Translation_Note:
+    target_languages: ["Python", "Rust"]
+    platform_specific: { "Python": "use asyncio" }
+    performance_considerations: { "Rust": "prefer iterators over indexing" }
+@End_Translation_Note
+```
+
+or
 
 ```runa
 @Translation_Note:
@@ -381,6 +638,23 @@ Language-specific implementation guidance.
 
 #### @Error_Handling Block
 Comprehensive error management strategy.
+
+What this is used for:
+- Define error models, recovery paths, and user impact explicitly.
+
+How to use this:
+- Enumerate expected errors with probabilities; state fallback behavior and notification policy.
+
+Example (ideal structure):
+```runa
+@Error_Handling:
+    expected_errors: [ { "type": "NetworkTimeout", "recovery": "retry" } ]
+    fallback_behavior: "return_cached_result"
+    user_notification: "user_friendly_messages"
+@End_Error_Handling
+```
+
+or
 
 ```runa
 @Error_Handling:
@@ -414,6 +688,25 @@ Comprehensive error management strategy.
 
 #### @Iteration Block
 Support for iterative development cycles.
+
+What this is used for:
+- Coordinate multi-step improvement loops with explicit success criteria.
+
+How to use this:
+- Link to previous feedback; keep cycle_number monotonic; update next plan based on measured outcomes.
+
+Example (ideal structure):
+```runa
+@Iteration:
+    cycle_number: 4
+    previous_feedback: ["memory spike under load"]
+    current_focus: "profile allocations"
+    success_criteria: ["peak RSS < 200MB"]
+    next_iteration_plan: "switch to arena allocator"
+@End_Iteration
+```
+
+or
 
 ```runa
 @Iteration:
@@ -584,3 +877,9 @@ Support for iterative development cycles.
 - **Evolution Tracking**: Monitor annotation usage over time
 
 This protocol represents a fundamental advancement in AI-assisted development, enabling enhanced code documentation, reasoning, and intelligent analysis while maintaining semantic fidelity and preserving human oversight capabilities.
+
+## Open Issues
+
+1. Finalize payload schemas and validation rules per annotation category with error codes.
+2. Define precedence/merging rules across nested scopes with concrete examples.
+3. Complete parser routing for reserved blocks and ensure round-trip in tooling.

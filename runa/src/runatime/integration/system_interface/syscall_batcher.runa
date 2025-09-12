@@ -1,0 +1,1306 @@
+Note: Syscall Batch Processing System - High-performance batching for syscall optimization
+Note: Collects multiple syscalls and executes them efficiently to reduce context switch overhead
+
+@Reasoning
+System calls have significant overhead due to user-kernel context switches. Many applications
+make multiple related syscalls in sequence that could be batched together for better performance.
+This module provides intelligent batching with dependency analysis, parallel execution where safe,
+and optimized batch submission strategies based on platform capabilities.
+@End Reasoning
+
+@Implementation  
+- Dependency-aware batch collection and execution ordering
+- Parallel execution for independent syscalls with thread pool management
+- Platform-specific batch optimization (io_uring on Linux, kqueue on BSD)
+- Automatic batch size optimization based on syscall types and system load
+- Result correlation and error handling for individual batched operations
+- Memory-efficient batch storage with zero-copy result distribution
+@End Implementation
+
+Import module "compiler/frontend/primitives/types/compiler_internals" as Internals
+Import module "compiler/backend/syscalls/syscall_registry" as Registry
+
+Note: =====================================================================
+Note: BATCH ENTRY STRUCTURE
+Note: =====================================================================
+
+Type called "SyscallBatchEntry":
+    syscall_id as Integer           Note: Unique ID for result correlation
+    syscall_name as String          Note: Name of the syscall
+    arguments as Internals.InternalArray  Note: Syscall arguments
+    result as Integer               Note: Result value after execution
+    error_code as Integer           Note: Error code if failed
+    status as BatchEntryStatus      Note: Current status of entry
+    dependencies as Internals.InternalArray  Note: IDs of syscalls this depends on
+    submit_time as Integer          Note: When entry was submitted
+    execute_time as Integer         Note: When entry was executed
+End Type
+
+Type BatchEntryStatus is:
+    | Pending                       Note: Waiting to be executed
+    | InFlight                      Note: Currently executing
+    | Completed                     Note: Successfully executed
+    | Failed                        Note: Execution failed
+    | Cancelled                     Note: Cancelled before execution
+End Type
+
+Type called "BatchStatistics":
+    total_batches as Integer        Note: Number of batches executed
+    total_syscalls as Integer       Note: Total syscalls processed
+    avg_batch_size as Float         Note: Average batch size
+    total_time_saved_ms as Integer  Note: Estimated time saved by batching
+    parallel_executions as Integer  Note: Number of parallel executions
+    failed_syscalls as Integer      Note: Number of failed syscalls
+End Type
+
+Type called "DependencyGraph":
+    nodes as Internals.InternalMap  Note: Map of syscall ID to entry
+    edges as Internals.InternalMap  Note: Map of ID to dependency list
+    execution_order as Internals.InternalArray  Note: Topologically sorted order
+End Type
+
+Note: =====================================================================
+Note: BATCH CONFIGURATION
+Note: =====================================================================
+
+Constant DEFAULT_BATCH_SIZE as Integer is 64      Note: Default max batch size
+Constant MAX_BATCH_SIZE as Integer is 256         Note: Maximum batch size
+Constant BATCH_TIMEOUT_MS as Integer is 100       Note: Max wait time for batch
+Constant MIN_BATCH_FOR_PARALLEL as Integer is 4   Note: Min size for parallel exec
+Constant THREAD_POOL_SIZE as Integer is 8         Note: Worker threads for parallel
+
+Note: =====================================================================
+Note: BATCH MANAGER STRUCTURE
+Note: =====================================================================
+
+Type called "SyscallBatcher":
+    current_batch as Internals.InternalArray     Note: Current batch being built
+    batch_map as Internals.InternalMap           Note: Map ID to batch entry
+    max_batch_size as Integer                    Note: Maximum batch size
+    batch_timeout_ms as Integer                  Note: Batch timeout in ms
+    auto_flush as Boolean                        Note: Auto-flush on timeout
+    statistics as BatchStatistics                Note: Performance metrics
+    dependency_graph as DependencyGraph          Note: Dependency tracking
+    next_id as Integer                          Note: Next syscall ID
+    lock as Integer                             Note: Thread safety lock
+    enabled as Boolean                          Note: Whether batching is active
+    last_flush_time as Integer                  Note: Time of last flush
+End Type
+
+Note: =====================================================================
+Note: BATCH INITIALIZATION
+Note: =====================================================================
+
+Process called "create_syscall_batcher" returns SyscallBatcher:
+    @Performance_Hints
+    Pre-allocates batch storage to avoid runtime allocation.
+    Initializes dependency graph for efficient ordering.
+    @End Performance_Hints
+    
+    Let batcher be SyscallBatcher()
+    Set batcher.current_batch to Internals.create_internal_array(DEFAULT_BATCH_SIZE)
+    Set batcher.batch_map to Internals.create_internal_map(DEFAULT_BATCH_SIZE)
+    Set batcher.max_batch_size to DEFAULT_BATCH_SIZE
+    Set batcher.batch_timeout_ms to BATCH_TIMEOUT_MS
+    Set batcher.auto_flush to true
+    Set batcher.next_id to 1
+    Set batcher.lock to 0
+    Set batcher.enabled to true
+    Set batcher.last_flush_time to get_current_timestamp_ms()
+    
+    Note: Initialize statistics
+    Let stats be BatchStatistics()
+    Set stats.total_batches to 0
+    Set stats.total_syscalls to 0
+    Set stats.avg_batch_size to 0.0
+    Set stats.total_time_saved_ms to 0
+    Set stats.parallel_executions to 0
+    Set stats.failed_syscalls to 0
+    Set batcher.statistics to stats
+    
+    Note: Initialize dependency graph
+    Let graph be DependencyGraph()
+    Set graph.nodes to Internals.create_internal_map(DEFAULT_BATCH_SIZE)
+    Set graph.edges to Internals.create_internal_map(DEFAULT_BATCH_SIZE)
+    Set graph.execution_order to Internals.create_internal_array(DEFAULT_BATCH_SIZE)
+    Set batcher.dependency_graph to graph
+    
+    Return batcher
+End Process
+
+Process called "create_batcher_with_config" that takes size as Integer, timeout as Integer returns SyscallBatcher:
+    @Performance_Hints
+    Custom configuration for specific workload patterns.
+    @End Performance_Hints
+    
+    Let batcher be SyscallBatcher()
+    Set batcher.current_batch to Internals.create_internal_array(size)
+    Set batcher.batch_map to Internals.create_internal_map(size)
+    Set batcher.max_batch_size to size
+    Set batcher.batch_timeout_ms to timeout
+    Set batcher.auto_flush to true
+    Set batcher.next_id to 1
+    Set batcher.lock to 0
+    Set batcher.enabled to true
+    Set batcher.last_flush_time to get_current_timestamp_ms()
+    
+    Let stats be BatchStatistics()
+    Set stats.total_batches to 0
+    Set stats.total_syscalls to 0
+    Set stats.avg_batch_size to 0.0
+    Set stats.total_time_saved_ms to 0
+    Set stats.parallel_executions to 0
+    Set stats.failed_syscalls to 0
+    Set batcher.statistics to stats
+    
+    Let graph be DependencyGraph()
+    Set graph.nodes to Internals.create_internal_map(size)
+    Set graph.edges to Internals.create_internal_map(size)
+    Set graph.execution_order to Internals.create_internal_array(size)
+    Set batcher.dependency_graph to graph
+    
+    Return batcher
+End Process
+
+Note: =====================================================================
+Note: BATCH SUBMISSION
+Note: =====================================================================
+
+Process called "submit_syscall" that takes batcher as SyscallBatcher, syscall_name as String, args as Internals.InternalArray returns Integer:
+    @Performance_Hints
+    Adds syscall to batch with automatic flushing on size/timeout.
+    Returns ID for result correlation.
+    @End Performance_Hints
+    
+    If not batcher.enabled:
+        Note: Execute immediately if batching disabled
+        Return execute_syscall_immediate(syscall_name, args)
+    End If
+    
+    acquire_lock(address_of(batcher.lock))
+    
+    Note: Check if we need to flush based on timeout
+    If batcher.auto_flush:
+        Let current_time be get_current_timestamp_ms()
+        Let elapsed be current_time minus batcher.last_flush_time
+        If elapsed greater than or equal to batcher.batch_timeout_ms:
+            flush_batch_internal(batcher)
+        End If
+    End If
+    
+    Note: Create batch entry
+    Let entry be SyscallBatchEntry()
+    Set entry.syscall_id to batcher.next_id
+    Set entry.syscall_name to syscall_name
+    Set entry.arguments to args
+    Set entry.result to 0
+    Set entry.error_code to 0
+    Set entry.status to BatchEntryStatus.Pending
+    Set entry.dependencies to Internals.create_internal_array(0)
+    Set entry.submit_time to get_current_timestamp_ms()
+    Set entry.execute_time to 0
+    
+    Note: Add to batch
+    Let entry_ptr be allocate_batch_entry(entry)
+    Internals.internal_array_add(batcher.current_batch, entry_ptr)
+    Internals.internal_map_set(batcher.batch_map, entry.syscall_id, entry_ptr)
+    
+    Note: Add to dependency graph
+    Internals.internal_map_set(batcher.dependency_graph.nodes, entry.syscall_id, entry_ptr)
+    
+    Let syscall_id be batcher.next_id
+    Set batcher.next_id to batcher.next_id plus 1
+    
+    Note: Check if batch is full
+    If batcher.current_batch.length greater than or equal to batcher.max_batch_size:
+        flush_batch_internal(batcher)
+    End If
+    
+    release_lock(address_of(batcher.lock))
+    
+    Return syscall_id
+End Process
+
+Process called "submit_with_dependencies" that takes batcher as SyscallBatcher, syscall_name as String, args as Internals.InternalArray, deps as Internals.InternalArray returns Integer:
+    @Performance_Hints
+    Submits syscall with explicit dependencies for ordering.
+    @End Performance_Hints
+    
+    acquire_lock(address_of(batcher.lock))
+    
+    Note: Submit as normal but with dependencies
+    Let syscall_id be submit_syscall(batcher, syscall_name, args)
+    
+    Note: Update entry with dependencies
+    Let entry_ptr be Internals.internal_map_get(batcher.batch_map, syscall_id)
+    If entry_ptr not equals minus 1:
+        Let entry be read_batch_entry(entry_ptr)
+        Set entry.dependencies to deps
+        write_batch_entry(entry_ptr, entry)
+        
+        Note: Update dependency graph edges
+        Internals.internal_map_set(batcher.dependency_graph.edges, syscall_id, deps)
+    End If
+    
+    release_lock(address_of(batcher.lock))
+    
+    Return syscall_id
+End Process
+
+Note: =====================================================================
+Note: BATCH EXECUTION
+Note: =====================================================================
+
+Process called "flush_batch" that takes batcher as SyscallBatcher returns Nothing:
+    @Performance_Hints
+    Forces immediate execution of current batch.
+    @End Performance_Hints
+    
+    acquire_lock(address_of(batcher.lock))
+    flush_batch_internal(batcher)
+    release_lock(address_of(batcher.lock))
+End Process
+
+Process called "flush_batch_internal" that takes batcher as SyscallBatcher returns Nothing:
+    @Performance_Hints
+    Internal batch flush with dependency resolution and parallel execution.
+    @End Performance_Hints
+    
+    If batcher.current_batch.length equals 0:
+        Return  Note: Nothing to flush
+    End If
+    
+    Note: Build execution order based on dependencies
+    Let execution_order be resolve_dependencies(batcher.dependency_graph)
+    
+    Note: Determine if we can use parallel execution
+    Let can_parallelize be check_parallelizability(batcher.current_batch)
+    
+    If can_parallelize and batcher.current_batch.length greater than or equal to MIN_BATCH_FOR_PARALLEL:
+        execute_batch_parallel(batcher, execution_order)
+    Otherwise:
+        execute_batch_sequential(batcher, execution_order)
+    End If
+    
+    Note: Update statistics
+    Set batcher.statistics.total_batches to batcher.statistics.total_batches plus 1
+    Set batcher.statistics.total_syscalls to batcher.statistics.total_syscalls plus batcher.current_batch.length
+    update_average_batch_size(batcher)
+    
+    Note: Clear batch
+    Set batcher.current_batch to Internals.create_internal_array(batcher.max_batch_size)
+    Set batcher.batch_map to Internals.create_internal_map(batcher.max_batch_size)
+    Set batcher.dependency_graph.nodes to Internals.create_internal_map(batcher.max_batch_size)
+    Set batcher.dependency_graph.edges to Internals.create_internal_map(batcher.max_batch_size)
+    Set batcher.dependency_graph.execution_order to Internals.create_internal_array(batcher.max_batch_size)
+    Set batcher.last_flush_time to get_current_timestamp_ms()
+End Process
+
+Process called "execute_batch_sequential" that takes batcher as SyscallBatcher, order as Internals.InternalArray returns Nothing:
+    @Performance_Hints
+    Sequential execution respecting dependency order.
+    @End Performance_Hints
+    
+    Let start_time be get_current_timestamp_ms()
+    
+    Let i be 0
+    While i less than order.length:
+        Let syscall_id be Internals.internal_array_get(order, i)
+        Let entry_ptr be Internals.internal_map_get(batcher.batch_map, syscall_id)
+        
+        If entry_ptr not equals minus 1:
+            Let entry be read_batch_entry(entry_ptr)
+            Set entry.status to BatchEntryStatus.InFlight
+            write_batch_entry(entry_ptr, entry)
+            
+            Note: Execute syscall
+            Let result be execute_syscall_direct(entry.syscall_name, entry.arguments)
+            
+            Note: Update entry with result
+            Set entry.result to result
+            If result less than 0:
+                Set entry.status to BatchEntryStatus.Failed
+                Set entry.error_code to result
+                Set batcher.statistics.failed_syscalls to batcher.statistics.failed_syscalls plus 1
+            Otherwise:
+                Set entry.status to BatchEntryStatus.Completed
+            End If
+            Set entry.execute_time to get_current_timestamp_ms()
+            write_batch_entry(entry_ptr, entry)
+        End If
+        
+        Set i to i plus 1
+    End While
+    
+    Let end_time be get_current_timestamp_ms()
+    Let time_saved be estimate_time_saved(batcher.current_batch.length, end_time minus start_time)
+    Set batcher.statistics.total_time_saved_ms to batcher.statistics.total_time_saved_ms plus time_saved
+End Process
+
+Process called "execute_batch_parallel" that takes batcher as SyscallBatcher, order as Internals.InternalArray returns Nothing:
+    @Performance_Hints
+    Parallel execution using thread pool for independent syscalls.
+    @End Performance_Hints
+    
+    Let start_time be get_current_timestamp_ms()
+    
+    Note: Group independent syscalls
+    Let groups be group_independent_syscalls(batcher, order)
+    
+    Note: Execute each group in parallel
+    Let g be 0
+    While g less than groups.length:
+        Let group be Internals.internal_array_get(groups, g)
+        execute_group_parallel(batcher, group)
+        Set g to g plus 1
+    End While
+    
+    Set batcher.statistics.parallel_executions to batcher.statistics.parallel_executions plus 1
+    
+    Let end_time be get_current_timestamp_ms()
+    Let time_saved be estimate_time_saved(batcher.current_batch.length, end_time minus start_time)
+    Set batcher.statistics.total_time_saved_ms to batcher.statistics.total_time_saved_ms plus time_saved
+End Process
+
+Process called "execute_group_parallel" that takes batcher as SyscallBatcher, group as Internals.InternalArray returns Nothing:
+    @Performance_Hints
+    Executes a group of independent syscalls in parallel.
+    @End Performance_Hints
+    
+    Note: Create thread data for each syscall
+    Let thread_count be min_int(group.length, THREAD_POOL_SIZE)
+    Let threads be Internals.create_internal_array(thread_count)
+    
+    Let i be 0
+    While i less group.length:
+        Let syscall_id be Internals.internal_array_get(group, i)
+        Let entry_ptr be Internals.internal_map_get(batcher.batch_map, syscall_id)
+        
+        If entry_ptr not equals minus 1:
+            Note: Assign to thread
+            Let thread_idx be i modulo thread_count
+            execute_on_thread(thread_idx, entry_ptr)
+        End If
+        
+        Set i to i plus 1
+    End While
+    
+    Note: Wait for all threads to complete
+    wait_for_threads(threads)
+End Process
+
+Note: =====================================================================
+Note: DEPENDENCY RESOLUTION
+Note: =====================================================================
+
+Process called "resolve_dependencies" that takes graph as DependencyGraph returns Internals.InternalArray:
+    @Performance_Hints
+    Topological sort for dependency resolution using Kahn's algorithm.
+    @End Performance_Hints
+    
+    Let result be Internals.create_internal_array(graph.nodes.size)
+    Let in_degree be Internals.create_internal_map(graph.nodes.size)
+    Let queue be Internals.create_internal_array(graph.nodes.size)
+    
+    Note: Calculate in-degrees
+    Let iter be Internals.internal_map_iterator(graph.edges)
+    While Internals.internal_map_has_next(iter):
+        Let kv be Internals.internal_map_next(iter)
+        Let deps be kv.value as Internals.InternalArray
+        
+        Let j be 0
+        While j less than deps.length:
+            Let dep_id be Internals.internal_array_get(deps, j)
+            Let current_degree be Internals.internal_map_get(in_degree, dep_id)
+            If current_degree equals minus 1:
+                Set current_degree to 0
+            End If
+            Internals.internal_map_set(in_degree, dep_id, current_degree plus 1)
+            Set j to j plus 1
+        End While
+    End While
+    
+    Note: Find nodes with no dependencies
+    Let node_iter be Internals.internal_map_iterator(graph.nodes)
+    While Internals.internal_map_has_next(node_iter):
+        Let kv be Internals.internal_map_next(node_iter)
+        Let node_id be kv.key as Integer
+        Let degree be Internals.internal_map_get(in_degree, node_id)
+        If degree equals minus 1 or degree equals 0:
+            Internals.internal_array_add(queue, node_id)
+        End If
+    End While
+    
+    Note: Process queue
+    Let front be 0
+    While front less than queue.length:
+        Let node_id be Internals.internal_array_get(queue, front)
+        Internals.internal_array_add(result, node_id)
+        
+        Note: Update dependent nodes
+        Let deps be Internals.internal_map_get(graph.edges, node_id)
+        If deps not equals minus 1:
+            Let dep_array be deps as Internals.InternalArray
+            Let k be 0
+            While k less than dep_array.length:
+                Let dep_id be Internals.internal_array_get(dep_array, k)
+                Let deg be Internals.internal_map_get(in_degree, dep_id)
+                Set deg to deg minus 1
+                Internals.internal_map_set(in_degree, dep_id, deg)
+                
+                If deg equals 0:
+                    Internals.internal_array_add(queue, dep_id)
+                End If
+                Set k to k plus 1
+            End While
+        End If
+        
+        Set front to front plus 1
+    End While
+    
+    Return result
+End Process
+
+Process called "check_parallelizability" that takes batch as Internals.InternalArray returns Boolean:
+    @Performance_Hints
+    Checks if batch can be executed in parallel based on syscall types.
+    @End Performance_Hints
+    
+    Let i be 0
+    While i less than batch.length:
+        Let entry_ptr be Internals.internal_array_get(batch, i)
+        Let entry be read_batch_entry(entry_ptr)
+        
+        Note: Check if syscall modifies shared state
+        If modifies_shared_state(entry.syscall_name):
+            Return false
+        End If
+        
+        Note: Check if has dependencies
+        If entry.dependencies.length greater than 0:
+            Return false
+        End If
+        
+        Set i to i plus 1
+    End While
+    
+    Return true
+End Process
+
+Process called "group_independent_syscalls" that takes batcher as SyscallBatcher, order as Internals.InternalArray returns Internals.InternalArray:
+    @Performance_Hints
+    Groups syscalls that can be executed in parallel.
+    @End Performance_Hints
+    
+    Let groups be Internals.create_internal_array(order.length)
+    Let current_group be Internals.create_internal_array(order.length)
+    Let processed be Internals.create_internal_map(order.length)
+    
+    Let i be 0
+    While i less than order.length:
+        Let syscall_id be Internals.internal_array_get(order, i)
+        
+        If Internals.internal_map_get(processed, syscall_id) equals minus 1:
+            Note: Not yet processed
+            Internals.internal_array_add(current_group, syscall_id)
+            Internals.internal_map_set(processed, syscall_id, 1)
+            
+            Note: Find other independent syscalls
+            Let j be i plus 1
+            While j less than order.length:
+                Let other_id be Internals.internal_array_get(order, j)
+                
+                If can_execute_parallel(batcher, syscall_id, other_id):
+                    Internals.internal_array_add(current_group, other_id)
+                    Internals.internal_map_set(processed, other_id, 1)
+                End If
+                
+                Set j to j plus 1
+            End While
+            
+            Note: Add group if not empty
+            If current_group.length greater than 0:
+                Internals.internal_array_add(groups, clone_array(current_group))
+                Set current_group to Internals.create_internal_array(order.length)
+            End If
+        End If
+        
+        Set i to i plus 1
+    End While
+    
+    Return groups
+End Process
+
+Process called "can_execute_parallel" that takes batcher as SyscallBatcher, id1 as Integer, id2 as Integer returns Boolean:
+    @Performance_Hints
+    Checks if two syscalls can execute in parallel.
+    @End Performance_Hints
+    
+    Let entry1_ptr be Internals.internal_map_get(batcher.batch_map, id1)
+    Let entry2_ptr be Internals.internal_map_get(batcher.batch_map, id2)
+    
+    If entry1_ptr equals minus 1 or entry2_ptr equals minus 1:
+        Return false
+    End If
+    
+    Let entry1 be read_batch_entry(entry1_ptr)
+    Let entry2 be read_batch_entry(entry2_ptr)
+    
+    Note: Check for direct dependencies
+    If has_dependency(entry1.dependencies, id2) or has_dependency(entry2.dependencies, id1):
+        Return false
+    End If
+    
+    Note: Check if they modify same resources
+    If modifies_same_resource(entry1.syscall_name, entry1.arguments, entry2.syscall_name, entry2.arguments):
+        Return false
+    End If
+    
+    Return true
+End Process
+
+Note: =====================================================================
+Note: RESULT RETRIEVAL
+Note: =====================================================================
+
+Process called "get_result" that takes batcher as SyscallBatcher, syscall_id as Integer returns Internals.InternalResult:
+    @Performance_Hints
+    Retrieves result of a batched syscall by ID.
+    @End Performance_Hints
+    
+    acquire_lock(address_of(batcher.lock))
+    
+    Let entry_ptr be Internals.internal_map_get(batcher.batch_map, syscall_id)
+    
+    If entry_ptr equals minus 1:
+        release_lock(address_of(batcher.lock))
+        Return Internals.error_result(-1, "Syscall ID not found")
+    End If
+    
+    Let entry be read_batch_entry(entry_ptr)
+    
+    Match entry.status:
+        When BatchEntryStatus.Pending:
+            release_lock(address_of(batcher.lock))
+            Return Internals.error_result(-2, "Syscall pending execution")
+        When BatchEntryStatus.InFlight:
+            release_lock(address_of(batcher.lock))
+            Return Internals.error_result(-3, "Syscall currently executing")
+        When BatchEntryStatus.Failed:
+            release_lock(address_of(batcher.lock))
+            Return Internals.error_result(entry.error_code, "Syscall failed")
+        When BatchEntryStatus.Cancelled:
+            release_lock(address_of(batcher.lock))
+            Return Internals.error_result(-4, "Syscall cancelled")
+        When BatchEntryStatus.Completed:
+            release_lock(address_of(batcher.lock))
+            Return Internals.success_result(entry.result)
+    End Match
+    
+    release_lock(address_of(batcher.lock))
+    Return Internals.error_result(-5, "Unknown status")
+End Process
+
+Process called "wait_for_result" that takes batcher as SyscallBatcher, syscall_id as Integer, timeout_ms as Integer returns Internals.InternalResult:
+    @Performance_Hints
+    Waits for syscall result with timeout.
+    @End Performance_Hints
+    
+    Let start_time be get_current_timestamp_ms()
+    
+    While true:
+        Let result be get_result(batcher, syscall_id)
+        
+        If result.is_success:
+            Return result
+        End If
+        
+        Note: Check for terminal states
+        If result.value equals minus 4 or result.value equals minus 1:
+            Return result
+        End If
+        
+        Note: Check timeout
+        Let current_time be get_current_timestamp_ms()
+        If current_time minus start_time greater than timeout_ms:
+            Return Internals.error_result(-6, "Timeout waiting for result")
+        End If
+        
+        Note: Yield to avoid busy waiting
+        yield_cpu()
+    End While
+End Process
+
+Note: =====================================================================
+Note: BATCH OPTIMIZATION
+Note: =====================================================================
+
+Process called "optimize_batch_size" that takes batcher as SyscallBatcher returns Nothing:
+    @Performance_Hints
+    Dynamically adjusts batch size based on performance metrics.
+    @End Performance_Hints
+    
+    If batcher.statistics.total_batches less than 10:
+        Return  Note: Not enough data
+    End If
+    
+    Let efficiency be calculate_batch_efficiency(batcher)
+    
+    If efficiency less than 0.5:
+        Note: Poor efficiency, increase batch size
+        If batcher.max_batch_size less than MAX_BATCH_SIZE:
+            Set batcher.max_batch_size to min_int(batcher.max_batch_size multiplied by 2, MAX_BATCH_SIZE)
+        End If
+    Otherwise:
+        If efficiency greater than 0.9:
+            Note: Very high efficiency, might benefit from smaller batches
+            If batcher.max_batch_size greater than 16:
+                Set batcher.max_batch_size to batcher.max_batch_size divided by 2
+            End If
+        End If
+    End If
+End Process
+
+Process called "calculate_batch_efficiency" that takes batcher as SyscallBatcher returns Float:
+    @Performance_Hints
+    Calculates batching efficiency metric.
+    @End Performance_Hints
+    
+    If batcher.statistics.total_syscalls equals 0:
+        Return 0.0
+    End If
+    
+    Let time_per_syscall be batcher.statistics.total_time_saved_ms as Float
+    Set time_per_syscall to time_per_syscall divided by batcher.statistics.total_syscalls as Float
+    
+    Let failed_ratio be batcher.statistics.failed_syscalls as Float
+    Set failed_ratio to failed_ratio divided by batcher.statistics.total_syscalls as Float
+    
+    Let efficiency be 1.0 minus failed_ratio
+    Set efficiency to efficiency multiplied by (time_per_syscall divided by 100.0)  Note: Normalize
+    
+    Return efficiency
+End Process
+
+Note: =====================================================================
+Note: STATISTICS AND MONITORING
+Note: =====================================================================
+
+Process called "get_batch_statistics" that takes batcher as SyscallBatcher returns BatchStatistics:
+    @Performance_Hints
+    Returns copy of current statistics.
+    @End Performance_Hints
+    
+    Return batcher.statistics
+End Process
+
+Process called "update_average_batch_size" that takes batcher as SyscallBatcher returns Nothing:
+    @Performance_Hints
+    Updates running average of batch size.
+    @End Performance_Hints
+    
+    If batcher.statistics.total_batches equals 1:
+        Set batcher.statistics.avg_batch_size to batcher.current_batch.length as Float
+    Otherwise:
+        Let current_avg be batcher.statistics.avg_batch_size
+        Let new_size be batcher.current_batch.length as Float
+        Let total be batcher.statistics.total_batches as Float
+        Let new_avg be ((current_avg multiplied by (total minus 1.0)) plus new_size) divided by total
+        Set batcher.statistics.avg_batch_size to new_avg
+    End If
+End Process
+
+Process called "reset_statistics" that takes batcher as SyscallBatcher returns Nothing:
+    @Performance_Hints
+    Resets all statistics counters.
+    @End Performance_Hints
+    
+    acquire_lock(address_of(batcher.lock))
+    
+    Set batcher.statistics.total_batches to 0
+    Set batcher.statistics.total_syscalls to 0
+    Set batcher.statistics.avg_batch_size to 0.0
+    Set batcher.statistics.total_time_saved_ms to 0
+    Set batcher.statistics.parallel_executions to 0
+    Set batcher.statistics.failed_syscalls to 0
+    
+    release_lock(address_of(batcher.lock))
+End Process
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Process called "modifies_shared_state" that takes syscall_name as String returns Boolean:
+    @Performance_Hints
+    Checks if syscall modifies global/shared state.
+    @End Performance_Hints
+    
+    Note: Write operations modify state
+    If syscall_name equals Registry.SYSCALL_WRITE:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_OPEN:
+        Return true  Note: May create files
+    End If
+    If syscall_name equals Registry.SYSCALL_CLOSE:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_MMAP:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_MUNMAP:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_BRK:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_FORK:
+        Return true
+    End If
+    If syscall_name equals Registry.SYSCALL_EXECVE:
+        Return true
+    End If
+    
+    Note: Read operations generally don't modify state
+    Return false
+End Process
+
+Process called "modifies_same_resource" that takes name1 as String, args1 as Internals.InternalArray, name2 as String, args2 as Internals.InternalArray returns Boolean:
+    @Performance_Hints
+    Checks if two syscalls modify the same resource.
+    @End Performance_Hints
+    
+    Note: Check file operations on same FD
+    If (name1 equals Registry.SYSCALL_READ or name1 equals Registry.SYSCALL_WRITE) and (name2 equals Registry.SYSCALL_READ or name2 equals Registry.SYSCALL_WRITE):
+        If args1.length greater than 0 and args2.length greater than 0:
+            Let fd1 be Internals.internal_array_get(args1, 0)
+            Let fd2 be Internals.internal_array_get(args2, 0)
+            Return fd1 equals fd2
+        End If
+    End If
+    
+    Note: Memory operations on overlapping regions
+    If (name1 equals Registry.SYSCALL_MMAP or name1 equals Registry.SYSCALL_MUNMAP) and (name2 equals Registry.SYSCALL_MMAP or name2 equals Registry.SYSCALL_MUNMAP):
+        Note: Check for actual memory region overlap
+        If args1.length greater_than_or_equal 2 and args2.length greater_than_or_equal 2:
+            Let addr1 be Internals.internal_array_get(args1, 0)
+            Let size1 be Internals.internal_array_get(args1, 1)
+            Let addr2 be Internals.internal_array_get(args2, 0)
+            Let size2 be Internals.internal_array_get(args2, 1)
+            
+            Note: Check if regions overlap: [addr1, addr1+size1) and [addr2, addr2+size2)
+            If addr1 less_than addr2:
+                Return (addr1 plus size1) greater_than addr2
+            Otherwise:
+                Return (addr2 plus size2) greater_than addr1
+            End If
+        End If
+        Return false
+    End If
+    
+    Return false
+End Process
+
+Process called "has_dependency" that takes deps as Internals.InternalArray, id as Integer returns Boolean:
+    @Performance_Hints
+    Checks if ID is in dependency list.
+    @End Performance_Hints
+    
+    Let i be 0
+    While i less than deps.length:
+        Let dep_id be Internals.internal_array_get(deps, i)
+        If dep_id equals id:
+            Return true
+        End If
+        Set i to i plus 1
+    End While
+    
+    Return false
+End Process
+
+Process called "estimate_time_saved" that takes batch_size as Integer, actual_time as Integer returns Integer:
+    @Performance_Hints
+    Estimates time saved by batching vs sequential execution.
+    @End Performance_Hints
+    
+    Constant CONTEXT_SWITCH_OVERHEAD_US as Integer is 2000  Note: 2ms per switch
+    
+    Let sequential_time be batch_size multiplied by CONTEXT_SWITCH_OVERHEAD_US
+    Let saved be sequential_time minus (actual_time multiplied by 1000)  Note: Convert to us
+    
+    If saved less than 0:
+        Return 0
+    End If
+    
+    Return saved divided by 1000  Note: Convert back to ms
+End Process
+
+Process called "execute_on_thread" that takes thread_idx as Integer, entry_ptr as Integer returns Nothing:
+    @Performance_Hints
+    Executes syscall on specified thread.
+    @End Performance_Hints
+    
+    Note: Create thread for parallel execution
+    Let thread_id as Integer
+    Let stack_size be 8192  Note: 8KB stack for worker thread
+    Let stack_ptr be Internals.allocate_raw_memory(stack_size)
+    
+    Note: Set up thread stack with entry pointer at top
+    Internals.write_integer_at(stack_ptr plus stack_size minus 8, entry_ptr)
+    
+    Note: Clone thread with shared memory but separate stack
+    Inline Assembly:
+        "mov rax, 56\n"             Note: clone syscall
+        "mov rdi, 0x10900\n"        Note: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_THREAD
+        "mov rsi, %1\n"             Note: New stack pointer
+        "xor rdx, rdx\n"            Note: No parent tid
+        "xor r10, r10\n"            Note: No child tid
+        "xor r8, r8\n"             Note: No tls
+        "syscall\n"
+        "test rax, rax\n"
+        "jnz parent_continue\n"
+        
+        Note: Child thread execution
+        "mov rdi, [rsp]\n"          Note: Get entry_ptr from stack
+        "call execute_worker_thread\n"
+        "mov rax, 60\n"             Note: exit syscall
+        "xor rdi, rdi\n"            Note: Exit code 0
+        "syscall\n"
+        
+        "parent_continue:\n"
+        "mov %0, rax\n"
+        : "=r"(thread_id)
+        : "r"(stack_ptr plus stack_size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory"
+    End Assembly
+    
+    Note: Store thread ID for later joining
+    Let entry be read_batch_entry(entry_ptr)
+    Set entry.thread_id to thread_id
+    write_batch_entry(entry_ptr, entry)
+End Process
+
+Process called "execute_worker_thread" that takes entry_ptr as Integer returns Nothing:
+    @Performance_Hints
+    Worker thread execution function.
+    @End Performance_Hints
+    
+    Let entry be read_batch_entry(entry_ptr)
+    Set entry.status to BatchEntryStatus.InFlight
+    write_batch_entry(entry_ptr, entry)
+    
+    Let result be execute_syscall_direct(entry.syscall_name, entry.arguments)
+    
+    Set entry.result to result
+    If result less than 0:
+        Set entry.status to BatchEntryStatus.Failed
+        Set entry.error_code to result
+    Otherwise:
+        Set entry.status to BatchEntryStatus.Completed
+    End If
+    Set entry.execute_time to get_current_timestamp_ms()
+    write_batch_entry(entry_ptr, entry)
+End Process
+
+Process called "wait_for_threads" that takes threads as Internals.InternalArray returns Nothing:
+    @Performance_Hints
+    Waits for all threads to complete using futex.
+    @End Performance_Hints
+    
+    Let i be 0
+    While i less than threads.length:
+        Let thread_info_ptr be Internals.internal_array_get(threads, i)
+        Let entry be read_batch_entry(thread_info_ptr)
+        
+        Note: Wait for thread completion using futex
+        While entry.status equals BatchEntryStatus.InFlight:
+            Let status_addr be thread_info_ptr plus 32  Note: Offset to status field
+            Let expected_status be BatchEntryStatus.InFlight as Integer
+            
+            Inline Assembly:
+                "mov rax, 202\n"        Note: futex syscall
+                "mov rdi, %0\n"         Note: Address to wait on
+                "mov rsi, 0\n"          Note: FUTEX_WAIT
+                "mov rdx, %1\n"         Note: Expected value
+                "xor r10, r10\n"        Note: No timeout
+                "xor r8, r8\n"          Note: Unused
+                "xor r9, r9\n"          Note: Unused
+                "syscall\n"
+                :
+                : "r"(status_addr), "r"(expected_status)
+                : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+            End Assembly
+            
+            Note: Re-read status after wake
+            Set entry to read_batch_entry(thread_info_ptr)
+        End While
+        
+        Set i to i plus 1
+    End While
+End Process
+
+Process called "clone_array" that takes arr as Internals.InternalArray returns Internals.InternalArray:
+    @Performance_Hints
+    Creates a copy of internal array.
+    @End Performance_Hints
+    
+    Let copy be Internals.create_internal_array(arr.capacity)
+    Let i be 0
+    While i less than arr.length:
+        Let value be Internals.internal_array_get(arr, i)
+        Internals.internal_array_add(copy, value)
+        Set i to i plus 1
+    End While
+    
+    Return copy
+End Process
+
+Process called "min_int" that takes a as Integer, b as Integer returns Integer:
+    @Performance_Hints
+    Returns minimum of two integers.
+    @End Performance_Hints
+    
+    If a less than b:
+        Return a
+    End If
+    Return b
+End Process
+
+Note: =====================================================================
+Note: THREAD SAFETY PRIMITIVES
+Note: =====================================================================
+
+Process called "acquire_lock" that takes lock_ptr as Integer returns Nothing:
+    @Performance_Hints
+    Spinlock acquisition with exponential backoff.
+    @End Performance_Hints
+    
+    Let expected be 0
+    Let backoff be 1
+    Constant MAX_BACKOFF as Integer is 1000
+    
+    While true:
+        Inline Assembly:
+            "mov rax, 0\n"
+            "mov rcx, 1\n"
+            "mov rbx, %1\n"
+            "lock cmpxchg [rbx], rcx\n"
+            "setz al\n"
+            "movzx %0, al\n"
+            : "=r"(expected)
+            : "r"(lock_ptr)
+            : "rax", "rbx", "rcx", "memory", "cc"
+        End Assembly
+        
+        If expected not equals 0:
+            Return
+        End If
+        
+        Note: Exponential backoff
+        Let i be 0
+        While i less than backoff:
+            Inline Assembly:
+                "pause\n"
+                :
+                :
+                : "memory"
+            End Assembly
+            Set i to i plus 1
+        End While
+        
+        Set backoff to backoff multiplied by 2
+        If backoff greater than MAX_BACKOFF:
+            Set backoff to MAX_BACKOFF
+        End If
+    End While
+End Process
+
+Process called "release_lock" that takes lock_ptr as Integer returns Nothing:
+    @Performance_Hints
+    Lock release with memory barrier.
+    @End Performance_Hints
+    
+    Inline Assembly:
+        "mov rbx, %0\n"
+        "mov dword ptr [rbx], 0\n"
+        "mfence\n"
+        :
+        : "r"(lock_ptr)
+        : "rbx", "memory"
+    End Assembly
+End Process
+
+Note: =====================================================================
+Note: BATCH ENTRY MANAGEMENT
+Note: =====================================================================
+
+Process called "allocate_batch_entry" that takes entry as SyscallBatchEntry returns Integer:
+    @Performance_Hints
+    Allocates memory for batch entry.
+    @End Performance_Hints
+    
+    Constant ENTRY_SIZE as Integer is 128  Note: Size of batch entry
+    Let ptr be Internals.allocate_raw_memory(ENTRY_SIZE)
+    
+    Internals.write_integer_at(ptr, 0, entry.syscall_id)
+    Internals.write_integer_at(ptr, 8, Internals.string_to_ptr(entry.syscall_name))
+    Internals.write_integer_at(ptr, 16, array_to_ptr(entry.arguments))
+    Internals.write_integer_at(ptr, 24, entry.result)
+    Internals.write_integer_at(ptr, 32, entry.error_code)
+    Internals.write_integer_at(ptr, 40, status_to_int(entry.status))
+    Internals.write_integer_at(ptr, 48, array_to_ptr(entry.dependencies))
+    Internals.write_integer_at(ptr, 56, entry.submit_time)
+    Internals.write_integer_at(ptr, 64, entry.execute_time)
+    
+    Return ptr
+End Process
+
+Process called "read_batch_entry" that takes ptr as Integer returns SyscallBatchEntry:
+    @Performance_Hints
+    Reads batch entry from memory.
+    @End Performance_Hints
+    
+    Let entry be SyscallBatchEntry()
+    Set entry.syscall_id to Internals.read_integer_at(ptr, 0)
+    Set entry.syscall_name to Internals.ptr_to_string(Internals.read_integer_at(ptr, 8))
+    Set entry.arguments to ptr_to_array(Internals.read_integer_at(ptr, 16))
+    Set entry.result to Internals.read_integer_at(ptr, 24)
+    Set entry.error_code to Internals.read_integer_at(ptr, 32)
+    Set entry.status to int_to_status(Internals.read_integer_at(ptr, 40))
+    Set entry.dependencies to ptr_to_array(Internals.read_integer_at(ptr, 48))
+    Set entry.submit_time to Internals.read_integer_at(ptr, 56)
+    Set entry.execute_time to Internals.read_integer_at(ptr, 64)
+    
+    Return entry
+End Process
+
+Process called "write_batch_entry" that takes ptr as Integer, entry as SyscallBatchEntry returns Nothing:
+    @Performance_Hints
+    Writes batch entry to memory.
+    @End Performance_Hints
+    
+    Internals.write_integer_at(ptr, 0, entry.syscall_id)
+    Internals.write_integer_at(ptr, 8, Internals.string_to_ptr(entry.syscall_name))
+    Internals.write_integer_at(ptr, 16, array_to_ptr(entry.arguments))
+    Internals.write_integer_at(ptr, 24, entry.result)
+    Internals.write_integer_at(ptr, 32, entry.error_code)
+    Internals.write_integer_at(ptr, 40, status_to_int(entry.status))
+    Internals.write_integer_at(ptr, 48, array_to_ptr(entry.dependencies))
+    Internals.write_integer_at(ptr, 56, entry.submit_time)
+    Internals.write_integer_at(ptr, 64, entry.execute_time)
+End Process
+
+Note: =====================================================================
+Note: UTILITY FUNCTIONS
+Note: =====================================================================
+
+Process called "get_current_timestamp_ms" returns Integer:
+    @Performance_Hints
+    Gets current monotonic timestamp in milliseconds.
+    @End Performance_Hints
+    
+    Let seconds as Integer
+    Let nanoseconds as Integer
+    
+    Inline Assembly:
+        "mov rax, 228\n"
+        "mov rdi, 1\n"
+        "lea rsi, [rsp-16]\n"
+        "syscall\n"
+        "mov %0, [rsi]\n"
+        "mov %1, [rsi+8]\n"
+        : "=r"(seconds), "=r"(nanoseconds)
+        :
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    Let ms be seconds multiplied by 1000
+    Set ms to ms plus (nanoseconds divided by 1000000)
+    Return ms
+End Process
+
+Process called "address_of" that takes value as Integer returns Integer:
+    @Performance_Hints
+    Returns address of value.
+    @End Performance_Hints
+    
+    Let addr as Integer
+    Inline Assembly:
+        "lea rax, %1\n"
+        "mov %0, rax\n"
+        : "=r"(addr)
+        : "m"(value)
+        : "rax"
+    End Assembly
+    Return addr
+End Process
+
+Process called "yield_cpu" returns Nothing:
+    @Performance_Hints
+    Yields CPU to other threads.
+    @End Performance_Hints
+    
+    Inline Assembly:
+        "pause\n"
+        :
+        :
+        : "memory"
+    End Assembly
+End Process
+
+Process called "sleep_ms" that takes ms as Integer returns Nothing:
+    @Performance_Hints
+    Sleeps for specified milliseconds.
+    @End Performance_Hints
+    
+    Let seconds be ms divided by 1000
+    Let nanoseconds be (ms modulo 1000) multiplied by 1000000
+    
+    Inline Assembly:
+        "mov rax, 35\n"         Note: nanosleep syscall
+        "lea rdi, [rsp-16]\n"   Note: timespec req
+        "mov [rdi], %0\n"       Note: seconds
+        "mov [rdi+8], %1\n"     Note: nanoseconds
+        "xor rsi, rsi\n"        Note: rem = NULL
+        "syscall\n"
+        :
+        : "r"(seconds), "r"(nanoseconds)
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+End Process
+
+Process called "execute_syscall_immediate" that takes syscall_name as String, args as Internals.InternalArray returns Integer:
+    @Performance_Hints
+    Executes syscall immediately without batching.
+    @End Performance_Hints
+    
+    Return execute_syscall_direct(syscall_name, args)
+End Process
+
+Process called "execute_syscall_direct" that takes syscall_name as String, args as Internals.InternalArray returns Integer:
+    @Performance_Hints
+    Direct syscall execution.
+    @End Performance_Hints
+    
+    Note: Map syscall name to number and execute
+    If syscall_name equals Registry.SYSCALL_READ:
+        If args.length greater than or equal to 3:
+            Let fd be Internals.internal_array_get(args, 0)
+            Let buf be Internals.internal_array_get(args, 1)
+            Let count be Internals.internal_array_get(args, 2)
+            
+            Let result as Integer
+            Inline Assembly:
+                "mov rax, 0\n"      Note: read syscall
+                "mov rdi, %1\n"
+                "mov rsi, %2\n"
+                "mov rdx, %3\n"
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r"(result)
+                : "r"(fd), "r"(buf), "r"(count)
+                : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+            End Assembly
+            Return result
+        End If
+    End If
+    
+    If syscall_name equals Registry.SYSCALL_WRITE:
+        If args.length greater than or equal to 3:
+            Let fd be Internals.internal_array_get(args, 0)
+            Let buf be Internals.internal_array_get(args, 1)
+            Let count be Internals.internal_array_get(args, 2)
+            
+            Let result as Integer
+            Inline Assembly:
+                "mov rax, 1\n"      Note: write syscall
+                "mov rdi, %1\n"
+                "mov rsi, %2\n"
+                "mov rdx, %3\n"
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r"(result)
+                : "r"(fd), "r"(buf), "r"(count)
+                : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+            End Assembly
+            Return result
+        End If
+    End If
+    
+    Return minus 1  Note: Unsupported syscall
+End Process
+
+Process called "status_to_int" that takes status as BatchEntryStatus returns Integer:
+    @Performance_Hints
+    Converts status enum to integer.
+    @End Performance_Hints
+    
+    Match status:
+        When BatchEntryStatus.Pending:
+            Return 0
+        When BatchEntryStatus.InFlight:
+            Return 1
+        When BatchEntryStatus.Completed:
+            Return 2
+        When BatchEntryStatus.Failed:
+            Return 3
+        When BatchEntryStatus.Cancelled:
+            Return 4
+    End Match
+    
+    Return 0
+End Process
+
+Process called "int_to_status" that takes value as Integer returns BatchEntryStatus:
+    @Performance_Hints
+    Converts integer to status enum.
+    @End Performance_Hints
+    
+    If value equals 1:
+        Return BatchEntryStatus.InFlight
+    End If
+    If value equals 2:
+        Return BatchEntryStatus.Completed
+    End If
+    If value equals 3:
+        Return BatchEntryStatus.Failed
+    End If
+    If value equals 4:
+        Return BatchEntryStatus.Cancelled
+    End If
+    
+    Return BatchEntryStatus.Pending
+End Process
+
+Process called "array_to_ptr" that takes arr as Internals.InternalArray returns Integer:
+    @Performance_Hints
+    Converts array to pointer.
+    @End Performance_Hints
+    
+    Let ptr as Integer
+    Inline Assembly:
+        "lea rax, %1\n"
+        "mov %0, rax\n"
+        : "=r"(ptr)
+        : "m"(arr)
+        : "rax"
+    End Assembly
+    Return ptr
+End Process
+
+Process called "ptr_to_array" that takes ptr as Integer returns Internals.InternalArray:
+    @Performance_Hints
+    Converts pointer to array.
+    @End Performance_Hints
+    
+    Let arr as Internals.InternalArray
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov %0, [rax]\n"
+        : "=m"(arr)
+        : "r"(ptr)
+        : "rax", "memory"
+    End Assembly
+    Return arr
+End Process

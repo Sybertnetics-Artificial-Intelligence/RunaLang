@@ -1,0 +1,684 @@
+Note: Platform-specific syscall interface definitions
+Note: This module defines the interface that all platform implementations must follow
+
+@Reasoning
+Different platforms (Linux x86_64, Linux ARM64, macOS, Windows) have different
+syscall conventions and numbers. This interface provides a unified way to access
+platform-specific syscall functionality while maintaining portability.
+@End Reasoning
+
+Import "compiler/frontend/primitives/types/compiler_internals" as Internals
+Import "compiler/backend/syscalls/syscall_registry" as Registry
+
+Note: =====================================================================
+Note: CALLING CONVENTION TYPES
+Note: =====================================================================
+
+Type called "CallingConvention":
+    Note: Describes how syscalls are made on a platform
+    
+    @Implementation
+    Each platform has its own calling convention for syscalls, including
+    which registers are used for parameters and return values.
+    @End Implementation
+    
+    name as String                          Note: Convention name (e.g., "SystemV", "Windows64")
+    syscall_register as String               Note: Register holding syscall number
+    param_registers as Internals.InternalArray   Note: Registers for parameters (array of string pointers)
+    return_register as String                Note: Register for return value
+    error_register as String                 Note: Register for error flag (if separate)
+    max_params as Integer                    Note: Maximum number of syscall parameters
+    instruction as String                    Note: Syscall instruction (e.g., "syscall", "svc")
+End Type
+
+Type called "ErrorMapping":
+    Note: Maps platform error codes to standard error codes
+    
+    @Implementation
+    Different platforms return different error codes for the same conditions.
+    This provides a mapping to standardize error handling.
+    @End Implementation
+    
+    platform_code as Integer                 Note: Platform-specific error code
+    standard_code as Integer                 Note: Standardized error code
+    error_name as String                     Note: Human-readable error name
+    description as String                    Note: Error description
+End Type
+
+Note: =====================================================================
+Note: PLATFORM INTERFACE DEFINITION
+Note: =====================================================================
+
+Interface called "PlatformSyscalls":
+    Note: Standard interface that all platform implementations must provide
+    
+    @Implementation
+    Each platform (linux_x86_64, linux_arm64, macos_x86_64, etc.) must
+    implement this interface to provide syscall functionality.
+    @End Implementation
+    
+    Process called "get_syscall_number" that takes name as String returns Integer:
+        Note: Get the syscall number for a given syscall name
+        
+        @Implementation
+        Returns the platform-specific syscall number for the given name.
+        Returns -1 if the syscall is not supported on this platform.
+        @End Implementation
+    End Process
+    
+    Process called "get_calling_convention" returns CallingConvention:
+        Note: Get the calling convention for this platform
+        
+        @Implementation
+        Returns the CallingConvention structure describing how to make
+        syscalls on this platform.
+        @End Implementation
+    End Process
+    
+    Process called "supports_syscall" that takes name as String returns Boolean:
+        Note: Check if a syscall is supported on this platform
+        
+        @Implementation
+        Returns true if the named syscall is available on this platform,
+        false otherwise.
+        @End Implementation
+    End Process
+    
+    Process called "get_error_mapping" returns Internals.InternalMap:
+        Note: Get the error code mapping for this platform
+        
+        @Implementation
+        Returns a map of platform-specific error codes to
+        standardized error information.
+        @End Implementation
+    End Process
+    
+    Process called "get_platform_name" returns String:
+        Note: Get the platform identifier
+        
+        @Implementation
+        Returns a string identifying the platform (e.g., "linux_x86_64").
+        @End Implementation
+    End Process
+    
+    Process called "get_kernel_version" returns String:
+        Note: Get the kernel/OS version
+        
+        @Implementation
+        Returns the kernel or OS version string for version-specific
+        syscall availability checking.
+        @End Implementation
+    End Process
+    
+    Process called "get_architecture" returns String:
+        Note: Get the CPU architecture
+        
+        @Implementation
+        Returns the CPU architecture (e.g., "x86_64", "aarch64").
+        @End Implementation
+    End Process
+    
+    Process called "get_max_syscall_args" returns Integer:
+        Note: Get the maximum number of syscall arguments
+        
+        @Implementation
+        Returns the maximum number of arguments that can be passed to
+        a syscall on this platform.
+        @End Implementation
+    End Process
+    
+End Interface
+
+Note: =====================================================================
+Note: PLATFORM REGISTRY
+Note: =====================================================================
+
+Type called "PlatformRegistry":
+    Note: Registry of available platform implementations
+    
+    @Implementation
+    Maintains a registry of all available platform implementations,
+    allowing runtime selection of the appropriate platform.
+    @End Implementation
+    
+    platforms as Dictionary[String, PlatformSyscalls]
+    current_platform as String
+End Type
+
+Note: Global platform registry using static storage
+Note: This uses inline assembly to maintain a global registry pointer
+Let global_registry_ptr as Integer
+
+Process called "initialize_global_registry" returns Nothing:
+    Note: Initialize the global platform registry
+    
+    @Implementation
+    Creates and initializes the global registry structure in memory.
+    Uses assembly to allocate and store the registry pointer.
+    @End Implementation
+    
+    Note: Allocate memory for PlatformRegistry structure
+    Assembly "
+        mov rdi, 24          ; Size of PlatformRegistry (8 + 8 + 8 bytes)
+        call malloc          ; Allocate memory
+        mov [global_registry_ptr], rax  ; Store pointer globally
+        
+        ; Initialize platforms dictionary (empty initially)
+        mov qword [rax], 0   ; platforms = null (empty dict)
+        mov qword [rax+8], 0 ; current_platform = null
+        mov qword [rax+16], 0 ; reserved
+    "
+End Process
+
+Process called "register_platform" that takes name as String, implementation as PlatformSyscalls returns Nothing:
+    Note: Register a platform implementation
+    
+    @Implementation
+    Adds a platform implementation to the global registry.
+    Uses assembly to manipulate the global registry structure.
+    @End Implementation
+    
+    Let name_ptr as Integer
+    Let impl_ptr as Integer
+    
+    Assembly "
+        ; Get string and implementation pointers
+        mov rax, %[name]
+        mov %[name_ptr], rax
+        mov rax, %[implementation]
+        mov %[impl_ptr], rax
+        
+        ; Get global registry pointer
+        mov rbx, [global_registry_ptr]
+        test rbx, rbx
+        jz .not_initialized
+        
+        ; Get platforms dictionary pointer
+        mov rcx, [rbx]       ; platforms dictionary
+        test rcx, rcx
+        jnz .has_dict
+        
+        ; Allocate new dictionary if needed
+        mov rdi, 256         ; Initial dictionary size
+        call malloc
+        mov rcx, rax
+        mov [rbx], rax       ; Store dictionary pointer
+        
+        ; Initialize dictionary header
+        mov qword [rcx], 0   ; entry_count = 0
+        mov qword [rcx+8], 32 ; bucket_count = 32
+        mov qword [rcx+16], 0 ; first_entry = null
+        
+    .has_dict:
+        ; Hash the platform name
+        mov rdi, %[name_ptr]
+        call hash_string
+        mov rdx, rax         ; hash value
+        
+        ; Allocate dictionary entry
+        mov rdi, 32          ; Entry size (key + value + next)
+        call malloc
+        mov rsi, rax         ; entry pointer
+        
+        ; Store entry data
+        mov rax, %[name_ptr]
+        mov [rsi], rax       ; key = name
+        mov rax, %[impl_ptr]
+        mov [rsi+8], rax     ; value = implementation
+        mov qword [rsi+16], 0 ; next = null
+        
+        ; Link into dictionary chain
+        mov rax, [rcx+16]    ; old first_entry
+        mov [rsi+16], rax    ; new_entry->next = old_first
+        mov [rcx+16], rsi    ; first_entry = new_entry
+        
+        ; Increment entry count
+        inc qword [rcx]
+        jmp .done
+        
+    .not_initialized:
+        ; Registry not initialized, initialize it first
+        call initialize_global_registry
+        ; Retry registration
+        jmp register_platform
+        
+    .done:
+    " with inputs [name_ptr, impl_ptr]
+    
+    ; Internal helper functions referenced by assembly
+    Assembly "
+    hash_string:
+        ; Simple DJB2 hash function
+        push rbx
+        mov rax, 5381        ; Initial hash
+        mov rbx, rdi         ; String pointer
+    .hash_loop:
+        movzx rcx, byte [rbx]
+        test rcx, rcx
+        jz .hash_done
+        shl rax, 5           ; hash * 32
+        add rax, rcx         ; + character
+        inc rbx
+        jmp .hash_loop
+    .hash_done:
+        pop rbx
+        ret
+        
+    malloc:
+        ; Memory allocation using mmap syscall
+        ; Input: rdi = size to allocate
+        ; Output: rax = allocated memory pointer
+        push rdi             ; Save size parameter
+        mov rsi, rdi         ; length = size
+        xor rdi, rdi         ; addr = NULL (let kernel choose)
+        mov rax, 9           ; sys_mmap
+        mov rdx, 3           ; PROT_READ | PROT_WRITE
+        mov r10, 0x22        ; MAP_PRIVATE | MAP_ANONYMOUS
+        mov r8, -1           ; fd = -1
+        xor r9, r9           ; offset = 0
+        syscall
+        pop rdi              ; Restore stack
+        ret
+    "
+End Process
+
+Process called "get_platform" that takes name as String returns PlatformSyscalls:
+    Note: Get a specific platform implementation
+    
+    @Implementation
+    Returns the platform implementation for the given name by searching
+    the global registry dictionary.
+    @End Implementation
+    
+    Let name_ptr as Integer
+    Let result_ptr as Integer
+    
+    Assembly "
+        ; Get string pointer
+        mov rax, %[name]
+        mov %[name_ptr], rax
+        
+        ; Get global registry pointer
+        mov rbx, [global_registry_ptr]
+        test rbx, rbx
+        jz .not_found        ; No registry
+        
+        ; Get platforms dictionary
+        mov rcx, [rbx]       ; platforms dictionary
+        test rcx, rcx
+        jz .not_found        ; No dictionary
+        
+        ; Hash the platform name
+        mov rdi, %[name_ptr]
+        call hash_string
+        mov rdx, rax         ; hash value
+        
+        ; Search dictionary chain
+        mov rsi, [rcx+16]    ; first_entry
+    .search_loop:
+        test rsi, rsi
+        jz .not_found        ; End of chain
+        
+        ; Compare keys
+        mov rdi, [rsi]       ; entry->key
+        push rsi
+        push rcx
+        push rdx
+        mov rsi, %[name_ptr]
+        call strcmp
+        pop rdx
+        pop rcx
+        pop rsi
+        test rax, rax
+        jz .found            ; Match found
+        
+        ; Move to next entry
+        mov rsi, [rsi+16]    ; entry = entry->next
+        jmp .search_loop
+        
+    .found:
+        mov rax, [rsi+8]     ; return entry->value (implementation)
+        mov %[result_ptr], rax
+        jmp .done
+        
+    .not_found:
+        xor rax, rax         ; return null
+        mov %[result_ptr], rax
+        
+    .done:
+    " with inputs [name_ptr] outputs [result_ptr]
+    
+    ; String comparison helper
+    Assembly "
+    strcmp:
+        push rbx
+    .strcmp_loop:
+        movzx rax, byte [rdi]
+        movzx rbx, byte [rsi]
+        cmp rax, rbx
+        jne .strcmp_diff
+        test rax, rax
+        jz .strcmp_equal
+        inc rdi
+        inc rsi
+        jmp .strcmp_loop
+    .strcmp_equal:
+        xor rax, rax         ; Equal
+        pop rbx
+        ret
+    .strcmp_diff:
+        mov rax, 1           ; Different
+        pop rbx
+        ret
+    "
+    
+    Note: Cast the pointer back to PlatformSyscalls interface
+    If result_ptr equals 0:
+        Return null
+    End If
+    
+    Let platform as PlatformSyscalls
+    Assembly "mov %[platform], %[result_ptr]" with inputs [result_ptr] outputs [platform]
+    Return platform
+End Process
+
+Note: =====================================================================
+Note: PLATFORM DETECTION
+Note: =====================================================================
+
+Process called "detect_current_platform" returns String:
+    Note: Detect the current platform at compile time or runtime
+    
+    @Implementation
+    Uses compile-time flags or runtime detection to determine the
+    current platform (OS and architecture combination).
+    @End Implementation
+    
+    Let arch as Integer
+    Let os as Integer
+    
+    Assembly "
+        ; Detect architecture
+        mov rax, 0
+        #ifdef __x86_64__
+            mov rax, 1
+        #endif
+        #ifdef __aarch64__
+            mov rax, 2
+        #endif
+        #ifdef __riscv
+            mov rax, 3
+        #endif
+        mov %[arch], rax
+        
+        ; Detect OS
+        mov rax, 0
+        #ifdef __linux__
+            mov rax, 1
+        #endif
+        #ifdef __APPLE__
+            mov rax, 2
+        #endif
+        #ifdef _WIN32
+            mov rax, 3
+        #endif
+        #ifdef __FreeBSD__
+            mov rax, 4
+        #endif
+        #ifdef __OpenBSD__
+            mov rax, 5
+        #endif
+        #ifdef __NetBSD__
+            mov rax, 6
+        #endif
+        #ifdef __DragonFly__
+            mov rax, 7
+        #endif
+        mov %[os], rax
+    " outputs [arch, os]
+    
+    If os equals 1:  Note: Linux
+        If arch equals 1:
+            Return "linux_x86_64"
+        Otherwise:
+            If arch equals 2:
+                Return "linux_aarch64"
+            Otherwise:
+                If arch equals 3:
+                    Return "linux_riscv64"
+                End If
+            End If
+        End If
+    Otherwise:
+        If os equals 2:  Note: macOS
+            If arch equals 1:
+                Return "macos_x86_64"
+            Otherwise:
+                If arch equals 2:
+                    Return "macos_aarch64"
+                End If
+            End If
+        Otherwise:
+            If os equals 3:  Note: Windows
+                If arch equals 1:
+                    Return "windows_x86_64"
+                Otherwise:
+                    If arch equals 2:
+                        Return "windows_aarch64"
+                    End If
+                End If
+            Otherwise:
+                If os equals 4:  Note: FreeBSD
+                    If arch equals 1:
+                        Return "freebsd_x86_64"
+                    Otherwise:
+                        If arch equals 2:
+                            Return "freebsd_aarch64"
+                        End If
+                    End If
+                Otherwise:
+                    If os equals 5:  Note: OpenBSD
+                        If arch equals 1:
+                            Return "openbsd_x86_64"
+                        Otherwise:
+                            If arch equals 2:
+                                Return "openbsd_aarch64"
+                            End If
+                        End If
+                    Otherwise:
+                        If os equals 6:  Note: NetBSD
+                            If arch equals 1:
+                                Return "netbsd_x86_64"
+                            Otherwise:
+                                If arch equals 2:
+                                    Return "netbsd_aarch64"
+                                End If
+                            End If
+                        Otherwise:
+                            If os equals 7:  Note: DragonFly BSD
+                                If arch equals 1:
+                                    Return "dragonfly_x86_64"
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+    
+    Return "unknown"
+End Process
+
+Process called "get_current_platform" returns PlatformSyscalls:
+    Note: Get the platform implementation for the current system
+    
+    @Implementation
+    Detects the current platform and returns the appropriate
+    implementation.
+    @End Implementation
+    
+    Let platform_name be detect_current_platform()
+    Return get_platform(platform_name)
+End Process
+
+Note: =====================================================================
+Note: PLATFORM CAPABILITIES
+Note: =====================================================================
+
+Process called "check_syscall_availability" that takes syscall_name as String, platform as PlatformSyscalls returns Boolean:
+    Note: Check if a syscall is available on the given platform
+    
+    @Implementation
+    Checks both platform support and kernel version requirements.
+    @End Implementation
+    
+    If platform is null:
+        Return false
+    End If
+    
+    Return platform.supports_syscall(syscall_name)
+End Process
+
+Process called "translate_error_code" that takes platform_error as Integer, platform as PlatformSyscalls returns ErrorMapping:
+    Note: Translate a platform error code to standard format
+    
+    @Implementation
+    Uses the platform's error mapping to translate platform-specific
+    error codes to standardized ones.
+    @End Implementation
+    
+    If platform is null:
+        Let unknown_error be ErrorMapping
+        Set unknown_error.platform_code to platform_error
+        Set unknown_error.standard_code to -1
+        Set unknown_error.error_name to "UNKNOWN"
+        Set unknown_error.description to "Unknown error"
+        Return unknown_error
+    End If
+    
+    Let mapping be platform.get_error_mapping()
+    If mapping contains platform_error:
+        Return mapping[platform_error]
+    End If
+    
+    Let unknown_error be ErrorMapping
+    Set unknown_error.platform_code to platform_error
+    Set unknown_error.standard_code to platform_error
+    Set unknown_error.error_name to "PLATFORM_SPECIFIC"
+    Set unknown_error.description to "Platform-specific error"
+    Return unknown_error
+End Process
+
+Note: =====================================================================
+Note: STANDARD ERROR CODES
+Note: =====================================================================
+
+Note: Standard error codes that platforms map to
+Constant EPERM as Integer is 1           Note: Operation not permitted
+Constant ENOENT as Integer is 2          Note: No such file or directory
+Constant ESRCH as Integer is 3           Note: No such process
+Constant EINTR as Integer is 4           Note: Interrupted system call
+Constant EIO as Integer is 5             Note: I/O error
+Constant ENXIO as Integer is 6           Note: No such device or address
+Constant E2BIG as Integer is 7           Note: Argument list too long
+Constant ENOEXEC as Integer is 8         Note: Exec format error
+Constant EBADF as Integer is 9           Note: Bad file number
+Constant ECHILD as Integer is 10         Note: No child processes
+Constant EAGAIN as Integer is 11         Note: Try again
+Constant ENOMEM as Integer is 12         Note: Out of memory
+Constant EACCES as Integer is 13         Note: Permission denied
+Constant EFAULT as Integer is 14         Note: Bad address
+Constant ENOTBLK as Integer is 15        Note: Block device required
+Constant EBUSY as Integer is 16          Note: Device or resource busy
+Constant EEXIST as Integer is 17         Note: File exists
+Constant EXDEV as Integer is 18          Note: Cross-device link
+Constant ENODEV as Integer is 19         Note: No such device
+Constant ENOTDIR as Integer is 20        Note: Not a directory
+Constant EISDIR as Integer is 21         Note: Is a directory
+Constant EINVAL as Integer is 22         Note: Invalid argument
+Constant ENFILE as Integer is 23         Note: File table overflow
+Constant EMFILE as Integer is 24         Note: Too many open files
+Constant ENOTTY as Integer is 25         Note: Not a typewriter
+Constant ETXTBSY as Integer is 26        Note: Text file busy
+Constant EFBIG as Integer is 27          Note: File too large
+Constant ENOSPC as Integer is 28         Note: No space left on device
+ESPIPE as Integer = 29          Note: Illegal seek
+Constant EROFS as Integer is 30          Note: Read-only file system
+Constant EMLINK as Integer is 31         Note: Too many links
+Constant EPIPE as Integer is 32          Note: Broken pipe
+Constant EDOM as Integer is 33           Note: Math argument out of domain
+Constant ERANGE as Integer is 34         Note: Math result not representable
+Constant ENOSYS as Integer is 38         Note: Function not implemented
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Process called "is_platform_supported" that takes platform_name as String returns Boolean:
+    Note: Check if a platform is supported
+    
+    @Implementation
+    Checks if the given platform name is in the list of supported platforms.
+    @End Implementation
+    
+    Match platform_name:
+        When "linux_x86_64":
+            Return true
+        When "linux_aarch64":
+            Return true
+        When "linux_riscv64":
+            Return true
+        When "macos_x86_64":
+            Return true
+        When "macos_aarch64":
+            Return true
+        When "windows_x86_64":
+            Return true
+        When "windows_aarch64":
+            Return true
+        When "freebsd_x86_64":
+            Return true
+        Otherwise:
+            Return false
+    End Match
+End Process
+
+Process called "get_syscall_category" that takes syscall_name as String returns String:
+    Note: Get the category of a syscall
+    
+    @Implementation
+    Returns the category (file, process, memory, etc.) for a syscall.
+    @End Implementation
+    
+    Match syscall_name:
+        When Registry.SYSCALL_READ:
+            Return "file"
+        When Registry.SYSCALL_WRITE:
+            Return "file"
+        When Registry.SYSCALL_OPEN:
+            Return "file"
+        When Registry.SYSCALL_CLOSE:
+            Return "file"
+        When Registry.SYSCALL_FORK:
+            Return "process"
+        When Registry.SYSCALL_EXECVE:
+            Return "process"
+        When Registry.SYSCALL_EXIT:
+            Return "process"
+        When Registry.SYSCALL_MMAP:
+            Return "memory"
+        When Registry.SYSCALL_MUNMAP:
+            Return "memory"
+        When Registry.SYSCALL_MPROTECT:
+            Return "memory"
+        When Registry.SYSCALL_SOCKET:
+            Return "network"
+        When Registry.SYSCALL_CONNECT:
+            Return "network"
+        When Registry.SYSCALL_ACCEPT:
+            Return "network"
+        Otherwise:
+            Return "unknown"
+    End Match
+End Process

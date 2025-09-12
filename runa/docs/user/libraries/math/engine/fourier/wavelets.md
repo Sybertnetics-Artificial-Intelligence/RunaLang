@@ -184,7 +184,7 @@ Process called "dwt_decompose" that takes signal as List[Float], wavelet as Wave
     
     Note: Create high-pass filter from low-pass (alternating signs)
     For i from 0 to low_pass.size() - 1:
-        Let sign be if i % 2 == 0 then 1.0 else -1.0
+        Let sign be if i % 2 == 0 then 1.0 Otherwise -1.0
         Call high_pass.append(sign * low_pass[low_pass.size() - 1 - i])
     
     Let current_signal be List[Float]
@@ -224,7 +224,7 @@ Process called "dwt_reconstruct" that takes coefficients as WaveletCoefficients 
     
     Note: Reconstruction filters (time-reversed)
     For i from 0 to low_pass.size() - 1:
-        Call high_pass.append(low_pass[low_pass.size() - 1 - i] * (if i % 2 == 0 then 1.0 else -1.0))
+        Call high_pass.append(low_pass[low_pass.size() - 1 - i] * (if i % 2 == 0 then 1.0 Otherwise -1.0))
     
     Let current_approx be List[Float]
     For coeff in coefficients.approximation:
@@ -240,8 +240,8 @@ Process called "dwt_reconstruct" that takes coefficients as WaveletCoefficients 
         Note: Add approximation and detail contributions
         Let reconstructed be List[Float]
         For i from 0 to MathCore.max(upsampled_approx.size(), upsampled_detail.size()) - 1:
-            Let approx_val be if i < upsampled_approx.size() then upsampled_approx[i] else 0.0
-            Let detail_val be if i < upsampled_detail.size() then upsampled_detail[i] else 0.0
+            Let approx_val be if i < upsampled_approx.size() then upsampled_approx[i] Otherwise 0.0
+            Let detail_val be if i < upsampled_detail.size() then upsampled_detail[i] Otherwise 0.0
             Call reconstructed.append(approx_val + detail_val)
         
         Set current_approx to reconstructed

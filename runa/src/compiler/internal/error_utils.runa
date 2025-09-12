@@ -1,0 +1,523 @@
+Note: Compiler-only error handling utilities - NOT part of stdlib
+Note: These are specialized for compiler error reporting and diagnostics
+
+Import "../../compiler/frontend/primitives/types/construction.runa" as Types
+Import "../../compiler/frontend/primitives/memory/layout.runa" as Memory
+
+@Reasoning
+The compiler needs its own error handling utilities separate from the standard library.
+These utilities are specifically designed for compiler diagnostics, error recovery,
+and source location tracking. They must be zero-dependency and optimized for the
+unique requirements of compiler error reporting.
+@End Reasoning
+
+Type called "CompilerErrorKind":
+    Note: Different categories of compiler errors
+    
+    @Implementation
+    Each error kind maps to specific compiler phases and recovery strategies.
+    The numeric values are used for efficient error categorization and filtering.
+    @End Implementation
+    
+    kind_id as Integer
+    severity as Integer  Note: 0=note, 1=warning, 2=error, 3=fatal
+    phase as Integer     Note: 0=lexer, 1=parser, 2=semantic, 3=codegen
+    recoverable as Boolean
+End Type
+
+Type called "SourceLocation":
+    Note: Precise location tracking for error reporting
+    
+    @Implementation
+    Tracks exact source positions for accurate error messages.
+    The span allows highlighting entire error regions in IDEs.
+    @End Implementation
+    
+    file_id as Integer
+    line as Integer
+    column as Integer
+    byte_offset as Integer
+    span_length as Integer
+End Type
+
+Type called "CompilerError":
+    Note: Complete error information with context
+    
+    @Implementation
+    Contains all information needed for rich error diagnostics including
+    source location, error message, and suggested fixes.
+    @End Implementation
+    
+    error_kind as CompilerErrorKind
+    location as SourceLocation
+    primary_message as Pointer
+    primary_message_length as Integer
+    secondary_message as Pointer
+    secondary_message_length as Integer
+    suggestion as Pointer
+    suggestion_length as Integer
+    error_code as Integer
+End Type
+
+Type called "ErrorBuffer":
+    Note: Efficient storage for multiple compiler errors
+    
+    @Performance_Hints
+    Pre-allocates space for typical error counts to avoid reallocation.
+    Uses geometric growth when expansion is needed.
+    @End Performance_Hints
+    
+    errors as Pointer
+    capacity as Integer
+    count as Integer
+    max_errors as Integer  Note: Stop after this many errors
+    has_fatal as Boolean
+End Type
+
+Process called "create_error" that takes kind as CompilerErrorKind, location as SourceLocation, message as Pointer, message_len as Integer returns CompilerError:
+    Note: Construct a new compiler error
+    
+    @Implementation
+    Creates a fully initialized error structure with all fields populated.
+    The error code is generated based on kind and phase for categorization.
+    @End Implementation
+    
+    Let error be CompilerError
+    Set error.error_kind to kind
+    Set error.location to location
+    Set error.primary_message to message
+    Set error.primary_message_length to message_len
+    Set error.secondary_message to null
+    Set error.secondary_message_length to 0
+    Set error.suggestion to null
+    Set error.suggestion_length to 0
+    
+    Note: Generate error code from kind and phase
+    Let phase_offset be kind.phase times 1000
+    Let severity_offset be kind.severity times 100
+    Set error.code to phase_offset plus severity_offset plus kind.kind_id
+    
+    Return error
+End Process
+
+Process called "add_suggestion" that takes error as CompilerError, suggestion as Pointer, suggestion_len as Integer returns Nothing:
+    Note: Attach a fix suggestion to an error
+    
+    @Implementation
+    Suggestions help users understand how to fix errors.
+    Common suggestions include typo corrections and syntax fixes.
+    @End Implementation
+    
+    Set error.suggestion to suggestion
+    Set error.suggestion_length to suggestion_len
+End Process
+
+Process called "create_error_buffer" that takes max_errors as Integer returns ErrorBuffer:
+    Note: Initialize error collection buffer
+    
+    @Performance_Hints
+    Initial capacity of 32 errors handles most compilation units.
+    Geometric growth prevents excessive reallocation.
+    @End Performance_Hints
+    
+    Let buffer be ErrorBuffer
+    Let initial_capacity be 32
+    
+    Note: Allocate error array
+    Let error_size be 88  Note: Size of CompilerError structure
+    Let total_size be initial_capacity times error_size
+    
+    Inline Assembly:
+        "mov rdi, %1\n"              Note: Size to allocate
+        "call malloc\n"              Note: Allocate memory
+        "mov %0, rax\n"              Note: Store result
+        : "=r"(buffer.errors)
+        : "r"(total_size)
+        : "rax", "rdi", "memory"
+    End Assembly
+    
+    Set buffer.capacity to initial_capacity
+    Set buffer.count to 0
+    Set buffer.max_errors to max_errors
+    Set buffer.has_fatal to false
+    
+    Return buffer
+End Process
+
+Process called "add_error" that takes buffer as ErrorBuffer, error as CompilerError returns Boolean:
+    Note: Add error to buffer, return false if limit reached
+    
+    @Implementation
+    Stops collecting errors after max_errors to prevent overwhelming output.
+    Fatal errors immediately set the has_fatal flag for early termination.
+    @End Implementation
+    
+    Note: Check if we've hit the error limit
+    If buffer.count is greater than or equal to buffer.max_errors:
+        Return false
+    End If
+    
+    Note: Expand buffer if needed
+    If buffer.count equals buffer.capacity:
+        Let new_capacity be buffer.capacity times 2
+        Let error_size be 88
+        Let new_size be new_capacity times error_size
+        
+        Inline Assembly:
+            "mov rdi, %1\n"          Note: Existing buffer
+            "mov rsi, %2\n"          Note: New size
+            "call realloc\n"         Note: Reallocate memory
+            "mov %0, rax\n"          Note: Store result
+            : "=r"(buffer.errors)
+            : "r"(buffer.errors), "r"(new_size)
+            : "rax", "rdi", "rsi", "memory"
+        End Assembly
+        
+        Set buffer.capacity to new_capacity
+    End If
+    
+    Note: Copy error to buffer
+    Let error_size be 88
+    Let offset be buffer.count times error_size
+    Let dest be buffer.errors plus offset
+    
+    Inline Assembly:
+        "mov rdi, %0\n"              Note: Destination
+        "mov rsi, %1\n"              Note: Source error
+        "mov rcx, %2\n"              Note: Size to copy
+        "rep movsb\n"                Note: Copy bytes
+        :
+        : "r"(dest), "r"(error), "r"(error_size)
+        : "rdi", "rsi", "rcx", "memory"
+    End Assembly
+    
+    Set buffer.count to buffer.count plus 1
+    
+    Note: Check for fatal errors
+    If error.error_kind.severity equals 3:
+        Set buffer.has_fatal to true
+    End If
+    
+    Return true
+End Process
+
+Process called "format_error" that takes error as CompilerError, output as Pointer, max_len as Integer returns Integer:
+    Note: Format error for display
+    
+    @Implementation
+    Produces human-readable error messages with location information.
+    Follows standard compiler error format: file:line:column: severity: message
+    @End Implementation
+    
+    Let written be 0
+    Let remaining be max_len
+    
+    Note: Format location prefix
+    Let location_str be output
+    Let chars be format_location(error.location, location_str, remaining)
+    Set written to written plus chars
+    Set remaining to remaining minus chars
+    
+    Note: Add severity marker
+    Let severity_str be location_str plus chars
+    Let severity_chars be format_severity(error.error_kind.severity, severity_str, remaining)
+    Set written to written plus severity_chars
+    Set remaining to remaining minus severity_chars
+    
+    Note: Copy primary message
+    Let message_dest be severity_str plus severity_chars
+    Let copy_len be error.primary_message_length
+    If copy_len is greater than remaining:
+        Set copy_len to remaining
+    End If
+    
+    Inline Assembly:
+        "mov rdi, %0\n"              Note: Destination
+        "mov rsi, %1\n"              Note: Source message
+        "mov rcx, %2\n"              Note: Length to copy
+        "rep movsb\n"                Note: Copy bytes
+        :
+        : "r"(message_dest), "r"(error.primary_message), "r"(copy_len)
+        : "rdi", "rsi", "rcx", "memory"
+    End Assembly
+    
+    Set written to written plus copy_len
+    
+    Return written
+End Process
+
+Process called "format_location" that takes location as SourceLocation, output as Pointer, max_len as Integer returns Integer:
+    Note: Format source location as file:line:column
+    
+    @Implementation
+    Produces standard compiler location format for IDE integration.
+    The format is recognized by most development tools.
+    @End Implementation
+    
+    Let written be 0
+    
+    Note: For now, write simplified location
+    Note: In full implementation, would resolve file_id to filename
+    Let line_digits be count_digits(location.line)
+    Let col_digits be count_digits(location.column)
+    
+    Note: Write line number
+    Let line_written be write_integer(location.line, output, max_len)
+    Set written to line_written
+    
+    Note: Write colon separator
+    If written is less than max_len:
+        Inline Assembly:
+            "mov rax, %0\n"          Note: Output pointer
+            "add rax, %1\n"          Note: Add offset
+            "mov byte [rax], 0x3A\n" Note: Write colon
+            :
+            : "r"(output), "r"(written)
+            : "rax", "memory"
+        End Assembly
+        Set written to written plus 1
+    End If
+    
+    Note: Write column number
+    If written is less than max_len:
+        Let col_written be write_integer(location.column, output plus written, max_len minus written)
+        Set written to written plus col_written
+    End If
+    
+    Note: Write final colon and space
+    If written plus 2 is less than or equal to max_len:
+        Inline Assembly:
+            "mov rax, %0\n"          Note: Output pointer
+            "add rax, %1\n"          Note: Add offset
+            "mov word [rax], 0x203A\n" Note: Write colon-space
+            :
+            : "r"(output), "r"(written)
+            : "rax", "memory"
+        End Assembly
+        Set written to written plus 2
+    End If
+    
+    Return written
+End Process
+
+Process called "format_severity" that takes severity as Integer, output as Pointer, max_len as Integer returns Integer:
+    Note: Format severity level as string
+    
+    @Implementation
+    Maps numeric severity levels to human-readable strings.
+    Uses standard compiler terminology for consistency.
+    @End Implementation
+    
+    Let message as Pointer
+    Let length as Integer
+    
+    Match severity:
+        When 0:
+            Inline Assembly:
+                "lea %0, [note_str]\n"   Note: Load address
+                "mov %1, 5\n"            Note: Set length
+                : "=r"(message), "=r"(length)
+                :
+                : "memory"
+            End Assembly
+        When 1:
+            Inline Assembly:
+                "lea %0, [warning_str]\n" Note: Load address
+                "mov %1, 8\n"            Note: Set length
+                : "=r"(message), "=r"(length)
+                :
+                : "memory"
+            End Assembly
+        When 2:
+            Inline Assembly:
+                "lea %0, [error_str]\n"  Note: Load address
+                "mov %1, 6\n"            Note: Set length
+                : "=r"(message), "=r"(length)
+                :
+                : "memory"
+            End Assembly
+        When 3:
+            Inline Assembly:
+                "lea %0, [fatal_str]\n"  Note: Load address
+                "mov %1, 6\n"            Note: Set length
+                : "=r"(message), "=r"(length)
+                :
+                : "memory"
+            End Assembly
+    End Match
+    
+    Let copy_len be length
+    If copy_len is greater than max_len:
+        Set copy_len to max_len
+    End If
+    
+    Inline Assembly:
+        "mov rdi, %0\n"              Note: Destination
+        "mov rsi, %1\n"              Note: Source message
+        "mov rcx, %2\n"              Note: Length to copy
+        "rep movsb\n"                Note: Copy bytes
+        :
+        : "r"(output), "r"(message), "r"(copy_len)
+        : "rdi", "rsi", "rcx", "memory"
+    End Assembly
+    
+    Return copy_len
+End Process
+
+Process called "count_digits" that takes value as Integer returns Integer:
+    Note: Count decimal digits in integer
+    
+    @Implementation
+    Uses successive division by 10 to count digits.
+    Handles zero as a special case (1 digit).
+    @End Implementation
+    
+    If value equals 0:
+        Return 1
+    End If
+    
+    Let count be 0
+    Let temp be value
+    If temp is less than 0:
+        Set temp to 0 minus temp
+        Set count to 1  Note: For minus sign
+    End If
+    
+    While temp is greater than 0:
+        Set temp to temp divided by 10
+        Set count to count plus 1
+    End While
+    
+    Return count
+End Process
+
+Process called "write_integer" that takes value as Integer, output as Pointer, max_len as Integer returns Integer:
+    Note: Write integer as decimal string
+    
+    @Implementation
+    Converts integer to decimal ASCII representation.
+    Writes digits in reverse order then reverses the result.
+    @End Implementation
+    
+    If max_len equals 0:
+        Return 0
+    End If
+    
+    Let is_negative be false
+    Let temp be value
+    
+    If temp is less than 0:
+        Set is_negative to true
+        Set temp to 0 minus temp
+    End If
+    
+    If temp equals 0:
+        Inline Assembly:
+            "mov rax, %0\n"          Note: Output pointer
+            "mov byte [rax], 0x30\n" Note: Write '0'
+            :
+            : "r"(output)
+            : "rax", "memory"
+        End Assembly
+        Return 1
+    End If
+    
+    Let written be 0
+    Let start be output
+    
+    Note: Write minus sign if negative
+    If is_negative:
+        Inline Assembly:
+            "mov rax, %0\n"          Note: Output pointer
+            "mov byte [rax], 0x2D\n" Note: Write minus sign
+            :
+            : "r"(output)
+            : "rax", "memory"
+        End Assembly
+        Set written to 1
+        Set start to output plus 1
+    End If
+    
+    Note: Extract digits in reverse
+    Let digit_count be 0
+    While temp is greater than 0 and digit_count plus written is less than max_len:
+        Let digit be temp modulo 10
+        Let ascii be digit plus 48  Note: Convert to ASCII
+        
+        Inline Assembly:
+            "mov al, %0b\n"          Note: ASCII digit
+            "mov rbx, %1\n"          Note: Start pointer
+            "add rbx, %2\n"          Note: Add offset
+            "mov [rbx], al\n"        Note: Store digit
+            :
+            : "r"(ascii), "r"(start), "r"(digit_count)
+            : "rax", "rbx", "memory"
+        End Assembly
+        
+        Set temp to temp divided by 10
+        Set digit_count to digit_count plus 1
+    End While
+    
+    Note: Reverse the digits
+    Let i be 0
+    Let j be digit_count minus 1
+    While i is less than j:
+        Inline Assembly:
+            "mov rcx, %0\n"          Note: Start pointer
+            "mov rdx, %1\n"          Note: Index i
+            "mov rsi, %2\n"          Note: Index j
+            "mov al, [rcx + rdx]\n"  Note: Load char at i
+            "mov bl, [rcx + rsi]\n"  Note: Load char at j
+            "mov [rcx + rdx], bl\n"  Note: Store j at i
+            "mov [rcx + rsi], al\n"  Note: Store i at j
+            :
+            : "r"(start), "r"(i), "r"(j)
+            : "rax", "rbx", "rcx", "rdx", "rsi", "memory"
+        End Assembly
+        Set i to i plus 1
+        Set j to j minus 1
+    End While
+    
+    Return written plus digit_count
+End Process
+
+Process called "clear_error_buffer" that takes buffer as ErrorBuffer returns Nothing:
+    Note: Reset error buffer for reuse
+    
+    @Implementation
+    Clears the error count but retains allocated memory for efficiency.
+    This allows reusing the buffer across multiple compilation units.
+    @End Implementation
+    
+    Set buffer.count to 0
+    Set buffer.has_fatal to false
+End Process
+
+Process called "free_error_buffer" that takes buffer as ErrorBuffer returns Nothing:
+    Note: Release error buffer memory
+    
+    @Implementation
+    Frees the dynamically allocated error array.
+    Should be called when the compiler is done with error reporting.
+    @End Implementation
+    
+    Inline Assembly:
+        "mov rdi, %0\n"              Note: Buffer pointer
+        "call free\n"                Note: Free memory
+        :
+        : "r"(buffer.errors)
+        : "rdi", "memory"
+    End Assembly
+    Set buffer.errors to null
+    Set buffer.capacity to 0
+    Set buffer.count to 0
+End Process
+
+Note: Static string data for severity levels
+Inline Assembly:
+    "section .rodata\n"
+    "note_str:    db 'note: ', 0\n"
+    warning_str: db 'warning: ', 0
+    error_str:   db 'error: ', 0
+    fatal_str:   db 'fatal: ', 0
+"

@@ -1,11 +1,15 @@
-# Field and Method Access in Runa
+# Field and Method Access in Runa (Mode-Scoped)
 
-**Last Updated**: 2025-08-15  
+**Last Updated**: 2025-09-08  
 **Note**: This documentation reflects the current implementation with mathematical symbol enforcement.
 
 ## Overview
 
-Runa supports dual syntax for accessing fields and methods: **natural language** for accessibility and **technical syntax** for efficiency. This approach ensures Runa is approachable for non-developers while remaining powerful for experienced programmers.
+Runa supports both natural language and technical syntax for accessing fields and methods. Usage is scoped by mode:
+
+- **Canon**: natural phrases like "the name of user" and "the area of circle".
+- **Developer**: dot notation as a technical shorthand (e.g., `user.name`, `circle.area`).
+- **Viewer**: read-only natural phrasing; dot notation is not displayed.
 
 **Mathematical Symbol Note**: Mathematical operations in method examples use natural language operators (`multiplied by`, `plus`, `minus`) which are always valid. Mathematical symbols (`*`, `+`, `-`) are restricted to mathematical contexts only.
 
@@ -22,7 +26,7 @@ Let balance be the balance of account
 Let status be the status of order
 ```
 
-### Technical Syntax (For Advanced/Backend Development)
+### Developer Mode Technical Syntax
 
 ```runa
 Let radius be circle.radius
@@ -57,9 +61,9 @@ Let length be string.length
 Let count be items.count
 ```
 
-## Collection Access
+## Collection Access (Mode-Scoped)
 
-### Bracket Notation (For Dictionaries and Lists)
+### Developer Mode Bracket Notation (Dictionaries and Lists)
 
 ```runa
 Let value be my_dict["key"]
@@ -70,7 +74,7 @@ Let last_item be list at index length of list minus 1
 Let value2 be my_dict at key "id"
 ```
 
-### Natural Language for Collections
+### Canon/Viewer Natural Language for Collections
 
 ```runa
 Let value be the value of my_dict at key
@@ -220,10 +224,10 @@ Catch err (Error):
 
 ### Natural Language vs Technical Syntax
 
-- **Natural Language**: More readable, better for documentation and teaching
-- **Technical Syntax**: More concise, better for performance-critical code
-- **Compilation**: Both compile to the same bytecode, no performance difference
-- **Parsing**: Technical syntax is slightly faster to parse
+- **Natural Language (Canon/Viewer)**: More readable, better for documentation and teaching
+- **Technical Syntax (Developer)**: More concise, better for performance-critical code
+- **Compilation**: Canon and Developer compile to the same representations under AOTT
+- **Parsing**: Developer syntax may be slightly faster to parse; Canon remains the canonical AST
 
 ## Best Practices
 
@@ -282,3 +286,8 @@ Let count be items.count
 ## Conclusion
 
 Runa's dual syntax approach provides flexibility for different audiences and use cases. Choose the syntax that best fits your project's needs and audience, but always prioritize consistency and clarity in your codebase. 
+
+## Open Issues
+
+1. Expand examples to cover Viewer transformations for complex chaining scenarios.
+2. Formalize guidance for nested collection access in Canon without brackets.

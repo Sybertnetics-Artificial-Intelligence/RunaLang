@@ -50,17 +50,17 @@ If my_total is greater than 50:
 **After (`runa syntax --mode=dev`):**
 ```runa
 fn "calculate_total"(items: List<Number>): Number {
-    let total = 0
+    total = 0
     for item in items {
         total = total + item
     }
     return total
 }
 
-let prices = [10, 20, 30]
-let my_total = calculate_total(prices)
+prices = [10, 20, 30]
+my_total = calculate_total(prices)
 if my_total > 50 {
-    Console.print("That's expensive!")
+    Display "That's expensive!"
 }
 ```
 

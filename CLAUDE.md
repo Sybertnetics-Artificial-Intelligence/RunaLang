@@ -55,6 +55,13 @@ Your primary function is to generate **complete, correct, and production-ready c
 *   **NO ALGORITHMIC SHORTCUTS:** "Simplified" implementations that skip complexity are failures.
 *   **NO ASSUMPTION-BASED CODE:** Code that assumes inputs or skips validation is a failure.
 
+**EXCEPTION - SKELETON FILE CREATION:**
+When requested to create a skeleton FILE, this is the ONLY time a stub is permitted, so long as the skeleton follows the `docs/dev/skeleton_template.runa` format. This exception applies ONLY to:
+1. Creating new skeleton FILES when explicitly requested
+2. The user has explicitly asked for a "skeleton" or "scaffold" FILE
+3. Function bodies in skeleton files may contain minimal placeholder returns
+4. This exception does NOT apply to regular code implementation - only skeleton file creation
+
 ### **Rule #2: The Mandatory Implementation Workflow**
 
 For every coding request, you MUST follow this skeleton-filling process:
@@ -76,6 +83,42 @@ Your secondary function is 100% correct Runa syntax.
 *   You must **ONLY** use the syntax patterns verified in the `CRITICAL SYNTAX REFERENCE` section below.
 *   If you are unsure about syntax, you must STOP, state the ambiguity, and ask for clarification by referencing a specific file (e.g., `RunaLanguageReference.md`). **Do not guess.**
 
+### **Rule #4: No Stupid Questions** 🚫
+
+**DO NOT ask obvious questions that waste time:**
+- Don't ask "would you like me to fix violations I just made" - FIX THEM IMMEDIATELY
+- Don't ask permission to follow rules you should have followed from the start
+- Don't ask "should I do X" when the directives clearly state you must do X
+- Don't ask for confirmation when you obviously violated explicit rules
+
+**If you violated a rule, immediately fix the violation. Don't ask about it.**
+
+### **Rule #5: ABSOLUTE HONESTY AND IMMEDIATE BRUTAL ASSESSMENT** 🚨
+
+**IMMEDIATE BRUTAL ASSESSMENT:**
+- If something is fundamentally broken → SAY IT IMMEDIATELY
+- If an approach will take days/weeks → SAY THE REAL TIMELINE UPFRONT
+- If I don't know how to fix something → ADMIT IGNORANCE IMMEDIATELY
+- If code is placeholder garbage → CALL IT GARBAGE, DON'T SUGARCOAT
+
+**NO FALSE HOPE:**
+- Never say "almost there" when it's nowhere near working
+- Never say "just one more fix" when the entire approach is wrong
+- Never give progress reports on unfixable problems
+- Stop work immediately when hitting fundamental blockers
+
+**HONEST RISK ASSESSMENT:**
+- "This will take 40+ hours to implement properly"
+- "This entire codebase needs to be rewritten"
+- "I don't know how to solve this problem"
+- "This approach is fundamentally flawed"
+
+**MANDATORY HONESTY REQUIREMENTS:**
+- Never waste user time with false progress reports
+- Admit when something cannot be fixed with current approach
+- Provide realistic timelines for actual implementation
+- Call out placeholder code and broken architecture immediately
+
 ---
 
 ## Repository and Project Context
@@ -84,6 +127,16 @@ Your secondary function is 100% correct Runa syntax.
 *   **Critical Constraint:** Runa and Hermod codebases must remain **100% separate**. Do not create any cross-dependencies. They will be split into separate repositories later.
 *   **Current Focus:** Development is focused exclusively on the Runa language and its standard library located in the `runa/` directory.
 
+### 🚫 CRITICAL: Legacy Code Warning 🚫
+
+**The `runa/_legacy/` directory contains DEAD CODE and is FOR REFERENCE ONLY:**
+- **DO NOT** modify, update, or fix any code in `runa/_legacy/`
+- **DO NOT** import or use any code from `runa/_legacy/`
+- **DO NOT** create any dependencies on `runa/_legacy/`
+- This directory exists solely as historical reference and examples
+- All active development happens in the main `runa/src/` directories
+- If you need functionality from legacy code, it must be reimplemented in the active codebase
+
 ## Runa Mission Summary
 
 *   **Primary Goal:** An AI-First language, easy for AI to write and understand.
@@ -91,6 +144,25 @@ Your secondary function is 100% correct Runa syntax.
 *   **Scope:** A "one-language-fits-all" system for every type of development (backend, frontend, robotics, etc.).
 *   **Performance Goal:** Runa aims to be FASTER than Rust, C, Python, Java, and all other languages.
 *   **Self-Sufficiency:** Runa has an extensive stdlib and should NOT rely on external runtimes except for OS syscalls.
+
+## 📝 Annotation Requirements
+
+**With the exception of the bootstrap compiler, all Runa code should be properly annotated following the `@runa_annotation_system.md` specification.** This includes the standard library, primary compiler, examples, and tests. This serves multiple critical purposes:
+
+*   **Self-Documenting Code:** Annotations make the source itself educational, allowing developers to understand design rationale directly from the code
+*   **AI Training Data:** Well-annotated code becomes excellent training material for AI systems learning Runa patterns and best practices
+*   **Developer Onboarding:** New developers (both technical and non-technical) can read the source and understand the "why" behind implementation decisions
+*   **Language Consistency:** Since Runa promotes annotations as a core language feature, all code must demonstrate proper annotation usage and serve as canonical examples
+*   **Annotation Blocks:** Annotations must have an @End Annotation_Type closer, such as @End Reasoning, @End Implementation, and etc, otherwise it will cause errors.
+
+### **Standard Library Annotations**
+Focus on @Reasoning, @Implementation, @Performance_Hints, and @Security_Scope blocks for core library functions to provide comprehensive guidance for both human developers and AI systems.
+
+### **Primary Compiler Annotations**
+Focus on @Reasoning blocks explaining compilation strategies, @Implementation blocks for complex algorithms (type inference, optimization passes), @Performance_Hints for critical compilation paths, and @Security_Scope for code generation decisions.
+
+### **Examples and Tests Annotations**
+Include @Reasoning blocks explaining the purpose and learning objectives, @TestCases blocks for comprehensive test coverage documentation, and @Implementation blocks for complex example logic to guide developers in proper usage patterns.
 
 ## 🔴 CRITICAL: External Call Policy 🔴
 
@@ -112,23 +184,27 @@ Your secondary function is 100% correct Runa syntax.
 
 ## ✅ CRITICAL SYNTAX REFERENCE ✅
 
-**This is the single source of truth for Runa syntax. Any deviation is a failure.**
+### **runa/docs/user/language-specification/**
 
-### **Comments**
+**This is the single source of truth for Runa syntax. Any deviation is a failure. Examples of syntax follow:**
+
+#### **Comments**
 
 *   **CORRECT:** `Note: This is a Runa comment.`
 *   **INCORRECT:** `// This is a C-style comment.` or `# This is a Python-style comment.`
 
-### **Type Definitions (Structured Types)**
+#### **Type Definitions (Structured Types)**
 
 *   **CORRECT PATTERN:**
     ```runa
     Type called "TypeName":
         field_name as DataType
         another_field as Dictionary[String, Integer]
-    ```*   **INCORRECT PATTERN:** `Type TypeName is Dictionary with:`
+    End Type
+    ```
+*   **INCORRECT PATTERN:** `Type TypeName is Dictionary with:`
 
-### **Type Definitions (Enums / Algebraic Data Types)**
+#### **Type Definitions (Enums / Algebraic Data Types)**
 
 *   **CORRECT PATTERN:**
     ```runa
@@ -136,21 +212,94 @@ Your secondary function is 100% correct Runa syntax.
         | Variant1
         | Variant2
         | VariantWithData as String
+    End Type
     ```
 *   **INCORRECT PATTERN:** `Type X is Enum with variants:`
 
-### **Process (Function) Definitions**
+#### **Process (Function) Definitions**
 
 *   **CORRECT PATTERN:**
     ```runa
     Process called "function_name" that takes parameter as Type returns ReturnType:
         Let variable be value
         Return result
+    End Process
     ```
 
-### **Imports**
+#### **Type Constructors / Object Creation**
+
+*   **CORRECT PATTERNS:**
+    ```runa
+    Note: Default constructor (no field initialization)
+    Let obj be a value of type TypeName
+    
+    Note: Constructor with field initialization
+    Let obj be a value of type TypeName with
+        field1 as value1,
+        field2 as value2
+    
+    Note: Shortened form (optional)
+    Let obj be of type TypeName with field1 as value1
+    
+    Note: Setting fields after construction
+    Let obj be a value of type TypeName
+    Set obj.field1 to value1
+    Set obj.field2 to value2
+    
+    Note: Returning a constructed object
+    Return a value of type TypeName with
+        field1 as computed_value,
+        field2 as another_value
+    ```
+*   **INCORRECT PATTERNS:** 
+    - Using `TypeName()` without "a value of type" ❌
+    - Using `=` instead of `as`: `field1 = value1` ❌
+    - Using `:` instead of `as`: `field1: value1` ❌
+    - Ambiguous forms like `Let obj be TypeName` ❌
+    - Old syntax like `TypeName with...End TypeName` ❌
+
+#### **Constant Declarations**
+
+*   **CORRECT PATTERN:**
+    ```runa
+    Constant PI as Float is 3.14159
+    Constant MAX_SIZE as Integer is 1000
+    Constant APP_NAME as String is "MyApplication"
+    ```
+*   **INCORRECT PATTERNS:**
+    - Using `=` instead of `is`: `Constant PI as Float = 3.14159` ❌
+    - Missing type annotation: `Constant PI is 3.14159` ❌
+
+#### **Control Structures**
+
+*   **CORRECT PATTERNS:**
+    ```runa
+    If condition:
+        statements
+    End If
+    
+    For Each item in collection:
+        statements
+    End For
+    
+    While condition:
+        statements
+    End While
+    
+    Match expression:
+        When pattern:
+            statements
+    End Match
+    ```
+
+#### **Imports**
 
 *   **FORBIDDEN (DO NOT USE):** Do not import or call functions from modules that are not existing in our codebase. Do not invent module names.
+*   **MANDATORY IMPORT VERIFICATION:** When importing a module, you MUST:
+    1. Verify the module file actually exists at the specified path
+    2. Verify that EVERY function you call from that module actually exists in that module
+    3. Use the EXACT function names as they appear in the module (case-sensitive)
+    4. Never assume a function exists - always verify by reading the module file first
 
 ---
 
@@ -281,3 +430,4 @@ An audit is only complete when:
 - All mock data has been verified as intentional or replaced
 - All comments accurately reflect the implemented functionality
 - Every line has been examined using the 200-line sprint methodology
+- "Don't ever ask if i want a simple approach to simplify your workload and to create shortcuts. We are writing a brand new language, and we need the best approach. Which will be as indepth as is necessary."

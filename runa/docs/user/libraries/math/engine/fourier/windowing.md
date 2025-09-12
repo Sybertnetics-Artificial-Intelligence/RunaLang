@@ -112,7 +112,7 @@ Process called "hanning_window" that takes length as Integer, periodic as Boolea
     Note: Hanning window: w[n] = 0.5 - 0.5 * cos(2πn/N)
     Let window be List[Float]
     
-    Let N be if periodic then length else length - 1
+    Let N be if periodic then length Otherwise length - 1
     For i from 0 to length - 1:
         Let value be 0.5 - 0.5 * MathCore.cos(2.0 * MathCore.pi() * i / N)
         Call window.append(value)
@@ -142,7 +142,7 @@ Process called "hamming_window" that takes length as Integer, periodic as Boolea
     Note: Hamming window: w[n] = 0.54 - 0.46 * cos(2πn/N)
     Let window be List[Float]
     
-    Let N be if periodic then length else length - 1
+    Let N be if periodic then length Otherwise length - 1
     For i from 0 to length - 1:
         Let value be 0.54 - 0.46 * MathCore.cos(2.0 * MathCore.pi() * i / N)
         Call window.append(value)
@@ -532,7 +532,7 @@ Process called "circular_2d_window" that takes radius as Float, height as Intege
             Let dx be Float(j) - center_x
             Let distance be MathCore.sqrt(dx * dx + dy * dy)
             
-            Let value be if distance <= radius then 1.0 else 0.0
+            Let value be if distance <= radius then 1.0 Otherwise 0.0
             Collections.set_matrix_element(window_2d, i, j, value)
     
     Return window_2d

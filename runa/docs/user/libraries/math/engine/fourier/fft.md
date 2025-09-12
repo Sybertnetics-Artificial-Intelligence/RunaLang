@@ -199,7 +199,7 @@ Process called "butterfly_radix4" that takes inputs as List[Complex], twiddles a
     Let a be complex_add(x0, x2)
     Let b be complex_subtract(x0, x2)
     Let c be complex_add(x1, x3)
-    Let d be complex_multiply(complex_subtract(x1, x3), Complex{real: 0.0, imag: if inverse then 1.0 else -1.0})
+    Let d be complex_multiply(complex_subtract(x1, x3), Complex{real: 0.0, imag: if inverse then 1.0 Otherwise -1.0})
     
     Note: Second stage
     Let y0 be complex_add(a, c)
@@ -405,8 +405,8 @@ Process called "apply_prime_factor_fft" that takes data as List[Complex], factor
             Call group_data.append(data[group + i * stride])
         
         Let transformed_group be if factor == 2 then fft_radix2(group_data, inverse) 
-                                  else if factor == 4 then fft_radix4(group_data, inverse)
-                                  else dft_direct_prime(group_data, factor, inverse)
+                                  Otherwise if factor == 4 then fft_radix4(group_data, inverse)
+                                  Otherwise dft_direct_prime(group_data, factor, inverse)
         
         For i from 0 to factor - 1:
             Set result[group + i * stride] to transformed_group[i]
