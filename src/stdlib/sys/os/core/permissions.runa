@@ -1,0 +1,575 @@
+Note:
+sys/os/core/permissions.runa
+User and Group Management for Access Control
+
+This module provides core user and group identity management operations
+for cross-platform access control systems. Handles user information,
+group membership, and high-level access control decisions.
+
+File-specific permission operations are in sys/os/filesystem/permissions.runa
+:End Note
+
+Import "sys/os/core/system_calls" as SysCalls
+Import "sys/os/platform/detection" as Platform
+Import "data/collections/core/dictionary" as Dict
+Import "data/collections/core/list" as List
+Import "text/string/core" as Str
+Import "sys/time/core" as Time
+Import "sys/memory/core" as Memory
+Import "dev/debug/errors/core" as Errors
+
+Note: =====================================================================
+Note: CORE TYPES FOR USER AND GROUP MANAGEMENT
+Note: =====================================================================
+
+Type called "UserInfo":
+    user_id as Integer
+    username as String
+    full_name as String
+    home_directory as String
+    shell as String
+    primary_group_id as Integer
+    is_system_user as Boolean
+    is_locked as Boolean
+    last_login_timestamp as Integer
+
+Type called "GroupInfo":
+    group_id as Integer
+    group_name as String
+    description as String
+    is_system_group as Boolean
+    members as List
+
+Type called "EffectivePermissions":
+    can_read as Boolean
+    can_write as Boolean
+    can_execute as Boolean
+    can_delete as Boolean
+    can_modify_permissions as Boolean
+    effective_user_id as Integer
+    effective_group_id as Integer
+    additional_groups as List
+
+Note: Platform-specific user/group management constants
+Let INVALID_USER_ID be -1
+Let INVALID_GROUP_ID be -1
+Let ROOT_USER_ID be 0
+Let ROOT_GROUP_ID be 0
+Let SYSTEM_USER_THRESHOLD be 1000
+
+Note: Internal cache for frequently accessed user/group data
+Let user_cache be Dict.create_empty
+Let group_cache be Dict.create_empty
+Let cache_ttl_seconds be 300
+
+Note: =====================================================================
+Note: PLATFORM-SPECIFIC SYSTEM CALL WRAPPERS
+Note: =====================================================================
+
+Process called "get_platform_user_info" that takes user_id as Integer returns UserInfo:
+    Note: Platform-specific user info retrieval using efficient file parsing
+    Let platform be Platform.get_current_platform
+    
+    If platform equals "linux" or platform equals "macos":
+        Note: Parse /etc/passwd for user information
+        Let passwd_fd be SysCalls.sys_open with "/etc/passwd" and 0 and 0
+        If passwd_fd >= 0:
+            Let buffer be Memory.allocate with 8192
+            Let bytes_read be SysCalls.sys_read with passwd_fd and buffer and 8192
+            SysCalls.sys_close with passwd_fd
+            
+            If bytes_read > 0:
+                Let content be Str.from_buffer with buffer and bytes_read
+                Let lines be Str.split with content by "\n"
+                
+                For each line in lines:
+                    If line.length > 0 and not line.starts_with "#":
+                        Let fields be Str.split with line by ":"
+                        If fields.length >= 7:
+                            Let line_uid_str be fields[2]
+                            Let line_uid be Integer.parse with line_uid_str
+                            
+                            If line_uid equals user_id:
+                                Let username be fields[0]
+                                Let full_name be fields[4]
+                                Let home_dir be fields[5]
+                                Let shell be fields[6]
+                                Let gid_str be fields[3]
+                                Let gid be Integer.parse with gid_str
+                                
+                                Let system_threshold be 1000
+                                If platform equals "macos":
+                                    system_threshold := 500
+                                
+                                Return UserInfo with:
+                                    user_id: user_id
+                                    username: username
+                                    full_name: full_name
+                                    home_directory: home_dir
+                                    shell: shell
+                                    primary_group_id: gid
+                                    is_system_user: (user_id < system_threshold)
+                                    is_locked: false
+                                    last_login_timestamp: 0
+            Memory.deallocate with buffer
+        
+        Throw Errors.UserNotFound with ("User ID not found: " + user_id.to_string)
+    
+    If platform equals "windows":
+        Note: For Windows, provide basic user info based on conventions
+        Let username be ("User_" + user_id.to_string)
+        Return UserInfo with:
+            user_id: user_id
+            username: username
+            full_name: username
+            home_directory: ("C:\\Users\\" + username)
+            shell: "cmd.exe"
+            primary_group_id: 513
+            is_system_user: (user_id < 1000)
+            is_locked: false
+            last_login_timestamp: 0
+    
+    Throw Errors.PlatformError with ("Unsupported platform: " + platform)
+
+Process called "get_platform_group_info" that takes group_id as Integer returns GroupInfo:
+    Note: Platform-specific group info retrieval using efficient file parsing
+    Let platform be Platform.get_current_platform
+    
+    If platform equals "linux" or platform equals "macos":
+        Note: Parse /etc/group for group information
+        Let group_fd be SysCalls.sys_open with "/etc/group" and 0 and 0
+        If group_fd >= 0:
+            Let buffer be Memory.allocate with 8192
+            Let bytes_read be SysCalls.sys_read with group_fd and buffer and 8192
+            SysCalls.sys_close with group_fd
+            
+            If bytes_read > 0:
+                Let content be Str.from_buffer with buffer and bytes_read
+                Let lines be Str.split with content by "\n"
+                
+                For each line in lines:
+                    If line.length > 0 and not line.starts_with "#":
+                        Let fields be Str.split with line by ":"
+                        If fields.length >= 4:
+                            Let line_gid_str be fields[2]
+                            Let line_gid be Integer.parse with line_gid_str
+                            
+                            If line_gid equals group_id:
+                                Let group_name be fields[0]
+                                Let description be fields[1]
+                                Let members_str be fields[3]
+                                Let members be List.create_empty
+                                
+                                If members_str.length > 0:
+                                    Let member_names be Str.split with members_str by ","
+                                    For each member in member_names:
+                                        If member.length > 0:
+                                            List.append to members with member
+                                
+                                Let system_threshold be 1000
+                                If platform equals "macos":
+                                    system_threshold := 20
+                                
+                                Return GroupInfo with:
+                                    group_id: group_id
+                                    group_name: group_name
+                                    description: description
+                                    is_system_group: (group_id < system_threshold)
+                                    members: members
+            Memory.deallocate with buffer
+        
+        Throw Errors.GroupNotFound with ("Group ID not found: " + group_id.to_string)
+    
+    If platform equals "windows":
+        Note: For Windows, provide basic group info based on conventions
+        Let group_name be ("Group_" + group_id.to_string)
+        Return GroupInfo with:
+            group_id: group_id
+            group_name: group_name
+            description: ""
+            is_system_group: (group_id < 1000)
+            members: List.create_empty
+    
+    Throw Errors.PlatformError with ("Unsupported platform: " + platform)
+
+Note: =====================================================================
+Note: USER MANAGEMENT OPERATIONS
+Note: =====================================================================
+
+Process called "get_current_user" returns UserInfo:
+    Note: Get information about current user using cached UID
+    Let current_uid be SysCalls.sys_getuid
+    If current_uid >= 0:
+        Return get_user_by_id with current_uid
+    Otherwise:
+        Throw Errors.SystemError with "Failed to get current user ID"
+
+Process called "get_user_by_id" that takes user_id as Integer returns UserInfo:
+    Note: Get user information by user ID with intelligent caching
+    Let cache_key be ("user_" + user_id.to_string)
+    
+    Note: Check cache first for performance
+    Let cached_result be Dict.get from user_cache with cache_key
+    If cached_result.exists and cached_result.timestamp > (Time.current_unix_timestamp - cache_ttl_seconds):
+        Return cached_result.value
+    
+    Note: Cache miss - fetch from system
+    Let user_info be get_platform_user_info with user_id
+    
+    Note: Cache the result with timestamp
+    Dict.set in user_cache with cache_key to {
+        value: user_info,
+        timestamp: Time.current_unix_timestamp
+    }
+    
+    Return user_info
+
+Process called "get_user_by_name" that takes username as String returns UserInfo:
+    Note: Get user information by username through efficient passwd parsing
+    Let platform be Platform.get_current_platform
+    
+    If platform equals "linux" or platform equals "macos" or platform equals "windows":
+        Note: Parse user database to find username
+        Let users be list_users
+        For each user in users:
+            If user.username equals username:
+                Return user
+        
+        Throw Errors.UserNotFound with ("User not found: " + username)
+    
+    Throw Errors.PlatformError with ("Unsupported platform: " + platform)
+
+Process called "list_users" returns List:
+    Note: List all system users with efficient file-based enumeration
+    Let users be List.create_empty
+    Let platform be Platform.get_current_platform
+    
+    If platform equals "linux" or platform equals "macos":
+        Note: Read /etc/passwd for complete user list
+        Let passwd_fd be SysCalls.sys_open with "/etc/passwd" and 0 and 0
+        If passwd_fd >= 0:
+            Let buffer be Memory.allocate with 8192
+            Let bytes_read be SysCalls.sys_read with passwd_fd and buffer and 8192
+            SysCalls.sys_close with passwd_fd
+            
+            If bytes_read > 0:
+                Let content be Str.from_buffer with buffer and bytes_read
+                Let lines be Str.split with content by "\n"
+                
+                For each line in lines:
+                    If line.length > 0 and not line.starts_with "#":
+                        Let fields be Str.split with line by ":"
+                        If fields.length >= 7:
+                            Let username be fields[0]
+                            Let uid_str be fields[2]
+                            Let uid be Integer.parse with uid_str
+                            Let full_name be fields[4]
+                            Let home_dir be fields[5]
+                            Let shell be fields[6]
+                            Let gid_str be fields[3]
+                            Let gid be Integer.parse with gid_str
+                            
+                            Let system_threshold be 1000
+                            If platform equals "macos":
+                                system_threshold := 500
+                            
+                            Let user_info be UserInfo with:
+                                user_id: uid
+                                username: username
+                                full_name: full_name
+                                home_directory: home_dir
+                                shell: shell
+                                primary_group_id: gid
+                                is_system_user: (uid < system_threshold)
+                                is_locked: false
+                                last_login_timestamp: 0
+                            
+                            List.append to users with user_info
+            Memory.deallocate with buffer
+        Otherwise:
+            Throw Errors.SystemError with "Failed to read user database"
+    
+    If platform equals "windows":
+        Note: For Windows, provide basic system users
+        For uid from 500 to 2000:
+            Let username be ("User_" + uid.to_string)
+            Let user_info be UserInfo with:
+                user_id: uid
+                username: username
+                full_name: username
+                home_directory: ("C:\\Users\\" + username)
+                shell: "cmd.exe"
+                primary_group_id: 513
+                is_system_user: (uid < 1000)
+                is_locked: false
+                last_login_timestamp: 0
+            List.append to users with user_info
+    
+    Return users
+
+Note: =====================================================================
+Note: GROUP MANAGEMENT OPERATIONS
+Note: =====================================================================
+
+Process called "get_current_group" returns GroupInfo:
+    Note: Get information about current user's primary group
+    Let current_gid be SysCalls.sys_getgid
+    If current_gid >= 0:
+        Return get_group_by_id with current_gid
+    Otherwise:
+        Throw Errors.SystemError with "Failed to get current group ID"
+
+Process called "get_group_by_id" that takes group_id as Integer returns GroupInfo:
+    Note: Get group information by group ID with intelligent caching
+    Let cache_key be ("group_" + group_id.to_string)
+    
+    Note: Check cache first for performance
+    Let cached_result be Dict.get from group_cache with cache_key
+    If cached_result.exists and cached_result.timestamp > (Time.current_unix_timestamp - cache_ttl_seconds):
+        Return cached_result.value
+    
+    Note: Cache miss - fetch from system
+    Let group_info be get_platform_group_info with group_id
+    
+    Note: Cache the result with timestamp
+    Dict.set in group_cache with cache_key to {
+        value: group_info,
+        timestamp: Time.current_unix_timestamp
+    }
+    
+    Return group_info
+
+Process called "get_group_by_name" that takes groupname as String returns GroupInfo:
+    Note: Get group information by group name through efficient group parsing
+    Let platform be Platform.get_current_platform
+    
+    If platform equals "linux" or platform equals "macos" or platform equals "windows":
+        Note: Parse group database to find groupname
+        Let groups be list_groups
+        For each group in groups:
+            If group.group_name equals groupname:
+                Return group
+        
+        Throw Errors.GroupNotFound with ("Group not found: " + groupname)
+    
+    Throw Errors.PlatformError with ("Unsupported platform: " + platform)
+
+Process called "get_user_groups" that takes user_id as Integer returns List:
+    Note: Get all groups that user belongs to with efficient group enumeration
+    Let groups be List.create_empty
+    Let user_info be get_user_by_id with user_id
+    
+    Note: Add primary group first
+    Let primary_group be get_group_by_id with user_info.primary_group_id
+    List.append to groups with primary_group
+    
+    Note: Search all groups for membership
+    Let all_groups be list_groups
+    For each group in all_groups:
+        If group.group_id not_equals user_info.primary_group_id:
+            Note: Check if user is in group members
+            For each member in group.members:
+                If member equals user_info.username:
+                    List.append to groups with group
+                    Break
+    
+    Return groups
+
+Process called "list_groups" returns List:
+    Note: List all system groups with efficient file-based enumeration
+    Let groups be List.create_empty
+    Let platform be Platform.get_current_platform
+    
+    If platform equals "linux" or platform equals "macos":
+        Note: Read /etc/group for complete group list
+        Let group_fd be SysCalls.sys_open with "/etc/group" and 0 and 0
+        If group_fd >= 0:
+            Let buffer be Memory.allocate with 8192
+            Let bytes_read be SysCalls.sys_read with group_fd and buffer and 8192
+            SysCalls.sys_close with group_fd
+            
+            If bytes_read > 0:
+                Let content be Str.from_buffer with buffer and bytes_read
+                Let lines be Str.split with content by "\n"
+                
+                For each line in lines:
+                    If line.length > 0 and not line.starts_with "#":
+                        Let fields be Str.split with line by ":"
+                        If fields.length >= 4:
+                            Let group_name be fields[0]
+                            Let description be fields[1]
+                            Let gid_str be fields[2]
+                            Let gid be Integer.parse with gid_str
+                            Let members_str be fields[3]
+                            Let members be List.create_empty
+                            
+                            If members_str.length > 0:
+                                Let member_names be Str.split with members_str by ","
+                                For each member in member_names:
+                                    If member.length > 0:
+                                        List.append to members with member
+                            
+                            Let system_threshold be 1000
+                            If platform equals "macos":
+                                system_threshold := 20
+                            
+                            Let group_info be GroupInfo with:
+                                group_id: gid
+                                group_name: group_name
+                                description: description
+                                is_system_group: (gid < system_threshold)
+                                members: members
+                            
+                            List.append to groups with group_info
+            Memory.deallocate with buffer
+        Otherwise:
+            Throw Errors.SystemError with "Failed to read group database"
+    
+    If platform equals "windows":
+        Note: For Windows, provide basic system groups
+        For gid from 513 to 1000:
+            Let group_name be ("Group_" + gid.to_string)
+            Let group_info be GroupInfo with:
+                group_id: gid
+                group_name: group_name
+                description: ""
+                is_system_group: (gid < 1000)
+                members: List.create_empty
+            List.append to groups with group_info
+    
+    Return groups
+
+Note: =====================================================================
+Note: ACCESS CONTROL OPERATIONS
+Note: =====================================================================
+
+Process called "check_access" that takes path as String, user_id as Integer, access_type as String returns Boolean:
+    Note: Check if user has specific access to file using optimized system calls
+    Note: Delegate to filesystem/permissions for file-specific operations
+    Import "sys/os/filesystem/permissions" as FilePerms
+    
+    Note: Fast path for current user
+    Let current_uid be SysCalls.sys_getuid
+    If current_uid >= 0 and current_uid equals user_id:
+        If access_type equals "read":
+            Return FilePerms.can_read with path
+        If access_type equals "write":
+            Return FilePerms.can_write with path
+        If access_type equals "execute":
+            Return FilePerms.can_execute with path
+    
+    Note: Complex access checking for other users requires privilege escalation
+    Let effective_perms be get_effective_permissions with path and user_id
+    
+    If access_type equals "read":
+        Return effective_perms.can_read
+    If access_type equals "write":
+        Return effective_perms.can_write
+    If access_type equals "execute":
+        Return effective_perms.can_execute
+    If access_type equals "delete":
+        Return effective_perms.can_delete
+    
+    Return false
+
+Process called "get_effective_permissions" that takes path as String, user_id as Integer returns EffectivePermissions:
+    Note: Calculate effective permissions considering user, group membership, and ACLs
+    Import "sys/os/filesystem/permissions" as FilePerms
+    
+    Note: Get file ownership and permissions
+    Let file_owner be FilePerms.get_owner with path
+    Let file_group be FilePerms.get_group with path
+    Let file_permissions be FilePerms.get_permissions with path
+    
+    Note: Get user information and group memberships
+    Let user_info be get_user_by_id with user_id
+    Let user_groups be get_user_groups with user_id
+    
+    Note: Check if user is root/administrator
+    Let is_root be (user_id equals ROOT_USER_ID)
+    
+    Note: Initialize permission flags
+    Let can_read be false
+    Let can_write be false
+    Let can_execute be false
+    Let can_delete be false
+    Let can_modify_perms be false
+    
+    Note: Root can do everything
+    If is_root:
+        can_read := true
+        can_write := true
+        can_execute := true
+        can_delete := true
+        can_modify_perms := true
+    Otherwise:
+        Note: Check owner permissions
+        If user_id equals file_owner.user_id:
+            can_read := file_permissions.owner_read
+            can_write := file_permissions.owner_write
+            can_execute := file_permissions.owner_execute
+            can_modify_perms := true
+        
+        Note: Check group permissions
+        Let is_member be false
+        For each group in user_groups:
+            If group.group_id equals file_group.group_id:
+                is_member := true
+                Break
+        
+        If is_member:
+            can_read := (can_read or file_permissions.group_read)
+            can_write := (can_write or file_permissions.group_write)
+            can_execute := (can_execute or file_permissions.group_execute)
+        
+        Note: Check other permissions
+        If not (user_id equals file_owner.user_id) and not is_member:
+            can_read := file_permissions.other_read
+            can_write := file_permissions.other_write
+            can_execute := file_permissions.other_execute
+        
+        Note: For deletion, check parent directory write permission
+        Let parent_dir be Str.dirname with path
+        Let parent_perms be get_effective_permissions with parent_dir and user_id
+        can_delete := parent_perms.can_write
+    
+    Note: Get additional group memberships for completeness
+    Let additional_groups be List.create_empty
+    For each group in user_groups:
+        If group.group_id not_equals user_info.primary_group_id:
+            List.append to additional_groups with group.group_id
+    
+    Return EffectivePermissions with:
+        can_read: can_read
+        can_write: can_write
+        can_execute: can_execute
+        can_delete: can_delete
+        can_modify_permissions: can_modify_perms
+        effective_user_id: user_id
+        effective_group_id: user_info.primary_group_id
+        additional_groups: additional_groups
+
+Note: =====================================================================
+Note: CACHE MANAGEMENT UTILITIES
+Note: =====================================================================
+
+Process called "clear_user_cache" returns Nothing:
+    Note: Clear the user information cache
+    Dict.clear with user_cache
+
+Process called "clear_group_cache" returns Nothing:
+    Note: Clear the group information cache
+    Dict.clear with group_cache
+
+Process called "clear_all_caches" returns Nothing:
+    Note: Clear all permission-related caches
+    clear_user_cache
+    clear_group_cache
+
+Process called "get_cache_stats" returns Dictionary:
+    Note: Get statistics about cache usage
+    Let stats be Dict.create_empty
+    Dict.set in stats with "user_cache_size" to Dict.size with user_cache
+    Dict.set in stats with "group_cache_size" to Dict.size with group_cache
+    Dict.set in stats with "cache_ttl_seconds" to cache_ttl_seconds
+    Return stats

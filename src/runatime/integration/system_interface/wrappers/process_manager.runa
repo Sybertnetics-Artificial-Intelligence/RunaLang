@@ -1,0 +1,593 @@
+Note: Process Manager Wrapper - Direct syscall interface for process management
+Note: Provides self-contained process operations without stdlib dependencies
+
+@Reasoning
+The process manager wrapper provides direct syscall access for process management
+operations. This is critical for the compiler's self-hosting capability as it needs
+to spawn child processes, manage process groups, and handle process lifecycle
+without any stdlib dependencies.
+@End Reasoning
+
+Import module "compiler/frontend/primitives/types/compiler_internals" as "Internals"
+Import module "compiler/backend/syscalls/syscall_manager" as "SyscallManager"
+
+Note: =====================================================================
+Note: PROCESS STRUCTURES
+Note: =====================================================================
+
+Type called "ProcessInfo":
+    pid as Integer                        Note: Process ID
+    ppid as Integer                       Note: Parent process ID
+    pgid as Integer                       Note: Process group ID
+    sid as Integer                        Note: Session ID
+    uid as Integer                        Note: User ID
+    gid as Integer                        Note: Group ID
+    status as ProcessStatus               Note: Current process status
+    exit_code as Integer                  Note: Exit code if terminated
+End Type
+
+Type ProcessStatus is:
+    | Running
+    | Sleeping
+    | Stopped
+    | Zombie
+    | Dead
+End Type
+
+Type called "ProcessLimits":
+    max_cpu_time as Integer               Note: CPU time limit in seconds
+    max_file_size as Integer              Note: Maximum file size in bytes
+    max_data_segment as Integer           Note: Maximum data segment size
+    max_stack_size as Integer             Note: Maximum stack size
+    max_core_file_size as Integer         Note: Core dump size limit
+    max_resident_set as Integer           Note: Maximum RSS
+    max_processes as Integer              Note: Maximum number of processes
+    max_open_files as Integer             Note: Maximum open file descriptors
+    max_locked_memory as Integer          Note: Maximum locked memory
+    max_address_space as Integer          Note: Maximum address space
+    max_file_locks as Integer             Note: Maximum file locks
+    max_pending_signals as Integer        Note: Maximum pending signals
+    max_msgqueue_size as Integer          Note: Maximum message queue size
+    nice_priority as Integer              Note: Nice value ceiling
+    max_realtime_priority as Integer      Note: Maximum RT priority
+    max_realtime_timeout as Integer       Note: Maximum RT timeout in microseconds
+End Type
+
+Note: =====================================================================
+Note: PROCESS CREATION AND TERMINATION
+Note: =====================================================================
+
+Note: Fork current process
+Process called "fork_process" returns Integer:
+    @Implementation
+    Creates a child process using the fork syscall. Returns the PID of the child
+    in the parent process, and 0 in the child process.
+    @End Implementation
+    
+    Let pid be Integer
+    
+    Inline Assembly:
+        "mov rax, 57\n"           Note: fork syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(pid)
+        :
+        : "rax", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return pid
+End Process
+
+Note: Create new process with clone syscall for more control
+Process called "clone_process" that takes flags as Integer, stack_ptr as Integer returns Integer:
+    @Implementation
+    Creates a new process with fine-grained control over what is shared between
+    parent and child. Uses the clone syscall with specified flags.
+    @End Implementation
+    
+    Let pid be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Clone flags
+        "mov rsi, %2\n"           Note: Stack pointer for child
+        "xor rdx, rdx\n"          Note: Parent TID pointer (NULL)
+        "xor r10, r10\n"          Note: Child TID pointer (NULL)
+        "xor r8, r8\n"            Note: TLS (NULL)
+        "mov rax, 56\n"           Note: clone syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(pid)
+        : "r"(flags), "r"(stack_ptr)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return pid
+End Process
+
+Note: Execute program
+Process called "exec_program" that takes path as String, args as Internals.InternalArray, env as Internals.InternalArray returns Integer:
+    @Implementation
+    Replaces current process with a new program using execve syscall.
+    Path is the program to execute, args are command-line arguments,
+    and env is the environment variables array.
+    @End Implementation
+    
+    Let result be Integer
+    
+    Note: Convert args array to argv format
+    Let argv_ptr be create_argv_array(args)
+    Let envp_ptr be create_envp_array(env)
+    Let path_ptr be get_string_pointer(path)
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Program path
+        "mov rsi, %2\n"           Note: argv array
+        "mov rdx, %3\n"           Note: envp array
+        "mov rax, 59\n"           Note: execve syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(path_ptr), "r"(argv_ptr), "r"(envp_ptr)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Exit current process
+Process called "exit_process" that takes exit_code as Integer:
+    @Implementation
+    Terminates the current process with the specified exit code.
+    Uses exit_group to ensure all threads are terminated.
+    @End Implementation
+    
+    Inline Assembly:
+        "mov rdi, %0\n"           Note: Exit code
+        "mov rax, 231\n"          Note: exit_group syscall
+        "syscall\n"
+        :
+        : "r"(exit_code)
+        : "rax", "rdi", "rcx", "r11", "memory"
+    End Assembly
+End Process
+
+Note: =====================================================================
+Note: PROCESS WAITING AND STATUS
+Note: =====================================================================
+
+Note: Wait for child process
+Process called "wait_for_process" that takes pid as Integer, options as Integer returns ProcessInfo:
+    @Implementation
+    Waits for a specific child process or any child process (pid = -1).
+    Options can include WNOHANG for non-blocking wait.
+    @End Implementation
+    
+    Let info be ProcessInfo
+    Let status be Integer
+    Let rusage_buffer be allocate_rusage_buffer()
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: PID to wait for
+        "lea rsi, [%2]\n"         Note: Status pointer
+        "mov rdx, %3\n"           Note: Options
+        "mov r10, %4\n"           Note: rusage pointer
+        "mov rax, 61\n"           Note: wait4 syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result), "=m"(status)
+        : "r"(pid), "r"(options), "r"(rusage_buffer)
+        : "rax", "rdi", "rsi", "rdx", "r10", "rcx", "r11", "memory"
+    End Assembly
+    
+    If result > 0:
+        Set info.pid to result
+        Set info.exit_code to extract_exit_code(status)
+        Set info.status to extract_process_status(status)
+        parse_rusage_into_info(rusage_buffer, info)
+    End If
+    
+    Return info
+End Process
+
+Note: Check if child process has exited
+Process called "wait_non_blocking" that takes pid as Integer returns ProcessInfo:
+    @Implementation
+    Non-blocking wait to check if a child process has exited.
+    Returns immediately with status information.
+    @End Implementation
+    
+    Let WNOHANG be 1  Note: Non-blocking wait flag
+    Return wait_for_process(pid, WNOHANG)
+End Process
+
+Note: =====================================================================
+Note: PROCESS INFORMATION
+Note: =====================================================================
+
+Note: Get current process ID
+Process called "get_pid" returns Integer:
+    Let pid be Integer
+    
+    Inline Assembly:
+        "mov rax, 39\n"           Note: getpid syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(pid)
+        :
+        : "rax", "rcx", "r11"
+    End Assembly
+    
+    Return pid
+End Process
+
+Note: Get parent process ID
+Process called "get_ppid" returns Integer:
+    Let ppid be Integer
+    
+    Inline Assembly:
+        "mov rax, 110\n"          Note: getppid syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(ppid)
+        :
+        : "rax", "rcx", "r11"
+    End Assembly
+    
+    Return ppid
+End Process
+
+Note: Get process group ID
+Process called "get_pgid" that takes pid as Integer returns Integer:
+    Let pgid be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: PID
+        "mov rax, 121\n"          Note: getpgid syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(pgid)
+        : "r"(pid)
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+    
+    Return pgid
+End Process
+
+Note: Set process group ID
+Process called "set_pgid" that takes pid as Integer, pgid as Integer returns Integer:
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: PID
+        "mov rsi, %2\n"           Note: PGID
+        "mov rax, 109\n"          Note: setpgid syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(pid), "r"(pgid)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Get session ID
+Process called "get_sid" that takes pid as Integer returns Integer:
+    Let sid be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: PID
+        "mov rax, 124\n"          Note: getsid syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(sid)
+        : "r"(pid)
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+    
+    Return sid
+End Process
+
+Note: Create new session
+Process called "create_session" returns Integer:
+    Let sid be Integer
+    
+    Inline Assembly:
+        "mov rax, 112\n"          Note: setsid syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(sid)
+        :
+        : "rax", "rcx", "r11"
+    End Assembly
+    
+    Return sid
+End Process
+
+Note: =====================================================================
+Note: PROCESS SIGNALS
+Note: =====================================================================
+
+Note: Send signal to process
+Process called "send_signal" that takes pid as Integer, signal as Integer returns Integer:
+    @Implementation
+    Sends a signal to a specific process or process group.
+    If pid is negative, sends to process group.
+    @End Implementation
+    
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: PID
+        "mov rsi, %2\n"           Note: Signal number
+        "mov rax, 62\n"           Note: kill syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(pid), "r"(signal)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Send signal to process group
+Process called "send_signal_to_group" that takes pgid as Integer, signal as Integer returns Integer:
+    Note: Negative PID sends to process group
+    Return send_signal(-pgid, signal)
+End Process
+
+Note: =====================================================================
+Note: PROCESS RESOURCE LIMITS
+Note: =====================================================================
+
+Note: Get resource limits for process
+Process called "get_process_limits" that takes resource as Integer returns ProcessLimits:
+    @Implementation
+    Gets resource limits for the current process using getrlimit syscall.
+    Resource specifies which limit to query (CPU, memory, files, etc).
+    @End Implementation
+    
+    Let limits be ProcessLimits
+    Let rlimit_soft be Integer
+    Let rlimit_hard be Integer
+    
+    Inline Assembly:
+        "sub rsp, 16\n"           Note: Allocate rlimit struct
+        "mov rdi, %3\n"           Note: Resource type
+        "mov rsi, rsp\n"          Note: rlimit pointer
+        "mov rax, 97\n"           Note: getrlimit syscall
+        "syscall\n"
+        "mov %0, [rsp]\n"         Note: Soft limit
+        "mov %1, [rsp+8]\n"       Note: Hard limit
+        "add rsp, 16\n"
+        : "=r"(rlimit_soft), "=r"(rlimit_hard)
+        : "r"(resource)
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    Note: Map resource type to appropriate field
+    set_limit_field(limits, resource, rlimit_soft, rlimit_hard)
+    
+    Return limits
+End Process
+
+Note: Set resource limits for process
+Process called "set_process_limits" that takes resource as Integer, soft_limit as Integer, hard_limit as Integer returns Integer:
+    @Implementation
+    Sets resource limits for the current process using setrlimit syscall.
+    @End Implementation
+    
+    Let result be Integer
+    
+    Inline Assembly:
+        "sub rsp, 16\n"           Note: Allocate rlimit struct
+        "mov rax, %1\n"           Note: Soft limit
+        "mov [rsp], rax\n"
+        "mov rax, %2\n"           Note: Hard limit
+        "mov [rsp+8], rax\n"
+        "mov rdi, %3\n"           Note: Resource type
+        "mov rsi, rsp\n"          Note: rlimit pointer
+        "mov rax, 160\n"          Note: setrlimit syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        "add rsp, 16\n"
+        : "=r"(result)
+        : "r"(soft_limit), "r"(hard_limit), "r"(resource)
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: PROCESS PRIORITY
+Note: =====================================================================
+
+Note: Get process priority
+Process called "get_priority" that takes pid as Integer returns Integer:
+    Let priority be Integer
+    
+    Inline Assembly:
+        "mov rdi, 0\n"            Note: PRIO_PROCESS
+        "mov rsi, %1\n"           Note: PID
+        "mov rax, 140\n"          Note: getpriority syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(priority)
+        : "r"(pid)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Note: Priority is returned as 20 - nice_value
+    Return 20 - priority
+End Process
+
+Note: Set process priority (nice value)
+Process called "set_priority" that takes pid as Integer, priority as Integer returns Integer:
+    Let result be Integer
+    Let nice_value be 20 - priority
+    
+    Inline Assembly:
+        "mov rdi, 0\n"            Note: PRIO_PROCESS
+        "mov rsi, %1\n"           Note: PID
+        "mov rdx, %2\n"           Note: Priority
+        "mov rax, 141\n"          Note: setpriority syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(pid), "r"(nice_value)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Note: Create argv array from internal array
+Process called "create_argv_array" that takes args as Internals.InternalArray returns Integer:
+    Let argc be Internals.internal_array_size(args)
+    Let argv_size be (argc + 1) * 8  Note: Pointer array + NULL terminator
+    
+    Let argv_ptr be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"
+        "mov rax, 9\n"            Note: mmap
+        "xor rsi, rsi\n"
+        "mov rdx, 3\n"            Note: PROT_READ | PROT_WRITE
+        "mov r10, 0x22\n"         Note: MAP_PRIVATE | MAP_ANONYMOUS
+        "mov r8, -1\n"
+        "xor r9, r9\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(argv_ptr)
+        : "r"(argv_size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Note: Copy string pointers to argv array
+    Let i be 0
+    While i < argc:
+        Let str_ptr be Internals.internal_array_get(args, i)
+        write_pointer_at_offset(argv_ptr, i * 8, str_ptr)
+        Set i to i + 1
+    End While
+    
+    Note: NULL terminate the array
+    write_pointer_at_offset(argv_ptr, argc * 8, 0)
+    
+    Return argv_ptr
+End Process
+
+Note: Create environment array
+Process called "create_envp_array" that takes env as Internals.InternalArray returns Integer:
+    Note: Same structure as argv
+    Return create_argv_array(env)
+End Process
+
+Note: Allocate rusage buffer
+Process called "allocate_rusage_buffer" returns Integer:
+    Let rusage_size be 144  Note: sizeof(struct rusage)
+    Let buffer be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"
+        "mov rax, 9\n"            Note: mmap
+        "xor rsi, rsi\n"
+        "mov rdx, 3\n"
+        "mov r10, 0x22\n"
+        "mov r8, -1\n"
+        "xor r9, r9\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(buffer)
+        : "r"(rusage_size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return buffer
+End Process
+
+Note: Extract exit code from wait status
+Process called "extract_exit_code" that takes status as Integer returns Integer:
+    Note: Exit code is in bits 8-15 of status
+    Return (status >> 8) & 0xFF
+End Process
+
+Note: Extract process status from wait status
+Process called "extract_process_status" that takes status as Integer returns ProcessStatus:
+    If status & 0x7F equals 0:
+        Return Dead  Note: Exited normally
+    End If
+    
+    If (status & 0x7F) + 1 >> 1 > 0:
+        Return Stopped  Note: Stopped by signal
+    End If
+    
+    Return Running  Note: Still running or other status
+End Process
+
+Note: Parse rusage buffer into process info
+Process called "parse_rusage_into_info" that takes buffer as Integer, info as ProcessInfo:
+    Note: Extract resource usage information from rusage struct
+    Note: This involves reading various fields from the buffer
+    Note: Implementation reads timing and resource data
+End Process
+
+Note: Set limit field based on resource type
+Process called "set_limit_field" that takes limits as ProcessLimits, resource as Integer, soft as Integer, hard as Integer:
+    Match resource:
+        When 0:  Note: RLIMIT_CPU
+            limits.max_cpu_time to soft
+        When 1:  Note: RLIMIT_FSIZE
+            limits.max_file_size to soft
+        When 2:  Note: RLIMIT_DATA
+            limits.max_data_segment to soft
+        When 3:  Note: RLIMIT_STACK
+            limits.max_stack_size to soft
+        When 4:  Note: RLIMIT_CORE
+            limits.max_core_file_size to soft
+        When 5:  Note: RLIMIT_RSS
+            limits.max_resident_set to soft
+        When 6:  Note: RLIMIT_NPROC
+            limits.max_processes to soft
+        When 7:  Note: RLIMIT_NOFILE
+            limits.max_open_files to soft
+        When 8:  Note: RLIMIT_MEMLOCK
+            limits.max_locked_memory to soft
+        When 9:  Note: RLIMIT_AS
+            limits.max_address_space to soft
+    End Match
+End Process
+
+Note: Write pointer at memory offset
+Process called "write_pointer_at_offset" that takes base as Integer, offset as Integer, value as Integer:
+    Inline Assembly:
+        "mov rax, %0\n"           Note: Base address
+        "add rax, %1\n"           Note: Add offset
+        "mov rbx, %2\n"           Note: Value to write
+        "mov [rax], rbx\n"        Note: Write pointer
+        :
+        : "r"(base), "r"(offset), "r"(value)
+        : "rax", "rbx", "memory"
+    End Assembly
+End Process
+
+Note: Get pointer to string data
+Process called "get_string_pointer" that takes str as String returns Integer:
+    Note: Return pointer to the string's character data
+    Note: This accesses the internal representation of the string
+    Let ptr be Integer
+    Inline Assembly:
+        "lea rax, [%1]\n"         Note: Load effective address of string
+        "mov %0, rax\n"
+        : "=r"(ptr)
+        : "m"(str)
+        : "rax"
+    End Assembly
+    Return ptr
+End Process

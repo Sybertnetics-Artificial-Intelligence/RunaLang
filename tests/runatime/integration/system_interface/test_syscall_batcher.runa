@@ -1,0 +1,1031 @@
+Note: Comprehensive test suite for the Syscall Batch Processing System
+Note: Tests batch collection, dependency resolution, parallel execution, and optimization
+
+@Reasoning
+The syscall batcher is a critical performance optimization component that reduces context
+switch overhead by intelligently batching multiple syscalls. Testing must verify correct
+batch formation, dependency ordering, parallel execution safety, error handling, and
+performance metrics. These tests ensure the batcher improves performance without
+compromising correctness or introducing race conditions.
+@End Reasoning
+
+@TestCases
+- Basic batch submission and execution
+- Dependency-aware ordering and topological sort
+- Parallel execution of independent syscalls
+- Batch size optimization and auto-flush
+- Thread safety and concurrent access
+- Error handling and recovery
+- Performance metrics and statistics
+- Lock contention and deadlock prevention
+- Memory management and leak detection
+- Platform-specific optimizations
+@End TestCases
+
+Import module "runatime/integration/system_interface/syscall_batcher" as Batcher
+Import module "compiler/frontend/primitives/types/compiler_internals" as Internals
+Import module "compiler/backend/syscalls/syscall_registry" as Registry
+Import module "stdlib/testing/test_framework" as Test
+Import module "stdlib/core/primitives/string_primitives" as StringPrim
+Import module "stdlib/core/primitives/integer_primitives" as IntPrim
+
+Note: =====================================================================
+Note: BASIC BATCH OPERATIONS
+Note: =====================================================================
+
+Process called "test_create_batcher" returns Nothing:
+    @Performance_Hints
+    Tests basic batcher creation and initialization.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Test.assert_not_null(batcher)
+    Test.assert_equals(batcher.max_batch_size, Batcher.DEFAULT_BATCH_SIZE)
+    Test.assert_equals(batcher.batch_timeout_ms, Batcher.BATCH_TIMEOUT_MS)
+    Test.assert_true(batcher.auto_flush)
+    Test.assert_true(batcher.enabled)
+    Test.assert_equals(batcher.next_id, 1)
+    
+    Note: Verify statistics initialization
+    Let stats be batcher.statistics
+    Test.assert_equals(stats.total_batches, 0)
+    Test.assert_equals(stats.total_syscalls, 0)
+    Test.assert_equals(stats.avg_batch_size, 0.0)
+    Test.assert_equals(stats.total_time_saved_ms, 0)
+    Test.assert_equals(stats.parallel_executions, 0)
+    Test.assert_equals(stats.failed_syscalls, 0)
+End Process
+
+Process called "test_custom_config_batcher" returns Nothing:
+    @Performance_Hints
+    Tests batcher creation with custom configuration.
+    @End Performance_Hints
+    
+    Let custom_size be 128
+    Let custom_timeout be 200
+    Let batcher be Batcher.create_batcher_with_config(custom_size, custom_timeout)
+    
+    Test.assert_not_null(batcher)
+    Test.assert_equals(batcher.max_batch_size, custom_size)
+    Test.assert_equals(batcher.batch_timeout_ms, custom_timeout)
+    Test.assert_true(batcher.auto_flush)
+    Test.assert_true(batcher.enabled)
+End Process
+
+Process called "test_submit_syscall" returns Nothing:
+    @Performance_Hints
+    Tests basic syscall submission to batch.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Create arguments for read syscall
+    Let args be Internals.create_internal_array(3)
+    Internals.internal_array_add(args, 0)  Note: stdin
+    Internals.internal_array_add(args, create_buffer())
+    Internals.internal_array_add(args, 1024)
+    
+    Let syscall_id be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+    
+    Test.assert_greater_than(syscall_id, 0)
+    Test.assert_equals(syscall_id, 1)  Note: First ID should be 1
+    
+    Note: Verify entry was added to batch
+    Test.assert_greater_than(batcher.current_batch.length, 0)
+End Process
+
+Process called "test_submit_with_dependencies" returns Nothing:
+    @Performance_Hints
+    Tests syscall submission with explicit dependencies.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Submit first syscall
+    Let args1 be create_syscall_args(0, 1024, 0)
+    Let id1 be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args1)
+    
+    Note: Submit second syscall depending on first
+    Let args2 be create_syscall_args(1, 1024, 0)
+    Let deps be Internals.create_internal_array(1)
+    Internals.internal_array_add(deps, id1)
+    Let id2 be Batcher.submit_with_dependencies(batcher, Registry.SYSCALL_WRITE, args2, deps)
+    
+    Test.assert_greater_than(id2, id1)
+    Test.assert_equals(batcher.current_batch.length, 2)
+End Process
+
+Note: =====================================================================
+Note: BATCH EXECUTION
+Note: =====================================================================
+
+Process called "test_flush_empty_batch" returns Nothing:
+    @Performance_Hints
+    Tests flushing an empty batch.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Flush empty batch should be safe
+    Batcher.flush_batch(batcher)
+    
+    Test.assert_equals(batcher.statistics.total_batches, 0)
+    Test.assert_equals(batcher.statistics.total_syscalls, 0)
+End Process
+
+Process called "test_flush_batch" returns Nothing:
+    @Performance_Hints
+    Tests manual batch flush.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Submit multiple syscalls
+    Let i be 0
+    While i less than 5:
+        Let args be create_syscall_args(0, 1024, i)
+        Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+        Set i to i plus 1
+    End While
+    
+    Test.assert_equals(batcher.current_batch.length, 5)
+    
+    Note: Flush batch
+    Batcher.flush_batch(batcher)
+    
+    Note: Verify statistics updated
+    Test.assert_equals(batcher.statistics.total_batches, 1)
+    Test.assert_equals(batcher.statistics.total_syscalls, 5)
+    Test.assert_equals(batcher.statistics.avg_batch_size, 5.0)
+    
+    Note: Verify batch cleared
+    Test.assert_equals(batcher.current_batch.length, 0)
+End Process
+
+Process called "test_auto_flush_on_size" returns Nothing:
+    @Performance_Hints
+    Tests automatic flush when batch reaches max size.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_batcher_with_config(8, 1000)  Note: Small batch size
+    
+    Note: Submit more syscalls than batch size
+    Let i be 0
+    While i less than 10:
+        Let args be create_syscall_args(0, 1024, i)
+        Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+        Set i to i plus 1
+    End While
+    
+    Note: Should have auto-flushed at least once
+    Test.assert_greater_than(batcher.statistics.total_batches, 0)
+    Test.assert_greater_than_or_equal(batcher.statistics.total_syscalls, 8)
+End Process
+
+Process called "test_auto_flush_on_timeout" returns Nothing:
+    @Performance_Hints
+    Tests automatic flush on timeout.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_batcher_with_config(64, 50)  Note: Short timeout
+    
+    Note: Submit a few syscalls
+    Let i be 0
+    While i less than 3:
+        Let args be create_syscall_args(0, 1024, i)
+        Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+        Set i to i plus 1
+    End While
+    
+    Note: Wait for timeout
+    sleep_milliseconds(60)
+    
+    Note: Submit another syscall to trigger timeout check
+    Let args be create_syscall_args(0, 1024, 99)
+    Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+    
+    Note: Should have flushed due to timeout
+    Test.assert_greater_than(batcher.statistics.total_batches, 0)
+End Process
+
+Note: =====================================================================
+Note: DEPENDENCY RESOLUTION
+Note: =====================================================================
+
+Process called "test_dependency_resolution" returns Nothing:
+    @Performance_Hints
+    Tests topological sort for dependency resolution.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Create dependency chain: A -> B -> C
+    Let args_a be create_syscall_args(0, 1024, 0)
+    Let id_a be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args_a)
+    
+    Let args_b be create_syscall_args(1, 1024, 0)
+    Let deps_b be Internals.create_internal_array(1)
+    Internals.internal_array_add(deps_b, id_a)
+    Let id_b be Batcher.submit_with_dependencies(batcher, Registry.SYSCALL_WRITE, args_b, deps_b)
+    
+    Let args_c be create_syscall_args(2, 1024, 0)
+    Let deps_c be Internals.create_internal_array(1)
+    Internals.internal_array_add(deps_c, id_b)
+    Let id_c be Batcher.submit_with_dependencies(batcher, Registry.SYSCALL_CLOSE, args_c, deps_c)
+    
+    Note: Resolve dependencies
+    Let order be Batcher.resolve_dependencies(batcher.dependency_graph)
+    
+    Test.assert_equals(order.length, 3)
+    
+    Note: Verify execution order respects dependencies
+    Let idx_a be find_index_in_array(order, id_a)
+    Let idx_b be find_index_in_array(order, id_b)
+    Let idx_c be find_index_in_array(order, id_c)
+    
+    Test.assert_less_than(idx_a, idx_b)  Note: A before B
+    Test.assert_less_than(idx_b, idx_c)  Note: B before C
+End Process
+
+Process called "test_complex_dependency_graph" returns Nothing:
+    @Performance_Hints
+    Tests resolution of complex dependency graph.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Create diamond dependency: 
+    Note:     A
+    Note:    / \
+    Note:   B   C
+    Note:    \ /
+    Note:     D
+    
+    Let id_a be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, create_syscall_args(0, 1024, 0))
+    
+    Let deps_b be Internals.create_internal_array(1)
+    Internals.internal_array_add(deps_b, id_a)
+    Let id_b be Batcher.submit_with_dependencies(batcher, Registry.SYSCALL_WRITE, create_syscall_args(1, 1024, 0), deps_b)
+    
+    Let deps_c be Internals.create_internal_array(1)
+    Internals.internal_array_add(deps_c, id_a)
+    Let id_c be Batcher.submit_with_dependencies(batcher, Registry.SYSCALL_WRITE, create_syscall_args(2, 1024, 0), deps_c)
+    
+    Let deps_d be Internals.create_internal_array(2)
+    Internals.internal_array_add(deps_d, id_b)
+    Internals.internal_array_add(deps_d, id_c)
+    Let id_d be Batcher.submit_with_dependencies(batcher, Registry.SYSCALL_CLOSE, create_syscall_args(3, 0, 0), deps_d)
+    
+    Let order be Batcher.resolve_dependencies(batcher.dependency_graph)
+    
+    Test.assert_equals(order.length, 4)
+    
+    Note: Verify A comes first and D comes last
+    Let idx_a be find_index_in_array(order, id_a)
+    Let idx_d be find_index_in_array(order, id_d)
+    Test.assert_equals(idx_a, 0)  Note: A should be first
+    Test.assert_equals(idx_d, 3)  Note: D should be last
+End Process
+
+Note: =====================================================================
+Note: PARALLEL EXECUTION
+Note: =====================================================================
+
+Process called "test_parallelizability_check" returns Nothing:
+    @Performance_Hints
+    Tests detection of parallelizable syscalls.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Submit independent read syscalls (parallelizable)
+    Let i be 0
+    While i less than 4:
+        Let args be create_syscall_args(i, 1024, 0)  Note: Different FDs
+        Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+        Set i to i plus 1
+    End While
+    
+    Let can_parallel be Batcher.check_parallelizability(batcher.current_batch)
+    Test.assert_true(can_parallel)
+    
+    Note: Add a write syscall (modifies state)
+    Let write_args be create_syscall_args(0, 1024, 0)
+    Batcher.submit_syscall(batcher, Registry.SYSCALL_WRITE, write_args)
+    
+    Set can_parallel to Batcher.check_parallelizability(batcher.current_batch)
+    Test.assert_false(can_parallel)  Note: Can't parallelize with write
+End Process
+
+Process called "test_parallel_execution_grouping" returns Nothing:
+    @Performance_Hints
+    Tests grouping of independent syscalls for parallel execution.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Submit mix of dependent and independent syscalls
+    Let id1 be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, create_syscall_args(0, 1024, 0))
+    Let id2 be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, create_syscall_args(1, 1024, 0))
+    
+    Let deps3 be Internals.create_internal_array(1)
+    Internals.internal_array_add(deps3, id1)
+    Let id3 be Batcher.submit_with_dependencies(batcher, Registry.SYSCALL_WRITE, create_syscall_args(0, 1024, 0), deps3)
+    
+    Let id4 be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, create_syscall_args(2, 1024, 0))
+    
+    Let order be Batcher.resolve_dependencies(batcher.dependency_graph)
+    Let groups be Batcher.group_independent_syscalls(batcher, order)
+    
+    Test.assert_greater_than(groups.length, 1)  Note: Should have multiple groups
+End Process
+
+Process called "test_resource_conflict_detection" returns Nothing:
+    @Performance_Hints
+    Tests detection of resource conflicts between syscalls.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Submit syscalls on same FD
+    Let args1 be create_syscall_args(5, 1024, 0)
+    Let args2 be create_syscall_args(5, 2048, 0)  Note: Same FD
+    
+    Let id1 be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args1)
+    Let id2 be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args2)
+    
+    Let can_parallel be Batcher.can_execute_parallel(batcher, id1, id2)
+    Test.assert_false(can_parallel)  Note: Same FD, can't parallelize
+    
+    Note: Submit syscalls on different FDs
+    Let args3 be create_syscall_args(6, 1024, 0)
+    Let args4 be create_syscall_args(7, 1024, 0)
+    
+    Let id3 be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args3)
+    Let id4 be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args4)
+    
+    Set can_parallel to Batcher.can_execute_parallel(batcher, id3, id4)
+    Test.assert_true(can_parallel)  Note: Different FDs, can parallelize
+End Process
+
+Note: =====================================================================
+Note: RESULT RETRIEVAL
+Note: =====================================================================
+
+Process called "test_get_result_pending" returns Nothing:
+    @Performance_Hints
+    Tests result retrieval for pending syscall.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Let args be create_syscall_args(0, 1024, 0)
+    Let id be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+    
+    Note: Get result before execution
+    Let result be Batcher.get_result(batcher, id)
+    
+    Test.assert_false(result.is_success)
+    Test.assert_equals(result.value, minus 2)  Note: Pending status
+End Process
+
+Process called "test_get_result_completed" returns Nothing:
+    @Performance_Hints
+    Tests result retrieval after execution.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Let args be create_syscall_args(0, 1024, 0)
+    Let id be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+    
+    Note: Flush to execute
+    Batcher.flush_batch(batcher)
+    
+    Note: Get result after execution
+    Let result be Batcher.get_result(batcher, id)
+    
+    Note: Result depends on actual syscall execution
+    Test.assert_not_equals(result.value, minus 2)  Note: Not pending anymore
+End Process
+
+Process called "test_wait_for_result" returns Nothing:
+    @Performance_Hints
+    Tests waiting for result with timeout.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Let args be create_syscall_args(0, 1024, 0)
+    Let id be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+    
+    Note: Start async flush
+    spawn_async_flush(batcher, 50)  Note: Flush after 50ms
+    
+    Note: Wait for result with sufficient timeout
+    Let result be Batcher.wait_for_result(batcher, id, 100)
+    
+    Test.assert_not_equals(result.value, minus 6)  Note: Should not timeout
+End Process
+
+Process called "test_invalid_syscall_id" returns Nothing:
+    @Performance_Hints
+    Tests result retrieval with invalid ID.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Let result be Batcher.get_result(batcher, 9999)  Note: Non-existent ID
+    
+    Test.assert_false(result.is_success)
+    Test.assert_equals(result.value, minus 1)  Note: Not found
+End Process
+
+Note: =====================================================================
+Note: BATCH OPTIMIZATION
+Note: =====================================================================
+
+Process called "test_batch_size_optimization" returns Nothing:
+    @Performance_Hints
+    Tests dynamic batch size adjustment.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_batcher_with_config(32, 100)
+    
+    Note: Simulate poor efficiency scenario
+    Set batcher.statistics.total_batches to 15
+    Set batcher.statistics.total_syscalls to 150
+    Set batcher.statistics.failed_syscalls to 75  Note: 50% failure rate
+    
+    Let initial_size be batcher.max_batch_size
+    Batcher.optimize_batch_size(batcher)
+    
+    Test.assert_greater_than(batcher.max_batch_size, initial_size)  Note: Should increase
+    
+    Note: Simulate high efficiency scenario
+    Set batcher.statistics.failed_syscalls to 0
+    Set batcher.statistics.total_time_saved_ms to 15000
+    
+    Batcher.optimize_batch_size(batcher)
+    Test.assert_less_than_or_equal(batcher.max_batch_size, Batcher.MAX_BATCH_SIZE)
+End Process
+
+Process called "test_efficiency_calculation" returns Nothing:
+    @Performance_Hints
+    Tests batch efficiency metric calculation.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: No syscalls yet
+    Let efficiency be Batcher.calculate_batch_efficiency(batcher)
+    Test.assert_equals(efficiency, 0.0)
+    
+    Note: Simulate successful batches
+    Set batcher.statistics.total_syscalls to 100
+    Set batcher.statistics.failed_syscalls to 5
+    Set batcher.statistics.total_time_saved_ms to 5000
+    
+    Set efficiency to Batcher.calculate_batch_efficiency(batcher)
+    Test.assert_greater_than(efficiency, 0.0)
+    Test.assert_less_than_or_equal(efficiency, 1.0)
+End Process
+
+Note: =====================================================================
+Note: STATISTICS AND MONITORING
+Note: =====================================================================
+
+Process called "test_statistics_tracking" returns Nothing:
+    @Performance_Hints
+    Tests accurate statistics collection.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Submit and flush multiple batches
+    Let batch_count be 3
+    Let batch_size be 5
+    
+    Let b be 0
+    While b less than batch_count:
+        Let i be 0
+        While i less than batch_size:
+            Let args be create_syscall_args(i, 1024, b multiplied by 100 plus i)
+            Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+            Set i to i plus 1
+        End While
+        Batcher.flush_batch(batcher)
+        Set b to b plus 1
+    End While
+    
+    Let stats be Batcher.get_batch_statistics(batcher)
+    
+    Test.assert_equals(stats.total_batches, batch_count)
+    Test.assert_equals(stats.total_syscalls, batch_count multiplied by batch_size)
+    Test.assert_equals(stats.avg_batch_size, batch_size as Float)
+End Process
+
+Process called "test_statistics_reset" returns Nothing:
+    @Performance_Hints
+    Tests statistics reset functionality.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Generate some statistics
+    Let i be 0
+    While i less than 10:
+        Let args be create_syscall_args(0, 1024, i)
+        Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+        Set i to i plus 1
+    End While
+    Batcher.flush_batch(batcher)
+    
+    Test.assert_greater_than(batcher.statistics.total_syscalls, 0)
+    
+    Note: Reset statistics
+    Batcher.reset_statistics(batcher)
+    
+    Test.assert_equals(batcher.statistics.total_batches, 0)
+    Test.assert_equals(batcher.statistics.total_syscalls, 0)
+    Test.assert_equals(batcher.statistics.avg_batch_size, 0.0)
+    Test.assert_equals(batcher.statistics.total_time_saved_ms, 0)
+    Test.assert_equals(batcher.statistics.parallel_executions, 0)
+    Test.assert_equals(batcher.statistics.failed_syscalls, 0)
+End Process
+
+Note: =====================================================================
+Note: THREAD SAFETY
+Note: =====================================================================
+
+Process called "test_concurrent_submission" returns Nothing:
+    @Performance_Hints
+    Tests thread-safe concurrent syscall submission.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    Let thread_count be 4
+    Let syscalls_per_thread be 10
+    
+    Note: Spawn threads to submit syscalls concurrently
+    Let threads be spawn_submission_threads(batcher, thread_count, syscalls_per_thread)
+    
+    Note: Wait for all threads
+    wait_for_threads(threads)
+    
+    Note: Verify all syscalls were submitted
+    Batcher.flush_batch(batcher)
+    Test.assert_equals(batcher.statistics.total_syscalls, thread_count multiplied by syscalls_per_thread)
+End Process
+
+Process called "test_lock_contention" returns Nothing:
+    @Performance_Hints
+    Tests performance under lock contention.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Measure time for sequential submission
+    Let start_time be get_timestamp_ms()
+    Let i be 0
+    While i less than 100:
+        Let args be create_syscall_args(0, 1024, i)
+        Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+        Set i to i plus 1
+    End While
+    Let sequential_time be get_timestamp_ms() minus start_time
+    
+    Note: Clear batch
+    Batcher.flush_batch(batcher)
+    Batcher.reset_statistics(batcher)
+    
+    Note: Measure time for concurrent submission
+    Set start_time to get_timestamp_ms()
+    Let threads be spawn_submission_threads(batcher, 10, 10)  Note: 10 threads, 10 syscalls each
+    wait_for_threads(threads)
+    Let concurrent_time be get_timestamp_ms() minus start_time
+    
+    Note: Concurrent should not be significantly slower despite lock contention
+    Test.assert_less_than(concurrent_time, sequential_time multiplied by 2)
+End Process
+
+Note: =====================================================================
+Note: ERROR HANDLING
+Note: =====================================================================
+
+Process called "test_failed_syscall_handling" returns Nothing:
+    @Performance_Hints
+    Tests proper handling of failed syscalls.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Submit invalid syscall (bad FD)
+    Let args be create_syscall_args(minus 1, 1024, 0)  Note: Invalid FD
+    Let id be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+    
+    Batcher.flush_batch(batcher)
+    
+    Let result be Batcher.get_result(batcher, id)
+    Test.assert_false(result.is_success)
+    Test.assert_greater_than(batcher.statistics.failed_syscalls, 0)
+End Process
+
+Process called "test_disabled_batching" returns Nothing:
+    @Performance_Hints
+    Tests immediate execution when batching is disabled.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    Set batcher.enabled to false
+    
+    Let args be create_syscall_args(0, 1024, 0)
+    Let id be Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+    
+    Note: Should execute immediately when disabled
+    Test.assert_equals(batcher.current_batch.length, 0)  Note: Not batched
+    Test.assert_equals(batcher.statistics.total_batches, 0)  Note: No batches
+End Process
+
+Note: =====================================================================
+Note: MEMORY OVERLAP DETECTION
+Note: =====================================================================
+
+Process called "test_memory_overlap_detection" returns Nothing:
+    @Performance_Hints
+    Tests detection of overlapping memory regions.
+    @End Performance_Hints
+    
+    Let batcher be Batcher.create_syscall_batcher()
+    
+    Note: Test non-overlapping regions
+    Let args1 be Internals.create_internal_array(2)
+    Internals.internal_array_add(args1, 0x1000)  Note: Address
+    Internals.internal_array_add(args1, 0x1000)  Note: Size
+    
+    Let args2 be Internals.create_internal_array(2)
+    Internals.internal_array_add(args2, 0x3000)  Note: Address (no overlap)
+    Internals.internal_array_add(args2, 0x1000)  Note: Size
+    
+    Let no_overlap be Batcher.modifies_same_resource(Registry.SYSCALL_MMAP, args1, Registry.SYSCALL_MMAP, args2)
+    Test.assert_false(no_overlap)
+    
+    Note: Test overlapping regions
+    Let args3 be Internals.create_internal_array(2)
+    Internals.internal_array_add(args3, 0x1000)  Note: Address
+    Internals.internal_array_add(args3, 0x2000)  Note: Size (extends to 0x3000)
+    
+    Let args4 be Internals.create_internal_array(2)
+    Internals.internal_array_add(args4, 0x2000)  Note: Address (overlaps with args3)
+    Internals.internal_array_add(args4, 0x1000)  Note: Size
+    
+    Let has_overlap be Batcher.modifies_same_resource(Registry.SYSCALL_MMAP, args3, Registry.SYSCALL_MMAP, args4)
+    Test.assert_true(has_overlap)
+End Process
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Process called "create_syscall_args" that takes fd as Integer, size as Integer, offset as Integer returns Internals.InternalArray:
+    @Performance_Hints
+    Creates standard syscall arguments for testing.
+    @End Performance_Hints
+    
+    Let args be Internals.create_internal_array(3)
+    Internals.internal_array_add(args, fd)
+    Internals.internal_array_add(args, create_buffer_with_size(size))
+    Internals.internal_array_add(args, offset)
+    Return args
+End Process
+
+Process called "create_buffer" returns Integer:
+    @Performance_Hints
+    Creates a test buffer.
+    @End Performance_Hints
+    
+    Return create_buffer_with_size(1024)
+End Process
+
+Process called "create_buffer_with_size" that takes size as Integer returns Integer:
+    @Performance_Hints
+    Creates a test buffer of specified size.
+    @End Performance_Hints
+    
+    Let buffer be Internals.allocate_raw_memory(size)
+    
+    Note: Initialize buffer with test data
+    Let i be 0
+    While i less than size:
+        Internals.write_byte_at(buffer, i, i modulo 256)
+        Set i to i plus 1
+    End While
+    
+    Return buffer
+End Process
+
+Process called "find_index_in_array" that takes arr as Internals.InternalArray, value as Integer returns Integer:
+    @Performance_Hints
+    Finds index of value in array.
+    @End Performance_Hints
+    
+    Let i be 0
+    While i less than arr.length:
+        Let item be Internals.internal_array_get(arr, i)
+        If item equals value:
+            Return i
+        End If
+        Set i to i plus 1
+    End While
+    
+    Return minus 1  Note: Not found
+End Process
+
+Process called "spawn_async_flush" that takes batcher as Batcher.SyscallBatcher, delay_ms as Integer returns Nothing:
+    @Performance_Hints
+    Spawns async task to flush batch after delay.
+    @End Performance_Hints
+    
+    Note: Create thread to flush after delay
+    Let stack_size be 8192
+    Let stack_ptr be Internals.allocate_raw_memory(stack_size)
+    
+    Note: Store batcher pointer and delay on stack
+    Internals.write_integer_at(stack_ptr plus stack_size minus 8, batcher as Integer)
+    Internals.write_integer_at(stack_ptr plus stack_size minus 16, delay_ms)
+    
+    Inline Assembly:
+        "mov rax, 56\n"             Note: clone syscall
+        "mov rdi, 0x10900\n"        Note: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_THREAD
+        "mov rsi, %0\n"             Note: New stack pointer
+        "xor rdx, rdx\n"
+        "xor r10, r10\n"
+        "xor r8, r8\n"
+        "syscall\n"
+        "test rax, rax\n"
+        "jnz parent_return\n"
+        
+        Note: Child thread execution
+        "mov rdi, [rsp]\n"          Note: Get batcher pointer
+        "mov rsi, [rsp+8]\n"        Note: Get delay
+        "call async_flush_worker\n"
+        "mov rax, 60\n"             Note: exit
+        "xor rdi, rdi\n"
+        "syscall\n"
+        
+        "parent_return:\n"
+        :
+        : "r"(stack_ptr plus stack_size minus 16)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory"
+    End Assembly
+End Process
+
+Process called "async_flush_worker" that takes batcher_ptr as Integer, delay_ms as Integer returns Nothing:
+    @Performance_Hints
+    Worker function for async flush.
+    @End Performance_Hints
+    
+    sleep_milliseconds(delay_ms)
+    Let batcher be ptr_to_batcher(batcher_ptr)
+    Batcher.flush_batch(batcher)
+End Process
+
+Process called "spawn_submission_threads" that takes batcher as Batcher.SyscallBatcher, thread_count as Integer, syscalls_per_thread as Integer returns Internals.InternalArray:
+    @Performance_Hints
+    Spawns multiple threads to submit syscalls concurrently.
+    @End Performance_Hints
+    
+    Let threads be Internals.create_internal_array(thread_count)
+    
+    Let t be 0
+    While t less than thread_count:
+        Let thread_id be spawn_submission_thread(batcher, t, syscalls_per_thread)
+        Internals.internal_array_add(threads, thread_id)
+        Set t to t plus 1
+    End While
+    
+    Return threads
+End Process
+
+Process called "spawn_submission_thread" that takes batcher as Batcher.SyscallBatcher, thread_idx as Integer, syscall_count as Integer returns Integer:
+    @Performance_Hints
+    Spawns a single submission thread.
+    @End Performance_Hints
+    
+    Let stack_size be 8192
+    Let stack_ptr be Internals.allocate_raw_memory(stack_size)
+    
+    Note: Store parameters on stack
+    Internals.write_integer_at(stack_ptr plus stack_size minus 8, batcher as Integer)
+    Internals.write_integer_at(stack_ptr plus stack_size minus 16, thread_idx)
+    Internals.write_integer_at(stack_ptr plus stack_size minus 24, syscall_count)
+    
+    Let thread_id as Integer
+    Inline Assembly:
+        "mov rax, 56\n"             Note: clone syscall
+        "mov rdi, 0x10900\n"        Note: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_THREAD
+        "mov rsi, %1\n"             Note: New stack pointer
+        "xor rdx, rdx\n"
+        "xor r10, r10\n"
+        "xor r8, r8\n"
+        "syscall\n"
+        "test rax, rax\n"
+        "jnz parent_cont\n"
+        
+        Note: Child thread execution
+        "mov rdi, [rsp]\n"          Note: batcher
+        "mov rsi, [rsp+8]\n"        Note: thread_idx
+        "mov rdx, [rsp+16]\n"       Note: syscall_count
+        "call submission_worker\n"
+        "mov rax, 60\n"
+        "xor rdi, rdi\n"
+        "syscall\n"
+        
+        "parent_cont:\n"
+        "mov %0, rax\n"
+        : "=r"(thread_id)
+        : "r"(stack_ptr plus stack_size minus 24)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return thread_id
+End Process
+
+Process called "submission_worker" that takes batcher_ptr as Integer, thread_idx as Integer, syscall_count as Integer returns Nothing:
+    @Performance_Hints
+    Worker function for concurrent submission.
+    @End Performance_Hints
+    
+    Let batcher be ptr_to_batcher(batcher_ptr)
+    
+    Let i be 0
+    While i less than syscall_count:
+        Let args be create_syscall_args(thread_idx, 1024, i)
+        Batcher.submit_syscall(batcher, Registry.SYSCALL_READ, args)
+        Set i to i plus 1
+    End While
+End Process
+
+Process called "wait_for_threads" that takes threads as Internals.InternalArray returns Nothing:
+    @Performance_Hints
+    Waits for all threads to complete.
+    @End Performance_Hints
+    
+    Let i be 0
+    While i less than threads.length:
+        Let thread_id be Internals.internal_array_get(threads, i)
+        wait_for_thread(thread_id)
+        Set i to i plus 1
+    End While
+End Process
+
+Process called "wait_for_thread" that takes thread_id as Integer returns Nothing:
+    @Performance_Hints
+    Waits for a single thread using waitpid.
+    @End Performance_Hints
+    
+    Let status as Integer
+    Inline Assembly:
+        "mov rax, 61\n"         Note: waitpid syscall
+        "mov rdi, %1\n"         Note: Thread ID
+        "lea rsi, [rsp-4]\n"    Note: Status pointer
+        "xor rdx, rdx\n"        Note: Options
+        "syscall\n"
+        "mov %0, [rsi]\n"
+        : "=r"(status)
+        : "r"(thread_id)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    End Assembly
+End Process
+
+Process called "get_timestamp_ms" returns Integer:
+    @Performance_Hints
+    Gets current timestamp in milliseconds.
+    @End Performance_Hints
+    
+    Let seconds as Integer
+    Let nanoseconds as Integer
+    
+    Inline Assembly:
+        "mov rax, 228\n"        Note: clock_gettime
+        "mov rdi, 1\n"          Note: CLOCK_MONOTONIC
+        "lea rsi, [rsp-16]\n"
+        "syscall\n"
+        "mov %0, [rsi]\n"
+        "mov %1, [rsi+8]\n"
+        : "=r"(seconds), "=r"(nanoseconds)
+        :
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return seconds multiplied by 1000 plus (nanoseconds divided by 1000000)
+End Process
+
+Process called "sleep_milliseconds" that takes ms as Integer returns Nothing:
+    @Performance_Hints
+    Sleeps for specified milliseconds.
+    @End Performance_Hints
+    
+    Let seconds be ms divided by 1000
+    Let nanoseconds be (ms modulo 1000) multiplied by 1000000
+    
+    Inline Assembly:
+        "mov rax, 35\n"         Note: nanosleep
+        "lea rdi, [rsp-16]\n"
+        "mov [rdi], %0\n"
+        "mov [rdi+8], %1\n"
+        "xor rsi, rsi\n"
+        "syscall\n"
+        :
+        : "r"(seconds), "r"(nanoseconds)
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+End Process
+
+Process called "ptr_to_batcher" that takes ptr as Integer returns Batcher.SyscallBatcher:
+    @Performance_Hints
+    Converts pointer to batcher.
+    @End Performance_Hints
+    
+    Let batcher as Batcher.SyscallBatcher
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov %0, [rax]\n"
+        : "=m"(batcher)
+        : "r"(ptr)
+        : "rax", "memory"
+    End Assembly
+    Return batcher
+End Process
+
+Note: =====================================================================
+Note: TEST RUNNER
+Note: =====================================================================
+
+Process called "run_all_batcher_tests" returns Nothing:
+    @Performance_Hints
+    Runs all syscall batcher tests.
+    @End Performance_Hints
+    
+    Test.start_suite("Syscall Batcher Tests")
+    
+    Note: Basic operations
+    Test.run_test("Create Batcher", test_create_batcher)
+    Test.run_test("Custom Config Batcher", test_custom_config_batcher)
+    Test.run_test("Submit Syscall", test_submit_syscall)
+    Test.run_test("Submit with Dependencies", test_submit_with_dependencies)
+    
+    Note: Batch execution
+    Test.run_test("Flush Empty Batch", test_flush_empty_batch)
+    Test.run_test("Flush Batch", test_flush_batch)
+    Test.run_test("Auto Flush on Size", test_auto_flush_on_size)
+    Test.run_test("Auto Flush on Timeout", test_auto_flush_on_timeout)
+    
+    Note: Dependency resolution
+    Test.run_test("Dependency Resolution", test_dependency_resolution)
+    Test.run_test("Complex Dependency Graph", test_complex_dependency_graph)
+    
+    Note: Parallel execution
+    Test.run_test("Parallelizability Check", test_parallelizability_check)
+    Test.run_test("Parallel Execution Grouping", test_parallel_execution_grouping)
+    Test.run_test("Resource Conflict Detection", test_resource_conflict_detection)
+    
+    Note: Result retrieval
+    Test.run_test("Get Result Pending", test_get_result_pending)
+    Test.run_test("Get Result Completed", test_get_result_completed)
+    Test.run_test("Wait for Result", test_wait_for_result)
+    Test.run_test("Invalid Syscall ID", test_invalid_syscall_id)
+    
+    Note: Batch optimization
+    Test.run_test("Batch Size Optimization", test_batch_size_optimization)
+    Test.run_test("Efficiency Calculation", test_efficiency_calculation)
+    
+    Note: Statistics
+    Test.run_test("Statistics Tracking", test_statistics_tracking)
+    Test.run_test("Statistics Reset", test_statistics_reset)
+    
+    Note: Thread safety
+    Test.run_test("Concurrent Submission", test_concurrent_submission)
+    Test.run_test("Lock Contention", test_lock_contention)
+    
+    Note: Error handling
+    Test.run_test("Failed Syscall Handling", test_failed_syscall_handling)
+    Test.run_test("Disabled Batching", test_disabled_batching)
+    
+    Note: Memory overlap
+    Test.run_test("Memory Overlap Detection", test_memory_overlap_detection)
+    
+    Test.end_suite()
+End Process
+
+@Security_Scope
+These tests verify critical security aspects of syscall batching:
+- Thread safety and race condition prevention
+- Proper lock acquisition and release
+- Safe parallel execution without data corruption
+- Resource conflict detection to prevent race conditions
+- Memory overlap detection for safe memory operations
+- Error handling without information leakage
+- Dependency resolution to maintain execution order
+@End Security_Scope

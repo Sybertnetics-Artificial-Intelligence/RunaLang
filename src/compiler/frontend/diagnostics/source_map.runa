@@ -1,0 +1,2896 @@
+Note:
+compiler/frontend/diagnostics/source_map.runa
+Source Code Location Mapping and Context Management
+
+This module provides comprehensive source mapping functionality including:
+- Precise source location tracking throughout compilation phases
+- Line and column mapping with Unicode character support
+- Source file content caching and retrieval
+- Cross-reference mapping between original and transformed code
+- Integration with error reporting and diagnostics
+- Performance optimized location lookup algorithms
+- Support for both natural and technical syntax positioning
+- Macro expansion source location preservation
+:End Note
+
+Import "../primitives/assembly/syscall" as Syscall
+Import "../primitives/core/string_primitive" as StringPrimitive
+Import "errors" as Errors
+
+Note: =====================================================================
+Note: SOURCE MAPPING DATA STRUCTURES
+Note: =====================================================================
+
+Type called "SourcePosition":
+    file_path as String
+    line_number as Integer
+    column_number as Integer
+    byte_offset as Integer
+    character_offset as Integer
+    utf8_byte_offset as Integer
+
+Type called "SourceRange":
+    start_position as SourcePosition
+    end_position as SourcePosition
+    range_length as Integer
+    contains_newlines as Boolean
+
+Type called "SourceFile":
+    file_id as String
+    file_path as String
+    content as String
+    line_breaks as List[Integer]
+    encoding as String
+    last_modified as Integer
+    content_hash as String
+
+Type called "LocationMapping":
+    mapping_id as String
+    original_location as SourcePosition
+    transformed_location as SourcePosition
+    transformation_type as String
+    context_info as String
+
+Type called "SourceMap":
+    map_id as String
+    source_files as Dictionary[String, SourceFile]
+    location_mappings as List[LocationMapping]
+    cached_lookups as Dictionary[String, SourcePosition]
+    statistics as Dictionary[String, Integer]
+
+Note: =====================================================================
+Note: SOURCE MAP OPERATIONS
+Note: =====================================================================
+
+Process called "create_source_map" that takes map_name as String returns SourceMap:
+    @Implementation
+    Creates a new source map with empty collections and default statistics.
+    Initializes all tracking structures for efficient source location management.
+    @End Implementation
+    
+    Let map be SourceMap with
+        map_id as map_name,
+        source_files as Dictionary[String, SourceFile],
+        location_mappings as List[LocationMapping],
+        cached_lookups as Dictionary[String, SourcePosition],
+        statistics as Dictionary[String, Integer]
+    End SourceMap
+    
+    Note: Initialize statistics
+    Set map.statistics["files_registered"] to 0
+    Set map.statistics["position_lookups"] to 0
+    Set map.statistics["cache_hits"] to 0
+    Set map.statistics["cache_misses"] to 0
+    
+    Return map
+
+Process called "register_source_file" that takes map as SourceMap, file_path as String returns Boolean:
+    @Implementation
+    Registers a source file in the map without loading content.
+    Creates file record with metadata for later content loading.
+    @End Implementation
+    
+    Note: Check if file already registered
+    If map.source_files contains file_path:
+        Return true
+    End If
+    
+    Note: Generate unique file ID
+    Let file_id be StringPrimitive.length(file_path) + map.statistics["files_registered"]
+    Let file_id_str be integer_to_string(file_id)
+    
+    Note: Create source file record
+    Let source_file be SourceFile with
+        file_id as file_id_str,
+        file_path as file_path,
+        content as "",
+        line_breaks as List[Integer],
+        encoding as "utf-8",
+        last_modified as 0,
+        content_hash as ""
+    End SourceFile
+    
+    Note: Register in map
+    Set map.source_files[file_path] to source_file
+    Set map.statistics["files_registered"] to map.statistics["files_registered"] + 1
+    
+    Return true
+
+Process called "load_source_content" that takes map as SourceMap, file_path as String returns Boolean:
+    @Implementation
+    Loads source file content from disk and caches it in the source map.
+    Builds line break index for efficient line/column operations.
+    @End Implementation
+    
+    Note: Check if file is registered
+    If not (map.source_files contains file_path):
+        Let registration_result be register_source_file(map, file_path)
+        If not registration_result:
+            Return false
+        End If
+    End If
+    
+    Note: Read file content using syscall
+    Let file_content be read_file_syscall(file_path)
+    If StringPrimitive.length(file_content) equals 0:
+        Return false
+    End If
+    
+    Note: Update source file record
+    Let source_file be map.source_files[file_path]
+    Set source_file.content to file_content
+    Set source_file.content_hash to calculate_content_hash(file_content)
+    Set source_file.last_modified to get_current_timestamp()
+    
+    Note: Build line break index
+    Let line_map_result be build_line_map(map, file_path)
+    
+    Return true
+
+Process called "update_source_file" that takes map as SourceMap, file_path as String, new_content as String returns Boolean:
+    @Implementation
+    Updates cached source file with new content and rebuilds line map.
+    @End Implementation
+    
+    Note: Check if file is registered
+    If not (map.source_files contains file_path):
+        Let registration_result be register_source_file(map, file_path)
+        If not registration_result:
+            Return false
+        End If
+    End If
+    
+    Note: Update source file record
+    Let source_file be map.source_files[file_path]
+    Set source_file.content to new_content
+    Set source_file.content_hash to calculate_content_hash(new_content)
+    Set source_file.last_modified to get_current_timestamp()
+    
+    Note: Rebuild line break index
+    Let line_map_result be build_line_map(map, file_path)
+    If not line_map_result:
+        Return false
+    End If
+    
+    Note: Clear cached lookups that might be invalid
+    Set map.cached_lookups to Dictionary[String, SourcePosition]
+    
+    Return true
+
+Note: =====================================================================
+Note: POSITION TRACKING OPERATIONS
+Note: =====================================================================
+
+Process called "create_source_position" that takes map as SourceMap, file_path as String, line as Integer, column as Integer returns SourcePosition:
+    @Implementation
+    Creates a complete source position with all offset calculations.
+    Computes byte offset, character offset, and UTF-8 byte offset.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains file_path):
+        Let load_result be load_source_content(map, file_path)
+        If not load_result:
+            Throw Errors.create_internal_error("Cannot load source file: " + file_path)
+        End If
+    End If
+    
+    Note: Calculate offsets
+    Let byte_offset be calculate_byte_offset(map, file_path, line, column)
+    Let char_offset be calculate_character_offset(map, file_path, line, column)
+    Let utf8_offset be byte_offset  Note: UTF-8 byte offset same as byte offset
+    
+    Note: Create position
+    Let position be SourcePosition with
+        file_path as file_path,
+        line_number as line,
+        column_number as column,
+        byte_offset as byte_offset,
+        character_offset as char_offset,
+        utf8_byte_offset as utf8_offset
+    End SourcePosition
+    
+    Note: Update statistics
+    Set map.statistics["position_lookups"] to map.statistics["position_lookups"] + 1
+    
+    Return position
+
+Process called "calculate_byte_offset" that takes map as SourceMap, file_path as String, line as Integer, column as Integer returns Integer:
+    @Implementation
+    Calculates byte offset from line and column using line break index.
+    Accounts for different line ending styles and validates bounds.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains file_path):
+        Return 0
+    End If
+    
+    Let source_file be map.source_files[file_path]
+    
+    Note: Validate line number
+    If line is less than 1:
+        Return 0
+    End If
+    
+    Note: Handle first line
+    If line equals 1:
+        If column is less than 1:
+            Return 0
+        End If
+        Return column - 1  Note: Convert to 0-based
+    End If
+    
+    Note: Check if we have enough line breaks
+    Let line_breaks_count be List.length(source_file.line_breaks)
+    If line is greater than (line_breaks_count + 1):
+        Return StringPrimitive.length(source_file.content)
+    End If
+    
+    Note: Get offset of start of line
+    Let line_start_offset be source_file.line_breaks[line - 2]  Note: Previous line break
+    
+    Note: Add column offset
+    Let byte_offset be line_start_offset + column - 1
+    
+    Note: Validate doesn't exceed content length
+    Let content_length be StringPrimitive.length(source_file.content)
+    If byte_offset is greater than content_length:
+        Return content_length
+    End If
+    
+    Return byte_offset
+
+Process called "calculate_character_offset" that takes map as SourceMap, file_path as String, line as Integer, column as Integer returns Integer:
+    @Implementation
+    Calculates Unicode character offset accounting for multi-byte characters.
+    Iterates through content to count actual characters vs bytes.
+    @End Implementation
+    
+    Note: Get byte offset first
+    Let byte_offset be calculate_byte_offset(map, file_path, line, column)
+    
+    Return calculate_character_offset_from_byte_offset(map, file_path, byte_offset)
+
+Process called "calculate_character_offset_from_byte_offset" that takes map as SourceMap, file_path as String, byte_offset as Integer returns Integer:
+    @Implementation
+    Calculates Unicode character offset from byte offset by counting characters.
+    @End Implementation
+    
+    Let source_file be map.source_files[file_path]
+    Let content be source_file.content
+    
+    Let character_count be 0
+    Let byte_index be 0
+    
+    While byte_index is less than byte_offset:
+        Let char_code be StringPrimitive.char_at(content, byte_index)
+        
+        Note: Determine UTF-8 character width
+        Let char_width be get_utf8_char_width(char_code)
+        Set byte_index to byte_index + char_width
+        Set character_count to character_count + 1
+        
+        Note: Safety check
+        If byte_index is greater than StringPrimitive.length(content):
+            Break
+        End If
+    End While
+    
+    Return character_count
+
+Process called "position_from_offset" that takes map as SourceMap, file_path as String, byte_offset as Integer returns SourcePosition:
+    @Implementation
+    Creates source position from byte offset by finding line and column.
+    Uses line break index for efficient line location.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains file_path):
+        Let load_result be load_source_content(map, file_path)
+        If not load_result:
+            Throw Errors.create_internal_error("Cannot load source file: " + file_path)
+        End If
+    End If
+    
+    Let source_file be map.source_files[file_path]
+    Let content_length be StringPrimitive.length(source_file.content)
+    
+    Note: Validate byte offset
+    If byte_offset is less than 0 or byte_offset is greater than content_length:
+        Throw Errors.create_validation_error("Byte offset out of bounds: " + integer_to_string(byte_offset))
+    End If
+    
+    Note: Find line containing this offset
+    Let line_number be find_line_containing_offset(map, file_path, byte_offset)
+    
+    Note: Calculate column from line start
+    Let line_start_offset be Integer
+    If line_number equals 1:
+        Set line_start_offset to 0
+    Otherwise:
+        Set line_start_offset to source_file.line_breaks[line_number - 2]
+    End If
+    
+    Let column_number be (byte_offset - line_start_offset) + 1
+    
+    Note: Calculate character offset
+    Let char_offset be calculate_character_offset_from_byte_offset(map, file_path, byte_offset)
+    
+    Let position be SourcePosition with
+        file_path as file_path,
+        line_number as line_number,
+        column_number as column_number,
+        byte_offset as byte_offset,
+        character_offset as char_offset,
+        utf8_byte_offset as byte_offset
+    End SourcePosition
+    
+    Return position
+
+Note: =====================================================================
+Note: RANGE OPERATIONS
+Note: =====================================================================
+
+Process called "create_source_range" that takes map as SourceMap, start_pos as SourcePosition, end_pos as SourcePosition returns SourceRange:
+    @Implementation
+    Creates source range between two positions with validation.
+    Calculates range length and checks for newlines within range.
+    @End Implementation
+    
+    Note: Validate positions are in same file
+    If not (start_pos.file_path equals end_pos.file_path):
+        Throw Errors.create_validation_error("Range positions must be in same file")
+    End If
+    
+    Note: Ensure start comes before end
+    If start_pos.byte_offset is greater than end_pos.byte_offset:
+        Let temp_pos be start_pos
+        Set start_pos to end_pos
+        Set end_pos to temp_pos
+    End If
+    
+    Note: Calculate range length
+    Let range_length be end_pos.byte_offset - start_pos.byte_offset
+    
+    Note: Check if range contains newlines
+    Let contains_newlines be check_range_contains_newlines(map, start_pos, end_pos)
+    
+    Note: Create range
+    Let range be SourceRange with
+        start_position as start_pos,
+        end_position as end_pos,
+        range_length as range_length,
+        contains_newlines as contains_newlines
+    End SourceRange
+    
+    Return range
+
+Process called "extract_substring" that takes str as String, start_offset as Integer, length as Integer returns String:
+    @Implementation
+    Extracts substring from string starting at offset with specified length.
+    @End Implementation
+    
+    Let result_str be StringPrimitive.create_with_capacity(length)
+    
+    For i from 0 to (length - 1):
+        Let char_code be StringPrimitive.char_at(str, start_offset + i)
+        StringPrimitive.set_char_at(result_str, i, char_code)
+    End For
+    
+    StringPrimitive.set_length(result_str, length)
+    Return result_str
+
+Process called "check_range_contains_newlines" that takes map as SourceMap, start_pos as SourcePosition, end_pos as SourcePosition returns Boolean:
+    @Implementation
+    Checks if range between two positions contains any newline characters.
+    @End Implementation
+    
+    Let source_file be map.source_files[start_pos.file_path]
+    Let content be source_file.content
+    
+    For i from start_pos.byte_offset to (end_pos.byte_offset - 1):
+        Let char_code be StringPrimitive.char_at(content, i)
+        If char_code equals 10 or char_code equals 13:  Note: LF or CR
+            Return true
+        End If
+    End For
+    
+    Return false
+
+Note: List operations (placeholder implementations)
+Process called "List.length" that takes list as List[Any] returns Integer:
+    @Implementation
+    Returns length of list by reading the list header.
+    @End Implementation
+    
+    Let length be 0
+    Inline Assembly:
+        "mov rsi, %1\n"             Note: Load list pointer
+        "mov %0, qword ptr [rsi]\n" Note: Length is stored at beginning
+        : "=r"(length)
+        : "r"(list)
+        : "rsi", "memory"
+    End Assembly
+    
+    Return length
+
+Process called "List.add" that takes list as List[Any], item as Any returns Nothing:
+    @Implementation
+    Adds item to end of list, expanding capacity if needed.
+    @End Implementation
+    
+    Let current_length be List.length(list)
+    
+    Note: Get list capacity from header
+    Let capacity be 0
+    Inline Assembly:
+        "mov rsi, %1\n"             Note: Load list pointer
+        "mov %0, qword ptr [rsi + 8]\n" Note: Capacity at offset 8
+        : "=r"(capacity)
+        : "r"(list)
+        : "rsi", "memory"
+    End Assembly
+    
+    Note: Expand capacity if needed
+    If current_length is greater than or equal to capacity:
+        Let new_capacity be capacity * 2
+        If new_capacity equals 0:
+            Set new_capacity to 8  Note: Initial capacity
+        End If
+        
+        Note: Reallocate list storage
+        Inline Assembly:
+            "mov rdi, %0\n"             Note: Load new capacity
+            "imul rdi, 8\n"             Note: Multiply by pointer size
+            "add rdi, 16\n"             Note: Add header size
+            "call malloc\n"             Note: Allocate new memory
+            "mov rsi, %1\n"             Note: Load old list pointer
+            "mov rcx, %2\n"             Note: Load current length
+            "imul rcx, 8\n"             Note: Multiply by pointer size
+            "add rcx, 16\n"             Note: Add header size
+            "mov rdi, rax\n"             Note: Destination for copy
+            "rep movsb\n"               Note: Copy old data
+            "mov qword ptr [rax + 8], %0\n" Note: Set new capacity
+            "mov %1, rax\n"             Note: Update list pointer
+            :
+            : "r"(new_capacity), "r"(list), "r"(current_length)
+            : "rdi", "rsi", "rcx", "rax", "memory"
+        End Assembly
+    End If
+    
+    Note: Add item to end of list
+    Let item_offset be 16 + (current_length * 8)  Note: Header + items
+    Inline Assembly:
+        "mov rsi, %0\n"             Note: Load list pointer
+        "add rsi, %1\n"             Note: Add item offset
+        "mov qword ptr [rsi], %2\n" Note: Store item
+        "mov qword ptr [%0], %3\n"  Note: Update length
+        :
+        : "r"(list), "r"(item_offset), "r"(item), "r"(current_length + 1)
+        : "rsi", "memory"
+    End Assembly
+
+Process called "expand_range_to_line" that takes map as SourceMap, range as SourceRange returns SourceRange:
+    @Implementation
+    Expands range to include entire lines containing start and end positions.
+    @End Implementation
+    
+    Note: Get line ranges for start and end positions
+    Let start_line_range be get_line_range(map, range.start_position.file_path, range.start_position.line_number)
+    Let end_line_range be get_line_range(map, range.end_position.file_path, range.end_position.line_number)
+    
+    Note: Create expanded range
+    Let expanded_range be SourceRange with
+        start_position as start_line_range.start_position,
+        end_position as end_line_range.end_position,
+        range_length as (end_line_range.end_position.byte_offset - start_line_range.start_position.byte_offset),
+        contains_newlines as true
+    End SourceRange
+    
+    Return expanded_range
+
+Process called "get_range_content" that takes map as SourceMap, range as SourceRange returns String:
+    @Implementation
+    Extracts source content within the specified range boundaries.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains range.start_position.file_path):
+        Return ""
+    End If
+    
+    Let source_file be map.source_files[range.start_position.file_path]
+    Let content be source_file.content
+    
+    Note: Validate range boundaries
+    Let content_length be StringPrimitive.length(content)
+    If range.start_position.byte_offset is greater than content_length:
+        Return ""
+    End If
+    
+    Let end_offset be range.end_position.byte_offset
+    If end_offset is greater than content_length:
+        Set end_offset to content_length
+    End If
+    
+    Let range_length be end_offset - range.start_position.byte_offset
+    If range_length is less than or equal to 0:
+        Return ""
+    End If
+    
+    Note: Extract substring
+    Return extract_substring(content, range.start_position.byte_offset, range_length)
+
+Process called "ranges_overlap" that takes map as SourceMap, range1 as SourceRange, range2 as SourceRange returns Boolean:
+    @Implementation
+    Checks if two source ranges overlap by comparing their byte offsets.
+    @End Implementation
+    
+    Note: Ranges must be in same file to overlap
+    If not (range1.start_position.file_path equals range2.start_position.file_path):
+        Return false
+    End If
+    
+    Note: Check for overlap using byte offsets
+    Let range1_start be range1.start_position.byte_offset
+    Let range1_end be range1.end_position.byte_offset
+    Let range2_start be range2.start_position.byte_offset
+    Let range2_end be range2.end_position.byte_offset
+    
+    Note: No overlap if one range ends before the other starts
+    If range1_end is less than or equal to range2_start:
+        Return false
+    End If
+    If range2_end is less than or equal to range1_start:
+        Return false
+    End If
+    
+    Return true
+
+Process called "merge_ranges" that takes map as SourceMap, ranges as List[SourceRange] returns SourceRange:
+    @Implementation
+    Merges multiple ranges into single encompassing range covering all input ranges.
+    @End Implementation
+    
+    Let ranges_count be List.length(ranges)
+    If ranges_count equals 0:
+        Throw Errors.create_validation_error("Cannot merge empty range list")
+    End If
+    
+    Note: Get first range as starting point
+    Let first_range be ranges[0]
+    Let earliest_start be first_range.start_position
+    Let latest_end be first_range.end_position
+    
+    Note: Find earliest start and latest end across all ranges
+    For i from 1 to (ranges_count - 1):
+        Let current_range be ranges[i]
+        
+        Note: Check file consistency
+        If not (current_range.start_position.file_path equals earliest_start.file_path):
+            Throw Errors.create_validation_error("All ranges must be in same file for merging")
+        End If
+        
+        Note: Update earliest start
+        If current_range.start_position.byte_offset is less than earliest_start.byte_offset:
+            Set earliest_start to current_range.start_position
+        End If
+        
+        Note: Update latest end
+        If current_range.end_position.byte_offset is greater than latest_end.byte_offset:
+            Set latest_end to current_range.end_position
+        End If
+    End For
+    
+    Note: Create merged range
+    Return create_source_range(map, earliest_start, latest_end)
+
+Note: =====================================================================
+Note: LINE AND COLUMN OPERATIONS
+Note: =====================================================================
+
+Process called "build_line_map" that takes map as SourceMap, file_path as String returns Boolean:
+    @Implementation
+    Builds index of line break positions for fast line/column calculations.
+    Handles different line ending styles (LF, CRLF, CR).
+    @End Implementation
+    
+    Note: Get source file
+    If not (map.source_files contains file_path):
+        Return false
+    End If
+    
+    Let source_file be map.source_files[file_path]
+    Let content be source_file.content
+    Let content_length be StringPrimitive.length(content)
+    
+    Note: Clear existing line breaks
+    Set source_file.line_breaks to List[Integer]
+    
+    Note: Add position 0 as start of first line
+    List.add(source_file.line_breaks, 0)
+    
+    Note: Scan for line breaks
+    For i from 0 to (content_length - 1):
+        Let char_code be StringPrimitive.char_at(content, i)
+        
+        If char_code equals 10:  Note: LF (\n)
+            List.add(source_file.line_breaks, i + 1)
+        Otherwise char_code equals 13:  Note: CR (\r)
+            Note: Check for CRLF
+            If (i + 1) is less than content_length:
+                Let next_char be StringPrimitive.char_at(content, i + 1)
+                If next_char equals 10:  Note: Found CRLF
+                    List.add(source_file.line_breaks, i + 2)
+                    Set i to i + 1  Note: Skip the LF
+                Otherwise:
+                    List.add(source_file.line_breaks, i + 1)  Note: Just CR
+                End If
+            Otherwise:
+                List.add(source_file.line_breaks, i + 1)  Note: CR at end
+            End If
+        End If
+    End For
+    
+    Return true
+
+Process called "get_line_content" that takes map as SourceMap, file_path as String, line_number as Integer returns String:
+    @Implementation
+    Extracts content of specific line from source file.
+    Returns empty string if line doesn't exist.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains file_path):
+        Return ""
+    End If
+    
+    Let source_file be map.source_files[file_path]
+    Let content be source_file.content
+    
+    Note: Validate line number
+    If line_number is less than 1:
+        Return ""
+    End If
+    
+    Let line_breaks_count be List.length(source_file.line_breaks)
+    If line_number is greater than line_breaks_count:
+        Return ""
+    End If
+    
+    Note: Get line start position
+    Let line_start be source_file.line_breaks[line_number - 1]
+    
+    Note: Get line end position
+    Let line_end be Integer
+    If line_number equals line_breaks_count:
+        Set line_end to StringPrimitive.length(content)
+    Otherwise:
+        Set line_end to source_file.line_breaks[line_number] - 1
+        Note: Exclude line ending character
+        Let char_at_end be StringPrimitive.char_at(content, line_end)
+        If char_at_end equals 10 or char_at_end equals 13:  Note: LF or CR
+            Set line_end to line_end - 1
+        End If
+    End If
+    
+    Note: Extract line content
+    Let line_length be line_end - line_start
+    If line_length is less than or equal to 0:
+        Return ""
+    End If
+    
+    Let line_content be extract_substring(content, line_start, line_length)
+    Return line_content
+
+Process called "get_line_range" that takes map as SourceMap, file_path as String, line_number as Integer returns SourceRange:
+    @Implementation
+    Gets source range covering entire specified line including line ending.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains file_path):
+        Let load_result be load_source_content(map, file_path)
+        If not load_result:
+            Throw Errors.create_internal_error("Cannot load source file: " + file_path)
+        End If
+    End If
+    
+    Let source_file be map.source_files[file_path]
+    
+    Note: Validate line number
+    Let line_count be List.length(source_file.line_breaks)
+    If line_number is less than 1 or line_number is greater than line_count:
+        Throw Errors.create_validation_error("Line number out of range: " + integer_to_string(line_number))
+    End If
+    
+    Note: Get line start position
+    Let line_start_offset be source_file.line_breaks[line_number - 1]
+    Let start_position be create_source_position(map, file_path, line_number, 1)
+    
+    Note: Get line end position
+    Let line_end_offset be Integer
+    If line_number equals line_count:
+        Set line_end_offset to StringPrimitive.length(source_file.content)
+    Otherwise:
+        Set line_end_offset to source_file.line_breaks[line_number] - 1
+    End If
+    
+    Let end_position be position_from_offset(map, file_path, line_end_offset)
+    
+    Note: Create range
+    Return create_source_range(map, start_position, end_position)
+
+Process called "count_lines_in_file" that takes map as SourceMap, file_path as String returns Integer:
+    @Implementation
+    Counts total lines in source file using line break index.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains file_path):
+        Let load_result be load_source_content(map, file_path)
+        If not load_result:
+            Return 0
+        End If
+    End If
+    
+    Let source_file be map.source_files[file_path]
+    Return List.length(source_file.line_breaks)
+
+Process called "find_line_containing_offset" that takes map as SourceMap, file_path as String, offset as Integer returns Integer:
+    @Implementation
+    Finds line number containing specified byte offset using binary search.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains file_path):
+        Return 0
+    End If
+    
+    Let source_file be map.source_files[file_path]
+    Let line_breaks_count be List.length(source_file.line_breaks)
+    
+    Note: Binary search for line containing offset
+    Let left be 0
+    Let right be line_breaks_count - 1
+    
+    While left is less than or equal to right:
+        Let mid be (left + right) / 2
+        Let line_start be source_file.line_breaks[mid]
+        
+        Note: Check if we found the right line
+        Let line_end be Integer
+        If mid equals (line_breaks_count - 1):
+            Set line_end to StringPrimitive.length(source_file.content)
+        Otherwise:
+            Set line_end to source_file.line_breaks[mid + 1] - 1
+        End If
+        
+        If offset is greater than or equal to line_start and offset is less than or equal to line_end:
+            Return mid + 1  Note: Convert to 1-based line number
+        Otherwise offset is less than line_start:
+            Set right to mid - 1
+        Otherwise:
+            Set left to mid + 1
+        End If
+    End While
+    
+    Return 1  Note: Default to first line
+
+Note: =====================================================================
+Note: UNICODE AND ENCODING SUPPORT
+Note: =====================================================================
+
+Process called "handle_unicode_characters" that takes map as SourceMap, text as String, position as Integer returns Integer:
+    @Implementation
+    Handles Unicode character width calculations for accurate position mapping.
+    Returns the display width of the character at the given position.
+    @End Implementation
+    
+    Let text_length be StringPrimitive.length(text)
+    If position is less than 0 or position is greater than or equal to text_length:
+        Return 1  Note: Default width for invalid position
+    End If
+    
+    Let char_code be StringPrimitive.char_at(text, position)
+    
+    Note: ASCII characters have width 1
+    If char_code is less than 128:
+        Return 1
+    End If
+    
+    Note: Control characters have width 0
+    If char_code is less than 32 or (char_code is greater than or equal to 127 and char_code is less than 160):
+        Return 0
+    End If
+    
+    Note: Most Unicode characters have width 1, some have width 2
+    Note: East Asian characters typically have width 2
+    If char_code is greater than or equal to 0x1100:
+        Note: Check for wide East Asian characters
+        If (char_code is greater than or equal to 0x1100 and char_code is less than or equal to 0x115F) or
+           (char_code is greater than or equal to 0x2329 and char_code is less than or equal to 0x232A) or
+           (char_code is greater than or equal to 0x2E80 and char_code is less than or equal to 0x303E) or
+           (char_code is greater than or equal to 0x3040 and char_code is less than or equal to 0xA4CF) or
+           (char_code is greater than or equal to 0xAC00 and char_code is less than or equal to 0xD7A3) or
+           (char_code is greater than or equal to 0xF900 and char_code is less than or equal to 0xFAFF) or
+           (char_code is greater than or equal to 0xFE10 and char_code is less than or equal to 0xFE19) or
+           (char_code is greater than or equal to 0xFE30 and char_code is less than or equal to 0xFE6F) or
+           (char_code is greater than or equal to 0xFF00 and char_code is less than or equal to 0xFF60) or
+           (char_code is greater than or equal to 0xFFE0 and char_code is less than or equal to 0xFFE6):
+            Return 2
+        End If
+    End If
+    
+    Return 1  Note: Default width for most Unicode characters
+
+Process called "convert_utf8_to_utf16_offset" that takes map as SourceMap, utf8_offset as Integer, text as String returns Integer:
+    @Implementation
+    Converts UTF-8 byte offset to UTF-16 character offset for Windows compatibility.
+    @End Implementation
+    
+    Let text_length be StringPrimitive.length(text)
+    If utf8_offset is less than 0 or utf8_offset is greater than text_length:
+        Return utf8_offset  Note: Invalid offset, return as-is
+    End If
+    
+    Let utf16_offset be 0
+    Let byte_index be 0
+    
+    While byte_index is less than utf8_offset:
+        Let char_code be StringPrimitive.char_at(text, byte_index)
+        Let char_width be get_utf8_char_width(char_code)
+        
+        Note: Advance byte index by UTF-8 character width
+        Set byte_index to byte_index + char_width
+        
+        Note: Most characters map 1:1 to UTF-16, but some need surrogate pairs
+        If char_code is greater than 0xFFFF:
+            Set utf16_offset to utf16_offset + 2  Note: Surrogate pair
+        Otherwise:
+            Set utf16_offset to utf16_offset + 1  Note: Single UTF-16 unit
+        End If
+        
+        Note: Safety check
+        If byte_index is greater than text_length:
+            Break
+        End If
+    End While
+    
+    Return utf16_offset
+
+Process called "detect_file_encoding" that takes map as SourceMap, file_content as String returns String:
+    @Implementation
+    Detects text encoding by checking byte order marks and character patterns.
+    @End Implementation
+    
+    Let content_length be StringPrimitive.length(file_content)
+    If content_length equals 0:
+        Return "utf-8"  Note: Default for empty files
+    End If
+    
+    Note: Check for UTF-8 BOM
+    If content_length is greater than or equal to 3:
+        Let byte1 be StringPrimitive.char_at(file_content, 0)
+        Let byte2 be StringPrimitive.char_at(file_content, 1)
+        Let byte3 be StringPrimitive.char_at(file_content, 2)
+        
+        If byte1 equals 0xEF and byte2 equals 0xBB and byte3 equals 0xBF:
+            Return "utf-8-bom"
+        End If
+    End If
+    
+    Note: Check for UTF-16 BOMs
+    If content_length is greater than or equal to 2:
+        Let byte1 be StringPrimitive.char_at(file_content, 0)
+        Let byte2 be StringPrimitive.char_at(file_content, 1)
+        
+        If byte1 equals 0xFF and byte2 equals 0xFE:
+            Return "utf-16le"
+        End If
+        If byte1 equals 0xFE and byte2 equals 0xFF:
+            Return "utf-16be"
+        End If
+    End If
+    
+    Note: Check for valid UTF-8 sequences
+    Let is_valid_utf8 be true
+    Let byte_index be 0
+    
+    While byte_index is less than content_length:
+        Let char_code be StringPrimitive.char_at(file_content, byte_index)
+        
+        If char_code is less than 128:
+            Set byte_index to byte_index + 1  Note: ASCII
+        Otherwise char_code is less than 194:
+            Set is_valid_utf8 to false  Note: Invalid UTF-8 start byte
+            Break
+        Otherwise char_code is less than 224:
+            Note: 2-byte sequence
+            If (byte_index + 1) is greater than or equal to content_length:
+                Set is_valid_utf8 to false
+                Break
+            End If
+            Let next_byte be StringPrimitive.char_at(file_content, byte_index + 1)
+            If next_byte is less than 128 or next_byte is greater than or equal to 192:
+                Set is_valid_utf8 to false
+                Break
+            End If
+            Set byte_index to byte_index + 2
+        Otherwise char_code is less than 240:
+            Note: 3-byte sequence
+            If (byte_index + 2) is greater than or equal to content_length:
+                Set is_valid_utf8 to false
+                Break
+            End If
+            Set byte_index to byte_index + 3
+        Otherwise char_code is less than 248:
+            Note: 4-byte sequence
+            If (byte_index + 3) is greater than or equal to content_length:
+                Set is_valid_utf8 to false
+                Break
+            End If
+            Set byte_index to byte_index + 4
+        Otherwise:
+            Set is_valid_utf8 to false  Note: Invalid UTF-8 start byte
+            Break
+        End If
+    End While
+    
+    If is_valid_utf8:
+        Return "utf-8"
+    Otherwise:
+        Return "ascii"  Note: Fallback to ASCII assumption
+    End If
+
+Process called "normalize_line_endings" that takes map as SourceMap, content as String returns String:
+    @Implementation
+    Normalizes line endings to Unix style (LF only) for consistent processing.
+    @End Implementation
+    
+    Let content_length be StringPrimitive.length(content)
+    If content_length equals 0:
+        Return content
+    End If
+    
+    Let normalized be StringPrimitive.create_with_capacity(content_length)
+    Let i be 0
+    
+    While i is less than content_length:
+        Let char_code be StringPrimitive.char_at(content, i)
+        
+        If char_code equals 13:  Note: CR (\r)
+            Note: Check for CRLF sequence
+            If (i + 1) is less than content_length:
+                Let next_char be StringPrimitive.char_at(content, i + 1)
+                If next_char equals 10:  Note: Found CRLF
+                    StringPrimitive.append_char(normalized, 10)  Note: Convert to LF
+                    Set i to i + 2  Note: Skip both CR and LF
+                Otherwise:
+                    StringPrimitive.append_char(normalized, 10)  Note: Convert CR to LF
+                    Set i to i + 1
+                End If
+            Otherwise:
+                StringPrimitive.append_char(normalized, 10)  Note: Convert final CR to LF
+                Set i to i + 1
+            End If
+        Otherwise:
+            StringPrimitive.append_char(normalized, char_code)  Note: Keep other characters
+            Set i to i + 1
+        End If
+    End While
+    
+    Return normalized
+
+Note: =====================================================================
+Note: CONTEXT EXTRACTION OPERATIONS
+Note: =====================================================================
+
+Process called "get_context_around_position" that takes map as SourceMap, position as SourcePosition, context_lines as Integer returns String:
+    @Implementation
+    Gets source context around specified position including surrounding lines.
+    @End Implementation
+    
+    Let context_lines_before be context_lines
+    Let context_lines_after be context_lines
+    
+    Let relevant_lines be extract_relevant_lines(map, position, context_lines_before, context_lines_after)
+    
+    Note: Build context string
+    Let context be StringPrimitive.create_with_capacity(1000)
+    Let lines_count be List.length(relevant_lines)
+    
+    For i from 0 to (lines_count - 1):
+        Let line_content be relevant_lines[i]
+        StringPrimitive.append(context, line_content)
+        If i is less than (lines_count - 1):
+            StringPrimitive.append_char(context, 10)  Note: Add newline
+        End If
+    End For
+    
+    Return context
+
+Process called "get_context_for_range" that takes map as SourceMap, range as SourceRange, context_lines as Integer returns String:
+    @Implementation
+    Gets source context for specified range including surrounding lines.
+    @End Implementation
+    
+    Note: Get context around start position
+    Let start_context be get_context_around_position(map, range.start_position, context_lines)
+    
+    Note: If range spans multiple lines, include end context too
+    If range.contains_newlines:
+        Let end_context be get_context_around_position(map, range.end_position, context_lines)
+        
+        Note: Combine contexts avoiding duplication
+        Let combined_context be StringPrimitive.create_with_capacity(2000)
+        StringPrimitive.append(combined_context, start_context)
+        StringPrimitive.append_char(combined_context, 10)  Note: Separator line
+        StringPrimitive.append(combined_context, "...")
+        StringPrimitive.append_char(combined_context, 10)
+        StringPrimitive.append(combined_context, end_context)
+        
+        Return combined_context
+    Otherwise:
+        Return start_context
+    End If
+
+Process called "extract_relevant_lines" that takes map as SourceMap, position as SourcePosition, lines_before as Integer, lines_after as Integer returns List[String]:
+    @Implementation
+    Extracts relevant lines around position for error display context.
+    @End Implementation
+    
+    Let result_lines be List[String]
+    
+    Note: Calculate line range
+    Let start_line be position.line_number - lines_before
+    If start_line is less than 1:
+        Set start_line to 1
+    End If
+    
+    Let total_lines be count_lines_in_file(map, position.file_path)
+    Let end_line be position.line_number + lines_after
+    If end_line is greater than total_lines:
+        Set end_line to total_lines
+    End If
+    
+    Note: Extract lines in range
+    For line_num from start_line to end_line:
+        Let line_content be get_line_content(map, position.file_path, line_num)
+        List.add(result_lines, line_content)
+    End For
+    
+    Return result_lines
+
+Process called "highlight_position_in_context" that takes map as SourceMap, position as SourcePosition, context as String returns String:
+    @Implementation
+    Highlights specific position within context text using caret notation.
+    @End Implementation
+    
+    Let highlighted_context be StringPrimitive.create_with_capacity(StringPrimitive.length(context) + 100)
+    
+    Note: Copy original context
+    StringPrimitive.append(highlighted_context, context)
+    
+    Note: Add highlighting line with caret
+    StringPrimitive.append_char(highlighted_context, 10)  Note: Newline
+    
+    Note: Add spaces up to column position
+    For i from 1 to (position.column_number - 1):
+        StringPrimitive.append_char(highlighted_context, 32)  Note: Space
+    End For
+    
+    Note: Add caret indicator
+    StringPrimitive.append_char(highlighted_context, 94)  Note: '^' caret
+    
+    Return highlighted_context
+
+Note: =====================================================================
+Note: TRANSFORMATION MAPPING
+Note: =====================================================================
+
+Process called "add_location_mapping" that takes map as SourceMap, original_pos as SourcePosition, transformed_pos as SourcePosition, transformation_type as String returns Boolean:
+    @Implementation
+    Adds mapping between original and transformed source locations for transformation tracking.
+    @End Implementation
+    
+    Note: Generate unique mapping ID
+    Let mapping_count be List.length(map.location_mappings)
+    Let mapping_id be "mapping_" + integer_to_string(mapping_count)
+    
+    Note: Create location mapping
+    Let mapping be LocationMapping with
+        mapping_id as mapping_id,
+        original_location as original_pos,
+        transformed_location as transformed_pos,
+        transformation_type as transformation_type,
+        context_info as "Added at " + integer_to_string(get_current_timestamp())
+    End LocationMapping
+    
+    Note: Add to mappings list
+    List.add(map.location_mappings, mapping)
+    
+    Return true
+
+Process called "map_to_original_location" that takes map as SourceMap, transformed_pos as SourcePosition returns SourcePosition:
+    @Implementation
+    Maps transformed position back to original source location using transformation mappings.
+    @End Implementation
+    
+    Let mappings_count be List.length(map.location_mappings)
+    
+    Note: Search for mapping with matching transformed position
+    For i from 0 to (mappings_count - 1):
+        Let mapping be map.location_mappings[i]
+        
+        Note: Check if transformed positions match
+        If mapping.transformed_location.file_path equals transformed_pos.file_path and
+           mapping.transformed_location.line_number equals transformed_pos.line_number and
+           mapping.transformed_location.column_number equals transformed_pos.column_number:
+            Return mapping.original_location
+        End If
+        
+        Note: Also check byte offset proximity for fuzzy matching
+        Let offset_difference be mapping.transformed_location.byte_offset - transformed_pos.byte_offset
+        If offset_difference is greater than -10 and offset_difference is less than 10:
+            Note: Close enough, return original location
+            Return mapping.original_location
+        End If
+    End For
+    
+    Note: No mapping found, return position as-is
+    Return transformed_pos
+
+Process called "map_to_transformed_location" that takes map as SourceMap, original_pos as SourcePosition returns SourcePosition:
+    @Implementation
+    Maps original position to transformed location using transformation mappings.
+    @End Implementation
+    
+    Let mappings_count be List.length(map.location_mappings)
+    
+    Note: Search for mapping with matching original position
+    For i from 0 to (mappings_count - 1):
+        Let mapping be map.location_mappings[i]
+        
+        Note: Check if original positions match
+        If mapping.original_location.file_path equals original_pos.file_path and
+           mapping.original_location.line_number equals original_pos.line_number and
+           mapping.original_location.column_number equals original_pos.column_number:
+            Return mapping.transformed_location
+        End If
+        
+        Note: Also check byte offset proximity for fuzzy matching
+        Let offset_difference be mapping.original_location.byte_offset - original_pos.byte_offset
+        If offset_difference is greater than -10 and offset_difference is less than 10:
+            Note: Close enough, return transformed location
+            Return mapping.transformed_location
+        End If
+    End For
+    
+    Note: No mapping found, return position as-is
+    Return original_pos
+
+Process called "track_macro_expansion" that takes map as SourceMap, macro_call_pos as SourcePosition, expanded_range as SourceRange returns Boolean:
+    @Implementation
+    Tracks source locations through macro expansion for accurate error reporting.
+    @End Implementation
+    
+    Note: Create mapping from macro call position to start of expanded range
+    Let start_mapping_result be add_location_mapping(map, macro_call_pos, expanded_range.start_position, "macro_expansion_start")
+    
+    Note: Create mapping from macro call position to end of expanded range
+    Let end_mapping_result be add_location_mapping(map, macro_call_pos, expanded_range.end_position, "macro_expansion_end")
+    
+    Note: Track the entire expanded range
+    Let range_mapping_id be "macro_range_" + integer_to_string(List.length(map.location_mappings))
+    
+    Let range_mapping be LocationMapping with
+        mapping_id as range_mapping_id,
+        original_location as macro_call_pos,
+        transformed_location as expanded_range.start_position,
+        transformation_type as "macro_expansion_range",
+        context_info as "Expanded range length: " + integer_to_string(expanded_range.range_length)
+    End LocationMapping
+    
+    List.add(map.location_mappings, range_mapping)
+    
+    Return (start_mapping_result and end_mapping_result)
+
+Note: =====================================================================
+Note: SYNTAX MODE POSITION TRACKING
+Note: =====================================================================
+
+Process called "track_natural_syntax_positions" that takes map as SourceMap, natural_ast as String returns Boolean:
+    @Implementation
+    Tracks positions for natural language syntax elements in AST for error reporting.
+    @End Implementation
+    
+    Note: Parse natural syntax markers from AST string
+    Let ast_length be StringPrimitive.length(natural_ast)
+    If ast_length equals 0:
+        Return true
+    End If
+    
+    Let position_count be 0
+    Let i be 0
+    
+    Note: Scan for natural language constructs
+    While i is less than ast_length:
+        Let char_code be StringPrimitive.char_at(natural_ast, i)
+        
+        Note: Look for natural language keywords
+        If char_code equals 119:  Note: 'w' - might be "when", "while", "with"
+            Let keyword_end be find_keyword_end(natural_ast, i)
+            Let keyword be extract_substring(natural_ast, i, keyword_end - i)
+            
+            If StringPrimitive.contains(keyword, "when") or StringPrimitive.contains(keyword, "while") or StringPrimitive.contains(keyword, "with"):
+                Note: Track natural syntax position
+                Let line_num be find_line_number_at_offset(natural_ast, i)
+                Let col_num be find_column_number_at_offset(natural_ast, i)
+                
+                Note: Create position mapping
+                Let natural_pos be SourcePosition with
+                    file_path as "<natural_ast>",
+                    line_number as line_num,
+                    column_number as col_num,
+                    byte_offset as i,
+                    character_offset as i,
+                    utf8_byte_offset as i
+                End SourcePosition
+                
+                Note: Cache the position
+                Let cache_key be "natural_" + integer_to_string(i)
+                Set map.cached_lookups[cache_key] to natural_pos
+                Set position_count to position_count + 1
+            End If
+            
+            Set i to keyword_end
+        Otherwise:
+            Set i to i + 1
+        End If
+    End While
+    
+    Return (position_count is greater than 0)
+
+Process called "track_technical_syntax_positions" that takes map as SourceMap, technical_ast as String returns Boolean:
+    @Implementation
+    Tracks positions for technical syntax elements like operators and punctuation.
+    @End Implementation
+    
+    Let ast_length be StringPrimitive.length(technical_ast)
+    If ast_length equals 0:
+        Return true
+    End If
+    
+    Let position_count be 0
+    Let i be 0
+    
+    Note: Scan for technical syntax elements
+    While i is less than ast_length:
+        Let char_code be StringPrimitive.char_at(technical_ast, i)
+        
+        Note: Track technical operators and punctuation
+        If char_code equals 123 or char_code equals 125 or  Note: { }
+           char_code equals 40 or char_code equals 41 or    Note: ( )
+           char_code equals 91 or char_code equals 93 or    Note: [ ]
+           char_code equals 59 or char_code equals 44 or    Note: ; ,
+           char_code equals 58 or char_code equals 46:      Note: : .
+            
+            Note: Create position for technical element
+            Let line_num be find_line_number_at_offset(technical_ast, i)
+            Let col_num be find_column_number_at_offset(technical_ast, i)
+            
+            Let tech_pos be SourcePosition with
+                file_path as "<technical_ast>",
+                line_number as line_num,
+                column_number as col_num,
+                byte_offset as i,
+                character_offset as i,
+                utf8_byte_offset as i
+            End SourcePosition
+            
+            Note: Cache the technical position
+            Let cache_key be "technical_" + integer_to_string(i) + "_" + integer_to_string(char_code)
+            Set map.cached_lookups[cache_key] to tech_pos
+            Set position_count to position_count + 1
+        End If
+        
+        Set i to i + 1
+    End While
+    
+    Return (position_count is greater than 0)
+
+Process called "map_between_syntax_modes" that takes map as SourceMap, position as SourcePosition, target_mode as String returns SourcePosition:
+    @Implementation
+    Maps position between natural and technical syntax modes using cached mappings.
+    @End Implementation
+    
+    Note: Determine source and target modes
+    Let is_natural_source be StringPrimitive.contains(position.file_path, "natural")
+    Let is_technical_target be StringPrimitive.contains(target_mode, "technical")
+    
+    Note: Search cached lookups for appropriate mapping
+    If is_natural_source and is_technical_target:
+        Note: Map from natural to technical
+        Let search_key be "technical_" + integer_to_string(position.byte_offset)
+        
+        Note: Try exact match first
+        If map.cached_lookups contains search_key:
+            Return map.cached_lookups[search_key]
+        End If
+        
+        Note: Try fuzzy matching within small range
+        For offset from (position.byte_offset - 5) to (position.byte_offset + 5):
+            Let fuzzy_key be "technical_" + integer_to_string(offset)
+            If map.cached_lookups contains fuzzy_key:
+                Return map.cached_lookups[fuzzy_key]
+            End If
+        End For
+        
+    Otherwise is_technical_target equals false and is_natural_source equals false:
+        Note: Map from technical to natural
+        Let search_key be "natural_" + integer_to_string(position.byte_offset)
+        
+        If map.cached_lookups contains search_key:
+            Return map.cached_lookups[search_key]
+        End If
+        
+        Note: Try fuzzy matching within small range
+        For offset from (position.byte_offset - 5) to (position.byte_offset + 5):
+            Let fuzzy_key be "natural_" + integer_to_string(offset)
+            If map.cached_lookups contains fuzzy_key:
+                Return map.cached_lookups[fuzzy_key]
+            End If
+        End For
+    End If
+    
+    Note: No mapping found, create approximate position
+    Let mapped_pos be SourcePosition with
+        file_path as "<" + target_mode + ">",
+        line_number as position.line_number,
+        column_number as position.column_number,
+        byte_offset as position.byte_offset,
+        character_offset as position.character_offset,
+        utf8_byte_offset as position.utf8_byte_offset
+    End SourcePosition
+    
+    Return mapped_pos
+
+Note: =====================================================================
+Note: MATHEMATICAL SYMBOL POSITION TRACKING
+Note: =====================================================================
+
+Process called "track_greek_symbol_positions" that takes map as SourceMap, math_expression as String returns Boolean:
+    @Implementation
+    Tracks positions of Greek symbols in mathematical expressions for error reporting.
+    @End Implementation
+    
+    Let expr_length be StringPrimitive.length(math_expression)
+    If expr_length equals 0:
+        Return true
+    End If
+    
+    Let symbol_count be 0
+    Let i be 0
+    
+    Note: Scan for Greek Unicode ranges
+    While i is less than expr_length:
+        Let char_code be StringPrimitive.char_at(math_expression, i)
+        
+        Note: Check for Greek and Coptic Unicode block (U+0370–U+03FF)
+        If char_code is greater than or equal to 0x0370 and char_code is less than or equal to 0x03FF:
+            Let line_num be find_line_number_at_offset(math_expression, i)
+            Let col_num be find_column_number_at_offset(math_expression, i)
+            
+            Let symbol_pos be SourcePosition with
+                file_path as "<math_expression>",
+                line_number as line_num,
+                column_number as col_num,
+                byte_offset as i,
+                character_offset as i,
+                utf8_byte_offset as i
+            End SourcePosition
+            
+            Note: Cache Greek symbol position
+            Let cache_key be "greek_" + integer_to_string(char_code) + "_" + integer_to_string(i)
+            Set map.cached_lookups[cache_key] to symbol_pos
+            Set symbol_count to symbol_count + 1
+        
+        Note: Check for Extended Greek Unicode block (U+1F00–U+1FFF)
+        Otherwise char_code is greater than or equal to 0x1F00 and char_code is less than or equal to 0x1FFF:
+            Let line_num be find_line_number_at_offset(math_expression, i)
+            Let col_num be find_column_number_at_offset(math_expression, i)
+            
+            Let symbol_pos be SourcePosition with
+                file_path as "<math_expression>",
+                line_number as line_num,
+                column_number as col_num,
+                byte_offset as i,
+                character_offset as i,
+                utf8_byte_offset as i
+            End SourcePosition
+            
+            Let cache_key be "greek_ext_" + integer_to_string(char_code) + "_" + integer_to_string(i)
+            Set map.cached_lookups[cache_key] to symbol_pos
+            Set symbol_count to symbol_count + 1
+        End If
+        
+        Set i to i + 1
+    End While
+    
+    Return (symbol_count is greater than 0)
+
+Process called "map_escape_sequence_to_symbol" that takes map as SourceMap, escape_pos as SourcePosition, symbol_pos as SourcePosition returns Boolean:
+    @Implementation
+    Maps LaTeX escape sequences to their rendered mathematical symbols for error reporting.
+    @End Implementation
+    
+    Note: Create mapping from escape sequence to rendered symbol
+    Let mapping_result be add_location_mapping(map, escape_pos, symbol_pos, "latex_escape_to_symbol")
+    
+    Note: Cache both positions for quick lookup
+    Let escape_cache_key be "escape_" + integer_to_string(escape_pos.byte_offset)
+    Let symbol_cache_key be "symbol_" + integer_to_string(symbol_pos.byte_offset)
+    
+    Set map.cached_lookups[escape_cache_key] to symbol_pos
+    Set map.cached_lookups[symbol_cache_key] to escape_pos
+    
+    Note: Track the transformation relationship
+    Let reverse_mapping_result be add_location_mapping(map, symbol_pos, escape_pos, "symbol_to_latex_escape")
+    
+    Return (mapping_result and reverse_mapping_result)
+
+Process called "calculate_symbol_display_width" that takes map as SourceMap, symbol as String returns Integer:
+    @Implementation
+    Calculates display width of mathematical symbols for proper column positioning.
+    @End Implementation
+    
+    Let symbol_length be StringPrimitive.length(symbol)
+    If symbol_length equals 0:
+        Return 0
+    End If
+    
+    Let total_width be 0
+    Let i be 0
+    
+    Note: Calculate width for each character in symbol
+    While i is less than symbol_length:
+        Let char_code be StringPrimitive.char_at(symbol, i)
+        Let char_width be handle_unicode_characters(map, symbol, i)
+        
+        Note: Special cases for mathematical symbols
+        If char_code is greater than or equal to 0x2190 and char_code is less than or equal to 0x21FF:  Note: Arrows
+            Set char_width to 2  Note: Arrows are typically wider
+        Otherwise char_code is greater than or equal to 0x2200 and char_code is less than or equal to 0x22FF:  Note: Mathematical operators
+            Set char_width to 2  Note: Math operators are typically wider
+        Otherwise char_code is greater than or equal to 0x2300 and char_code is less than or equal to 0x23FF:  Note: Miscellaneous technical
+            Set char_width to 2
+        Otherwise char_code is greater than or equal to 0x25A0 and char_code is less than or equal to 0x25FF:  Note: Geometric shapes
+            Set char_width to 2
+        Otherwise char_code is greater than or equal to 0x2600 and char_code is less than or equal to 0x26FF:  Note: Miscellaneous symbols
+            Set char_width to 2
+        Otherwise char_code is greater than or equal to 0x27C0 and char_code is less than or equal to 0x27EF:  Note: Supplemental arrows-A
+            Set char_width to 2
+        Otherwise char_code is greater than or equal to 0x2980 and char_code is less than or equal to 0x29FF:  Note: Supplemental arrows-B
+            Set char_width to 2
+        Otherwise char_code is greater than or equal to 0x2A00 and char_code is less than or equal to 0x2AFF:  Note: Supplemental mathematical operators
+            Set char_width to 2
+        End If
+        
+        Set total_width to total_width + char_width
+        Set i to i + 1
+    End While
+    
+    Return total_width
+
+Note: =====================================================================
+Note: PERFORMANCE OPTIMIZATION
+Note: =====================================================================
+
+Process called "cache_position_lookup" that takes map as SourceMap, lookup_key as String, position as SourcePosition returns Boolean:
+    @Implementation
+    Caches frequently accessed position lookups for performance optimization.
+    @End Implementation
+    
+    Note: Validate inputs
+    If StringPrimitive.length(lookup_key) equals 0:
+        Return false
+    End If
+    
+    Note: Store position in cache
+    Set map.cached_lookups[lookup_key] to position
+    
+    Note: Update cache statistics
+    If map.statistics contains "cache_entries":
+        Set map.statistics["cache_entries"] to map.statistics["cache_entries"] + 1
+    Otherwise:
+        Set map.statistics["cache_entries"] to 1
+    End If
+    
+    Note: Implement simple cache size limit
+    Let cache_size be Dictionary.size(map.cached_lookups)
+    If cache_size is greater than 1000:  Note: Arbitrary limit to prevent memory bloat
+        Note: Remove oldest entries (simple approach - clear half)
+        Let entries_to_remove be cache_size / 2
+        Let removed_count be 0
+        
+        For Each key in Dictionary.keys(map.cached_lookups):
+            If removed_count is greater than or equal to entries_to_remove:
+                Break
+            End If
+            Dictionary.remove(map.cached_lookups, key)
+            Set removed_count to removed_count + 1
+        End For
+        
+        Set map.statistics["cache_evictions"] to map.statistics["cache_evictions"] + entries_to_remove
+    End If
+    
+    Return true
+
+Process called "optimize_line_map_access" that takes map as SourceMap, file_path as String returns Boolean:
+    @Implementation
+    Optimizes line map data structure for faster binary search access patterns.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains file_path):
+        Return false
+    End If
+    
+    Let source_file be map.source_files[file_path]
+    Let line_breaks_count be List.length(source_file.line_breaks)
+    
+    If line_breaks_count is less than 2:
+        Return true  Note: Nothing to optimize for small files
+    End If
+    
+    Note: Verify line breaks are sorted (required for binary search)
+    Let is_sorted be true
+    For i from 1 to (line_breaks_count - 1):
+        Let current_offset be source_file.line_breaks[i]
+        Let previous_offset be source_file.line_breaks[i - 1]
+        
+        If current_offset is less than or equal to previous_offset:
+            Set is_sorted to false
+            Break
+        End If
+    End For
+    
+    Note: Sort line breaks if needed (should not happen in normal cases)
+    If not is_sorted:
+        Note: Simple bubble sort for line breaks
+        For i from 0 to (line_breaks_count - 2):
+            For j from 0 to (line_breaks_count - 2 - i):
+                Let current be source_file.line_breaks[j]
+                Let next be source_file.line_breaks[j + 1]
+                
+                If current is greater than next:
+                    Set source_file.line_breaks[j] to next
+                    Set source_file.line_breaks[j + 1] to current
+                End If
+            End For
+        End For
+    End If
+    
+    Note: Update optimization statistics
+    Set map.statistics["line_maps_optimized"] to map.statistics["line_maps_optimized"] + 1
+    
+    Return true
+
+Process called "precompute_common_ranges" that takes map as SourceMap, file_path as String returns Boolean:
+    @Implementation
+    Precomputes commonly accessed source ranges for performance optimization.
+    @End Implementation
+    
+    Note: Ensure file is loaded
+    If not (map.source_files contains file_path):
+        Return false
+    End If
+    
+    Let source_file be map.source_files[file_path]
+    Let total_lines be List.length(source_file.line_breaks)
+    Let content_length be StringPrimitive.length(source_file.content)
+    
+    If total_lines is less than 1 or content_length equals 0:
+        Return true
+    End If
+    
+    Note: Precompute ranges for first and last 10 lines
+    Let lines_to_precompute be 10
+    If lines_to_precompute is greater than total_lines:
+        Set lines_to_precompute to total_lines
+    End If
+    
+    Note: Precompute ranges for beginning of file
+    For line_num from 1 to lines_to_precompute:
+        Let start_pos be create_source_position(map, file_path, line_num, 1)
+        Let line_content be get_line_content(map, file_path, line_num)
+        Let line_length be StringPrimitive.length(line_content)
+        Let end_pos be create_source_position(map, file_path, line_num, line_length + 1)
+        
+        Let range be create_source_range(map, start_pos, end_pos)
+        
+        Note: Cache the precomputed range
+        Let cache_key be "precomputed_line_" + integer_to_string(line_num)
+        Let range_cache_key be "range_" + file_path + "_" + integer_to_string(line_num)
+        cache_position_lookup(map, range_cache_key, start_pos)
+    End For
+    
+    Note: Precompute ranges for end of file
+    Let start_line be total_lines - lines_to_precompute + 1
+    If start_line is less than or equal to lines_to_precompute:
+        Set start_line to lines_to_precompute + 1
+    End If
+    
+    For line_num from start_line to total_lines:
+        Let start_pos be create_source_position(map, file_path, line_num, 1)
+        Let line_content be get_line_content(map, file_path, line_num)
+        Let line_length be StringPrimitive.length(line_content)
+        Let end_pos be create_source_position(map, file_path, line_num, line_length + 1)
+        
+        Let range be create_source_range(map, start_pos, end_pos)
+        
+        Let cache_key be "precomputed_end_line_" + integer_to_string(line_num)
+        Let range_cache_key be "range_" + file_path + "_end_" + integer_to_string(line_num)
+        cache_position_lookup(map, range_cache_key, start_pos)
+    End For
+    
+    Note: Update precomputation statistics
+    Set map.statistics["ranges_precomputed"] to map.statistics["ranges_precomputed"] + (lines_to_precompute * 2)
+    
+    Return true
+
+Note: =====================================================================
+Note: VALIDATION OPERATIONS
+Note: =====================================================================
+
+Process called "validate_source_position" that takes map as SourceMap, position as SourcePosition returns List[String]:
+    @Implementation
+    Validates that source position is within valid bounds of the file.
+    Returns list of validation errors, empty if valid.
+    @End Implementation
+    
+    Let errors be List[String]
+    
+    Note: Check if file exists in map
+    If not (map.source_files contains position.file_path):
+        List.add(errors, "File not found in source map: " + position.file_path)
+        Return errors
+    End If
+    
+    Let source_file be map.source_files[position.file_path]
+    
+    Note: Validate line number
+    If position.line_number is less than 1:
+        List.add(errors, "Invalid line number: " + integer_to_string(position.line_number))
+    End If
+    
+    Note: Validate column number
+    If position.column_number is less than 1:
+        List.add(errors, "Invalid column number: " + integer_to_string(position.column_number))
+    End If
+    
+    Note: Validate byte offset
+    Let content_length be StringPrimitive.length(source_file.content)
+    If position.byte_offset is greater than content_length:
+        List.add(errors, "Byte offset exceeds file length")
+    End If
+    
+    Return errors
+
+Process called "validate_source_range" that takes map as SourceMap, range as SourceRange returns List[String]:
+    @Implementation
+    Validates that source range is well-formed and contains valid positions.
+    Returns list of validation errors, empty if valid.
+    @End Implementation
+    
+    Let errors be List[String]
+    
+    Note: Validate start position
+    Let start_errors be validate_source_position(map, range.start_position)
+    Let start_errors_count be List.length(start_errors)
+    For i from 0 to (start_errors_count - 1):
+        List.add(errors, "Start position: " + start_errors[i])
+    End For
+    
+    Note: Validate end position
+    Let end_errors be validate_source_position(map, range.end_position)
+    Let end_errors_count be List.length(end_errors)
+    For i from 0 to (end_errors_count - 1):
+        List.add(errors, "End position: " + end_errors[i])
+    End For
+    
+    Note: Validate that both positions are in same file
+    If not (range.start_position.file_path equals range.end_position.file_path):
+        List.add(errors, "Start and end positions must be in same file")
+        Return errors  Note: Don't continue validation if files don't match
+    End If
+    
+    Note: Validate that start comes before end
+    If range.start_position.byte_offset is greater than range.end_position.byte_offset:
+        List.add(errors, "Start position must come before end position")
+    End If
+    
+    Note: Validate range length consistency
+    Let calculated_length be range.end_position.byte_offset - range.start_position.byte_offset
+    If range.range_length not equals calculated_length:
+        List.add(errors, "Range length inconsistent with position offsets")
+    End If
+    
+    Note: Validate newline detection consistency
+    Let actual_contains_newlines be check_range_contains_newlines(map, range.start_position, range.end_position)
+    If range.contains_newlines not equals actual_contains_newlines:
+        List.add(errors, "Newline detection inconsistent with actual content")
+    End If
+    
+    Return errors
+
+Process called "check_mapping_consistency" that takes map as SourceMap returns List[String]:
+    @Implementation
+    Checks consistency of location mappings and returns list of inconsistency errors.
+    @End Implementation
+    
+    Let errors be List[String]
+    Let mappings_count be List.length(map.location_mappings)
+    
+    Note: Check each mapping for internal consistency
+    For i from 0 to (mappings_count - 1):
+        Let mapping be map.location_mappings[i]
+        
+        Note: Validate mapping ID is not empty
+        If StringPrimitive.length(mapping.mapping_id) equals 0:
+            List.add(errors, "Empty mapping ID at index " + integer_to_string(i))
+        End If
+        
+        Note: Validate original location
+        Let original_errors be validate_source_position(map, mapping.original_location)
+        Let original_errors_count be List.length(original_errors)
+        For j from 0 to (original_errors_count - 1):
+            List.add(errors, "Original location: " + original_errors[j])
+        End For
+        
+        Note: Validate transformed location
+        Let transformed_errors be validate_source_position(map, mapping.transformed_location)
+        Let transformed_errors_count be List.length(transformed_errors)
+        For j from 0 to (transformed_errors_count - 1):
+            List.add(errors, "Transformed location: " + transformed_errors[j])
+        End For
+        
+        Note: Check for duplicate mapping IDs
+        For k from (i + 1) to (mappings_count - 1):
+            Let other_mapping be map.location_mappings[k]
+            If mapping.mapping_id equals other_mapping.mapping_id:
+                List.add(errors, "Duplicate mapping ID: " + mapping.mapping_id)
+            End If
+        End For
+    End For
+    
+    Return errors
+
+Note: =====================================================================
+Note: UTILITY OPERATIONS
+Note: =====================================================================
+
+Process called "get_source_map_statistics" that takes map as SourceMap returns Dictionary[String, Integer]:
+    @Implementation
+    Collects comprehensive source map usage statistics for monitoring and optimization.
+    @End Implementation
+    
+    Let stats be Dictionary[String, Integer]
+    
+    Note: Copy existing statistics
+    Set stats["files_registered"] to map.statistics["files_registered"]
+    Set stats["position_lookups"] to map.statistics["position_lookups"]
+    Set stats["cache_hits"] to map.statistics["cache_hits"]
+    Set stats["cache_misses"] to map.statistics["cache_misses"]
+    
+    Note: Calculate derived statistics
+    Let total_mappings be List.length(map.location_mappings)
+    Set stats["location_mappings"] to total_mappings
+    
+    Let cache_size be Dictionary.size(map.cached_lookups)
+    Set stats["cached_lookups"] to cache_size
+    
+    Note: Calculate total lines across all files
+    Let total_lines be 0
+    Let total_content_size be 0
+    
+    For Each file_path in Dictionary.keys(map.source_files):
+        Let source_file be map.source_files[file_path]
+        Let file_lines be List.length(source_file.line_breaks)
+        Set total_lines to total_lines + file_lines
+        
+        Let content_size be StringPrimitive.length(source_file.content)
+        Set total_content_size to total_content_size + content_size
+    End For
+    
+    Set stats["total_lines"] to total_lines
+    Set stats["total_content_bytes"] to total_content_size
+    
+    Note: Calculate cache hit rate if lookups were performed
+    If map.statistics["position_lookups"] is greater than 0:
+        Let hit_rate be (map.statistics["cache_hits"] * 100) / map.statistics["position_lookups"]
+        Set stats["cache_hit_rate_percent"] to hit_rate
+    Otherwise:
+        Set stats["cache_hit_rate_percent"] to 0
+    End If
+    
+    Note: Add optional statistics if they exist
+    If map.statistics contains "cache_entries":
+        Set stats["cache_entries"] to map.statistics["cache_entries"]
+    End If
+    
+    If map.statistics contains "cache_evictions":
+        Set stats["cache_evictions"] to map.statistics["cache_evictions"]
+    End If
+    
+    If map.statistics contains "line_maps_optimized":
+        Set stats["line_maps_optimized"] to map.statistics["line_maps_optimized"]
+    End If
+    
+    If map.statistics contains "ranges_precomputed":
+        Set stats["ranges_precomputed"] to map.statistics["ranges_precomputed"]
+    End If
+    
+    Return stats
+
+Process called "export_source_map" that takes map as SourceMap, format as String returns String:
+    @Implementation
+    Exports source map in specified format for persistence or interchange.
+    @End Implementation
+    
+    Match format:
+        When "json":
+            Note: Export as JSON format
+            Let json_output be StringPrimitive.create_with_capacity(10000)
+            
+            StringPrimitive.append(json_output, "{")
+            StringPrimitive.append(json_output, "\"map_id\":\"")
+            StringPrimitive.append(json_output, map.map_id)
+            StringPrimitive.append(json_output, "\",")
+            
+            Note: Export statistics
+            StringPrimitive.append(json_output, "\"statistics\":{")
+            StringPrimitive.append(json_output, "\"files_registered\":")
+            StringPrimitive.append_integer(json_output, map.statistics["files_registered"])
+            StringPrimitive.append(json_output, ",\"position_lookups\":")
+            StringPrimitive.append_integer(json_output, map.statistics["position_lookups"])
+            StringPrimitive.append(json_output, ",\"cache_hits\":")
+            StringPrimitive.append_integer(json_output, map.statistics["cache_hits"])
+            StringPrimitive.append(json_output, ",\"cache_misses\":")
+            StringPrimitive.append_integer(json_output, map.statistics["cache_misses"])
+            StringPrimitive.append(json_output, "},")
+            
+            Note: Export file count
+            Let file_count be Dictionary.size(map.source_files)
+            StringPrimitive.append(json_output, "\"file_count\":")
+            StringPrimitive.append_integer(json_output, file_count)
+            StringPrimitive.append(json_output, ",")
+            
+            Note: Export mapping count
+            Let mapping_count be List.length(map.location_mappings)
+            StringPrimitive.append(json_output, "\"mapping_count\":")
+            StringPrimitive.append_integer(json_output, mapping_count)
+            StringPrimitive.append(json_output, ",")
+            
+            Note: Export cache count
+            Let cache_count be Dictionary.size(map.cached_lookups)
+            StringPrimitive.append(json_output, "\"cache_count\":")
+            StringPrimitive.append_integer(json_output, cache_count)
+            
+            StringPrimitive.append(json_output, "}")
+            Return json_output
+        
+        When "summary":
+            Note: Export as human-readable summary
+            Let summary be StringPrimitive.create_with_capacity(1000)
+            
+            StringPrimitive.append(summary, "Source Map: ")
+            StringPrimitive.append(summary, map.map_id)
+            StringPrimitive.append_char(summary, 10)  Note: Newline
+            
+            StringPrimitive.append(summary, "Files: ")
+            StringPrimitive.append_integer(summary, Dictionary.size(map.source_files))
+            StringPrimitive.append_char(summary, 10)
+            
+            StringPrimitive.append(summary, "Mappings: ")
+            StringPrimitive.append_integer(summary, List.length(map.location_mappings))
+            StringPrimitive.append_char(summary, 10)
+            
+            StringPrimitive.append(summary, "Cached Lookups: ")
+            StringPrimitive.append_integer(summary, Dictionary.size(map.cached_lookups))
+            StringPrimitive.append_char(summary, 10)
+            
+            StringPrimitive.append(summary, "Position Lookups: ")
+            StringPrimitive.append_integer(summary, map.statistics["position_lookups"])
+            StringPrimitive.append_char(summary, 10)
+            
+            Return summary
+        
+        Otherwise:
+            Return "Unsupported export format: " + format
+    End Match
+
+Process called "import_source_map" that takes map as SourceMap, data as String, format as String returns Boolean:
+    @Implementation
+    Imports source map from external format, merging with existing data.
+    @End Implementation
+    
+    Let data_length be StringPrimitive.length(data)
+    If data_length equals 0:
+        Return false
+    End If
+    
+    Match format:
+        When "json":
+            Note: Complete JSON parsing for source map data with proper token lexing
+            
+            Note: Initialize JSON parser state
+            Let parse_index be 0
+            Let data_length be StringPrimitive.length(data)
+            Let success be true
+            
+            Note: Skip whitespace to find opening brace
+            While parse_index is less than data_length and is_whitespace_char(StringPrimitive.char_at(data, parse_index)):
+                Set parse_index to (parse_index + 1)
+            End While
+            
+            Note: Verify JSON object starts with opening brace
+            If parse_index is greater than or equal to data_length or StringPrimitive.char_at(data, parse_index) not equals 123:
+                Return false  Note: Invalid JSON - missing opening brace
+            End If
+            
+            Set parse_index to (parse_index + 1)  Note: Skip opening brace
+            
+            Note: Parse JSON object key-value pairs
+            Let parsing_complete be false
+            While parse_index is less than data_length and not parsing_complete:
+                Note: Skip whitespace
+                While parse_index is less than data_length and is_whitespace_char(StringPrimitive.char_at(data, parse_index)):
+                    Set parse_index to (parse_index + 1)
+                End While
+                
+                Note: Check for closing brace
+                If parse_index is less than data_length and StringPrimitive.char_at(data, parse_index) equals 125:
+                    Set parsing_complete to true
+                    Break
+                End If
+                
+                Note: Parse key string
+                Let key_result be parse_json_string(data, parse_index)
+                If StringPrimitive.length(key_result.value) equals 0:
+                    Return false  Note: Invalid key
+                End If
+                Set parse_index to key_result.new_index
+                
+                Note: Skip whitespace and find colon
+                While parse_index is less than data_length and is_whitespace_char(StringPrimitive.char_at(data, parse_index)):
+                    Set parse_index to (parse_index + 1)
+                End While
+                If parse_index is greater than or equal to data_length or StringPrimitive.char_at(data, parse_index) not equals 58:
+                    Return false  Note: Missing colon
+                End If
+                Set parse_index to (parse_index + 1)  Note: Skip colon
+                
+                Note: Skip whitespace before value
+                While parse_index is less than data_length and is_whitespace_char(StringPrimitive.char_at(data, parse_index)):
+                    Set parse_index to (parse_index + 1)
+                End While
+                
+                Note: Parse value based on key
+                Match key_result.value:
+                    When "map_id":
+                        Let value_result be parse_json_string(data, parse_index)
+                        Set map.map_id to value_result.value
+                        Set parse_index to value_result.new_index
+                    When "files_registered":
+                        Let number_result be parse_json_number(data, parse_index)
+                        Set map.statistics["files_registered"] to number_result.value
+                        Set parse_index to number_result.new_index
+                    When "position_lookups":
+                        Let number_result be parse_json_number(data, parse_index)
+                        Set map.statistics["position_lookups"] to number_result.value
+                        Set parse_index to number_result.new_index
+                    Otherwise:
+                        Note: Skip unknown value
+                        Let skip_result be skip_json_value(data, parse_index)
+                        Set parse_index to skip_result.new_index
+                End Match
+                
+                Note: Skip whitespace after value
+                While parse_index is less than data_length and is_whitespace_char(StringPrimitive.char_at(data, parse_index)):
+                    Set parse_index to (parse_index + 1)
+                End While
+                
+                Note: Handle comma or end
+                If parse_index is less than data_length:
+                    Let current_char be StringPrimitive.char_at(data, parse_index)
+                    If current_char equals 44:
+                        Set parse_index to (parse_index + 1)  Note: Skip comma
+                    Otherwise current_char equals 125:
+                        Set parsing_complete to true
+                    Otherwise:
+                        Return false  Note: Invalid JSON syntax
+                    End If
+                End If
+            End While
+            
+            Return success
+        
+        When "summary":
+            Note: Parse summary format (key-value pairs)
+            Let lines be split_string_by_newlines(data)
+            Let lines_count be List.length(lines)
+            
+            For i from 0 to (lines_count - 1):
+                Let line be lines[i]
+                
+                If StringPrimitive.contains(line, "Source Map:"):
+                    Let map_id be extract_after_colon(line)
+                    Set map.map_id to map_id
+                Otherwise StringPrimitive.contains(line, "Position Lookups:"):
+                    Let lookups_str be extract_after_colon(line)
+                    Let lookups_value be parse_integer_from_string(lookups_str)
+                    Set map.statistics["position_lookups"] to lookups_value
+                End If
+            End For
+            
+            Return true
+        
+        Otherwise:
+            Return false  Note: Unsupported format
+    End Match
+
+Process called "clear_source_cache" that takes map as SourceMap returns Boolean:
+    @Implementation
+    Clears cached source content and lookups to free memory while preserving structure.
+    @End Implementation
+    
+    Note: Clear all cached position lookups
+    Set map.cached_lookups to Dictionary[String, SourcePosition]
+    
+    Note: Clear source file content but keep file registration
+    For Each file_path in Dictionary.keys(map.source_files):
+        Let source_file be map.source_files[file_path]
+        Set source_file.content to ""  Note: Clear content to free memory
+        Set source_file.line_breaks to List[Integer]  Note: Clear line breaks
+        Set source_file.content_hash to ""  Note: Clear hash
+    End For
+    
+    Note: Update cache statistics
+    Set map.statistics["cache_hits"] to 0
+    Set map.statistics["cache_misses"] to 0
+    
+    If map.statistics contains "cache_entries":
+        Set map.statistics["cache_entries"] to 0
+    End If
+    
+    Note: Keep other statistics intact (files_registered, position_lookups, etc.)
+    
+    Return true
+
+Process called "reset_source_map" that takes map as SourceMap returns Boolean:
+    @Implementation
+    Resets source map to initial state, clearing all cached data.
+    Preserves map ID but reinitializes all collections.
+    @End Implementation
+    
+    Note: Clear all collections
+    Set map.source_files to Dictionary[String, SourceFile]
+    Set map.location_mappings to List[LocationMapping]
+    Set map.cached_lookups to Dictionary[String, SourcePosition]
+    
+    Note: Reset statistics
+    Set map.statistics["files_registered"] to 0
+    Set map.statistics["position_lookups"] to 0
+    Set map.statistics["cache_hits"] to 0
+    Set map.statistics["cache_misses"] to 0
+    
+    Return true
+
+Note: =====================================================================
+Note: UTILITY HELPER FUNCTIONS
+Note: =====================================================================
+
+Process called "integer_to_string" that takes value as Integer returns String:
+    @Implementation
+    Converts integer to string representation for IDs and statistics.
+    @End Implementation
+    
+    If value equals 0:
+        Return "0"
+    End If
+    
+    Let result be ""
+    Let working_value be value
+    Let is_negative be false
+    
+    If working_value is less than 0:
+        Set is_negative to true
+        Set working_value to 0 - working_value
+    End If
+    
+    While working_value is greater than 0:
+        Let digit be working_value mod 10
+        Let digit_char be convert_digit_to_char(digit)
+        Set result to digit_char + result
+        Set working_value to working_value / 10
+    End While
+    
+    If is_negative:
+        Set result to "-" + result
+    End If
+    
+    Return result
+
+Process called "convert_digit_to_char" that takes digit as Integer returns String:
+    @Implementation
+    Converts single digit (0-9) to character representation.
+    @End Implementation
+    
+    Match digit:
+        When 0: Return "0"
+        When 1: Return "1"
+        When 2: Return "2"
+        When 3: Return "3"
+        When 4: Return "4"
+        When 5: Return "5"
+        When 6: Return "6"
+        When 7: Return "7"
+        When 8: Return "8"
+        When 9: Return "9"
+        Otherwise: Return "?"
+    End Match
+
+Process called "read_file_syscall" that takes file_path as String returns String:
+    @Implementation
+    Reads file content using direct syscalls. Opens file, reads content, closes file.
+    Returns empty string on error.
+    @End Implementation
+    
+    Note: Open file for reading
+    Let file_path_ptr be get_string_pointer(file_path)
+    Let open_result be Syscall.make_syscall_3(2, file_path_ptr, 0, 0)  Note: sys_open with O_RDONLY
+    
+    If Syscall.is_syscall_error(open_result):
+        Return ""
+    End If
+    
+    Let fd be open_result.value
+    
+    Note: Get file size using fstat
+    Let stat_buffer be allocate_stat_buffer()
+    Let fstat_result be Syscall.make_syscall_2(5, fd, stat_buffer)  Note: sys_fstat
+    
+    If Syscall.is_syscall_error(fstat_result):
+        Let close_result be Syscall.make_syscall_1(3, fd)  Note: sys_close
+        Return ""
+    End If
+    
+    Let file_size be get_file_size_from_stat(stat_buffer)
+    
+    Note: Allocate buffer for file content
+    Let content_buffer be allocate_buffer(file_size + 1)
+    
+    Note: Read file content
+    Let read_result be Syscall.make_syscall_3(0, fd, content_buffer, file_size)  Note: sys_read
+    
+    Note: Close file
+    Let close_result be Syscall.make_syscall_1(3, fd)  Note: sys_close
+    
+    If Syscall.is_syscall_error(read_result):
+        Return ""
+    End If
+    
+    Note: Convert buffer to string
+    Let content be buffer_to_string(content_buffer, read_result.value)
+    
+    Return content
+
+Process called "get_string_pointer" that takes str as String returns Integer:
+    @Implementation
+    Returns pointer to string data for syscall use.
+    @End Implementation
+    
+    Let buffer_size be StringPrimitive.length(str) + 1
+    Let buffer_ptr be allocate_buffer(buffer_size)
+    StringPrimitive.copy_to_memory(buffer_ptr, str)
+    Return buffer_ptr
+
+Process called "allocate_stat_buffer" returns Integer:
+    @Implementation
+    Allocates buffer for stat structure (144 bytes on Linux x86_64).
+    @End Implementation
+    
+    Let buffer_ptr be Integer
+    
+    Assembly "
+        mov rdi, 144         ; stat struct size
+        call malloc          ; allocate memory
+        mov %[ptr], rax      ; store pointer
+    " outputs [buffer_ptr]
+    
+    Return buffer_ptr
+
+Process called "get_file_size_from_stat" that takes stat_buffer as Integer returns Integer:
+    @Implementation
+    Extracts file size from stat structure (offset 48 on Linux x86_64).
+    @End Implementation
+    
+    Let file_size be Integer
+    
+    Assembly "
+        mov rax, %[buffer]   ; stat buffer pointer
+        mov rax, [rax + 48]  ; file size at offset 48
+        mov %[size], rax     ; store size
+    " with inputs [stat_buffer] outputs [file_size]
+    
+    Return file_size
+
+Process called "allocate_buffer" that takes size as Integer returns Integer:
+    @Implementation
+    Allocates memory buffer of specified size using malloc.
+    @End Implementation
+    
+    Let buffer_ptr be Integer
+    
+    Assembly "
+        mov rdi, %[size]     ; buffer size
+        call malloc          ; allocate memory
+        mov %[ptr], rax      ; store pointer
+    " with inputs [size] outputs [buffer_ptr]
+    
+    Return buffer_ptr
+
+Process called "buffer_to_string" that takes buffer as Integer, length as Integer returns String:
+    @Implementation
+    Converts memory buffer to Runa string with specified length.
+    @End Implementation
+    
+    Let result_str be StringPrimitive.create_with_capacity(length)
+    
+    For i from 0 to (length - 1):
+        Let char_value be get_byte_at_offset(buffer, i)
+        StringPrimitive.set_char_at(result_str, i, char_value)
+    End For
+    
+    StringPrimitive.set_length(result_str, length)
+    Return result_str
+
+Process called "get_byte_at_offset" that takes buffer as Integer, offset as Integer returns Integer:
+    @Implementation
+    Reads single byte from buffer at specified offset.
+    @End Implementation
+    
+    Let byte_value be Integer
+    
+    Assembly "
+        mov rax, %[buffer]   ; buffer pointer
+        add rax, %[offset]   ; add offset
+        movzx rax, byte ptr [rax]  ; load byte
+        mov %[value], rax    ; store value
+    " with inputs [buffer, offset] outputs [byte_value]
+    
+    Return byte_value
+
+Process called "calculate_content_hash" that takes content as String returns String:
+    @Implementation
+    Calculates simple hash of content for change detection.
+    Uses basic polynomial rolling hash algorithm.
+    @End Implementation
+    
+    Let hash_value be 0
+    Let prime be 31
+    Let content_length be StringPrimitive.length(content)
+    
+    For i from 0 to (content_length - 1):
+        Let char_code be StringPrimitive.char_at(content, i)
+        Set hash_value to (hash_value * prime + char_code) mod 1000000007
+    End For
+    
+    Return integer_to_string(hash_value)
+
+Process called "get_current_timestamp" returns Integer:
+    @Implementation
+    Gets current timestamp using time syscall.
+    @End Implementation
+    
+    Let time_result be Syscall.make_syscall_1(201, 0)  Note: sys_time
+    
+    If Syscall.is_syscall_error(time_result):
+        Return 0
+    End If
+    
+    Return time_result.value
+
+Process called "get_utf8_char_width" that takes char_code as Integer returns Integer:
+    @Implementation
+    Determines the width in bytes of a UTF-8 character from its first byte.
+    @End Implementation
+    
+    If char_code is less than 128:  Note: ASCII (0xxxxxxx)
+        Return 1
+    Otherwise char_code is less than 224:  Note: 2-byte (110xxxxx)
+        Return 2
+    Otherwise char_code is less than 240:  Note: 3-byte (1110xxxx)
+        Return 3
+    Otherwise char_code is less than 248:  Note: 4-byte (11110xxx)
+        Return 4
+    Otherwise:
+        Return 1  Note: Invalid UTF-8, treat as single byte
+    End If
+
+Process called "find_keyword_end" that takes text as String, start_pos as Integer returns Integer:
+    @Implementation
+    Finds the end position of a keyword starting at start_pos.
+    @End Implementation
+    
+    Let text_length be StringPrimitive.length(text)
+    Let i be start_pos
+    
+    While i is less than text_length:
+        Let char_code be StringPrimitive.char_at(text, i)
+        
+        Note: Stop at non-alphanumeric characters
+        If not ((char_code is greater than or equal to 97 and char_code is less than or equal to 122) or  Note: a-z
+                (char_code is greater than or equal to 65 and char_code is less than or equal to 90) or   Note: A-Z
+                (char_code is greater than or equal to 48 and char_code is less than or equal to 57) or   Note: 0-9
+                char_code equals 95):  Note: underscore
+            Return i
+        End If
+        
+        Set i to i + 1
+    End While
+    
+    Return text_length
+
+Process called "find_line_number_at_offset" that takes text as String, offset as Integer returns Integer:
+    @Implementation
+    Finds line number containing the given byte offset in text.
+    @End Implementation
+    
+    Let line_number be 1
+    Let i be 0
+    
+    While i is less than offset and i is less than StringPrimitive.length(text):
+        Let char_code be StringPrimitive.char_at(text, i)
+        
+        If char_code equals 10:  Note: LF
+            Set line_number to line_number + 1
+        Otherwise char_code equals 13:  Note: CR
+            Set line_number to line_number + 1
+            Note: Skip following LF if present
+            If (i + 1) is less than StringPrimitive.length(text):
+                Let next_char be StringPrimitive.char_at(text, i + 1)
+                If next_char equals 10:
+                    Set i to i + 1  Note: Skip the LF
+                End If
+            End If
+        End If
+        
+        Set i to i + 1
+    End While
+    
+    Return line_number
+
+Process called "find_column_number_at_offset" that takes text as String, offset as Integer returns Integer:
+    @Implementation
+    Finds column number at the given byte offset within its line.
+    @End Implementation
+    
+    Let column_number be 1
+    Let i be 0
+    
+    Note: Find start of line containing offset
+    Let line_start be 0
+    While i is less than offset and i is less than StringPrimitive.length(text):
+        Let char_code be StringPrimitive.char_at(text, i)
+        
+        If char_code equals 10 or char_code equals 13:  Note: Line ending
+            Set line_start to i + 1
+            If char_code equals 13 and (i + 1) is less than StringPrimitive.length(text):
+                Let next_char be StringPrimitive.char_at(text, i + 1)
+                If next_char equals 10:
+                    Set line_start to i + 2  Note: Skip CRLF
+                    Set i to i + 1
+                End If
+            End If
+        End If
+        
+        Set i to i + 1
+    End While
+    
+    Note: Calculate column from line start to offset
+    Set column_number to (offset - line_start) + 1
+    
+    Return column_number
+
+Process called "find_json_string_value" that takes json as String, field_name as String returns Integer:
+    @Implementation
+    Finds the start position of a JSON string value for the given field name.
+    @End Implementation
+    
+    Let search_pattern be "\"" + field_name + "\":\""
+    Let json_length be StringPrimitive.length(json)
+    Let pattern_length be StringPrimitive.length(search_pattern)
+    
+    For i from 0 to (json_length - pattern_length):
+        Let matches be true
+        For j from 0 to (pattern_length - 1):
+            Let json_char be StringPrimitive.char_at(json, i + j)
+            Let pattern_char be StringPrimitive.char_at(search_pattern, j)
+            If json_char not equals pattern_char:
+                Set matches to false
+                Break
+            End If
+        End For
+        
+        If matches:
+            Return i + pattern_length  Note: Return start of value
+        End If
+    End For
+    
+    Return -1  Note: Not found
+
+Process called "extract_json_string" that takes json as String, start_pos as Integer returns String:
+    @Implementation
+    Extracts a JSON string value starting at the given position.
+    @End Implementation
+    
+    Let json_length be StringPrimitive.length(json)
+    Let result be StringPrimitive.create_with_capacity(100)
+    Let i be start_pos
+    
+    Note: Find end of string (next quote not preceded by backslash)
+    While i is less than json_length:
+        Let char_code be StringPrimitive.char_at(json, i)
+        
+        If char_code equals 34:  Note: Quote character
+            Break  Note: End of string found
+        End If
+        
+        StringPrimitive.append_char(result, char_code)
+        Set i to i + 1
+    End While
+    
+    Return result
+
+Process called "find_json_number_value" that takes json as String, field_name as String returns Integer:
+    @Implementation
+    Finds and parses a JSON number value for the given field name.
+    @End Implementation
+    
+    Let search_pattern be "\"" + field_name + "\":"
+    Let json_length be StringPrimitive.length(json)
+    Let pattern_length be StringPrimitive.length(search_pattern)
+    
+    For i from 0 to (json_length - pattern_length):
+        Let matches be true
+        For j from 0 to (pattern_length - 1):
+            Let json_char be StringPrimitive.char_at(json, i + j)
+            Let pattern_char be StringPrimitive.char_at(search_pattern, j)
+            If json_char not equals pattern_char:
+                Set matches to false
+                Break
+            End If
+        End For
+        
+        If matches:
+            Note: Found field, now extract number
+            Let value_start be i + pattern_length
+            
+            Note: Skip whitespace
+            While value_start is less than json_length:
+                Let char_code be StringPrimitive.char_at(json, value_start)
+                If char_code not equals 32 and char_code not equals 9:  Note: Not space or tab
+                    Break
+                End If
+                Set value_start to value_start + 1
+            End While
+            
+            Note: Parse number
+            Let number_value be 0
+            While value_start is less than json_length:
+                Let digit_char be StringPrimitive.char_at(json, value_start)
+                If digit_char is greater than or equal to 48 and digit_char is less than or equal to 57:  Note: 0-9
+                    Set number_value to (number_value * 10) + (digit_char - 48)
+                    Set value_start to value_start + 1
+                Otherwise:
+                    Break  Note: End of number
+                End If
+            End While
+            
+            Return number_value
+        End If
+    End For
+    
+    Return -1  Note: Not found
+
+Process called "split_string_by_newlines" that takes text as String returns List[String]:
+    @Implementation
+    Splits string into lines using newline characters.
+    @End Implementation
+    
+    Let lines be List[String]
+    Let text_length be StringPrimitive.length(text)
+    Let current_line be StringPrimitive.create_with_capacity(100)
+    
+    For i from 0 to (text_length - 1):
+        Let char_code be StringPrimitive.char_at(text, i)
+        
+        If char_code equals 10:  Note: LF
+            List.add(lines, current_line)
+            Set current_line to StringPrimitive.create_with_capacity(100)
+        Otherwise char_code equals 13:  Note: CR
+            List.add(lines, current_line)
+            Set current_line to StringPrimitive.create_with_capacity(100)
+            
+            Note: Skip following LF if present
+            If (i + 1) is less than text_length:
+                Let next_char be StringPrimitive.char_at(text, i + 1)
+                If next_char equals 10:
+                    Set i to i + 1  Note: Skip the LF
+                End If
+            End If
+        Otherwise:
+            StringPrimitive.append_char(current_line, char_code)
+        End If
+    End For
+    
+    Note: Add final line if not empty
+    If StringPrimitive.length(current_line) is greater than 0:
+        List.add(lines, current_line)
+    End If
+    
+    Return lines
+
+Process called "extract_after_colon" that takes line as String returns String:
+    @Implementation
+    Extracts text after the first colon, trimming whitespace.
+    @End Implementation
+    
+    Let line_length be StringPrimitive.length(line)
+    Let colon_pos be -1
+    
+    Note: Find colon position
+    For i from 0 to (line_length - 1):
+        Let char_code be StringPrimitive.char_at(line, i)
+        If char_code equals 58:  Note: Colon
+            Set colon_pos to i
+            Break
+        End If
+    End For
+    
+    If colon_pos equals -1:
+        Return ""  Note: No colon found
+    End If
+    
+    Note: Extract text after colon, skipping whitespace
+    Let start_pos be colon_pos + 1
+    While start_pos is less than line_length:
+        Let char_code be StringPrimitive.char_at(line, start_pos)
+        If char_code not equals 32 and char_code not equals 9:  Note: Not space or tab
+            Break
+        End If
+        Set start_pos to start_pos + 1
+    End While
+    
+    Let result_length be line_length - start_pos
+    If result_length is less than or equal to 0:
+        Return ""
+    End If
+    
+    Return extract_substring(line, start_pos, result_length)
+
+Process called "parse_integer_from_string" that takes str as String returns Integer:
+    @Implementation
+    Parses integer from string, handling leading/trailing whitespace.
+    @End Implementation
+    
+    Let str_length be StringPrimitive.length(str)
+    If str_length equals 0:
+        Return 0
+    End If
+    
+    Let start_pos be 0
+    Let end_pos be str_length - 1
+    
+    Note: Skip leading whitespace
+    While start_pos is less than str_length:
+        Let char_code be StringPrimitive.char_at(str, start_pos)
+        If char_code not equals 32 and char_code not equals 9:  Note: Not space or tab
+            Break
+        End If
+        Set start_pos to start_pos + 1
+    End While
+    
+    Note: Skip trailing whitespace
+    While end_pos is greater than start_pos:
+        Let char_code be StringPrimitive.char_at(str, end_pos)
+        If char_code not equals 32 and char_code not equals 9:  Note: Not space or tab
+            Break
+        End If
+        Set end_pos to end_pos - 1
+    End While
+    
+    Note: Parse digits
+    Let result be 0
+    For i from start_pos to end_pos:
+        Let char_code be StringPrimitive.char_at(str, i)
+        If char_code is greater than or equal to 48 and char_code is less than or equal to 57:  Note: 0-9
+            Set result to (result * 10) + (char_code - 48)
+        Otherwise:
+            Return result  Note: Stop at first non-digit
+        End If
+    End For
+    
+    Return result
+
+Note: =====================================================================
+Note: JSON PARSING HELPER FUNCTIONS
+Note: =====================================================================
+
+Process called "is_whitespace_char" that takes char_code as Integer returns Boolean:
+    @Implementation
+    Checks if character code represents whitespace (space, tab, newline, carriage return).
+    @End Implementation
+    
+    Return (char_code equals 32 or char_code equals 9 or char_code equals 10 or char_code equals 13)
+End Process
+
+Type called "JsonStringResult":
+    value as String
+    new_index as Integer
+End Type
+
+Process called "parse_json_string" that takes data as String, start_index as Integer returns JsonStringResult:
+    @Implementation
+    Parses JSON string value starting at specified index, handling escape sequences properly.
+    @End Implementation
+    
+    Let data_length be StringPrimitive.length(data)
+    Let current_index be start_index
+    
+    Note: Verify starting quote
+    If current_index is greater than or equal to data_length or StringPrimitive.char_at(data, current_index) not equals 34:
+        Return JsonStringResult with
+            value as "",
+            new_index as start_index
+        End JsonStringResult
+    End If
+    
+    Set current_index to (current_index + 1)  Note: Skip opening quote
+    Let result_string be ""
+    
+    While current_index is less than data_length:
+        Let char_code be StringPrimitive.char_at(data, current_index)
+        
+        If char_code equals 34:  Note: Closing quote
+            Set current_index to (current_index + 1)  Note: Skip closing quote
+            Return JsonStringResult with
+                value as result_string,
+                new_index as current_index
+            End JsonStringResult
+        Otherwise char_code equals 92:  Note: Escape sequence
+            Set current_index to (current_index + 1)
+            If current_index is greater than or equal to data_length:
+                Return JsonStringResult with
+                    value as "",
+                    new_index as start_index
+                End JsonStringResult
+            End If
+            
+            Let escaped_char be StringPrimitive.char_at(data, current_index)
+            Match escaped_char:
+                When 34:  Note: \"
+                    StringPrimitive.append_char(result_string, 34)
+                When 92:  Note: \\
+                    StringPrimitive.append_char(result_string, 92)
+                When 47:  Note: \/
+                    StringPrimitive.append_char(result_string, 47)
+                When 98:  Note: \b
+                    StringPrimitive.append_char(result_string, 8)
+                When 102:  Note: \f
+                    StringPrimitive.append_char(result_string, 12)
+                When 110:  Note: \n
+                    StringPrimitive.append_char(result_string, 10)
+                When 114:  Note: \r
+                    StringPrimitive.append_char(result_string, 13)
+                When 116:  Note: \t
+                    StringPrimitive.append_char(result_string, 9)
+                Otherwise:
+                    StringPrimitive.append_char(result_string, escaped_char)
+            End Match
+            Set current_index to (current_index + 1)
+        Otherwise:
+            StringPrimitive.append_char(result_string, char_code)
+            Set current_index to (current_index + 1)
+        End If
+    End While
+    
+    Note: Unclosed string
+    Return JsonStringResult with
+        value as "",
+        new_index as start_index
+    End JsonStringResult
+End Process
+
+Type called "JsonNumberResult":
+    value as Integer
+    new_index as Integer
+End Type
+
+Process called "parse_json_number" that takes data as String, start_index as Integer returns JsonNumberResult:
+    @Implementation
+    Parses JSON number value starting at specified index, handling negative numbers.
+    @End Implementation
+    
+    Let data_length be StringPrimitive.length(data)
+    Let current_index be start_index
+    Let result_value be 0
+    Let is_negative be false
+    
+    Note: Handle negative sign
+    If current_index is less than data_length and StringPrimitive.char_at(data, current_index) equals 45:
+        Set is_negative to true
+        Set current_index to (current_index + 1)
+    End If
+    
+    Note: Parse digits
+    Let digits_found be false
+    While current_index is less than data_length:
+        Let char_code be StringPrimitive.char_at(data, current_index)
+        If char_code is greater than or equal to 48 and char_code is less than or equal to 57:
+            Set result_value to (result_value * 10) + (char_code - 48)
+            Set current_index to (current_index + 1)
+            Set digits_found to true
+        Otherwise:
+            Break
+        End If
+    End While
+    
+    If not digits_found:
+        Return JsonNumberResult with
+            value as 0,
+            new_index as start_index
+        End JsonNumberResult
+    End If
+    
+    If is_negative:
+        Set result_value to (0 - result_value)
+    End If
+    
+    Return JsonNumberResult with
+        value as result_value,
+        new_index as current_index
+    End JsonNumberResult
+End Process
+
+Type called "JsonSkipResult":
+    new_index as Integer
+End Type
+
+Process called "skip_json_value" that takes data as String, start_index as Integer returns JsonSkipResult:
+    @Implementation
+    Skips over a JSON value (string, number, boolean, null, array, or object) starting at specified index.
+    @End Implementation
+    
+    Let data_length be StringPrimitive.length(data)
+    Let current_index be start_index
+    
+    Note: Skip whitespace
+    While current_index is less than data_length and is_whitespace_char(StringPrimitive.char_at(data, current_index)):
+        Set current_index to (current_index + 1)
+    End While
+    
+    If current_index is greater than or equal to data_length:
+        Return JsonSkipResult with new_index as current_index End JsonSkipResult
+    End If
+    
+    Let first_char be StringPrimitive.char_at(data, current_index)
+    
+    Match first_char:
+        When 34:  Note: String
+            Let string_result be parse_json_string(data, current_index)
+            Return JsonSkipResult with new_index as string_result.new_index End JsonSkipResult
+        When 123:  Note: Object
+            Return skip_json_object(data, current_index)
+        When 91:  Note: Array
+            Return skip_json_array(data, current_index)
+        Otherwise:
+            Note: Number, boolean, or null
+            While current_index is less than data_length:
+                Let char_code be StringPrimitive.char_at(data, current_index)
+                If char_code equals 44 or char_code equals 125 or char_code equals 93 or is_whitespace_char(char_code):
+                    Break
+                End If
+                Set current_index to (current_index + 1)
+            End While
+            Return JsonSkipResult with new_index as current_index End JsonSkipResult
+    End Match
+End Process
+
+Process called "skip_json_object" that takes data as String, start_index as Integer returns JsonSkipResult:
+    @Implementation
+    Skips over a complete JSON object including nested objects and arrays.
+    @End Implementation
+    
+    Let data_length be StringPrimitive.length(data)
+    Let current_index be start_index
+    Let brace_count be 0
+    
+    While current_index is less than data_length:
+        Let char_code be StringPrimitive.char_at(data, current_index)
+        
+        If char_code equals 123:  Note: Opening brace
+            Set brace_count to (brace_count + 1)
+        Otherwise char_code equals 125:  Note: Closing brace
+            Set brace_count to (brace_count - 1)
+            If brace_count equals 0:
+                Set current_index to (current_index + 1)
+                Return JsonSkipResult with new_index as current_index End JsonSkipResult
+            End If
+        Otherwise char_code equals 34:  Note: String - need to skip properly
+            Let string_result be parse_json_string(data, current_index)
+            Set current_index to string_result.new_index
+            Continue
+        End If
+        
+        Set current_index to (current_index + 1)
+    End While
+    
+    Return JsonSkipResult with new_index as current_index End JsonSkipResult
+End Process
+
+Process called "skip_json_array" that takes data as String, start_index as Integer returns JsonSkipResult:
+    @Implementation
+    Skips over a complete JSON array including nested objects and arrays.
+    @End Implementation
+    
+    Let data_length be StringPrimitive.length(data)
+    Let current_index be start_index
+    Let bracket_count be 0
+    
+    While current_index is less than data_length:
+        Let char_code be StringPrimitive.char_at(data, current_index)
+        
+        If char_code equals 91:  Note: Opening bracket
+            Set bracket_count to (bracket_count + 1)
+        Otherwise char_code equals 93:  Note: Closing bracket
+            Set bracket_count to (bracket_count - 1)
+            If bracket_count equals 0:
+                Set current_index to (current_index + 1)
+                Return JsonSkipResult with new_index as current_index End JsonSkipResult
+            End If
+        Otherwise char_code equals 34:  Note: String - need to skip properly
+            Let string_result be parse_json_string(data, current_index)
+            Set current_index to string_result.new_index
+            Continue
+        End If
+        
+        Set current_index to (current_index + 1)
+    End While
+    
+    Return JsonSkipResult with new_index as current_index End JsonSkipResult
+End Process

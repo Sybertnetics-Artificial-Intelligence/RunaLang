@@ -1,0 +1,633 @@
+Note: AAPCS64 (ARM Procedure Call Standard) implementation
+
+Import "./registers.runa" as Registers
+
+@Reasoning
+The AAPCS64 defines the calling convention for AArch64 systems. It specifies
+how functions pass parameters (X0-X7, V0-V7), preserve registers (X19-X29),
+manage the stack, and handle return values. This module implements the complete
+convention for ARM64 code generation.
+@End Reasoning
+
+Type called "AAPCS64Frame":
+    Note: ARM64 function call frame information
+    
+    @Implementation
+    Tracks parameter passing, register preservation, and stack layout
+    according to AAPCS64 requirements. Stack must be 16-byte aligned.
+    @End Implementation
+    
+    param_count as Integer
+    int_param_regs as Integer    Note: Count in X0-X7 (max 8)
+    fp_param_regs as Integer      Note: Count in V0-V7 (max 8)
+    stack_params as Integer       Note: Parameters on stack
+    local_size as Integer         Note: Local variable space
+    callee_saved_mask as Integer  Note: X19-X29 preservation mask
+    fp_saved_mask as Integer      Note: V8-V15 preservation mask
+    frame_size as Integer         Note: Total frame size (16-byte aligned)
+    uses_frame_pointer as Boolean Note: X29 as frame pointer
+End Type
+
+Type called "AAPCS64ParamInfo":
+    Note: Parameter passing information
+    
+    @Implementation
+    AAPCS64 classifies parameters for register or stack passing.
+    Aggregates larger than 16 bytes go via stack or X8 pointer.
+    @End Implementation
+    
+    param_class as Integer  Note: 0=integer, 1=float, 2=composite
+    size as Integer
+    alignment as Integer
+    reg_count as Integer    Note: Registers needed
+    stack_offset as Integer Note: If passed on stack
+End Type
+
+Process called "classify_aapcs64_param" that takes type_size as Integer, is_float as Boolean, is_composite as Boolean returns AAPCS64ParamInfo:
+    Note: Classify parameter per AAPCS64 rules
+    
+    @Implementation
+    Parameters up to 16 bytes can use registers. Larger composites
+    are passed by reference or use indirect result location (X8).
+    @End Implementation
+    
+    Let info be AAPCS64ParamInfo
+    
+    If is_composite:
+        Set info.param_class to 2
+        Set info.size to type_size
+        
+        If type_size is less than or equal to 16:
+            Note: Small composite, use 1-2 registers
+            Set info.reg_count to (type_size plus 7) divided by 8
+            Set info.alignment to 8
+        Otherwise:
+            Note: Large composite, pass by reference
+            Set info.reg_count to 1  Note: Pointer in register
+            Set info.alignment to 8
+        End If
+    Otherwise:
+        If is_float:
+            Set info.param_class to 1
+            Set info.size to type_size
+            Set info.alignment to type_size
+            Set info.reg_count to 1
+        Otherwise:
+            Set info.param_class to 0
+            Set info.size to type_size
+            Set info.alignment to 8
+            Set info.reg_count to 1
+        End If
+    End If
+    
+    Return info
+End Process
+
+Process called "setup_aapcs64_frame" that takes param_types as Pointer, param_count as Integer, local_size as Integer returns AAPCS64Frame:
+    Note: Setup ARM64 call frame
+    
+    @Implementation
+    Analyzes function signature to determine register usage and stack layout.
+    Ensures 16-byte stack alignment as required by AAPCS64.
+    @End Implementation
+    
+    Let frame be AAPCS64Frame
+    Set frame.param_count to param_count
+    Set frame.int_param_regs to 0
+    Set frame.fp_param_regs to 0
+    Set frame.stack_params to 0
+    Set frame.local_size to local_size
+    
+    Note: Process parameters
+    Let i be 0
+    Let stack_offset be 0
+    
+    While i is less than param_count:
+        Let param_size be get_param_size_aapcs64(param_types, i)
+        Let is_float be is_float_type_aapcs64(param_types, i)
+        Let is_composite be is_composite_type_aapcs64(param_types, i)
+        
+        Let info be classify_aapcs64_param(param_size, is_float, is_composite)
+        
+        If info.param_class equals 0:  Note: Integer
+            If frame.int_param_regs plus info.reg_count is less than or equal to 8:
+                Set frame.int_param_regs to frame.int_param_regs plus info.reg_count
+            Otherwise:
+                Set frame.stack_params to frame.stack_params plus 1
+                Set stack_offset to stack_offset plus align_to(param_size, 8)
+            End If
+        Otherwise:
+            If info.param_class equals 1:  Note: Float
+                If frame.fp_param_regs is less than 8:
+                    Set frame.fp_param_regs to frame.fp_param_regs plus 1
+                Otherwise:
+                    Set frame.stack_params to frame.stack_params plus 1
+                    Set stack_offset to stack_offset plus param_size
+                End If
+            Otherwise:  Note: Composite
+                If param_size is greater than 16:
+                    Note: Use X8 for indirect result
+                    Set frame.int_param_regs to frame.int_param_regs plus 1
+                Otherwise:
+                    If frame.int_param_regs plus info.reg_count is less than or equal to 8:
+                        Set frame.int_param_regs to frame.int_param_regs plus info.reg_count
+                    Otherwise:
+                        Set frame.stack_params to frame.stack_params plus 1
+                        Set stack_offset to stack_offset plus align_to(param_size, 16)
+                    End If
+                End If
+            End If
+        End If
+        
+        Set i to i plus 1
+    End While
+    
+    Note: Calculate aligned frame size
+    Let total_size be stack_offset plus frame.local_size
+    Set frame.frame_size to align_to(total_size, 16)
+    
+    Note: Determine if frame pointer needed
+    If frame.frame_size is greater than 256 or frame.stack_params is greater than 0:
+        Set frame.uses_frame_pointer to true
+    Otherwise:
+        Set frame.uses_frame_pointer to false
+    End If
+    
+    Return frame
+End Process
+
+Process called "generate_aapcs64_prologue" that takes frame as AAPCS64Frame, buffer as Pointer returns Integer:
+    Note: Generate ARM64 function prologue
+    
+    @Implementation
+    Creates standard prologue: save LR/FP, setup frame, save callee-saved.
+    Uses STP for efficient register pair saving.
+    @End Implementation
+    
+    Let offset be 0
+    
+    Note: Save LR and FP if needed
+    If frame.uses_frame_pointer:
+        Note: STP X29, X30, [SP, #-16]!
+        Inline Assembly:
+            "mov dword ptr [%0], %1"       Note: STP X29, X30, [SP, #-16]! encoding
+            "add %2, %2, %3"              Note: Increment offset
+            : "=r"(offset)
+            : "m"(buffer), "i"(0xA9BF7BFD), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+        
+        Note: MOV X29, SP
+        Inline Assembly:
+            "mov dword ptr [%0 + %1], %2"  Note: MOV X29, SP encoding
+            "add %3, %3, %4"              Note: Increment offset
+            : "=r"(offset)
+            : "r"(buffer), "r"(offset), "i"(0x910003FD), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+    Otherwise:
+        If frame.callee_saved_mask is not equal to 0:
+            Note: Just save LR: STR X30, [SP, #-16]!
+            Inline Assembly:
+                "mov dword ptr [%0], %1"       Note: STR X30, [SP, #-16]! encoding
+                "add %2, %2, %3"              Note: Increment offset
+                : "=r"(offset)
+                : "r"(buffer), "i"(0xF81F0FFE), "r"(offset), "i"(4)
+                : "memory"
+            End Assembly
+        End If
+    End If
+    
+    Note: Allocate stack space
+    If frame.frame_size is greater than 0:
+        If frame.frame_size is less than or equal to 4095:
+            Note: SUB SP, SP, #frame_size
+            Let encoding be 0xD10003FF plus (frame.frame_size left_shift 10)
+            Inline Assembly:
+                "mov dword ptr [%0 + %1], %2"  Note: SUB SP, SP, #frame_size
+                "add %3, %3, %4"              Note: Increment offset
+                : "=r"(offset)
+                : "r"(buffer), "r"(offset), "r"(encoding), "r"(offset), "i"(4)
+                : "memory"
+            End Assembly
+        Otherwise:
+            Note: Large frame, use multiple instructions
+            Let remaining be frame.frame_size
+            While remaining is greater than 0:
+                Let chunk be remaining
+                If chunk is greater than 4095:
+                    Set chunk to 4095
+                End If
+                
+                Let encoding be 0xD10003FF plus (chunk left_shift 10)
+                Inline Assembly:
+                    "mov dword ptr [%0 + %1], %2"  Note: SUB SP, SP, #chunk
+                    "add %3, %3, %4"              Note: Increment offset
+                    : "=r"(offset)
+                    : "r"(buffer), "r"(offset), "r"(encoding), "r"(offset), "i"(4)
+                    : "memory"
+                End Assembly
+                
+                Set remaining to remaining minus chunk
+            End While
+        End If
+    End If
+    
+    Note: Save callee-saved registers (X19-X28)
+    Let saved_mask be frame.callee_saved_mask
+    Let reg_base be 19
+    
+    While saved_mask is not equal to 0:
+        If (saved_mask bitwise_and 3) equals 3:  Note: Save pair
+            Note: STP Xn, Xn+1, [SP, #offset]
+            Let stp_encoding be 0xA9000000
+            Set stp_encoding to stp_encoding plus reg_base
+            Set stp_encoding to stp_encoding plus ((reg_base plus 1) left_shift 10)
+            Set stp_encoding to stp_encoding plus (31 left_shift 5)  Note: SP
+            
+            Inline Assembly:
+                "mov dword ptr [%0 + %1], %2"  Note: STP Xn, Xn+1, [SP, #offset]
+                "add %3, %3, %4"              Note: Increment offset
+                : "=r"(offset)
+                : "r"(buffer), "r"(offset), "r"(stp_encoding), "r"(offset), "i"(4)
+                : "memory"
+            End Assembly
+            
+            Set saved_mask to saved_mask right_shift 2
+            Set reg_base to reg_base plus 2
+        Otherwise:
+            If (saved_mask bitwise_and 1) equals 1:  Note: Save single
+                Note: STR Xn, [SP, #offset]
+                Let str_encoding be 0xF9000000
+                Set str_encoding to str_encoding plus reg_base
+                Set str_encoding to str_encoding plus (31 left_shift 5)
+                
+                Inline Assembly:
+                    "mov dword ptr [%0 + %1], %2"  Note: STR Xn, [SP, #offset]
+                    "add %3, %3, %4"              Note: Increment offset
+                    : "=r"(offset)
+                    : "r"(buffer), "r"(offset), "r"(str_encoding), "r"(offset), "i"(4)
+                    : "memory"
+                End Assembly
+            End If
+            
+            Set saved_mask to saved_mask right_shift 1
+            Set reg_base to reg_base plus 1
+        End If
+    End While
+    
+    Return offset
+End Process
+
+Process called "generate_aapcs64_epilogue" that takes frame as AAPCS64Frame, buffer as Pointer returns Integer:
+    Note: Generate ARM64 function epilogue
+    
+    @Implementation
+    Restores callee-saved registers, deallocates frame, restores LR/FP.
+    Uses LDP for efficient register pair restoration.
+    @End Implementation
+    
+    Let offset be 0
+    
+    Note: Restore callee-saved registers in reverse order
+    Let saved_mask be frame.callee_saved_mask
+    Let restore_offset be frame.frame_size minus 16
+    
+    Note: Calculate which registers to restore
+    Let reg_count be 0
+    Let temp_mask be saved_mask
+    While temp_mask is not equal to 0:
+        If (temp_mask bitwise_and 1) equals 1:
+            Set reg_count to reg_count plus 1
+        End If
+        Set temp_mask to temp_mask right_shift 1
+    End While
+    
+    Note: Restore pairs from highest to lowest
+    Let reg_base be 19 plus reg_count minus 1
+    While reg_base is greater than or equal to 19:
+        If reg_base is greater than 19:  Note: Can restore pair
+            Note: LDP Xn-1, Xn, [SP, #offset]
+            Let ldp_encoding be 0xA9400000
+            Set ldp_encoding to ldp_encoding plus (reg_base minus 1)
+            Set ldp_encoding to ldp_encoding plus (reg_base left_shift 10)
+            Set ldp_encoding to ldp_encoding plus (31 left_shift 5)
+            
+            Inline Assembly:
+                "mov dword ptr [%0 + %1], %2"  Note: LDP Xn-1, Xn, [SP, #offset]
+                "add %3, %3, %4"              Note: Increment offset
+                : "=r"(offset)
+                : "r"(buffer), "r"(offset), "r"(ldp_encoding), "r"(offset), "i"(4)
+                : "memory"
+            End Assembly
+            
+            Set reg_base to reg_base minus 2
+        Otherwise:
+            Note: LDR Xn, [SP, #offset]
+            Let ldr_encoding be 0xF9400000
+            Set ldr_encoding to ldr_encoding plus reg_base
+            Set ldr_encoding to ldr_encoding plus (31 left_shift 5)
+            
+            Inline Assembly:
+                "mov dword ptr [%0 + %1], %2"  Note: LDR Xn, [SP, #offset]
+                "add %3, %3, %4"              Note: Increment offset
+                : "=r"(offset)
+                : "r"(buffer), "r"(offset), "r"(ldr_encoding), "r"(offset), "i"(4)
+                : "memory"
+            End Assembly
+            
+            Set reg_base to reg_base minus 1
+        End If
+    End While
+    
+    Note: Deallocate stack frame
+    If frame.frame_size is greater than 0:
+        If frame.frame_size is less than or equal to 4095:
+            Note: ADD SP, SP, #frame_size
+            Let encoding be 0x910003FF plus (frame.frame_size left_shift 10)
+            Inline Assembly:
+                "mov dword ptr [%0 + %1], %2"  Note: ADD SP, SP, #frame_size
+                "add %3, %3, %4"              Note: Increment offset
+                : "=r"(offset)
+                : "r"(buffer), "r"(offset), "r"(encoding), "r"(offset), "i"(4)
+                : "memory"
+            End Assembly
+        Otherwise:
+            Note: Large frame deallocation
+            Let remaining be frame.frame_size
+            While remaining is greater than 0:
+                Let chunk be remaining
+                If chunk is greater than 4095:
+                    Set chunk to 4095
+                End If
+                
+                Let encoding be 0x910003FF plus (chunk left_shift 10)
+                Inline Assembly:
+                    "mov dword ptr [%0 + %1], %2"  Note: ADD SP, SP, #chunk
+                    "add %3, %3, %4"              Note: Increment offset
+                    : "=r"(offset)
+                    : "r"(buffer), "r"(offset), "r"(encoding), "r"(offset), "i"(4)
+                    : "memory"
+                End Assembly
+                
+                Set remaining to remaining minus chunk
+            End While
+        End If
+    End If
+    
+    Note: Restore LR and FP if saved
+    If frame.uses_frame_pointer:
+        Note: LDP X29, X30, [SP], #16
+        Inline Assembly:
+            "mov dword ptr [%0 + %1], %2"  Note: LDP X29, X30, [SP], #16 encoding
+            "add %3, %3, %4"              Note: Increment offset
+            : "=r"(offset)
+            : "r"(buffer), "r"(offset), "i"(0xA8C17BFD), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+    Otherwise:
+        If frame.callee_saved_mask is not equal to 0:
+            Note: LDR X30, [SP], #16
+            Inline Assembly:
+                "mov dword ptr [%0 + %1], %2"  Note: LDR X30, [SP], #16 encoding
+                "add %3, %3, %4"              Note: Increment offset
+                : "=r"(offset)
+                : "r"(buffer), "r"(offset), "i"(0xF84107FE), "r"(offset), "i"(4)
+                : "memory"
+            End Assembly
+        End If
+    End If
+    
+    Note: RET
+    Inline Assembly:
+        "mov dword ptr [%0 + %1], %2"  Note: RET instruction encoding
+        "add %3, %3, %4"              Note: Increment offset
+        : "=r"(offset)
+        : "r"(buffer), "r"(offset), "i"(0xD65F03C0), "r"(offset), "i"(4)
+        : "memory"
+    End Assembly
+    
+    Return offset
+End Process
+
+Process called "setup_aapcs64_arguments" that takes frame as AAPCS64Frame, buffer as Pointer returns Integer:
+    Note: Move arguments to expected locations
+    
+    @Implementation
+    Saves function arguments from parameter registers to stack frame
+    for later access within the function body.
+    @End Implementation
+    
+    Let offset be 0
+    
+    Note: Save integer arguments (X0-X7)
+    Let i be 0
+    While i is less than frame.int_param_regs and i is less than 8:
+        Note: STR Xi, [SP, #offset]
+        Let str_encoding be 0xF9000000
+        Set str_encoding to str_encoding plus i  Note: Xi
+        Set str_encoding to str_encoding plus (31 left_shift 5)  Note: SP
+        Set str_encoding to str_encoding plus ((i times 8) left_shift 10)  Note: Offset
+        
+        Inline Assembly:
+            "mov dword ptr [%0 + %1], %2"  Note: STR Xi, [SP, #offset]
+            "add %3, %3, %4"              Note: Increment offset
+            : "=r"(offset)
+            : "r"(buffer), "r"(offset), "r"(str_encoding), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+        
+        Set i to i plus 1
+    End While
+    
+    Note: Save FP arguments (V0-V7)
+    Let j be 0
+    While j is less than frame.fp_param_regs and j is less than 8:
+        Note: STR Di, [SP, #offset]
+        Let str_encoding be 0xFD000000
+        Set str_encoding to str_encoding plus j  Note: Vi
+        Set str_encoding to str_encoding plus (31 left_shift 5)  Note: SP
+        Set str_encoding to str_encoding plus (((64 plus j times 8)) left_shift 10)
+        
+        Inline Assembly:
+            "mov dword ptr [%0 + %1], %2"  Note: STR Di, [SP, #offset]
+            "add %3, %3, %4"              Note: Increment offset
+            : "=r"(offset)
+            : "r"(buffer), "r"(offset), "r"(str_encoding), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+        
+        Set j to j plus 1
+    End While
+    
+    Return offset
+End Process
+
+Process called "prepare_aapcs64_call" that takes frame as AAPCS64Frame, buffer as Pointer returns Integer:
+    Note: Setup arguments for function call
+    
+    @Implementation
+    Loads arguments into X0-X7 and V0-V7 as needed.
+    Stack arguments are pushed in correct order.
+    @End Implementation
+    
+    Let offset be 0
+    
+    Note: Load integer arguments
+    Let i be 0
+    While i is less than frame.int_param_regs and i is less than 8:
+        Note: LDR Xi, [SP, #saved_offset]
+        Let ldr_encoding be 0xF9400000
+        Set ldr_encoding to ldr_encoding plus i
+        Set ldr_encoding to ldr_encoding plus (31 left_shift 5)
+        Set ldr_encoding to ldr_encoding plus ((i times 8) left_shift 10)
+        
+        Inline Assembly:
+            "mov dword ptr [%0 + %1], %2"  Note: LDR Xi, [SP, #saved_offset]
+            "add %3, %3, %4"              Note: Increment offset
+            : "=r"(offset)
+            : "r"(buffer), "r"(offset), "r"(ldr_encoding), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+        
+        Set i to i plus 1
+    End While
+    
+    Note: Load FP arguments
+    Let j be 0
+    While j is less than frame.fp_param_regs and j is less than 8:
+        Note: LDR Di, [SP, #saved_offset]
+        Let ldr_encoding be 0xFD400000
+        Set ldr_encoding to ldr_encoding plus j
+        Set ldr_encoding to ldr_encoding plus (31 left_shift 5)
+        Set ldr_encoding to ldr_encoding plus (((64 plus j times 8)) left_shift 10)
+        
+        Inline Assembly:
+            "mov dword ptr [%0 + %1], %2"  Note: LDR Di, [SP, #saved_offset]
+            "add %3, %3, %4"              Note: Increment offset
+            : "=r"(offset)
+            : "r"(buffer), "r"(offset), "r"(ldr_encoding), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+        
+        Set j to j plus 1
+    End While
+    
+    Note: Push stack arguments if any
+    If frame.stack_params is greater than 0:
+        Note: Adjust SP for arguments
+        Let stack_space be frame.stack_params times 8
+        Let sub_encoding be 0xD10003FF plus (stack_space left_shift 10)
+        
+        Inline Assembly:
+            "mov dword ptr [%0 + %1], %2"  Note: SUB SP, SP, #stack_space
+            "add %3, %3, %4"              Note: Increment offset
+            : "=r"(offset)
+            : "r"(buffer), "r"(offset), "r"(sub_encoding), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+        
+        Note: Copy arguments to stack
+        Let k be 0
+        While k is less than frame.stack_params:
+            Note: LDR X9, [X29, #arg_offset]
+            Note: STR X9, [SP, #k*8]
+            Let ldr_encoding be 0xF94003A9  Note: LDR X9, [X29]
+            Let str_encoding be 0xF90003E9  Note: STR X9, [SP]
+            Set str_encoding to str_encoding plus ((k times 8) left_shift 10)
+            
+            Inline Assembly:
+                "mov dword ptr [%0 + %1], %2"  Note: LDR X9, [X29, #arg_offset]
+                "mov dword ptr [%3 + %4 + 4], %5" Note: STR X9, [SP, #k*8]
+                "add %6, %6, %7"              Note: Increment offset by 8
+                : "=r"(offset)
+                : "r"(buffer), "r"(offset), "r"(ldr_encoding), "r"(buffer), "r"(offset), "r"(str_encoding), "r"(offset), "i"(8)
+                : "memory"
+            End Assembly
+            
+            Set k to k plus 1
+        End While
+    End If
+    
+    Return offset
+End Process
+
+Process called "handle_aapcs64_return" that takes is_float as Boolean, buffer as Pointer returns Integer:
+    Note: Handle function return value
+    
+    @Implementation
+    Return values in X0 (integer) or V0 (float).
+    Large structures use X8 for indirect return.
+    @End Implementation
+    
+    Let offset be 0
+    
+    If is_float:
+        Note: Result in V0, optionally save
+        Note: STR D0, [SP, #return_offset]
+        Inline Assembly:
+            "mov dword ptr [%0], %1"       Note: STR D0, [SP, #return_offset]
+            "mov %2, %3"                  Note: Set offset to 4
+            : "=r"(offset)
+            : "r"(buffer), "i"(0xFD0003E0), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+    Otherwise:
+        Note: Result in X0, optionally save
+        Note: STR X0, [SP, #return_offset]
+        Inline Assembly:
+            "mov dword ptr [%0], %1"       Note: STR X0, [SP, #return_offset]
+            "mov %2, %3"                  Note: Set offset to 4
+            : "=r"(offset)
+            : "r"(buffer), "i"(0xF90003E0), "r"(offset), "i"(4)
+            : "memory"
+        End Assembly
+    End If
+    
+    Return offset
+End Process
+
+Note: Helper functions
+Process called "align_to" that takes value as Integer, alignment as Integer returns Integer:
+    Note: Align value to boundary
+    
+    @Implementation
+    Rounds up to next alignment boundary.
+    Used for stack and parameter alignment.
+    @End Implementation
+    
+    Return ((value plus alignment minus 1) divided by alignment) times alignment
+End Process
+
+Process called "get_param_size_aapcs64" that takes param_types as Pointer, index as Integer returns Integer:
+    Note: Get parameter size at index
+    
+    @Implementation
+    Returns size of parameter for AAPCS64 classification.
+    Default to 8 bytes (64-bit) for basic types.
+    @End Implementation
+    
+    Return 8
+End Process
+
+Process called "is_float_type_aapcs64" that takes param_types as Pointer, index as Integer returns Boolean:
+    Note: Check if parameter is floating point
+    
+    @Implementation
+    Determines if parameter should use FP registers.
+    Would check actual type info in full implementation.
+    @End Implementation
+    
+    Return false
+End Process
+
+Process called "is_composite_type_aapcs64" that takes param_types as Pointer, index as Integer returns Boolean:
+    Note: Check if parameter is composite type
+    
+    @Implementation
+    Composites (structs, arrays) have special passing rules.
+    Would check actual type info in full implementation.
+    @End Implementation
+    
+    Return false
+End Process

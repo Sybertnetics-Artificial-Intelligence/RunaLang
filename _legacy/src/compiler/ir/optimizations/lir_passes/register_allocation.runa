@@ -1,0 +1,383 @@
+Note: Runa Compiler: LIR Register Allocation Optimization
+Note: Maps virtual registers to physical registers or memory locations
+
+Import "../../lir/lir.runa"
+Import "../../types/types.runa"
+Import "../../ir_context.runa"
+
+Note: LIR Register Allocation Optimization
+Type RegisterAllocator is Dictionary with:
+    context as IRContext
+    type_system as TypeSystem
+    physical_registers as List[String]
+    register_map as Dictionary[String, String]
+    spilled_registers as Dictionary[String, Integer]
+    next_stack_offset as Integer
+    metadata as Dictionary[String, Any]
+
+Process called "create_register_allocator" that takes context as IRContext and type_system as TypeSystem returns RegisterAllocator:
+    Note: Create a new register allocator
+    Let physical_regs be list containing:
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
+    
+    Return RegisterAllocator with:
+        context as context
+        type_system as type_system
+        physical_registers as physical_regs
+        register_map as dictionary containing
+        spilled_registers as dictionary containing
+        next_stack_offset as 0
+        metadata as dictionary containing
+
+Process called "allocate_registers" that takes lir_module as LIRModule and context as IRContext returns Dictionary[String, Any]:
+    Note: Apply register allocation to LIR module
+    Let type_system be create_type_system
+    Let allocator be create_register_allocator with context as context and type_system as type_system
+    
+    Let optimized_module be copy_lir_module with module as lir_module
+    Let total_allocated be 0
+    Let total_spilled be 0
+    
+    For each function in optimized_module.functions:
+        Let function_result be allocate_registers_for_function with allocator as allocator and lir_function as function
+        Set total_allocated to total_allocated plus function_result.allocated_count
+        Set total_spilled to total_spilled plus function_result.spilled_count
+    
+    Return dictionary containing:
+        "success" as true
+        "optimized_module" as optimized_module
+        "statistics" as dictionary containing:
+            "allocated_registers" as total_allocated
+            "spilled_registers" as total_spilled
+            "allocation_ratio" as ((total_allocated divided by (total_allocated plus total_spilled)) multiplied by 100.0 if (total_allocated plus total_spilled) is greater than 0 else 0.0)
+
+Process called "allocate_registers_for_function" that takes allocator as RegisterAllocator and lir_function as LIRFunction returns Dictionary[String, Any]:
+    Note: Allocate registers for a single function
+    Let allocated_count be 0
+    Let spilled_count be 0
+    
+    Note: Build interference graph
+    Let interference_graph be build_interference_graph with lir_function as lir_function
+    
+    Note: Perform graph coloring
+    Let coloring_result be color_interference_graph with graph as interference_graph and physical_registers as allocator.physical_registers
+    Let register_colors be coloring_result.colors
+    
+    Note: Apply allocation
+    For each virtual_reg_name in lir_function.virtual_registers:
+        Let virtual_reg be lir_function.virtual_registers at key virtual_reg_name
+        If virtual_reg_name is in register_colors:
+            Let physical_reg be register_colors at key virtual_reg_name
+            Set allocator.register_map at key virtual_reg_name to physical_reg
+            Set virtual_reg.physical_register to physical_reg
+            Set allocated_count to allocated_count plus 1
+        Otherwise:
+            Note: Spill to stack
+            Let stack_offset be allocator.next_stack_offset
+            Set allocator.next_stack_offset to allocator.next_stack_offset plus get_type_size with type_system as allocator.type_system and ir_type as virtual_reg.type
+            Set allocator.spilled_registers at key virtual_reg_name to stack_offset
+            Set virtual_reg.is_spilled to true
+            Set spilled_count to spilled_count plus 1
+    
+    Note: Update instructions to use physical registers
+    For each basic_block in lir_function.basic_blocks:
+        Let block_result be update_instructions_with_allocation with allocator as allocator and basic_block as basic_block
+        Set allocated_count to allocated_count plus block_result.updated_count
+    
+    Return dictionary containing:
+        "allocated_count" as allocated_count
+        "spilled_count" as spilled_count
+
+Process called "build_interference_graph" that takes lir_function as LIRFunction returns Dictionary[String, Set[String]]:
+    Note: Build interference graph for register allocation
+    Let interference_graph be dictionary containing
+    
+    Note: Initialize graph with all virtual registers
+    For each virtual_reg_name in lir_function.virtual_registers:
+        Set interference_graph at key virtual_reg_name to set containing
+    
+    Note: Analyze live ranges and build interference edges
+    For each basic_block in lir_function.basic_blocks:
+        Let block_interference be analyze_basic_block_interference with basic_block as basic_block
+        For each edge in block_interference:
+            Let reg1 be edge.reg1
+            Let reg2 be edge.reg2
+            Add reg2 to interference_graph at key reg1
+            Add reg1 to interference_graph at key reg2
+    
+    Return interference_graph
+
+Process called "analyze_basic_block_interference" that takes basic_block as LIRBasicBlock returns List[Dictionary[String, String]]:
+    Note: Analyze interference within a basic block
+    Let interference_edges be list containing
+    Let live_registers be set containing
+    
+    Note: Process instructions in reverse order to build live ranges
+    For i from (length of basic_block.instructions minus 1) down to 0:
+        Let instruction be basic_block.instructions at index i
+        Let sources be get_lir_instruction_sources with instruction as instruction
+        Let destination be get_lir_instruction_destination with instruction as instruction
+        
+        Note: Add source registers to live set
+        For each source in sources:
+            Add source.name to live_registers
+        
+        Note: Create interference edges for destination
+        If destination is not None:
+            For each live_reg in live_registers:
+                If live_reg is not equal to destination.name:
+                    Add dictionary containing:
+                        "reg1" as destination.name
+                        "reg2" as live_reg
+                    to interference_edges
+            
+            Note: Remove destination from live set (it's being defined)
+            Remove destination.name from live_registers
+    
+    Return interference_edges
+
+Process called "color_interference_graph" that takes graph as Dictionary[String, Set[String]] and physical_registers as List[String] returns Dictionary[String, Any]:
+    Note: Color the interference graph using graph coloring algorithm
+    Let colors be dictionary containing
+    Let available_colors be list containing
+    For each reg in physical_registers:
+        Add reg to available_colors
+    
+    Note: Sort nodes by degree (highest first) for better coloring
+    Let sorted_nodes be sort_nodes_by_degree with graph as graph
+    
+    For each node in sorted_nodes:
+        Let used_colors be set containing
+        For each neighbor in graph at key node:
+            If neighbor is in colors:
+                Add colors at key neighbor to used_colors
+        
+        Note: Find available color
+        Let assigned_color be None
+        For each color in available_colors:
+            If color is not in used_colors:
+                Set assigned_color to color
+                Break
+        
+        If assigned_color is not None:
+            Set colors at key node to assigned_color
+        Otherwise:
+            Note: No color available - will be spilled
+            Set colors at key node to "spilled"
+    
+    Return dictionary containing:
+        "colors" as colors
+        "spilled_count" as count_spilled_registers with colors as colors
+
+Process called "sort_nodes_by_degree" that takes graph as Dictionary[String, Set[String]] returns List[String]:
+    Note: Sort nodes by degree in descending order
+    Let node_degrees be list containing
+    For each node in graph:
+        Let degree be length of graph at key node
+        Add dictionary containing:
+            "node" as node
+            "degree" as degree
+        to node_degrees
+    
+    Note: Sort by degree (descending)
+    Let sorted_nodes be list containing
+    For i from 0 to (length of node_degrees minus 1):
+        Let max_degree be 0
+        Let max_index be 0
+        For j from 0 to (length of node_degrees minus 1):
+            Let degree_info be node_degrees at index j
+            If degree_info.degree is greater than max_degree:
+                Set max_degree to degree_info.degree
+                Set max_index to j
+        
+        Let selected_node be node_degrees at index max_index
+        Add selected_node.node to sorted_nodes
+        Set node_degrees at index max_index to dictionary containing:
+            "node" as selected_node.node
+            "degree" as -1
+    
+    Return sorted_nodes
+
+Process called "count_spilled_registers" that takes colors as Dictionary[String, String] returns Integer:
+    Note: Count how many registers were spilled
+    Let spilled_count be 0
+    For each reg_name in colors:
+        If colors at key reg_name is equal to "spilled":
+            Set spilled_count to spilled_count plus 1
+    Return spilled_count
+
+Process called "update_instructions_with_allocation" that takes allocator as RegisterAllocator and basic_block as LIRBasicBlock returns Dictionary[String, Any]:
+    Note: Update instructions to use physical registers
+    Let updated_count be 0
+    
+    For each instruction in basic_block.instructions:
+        Let update_result be update_instruction_with_allocation with allocator as allocator and instruction as instruction
+        If update_result.updated:
+            Set updated_count to updated_count plus 1
+    
+    Return dictionary containing:
+        "updated_count" as updated_count
+
+Process called "update_instruction_with_allocation" that takes allocator as RegisterAllocator and instruction as LIRInstruction returns Dictionary[String, Any]:
+    Note: Update a single instruction with register allocation
+    Match instruction:
+        When LIRLoad with destination as destination and source as source and type as type:
+            Let physical_dest be get_physical_register with allocator as allocator and virtual_reg as destination
+            Let updated_source be update_memory_address_with_allocation with allocator as allocator and address as source
+            Return dictionary containing:
+                "updated" as true
+                "instruction" as LIRLoad with destination as physical_dest and source as updated_source and type as type
+        
+        When LIRStore with destination as destination and source as source and type as type:
+            Let physical_source be get_physical_register with allocator as allocator and virtual_reg as source
+            Let updated_dest be update_memory_address_with_allocation with allocator as allocator and address as destination
+            Return dictionary containing:
+                "updated" as true
+                "instruction" as LIRStore with destination as updated_dest and source as physical_source and type as type
+        
+        When LIRMove with destination as destination and source as source:
+            Let physical_dest be get_physical_register with allocator as allocator and virtual_reg as destination
+            Let physical_source be get_physical_register_or_immediate with allocator as allocator and operand as source
+            Return dictionary containing:
+                "updated" as true
+                "instruction" as LIRMove with destination as physical_dest and source as physical_source
+        
+        When LIRBinaryOp with destination as destination and left as left and operator as operator and right as right and type as type:
+            Let physical_dest be get_physical_register with allocator as allocator and virtual_reg as destination
+            Let physical_left be get_physical_register with allocator as allocator and virtual_reg as left
+            Let physical_right be get_physical_register_or_immediate with allocator as allocator and operand as right
+            Return dictionary containing:
+                "updated" as true
+                "instruction" as LIRBinaryOp with destination as physical_dest and left as physical_left and operator as operator and right as physical_right and type as type
+        
+        When LIRCall with destination as destination and function as function and arguments as arguments and return_type as return_type:
+            Let physical_dest be None
+            If destination is not None:
+                Set physical_dest to get_physical_register with allocator as allocator and virtual_reg as destination
+            
+            Let physical_args be list containing
+            For each arg in arguments:
+                Let physical_arg be get_physical_register with allocator as allocator and virtual_reg as arg
+                Add physical_arg to physical_args
+            
+            Return dictionary containing:
+                "updated" as true
+                "instruction" as LIRCall with destination as physical_dest and function as function and arguments as physical_args and return_type as return_type
+        
+        Otherwise:
+            Return dictionary containing:
+                "updated" as false
+                "instruction" as instruction
+
+Process called "get_physical_register" that takes allocator as RegisterAllocator and virtual_reg as VirtualRegister returns VirtualRegister:
+    Note: Get the physical register for a virtual register
+    If virtual_reg.name is in allocator.register_map:
+        Let physical_name be allocator.register_map at key virtual_reg.name
+        Return VirtualRegister with:
+            name as physical_name
+            type as virtual_reg.type
+            is_spilled as false
+            physical_register as physical_name
+            metadata as virtual_reg.metadata
+    Otherwise:
+        Note: Register was spilled
+        Return virtual_reg
+
+Process called "get_physical_register_or_immediate" that takes allocator as RegisterAllocator and operand as VirtualRegister or Immediate returns VirtualRegister or Immediate:
+    Note: Get physical register or return immediate unchanged
+    Match operand:
+        When VirtualRegister:
+            Return get_physical_register with allocator as allocator and virtual_reg as operand
+        Otherwise:
+            Return operand
+
+Process called "update_memory_address_with_allocation" that takes allocator as RegisterAllocator and address as MemoryAddress returns MemoryAddress:
+    Note: Update memory address with register allocation
+    Match address:
+        When LIRDirectAddress with offset as offset and base as base:
+            If base is not None:
+                Let physical_base be get_physical_register with allocator as allocator and virtual_reg as base
+                Return LIRDirectAddress with offset as offset and base as physical_base
+            Otherwise:
+                Return address
+        When LIRIndirectAddress with base as base and offset as offset:
+            Let physical_base be get_physical_register with allocator as allocator and virtual_reg as base
+            Return LIRIndirectAddress with base as physical_base and offset as offset
+        When LIRIndexedAddress with base as base and index as index and scale as scale:
+            Let physical_base be get_physical_register with allocator as allocator and virtual_reg as base
+            Let physical_index be get_physical_register with allocator as allocator and virtual_reg as index
+            Return LIRIndexedAddress with base as physical_base and index as physical_index and scale as scale
+
+Process called "copy_lir_module" that takes module as LIRModule returns LIRModule:
+    Note: Create a copy of a LIR module
+    Let copied_functions be list containing
+    For each function in module.functions:
+        Let copied_function be copy_lir_function with function as function
+        Add copied_function to copied_functions
+    
+    Return LIRModule with:
+        name as module.name
+        functions as copied_functions
+        global_variables as module.global_variables
+        constants as module.constants
+
+Process called "copy_lir_function" that takes function as LIRFunction returns LIRFunction:
+    Note: Create a copy of a LIR function
+    Let copied_basic_blocks be list containing
+    For each basic_block in function.basic_blocks:
+        Let copied_block be copy_lir_basic_block with basic_block as basic_block
+        Add copied_block to copied_basic_blocks
+    
+    Return LIRFunction with:
+        name as function.name
+        parameters as function.parameters
+        return_type as function.return_type
+        basic_blocks as copied_basic_blocks
+        entry_block as function.entry_block
+        exit_blocks as function.exit_blocks
+        virtual_registers as function.virtual_registers
+        stack_frame_size as function.stack_frame_size
+        metadata as function.metadata
+
+Process called "copy_lir_basic_block" that takes basic_block as LIRBasicBlock returns LIRBasicBlock:
+    Note: Create a copy of a LIR basic block
+    Return LIRBasicBlock with:
+        name as basic_block.name
+        instructions as basic_block.instructions
+        terminator as basic_block.terminator
+        predecessors as basic_block.predecessors
+        successors as basic_block.successors
+        live_in as basic_block.live_in
+        live_out as basic_block.live_out
+        metadata as basic_block.metadata
+
+Note: Register Allocation Diagnostics
+Process called "get_register_allocation_diagnostics" that takes allocator as RegisterAllocator returns List[IRDiagnostic]:
+    Note: Get diagnostics from register allocator
+    Return allocator.context.diagnostics
+
+Process called "has_register_allocation_errors" that takes allocator as RegisterAllocator returns Boolean:
+    Note: Check if register allocator has errors
+    Let diagnostics be get_register_allocation_diagnostics with allocator as allocator
+    
+    For each diagnostic in diagnostics:
+        If diagnostic.severity is equal to "error":
+            Return true
+    
+    Return false
+
+Note: Register Allocation Statistics
+Process called "get_register_allocation_statistics" that takes lir_module as LIRModule returns Dictionary[String, Any]:
+    Note: Get register allocation statistics for a LIR module
+    Let type_system be create_type_system
+    Let allocator be create_register_allocator with context as create_ir_context with compilation_unit as "stats" and source_file as "unknown" and type_system as type_system
+    
+    Let allocation_result be allocate_registers with lir_module as lir_module and context as allocator.context
+    Let statistics be allocation_result.statistics
+    
+    Return dictionary containing:
+        "allocated_registers" as statistics.allocated_registers
+        "spilled_registers" as statistics.spilled_registers
+        "allocation_ratio" as statistics.allocation_ratio
+        "function_count" as length of lir_module.functions
+        "total_virtual_registers" as get_total_virtual_register_count with lir_module as lir_module 
