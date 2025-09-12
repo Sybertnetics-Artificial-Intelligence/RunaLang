@@ -1,0 +1,414 @@
+Note: Security permission checker for syscall validation
+Note: Ensures only safe syscalls are allowed in different execution contexts
+
+Import "compiler.frontend.primitives.types.compiler_internals" as Internals
+
+Note: Permission levels for different execution contexts
+Type PermissionLevel is:
+    | Unrestricted     Note: Full system access
+    | Sandboxed        Note: Limited file/network access
+    | ReadOnly         Note: No write operations
+    | NetworkRestricted Note: No network operations
+    | FileRestricted   Note: No file operations
+End Type
+
+Note: Syscall permission metadata
+Type called "SyscallPermission":
+    syscall_number as Integer
+    min_permission as PermissionLevel
+    requires_path_validation as Boolean
+    requires_fd_validation as Boolean
+    allows_network as Boolean
+    allows_filesystem as Boolean
+End Type
+
+Note: Permission validation context
+Type called "ValidationContext":
+    current_permission as PermissionLevel
+    allowed_paths as Internals.InternalArray    Note: String pointers to allowed paths
+    allowed_fds as Internals.InternalArray      Note: Integer file descriptors
+    network_allowed as Boolean
+    filesystem_allowed as Boolean
+End Type
+
+Note: Initialize permission checker with default rules
+Process called "initialize_permission_system" returns Internals.InternalMap:
+    Let permissions be Internals.create_internal_map()
+    
+    Note: File operations - require appropriate permissions
+    add_syscall_permission(permissions, 2, ReadOnly, true, false, false, true)      Note: open
+    add_syscall_permission(permissions, 3, Unrestricted, false, true, false, true)  Note: close
+    add_syscall_permission(permissions, 0, ReadOnly, false, true, false, true)      Note: read
+    add_syscall_permission(permissions, 1, Sandboxed, false, true, false, true)     Note: write
+    add_syscall_permission(permissions, 8, ReadOnly, false, true, false, true)      Note: lseek
+    add_syscall_permission(permissions, 5, ReadOnly, false, false, false, true)     Note: fstat
+    add_syscall_permission(permissions, 4, ReadOnly, false, false, false, true)     Note: stat
+    add_syscall_permission(permissions, 6, ReadOnly, false, false, false, true)     Note: lstat
+    
+    Note: Memory operations - generally safe
+    add_syscall_permission(permissions, 9, ReadOnly, false, false, false, false)    Note: mmap
+    add_syscall_permission(permissions, 11, ReadOnly, false, false, false, false)   Note: munmap
+    add_syscall_permission(permissions, 10, Sandboxed, false, false, false, false)  Note: mprotect
+    add_syscall_permission(permissions, 12, ReadOnly, false, false, false, false)   Note: brk
+    
+    Note: Process operations - require higher permissions
+    add_syscall_permission(permissions, 57, Unrestricted, false, false, false, false) Note: fork
+    add_syscall_permission(permissions, 59, Unrestricted, false, false, false, false) Note: execve
+    add_syscall_permission(permissions, 60, Sandboxed, false, false, false, false)   Note: exit
+    add_syscall_permission(permissions, 39, Sandboxed, false, false, false, false)   Note: getpid
+    
+    Note: Network operations - require network permissions
+    add_syscall_permission(permissions, 41, NetworkRestricted, false, false, true, false)  Note: socket
+    add_syscall_permission(permissions, 42, NetworkRestricted, false, true, true, false)   Note: connect
+    add_syscall_permission(permissions, 43, NetworkRestricted, false, true, true, false)   Note: accept
+    add_syscall_permission(permissions, 44, NetworkRestricted, false, true, false, false)  Note: sendto
+    add_syscall_permission(permissions, 45, NetworkRestricted, false, true, false, false)  Note: recvfrom
+    add_syscall_permission(permissions, 46, NetworkRestricted, false, true, true, false)   Note: sendmsg
+    add_syscall_permission(permissions, 47, NetworkRestricted, false, true, true, false)   Note: recvmsg
+    add_syscall_permission(permissions, 49, NetworkRestricted, false, true, true, false)   Note: bind
+    add_syscall_permission(permissions, 50, NetworkRestricted, false, true, true, false)   Note: listen
+    
+    Return permissions
+End Process
+
+Note: Add syscall permission to registry
+Process called "add_syscall_permission" that takes permissions as Internals.InternalMap, syscall_num as Integer, min_perm as PermissionLevel, path_validation as Boolean, fd_validation as Boolean, network as Boolean, filesystem as Boolean:
+    Note: Allocate permission structure
+    Let perm_ptr as Integer
+    Inline Assembly:
+        "mov rdi, 40\n"           Note: Size of SyscallPermission structure  
+        "mov rax, 9\n"            Note: mmap syscall
+        "mov rsi, rdi\n"          Note: length = size
+        "mov rdi, 0\n"            Note: addr = NULL
+        "mov rdx, 3\n"            Note: PROT_READ | PROT_WRITE
+        "mov r10, 34\n"           Note: MAP_PRIVATE | MAP_ANONYMOUS
+        "mov r8, -1\n"            Note: fd = -1
+        "mov r9, 0\n"             Note: offset = 0
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(perm_ptr)
+        :
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Note: Initialize permission structure
+    write_syscall_permission(perm_ptr, syscall_num, min_perm, path_validation, fd_validation, network, filesystem)
+    
+    Note: Add to map using syscall number as key
+    Internals.internal_map_insert(permissions, syscall_num, perm_ptr)
+End Process
+
+Note: Write syscall permission data to allocated memory
+Process called "write_syscall_permission" that takes ptr as Integer, syscall_num as Integer, min_perm as PermissionLevel, path_validation as Boolean, fd_validation as Boolean, network as Boolean, filesystem as Boolean:
+    Note: Write syscall_number (offset 0)
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov [%0], rax\n"
+        :
+        : "r"(ptr), "r"(syscall_num)
+        : "rax", "memory"
+    End Assembly
+    
+    Note: Write min_permission (offset 8) - convert enum to integer
+    Let perm_int be permission_level_to_int(min_perm)
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov [%0 + 8], rax\n"
+        :
+        : "r"(ptr), "r"(perm_int)
+        : "rax", "memory"
+    End Assembly
+    
+    Note: Write boolean flags (offsets 16, 17, 18, 19, 20)
+    Let path_val be boolean_to_int(path_validation)
+    Let fd_val be boolean_to_int(fd_validation)
+    Let net_val be boolean_to_int(network)
+    Let fs_val be boolean_to_int(filesystem)
+    
+    Inline Assembly:
+        "mov al, %1\n"
+        "mov [%0 + 16], al\n"     Note: requires_path_validation
+        "mov al, %2\n"
+        "mov [%0 + 17], al\n"     Note: requires_fd_validation
+        "mov al, %3\n"
+        "mov [%0 + 18], al\n"     Note: allows_network
+        "mov al, %4\n"
+        "mov [%0 + 19], al\n"     Note: allows_filesystem
+        :
+        : "r"(ptr), "r"(path_val), "r"(fd_val), "r"(net_val), "r"(fs_val)
+        : "rax", "memory"
+    End Assembly
+End Process
+
+Note: Convert permission level enum to integer
+Process called "permission_level_to_int" that takes level as PermissionLevel returns Integer:
+    Match level:
+        When Unrestricted:
+            Return 0
+        When Sandboxed:
+            Return 1
+        When ReadOnly:
+            Return 2
+        When NetworkRestricted:
+            Return 3
+        When FileRestricted:
+            Return 4
+    End Match
+End Process
+
+Note: Convert integer to permission level enum
+Process called "int_to_permission_level" that takes value as Integer returns PermissionLevel:
+    Match value:
+        When 0:
+            Return Unrestricted
+        When 1:
+            Return Sandboxed
+        When 2:
+            Return ReadOnly
+        When 3:
+            Return NetworkRestricted
+        When 4:
+            Return FileRestricted
+    End Match
+    Note: Default to most restrictive
+    Return FileRestricted
+End Process
+
+Note: Convert boolean to integer for assembly
+Process called "boolean_to_int" that takes value as Boolean returns Integer:
+    If value:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: Read syscall permission from memory pointer
+Process called "read_syscall_permission" that takes ptr as Integer returns SyscallPermission:
+    Note: Read syscall_number (offset 0)
+    Let syscall_num as Integer
+    Inline Assembly:
+        "mov rax, [%1]\n"
+        "mov %0, rax\n"
+        : "=r"(syscall_num)
+        : "r"(ptr)
+        : "rax"
+    End Assembly
+    
+    Note: Read min_permission (offset 8)
+    Let perm_int as Integer
+    Inline Assembly:
+        "mov rax, [%1 + 8]\n"
+        "mov %0, rax\n"
+        : "=r"(perm_int)
+        : "r"(ptr)
+        : "rax"
+    End Assembly
+    
+    Note: Read boolean flags
+    Let path_int as Integer
+    Let fd_int as Integer
+    Let net_int as Integer
+    Let fs_int as Integer
+    
+    Inline Assembly:
+        "movzx rax, byte ptr [%4 + 16]\n"
+        "mov %0, rax\n"
+        "movzx rax, byte ptr [%4 + 17]\n"
+        "mov %1, rax\n"
+        "movzx rax, byte ptr [%4 + 18]\n"
+        "mov %2, rax\n"
+        "movzx rax, byte ptr [%4 + 19]\n"
+        "mov %3, rax\n"
+        : "=r"(path_int), "=r"(fd_int), "=r"(net_int), "=r"(fs_int)
+        : "r"(ptr)
+        : "rax"
+    End Assembly
+    
+    Note: Convert and return structure
+    Let result as SyscallPermission
+    result.syscall_number = syscall_num
+    result.min_permission = int_to_permission_level(perm_int)
+    result.requires_path_validation = int_to_boolean(path_int)
+    result.requires_fd_validation = int_to_boolean(fd_int)
+    result.allows_network = int_to_boolean(net_int)
+    result.allows_filesystem = int_to_boolean(fs_int)
+    Return result
+End Process
+
+Note: Convert integer to boolean
+Process called "int_to_boolean" that takes value as Integer returns Boolean:
+    If value equals 1:
+        Return true
+    End If
+    Return false
+End Process
+
+Note: Create validation context for permission checking
+Process called "create_validation_context" that takes permission as PermissionLevel returns ValidationContext:
+    Let context as ValidationContext
+    context.current_permission = permission
+    context.allowed_paths = Internals.create_internal_array(16)
+    context.allowed_fds = Internals.create_internal_array(16)
+    
+    Note: Set capabilities based on permission level
+    Match permission:
+        When Unrestricted:
+            context.network_allowed = true
+            context.filesystem_allowed = true
+        When Sandboxed:
+            context.network_allowed = false
+            context.filesystem_allowed = true
+        When ReadOnly:
+            context.network_allowed = false
+            context.filesystem_allowed = true
+        When NetworkRestricted:
+            context.network_allowed = false
+            context.filesystem_allowed = true
+        When FileRestricted:
+            context.network_allowed = false
+            context.filesystem_allowed = false
+    End Match
+    
+    Return context
+End Process
+
+Note: Check if syscall is allowed in current context
+Process called "validate_syscall" that takes permissions as Internals.InternalMap, context as ValidationContext, syscall_num as Integer returns Boolean:
+    Note: Look up syscall permission
+    Let perm_ptr be Internals.internal_map_get(permissions, syscall_num)
+    If perm_ptr equals 0:
+        Note: Unknown syscall - deny by default
+        Return false
+    End If
+    
+    Let permission be read_syscall_permission(perm_ptr)
+    
+    Note: Check if current permission level is sufficient
+    Let current_level be permission_level_to_int(context.current_permission)
+    Let required_level be permission_level_to_int(permission.min_permission)
+    
+    If current_level > required_level:
+        Note: Current permission is more restrictive than required
+        Return false
+    End If
+    
+    Note: Check network permissions
+    If permission.allows_network and not context.network_allowed:
+        Return false
+    End If
+    
+    Note: Check filesystem permissions
+    If permission.allows_filesystem and not context.filesystem_allowed:
+        Return false
+    End If
+    
+    Return true
+End Process
+
+Note: Add allowed path to validation context
+Process called "add_allowed_path" that takes context as ValidationContext, path as String:
+    Let path_ptr be Internals.string_to_ptr(path)
+    Internals.internal_array_add(context.allowed_paths, path_ptr)
+End Process
+
+Note: Add allowed file descriptor to validation context
+Process called "add_allowed_fd" that takes context as ValidationContext, fd as Integer:
+    Internals.internal_array_add(context.allowed_fds, fd)
+End Process
+
+Note: Check if path is allowed in validation context
+Process called "validate_path" that takes context as ValidationContext, path as String returns Boolean:
+    Let path_ptr be Internals.string_to_ptr(path)
+    Let iter be Internals.internal_array_iterator(context.allowed_paths)
+    
+    While Internals.internal_array_has_next(iter):
+        Let allowed_ptr be Internals.internal_array_next(iter)
+        If path_ptr equals allowed_ptr:
+            Return true
+        End If
+        
+        Note: Check if path is under allowed directory
+        If path_starts_with(path, Internals.ptr_to_string(allowed_ptr)):
+            Return true
+        End If
+    End While
+    
+    Return false
+End Process
+
+Note: Check if file descriptor is allowed in validation context
+Process called "validate_fd" that takes context as ValidationContext, fd as Integer returns Boolean:
+    Let iter be Internals.internal_array_iterator(context.allowed_fds)
+    
+    While Internals.internal_array_has_next(iter):
+        Let allowed_fd be Internals.internal_array_next(iter)
+        If fd equals allowed_fd:
+            Return true
+        End If
+    End While
+    
+    Return false
+End Process
+
+Note: Check if path starts with prefix (for directory validation)
+Process called "path_starts_with" that takes path as String, prefix as String returns Boolean:
+    Let path_len be string_length(path)
+    Let prefix_len be string_length(prefix)
+    
+    If prefix_len > path_len:
+        Return false
+    End If
+    
+    Note: Compare character by character
+    Let i be 0
+    While i < prefix_len:
+        Let path_char be string_char_at(path, i)
+        Let prefix_char be string_char_at(prefix, i)
+        If path_char does not equal prefix_char:
+            Return false
+        End If
+        i = i + 1
+    End While
+    
+    Return true
+End Process
+
+Note: Get string length using primitive operations
+Process called "string_length" that takes str as String returns Integer:
+    Let ptr be Internals.string_to_ptr(str)
+    Let length be 0
+    
+    Note: Count characters until null terminator
+    While true:
+        Let char_val as Integer
+        Inline Assembly:
+            "movzx rax, byte ptr [%1 + %2]\n"
+            "mov %0, rax\n"
+            : "=r"(char_val)
+            : "r"(ptr), "r"(length)
+            : "rax"
+        End Assembly
+        
+        If char_val equals 0:
+            Return length
+        End If
+        
+        length = length + 1
+    End While
+End Process
+
+Note: Get character at specific index in string
+Process called "string_char_at" that takes str as String, index as Integer returns Integer:
+    Let ptr be Internals.string_to_ptr(str)
+    Let char_val as Integer
+    
+    Inline Assembly:
+        "movzx rax, byte ptr [%1 + %2]\n"
+        "mov %0, rax\n"
+        : "=r"(char_val)
+        : "r"(ptr), "r"(index)
+        : "rax"
+    End Assembly
+    
+    Return char_val
+End Process

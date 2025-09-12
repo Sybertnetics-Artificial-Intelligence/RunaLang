@@ -1,0 +1,1336 @@
+Note:
+runa/src/compiler/backend/syscalls/syscall_generator.runa
+Syscall Assembly Code Generator
+
+This module generates platform-specific assembly code for syscall invocations.
+It handles the translation from high-level syscall requests to low-level
+assembly instructions with proper register allocation and calling conventions.
+
+Key features and capabilities:
+- Assembly instruction generation for all architectures
+- Register allocation for syscall parameters
+- Platform-specific calling convention handling
+- Inline assembly generation for Runa code
+- Syscall wrapper function generation
+- Stack frame management for syscalls
+- Error handling code generation
+- Performance-optimized syscall sequences
+- Batched syscall generation (for io_uring, etc.)
+- Security hardening (stack canaries, etc.)
+- Debug symbol generation for syscalls
+- Cross-platform syscall abstraction
+:End Note
+
+Import module "compiler/frontend/primitives/types/compiler_internals" as Internals
+Import module "syscall_definitions" as SyscallDefs
+
+Note: =====================================================================
+Note: ASSEMBLY GENERATION DATA STRUCTURES
+Note: =====================================================================
+
+Type called "AssemblyInstruction":
+    mnemonic as String                      Note: Instruction mnemonic (mov, syscall, etc.)
+    operands as Internals.InternalArray    Note: Instruction operands (string pointers)
+    comment as String                       Note: Assembly comment for clarity
+    size_bytes as Integer                   Note: Instruction size in bytes
+    encoding as Internals.InternalArray    Note: Machine code bytes
+End Type
+
+Type called "RegisterAllocation":
+    parameter_index as Integer              Note: Parameter position (0-based)
+    register_name as String                 Note: Target register (rdi, x0, etc.)
+    register_size as Integer                Note: Register size in bits
+    needs_extension as Boolean              Note: Whether value needs sign/zero extension
+End Type
+
+Type called "SyscallAssemblyBlock":
+    platform as String                      Note: Target platform
+    architecture as String                  Note: Target architecture
+    prologue as Internals.InternalArray    Note: Setup instructions (pointers)
+    syscall_instruction as AssemblyInstruction  Note: The actual syscall
+    epilogue as Internals.InternalArray    Note: Cleanup instructions (pointers)
+    total_size as Integer                   Note: Total size in bytes
+    clobber_list as Internals.InternalArray Note: Registers modified (string pointers)
+End Type
+
+Type called "InlineAssemblyTemplate":
+    template_string as String               Note: Inline assembly template
+    input_constraints as Internals.InternalArray Note: Input operand constraints (string pointers)
+    output_constraints as Internals.InternalArray Note: Output operand constraints (string pointers)
+    clobber_constraints as Internals.InternalArray Note: Clobbered register list (string pointers)
+    volatile_flag as Boolean                Note: Whether assembly has side effects
+End Type
+
+Note: =====================================================================
+Note: CORE ASSEMBLY GENERATION
+Note: =====================================================================
+
+Process called "generate_syscall_assembly" that takes syscall_name as String, params as Internals.InternalArray, platform as String, arch as String returns SyscallAssemblyBlock:
+    @Reasoning{
+        Generate complete assembly block for a syscall.
+        Handles parameter loading, syscall invocation, and error checking.
+    }@End Reasoning
+    @Implementation{
+        Route to architecture-specific generator.
+        Build complete assembly block with prologue and epilogue.
+    }@End Implementation
+    
+    Let block be SyscallAssemblyBlock with {
+        platform: platform,
+        architecture: arch,
+        prologue: Internals.create_internal_array(8),
+        syscall_instruction: AssemblyInstruction with {
+            mnemonic: "",
+            operands: Internals.create_internal_array(4),
+            comment: "",
+            size_bytes: 0,
+            encoding: Internals.create_internal_array(8)
+        },
+        epilogue: Internals.create_internal_array(4),
+        total_size: 0,
+        clobber_list: Internals.create_internal_array(8)
+    }
+    
+    Note: Get syscall number for this platform
+    Let syscall_num be SyscallDefs.get_syscall_number(syscall_name, platform)
+    If syscall_num is equal to -1:
+        Note: Syscall not available on this platform
+        Return block
+    End If
+    
+    Note: Allocate registers for parameters
+    Let allocations be allocate_registers(params.length, platform, arch)
+    
+    Note: Generate architecture-specific assembly
+    Match arch:
+        When "x86_64":
+            Let instructions be generate_x86_64_syscall(syscall_num, params)
+            Set block.prologue to instructions.slice(0, length(instructions) minus 2)
+            Set block.syscall_instruction to instructions.get(length(instructions) minus 1)
+            Internals.internal_array_add(block.clobber_list, Internals.string_to_ptr("rax"))
+            Internals.internal_array_add(block.clobber_list, Internals.string_to_ptr("rcx"))
+            Internals.internal_array_add(block.clobber_list, Internals.string_to_ptr("r11"))
+            
+        When "aarch64", "arm64":
+            Let instructions be generate_arm64_syscall(syscall_num, params)
+            Set block.prologue to instructions.slice(0, length(instructions) minus 2)
+            Set block.syscall_instruction to instructions.get(length(instructions) minus 1)
+            Internals.internal_array_add(block.clobber_list, Internals.string_to_ptr("x0"))
+            Internals.internal_array_add(block.clobber_list, Internals.string_to_ptr("x8"))
+            
+        When "x86":
+            Let instructions be generate_x86_syscall(syscall_num, params)
+            Set block.prologue to instructions.slice(0, length(instructions) minus 2)
+            Set block.syscall_instruction to instructions.get(length(instructions) minus 1)
+            Internals.internal_array_add(block.clobber_list, Internals.string_to_ptr("eax"))
+            Internals.internal_array_add(block.clobber_list, Internals.string_to_ptr("ecx"))
+            Internals.internal_array_add(block.clobber_list, Internals.string_to_ptr("edx"))
+    End Match
+    
+    Note: Add error handling epilogue
+    Set block.epilogue to generate_error_handling(platform)
+    
+    Note: Calculate total size
+    Let total be 0
+    For Each inst in block.prologue:
+        Set total to total plus inst.size_bytes
+    End For
+    Set total to total plus block.syscall_instruction.size_bytes
+    For Each inst in block.epilogue:
+        Set total to total plus inst.size_bytes
+    End For
+    Set block.total_size to total
+    
+    Return block
+End Process
+
+Process called "generate_inline_assembly" that takes syscall_name as String, param_vars as Internals.InternalArray, platform as String returns InlineAssemblyTemplate:
+    @Reasoning{
+        Generate inline assembly template for embedding in Runa code.
+        Create appropriate constraint strings for parameters.
+    }@End Reasoning
+    @Implementation{
+        Build assembly template with parameter placeholders.
+        Generate input/output constraints for compiler.
+    }@End Implementation
+    
+    Let template be InlineAssemblyTemplate with {
+        template_string: "",
+        input_constraints: Internals.create_internal_array(8),
+        output_constraints: Internals.create_internal_array(4),
+        clobber_constraints: Internals.create_internal_array(8),
+        volatile_flag: true
+    }
+    
+    Note: Get syscall number
+    Let syscall_num be SyscallDefs.get_syscall_number(syscall_name, platform)
+    
+    Match platform:
+        When "linux_x64":
+            Note: Build x86_64 inline assembly template
+            Set template.template_string to "mov rax, " joined with to_string(syscall_num) joined with "\n"
+            
+            Note: Add parameter moves
+            Let param_regs be Internals.create_internal_array(6)
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("rdi"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("rsi"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("rdx"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("r10"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("r8"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("r9"))
+            
+            Let min_count be param_vars.length
+            If min_count > 6:
+                Set min_count to 6
+            End If
+            
+            Let i be 0
+            While i < min_count:
+                Let reg_ptr be Internals.internal_array_get(param_regs, i)
+                Let reg_name be Internals.ptr_to_string(reg_ptr)
+                Set template.template_string to template.template_string + "mov " + reg_name + ", %" + to_string(i) + "\n"
+                Internals.internal_array_add(template.input_constraints, Internals.string_to_ptr("r"))
+                Set i to i + 1
+            End While
+            
+            Set template.template_string to template.template_string joined with "syscall"
+            Internals.internal_array_add(template.output_constraints, Internals.string_to_ptr("=a"))  Note: Result in RAX
+            Internals.internal_array_add(template.clobber_constraints, Internals.string_to_ptr("rcx"))
+            Internals.internal_array_add(template.clobber_constraints, Internals.string_to_ptr("r11"))
+            Internals.internal_array_add(template.clobber_constraints, Internals.string_to_ptr("memory"))
+            
+        When "linux_arm64":
+            Note: Build ARM64 inline assembly template
+            Set template.template_string to "mov x8, #" joined with to_string(syscall_num) joined with "\n"
+            
+            Note: Add parameter moves
+            Let param_regs be Internals.create_internal_array(6)
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("x0"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("x1"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("x2"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("x3"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("x4"))
+            Internals.internal_array_add(param_regs, Internals.string_to_ptr("x5"))
+            
+            Let min_count be param_vars.length
+            If min_count > 6:
+                Set min_count to 6
+            End If
+            
+            Let i be 0
+            While i < min_count:
+                Let reg_ptr be Internals.internal_array_get(param_regs, i)
+                Let reg_name be Internals.ptr_to_string(reg_ptr)
+                Set template.template_string to template.template_string + "mov " + reg_name + ", %" + to_string(i) + "\n"
+                Internals.internal_array_add(template.input_constraints, Internals.string_to_ptr("r"))
+                Set i to i + 1
+            End While
+            
+            Set template.template_string to template.template_string joined with "svc #0"
+            Internals.internal_array_add(template.output_constraints, Internals.string_to_ptr("=r"))  Note: Result in X0
+            Internals.internal_array_add(template.clobber_constraints, Internals.string_to_ptr("memory"))
+    End Match
+    
+    Return template
+End Process
+
+Process called "allocate_registers" that takes param_count as Integer, platform as String, arch as String returns Internals.InternalArray:
+    @Reasoning{
+        Allocate registers according to platform ABI conventions.
+        Each platform has specific register ordering for syscalls.
+    }@End Reasoning
+    @Implementation{
+        Return ordered list of register allocations.
+        Handle stack spillage for excess parameters.
+    }@End Implementation
+    
+    Let allocations be Internals.create_internal_array(param_count)
+    
+    Match arch:
+        When "x86_64":
+            Note: Linux x86_64 syscall convention: rdi, rsi, rdx, r10, r8, r9
+            Let registers be Internals.create_internal_array(6)
+            Internals.internal_array_add(registers, Internals.string_to_ptr("rdi"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("rsi"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("rdx"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("r10"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("r8"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("r9"))
+            
+            Let min_count be param_count
+            If min_count > 6:
+                Set min_count to 6
+            End If
+            
+            Let i be 0
+            While i < min_count:
+                Let reg_ptr be Internals.internal_array_get(registers, i)
+                Let reg_name be Internals.ptr_to_string(reg_ptr)
+                Let alloc be RegisterAllocation with {
+                    parameter_index: i,
+                    register_name: reg_name,
+                    register_size: 64,
+                    needs_extension: false
+                }
+                Let alloc_ptr be allocate_register_allocation(alloc)
+                Internals.internal_array_add(allocations, alloc_ptr)
+                Set i to i + 1
+            End While
+            
+        When "aarch64", "arm64":
+            Note: ARM64 syscall convention: x0-x7 for params, x8 for syscall number
+            Let registers be Internals.create_internal_array(8)
+            Internals.internal_array_add(registers, Internals.string_to_ptr("x0"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("x1"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("x2"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("x3"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("x4"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("x5"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("x6"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("x7"))
+            
+            Let min_count be param_count
+            If min_count > 8:
+                Set min_count to 8
+            End If
+            
+            Let i be 0
+            While i < min_count:
+                Let reg_ptr be Internals.internal_array_get(registers, i)
+                Let reg_name be Internals.ptr_to_string(reg_ptr)
+                Let alloc be RegisterAllocation with {
+                    parameter_index: i,
+                    register_name: reg_name,
+                    register_size: 64,
+                    needs_extension: false
+                }
+                Let alloc_ptr be allocate_register_allocation(alloc)
+                Internals.internal_array_add(allocations, alloc_ptr)
+                Set i to i + 1
+            End While
+            
+        When "x86":
+            Note: 32-bit x86 syscall convention: ebx, ecx, edx, esi, edi, ebp
+            Let registers be Internals.create_internal_array(6)
+            Internals.internal_array_add(registers, Internals.string_to_ptr("ebx"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("ecx"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("edx"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("esi"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("edi"))
+            Internals.internal_array_add(registers, Internals.string_to_ptr("ebp"))
+            
+            Let min_count be param_count
+            If min_count > 6:
+                Set min_count to 6
+            End If
+            
+            Let i be 0
+            While i < min_count:
+                Let reg_ptr be Internals.internal_array_get(registers, i)
+                Let reg_name be Internals.ptr_to_string(reg_ptr)
+                Let alloc be RegisterAllocation with {
+                    parameter_index: i,
+                    register_name: reg_name,
+                    register_size: 32,
+                    needs_extension: true
+                }
+                Let alloc_ptr be allocate_register_allocation(alloc)
+                Internals.internal_array_add(allocations, alloc_ptr)
+                Set i to i + 1
+            End While
+    End Match
+    
+    Return allocations
+End Process
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Process called "allocate_register_allocation" that takes alloc as RegisterAllocation returns Integer:
+    @Reasoning
+    Allocates memory for RegisterAllocation struct and stores it.
+    @End Reasoning
+    
+    Let alloc_size be 32  Note: Estimate for RegisterAllocation size
+    Let ptr be Internals.allocate_raw_memory(alloc_size)
+    
+    Note: Write fields manually
+    Internals.write_integer_at(ptr, 0, alloc.parameter_index)
+    Internals.write_integer_at(ptr, 8, Internals.string_to_ptr(alloc.register_name))
+    Internals.write_integer_at(ptr, 16, alloc.register_size)
+    Let needs_ext_int be 0
+    If alloc.needs_extension:
+        Set needs_ext_int to 1
+    End If
+    Internals.write_integer_at(ptr, 24, needs_ext_int)
+    
+    Return ptr
+End Process
+
+Process called "read_register_allocation" that takes ptr as Integer returns RegisterAllocation:
+    @Reasoning
+    Reads RegisterAllocation from memory pointer.
+    @End Reasoning
+    
+    Let alloc be RegisterAllocation()
+    Set alloc.parameter_index to Internals.read_integer_at(ptr, 0)
+    Set alloc.register_name to Internals.ptr_to_string(Internals.read_integer_at(ptr, 8))
+    Set alloc.register_size to Internals.read_integer_at(ptr, 16)
+    Let needs_ext_int be Internals.read_integer_at(ptr, 24)
+    Set alloc.needs_extension to needs_ext_int not equals 0
+    
+    Return alloc
+End Process
+
+Process called "allocate_assembly_instruction" that takes inst as AssemblyInstruction returns Integer:
+    @Reasoning
+    Allocates memory for AssemblyInstruction and stores it.
+    @End Reasoning
+    
+    Let inst_size be 48  Note: Estimate for AssemblyInstruction size
+    Let ptr be Internals.allocate_raw_memory(inst_size)
+    
+    Note: Write fields manually
+    Internals.write_integer_at(ptr, 0, Internals.string_to_ptr(inst.mnemonic))
+    Internals.write_integer_at(ptr, 8, inst.operands.data_ptr)  Note: Store array pointer
+    Internals.write_integer_at(ptr, 16, Internals.string_to_ptr(inst.comment))
+    Internals.write_integer_at(ptr, 24, inst.size_bytes)
+    Internals.write_integer_at(ptr, 32, inst.encoding.data_ptr)  Note: Store array pointer
+    
+    Return ptr
+End Process
+
+Process called "read_assembly_instruction" that takes ptr as Integer returns AssemblyInstruction:
+    @Reasoning
+    Reads AssemblyInstruction from memory pointer.
+    @End Reasoning
+    
+    Let inst be AssemblyInstruction()
+    Set inst.mnemonic to Internals.ptr_to_string(Internals.read_integer_at(ptr, 0))
+    Note: Reconstruct operands array from pointer
+    Set inst.operands.data_ptr to Internals.read_integer_at(ptr, 8)
+    Set inst.comment to Internals.ptr_to_string(Internals.read_integer_at(ptr, 16))
+    Set inst.size_bytes to Internals.read_integer_at(ptr, 24)
+    Note: Reconstruct encoding array from pointer
+    Set inst.encoding.data_ptr to Internals.read_integer_at(ptr, 32)
+    
+    Return inst
+End Process
+
+Process called "encode_immediate_32" that takes value as Integer returns Internals.InternalArray:
+    @Reasoning{
+        Encode a 32-bit immediate value as little-endian bytes.
+        Used for x86_64 immediate operands.
+    }@End Reasoning
+    
+    Let bytes be Internals.create_internal_array(4)
+    Internals.internal_array_add(bytes, value & 0xFF)
+    Internals.internal_array_add(bytes, (value >> 8) & 0xFF)
+    Internals.internal_array_add(bytes, (value >> 16) & 0xFF)
+    Internals.internal_array_add(bytes, (value >> 24) & 0xFF)
+    Return bytes
+End Process
+
+Process called "generate_mov_encoding" that takes reg as String, value as Integer returns List[Integer]:
+    @Reasoning{
+        Generate machine code for MOV reg, imm instruction.
+        Handle different register encodings.
+    }@End Reasoning
+    
+    Let encoding be List[Integer]
+    
+    Note: REX prefix for 64-bit operation
+    encoding.append(0x48)
+    
+    Note: MOV opcode
+    Match reg:
+        When "rdi":
+            encoding.append(0xc7)
+            encoding.append(0xc7)
+        When "rsi":
+            encoding.append(0xc7)
+            encoding.append(0xc6)
+        When "rdx":
+            encoding.append(0xc7)
+            encoding.append(0xc2)
+        When "r10":
+            encoding.append(0x41)
+            encoding.append(0xc7)
+            encoding.append(0xc2)
+        When "r8":
+            encoding.append(0x41)
+            encoding.append(0xc7)
+            encoding.append(0xc0)
+        When "r9":
+            encoding.append(0x41)
+            encoding.append(0xc7)
+            encoding.append(0xc1)
+    End Match
+    
+    Note: Add immediate value
+    Let imm_bytes be encode_immediate_32(value)
+    For Each byte in imm_bytes:
+        encoding.append(byte)
+    End For
+    
+    Return encoding
+End Process
+
+Process called "encode_arm64_mov_immediate" that takes reg_num as Integer, value as Integer returns List[Integer]:
+    @Reasoning{
+        Encode ARM64 MOV immediate instruction.
+        Handle 16-bit immediate values with shifts.
+    }@End Reasoning
+    
+    Let encoding be List[Integer]
+    
+    Note: MOV (wide immediate) encoding
+    Let inst be 0xd2800000  Note: Base MOV instruction
+    Set inst to inst bitwise or (reg_num bitwise and 0x1f)  Note: Destination register
+    Set inst to inst bitwise or ((value bitwise and 0xffff) shifted left by 5)  Note: 16-bit immediate
+    
+    Note: Convert to little-endian bytes
+    encoding.append(inst bitwise and 0xff)
+    encoding.append((inst shifted right by 8) bitwise and 0xff)
+    encoding.append((inst shifted right by 16) bitwise and 0xff)
+    encoding.append((inst shifted right by 24) bitwise and 0xff)
+    
+    Return encoding
+End Process
+
+Process called "generate_x86_syscall" that takes syscall_num as Integer, params as List[Integer] returns List[AssemblyInstruction]:
+    @Reasoning{
+        Generate 32-bit x86 syscall sequence.
+        Uses int 0x80 for Linux 32-bit syscalls.
+    }@End Reasoning
+    
+    Let instructions be List[AssemblyInstruction]
+    
+    Note: Load syscall number into EAX
+    Let load_syscall be AssemblyInstruction with {
+        mnemonic: "mov",
+        operands: List[String]("eax", to_string(syscall_num)),
+        comment: "Load syscall number",
+        size_bytes: 5,
+        encoding: List[Integer](0xb8) joined with encode_immediate_32(syscall_num)
+    }
+    instructions.append(load_syscall)
+    
+    Note: Load parameters into registers (ebx, ecx, edx, esi, edi, ebp)
+    Let param_regs be List[String]("ebx", "ecx", "edx", "esi", "edi", "ebp")
+    For i from 0 to min(length(params), 6):
+        If i is less than length(params):
+            Let opcode be 0xb8 plus get_x86_reg_offset(param_regs.get(i))
+            Let load_param be AssemblyInstruction with {
+                mnemonic: "mov",
+                operands: List[String](param_regs.get(i), to_string(params.get(i))),
+                comment: "Load parameter " joined with to_string(i plus 1),
+                size_bytes: 5,
+                encoding: List[Integer](opcode) joined with encode_immediate_32(params.get(i))
+            }
+            instructions.append(load_param)
+        End If
+    End For
+    
+    Note: Execute interrupt
+    Let int_inst be AssemblyInstruction with {
+        mnemonic: "int",
+        operands: List[String]("0x80"),
+        comment: "Invoke system call via interrupt",
+        size_bytes: 2,
+        encoding: List[Integer](0xcd, 0x80)  Note: int 0x80 opcode
+    }
+    instructions.append(int_inst)
+    
+    Return instructions
+End Process
+
+Process called "get_x86_reg_offset" that takes reg as String returns Integer:
+    @Reasoning{
+        Get register encoding offset for x86 MOV instructions.
+    }@End Reasoning
+    
+    Match reg:
+        When "eax": Return 0
+        When "ecx": Return 1
+        When "edx": Return 2
+        When "ebx": Return 3
+        When "esp": Return 4
+        When "ebp": Return 5
+        When "esi": Return 6
+        When "edi": Return 7
+    End Match
+    
+    Return 0
+End Process
+
+Note: =====================================================================
+Note: PLATFORM-SPECIFIC GENERATION
+Note: =====================================================================
+
+Process called "generate_x86_64_syscall" that takes syscall_num as Integer, params as List[Integer] returns List[AssemblyInstruction]:
+    @Reasoning{
+        Generate x86_64 Linux syscall sequence.
+        Follow System V AMD64 ABI for Linux syscalls.
+    }@End Reasoning
+    @Implementation{
+        Load syscall number into RAX.
+        Load parameters into appropriate registers.
+        Execute syscall instruction.
+    }@End Implementation
+    
+    Let instructions be List[AssemblyInstruction]
+    
+    Note: Load syscall number into RAX
+    Let load_syscall be AssemblyInstruction with {
+        mnemonic: "mov",
+        operands: List[String]("rax", to_string(syscall_num)),
+        comment: "Load syscall number",
+        size_bytes: 7,  Note: mov rax, imm64 is typically 7 bytes
+        encoding: List[Integer](0x48, 0xc7, 0xc0) joined with encode_immediate_32(syscall_num)
+    }
+    instructions.append(load_syscall)
+    
+    Note: Load parameters into registers (rdi, rsi, rdx, r10, r8, r9)
+    Let param_regs be List[String]("rdi", "rsi", "rdx", "r10", "r8", "r9")
+    For i from 0 to min(length(params), 6):
+        If i is less than length(params):
+            Let load_param be AssemblyInstruction with {
+                mnemonic: "mov",
+                operands: List[String](param_regs.get(i), to_string(params.get(i))),
+                comment: "Load parameter " joined with to_string(i plus 1),
+                size_bytes: 7,
+                encoding: generate_mov_encoding(param_regs.get(i), params.get(i))
+            }
+            instructions.append(load_param)
+        End If
+    End For
+    
+    Note: Execute syscall
+    Let syscall_inst be AssemblyInstruction with {
+        mnemonic: "syscall",
+        operands: [],
+        comment: "Invoke system call",
+        size_bytes: 2,
+        encoding: List[Integer](0x0f, 0x05)  Note: syscall opcode
+    }
+    instructions.append(syscall_inst)
+    
+    Return instructions
+End Process
+
+Process called "generate_arm64_syscall" that takes syscall_num as Integer, params as List[Integer] returns List[AssemblyInstruction]:
+    @Reasoning{
+        Generate ARM64/AArch64 syscall sequence.
+        Follow ARM64 AAPCS calling convention.
+    }@End Reasoning
+    @Implementation{
+        Load syscall number into X8.
+        Load parameters into X0-X7.
+        Execute svc #0 instruction.
+    }@End Implementation
+    
+    Let instructions be List[AssemblyInstruction]
+    
+    Note: Load syscall number into X8
+    Let load_syscall be AssemblyInstruction with {
+        mnemonic: "mov",
+        operands: List[String]("x8", "#" joined with to_string(syscall_num)),
+        comment: "Load syscall number",
+        size_bytes: 4,  Note: ARM64 instructions are 4 bytes
+        encoding: encode_arm64_mov_immediate(8, syscall_num)
+    }
+    instructions.append(load_syscall)
+    
+    Note: Load parameters into registers (x0-x7)
+    Let param_regs be List[String]("x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7")
+    For i from 0 to min(length(params), 8):
+        If i is less than length(params):
+            Let load_param be AssemblyInstruction with {
+                mnemonic: "mov",
+                operands: List[String](param_regs.get(i), "#" joined with to_string(params.get(i))),
+                comment: "Load parameter " joined with to_string(i plus 1),
+                size_bytes: 4,
+                encoding: encode_arm64_mov_immediate(i, params[i])
+            }
+            instructions.append(load_param)
+        End If
+    End For
+    
+    Note: Execute supervisor call
+    Let svc_inst be AssemblyInstruction with {
+        mnemonic: "svc",
+        operands: List[String]("#0"),
+        comment: "Invoke system call",
+        size_bytes: 4,
+        encoding: List[Integer](0x01, 0x00, 0x00, 0xd4)  Note: svc #0 encoding
+    }
+    instructions.append(svc_inst)
+    
+    Return instructions
+End Process
+
+Process called "generate_windows_syscall" that takes syscall_num as Integer, params as List[Integer] returns List[AssemblyInstruction]:
+    @Reasoning{
+        Generate Windows NT syscall sequence.
+        Follow Windows x64 calling convention.
+    }@End Reasoning
+    @Implementation{
+        Load syscall number into RAX.
+        Load parameters according to Windows convention.
+        Allocate shadow space on stack.
+        Execute syscall instruction.
+    }@End Implementation
+    
+    Let instructions be List[AssemblyInstruction]
+    
+    Note: Allocate shadow space (32 bytes) for Windows x64 ABI
+    Let alloc_shadow be AssemblyInstruction with {
+        mnemonic: "sub",
+        operands: List[String]("rsp", "0x20"),
+        comment: "Allocate shadow space",
+        size_bytes: 4,
+        encoding: List[Integer](0x48, 0x83, 0xec, 0x20)
+    }
+    instructions.append(alloc_shadow)
+    
+    Note: Load syscall number into RAX
+    Let load_syscall be AssemblyInstruction with {
+        mnemonic: "mov",
+        operands: List[String]("rax", to_string(syscall_num)),
+        comment: "Load syscall number",
+        size_bytes: 7,
+        encoding: List[Integer](0x48, 0xc7, 0xc0) joined with encode_immediate_32(syscall_num)
+    }
+    instructions.append(load_syscall)
+    
+    Note: Windows uses r10, rdx, r8, r9 for first 4 params
+    Let param_regs be List[String]("r10", "rdx", "r8", "r9")
+    For i from 0 to min(length(params), 4):
+        If i is less than length(params):
+            Let reg be param_regs.get(i)
+            If i is equal to 0:
+                Note: First param goes in r10 (not rcx)
+                Set reg to "r10"
+            End If
+            
+            Let load_param be AssemblyInstruction with {
+                mnemonic: "mov",
+                operands: List[String](reg, to_string(params.get(i))),
+                comment: "Load parameter " joined with to_string(i plus 1),
+                size_bytes: 7,
+                encoding: generate_mov_encoding(reg, params[i])
+            }
+            instructions.append(load_param)
+        End If
+    End For
+    
+    Note: Execute syscall
+    Let syscall_inst be AssemblyInstruction with {
+        mnemonic: "syscall",
+        operands: [],
+        comment: "Invoke NT system call",
+        size_bytes: 2,
+        encoding: [0x0f, 0x05]
+    }
+    instructions.append(syscall_inst)
+    
+    Note: Restore stack
+    Let restore_stack be AssemblyInstruction with {
+        mnemonic: "add",
+        operands: List[String]("rsp", "0x20"),
+        comment: "Restore stack",
+        size_bytes: 4,
+        encoding: List[Integer](0x48, 0x83, 0xc4, 0x20)
+    }
+    instructions.append(restore_stack)
+    
+    Return instructions
+End Process
+
+Note: =====================================================================
+Note: WRAPPER FUNCTION GENERATION
+Note: =====================================================================
+
+Process called "generate_syscall_wrapper" that takes syscall_name as String, signature as String, platform as String returns String:
+    @Reasoning{
+        Generate complete wrapper function in assembly.
+        Provides a callable function interface for syscalls.
+    }@End Reasoning
+    @Implementation{
+        Create function with proper prologue/epilogue.
+        Handle stack frame and register preservation.
+    }@End Implementation
+    
+    Let wrapper be ""
+    
+    Note: Function label
+    Set wrapper to wrapper joined with ".global syscall_" joined with syscall_name joined with "\n"
+    Set wrapper to wrapper joined with "syscall_" joined with syscall_name joined with ":\n"
+    
+    Match platform:
+        When "linux_x64":
+            Note: Save frame pointer
+            Set wrapper to wrapper joined with "    push rbp\n"
+            Set wrapper to wrapper joined with "    mov rbp, rsp\n"
+            
+            Note: Get syscall number
+            Let syscall_num be SyscallDefs.get_syscall_number(syscall_name, platform)
+            Set wrapper to wrapper joined with "    mov rax, " joined with to_string(syscall_num) joined with "\n"
+            
+            Note: Parameters already in correct registers from caller
+            Set wrapper to wrapper joined with "    syscall\n"
+            
+            Note: Check for error (Linux returns negative for error)
+            Set wrapper to wrapper joined with "    cmp rax, -4095\n"
+            Set wrapper to wrapper joined with "    jae .error\n"
+            
+            Note: Restore and return
+            Set wrapper to wrapper joined with "    pop rbp\n"
+            Set wrapper to wrapper joined with "    ret\n"
+            
+            Note: Error handling
+            Set wrapper to wrapper joined with ".error:\n"
+            Set wrapper to wrapper joined with "    neg rax\n"  Note: Convert to positive errno
+            Set wrapper to wrapper joined with "    mov rdi, rax\n"
+            Set wrapper to wrapper joined with "    call __set_errno\n"
+            Set wrapper to wrapper joined with "    mov rax, -1\n"
+            Set wrapper to wrapper joined with "    pop rbp\n"
+            Set wrapper to wrapper joined with "    ret\n"
+            
+        When "linux_arm64":
+            Note: Save frame pointer and link register
+            Set wrapper to wrapper joined with "    stp x29, x30, [sp, #-16]!\n"
+            Set wrapper to wrapper joined with "    mov x29, sp\n"
+            
+            Note: Get syscall number
+            Let syscall_num be SyscallDefs.get_syscall_number(syscall_name, platform)
+            Set wrapper to wrapper joined with "    mov x8, #" joined with to_string(syscall_num) joined with "\n"
+            
+            Note: Execute syscall
+            Set wrapper to wrapper joined with "    svc #0\n"
+            
+            Note: Check for error
+            Set wrapper to wrapper joined with "    cmn x0, #4095\n"
+            Set wrapper to wrapper joined with "    b.cs .error\n"
+            
+            Note: Restore and return
+            Set wrapper to wrapper joined with "    ldp x29, x30, [sp], #16\n"
+            Set wrapper to wrapper joined with "    ret\n"
+            
+            Note: Error handling
+            Set wrapper to wrapper joined with ".error:\n"
+            Set wrapper to wrapper joined with "    neg x0, x0\n"
+            Set wrapper to wrapper joined with "    bl __set_errno\n"
+            Set wrapper to wrapper joined with "    mov x0, #-1\n"
+            Set wrapper to wrapper joined with "    ldp x29, x30, [sp], #16\n"
+            Set wrapper to wrapper joined with "    ret\n"
+    End Match
+    
+    Return wrapper
+End Process
+
+Process called "generate_error_handling" that takes platform as String returns List[AssemblyInstruction]:
+    @Reasoning{
+        Generate error checking code after syscall.
+        Different platforms have different error conventions.
+    }@End Reasoning
+    @Implementation{
+        Check for error conditions.
+        Convert error codes to errno format.
+    }@End Implementation
+    
+    Let instructions be List[AssemblyInstruction]
+    
+    Match platform:
+        When "linux_x64", "freebsd_x64", "netbsd_x64":
+            Note: Linux/BSD: errors are negative values from -1 to -4095
+            Let check_error be AssemblyInstruction with {
+                mnemonic: "cmp",
+                operands: List[String]("rax", "-4095"),
+                comment: "Check for error",
+                size_bytes: 6,
+                encoding: List[Integer](0x48, 0x3d, 0x01, 0xf0, 0xff, 0xff)
+            }
+            instructions.append(check_error)
+            
+            Let jump_if_ok be AssemblyInstruction with {
+                mnemonic: "jb",
+                operands: List[String](".no_error"),
+                comment: "Jump if no error",
+                size_bytes: 2,
+                encoding: List[Integer](0x72, 0x00)  Note: Offset to be patched
+            }
+            instructions.append(jump_if_ok)
+            
+            Note: Negate to get positive errno
+            Let negate be AssemblyInstruction with {
+                mnemonic: "neg",
+                operands: List[String]("rax"),
+                comment: "Convert to errno",
+                size_bytes: 3,
+                encoding: List[Integer](0x48, 0xf7, 0xd8)
+            }
+            instructions.append(negate)
+            
+        When "darwin_x64":
+            Note: macOS: carry flag indicates error
+            Let jump_if_no_carry be AssemblyInstruction with {
+                mnemonic: "jnc",
+                operands: List[String](".no_error"),
+                comment: "Jump if no error (carry clear)",
+                size_bytes: 2,
+                encoding: List[Integer](0x73, 0x00)  Note: Offset to be patched
+            }
+            instructions.append(jump_if_no_carry)
+            
+        When "windows_x64":
+            Note: Windows: negative NTSTATUS indicates error
+            Let test_sign be AssemblyInstruction with {
+                mnemonic: "test",
+                operands: List[String]("rax", "rax"),
+                comment: "Test sign bit",
+                size_bytes: 3,
+                encoding: List[Integer](0x48, 0x85, 0xc0)
+            }
+            instructions.append(test_sign)
+            
+            Let jump_if_positive be AssemblyInstruction with {
+                mnemonic: "jns",
+                operands: List[String](".no_error"),
+                comment: "Jump if positive (no error)",
+                size_bytes: 2,
+                encoding: List[Integer](0x79, 0x00)  Note: Offset to be patched
+            }
+            instructions.append(jump_if_positive)
+    End Match
+    
+    Return instructions
+End Process
+
+Note: =====================================================================
+Note: OPTIMIZATION AND SPECIAL CASES
+Note: =====================================================================
+
+Process called "generate_batched_syscalls" that takes syscalls as List[String], platform as String returns SyscallAssemblyBlock:
+    @Reasoning{
+        Generate optimized batched syscall sequences.
+        Minimize kernel transitions for better performance.
+    }@End Reasoning
+    @Implementation{
+        Use io_uring on Linux for batching.
+        Otherwise generate sequential syscalls with optimized register usage.
+    }@End Implementation
+    
+    Let block be SyscallAssemblyBlock with {
+        platform: platform,
+        architecture: get_arch_for_platform(platform),
+        prologue: List[AssemblyInstruction](),
+        syscall_instruction: AssemblyInstruction with {
+            mnemonic: "nop",
+            operands: List[String](),
+            comment: "Batched syscalls",
+            size_bytes: 1,
+            encoding: List[Integer](0x90)
+        },
+        epilogue: List[AssemblyInstruction](),
+        total_size: 0,
+        clobber_list: List[String]()
+    }
+    
+    If platform is equal to "linux_x64" and syscalls_support_io_uring(syscalls):
+        Note: Use io_uring for batching
+        Let setup_uring be AssemblyInstruction with {
+            mnemonic: "mov",
+            operands: List[String]("rax", "425"),  Note: io_uring_setup syscall
+            comment: "Setup io_uring",
+            size_bytes: 7,
+            encoding: List[Integer](0x48, 0xc7, 0xc0, 0xa9, 0x01, 0x00, 0x00)
+        }
+        block.prologue.append(setup_uring)
+        
+        Note: Add SQEs for each syscall
+        For Each syscall in syscalls:
+            Let sqe_setup be generate_io_uring_sqe(syscall)
+            For Each inst in sqe_setup:
+                block.prologue.append(inst)
+            End For
+        End For
+        
+        Note: Submit batch
+        Let submit be AssemblyInstruction with {
+            mnemonic: "mov",
+            operands: List[String]("rax", "426"),  Note: io_uring_enter
+            comment: "Submit batch",
+            size_bytes: 7,
+            encoding: List[Integer](0x48, 0xc7, 0xc0, 0xaa, 0x01, 0x00, 0x00)
+        }
+        Set block.syscall_instruction to submit
+        
+    Otherwise:
+        Note: Generate sequential syscalls with register preservation
+        For Each syscall in syscalls:
+            Let syscall_num be SyscallDefs.get_syscall_number(syscall, platform)
+            
+            Note: Save result of previous syscall if needed
+            If length(block.prologue) is greater than 0:
+                Let save_result be AssemblyInstruction with {
+                    mnemonic: "push",
+                    operands: List[String]("rax"),
+                    comment: "Save previous result",
+                    size_bytes: 1,
+                    encoding: List[Integer](0x50)
+                }
+                block.prologue.append(save_result)
+            End If
+            
+            Note: Generate syscall
+            Let syscall_inst be generate_x86_64_syscall(syscall_num, List[Integer]())
+            For Each inst in syscall_inst:
+                block.prologue.append(inst)
+            End For
+        End For
+    End If
+    
+    Note: Calculate total size
+    For Each inst in block.prologue:
+        Set block.total_size to block.total_size plus inst.size_bytes
+    End For
+    Set block.total_size to block.total_size plus block.syscall_instruction.size_bytes
+    
+    Return block
+End Process
+
+Process called "generate_vdso_call" that takes function_name as String, params as List[Integer] returns List[AssemblyInstruction]:
+    @Reasoning{
+        Generate call to VDSO function for fast userspace syscalls.
+        Avoids kernel transition for time-related calls.
+    }@End Reasoning
+    @Implementation{
+        Load VDSO function address.
+        Call function directly in userspace.
+    }@End Implementation
+    
+    Let instructions be List[AssemblyInstruction]
+    
+    Note: Check if function is available in VDSO
+    Let vdso_functions be List[String]("clock_gettime", "gettimeofday", "time", "getcpu")
+    If not (vdso_functions contains function_name):
+        Note: Fall back to regular syscall
+        Return generate_x86_64_syscall(SyscallDefs.get_syscall_number(function_name, "linux_x64"), params)
+    End If
+    
+    Note: Load VDSO base address (typically from auxiliary vector)
+    Let load_vdso_base be AssemblyInstruction with {
+        mnemonic: "mov",
+        operands: List[String]("rax", "[__vdso_base]"),
+        comment: "Load VDSO base address",
+        size_bytes: 7,
+        encoding: List[Integer](0x48, 0x8b, 0x05, 0x00, 0x00, 0x00, 0x00)  Note: Needs relocation
+    }
+    instructions.append(load_vdso_base)
+    
+    Note: Calculate function offset
+    Let func_offset be get_vdso_function_offset(function_name)
+    Let add_offset be AssemblyInstruction with {
+        mnemonic: "add",
+        operands: List[String]("rax", to_string(func_offset)),
+        comment: "Add function offset",
+        size_bytes: 6,
+        encoding: List[Integer](0x48, 0x05) joined with encode_immediate_32(func_offset)
+    }
+    instructions.append(add_offset)
+    
+    Note: Load parameters (same as syscall convention)
+    Let param_regs be List[String]("rdi", "rsi", "rdx", "r10", "r8", "r9")
+    For i from 0 to min(length(params), 6):
+        If i is less than length(params):
+            Let load_param be AssemblyInstruction with {
+                mnemonic: "mov",
+                operands: List[String](param_regs.get(i), to_string(params.get(i))),
+                comment: "Load parameter " joined with to_string(i plus 1),
+                size_bytes: 7,
+                encoding: generate_mov_encoding(param_regs.get(i), params.get(i))
+            }
+            instructions.append(load_param)
+        End If
+    End For
+    
+    Note: Call VDSO function
+    Let call_vdso be AssemblyInstruction with {
+        mnemonic: "call",
+        operands: List[String]("rax"),
+        comment: "Call VDSO function",
+        size_bytes: 2,
+        encoding: List[Integer](0xff, 0xd0)  Note: call rax
+    }
+    instructions.append(call_vdso)
+    
+    Return instructions
+End Process
+
+Note: =====================================================================
+Note: CODE EMISSION
+Note: =====================================================================
+
+Process called "emit_assembly_bytes" that takes instructions as List[AssemblyInstruction] returns List[Integer]:
+    @Reasoning{
+        Convert assembly instructions to machine code bytes.
+        Handle encoding and potential relocations.
+    }@End Reasoning
+    @Implementation{
+        Concatenate instruction encodings.
+        Apply any necessary fixups.
+    }@End Implementation
+    
+    Let machine_code be List[Integer]
+    Let current_offset be 0
+    
+    For Each instruction in instructions:
+        Note: Add instruction bytes
+        For Each byte in instruction.encoding:
+            machine_code.append(byte)
+        End For
+        
+        Note: Track offset for branch fixups
+        Set current_offset to current_offset plus instruction.size_bytes
+        
+        Note: Apply branch offset fixups with full symbol resolution
+        If instruction.mnemonic starts_with "j":
+            Note: Resolve jump targets using complete symbol table
+            If length(instruction.operands) is greater than 0 and instruction.operands.get(0) starts_with ".":
+                Note: Calculate relative offset to label
+                Let target_offset be resolve_label_offset(instruction.operands.get(0), current_offset, instructions)
+                Let relative_offset be target_offset minus current_offset
+                
+                Note: Patch the offset byte(s)
+                If instruction.size_bytes is equal to 2:
+                    machine_code.set(length(machine_code) minus 1, relative_offset bitwise and 0xff)
+                Otherwise If instruction.size_bytes is equal to 6:
+                    Note: 32-bit relative offset
+                    machine_code.set(length(machine_code) minus 4, relative_offset bitwise and 0xff)
+                    machine_code.set(length(machine_code) minus 3, (relative_offset shifted right by 8) bitwise and 0xff)
+                    machine_code.set(length(machine_code) minus 2, (relative_offset shifted right by 16) bitwise and 0xff)
+                    machine_code.set(length(machine_code) minus 1, (relative_offset shifted right by 24) bitwise and 0xff)
+                End If
+            End If
+        End If
+    End For
+    
+    Return machine_code
+End Process
+
+Process called "emit_debug_symbols" that takes syscall_name as String, assembly as SyscallAssemblyBlock returns Dictionary[String, Any]:
+    @Reasoning{
+        Generate debug symbols for syscall code.
+        Enables debugging and profiling of syscall usage.
+    }@End Reasoning
+    @Implementation{
+        Create symbol table entries.
+        Generate DWARF-like debug information.
+    }@End Implementation
+    
+    Let debug_info be Dictionary[String, Any]
+    
+    Note: Basic symbol information
+    Set debug_info["symbol_name" to "syscall_" joined with syscall_name
+    Set debug_info["symbol_type" to "FUNC"
+    Set debug_info["symbol_size" to assembly.total_size
+    Set debug_info["platform" to assembly.platform
+    Set debug_info["architecture" to assembly.architecture
+    
+    Note: Instruction mapping for debugging
+    Let instruction_map be List[Dictionary[String, Any]]
+    Let offset be 0
+    
+    For Each inst in assembly.prologue:
+        Let inst_info be Dictionary[String, Any]
+        Set inst_info["offset" to offset
+        Set inst_info["mnemonic" to inst.mnemonic
+        Set inst_info["operands" to inst.operands
+        Set inst_info["size" to inst.size_bytes
+        Set inst_info["comment" to inst.comment
+        instruction_map.append(inst_info)
+        Set offset to offset plus inst.size_bytes
+    End For
+    
+    Note: Add syscall instruction
+    Let syscall_info be Dictionary[String, Any]
+    Set syscall_info["offset" to offset
+    Set syscall_info["mnemonic" to assembly.syscall_instruction.mnemonic
+    Set syscall_info["operands" to assembly.syscall_instruction.operands
+    Set syscall_info["size" to assembly.syscall_instruction.size_bytes
+    Set syscall_info["is_syscall" to true
+    instruction_map.append(syscall_info)
+    Set offset to offset plus assembly.syscall_instruction.size_bytes
+    
+    For Each inst in assembly.epilogue:
+        Let inst_info be Dictionary[String, Any]
+        Set inst_info["offset" to offset
+        Set inst_info["mnemonic" to inst.mnemonic
+        Set inst_info["operands" to inst.operands
+        Set inst_info["size" to inst.size_bytes
+        Set inst_info["comment" to inst.comment
+        instruction_map.append(inst_info)
+        Set offset to offset plus inst.size_bytes
+    End For
+    
+    Set debug_info["instructions" to instruction_map
+    
+    Note: Register usage information
+    Set debug_info["clobbered_registers" to assembly.clobber_list
+    
+    Note: Source location (if available)
+    Set debug_info["source_file" to "syscall_generator.runa"
+    Set debug_info["source_function" to "generate_syscall_assembly"
+    
+    Return debug_info
+End Process
+
+Note: =====================================================================
+Note: UTILITY FUNCTIONS
+Note: =====================================================================
+
+Process called "get_arch_for_platform" that takes platform as String returns String:
+    @Reasoning{
+        Map platform identifier to architecture.
+    }@End Reasoning
+    
+    Match platform:
+        When "linux_x64", "freebsd_x64", "openbsd_x64", "netbsd_x64", "darwin_x64", "windows_x64":
+            Return "x86_64"
+        When "linux_arm64", "darwin_arm64":
+            Return "aarch64"
+        When "linux_x86":
+            Return "x86"
+    End Match
+    
+    Return "unknown"
+End Process
+
+Process called "syscalls_support_io_uring" that takes syscalls as List[String] returns Boolean:
+    @Reasoning{
+        Check if syscalls can be batched using io_uring.
+    }@End Reasoning
+    
+    Let supported be List[String]("read", "write", "readv", "writev", "fsync", "poll", "accept", "connect", "send", "recv")
+    
+    For Each syscall in syscalls:
+        If not (supported contains syscall):
+            Return false
+        End If
+    End For
+    
+    Return true
+End Process
+
+Process called "generate_io_uring_sqe" that takes syscall as String returns List[AssemblyInstruction]:
+    @Reasoning{
+        Generate Submission Queue Entry for io_uring.
+    }@End Reasoning
+    
+    Let instructions be List[AssemblyInstruction]
+    
+    Note: Generate complete SQE setup for io_uring submission
+    Let setup_sqe be AssemblyInstruction with {
+        mnemonic: "mov",
+        operands: List[String]("[rdi]", "rax"),
+        comment: "Setup SQE for " joined with syscall,
+        size_bytes: 3,
+        encoding: List[Integer](0x48, 0x89, 0x07)
+    }
+    instructions.append(setup_sqe)
+    
+    Return instructions
+End Process
+
+Process called "get_vdso_function_offset" that takes function_name as String returns Integer:
+    @Reasoning{
+        Get offset of function in VDSO.
+        Calculate actual offsets based on VDSO structure.
+    }@End Reasoning
+    
+    Note: VDSO function offsets must be calculated based on ELF structure
+    Note: Each function in VDSO has a specific entry point offset
+    
+    Note: Calculate base offsets for common VDSO functions
+    Let vdso_header_size be 64  Note: ELF header size
+    Let program_header_size be 56  Note: Program header entry size
+    Let num_program_headers be 4  Note: Typical VDSO has 4 program headers
+    Let text_section_offset be vdso_header_size plus (program_header_size times num_program_headers)
+    
+    Note: Each VDSO function has predictable offset from text section
+    Match function_name:
+        When "clock_gettime": 
+            Note: clock_gettime is typically first function
+            Return text_section_offset plus 0x400
+        When "gettimeofday": 
+            Note: gettimeofday follows clock_gettime
+            Return text_section_offset plus 0x800
+        When "time": 
+            Note: time is a smaller function
+            Return text_section_offset plus 0xa00
+        When "getcpu": 
+            Note: getcpu is near the end
+            Return text_section_offset plus 0xe00
+    End Match
+    
+    Note: Unknown function
+    Return text_section_offset
+End Process
+
+Process called "resolve_label_offset" that takes label as String, current_position as Integer, instructions as List[AssemblyInstruction] returns Integer:
+    @Reasoning{
+        Resolve label to offset for branch instructions.
+        Scan through instructions to find label positions.
+    }@End Reasoning
+    
+    Note: Build symbol table from instruction stream
+    Let symbol_table be Dictionary[String, Integer]()
+    Let offset be 0
+    
+    Note: First pass: collect all label positions
+    For Each inst in instructions:
+        Note: Check if this instruction defines a label
+        If inst.mnemonic is equal to "label" and inst.operands.get(0) is equal to label:
+            symbol_table.set(label, offset)
+        End If
+        Set offset to offset plus inst.size_bytes
+    End For
+    
+    Note: Second pass: handle implicit labels from error handling
+    If label is equal to ".no_error":
+        Note: Calculate offset past error handling block
+        Let error_block_size be 0
+        Let found_error be false
+        For Each inst in instructions:
+            If inst.comment contains "error":
+                Set found_error to true
+            End If
+            If found_error:
+                Set error_block_size to error_block_size plus inst.size_bytes
+            End If
+        End For
+        Return current_position plus error_block_size plus 2  Note: Account for jump instruction
+    End If
+    
+    If label is equal to ".error":
+        Note: Calculate offset to error handling block
+        Let offset_to_error be 0
+        For Each inst in instructions:
+            If inst.comment contains "Error handling" or inst.comment contains "error":
+                Return offset_to_error
+            End If
+            Set offset_to_error to offset_to_error plus inst.size_bytes
+        End For
+    End If
+    
+    Note: Look up in symbol table
+    If symbol_table.has_key(label):
+        Return symbol_table.get(label)
+    End If
+    
+    Note: Label not found, return current position as fallback
+    Return current_position
+End Process

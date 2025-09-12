@@ -1,0 +1,410 @@
+Note:
+Mid-Level Intermediate Representation (MIR) Builder Module
+
+This module provides comprehensive MIR construction capabilities for the Runa
+compiler. It transforms High-Level IR (HIR) into a mid-level intermediate 
+representation that normalizes control flow, converts to SSA form, and prepares
+for optimization passes. MIR represents a lower-level abstraction suitable for
+aggressive optimization while maintaining semantic clarity.
+
+Core responsibilities:
+- HIR to MIR transformation with control flow normalization
+- Static Single Assignment (SSA) form conversion
+- Basic block generation and control flow graph construction
+- Variable lifetime analysis and phi node insertion
+- Exception handling lowering and cleanup code generation
+- Function call lowering and parameter passing conventions
+:End Note
+
+Import "compiler/frontend/diagnostics/errors" as Errors
+
+Note: ===== MIR Builder Configuration Types =====
+
+Type called "MIRBuilderConfig":
+    enable_ssa_form as Boolean            Note: Whether to convert to SSA form
+    optimize_basic_blocks as Boolean      Note: Optimize basic blocks during construction
+    insert_debug_info as Boolean          Note: Insert debug information
+    validate_construction as Boolean      Note: Validate MIR during construction
+    preserve_source_mapping as Boolean    Note: Preserve mapping to original source
+    generate_dominator_tree as Boolean    Note: Generate dominator tree during construction
+    enable_phi_placement as Boolean       Note: Enable phi node placement optimization
+
+Type called "MIRBuildContext":
+    context_id as String                  Note: Unique build context identifier
+    source_hir as HIRProgram              Note: Source HIR being transformed
+    current_function as Optional[MIRFunction] Note: Function being processed
+    current_block as Optional[BasicBlockId] Note: Current basic block
+    variable_versions as Dictionary[String, Integer] Note: SSA variable versioning
+    phi_nodes as Dictionary[BasicBlockId, List[PhiNode]] Note: Phi nodes by block
+    dominator_info as Optional[DominatorInfo] Note: Dominator tree information
+    loop_info as Optional[LoopInfo]       Note: Loop analysis information
+    diagnostics as List[Diagnostic]       Note: Construction diagnostics
+
+Type called "SSAConstructionState":
+    variable_stack as Dictionary[String, Stack[SSAValue]] Note: Variable definition stack
+    incomplete_phi_nodes as List[IncompletePhiNode] Note: Phi nodes needing completion
+    sealed_blocks as Set[BasicBlockId]    Note: Blocks with complete predecessors
+    filled_blocks as Set[BasicBlockId]    Note: Blocks with complete instructions
+    current_definitions as Dictionary[String, SSAValue] Note: Current variable definitions
+
+Type called "IncompletePhiNode":
+    phi_id as String                      Note: Unique phi node identifier
+    variable_name as String               Note: Variable being merged
+    block_id as BasicBlockId              Note: Block containing phi node
+    operands as List[PhiOperand]          Note: Phi node operands
+
+Note: ===== Control Flow Analysis Types =====
+
+Type called "ControlFlowAnalysis":
+    entry_block as BasicBlockId           Note: Function entry block
+    exit_blocks as List[BasicBlockId]     Note: Function exit blocks
+    basic_blocks as Dictionary[BasicBlockId, MIRBasicBlock] Note: All basic blocks
+    edges as List[ControlFlowEdge]        Note: Control flow edges
+    back_edges as List[ControlFlowEdge]   Note: Loop back edges
+    critical_edges as List[ControlFlowEdge] Note: Critical edges requiring splitting
+    unreachable_blocks as List[BasicBlockId] Note: Unreachable basic blocks
+
+Type called "DominatorInfo":
+    dominator_tree as DominatorTree       Note: Dominator tree structure
+    dominance_frontiers as Dictionary[BasicBlockId, Set[BasicBlockId]] Note: Dominance frontiers
+    immediate_dominators as Dictionary[BasicBlockId, BasicBlockId] Note: Immediate dominators
+    dominated_blocks as Dictionary[BasicBlockId, Set[BasicBlockId]] Note: Blocks dominated by each block
+
+Type called "LoopInfo":
+    natural_loops as List[NaturalLoop]    Note: Natural loops in function
+    loop_headers as Set[BasicBlockId]     Note: Loop header blocks
+    loop_nesting as Dictionary[BasicBlockId, Integer] Note: Loop nesting depth
+    irreducible_loops as List[IrreducibleLoop] Note: Irreducible control flow
+
+Type called "NaturalLoop":
+    loop_id as String                     Note: Unique loop identifier
+    header as BasicBlockId                Note: Loop header block
+    back_edge_sources as List[BasicBlockId] Note: Blocks with back edges to header
+    body_blocks as Set[BasicBlockId]      Note: All blocks in loop body
+    exit_blocks as Set[BasicBlockId]      Note: Blocks that exit the loop
+    nesting_level as Integer              Note: Loop nesting level
+
+Note: ===== HIR to MIR Mapping Types =====
+
+Type called "HIRToMIRMapping":
+    hir_to_mir_nodes as Dictionary[HIRNodeId, List[MIRInstruction]] Note: HIR node to MIR instructions
+    mir_to_hir_nodes as Dictionary[MIRInstructionId, HIRNodeId] Note: MIR instruction to HIR node
+    variable_mappings as Dictionary[String, SSAValue] Note: Variable name to SSA value
+    type_mappings as Dictionary[HIRNodeId, MIRType] Note: HIR type to MIR type mapping
+    source_locations as Dictionary[MIRInstructionId, SourceLocation] Note: Source location mapping
+
+Type called "VariableLifetime":
+    variable_name as String               Note: Original variable name
+    ssa_values as List[SSAValue]          Note: All SSA values for this variable
+    definition_points as List[MIRInstructionId] Note: Where variable is defined
+    use_points as List[MIRInstructionId]  Note: Where variable is used
+    live_ranges as List[LiveRange]        Note: Variable live ranges
+
+Type called "LiveRange":
+    start_instruction as MIRInstructionId Note: First instruction in range
+    end_instruction as MIRInstructionId   Note: Last instruction in range
+    basic_block as BasicBlockId           Note: Basic block containing range
+    interference_set as Set[SSAValue]     Note: Values that interfere with this range
+
+Note: ===== Exception Handling Types =====
+
+Type called "ExceptionHandlingInfo":
+    try_blocks as List[TryBlock]          Note: Try blocks in function
+    catch_blocks as List[CatchBlock]      Note: Catch blocks in function
+    finally_blocks as List[FinallyBlock]  Note: Finally blocks in function
+    cleanup_blocks as List[CleanupBlock]  Note: Cleanup blocks for unwinding
+    exception_edges as List[ExceptionEdge] Note: Exceptional control flow edges
+
+Type called "TryBlock":
+    try_id as String                      Note: Unique try block identifier
+    protected_blocks as Set[BasicBlockId] Note: Blocks protected by try
+    handlers as List[ExceptionHandler]    Note: Exception handlers for this try
+    finally_handler as Optional[FinallyHandler] Note: Finally handler if present
+
+Type called "ExceptionHandler":
+    handler_id as String                  Note: Unique handler identifier
+    exception_types as List[MIRType]      Note: Exception types handled
+    handler_block as BasicBlockId         Note: Handler basic block
+    catch_variable as Optional[SSAValue]  Note: Variable to bind caught exception
+
+Type called "FinallyHandler":
+    handler_id as String                  Note: Unique finally handler identifier
+    finally_block as BasicBlockId         Note: Finally block
+    cleanup_actions as List[CleanupAction] Note: Cleanup actions to perform
+
+Note: ===== Core MIR Construction Functions =====
+
+Process called "initialize_mir_builder" that takes config as MIRBuilderConfig returns MIRBuilder:
+    Note: Initializes MIR builder with configuration settings
+    Note: Sets up SSA construction state and analysis frameworks
+    Note: Time complexity: O(1), Space complexity: O(1)
+    Note: TODO: Implement MIR builder initialization
+    Throw Errors.NotImplemented
+
+Process called "build_mir_from_hir" that takes hir as HIRProgram, context as MIRBuildContext returns MIRProgram:
+    Note: Transforms complete HIR program into MIR representation
+    Note: Main entry point for HIR to MIR transformation
+    Note: Time complexity: O(n) where n is HIR nodes, Space complexity: O(m) where m is MIR instructions
+    Note: TODO: Implement comprehensive HIR to MIR transformation
+    Throw Errors.NotImplemented
+
+Process called "build_mir_function" that takes hir_function as HIRFunction, context as MIRBuildContext returns MIRFunction:
+    Note: Transforms HIR function into MIR function with basic blocks
+    Note: Performs control flow analysis and SSA construction
+    Note: Time complexity: O(f) where f is function complexity, Space complexity: O(f)
+    Note: TODO: Implement MIR function construction
+    Throw Errors.NotImplemented
+
+Process called "build_mir_module" that takes hir_module as HIRModule, context as MIRBuildContext returns MIRModule:
+    Note: Transforms HIR module into MIR module representation
+    Note: Handles module-level declarations and global variables
+    Note: Time complexity: O(d) where d is declarations, Space complexity: O(d)
+    Note: TODO: Implement MIR module construction
+    Throw Errors.NotImplemented
+
+Note: ===== Basic Block Construction Functions =====
+
+Process called "create_basic_blocks" that takes hir_function as HIRFunction, context as MIRBuildContext returns List[MIRBasicBlock]:
+    Note: Creates basic blocks from HIR function control flow
+    Note: Identifies block boundaries and creates block structure
+    Note: Time complexity: O(s) where s is statements, Space complexity: O(b) where b is blocks
+    Note: TODO: Implement basic block creation
+    Throw Errors.NotImplemented
+
+Process called "split_at_control_flow" that takes statements as List[HIRStatement] returns List[BasicBlockBoundary]:
+    Note: Identifies where to split statements into basic blocks
+    Note: Finds branch points, jump targets, and exception boundaries
+    Note: Time complexity: O(s), Space complexity: O(b)
+    Note: TODO: Implement control flow splitting
+    Throw Errors.NotImplemented
+
+Process called "connect_basic_blocks" that takes blocks as List[MIRBasicBlock] returns ControlFlowGraph:
+    Note: Connects basic blocks with control flow edges
+    Note: Builds complete control flow graph with edge annotations
+    Note: Time complexity: O(b²) in worst case, Space complexity: O(e) where e is edges
+    Note: TODO: Implement basic block connection
+    Throw Errors.NotImplemented
+
+Process called "optimize_basic_blocks" that takes blocks as List[MIRBasicBlock] returns List[MIRBasicBlock]:
+    Note: Optimizes basic blocks by merging and cleaning up
+    Note: Removes empty blocks and straightens control flow
+    Note: Time complexity: O(b * i) where i is instructions per block, Space complexity: O(b)
+    Note: TODO: Implement basic block optimization
+    Throw Errors.NotImplemented
+
+Process called "insert_critical_edge_splits" that takes cfg as ControlFlowGraph returns ControlFlowGraph:
+    Note: Splits critical edges by inserting empty basic blocks
+    Note: Ensures each critical edge has a dedicated block
+    Note: Time complexity: O(e), Space complexity: O(c) where c is critical edges
+    Note: TODO: Implement critical edge splitting
+    Throw Errors.NotImplemented
+
+Note: ===== SSA Form Construction Functions =====
+
+Process called "convert_to_ssa_form" that takes function as MIRFunction, context as MIRBuildContext returns MIRFunction:
+    Note: Converts MIR function to Static Single Assignment form
+    Note: Inserts phi functions and renames variables
+    Note: Time complexity: O(n * α(n)) where α is inverse Ackermann, Space complexity: O(n)
+    Note: TODO: Implement SSA form conversion
+    Throw Errors.NotImplemented
+
+Process called "insert_phi_functions" that takes function as MIRFunction, dominance_frontiers as Dictionary[BasicBlockId, Set[BasicBlockId]] returns MIRFunction:
+    Note: Inserts phi functions at join points in control flow
+    Note: Places phi functions based on dominance frontier analysis
+    Note: Time complexity: O(v * d) where v is variables, d is dominance frontier size, Space complexity: O(p) where p is phi functions
+    Note: TODO: Implement phi function insertion
+    Throw Errors.NotImplemented
+
+Process called "rename_variables_ssa" that takes function as MIRFunction, context as MIRBuildContext returns MIRFunction:
+    Note: Renames variables to satisfy SSA property
+    Note: Each variable definition gets unique name
+    Note: Time complexity: O(n), Space complexity: O(v) where v is variable versions
+    Note: TODO: Implement SSA variable renaming
+    Throw Errors.NotImplemented
+
+Process called "compute_dominance_frontiers" that takes cfg as ControlFlowGraph returns Dictionary[BasicBlockId, Set[BasicBlockId]]:
+    Note: Computes dominance frontiers for all basic blocks
+    Note: Identifies where phi functions need to be placed
+    Note: Time complexity: O(n²), Space complexity: O(n²)
+    Note: TODO: Implement dominance frontier computation
+    Throw Errors.NotImplemented
+
+Process called "build_dominator_tree" that takes cfg as ControlFlowGraph returns DominatorTree:
+    Note: Builds dominator tree using Lengauer-Tarjan algorithm
+    Note: Computes immediate dominators and dominator relationships
+    Note: Time complexity: O(n * α(n)), Space complexity: O(n)
+    Note: TODO: Implement dominator tree construction
+    Throw Errors.NotImplemented
+
+Note: ===== Instruction Lowering Functions =====
+
+Process called "lower_hir_expression" that takes hir_expr as HIRExpression, context as MIRBuildContext returns List[MIRInstruction]:
+    Note: Lowers HIR expression to sequence of MIR instructions
+    Note: Breaks down complex expressions into simple operations
+    Note: Time complexity: O(e) where e is expression complexity, Space complexity: O(i) where i is instructions
+    Note: TODO: Implement HIR expression lowering
+    Throw Errors.NotImplemented
+
+Process called "lower_hir_statement" that takes hir_stmt as HIRStatement, context as MIRBuildContext returns List[MIRInstruction]:
+    Note: Lowers HIR statement to sequence of MIR instructions
+    Note: Handles control flow and variable assignments
+    Note: Time complexity: O(s), Space complexity: O(i)
+    Note: TODO: Implement HIR statement lowering
+    Throw Errors.NotImplemented
+
+Process called "lower_function_call" that takes call as HIRFunctionCall, context as MIRBuildContext returns List[MIRInstruction]:
+    Note: Lowers function call to MIR calling convention
+    Note: Handles parameter passing and return value handling
+    Note: Time complexity: O(p) where p is parameter count, Space complexity: O(p)
+    Note: TODO: Implement function call lowering
+    Throw Errors.NotImplemented
+
+Process called "lower_control_flow" that takes control as HIRStatement, context as MIRBuildContext returns List[MIRInstruction]:
+    Note: Lowers control flow statements to MIR jumps and branches
+    Note: Transforms high-level control flow to basic blocks
+    Note: Time complexity: O(b) where b is branch complexity, Space complexity: O(i)
+    Note: TODO: Implement control flow lowering
+    Throw Errors.NotImplemented
+
+Process called "lower_variable_access" that takes access as HIRExpression, context as MIRBuildContext returns List[MIRInstruction]:
+    Note: Lowers variable access to MIR load/store instructions
+    Note: Handles local variables, parameters, and global variables
+    Note: Time complexity: O(1), Space complexity: O(1)
+    Note: TODO: Implement variable access lowering
+    Throw Errors.NotImplemented
+
+Note: ===== Type System Lowering Functions =====
+
+Process called "lower_hir_type" that takes hir_type as TypeSignature, context as MIRBuildContext returns MIRType:
+    Note: Lowers HIR type to MIR type representation
+    Note: Resolves generic types and computes layout information
+    Note: Time complexity: O(t) where t is type complexity, Space complexity: O(1)
+    Note: TODO: Implement HIR to MIR type lowering
+    Throw Errors.NotImplemented
+
+Process called "compute_type_layout" that takes mir_type as MIRType returns TypeLayout:
+    Note: Computes memory layout for MIR type
+    Note: Determines size, alignment, and field offsets
+    Note: Time complexity: O(f) where f is field count, Space complexity: O(1)
+    Note: TODO: Implement MIR type layout computation
+    Throw Errors.NotImplemented
+
+Process called "lower_generic_instantiation" that takes generic_type as TypeSignature, type_args as List[TypeSignature], context as MIRBuildContext returns MIRType:
+    Note: Lowers generic type instantiation to concrete MIR type
+    Note: Substitutes type parameters with concrete types
+    Note: Time complexity: O(g) where g is generic parameters, Space complexity: O(1)
+    Note: TODO: Implement generic type instantiation lowering
+    Throw Errors.NotImplemented
+
+Note: ===== Exception Handling Lowering Functions =====
+
+Process called "lower_exception_handling" that takes hir_function as HIRFunction, context as MIRBuildContext returns ExceptionHandlingInfo:
+    Note: Lowers exception handling constructs to MIR representation
+    Note: Creates exception tables and cleanup code
+    Note: Time complexity: O(h) where h is handler count, Space complexity: O(h)
+    Note: TODO: Implement exception handling lowering
+    Throw Errors.NotImplemented
+
+Process called "create_cleanup_blocks" that takes try_blocks as List[TryBlock], context as MIRBuildContext returns List[CleanupBlock]:
+    Note: Creates cleanup blocks for exception unwinding
+    Note: Generates code to clean up resources during unwinding
+    Note: Time complexity: O(t * r) where t is try blocks, r is resources, Space complexity: O(c) where c is cleanup blocks
+    Note: TODO: Implement cleanup block creation
+    Throw Errors.NotImplemented
+
+Process called "insert_exception_edges" that takes cfg as ControlFlowGraph, exception_info as ExceptionHandlingInfo returns ControlFlowGraph:
+    Note: Inserts exceptional control flow edges into CFG
+    Note: Connects throwing instructions to exception handlers
+    Note: Time complexity: O(i * h) where i is instructions, h is handlers, Space complexity: O(e) where e is exception edges
+    Note: TODO: Implement exception edge insertion
+    Throw Errors.NotImplemented
+
+Note: ===== Variable Lifetime Analysis Functions =====
+
+Process called "analyze_variable_lifetimes" that takes function as MIRFunction returns Dictionary[SSAValue, VariableLifetime]:
+    Note: Analyzes lifetimes of all variables in MIR function
+    Note: Computes live ranges and interference information
+    Note: Time complexity: O(n²) in worst case, Space complexity: O(v * r) where v is variables, r is ranges
+    Note: TODO: Implement variable lifetime analysis
+    Throw Errors.NotImplemented
+
+Process called "compute_live_sets" that takes function as MIRFunction returns LivenessInfo:
+    Note: Computes live-in and live-out sets for all basic blocks
+    Note: Uses dataflow analysis to determine variable liveness
+    Note: Time complexity: O(b * i * v) where b is blocks, i is iterations, v is variables, Space complexity: O(b * v)
+    Note: TODO: Implement liveness analysis
+    Throw Errors.NotImplemented
+
+Process called "build_interference_graph" that takes lifetimes as Dictionary[SSAValue, VariableLifetime] returns InterferenceGraph:
+    Note: Builds interference graph showing which variables interfere
+    Note: Two variables interfere if their live ranges overlap
+    Note: Time complexity: O(v²), Space complexity: O(e) where e is interference edges
+    Note: TODO: Implement interference graph construction
+    Throw Errors.NotImplemented
+
+Process called "optimize_variable_placement" that takes function as MIRFunction, lifetimes as Dictionary[SSAValue, VariableLifetime] returns MIRFunction:
+    Note: Optimizes variable placement to reduce register pressure
+    Note: Reorders instructions to minimize live variable count
+    Note: Time complexity: O(i * v), Space complexity: O(i)
+    Note: TODO: Implement variable placement optimization
+    Throw Errors.NotImplemented
+
+Note: ===== Debug Information Functions =====
+
+Process called "generate_mir_debug_info" that takes mir as MIRProgram, hir_mapping as HIRToMIRMapping returns MIRDebugInfo:
+    Note: Generates debug information for MIR representation
+    Note: Creates mappings from MIR back to source code
+    Note: Time complexity: O(n), Space complexity: O(n)
+    Note: TODO: Implement MIR debug information generation
+    Throw Errors.NotImplemented
+
+Process called "preserve_source_locations" that takes mir_instructions as List[MIRInstruction], hir_mapping as HIRToMIRMapping returns Boolean:
+    Note: Preserves source location information in MIR instructions
+    Note: Maintains connection to original source code
+    Note: Time complexity: O(i), Space complexity: O(1)
+    Note: TODO: Implement source location preservation
+    Throw Errors.NotImplemented
+
+Process called "create_variable_debug_info" that takes ssa_values as List[SSAValue], original_names as Dictionary[SSAValue, String] returns VariableDebugInfo:
+    Note: Creates debug information for SSA variables
+    Note: Maps SSA values back to original variable names
+    Note: Time complexity: O(v), Space complexity: O(v)
+    Note: TODO: Implement variable debug information creation
+    Throw Errors.NotImplemented
+
+Note: ===== Validation and Analysis Functions =====
+
+Process called "validate_mir_construction" that takes mir as MIRProgram returns List[MIRValidationError]:
+    Note: Validates correctness of MIR construction
+    Note: Checks SSA form properties and control flow integrity
+    Note: Time complexity: O(n), Space complexity: O(e) where e is errors
+    Note: TODO: Implement MIR construction validation
+    Throw Errors.NotImplemented
+
+Process called "verify_ssa_properties" that takes function as MIRFunction returns List[SSAViolation]:
+    Note: Verifies that function is in proper SSA form
+    Note: Checks single assignment property and phi node correctness
+    Note: Time complexity: O(v + d) where d is definitions, Space complexity: O(violations)
+    Note: TODO: Implement SSA property verification
+    Throw Errors.NotImplemented
+
+Process called "analyze_mir_complexity" that takes mir as MIRProgram returns MIRComplexityMetrics:
+    Note: Analyzes complexity metrics of MIR representation
+    Note: Computes instruction count, basic block count, etc.
+    Note: Time complexity: O(n), Space complexity: O(1)
+    Note: TODO: Implement MIR complexity analysis
+    Throw Errors.NotImplemented
+
+Process called "detect_unreachable_code" that takes function as MIRFunction returns List[UnreachableBlock]:
+    Note: Detects unreachable basic blocks in MIR function
+    Note: Identifies dead code that can be eliminated
+    Note: Time complexity: O(b + e) where e is edges, Space complexity: O(b)
+    Note: TODO: Implement unreachable code detection
+    Throw Errors.NotImplemented
+
+Process called "optimize_mir_construction" that takes mir as MIRProgram, optimization_level as Integer returns MIRProgram:
+    Note: Applies optimizations during MIR construction
+    Note: Performs local optimizations that benefit from early application
+    Note: Time complexity: O(n * o) where o is optimization passes, Space complexity: O(n)
+    Note: TODO: Implement construction-time MIR optimizations
+    Throw Errors.NotImplemented

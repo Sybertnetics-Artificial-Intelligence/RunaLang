@@ -1,0 +1,466 @@
+# Kubernetes Deployment Configuration for Runa Universal Translation Platform
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: runa-system
+---
+# ConfigMap for Runa configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runa-config
+  namespace: runa-system
+data:
+  RUNA_ENV: "production"
+  RUNA_LOG_LEVEL: "INFO"
+  RUNA_CACHE_DIR: "/opt/runa/cache"
+  REGISTRY_HOST: "0.0.0.0"
+  REGISTRY_PORT: "8080"
+---
+# Secret for sensitive configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: runa-secrets
+  namespace: runa-system
+type: Opaque
+data:
+  RUNA_REGISTRY_TOKEN: cnVuYS1wcm9kLXRva2VuLWNoYW5nZS1tZQ== # base64: runa-prod-token-change-me
+  POSTGRES_PASSWORD: cnVuYS1wcm9kLXBhc3N3b3JkLWNoYW5nZS1tZQ== # base64: runa-prod-password-change-me
+---
+# Persistent Volume Claim for Runa cache
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: runa-cache-pvc
+  namespace: runa-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: fast-ssd # Adjust based on your cluster
+---
+# Persistent Volume Claim for Registry data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: runa-registry-pvc
+  namespace: runa-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard
+---
+# PostgreSQL Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runa-postgres
+  namespace: runa-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: runa-postgres
+  template:
+    metadata:
+      labels:
+        app: runa-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: runa_registry
+        - name: POSTGRES_USER
+          value: runa
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: runa-secrets
+              key: POSTGRES_PASSWORD
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - runa
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - runa
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: runa-registry-pvc
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: runa-postgres-service
+  namespace: runa-system
+spec:
+  selector:
+    app: runa-postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+---
+# Redis Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runa-redis
+  namespace: runa-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: runa-redis
+  template:
+    metadata:
+      labels:
+        app: runa-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        command: ["redis-server", "--appendonly", "yes"]
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: runa-redis-service
+  namespace: runa-system
+spec:
+  selector:
+    app: runa-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+---
+# Runa Registry Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runa-registry
+  namespace: runa-system
+spec:
+  replicas: 2 # Scale as needed
+  selector:
+    matchLabels:
+      app: runa-registry
+  template:
+    metadata:
+      labels:
+        app: runa-registry
+    spec:
+      containers:
+      - name: runa-registry
+        image: sybertnetics/runa-registry:latest
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: runa-config
+        env:
+        - name: RUNA_REGISTRY_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: runa-secrets
+              key: RUNA_REGISTRY_TOKEN
+        volumeMounts:
+        - name: registry-data
+          mountPath: /var/lib/runa-registry
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: registry-data
+        persistentVolumeClaim:
+          claimName: runa-registry-pvc
+---
+# Runa Registry Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: runa-registry-service
+  namespace: runa-system
+spec:
+  selector:
+    app: runa-registry
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+---
+# Runa Runtime Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runa-runtime
+  namespace: runa-system
+spec:
+  replicas: 3 # Scale based on load
+  selector:
+    matchLabels:
+      app: runa-runtime
+  template:
+    metadata:
+      labels:
+        app: runa-runtime
+    spec:
+      containers:
+      - name: runa-runtime
+        image: sybertnetics/runa:latest
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: runa-config
+        volumeMounts:
+        - name: runa-cache
+          mountPath: /opt/runa/cache
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "from src.runa.core.pipeline import get_pipeline; print('OK')"
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "from src.runa.core.pipeline import get_pipeline; print('OK')"
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: runa-cache
+        persistentVolumeClaim:
+          claimName: runa-cache-pvc
+---
+# Runa Runtime Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: runa-runtime-service
+  namespace: runa-system
+spec:
+  selector:
+    app: runa-runtime
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: runa-ingress
+  namespace: runa-system
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod" # If using cert-manager
+spec:
+  tls:
+  - hosts:
+    - runa.example.com # Replace with your domain
+    secretName: runa-tls-secret
+  rules:
+  - host: runa.example.com # Replace with your domain
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: runa-runtime-service
+            port:
+              number: 8080
+      - path: /registry
+        pathType: Prefix
+        backend:
+          service:
+            name: runa-registry-service
+            port:
+              number: 8080
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: runa-runtime-service
+            port:
+              number: 8080
+---
+# Horizontal Pod Autoscaler for Runtime
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: runa-runtime-hpa
+  namespace: runa-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: runa-runtime
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+# Horizontal Pod Autoscaler for Registry
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: runa-registry-hpa
+  namespace: runa-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: runa-registry
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+---
+# Network Policy for security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runa-network-policy
+  namespace: runa-system
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - podSelector:
+        matchLabels:
+          app: runa-runtime
+    - podSelector:
+        matchLabels:
+          app: runa-registry
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: runa-postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - podSelector:
+        matchLabels:
+          app: runa-redis
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to: [] # Allow all outbound for package downloads, etc.
+    ports:
+    - protocol: TCP
+      port: 80
+    - protocol: TCP
+      port: 443
+    - protocol: UDP
+      port: 53

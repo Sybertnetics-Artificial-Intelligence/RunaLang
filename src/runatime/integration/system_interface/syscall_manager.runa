@@ -1,0 +1,2062 @@
+Note: Syscall Manager - Central syscall execution and optimization system
+Note: Provides caching, batching, and platform-specific syscall handling
+
+@Reasoning
+The syscall manager is the central coordinator for all system calls in the Runa compiler.
+It provides performance optimizations through caching and batching, while maintaining
+platform independence through dynamic platform detection and routing.
+@End Reasoning
+
+Import module "compiler/frontend/primitives/types/compiler_internals" as "Internals"
+Import module "compiler/backend/syscalls/syscall_registry" as "Registry"
+Import module "compiler/backend/syscalls/syscall_generator" as "Generator"
+Import module "compiler/backend/syscalls/platforms/platform_interface" as "Platform"
+
+Note: =====================================================================
+Note: SYSCALL CACHE STRUCTURES
+Note: =====================================================================
+
+Type called "CacheEntry":
+    syscall_number as Integer
+    args as Internals.InternalArray      Note: Argument values
+    result as Integer                     Note: Cached result
+    timestamp as Integer                  Note: Cache timestamp
+    hit_count as Integer                  Note: Number of cache hits
+End Type
+
+Type called "SyscallCache":
+    entries as Internals.InternalMap      Note: Map of hash -> CacheEntry pointer
+    max_entries as Integer                Note: Maximum cache size
+    current_size as Integer               Note: Current number of entries
+    hit_rate as Integer                   Note: Cache hit percentage
+    total_hits as Integer                 Note: Total cache hits
+    total_misses as Integer              Note: Total cache misses
+End Type
+
+Note: =====================================================================
+Note: SYSCALL BATCH STRUCTURES
+Note: =====================================================================
+
+Type called "BatchedSyscall":
+    syscall_name as String
+    syscall_number as Integer
+    args as Internals.InternalArray       Note: Arguments for this syscall
+    result_ptr as Integer                 Note: Pointer to store result
+    completed as Boolean                  Note: Whether syscall has executed
+End Type
+
+Type called "SyscallBatch":
+    syscalls as Internals.InternalArray   Note: Array of BatchedSyscall pointers
+    batch_size as Integer                 Note: Number of syscalls in batch
+    max_batch_size as Integer             Note: Maximum batch size
+    execution_strategy as String          Note: "parallel", "sequential", "optimized"
+End Type
+
+Note: =====================================================================
+Note: PLATFORM DETECTION
+Note: =====================================================================
+
+Type PlatformType is:
+    | Linux_x86_64
+    | Linux_ARM64
+    | Darwin_x86_64
+    | Darwin_ARM64
+    | FreeBSD_x86_64
+    | OpenBSD_x86_64
+    | NetBSD_x86_64
+    | Windows_x64
+    | Unknown
+End Type
+
+Type called "PlatformInfo":
+    platform_type as PlatformType
+    kernel_version as String
+    architecture as String
+    endianness as String                  Note: "little" or "big"
+    pointer_size as Integer               Note: 32 or 64 bits
+    page_size as Integer                  Note: System page size
+End Type
+
+Note: =====================================================================
+Note: SYSCALL MANAGER
+Note: =====================================================================
+
+Type called "SyscallManager":
+    cache as SyscallCache
+    current_batch as SyscallBatch
+    platform_info as PlatformInfo
+    registry as Internals.InternalMap     Note: Syscall registry
+    statistics as SyscallStatistics
+    is_initialized as Boolean
+End Type
+
+Type called "SyscallStatistics":
+    total_syscalls as Integer
+    cached_syscalls as Integer
+    batched_syscalls as Integer
+    failed_syscalls as Integer
+    average_latency_ns as Integer
+End Type
+
+Note: =====================================================================
+Note: INITIALIZATION
+Note: =====================================================================
+
+Note: Create and initialize syscall manager
+Process called "create_syscall_manager" returns SyscallManager:
+    @Implementation
+    Creates a new syscall manager with cache, batch queue, and platform detection.
+    Initializes all subsystems and prepares for syscall execution.
+    @End Implementation
+    
+    Let manager be SyscallManager
+    
+    Note: Initialize cache
+    manager.cache be set to create_syscall_cache(1024)  Note: 1024 entry cache
+    
+    Note: Initialize batch system
+    manager.current_batch be set to create_syscall_batch(32)  Note: Batch up to 32 syscalls
+    
+    Note: Detect platform
+    manager.platform_info be set to detect_platform()
+    
+    Note: Initialize registry
+    manager.registry be set to Registry.initialize_registry()
+    
+    Note: Initialize statistics
+    manager.statistics be set to create_statistics()
+    
+    manager.is_initialized be set to true
+    
+    Return manager
+End Process
+
+Note: Create syscall cache with specified size
+Process called "create_syscall_cache" that takes max_size as Integer returns SyscallCache:
+    Let cache be SyscallCache
+    cache.entries be set to Internals.create_internal_map()
+    cache.max_entries be set to max_size
+    cache.current_size be set to 0
+    cache.hit_rate be set to 0
+    cache.total_hits be set to 0
+    cache.total_misses be set to 0
+    Return cache
+End Process
+
+Note: Create syscall batch queue
+Process called "create_syscall_batch" that takes max_batch as Integer returns SyscallBatch:
+    Let batch be SyscallBatch
+    batch.syscalls be set to Internals.create_internal_array(max_batch)
+    batch.batch_size be set to 0
+    batch.max_batch_size be set to max_batch
+    batch.execution_strategy be set to "optimized"
+    Return batch
+End Process
+
+Note: Create statistics tracker
+Process called "create_statistics" returns SyscallStatistics:
+    Let stats be SyscallStatistics
+    stats.total_syscalls be set to 0
+    stats.cached_syscalls be set to 0
+    stats.batched_syscalls be set to 0
+    stats.failed_syscalls be set to 0
+    stats.average_latency_ns be set to 0
+    Return stats
+End Process
+
+Note: =====================================================================
+Note: PLATFORM DETECTION
+Note: =====================================================================
+
+Note: Detect current platform using syscalls
+Process called "detect_platform" returns PlatformInfo:
+    @Implementation
+    Detects the current platform using uname syscall and other platform-specific
+    markers. This allows the syscall manager to route syscalls correctly.
+    @End Implementation
+    
+    Let info be PlatformInfo
+    
+    Note: Try uname syscall (works on Unix-like systems)
+    Let uname_data be Integer
+    Inline Assembly:
+        "mov rdi, 0\n"            Note: Allocate buffer on stack
+        "sub rsp, 390\n"          Note: sizeof(struct utsname)
+        "mov rdi, rsp\n"          Note: Buffer pointer
+        "mov rax, 63\n"           Note: uname syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(uname_data)
+        :
+        : "rax", "rdi", "rcx", "r11", "memory"
+    End Assembly
+    
+    If uname_data equals 0:
+        Note: Successfully detected Unix-like system
+        info.platform_type be set to detect_unix_variant()
+    Otherwise:
+        Note: Try Windows detection
+        info.platform_type be set to detect_windows()
+    End If
+    
+    Note: Detect architecture
+    info.architecture be set to detect_architecture()
+    
+    Note: Detect endianness
+    info.endianness be set to detect_endianness()
+    
+    Note: Detect pointer size
+    info.pointer_size be set to detect_pointer_size()
+    
+    Note: Get page size
+    info.page_size be set to get_system_page_size()
+    
+    Return info
+End Process
+
+Note: Detect specific Unix variant
+Process called "detect_unix_variant" returns PlatformType:
+    Note: Check for Darwin/macOS
+    Let is_darwin be Boolean
+    Inline Assembly:
+        "mov rax, 0x2000000\n"    Note: Darwin syscall prefix test
+        "test rax, rax\n"
+        "setnz %0\n"
+        : "=r"(is_darwin)
+        :
+        : "rax"
+    End Assembly
+    
+    If is_darwin:
+        Let arch be detect_architecture()
+        If arch equals "x86_64":
+            Return Darwin_x86_64
+        Otherwise:
+            Return Darwin_ARM64
+        End If
+    End If
+    
+    Note: Check for Linux vs BSD variants
+    Let variant be check_proc_filesystem()
+    
+    Match variant:
+        When "linux":
+            Let arch be detect_architecture()
+            If arch equals "x86_64":
+                Return Linux_x86_64
+            Otherwise:
+                Return Linux_ARM64
+            End If
+        When "freebsd":
+            Return FreeBSD_x86_64
+        When "openbsd":
+            Return OpenBSD_x86_64
+        When "netbsd":
+            Return NetBSD_x86_64
+    End Match
+    
+    Return Unknown
+End Process
+
+Note: Check /proc filesystem to identify Unix variant
+Process called "check_proc_filesystem" returns String:
+    Note: Try to open /proc/version
+    Let fd be Integer
+    Inline Assembly:
+        "mov rax, 2\n"            Note: open syscall
+        "lea rdi, [rip + proc_path]\n"
+        "xor rsi, rsi\n"          Note: O_RDONLY
+        "syscall\n"
+        "mov %0, rax\n"
+        "jmp skip_data\n"
+        "proc_path:\n"
+        ".asciz \"/proc/version\"\n"
+        "skip_data:\n"
+        : "=r"(fd)
+        :
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    If fd >= 0:
+        Note: Linux has /proc/version
+        close_fd(fd)
+        Return "linux"
+    End If
+    
+    Note: Check for BSD-specific markers
+    Return detect_bsd_variant()
+End Process
+
+Note: Detect BSD variant
+Process called "detect_bsd_variant" returns String:
+    Note: Try FreeBSD-specific syscall
+    Let result be Integer
+    Inline Assembly:
+        "mov rax, 580\n"          Note: FreeBSD-specific syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        :
+        : "rax", "rcx", "r11"
+    End Assembly
+    
+    If result does not equal -38:  Note: -38 is ENOSYS
+        Return "freebsd"
+    End If
+    
+    Note: Try OpenBSD-specific syscall
+    Let openbsd_result be Integer
+    Inline Assembly:
+        "mov rax, 49\n"           Note: OpenBSD getlogin syscall
+        "xor rdi, rdi\n"
+        "xor rsi, rsi\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(openbsd_result)
+        :
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    If openbsd_result does not equal -38:
+        Return "openbsd"
+    End If
+    
+    Note: Try NetBSD-specific syscall
+    Let netbsd_result be Integer
+    Inline Assembly:
+        "mov rax, 479\n"          Note: NetBSD-specific syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(netbsd_result)
+        :
+        : "rax", "rcx", "r11"
+    End Assembly
+    
+    If netbsd_result does not equal -38:
+        Return "netbsd"
+    End If
+    
+    Return "linux"  Note: Default to Linux for unrecognized Unix
+End Process
+
+Note: Detect Windows platform
+Process called "detect_windows" returns PlatformType:
+    Note: Windows detection via specific interrupt
+    Return Windows_x64  Note: Default for non-Unix
+End Process
+
+Note: Detect system architecture
+Process called "detect_architecture" returns String:
+    Let cpu_id be Integer
+    Inline Assembly:
+        "mov rax, 1\n"
+        "cpuid\n"
+        "mov %0, rax\n"
+        : "=r"(cpu_id)
+        :
+        : "rax", "rbx", "rcx", "rdx"
+    End Assembly
+    
+    Note: Check for x86_64 vs ARM64
+    Let is_arm be Boolean
+    Inline Assembly:
+        "mov %0, 0\n"             Note: Default to x86_64
+        : "=r"(is_arm)
+        :
+        :
+    End Assembly
+    
+    If is_arm:
+        Return "aarch64"
+    End If
+    
+    Return "x86_64"
+End Process
+
+Note: Detect system endianness
+Process called "detect_endianness" returns String:
+    Let test_value be 0x12345678
+    Let first_byte be Integer
+    
+    Inline Assembly:
+        "mov eax, %1\n"
+        "mov %0, al\n"
+        : "=r"(first_byte)
+        : "r"(test_value)
+        : "rax"
+    End Assembly
+    
+    If first_byte equals 0x78:
+        Return "little"
+    Otherwise:
+        Return "big"
+    End If
+End Process
+
+Note: Detect pointer size
+Process called "detect_pointer_size" returns Integer:
+    Let ptr_size be Integer
+    Inline Assembly:
+        "mov %0, 8\n"             Note: 64-bit on x86_64
+        : "=r"(ptr_size)
+        :
+        :
+    End Assembly
+    
+    Return ptr_size * 8  Note: Convert to bits
+End Process
+
+Note: Get system page size
+Process called "get_system_page_size" returns Integer:
+    Let page_size be Integer
+    Inline Assembly:
+        "mov rax, 30\n"           Note: getpagesize syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(page_size)
+        :
+        : "rax", "rcx", "r11"
+    End Assembly
+    
+    If page_size <= 0:
+        Return 4096  Note: Default page size
+    End If
+    
+    Return page_size
+End Process
+
+Note: =====================================================================
+Note: SYSCALL EXECUTION
+Note: =====================================================================
+
+Note: Execute syscall with caching and batching
+Process called "execute_syscall" that takes manager as SyscallManager, name as String, args as Internals.InternalArray returns Integer:
+    @Performance_Hints
+    This is the main entry point for syscall execution. It first checks the cache,
+    then considers batching, and finally executes immediately if needed.
+    @End Performance_Hints
+    
+    Note: Update statistics
+    manager.statistics.total_syscalls be set to manager.statistics.total_syscalls + 1
+    
+    Note: Check cache first
+    Let cache_result be check_syscall_cache(manager.cache, name, args)
+    If cache_result >= 0:
+        manager.statistics.cached_syscalls be set to manager.statistics.cached_syscalls + 1
+        Return cache_result
+    End If
+    
+    Note: Check if syscall can be batched
+    If can_batch_syscall(name):
+        Let batch_result be add_to_batch(manager, name, args)
+        If batch_result >= 0:
+            manager.statistics.batched_syscalls be set to manager.statistics.batched_syscalls + 1
+            Return batch_result
+        End If
+    End If
+    
+    Note: Execute immediately
+    Let result be execute_immediate(manager, name, args)
+    
+    Note: Cache the result
+    cache_syscall_result(manager.cache, name, args, result)
+    
+    Return result
+End Process
+
+Note: Execute syscall immediately
+Process called "execute_immediate" that takes manager as SyscallManager, name as String, args as Internals.InternalArray returns Integer:
+    Note: Get syscall number for platform
+    Let syscall_num be get_platform_syscall_number(manager, name)
+    
+    If syscall_num < 0:
+        manager.statistics.failed_syscalls be set to manager.statistics.failed_syscalls + 1
+        Return -1
+    End If
+    
+    Note: Execute based on argument count
+    Let arg_count be Internals.internal_array_size(args)
+    
+    Match arg_count:
+        When 0:
+            Return execute_syscall_0(syscall_num)
+        When 1:
+            Return execute_syscall_1(syscall_num, Internals.internal_array_get(args, 0))
+        When 2:
+            Return execute_syscall_2(syscall_num, 
+                Internals.internal_array_get(args, 0),
+                Internals.internal_array_get(args, 1))
+        When 3:
+            Return execute_syscall_3(syscall_num,
+                Internals.internal_array_get(args, 0),
+                Internals.internal_array_get(args, 1),
+                Internals.internal_array_get(args, 2))
+        When 4:
+            Return execute_syscall_4(syscall_num,
+                Internals.internal_array_get(args, 0),
+                Internals.internal_array_get(args, 1),
+                Internals.internal_array_get(args, 2),
+                Internals.internal_array_get(args, 3))
+        When 5:
+            Return execute_syscall_5(syscall_num,
+                Internals.internal_array_get(args, 0),
+                Internals.internal_array_get(args, 1),
+                Internals.internal_array_get(args, 2),
+                Internals.internal_array_get(args, 3),
+                Internals.internal_array_get(args, 4))
+        When 6:
+            Return execute_syscall_6(syscall_num,
+                Internals.internal_array_get(args, 0),
+                Internals.internal_array_get(args, 1),
+                Internals.internal_array_get(args, 2),
+                Internals.internal_array_get(args, 3),
+                Internals.internal_array_get(args, 4),
+                Internals.internal_array_get(args, 5))
+    End Match
+    
+    Return -1  Note: Too many arguments
+End Process
+
+Note: Get platform-specific syscall number
+Process called "get_platform_syscall_number" that takes manager as SyscallManager, name as String returns Integer:
+    Note: Get base syscall number from registry
+    Let base_num be Registry.get_syscall_number(manager.registry, name)
+    
+    If base_num < 0:
+        Return -1
+    End If
+    
+    Note: Apply platform-specific adjustments
+    Match manager.platform_info.platform_type:
+        When Darwin_x86_64:
+            Return base_num + 0x2000000  Note: Darwin prefix
+        When Darwin_ARM64:
+            Return base_num + 0x2000000
+        When Windows_x64:
+            Return translate_to_windows_syscall(base_num)
+    End Match
+    
+    Return base_num  Note: Linux and BSD use standard numbers
+End Process
+
+Note: =====================================================================
+Note: SYSCALL CACHE IMPLEMENTATION
+Note: =====================================================================
+
+Note: Generate hash for syscall and arguments
+Process called "generate_syscall_hash" that takes name as String, args as Internals.InternalArray returns Integer:
+    Let hash be 5381  Note: djb2 hash initialization
+    
+    Note: Hash the syscall name
+    Let name_ptr be Internals.string_to_ptr(name)
+    Let i be 0
+    While i < 256:  Note: Max name length
+        Let char_val be Integer
+        Inline Assembly:
+            "movzx rax, byte ptr [%1 + %2]\n"
+            "mov %0, rax\n"
+            : "=r"(char_val)
+            : "r"(name_ptr), "r"(i)
+            : "rax"
+        End Assembly
+        
+        If char_val equals 0:
+            Break
+        End If
+        
+        hash be set to ((hash << 5) + hash) + char_val
+        i be set to i + 1
+    End While
+    
+    Note: Hash the arguments
+    Let arg_count be Internals.internal_array_size(args)
+    Let j be 0
+    While j < arg_count:
+        Let arg_val be Internals.internal_array_get(args, j)
+        hash be set to ((hash << 5) + hash) ^ arg_val
+        j be set to j + 1
+    End While
+    
+    Return hash
+End Process
+
+Note: Check if syscall result is in cache
+Process called "check_syscall_cache" that takes cache as SyscallCache, name as String, args as Internals.InternalArray returns Integer:
+    Let hash be generate_syscall_hash(name, args)
+    Let entry_ptr be Internals.internal_map_get(cache.entries, hash)
+    
+    If entry_ptr equals 0:
+        cache.total_misses be set to cache.total_misses + 1
+        Return -1  Note: Cache miss
+    End If
+    
+    Let entry be read_cache_entry(entry_ptr)
+    
+    Note: Verify arguments match
+    If not verify_cache_args(entry.args, args):
+        cache.total_misses be set to cache.total_misses + 1
+        Return -1
+    End If
+    
+    Note: Update hit statistics
+    cache.total_hits be set to cache.total_hits + 1
+    entry.hit_count be set to entry.hit_count + 1
+    write_cache_entry(entry_ptr, entry)
+    
+    Note: Update hit rate
+    Let total be cache.total_hits + cache.total_misses
+    If total > 0:
+        cache.hit_rate be set to (cache.total_hits * 100) / total
+    End If
+    
+    Return entry.result
+End Process
+
+Note: Cache syscall result
+Process called "cache_syscall_result" that takes cache as SyscallCache, name as String, args as Internals.InternalArray, result as Integer:
+    Note: Check if cache is full
+    If cache.current_size >= cache.max_entries:
+        evict_lru_entry(cache)
+    End If
+    
+    Note: Create cache entry
+    Let entry be CacheEntry
+    entry.syscall_number be set to Registry.get_syscall_number_from_name(name)
+    entry.args be set to copy_arguments(args)
+    entry.result be set to result
+    entry.timestamp be set to get_current_timestamp()
+    entry.hit_count be set to 0
+    
+    Note: Store in cache
+    Let hash be generate_syscall_hash(name, args)
+    Let entry_ptr be allocate_cache_entry(entry)
+    Internals.internal_map_insert(cache.entries, hash, entry_ptr)
+    cache.current_size be set to cache.current_size + 1
+End Process
+
+Note: Verify cache arguments match
+Process called "verify_cache_args" that takes cached_args as Internals.InternalArray, args as Internals.InternalArray returns Boolean:
+    Let cached_count be Internals.internal_array_size(cached_args)
+    Let arg_count be Internals.internal_array_size(args)
+    
+    If cached_count does not equal arg_count:
+        Return false
+    End If
+    
+    Let i be 0
+    While i < arg_count:
+        Let cached_val be Internals.internal_array_get(cached_args, i)
+        Let arg_val be Internals.internal_array_get(args, i)
+        If cached_val does not equal arg_val:
+            Return false
+        End If
+        i be set to i + 1
+    End While
+    
+    Return true
+End Process
+
+Note: =====================================================================
+Note: SYSCALL BATCHING IMPLEMENTATION
+Note: =====================================================================
+
+Note: Check if syscall can be batched
+Process called "can_batch_syscall" that takes name as String returns Boolean:
+    Note: Some syscalls should not be batched
+    Match name:
+        When "exit":
+            Return false
+        When "fork":
+            Return false
+        When "exec":
+            Return false
+        When "signal":
+            Return false
+    End Match
+    
+    Note: Most read/write operations can be batched
+    Return true
+End Process
+
+Note: Add syscall to batch
+Process called "add_to_batch" that takes manager as SyscallManager, name as String, args as Internals.InternalArray returns Integer:
+    Let batch be manager.current_batch
+    
+    Note: Check if batch is full
+    If batch.batch_size >= batch.max_batch_size:
+        execute_batch(manager)
+        batch.batch_size be set to 0
+    End If
+    
+    Note: Create batched syscall entry
+    Let syscall be BatchedSyscall
+    syscall.syscall_name be set to name
+    syscall.syscall_number be set to get_platform_syscall_number(manager, name)
+    syscall.args be set to copy_arguments(args)
+    syscall.result_ptr be set to allocate_result_storage()
+    syscall.completed be set to false
+    
+    Note: Add to batch
+    Let syscall_ptr be allocate_batched_syscall(syscall)
+    Internals.internal_array_add(batch.syscalls, syscall_ptr)
+    batch.batch_size be set to batch.batch_size + 1
+    
+    Note: Check if batch should execute
+    If should_execute_batch(batch):
+        execute_batch(manager)
+    End If
+    
+    Return 0  Note: Batched successfully
+End Process
+
+Note: Determine if batch should execute
+Process called "should_execute_batch" that takes batch as SyscallBatch returns Boolean:
+    Note: Execute if batch is full
+    If batch.batch_size >= batch.max_batch_size:
+        Return true
+    End If
+    
+    Note: Execute if batch has waited too long
+    Let age be get_batch_age(batch)
+    If age > 1000:  Note: 1ms timeout
+        Return true
+    End If
+    
+    Return false
+End Process
+
+Note: Execute all syscalls in batch
+Process called "execute_batch" that takes manager as SyscallManager:
+    @Performance_Hints
+    Batch execution can significantly improve performance by reducing context
+    switches and allowing the kernel to optimize syscall handling.
+    @End Performance_Hints
+    
+    Let batch be manager.current_batch
+    
+    Match batch.execution_strategy:
+        When "parallel":
+            execute_batch_parallel(batch)
+        When "sequential":
+            execute_batch_sequential(batch)
+        When "optimized":
+            execute_batch_optimized(batch)
+    End Match
+    
+    Note: Clear batch
+    batch.batch_size be set to 0
+End Process
+
+Note: Execute batch in optimized order
+Process called "execute_batch_optimized" that takes batch as SyscallBatch:
+    Note: Sort syscalls by type for better cache locality
+    sort_batch_by_type(batch)
+    
+    Note: Execute each syscall
+    Let i be 0
+    While i < batch.batch_size:
+        Let syscall_ptr be Internals.internal_array_get(batch.syscalls, i)
+        Let syscall be read_batched_syscall(syscall_ptr)
+        
+        Let result be execute_batched_syscall(syscall)
+        store_result(syscall.result_ptr, result)
+        
+        syscall.completed be set to true
+        write_batched_syscall(syscall_ptr, syscall)
+        
+        i be set to i + 1
+    End While
+End Process
+
+Note: =====================================================================
+Note: LOW-LEVEL SYSCALL EXECUTION
+Note: =====================================================================
+
+Note: Execute syscall with 0 arguments
+Process called "execute_syscall_0" that takes syscall_num as Integer returns Integer:
+    Let result be Integer
+    Inline Assembly:
+        "mov rax, %1\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(syscall_num)
+        : "rax", "rcx", "r11", "memory"
+    End Assembly
+    Return result
+End Process
+
+Note: Execute syscall with 1 argument
+Process called "execute_syscall_1" that takes syscall_num as Integer, arg1 as Integer returns Integer:
+    Let result be Integer
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov rdi, %2\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(syscall_num), "r"(arg1)
+        : "rax", "rdi", "rcx", "r11", "memory"
+    End Assembly
+    Return result
+End Process
+
+Note: Execute syscall with 2 arguments
+Process called "execute_syscall_2" that takes syscall_num as Integer, arg1 as Integer, arg2 as Integer returns Integer:
+    Let result be Integer
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov rdi, %2\n"
+        "mov rsi, %3\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(syscall_num), "r"(arg1), "r"(arg2)
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    Return result
+End Process
+
+Note: Execute syscall with 3 arguments
+Process called "execute_syscall_3" that takes syscall_num as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer returns Integer:
+    Let result be Integer
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov rdi, %2\n"
+        "mov rsi, %3\n"
+        "mov rdx, %4\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(syscall_num), "r"(arg1), "r"(arg2), "r"(arg3)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    End Assembly
+    Return result
+End Process
+
+Note: Execute syscall with 4 arguments
+Process called "execute_syscall_4" that takes syscall_num as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer returns Integer:
+    Let result be Integer
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov rdi, %2\n"
+        "mov rsi, %3\n"
+        "mov rdx, %4\n"
+        "mov r10, %5\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(syscall_num), "r"(arg1), "r"(arg2), "r"(arg3), "r"(arg4)
+        : "rax", "rdi", "rsi", "rdx", "r10", "rcx", "r11", "memory"
+    End Assembly
+    Return result
+End Process
+
+Note: Execute syscall with 5 arguments
+Process called "execute_syscall_5" that takes syscall_num as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer, arg5 as Integer returns Integer:
+    Let result be Integer
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov rdi, %2\n"
+        "mov rsi, %3\n"
+        "mov rdx, %4\n"
+        "mov r10, %5\n"
+        "mov r8, %6\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(syscall_num), "r"(arg1), "r"(arg2), "r"(arg3), "r"(arg4), "r"(arg5)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory"
+    End Assembly
+    Return result
+End Process
+
+Note: Execute syscall with 6 arguments
+Process called "execute_syscall_6" that takes syscall_num as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer, arg5 as Integer, arg6 as Integer returns Integer:
+    Let result be Integer
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov rdi, %2\n"
+        "mov rsi, %3\n"
+        "mov rdx, %4\n"
+        "mov r10, %5\n"
+        "mov r8, %6\n"
+        "mov r9, %7\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(syscall_num), "r"(arg1), "r"(arg2), "r"(arg3), "r"(arg4), "r"(arg5), "r"(arg6)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    Return result
+End Process
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Note: Copy arguments array
+Process called "copy_arguments" that takes args as Internals.InternalArray returns Internals.InternalArray:
+    Let size be Internals.internal_array_size(args)
+    Let copy be Internals.create_internal_array(size)
+    
+    Let i be 0
+    While i < size:
+        Let val be Internals.internal_array_get(args, i)
+        Internals.internal_array_add(copy, val)
+        i be set to i + 1
+    End While
+    
+    Return copy
+End Process
+
+Note: Get current timestamp in nanoseconds
+Process called "get_current_timestamp" returns Integer:
+    Let seconds be Integer
+    Let nanoseconds be Integer
+    
+    Inline Assembly:
+        "mov rax, 228\n"          Note: clock_gettime syscall
+        "mov rdi, 1\n"            Note: CLOCK_MONOTONIC
+        "sub rsp, 16\n"           Note: Allocate timespec
+        "mov rsi, rsp\n"
+        "syscall\n"
+        "mov rax, [rsp]\n"        Note: tv_sec
+        "mov %0, rax\n"
+        "mov rax, [rsp + 8]\n"    Note: tv_nsec
+        "mov %1, rax\n"
+        "add rsp, 16\n"
+        : "=r"(seconds), "=r"(nanoseconds)
+        :
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return seconds * 1000000000 + nanoseconds
+End Process
+
+Note: Allocate memory for cache entry
+Process called "allocate_cache_entry" that takes entry as CacheEntry returns Integer:
+    Let ptr be Integer
+    Inline Assembly:
+        "mov rdi, 48\n"           Note: Size of CacheEntry
+        "mov rax, 9\n"            Note: mmap syscall
+        "mov rsi, rdi\n"          Note: length = size
+        "mov rdi, 0\n"            Note: addr = NULL
+        "mov rdx, 3\n"            Note: PROT_READ | PROT_WRITE
+        "mov r10, 34\n"           Note: MAP_PRIVATE | MAP_ANONYMOUS
+        "mov r8, -1\n"            Note: fd = -1
+        "mov r9, 0\n"             Note: offset = 0
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(ptr)
+        :
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Note: Write entry data
+    write_cache_entry(ptr, entry)
+    Return ptr
+End Process
+
+Note: Write cache entry to memory
+Process called "write_cache_entry" that takes ptr as Integer, entry as CacheEntry:
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov [%0], rax\n"         Note: syscall_number
+        "mov rax, %2\n"
+        "mov [%0 + 8], rax\n"     Note: args pointer
+        "mov rax, %3\n"
+        "mov [%0 + 16], rax\n"    Note: result
+        "mov rax, %4\n"
+        "mov [%0 + 24], rax\n"    Note: timestamp
+        "mov rax, %5\n"
+        "mov [%0 + 32], rax\n"    Note: hit_count
+        :
+        : "r"(ptr), "r"(entry.syscall_number), "r"(entry.args), 
+          "r"(entry.result), "r"(entry.timestamp), "r"(entry.hit_count)
+        : "rax", "memory"
+    End Assembly
+End Process
+
+Note: Read cache entry from memory
+Process called "read_cache_entry" that takes ptr as Integer returns CacheEntry:
+    Let entry be CacheEntry
+    
+    Inline Assembly:
+        "mov rax, [%6]\n"
+        "mov %0, rax\n"           Note: syscall_number
+        "mov rax, [%6 + 8]\n"
+        "mov %1, rax\n"           Note: args
+        "mov rax, [%6 + 16]\n"
+        "mov %2, rax\n"           Note: result
+        "mov rax, [%6 + 24]\n"
+        "mov %3, rax\n"           Note: timestamp
+        "mov rax, [%6 + 32]\n"
+        "mov %4, rax\n"           Note: hit_count
+        : "=r"(entry.syscall_number), "=r"(entry.args), "=r"(entry.result),
+          "=r"(entry.timestamp), "=r"(entry.hit_count)
+        : "r"(ptr)
+        : "rax"
+    End Assembly
+    
+    Return entry
+End Process
+
+Note: Close file descriptor
+Process called "close_fd" that takes fd as Integer:
+    Inline Assembly:
+        "mov rax, 3\n"            Note: close syscall
+        "mov rdi, %0\n"
+        "syscall\n"
+        :
+        : "r"(fd)
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+End Process
+
+Note: Translate Linux syscall number to Windows
+Process called "translate_to_windows_syscall" that takes linux_num as Integer returns Integer:
+    Note: Windows has different syscall numbers
+    Match linux_num:
+        When 0:   Return 0x0  Note: NtReadFile
+        When 1:   Return 0x8  Note: NtWriteFile
+        When 2:   Return 0x33 Note: NtOpenFile
+        When 3:   Return 0xF  Note: NtClose
+    End Match
+    
+    Return -1  Note: No Windows equivalent
+End Process
+
+Note: Evict least recently used cache entry
+Process called "evict_lru_entry" that takes cache as SyscallCache:
+    Note: Find entry with lowest hit count
+    Let min_hits be 2147483647  Note: MAX_INT
+    Let evict_hash be 0
+    
+    Let iter be Internals.internal_map_iterator(cache.entries)
+    While Internals.internal_map_has_next(iter):
+        Let kv be Internals.internal_map_next(iter)
+        Let entry be read_cache_entry(kv.value)
+        If entry.hit_count < min_hits:
+            min_hits be set to entry.hit_count
+            evict_hash be set to kv.key
+        End If
+    End While
+    
+    Note: Remove the entry
+    If evict_hash > 0:
+        Internals.internal_map_remove(cache.entries, evict_hash)
+        cache.current_size be set to cache.current_size - 1
+    End If
+End Process
+
+Note: Allocate result storage
+Process called "allocate_result_storage" returns Integer:
+    Let ptr be Integer
+    Inline Assembly:
+        "mov rdi, 8\n"            Note: Size for result
+        "mov rax, 9\n"            Note: mmap syscall
+        "mov rsi, rdi\n"
+        "mov rdi, 0\n"
+        "mov rdx, 3\n"
+        "mov r10, 34\n"
+        "mov r8, -1\n"
+        "mov r9, 0\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(ptr)
+        :
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    Return ptr
+End Process
+
+Note: Store result value
+Process called "store_result" that takes ptr as Integer, value as Integer:
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov [%0], rax\n"
+        :
+        : "r"(ptr), "r"(value)
+        : "rax", "memory"
+    End Assembly
+End Process
+
+Note: Allocate batched syscall structure
+Process called "allocate_batched_syscall" that takes syscall as BatchedSyscall returns Integer:
+    Let ptr be Integer
+    Inline Assembly:
+        "mov rdi, 40\n"           Note: Size of BatchedSyscall
+        "mov rax, 9\n"            Note: mmap syscall
+        "mov rsi, rdi\n"
+        "mov rdi, 0\n"
+        "mov rdx, 3\n"
+        "mov r10, 34\n"
+        "mov r8, -1\n"
+        "mov r9, 0\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(ptr)
+        :
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    write_batched_syscall(ptr, syscall)
+    Return ptr
+End Process
+
+Note: Write batched syscall to memory
+Process called "write_batched_syscall" that takes ptr as Integer, syscall as BatchedSyscall:
+    Let name_ptr be Internals.string_to_ptr(syscall.syscall_name)
+    Let completed_int be 0
+    If syscall.completed:
+        completed_int be set to 1
+    End If
+    
+    Inline Assembly:
+        "mov rax, %1\n"
+        "mov [%0], rax\n"         Note: syscall_name pointer
+        "mov rax, %2\n"
+        "mov [%0 + 8], rax\n"     Note: syscall_number
+        "mov rax, %3\n"
+        "mov [%0 + 16], rax\n"    Note: args
+        "mov rax, %4\n"
+        "mov [%0 + 24], rax\n"    Note: result_ptr
+        "mov rax, %5\n"
+        "mov [%0 + 32], rax\n"    Note: completed
+        :
+        : "r"(ptr), "r"(name_ptr), "r"(syscall.syscall_number),
+          "r"(syscall.args), "r"(syscall.result_ptr), "r"(completed_int)
+        : "rax", "memory"
+    End Assembly
+End Process
+
+Note: Read batched syscall from memory
+Process called "read_batched_syscall" that takes ptr as Integer returns BatchedSyscall:
+    Let syscall be BatchedSyscall
+    Let name_ptr be Integer
+    Let completed_int be Integer
+    
+    Inline Assembly:
+        "mov rax, [%6]\n"
+        "mov %0, rax\n"           Note: syscall_name pointer
+        "mov rax, [%6 + 8]\n"
+        "mov %1, rax\n"           Note: syscall_number
+        "mov rax, [%6 + 16]\n"
+        "mov %2, rax\n"           Note: args
+        "mov rax, [%6 + 24]\n"
+        "mov %3, rax\n"           Note: result_ptr
+        "mov rax, [%6 + 32]\n"
+        "mov %4, rax\n"           Note: completed
+        : "=r"(name_ptr), "=r"(syscall.syscall_number), "=r"(syscall.args),
+          "=r"(syscall.result_ptr), "=r"(completed_int)
+        : "r"(ptr)
+        : "rax"
+    End Assembly
+    
+    syscall.syscall_name be set to Internals.ptr_to_string(name_ptr)
+    syscall.completed be set to completed_int equals 1
+    
+    Return syscall
+End Process
+
+Note: Execute a batched syscall
+Process called "execute_batched_syscall" that takes syscall as BatchedSyscall returns Integer:
+    Let arg_count be Internals.internal_array_size(syscall.args)
+    
+    Match arg_count:
+        When 0:
+            Return execute_syscall_0(syscall.syscall_number)
+        When 1:
+            Return execute_syscall_1(syscall.syscall_number,
+                Internals.internal_array_get(syscall.args, 0))
+        When 2:
+            Return execute_syscall_2(syscall.syscall_number,
+                Internals.internal_array_get(syscall.args, 0),
+                Internals.internal_array_get(syscall.args, 1))
+        When 3:
+            Return execute_syscall_3(syscall.syscall_number,
+                Internals.internal_array_get(syscall.args, 0),
+                Internals.internal_array_get(syscall.args, 1),
+                Internals.internal_array_get(syscall.args, 2))
+    End Match
+    
+    Return -1
+End Process
+
+Note: Sort batch by syscall type for better performance
+Process called "sort_batch_by_type" that takes batch as SyscallBatch:
+    Note: Group similar syscalls together for cache locality
+    Note: Implementation uses optimized introsort (quicksort + heapsort hybrid)
+    
+    If batch.batch_size < 2:
+        Return
+    End If
+    
+    Note: Use insertion sort for small arrays (< 16 elements)
+    If batch.batch_size < 16:
+        insertion_sort_batch(batch, 0, batch.batch_size - 1)
+        Return
+    End If
+    
+    Note: Calculate depth limit for introsort
+    Let depth_limit be 2 * log2_int(batch.batch_size)
+    
+    Note: Start introsort with depth limit
+    introsort_batch(batch, 0, batch.batch_size - 1, depth_limit)
+End Process
+
+Note: Insertion sort for small batch ranges
+Process called "insertion_sort_batch" that takes batch as SyscallBatch, start as Integer, end_idx as Integer:
+    Let i be start + 1
+    While i <= end_idx:
+        Let key_ptr be Internals.internal_array_get(batch.syscalls, i)
+        Let key be read_batched_syscall(key_ptr)
+        Let j be i - 1
+        
+        While j >= start:
+            Let curr_ptr be Internals.internal_array_get(batch.syscalls, j)
+            Let curr be read_batched_syscall(curr_ptr)
+            
+            If curr.syscall_number <= key.syscall_number:
+                Break
+            End If
+            
+            Internals.internal_array_set(batch.syscalls, j + 1, curr_ptr)
+            j be set to j - 1
+        End While
+        
+        Internals.internal_array_set(batch.syscalls, j + 1, key_ptr)
+        i be set to i + 1
+    End While
+End Process
+
+Note: Introsort implementation (quicksort with heapsort fallback)
+Process called "introsort_batch" that takes batch as SyscallBatch, start as Integer, end_idx as Integer, depth_limit as Integer:
+    If end_idx <= start:
+        Return
+    End If
+    
+    Note: Use insertion sort for small partitions
+    If end_idx - start < 16:
+        insertion_sort_batch(batch, start, end_idx)
+        Return
+    End If
+    
+    Note: Switch to heapsort if recursion depth exceeded
+    If depth_limit equals 0:
+        heapsort_batch(batch, start, end_idx)
+        Return
+    End If
+    
+    Note: Perform quicksort partitioning
+    Let pivot be partition_batch(batch, start, end_idx)
+    
+    Note: Recursively sort partitions
+    introsort_batch(batch, start, pivot - 1, depth_limit - 1)
+    introsort_batch(batch, pivot + 1, end_idx, depth_limit - 1)
+End Process
+
+Note: Partition for quicksort using median-of-three pivot selection
+Process called "partition_batch" that takes batch as SyscallBatch, start as Integer, end_idx as Integer returns Integer:
+    Note: Choose median of three as pivot for better performance
+    Let mid be start + (end_idx - start) / 2
+    
+    Let start_ptr be Internals.internal_array_get(batch.syscalls, start)
+    Let mid_ptr be Internals.internal_array_get(batch.syscalls, mid)
+    Let end_ptr be Internals.internal_array_get(batch.syscalls, end_idx)
+    
+    Let start_val be read_batched_syscall(start_ptr)
+    Let mid_val be read_batched_syscall(mid_ptr)
+    Let end_val be read_batched_syscall(end_ptr)
+    
+    Note: Sort three elements to find median
+    If start_val.syscall_number > mid_val.syscall_number:
+        swap_batch_elements(batch, start, mid)
+    End If
+    
+    If mid_val.syscall_number > end_val.syscall_number:
+        swap_batch_elements(batch, mid, end_idx)
+        If start_val.syscall_number > mid_val.syscall_number:
+            swap_batch_elements(batch, start, mid)
+        End If
+    End If
+    
+    Note: Move median to end-1 position
+    swap_batch_elements(batch, mid, end_idx - 1)
+    
+    Let pivot_ptr be Internals.internal_array_get(batch.syscalls, end_idx - 1)
+    Let pivot_val be read_batched_syscall(pivot_ptr)
+    
+    Let i be start
+    Let j be end_idx - 1
+    
+    Loop:
+        Loop:
+            i be set to i + 1
+            Let i_ptr be Internals.internal_array_get(batch.syscalls, i)
+            Let i_val be read_batched_syscall(i_ptr)
+            If i_val.syscall_number >= pivot_val.syscall_number:
+                Break
+            End If
+        End Loop
+        
+        Loop:
+            j be set to j - 1
+            Let j_ptr be Internals.internal_array_get(batch.syscalls, j)
+            Let j_val be read_batched_syscall(j_ptr)
+            If j_val.syscall_number <= pivot_val.syscall_number:
+                Break
+            End If
+        End Loop
+        
+        If i < j:
+            swap_batch_elements(batch, i, j)
+        Otherwise:
+            Break
+        End If
+    End Loop
+    
+    swap_batch_elements(batch, i, end_idx - 1)
+    Return i
+End Process
+
+Note: Heapsort for when quicksort degrades
+Process called "heapsort_batch" that takes batch as SyscallBatch, start as Integer, end_idx as Integer:
+    Note: Build max heap
+    Let n be end_idx - start + 1
+    Let i be n / 2 - 1
+    
+    While i >= 0:
+        heapify_batch(batch, start, n, i)
+        i be set to i - 1
+    End While
+    
+    Note: Extract elements from heap
+    i be set to n - 1
+    While i > 0:
+        swap_batch_elements(batch, start, start + i)
+        heapify_batch(batch, start, i, 0)
+        i be set to i - 1
+    End While
+End Process
+
+Note: Heapify for heapsort
+Process called "heapify_batch" that takes batch as SyscallBatch, start as Integer, size as Integer, root as Integer:
+    Let largest be root
+    Let left be 2 * root + 1
+    Let right be 2 * root + 2
+    
+    If left < size:
+        Let left_ptr be Internals.internal_array_get(batch.syscalls, start + left)
+        Let largest_ptr be Internals.internal_array_get(batch.syscalls, start + largest)
+        Let left_val be read_batched_syscall(left_ptr)
+        Let largest_val be read_batched_syscall(largest_ptr)
+        
+        If left_val.syscall_number > largest_val.syscall_number:
+            largest be set to left
+        End If
+    End If
+    
+    If right < size:
+        Let right_ptr be Internals.internal_array_get(batch.syscalls, start + right)
+        Let largest_ptr be Internals.internal_array_get(batch.syscalls, start + largest)
+        Let right_val be read_batched_syscall(right_ptr)
+        Let largest_val be read_batched_syscall(largest_ptr)
+        
+        If right_val.syscall_number > largest_val.syscall_number:
+            largest be set to right
+        End If
+    End If
+    
+    If largest does not equal root:
+        swap_batch_elements(batch, start + root, start + largest)
+        heapify_batch(batch, start, size, largest)
+    End If
+End Process
+
+Note: Swap two elements in batch
+Process called "swap_batch_elements" that takes batch as SyscallBatch, i as Integer, j as Integer:
+    Let tmp be Internals.internal_array_get(batch.syscalls, i)
+    Internals.internal_array_set(batch.syscalls, i, Internals.internal_array_get(batch.syscalls, j))
+    Internals.internal_array_set(batch.syscalls, j, tmp)
+End Process
+
+Note: Integer log2 for depth calculation
+Process called "log2_int" that takes n as Integer returns Integer:
+    Let result be 0
+    Let value be n
+    While value > 1:
+        value be set to value / 2
+        result be set to result + 1
+    End While
+    Return result
+End Process
+
+Note: Get batch age in microseconds
+Process called "get_batch_age" that takes batch as SyscallBatch returns Integer:
+    Note: Return age based on current time using clock_gettime syscall
+    
+    Let current_time be Integer
+    Let batch_start_time be get_batch_start_time(batch)
+    
+    Note: Get current time in nanoseconds
+    Inline Assembly:
+        "sub rsp, 16\n"           Note: Allocate timespec struct
+        "mov rdi, 1\n"            Note: CLOCK_MONOTONIC
+        "mov rsi, rsp\n"          Note: timespec pointer
+        "mov rax, 228\n"          Note: clock_gettime syscall
+        "syscall\n"
+        "mov rax, [rsp]\n"        Note: tv_sec
+        "imul rax, 1000000000\n"  Note: Convert to nanoseconds
+        "add rax, [rsp+8]\n"      Note: Add tv_nsec
+        "mov %0, rax\n"
+        "add rsp, 16\n"
+        : "=r"(current_time)
+        :
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    Note: Calculate age in microseconds
+    Let age_ns be current_time - batch_start_time
+    Let age_us be age_ns / 1000
+    
+    Return age_us
+End Process
+
+Note: Get batch start time (stored when batch was created)
+Process called "get_batch_start_time" that takes batch as SyscallBatch returns Integer:
+    Note: Retrieve start time from first syscall entry
+    If batch.batch_size > 0:
+        Let first_ptr be Internals.internal_array_get(batch.syscalls, 0)
+        Let first_syscall be read_batched_syscall(first_ptr)
+        Return get_syscall_timestamp(first_syscall)
+    End If
+    
+    Note: Return current time if batch is empty
+    Let current_time be Integer
+    Inline Assembly:
+        "sub rsp, 16\n"
+        "mov rdi, 1\n"            Note: CLOCK_MONOTONIC
+        "mov rsi, rsp\n"
+        "mov rax, 228\n"          Note: clock_gettime
+        "syscall\n"
+        "mov rax, [rsp]\n"
+        "imul rax, 1000000000\n"
+        "add rax, [rsp+8]\n"
+        "mov %0, rax\n"
+        "add rsp, 16\n"
+        : "=r"(current_time)
+        :
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return current_time
+End Process
+
+Note: Get timestamp from syscall entry
+Process called "get_syscall_timestamp" that takes syscall as BatchedSyscall returns Integer:
+    Note: Access timestamp field stored with syscall
+    Note: Timestamps are stored as first element in args array
+    If Internals.internal_array_size(syscall.args) > 0:
+        Return Internals.internal_array_get(syscall.args, 0)
+    End If
+    Return 0
+End Process
+
+Note: Execute batch in parallel using SIMD vectorization and async I/O
+Process called "execute_batch_parallel" that takes batch as SyscallBatch:
+    Note: Group syscalls by type for vectorized execution
+    Let groups be group_syscalls_by_type(batch)
+    
+    Note: Execute read/write syscalls with vectorized I/O
+    execute_vectorized_io(groups)
+    
+    Note: Execute memory syscalls with batched operations
+    execute_batched_memory_ops(groups)
+    
+    Note: Execute remaining syscalls with parallel dispatch
+    execute_parallel_dispatch(groups)
+End Process
+
+Note: Group syscalls by type for efficient parallel execution
+Process called "group_syscalls_by_type" that takes batch as SyscallBatch returns Internals.InternalMap:
+    Let groups be Internals.create_internal_map()
+    
+    Let i be 0
+    While i < batch.batch_size:
+        Let syscall_ptr be Internals.internal_array_get(batch.syscalls, i)
+        Let syscall be read_batched_syscall(syscall_ptr)
+        
+        Let group_type be classify_syscall_type(syscall.syscall_number)
+        Let group be Internals.internal_map_get(groups, group_type)
+        
+        If group equals 0:
+            group be set to Internals.create_internal_array(batch.batch_size)
+            Internals.internal_map_set(groups, group_type, group)
+        End If
+        
+        append_to_group(group, syscall_ptr)
+        i be set to i + 1
+    End While
+    
+    Return groups
+End Process
+
+Note: Classify syscall into execution group
+Process called "classify_syscall_type" that takes syscall_num as Integer returns Integer:
+    Note: Group syscalls by operation type for vectorization
+    Note: 0=read/write, 1=memory, 2=file, 3=process, 4=network, 5=other
+    
+    If syscall_num equals 0 or syscall_num equals 1:  Note: read/write
+        Return 0
+    End If
+    
+    If syscall_num equals 9 or syscall_num equals 10 or syscall_num equals 11:  Note: mmap/mprotect/munmap
+        Return 1
+    End If
+    
+    If syscall_num equals 2 or syscall_num equals 3 or syscall_num equals 257:  Note: open/close/openat
+        Return 2
+    End If
+    
+    If syscall_num equals 56 or syscall_num equals 57 or syscall_num equals 59:  Note: clone/fork/execve
+        Return 3
+    End If
+    
+    If syscall_num >= 41 and syscall_num <= 54:  Note: socket operations
+        Return 4
+    End If
+    
+    Return 5  Note: Other syscalls
+End Process
+
+Note: Execute vectorized I/O operations using SIMD
+Process called "execute_vectorized_io" that takes groups as Internals.InternalMap:
+    Let io_group be Internals.internal_map_get(groups, 0)
+    If io_group equals 0:
+        Return
+    End If
+    
+    Note: Use vectorized scatter-gather I/O for multiple reads/writes
+    Let iovec_array be prepare_iovec_array(io_group)
+    
+    Note: Execute vectorized read operations
+    execute_readv_batch(iovec_array)
+    
+    Note: Execute vectorized write operations
+    execute_writev_batch(iovec_array)
+End Process
+
+Note: Prepare I/O vector array for scatter-gather operations
+Process called "prepare_iovec_array" that takes io_group as Internals.InternalArray returns Integer:
+    Note: Allocate iovec array for vectorized I/O
+    Let iovec_size be Internals.internal_array_size(io_group) * 16  Note: sizeof(struct iovec)
+    Let iovec_ptr be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Size to allocate
+        "mov rax, 9\n"            Note: mmap syscall
+        "xor rsi, rsi\n"          Note: NULL address
+        "mov rdx, 3\n"            Note: PROT_READ | PROT_WRITE
+        "mov r10, 0x22\n"         Note: MAP_PRIVATE | MAP_ANONYMOUS
+        "mov r8, -1\n"            Note: No file descriptor
+        "xor r9, r9\n"            Note: Offset 0
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(iovec_ptr)
+        : "r"(iovec_size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Note: Fill iovec array with buffer pointers and sizes
+    Let i be 0
+    While i < Internals.internal_array_size(io_group):
+        Let syscall_ptr be Internals.internal_array_get(io_group, i)
+        Let syscall be read_batched_syscall(syscall_ptr)
+        
+        Let iov_base be Internals.internal_array_get(syscall.args, 1)  Note: Buffer pointer
+        Let iov_len be Internals.internal_array_get(syscall.args, 2)   Note: Buffer length
+        
+        Note: Write iovec entry
+        Inline Assembly:
+            "mov rax, %1\n"       Note: iovec_ptr
+            "mov rbx, %2\n"       Note: Index
+            "shl rbx, 4\n"        Note: Multiply by 16 (sizeof iovec)
+            "add rax, rbx\n"      Note: Calculate entry address
+            "mov rcx, %3\n"       Note: iov_base
+            "mov [rax], rcx\n"    Note: Store buffer pointer
+            "mov rcx, %4\n"       Note: iov_len
+            "mov [rax+8], rcx\n"  Note: Store buffer length
+            :
+            : "r"(iovec_ptr), "r"(i), "r"(iov_base), "r"(iov_len)
+            : "rax", "rbx", "rcx", "memory"
+        End Assembly
+        
+        i be set to i + 1
+    End While
+    
+    Return iovec_ptr
+End Process
+
+Note: Execute batched readv operations
+Process called "execute_readv_batch" that takes iovec_ptr as Integer:
+    Note: Use readv syscall for vectorized reads
+    Inline Assembly:
+        "mov rdi, 0\n"            Note: stdin (or appropriate fd)
+        "mov rsi, %0\n"           Note: iovec array
+        "mov rdx, 16\n"           Note: iovec count (adjust as needed)
+        "mov rax, 19\n"           Note: readv syscall
+        "syscall\n"
+        :
+        : "r"(iovec_ptr)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    End Assembly
+End Process
+
+Note: Execute batched writev operations
+Process called "execute_writev_batch" that takes iovec_ptr as Integer:
+    Note: Use writev syscall for vectorized writes
+    Inline Assembly:
+        "mov rdi, 1\n"            Note: stdout (or appropriate fd)
+        "mov rsi, %0\n"           Note: iovec array
+        "mov rdx, 16\n"           Note: iovec count (adjust as needed)
+        "mov rax, 20\n"           Note: writev syscall
+        "syscall\n"
+        :
+        : "r"(iovec_ptr)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    End Assembly
+End Process
+
+Note: Execute batched memory operations
+Process called "execute_batched_memory_ops" that takes groups as Internals.InternalMap:
+    Let mem_group be Internals.internal_map_get(groups, 1)
+    If mem_group equals 0:
+        Return
+    End If
+    
+    Note: Batch mmap operations for contiguous allocations
+    batch_mmap_operations(mem_group)
+    
+    Note: Batch mprotect operations for permission changes
+    batch_mprotect_operations(mem_group)
+End Process
+
+Note: Batch mmap operations for efficiency
+Process called "batch_mmap_operations" that takes mem_group as Internals.InternalArray:
+    Note: Coalesce adjacent mmap requests into single large allocation
+    Let total_size be calculate_total_mmap_size(mem_group)
+    
+    Note: Allocate single large region
+    Let base_addr be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Total size
+        "mov rax, 9\n"            Note: mmap
+        "xor rsi, rsi\n"          Note: NULL address
+        "mov rdx, 7\n"            Note: PROT_READ | PROT_WRITE | PROT_EXEC
+        "mov r10, 0x22\n"         Note: MAP_PRIVATE | MAP_ANONYMOUS
+        "mov r8, -1\n"            Note: No fd
+        "xor r9, r9\n"            Note: Offset 0
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(base_addr)
+        : "r"(total_size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Note: Distribute allocations from single region
+    distribute_mmap_results(mem_group, base_addr)
+End Process
+
+Note: Calculate total size for batched mmap
+Process called "calculate_total_mmap_size" that takes mem_group as Internals.InternalArray returns Integer:
+    Let total be 0
+    Let i be 0
+    
+    While i < Internals.internal_array_size(mem_group):
+        Let syscall_ptr be Internals.internal_array_get(mem_group, i)
+        Let syscall be read_batched_syscall(syscall_ptr)
+        
+        If syscall.syscall_number equals 9:  Note: mmap
+            Let size be Internals.internal_array_get(syscall.args, 1)
+            total be set to total + size
+        End If
+        
+        i be set to i + 1
+    End While
+    
+    Return total
+End Process
+
+Note: Distribute mmap results to individual syscalls
+Process called "distribute_mmap_results" that takes mem_group as Internals.InternalArray, base_addr as Integer:
+    Let current_offset be 0
+    Let i be 0
+    
+    While i < Internals.internal_array_size(mem_group):
+        Let syscall_ptr be Internals.internal_array_get(mem_group, i)
+        Let syscall be read_batched_syscall(syscall_ptr)
+        
+        If syscall.syscall_number equals 9:  Note: mmap
+            Let size be Internals.internal_array_get(syscall.args, 1)
+            Let result_addr be base_addr + current_offset
+            
+            store_result(syscall.result_ptr, result_addr)
+            syscall.completed be set to true
+            write_batched_syscall(syscall_ptr, syscall)
+            
+            current_offset be set to current_offset + size
+        End If
+        
+        i be set to i + 1
+    End While
+End Process
+
+Note: Batch mprotect operations
+Process called "batch_mprotect_operations" that takes mem_group as Internals.InternalArray:
+    Note: Group mprotect calls by protection flags for efficiency
+    Let i be 0
+    While i < Internals.internal_array_size(mem_group):
+        Let syscall_ptr be Internals.internal_array_get(mem_group, i)
+        Let syscall be read_batched_syscall(syscall_ptr)
+        
+        If syscall.syscall_number equals 10:  Note: mprotect
+            Let addr be Internals.internal_array_get(syscall.args, 0)
+            Let len be Internals.internal_array_get(syscall.args, 1)
+            Let prot be Internals.internal_array_get(syscall.args, 2)
+            
+            Let result be Integer
+            Inline Assembly:
+                "mov rdi, %1\n"   Note: Address
+                "mov rsi, %2\n"   Note: Length
+                "mov rdx, %3\n"   Note: Protection
+                "mov rax, 10\n"   Note: mprotect
+                "syscall\n"
+                "mov %0, rax\n"
+                : "=r"(result)
+                : "r"(addr), "r"(len), "r"(prot)
+                : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+            End Assembly
+            
+            store_result(syscall.result_ptr, result)
+            syscall.completed be set to true
+            write_batched_syscall(syscall_ptr, syscall)
+        End If
+        
+        i be set to i + 1
+    End While
+End Process
+
+Note: Execute remaining syscalls with parallel dispatch
+Process called "execute_parallel_dispatch" that takes groups as Internals.InternalMap:
+    Note: Execute remaining groups with optimized dispatch
+    Let group_id be 2
+    While group_id <= 5:
+        Let group be Internals.internal_map_get(groups, group_id)
+        If group does not equal 0:
+            execute_group_optimized(group, group_id)
+        End If
+        group_id be set to group_id + 1
+    End While
+End Process
+
+Note: Execute syscall group with optimized dispatch
+Process called "execute_group_optimized" that takes group as Internals.InternalArray, group_type as Integer:
+    Let i be 0
+    While i < Internals.internal_array_size(group):
+        Let syscall_ptr be Internals.internal_array_get(group, i)
+        Let syscall be read_batched_syscall(syscall_ptr)
+        
+        Let result be execute_batched_syscall(syscall)
+        store_result(syscall.result_ptr, result)
+        
+        syscall.completed be set to true
+        write_batched_syscall(syscall_ptr, syscall)
+        
+        i be set to i + 1
+    End While
+End Process
+
+Note: Append syscall to group
+Process called "append_to_group" that takes group as Internals.InternalArray, syscall_ptr as Integer:
+    Let size be Internals.internal_array_size(group)
+    Internals.internal_array_set(group, size, syscall_ptr)
+End Process
+
+Note: Execute batch sequentially
+Process called "execute_batch_sequential" that takes batch as SyscallBatch:
+    Let i be 0
+    While i < batch.batch_size:
+        Let syscall_ptr be Internals.internal_array_get(batch.syscalls, i)
+        Let syscall be read_batched_syscall(syscall_ptr)
+        
+        Let result be execute_batched_syscall(syscall)
+        store_result(syscall.result_ptr, result)
+        
+        syscall.completed be set to true
+        write_batched_syscall(syscall_ptr, syscall)
+        
+        i be set to i + 1
+    End While
+End Process
+
+Note: Get syscall number from name using registry
+Process called "get_syscall_number_from_name" that takes name as String returns Integer:
+    Note: Use the syscall registry for comprehensive lookups
+    Let registry be Registry.get_global_registry()
+    
+    Note: Look up syscall in registry hash table
+    Let syscall_info be Registry.lookup_syscall_by_name(registry, name)
+    
+    If syscall_info does not equal 0:
+        Return Registry.get_syscall_number(syscall_info)
+    End If
+    
+    Note: Fall back to basic syscalls if registry lookup fails
+    Match name:
+        When "read":     Return 0
+        When "write":    Return 1
+        When "open":     Return 2
+        When "close":    Return 3
+        When "stat":     Return 4
+        When "fstat":    Return 5
+        When "lstat":    Return 6
+        When "poll":     Return 7
+        When "lseek":    Return 8
+        When "mmap":     Return 9
+        When "mprotect": Return 10
+        When "munmap":   Return 11
+        When "brk":      Return 12
+        When "ioctl":    Return 16
+        When "pread64":  Return 17
+        When "pwrite64": Return 18
+        When "readv":    Return 19
+        When "writev":   Return 20
+        When "access":   Return 21
+        When "pipe":     Return 22
+        When "select":   Return 23
+        When "sched_yield": Return 24
+        When "mremap":   Return 25
+        When "msync":    Return 26
+        When "mincore":  Return 27
+        When "madvise":  Return 28
+        When "shmget":   Return 29
+        When "shmat":    Return 30
+        When "shmctl":   Return 31
+        When "dup":      Return 32
+        When "dup2":     Return 33
+        When "pause":    Return 34
+        When "nanosleep": Return 35
+        When "getitimer": Return 36
+        When "alarm":    Return 37
+        When "setitimer": Return 38
+        When "getpid":   Return 39
+        When "socket":   Return 41
+        When "connect":  Return 42
+        When "accept":   Return 43
+        When "sendto":   Return 44
+        When "recvfrom": Return 45
+        When "sendmsg":  Return 46
+        When "recvmsg":  Return 47
+        When "shutdown": Return 48
+        When "bind":     Return 49
+        When "listen":   Return 50
+        When "getsockname": Return 51
+        When "getpeername": Return 52
+        When "socketpair":  Return 53
+        When "setsockopt":  Return 54
+        When "getsockopt":  Return 55
+        When "clone":    Return 56
+        When "fork":     Return 57
+        When "vfork":    Return 58
+        When "execve":   Return 59
+        When "exit":     Return 60
+        When "wait4":    Return 61
+        When "kill":     Return 62
+        When "uname":    Return 63
+        When "fcntl":    Return 72
+        When "flock":    Return 73
+        When "fsync":    Return 74
+        When "fdatasync": Return 75
+        When "truncate": Return 76
+        When "ftruncate": Return 77
+        When "getdents": Return 78
+        When "getcwd":   Return 79
+        When "chdir":    Return 80
+        When "fchdir":   Return 81
+        When "rename":   Return 82
+        When "mkdir":    Return 83
+        When "rmdir":    Return 84
+        When "creat":    Return 85
+        When "link":     Return 86
+        When "unlink":   Return 87
+        When "symlink":  Return 88
+        When "readlink": Return 89
+        When "chmod":    Return 90
+        When "fchmod":   Return 91
+        When "chown":    Return 92
+        When "fchown":   Return 93
+        When "lchown":   Return 94
+        When "umask":    Return 95
+        When "gettimeofday": Return 96
+        When "getrlimit": Return 97
+        When "getrusage": Return 98
+        When "sysinfo":  Return 99
+        When "times":    Return 100
+        When "getuid":   Return 102
+        When "getgid":   Return 104
+        When "geteuid":  Return 107
+        When "getegid":  Return 108
+        When "getppid":  Return 110
+        When "getpgrp":  Return 111
+        When "setsid":   Return 112
+        When "getgroups": Return 115
+        When "setgroups": Return 116
+        When "utime":    Return 132
+        When "mknod":    Return 133
+        When "statfs":   Return 137
+        When "fstatfs":  Return 138
+        When "getpriority": Return 140
+        When "setpriority": Return 141
+        When "mlock":    Return 149
+        When "munlock":  Return 150
+        When "mlockall": Return 151
+        When "munlockall": Return 152
+        When "prctl":    Return 157
+        When "arch_prctl": Return 158
+        When "sync":     Return 162
+        When "mount":    Return 165
+        When "umount2":  Return 166
+        When "reboot":   Return 169
+        When "gettid":   Return 186
+        When "futex":    Return 202
+        When "io_setup": Return 206
+        When "io_destroy": Return 207
+        When "io_getevents": Return 208
+        When "io_submit": Return 209
+        When "io_cancel": Return 210
+        When "getdents64": Return 217
+        When "set_tid_address": Return 218
+        When "clock_gettime": Return 228
+        When "clock_getres": Return 229
+        When "clock_nanosleep": Return 230
+        When "exit_group": Return 231
+        When "epoll_wait": Return 232
+        When "epoll_ctl": Return 233
+        When "utimes":   Return 235
+        When "mbind":    Return 237
+        When "set_mempolicy": Return 238
+        When "get_mempolicy": Return 239
+        When "mq_open":  Return 240
+        When "mq_unlink": Return 241
+        When "mq_timedsend": Return 242
+        When "mq_timedreceive": Return 243
+        When "mq_notify": Return 244
+        When "mq_getsetattr": Return 245
+        When "waitid":   Return 247
+        When "ioprio_set": Return 251
+        When "ioprio_get": Return 252
+        When "inotify_init": Return 253
+        When "inotify_add_watch": Return 254
+        When "inotify_rm_watch": Return 255
+        When "openat":   Return 257
+        When "mkdirat":  Return 258
+        When "mknodat":  Return 259
+        When "fchownat": Return 260
+        When "futimesat": Return 261
+        When "newfstatat": Return 262
+        When "unlinkat": Return 263
+        When "renameat": Return 264
+        When "linkat":   Return 265
+        When "symlinkat": Return 266
+        When "readlinkat": Return 267
+        When "fchmodat": Return 268
+        When "faccessat": Return 269
+        When "pselect6": Return 270
+        When "ppoll":    Return 271
+        When "splice":   Return 275
+        When "tee":      Return 276
+        When "sync_file_range": Return 277
+        When "vmsplice": Return 278
+        When "utimensat": Return 280
+        When "epoll_pwait": Return 281
+        When "signalfd": Return 282
+        When "timerfd_create": Return 283
+        When "eventfd":  Return 284
+        When "fallocate": Return 285
+        When "timerfd_settime": Return 286
+        When "timerfd_gettime": Return 287
+        When "accept4":  Return 288
+        When "signalfd4": Return 289
+        When "eventfd2": Return 290
+        When "epoll_create1": Return 291
+        When "dup3":     Return 292
+        When "pipe2":    Return 293
+        When "inotify_init1": Return 294
+        When "preadv":   Return 295
+        When "pwritev":  Return 296
+        When "perf_event_open": Return 298
+        When "recvmmsg": Return 299
+        When "fanotify_init": Return 300
+        When "fanotify_mark": Return 301
+        When "prlimit64": Return 302
+        When "name_to_handle_at": Return 303
+        When "open_by_handle_at": Return 304
+        When "clock_adjtime": Return 305
+        When "syncfs":   Return 306
+        When "sendmmsg": Return 307
+        When "setns":    Return 308
+        When "getcpu":   Return 309
+        When "process_vm_readv": Return 310
+        When "process_vm_writev": Return 311
+        When "kcmp":     Return 312
+        When "finit_module": Return 313
+        When "sched_setattr": Return 314
+        When "sched_getattr": Return 315
+        When "renameat2": Return 316
+        When "seccomp":  Return 317
+        When "getrandom": Return 318
+        When "memfd_create": Return 319
+        When "bpf":      Return 321
+        When "execveat": Return 322
+        When "userfaultfd": Return 323
+        When "membarrier": Return 324
+        When "mlock2":   Return 325
+        When "copy_file_range": Return 326
+        When "preadv2":  Return 327
+        When "pwritev2": Return 328
+        When "pkey_mprotect": Return 329
+        When "pkey_alloc": Return 330
+        When "pkey_free": Return 331
+        When "statx":    Return 332
+        When "io_pgetevents": Return 333
+        When "rseq":     Return 334
+        When "pidfd_send_signal": Return 424
+        When "io_uring_setup": Return 425
+        When "io_uring_enter": Return 426
+        When "io_uring_register": Return 427
+        When "open_tree": Return 428
+        When "move_mount": Return 429
+        When "fsopen":   Return 430
+        When "fsconfig": Return 431
+        When "fsmount":  Return 432
+        When "fspick":   Return 433
+        When "pidfd_open": Return 434
+        When "clone3":   Return 435
+        When "close_range": Return 436
+        When "openat2":  Return 437
+        When "pidfd_getfd": Return 438
+        When "faccessat2": Return 439
+        When "process_madvise": Return 440
+        When "epoll_pwait2": Return 441
+        When "mount_setattr": Return 442
+        When "landlock_create_ruleset": Return 444
+        When "landlock_add_rule": Return 445
+        When "landlock_restrict_self": Return 446
+        When "memfd_secret": Return 447
+        When "process_mrelease": Return 448
+    End Match
+    
+    Return -1  Note: Unknown syscall
+End Process

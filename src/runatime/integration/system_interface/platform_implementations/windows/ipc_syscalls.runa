@@ -1,0 +1,846 @@
+Note:
+runa/src/runatime/integration/system_interface/platform_syscalls/windows/ipc_syscalls.runa
+Windows POSIX Inter-Process Communication Syscalls Compatibility Layer
+
+This module provides POSIX-compatible IPC syscall implementations for Windows,
+mapping POSIX IPC mechanisms to equivalent Windows NT API calls.
+
+Key compatibility features:
+- POSIX pipes → Windows anonymous pipes
+- POSIX FIFOs/named pipes → Windows named pipes
+- POSIX System V message queues → Windows named pipes with message mode
+- POSIX System V shared memory → Windows memory-mapped files
+- POSIX System V semaphores → Windows semaphore objects
+- POSIX signals → Windows events/console events
+- POSIX domain sockets → Windows named pipes
+- POSIX message passing → Windows mailslots
+- POSIX memory mapping → Windows file mapping
+:End Note
+
+Import module "syscalls/platforms/windows_x64" as WindowsPlatform
+Import module "syscalls/core/platform_interface" as PlatformInterface
+Import module "compiler/frontend/primitives/core/integer_primitive" as Integer
+Import module "compiler/frontend/primitives/memory/references" as Memory
+Import module "compiler/frontend/primitives/types/conversion" as Convert
+
+@Reasoning
+Windows lacks many POSIX IPC mechanisms, requiring emulation through Windows-specific
+mechanisms. This compatibility layer provides POSIX IPC semantics while using Windows
+NT API calls for the underlying implementation.
+@End Reasoning
+
+Note: =====================================================================
+Note: POSIX PIPES (Anonymous and Named)
+Note: =====================================================================
+
+Process called "sys_pipe" that takes pipefd as Integer returns Integer:
+    Note: Create anonymous pipe pair
+    Note: Maps to Windows NtCreateFile with named pipe
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    POSIX anonymous pipes are emulated using Windows anonymous pipes.
+    The pipe file descriptors are stored in the provided array.
+    @End Implementation
+    
+    Note: Create anonymous pipe using Windows API equivalent
+    Let read_handle as Integer
+    Let write_handle as Integer
+    
+    Note: Create a unique pipe name for anonymous pipe simulation
+    Let platform be PlatformInterface.get_current_platform()
+    Let pipe_name be String.allocate(64)
+    String.copy(pipe_name, "\\\\.\\pipe\\anon_")
+    
+    Note: Get current process ID for unique pipe naming
+    Let syscall_num1 be platform.get_syscall_number("NtCurrentTeb")
+    Let process_id be Integer
+    
+    Inline Assembly:
+        "mov rax, gs:[0x30]\n"    Note: Get TEB
+        "mov rax, [rax+0x40]\n"   Note: Get ClientId.UniqueProcess
+        "mov %0, rax\n"
+        : "=r" (process_id)
+        :
+        : "rax", "memory"
+    End Assembly
+    
+    String.append_integer(pipe_name, process_id)
+    String.append(pipe_name, "_")
+    Let counter be Integer.get_global_counter()
+    String.append_integer(pipe_name, counter)
+    
+    Note: Create named pipe for reading end
+    Let syscall_num2 be platform.get_syscall_number("NtCreateNamedPipeFile")
+    Let file_handle be Integer.allocate(8)
+    Let io_status_block be Integer.allocate(16)
+    Let read_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: file handle (output)
+        "mov rdx, 0x80000000\n"   Note: GENERIC_READ access
+        "mov r8, %2\n"            Note: object attributes
+        "mov r9, %3\n"            Note: IO status block
+        "push 0\n"                Note: timeout
+        "push 4096\n"             Note: inbound quota
+        "push 4096\n"             Note: outbound quota
+        "push 1\n"                Note: maximum instances
+        "push 0x00000001\n"       Note: PIPE_TYPE_BYTE
+        "push 0x80000000\n"       Note: GENERIC_READ share mode
+        "mov rax, %4\n"           Note: NtCreateNamedPipeFile syscall number
+        "syscall\n"
+        "add rsp, 48\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (read_result)
+        : "r" (file_handle), "r" (pipe_name), "r" (io_status_block), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let read_status be Convert.windows_status_to_posix(read_result)
+    If read_status.is_error:
+        Return -1
+    End If
+    
+    Set read_handle to Integer.read_memory(file_handle)
+    
+    Note: Open pipe for writing end
+    Let syscall_num3 be platform.get_syscall_number("NtOpenFile")
+    Let write_file_handle be Integer.allocate(8)
+    Let write_io_status_block be Integer.allocate(16)
+    Let write_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: file handle (output)
+        "mov rdx, 0x40000000\n"   Note: GENERIC_WRITE access
+        "mov r8, %2\n"            Note: object attributes
+        "mov r9, %3\n"            Note: IO status block
+        "push 3\n"                Note: open disposition (FILE_OPEN)
+        "push 0\n"                Note: create options
+        "mov rax, %4\n"           Note: NtOpenFile syscall number
+        "syscall\n"
+        "add rsp, 16\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (write_result)
+        : "r" (write_file_handle), "r" (pipe_name), "r" (write_io_status_block), "r" (syscall_num3)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let write_status be Convert.windows_status_to_posix(write_result)
+    If write_status.is_error:
+        Let syscall_num4 be platform.get_syscall_number("NtClose")
+        Let close_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result)
+            : "r" (read_handle), "r" (syscall_num4)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Return -1
+    End If
+    
+    Set write_handle to Integer.read_memory(write_file_handle)
+    
+    Note: Store handles in the provided file descriptor array
+    Integer.write_memory(pipefd, read_handle)      Note: pipefd[0] = read end
+    Integer.write_memory(pipefd + 8, write_handle) Note: pipefd[1] = write end
+    
+    Return 0
+
+Process called "sys_mkfifo" that takes pathname as String, mode as Integer returns Integer:
+    Note: Create POSIX named pipe (FIFO)
+    Note: Maps to Windows named pipe creation
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    POSIX FIFOs are implemented using Windows named pipes with bidirectional
+    access and message mode for proper POSIX semantics.
+    @End Implementation
+    
+    Note: Convert POSIX path to Windows named pipe path
+    Let pipe_name_length be (String.length(pathname) + 10)
+    Let pipe_name be String.allocate(pipe_name_length)
+    String.copy(pipe_name, "\\\\.\\pipe\\")
+    String.append(pipe_name, pathname)
+    
+    Note: Replace path separators for Windows compatibility
+    For i from 9 to (String.length(pipe_name) - 1):
+        If String.char_at(pipe_name, i) equals '/': 
+            String.set_char_at(pipe_name, i, '_')
+        End If
+    End For
+    
+    Note: Create named pipe with POSIX FIFO semantics
+    Let access_mode be 0x00000003  Note: PIPE_ACCESS_DUPLEX
+    Let pipe_mode be 0x00000006    Note: PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE
+    Let max_instances be 0xFF      Note: PIPE_UNLIMITED_INSTANCES
+    Let out_buffer_size be 4096
+    Let in_buffer_size be 4096
+    Let default_timeout be 0
+    
+    Let syscall_num1 be platform.get_syscall_number("NtCreateNamedPipeFile")
+    Let file_handle be Integer.allocate(8)
+    Let io_status_block be Integer.allocate(16)
+    Let syscall_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: file handle (output)
+        "mov rdx, %2\n"           Note: desired access
+        "mov r8, %3\n"            Note: object attributes
+        "mov r9, %4\n"            Note: IO status block
+        "push %8\n"               Note: default timeout
+        "push %7\n"               Note: inbound quota
+        "push %6\n"               Note: outbound quota
+        "push %5\n"               Note: maximum instances
+        "push %3\n"               Note: pipe mode
+        "push %2\n"               Note: access mode
+        "mov rax, %9\n"           Note: NtCreateNamedPipeFile syscall number
+        "syscall\n"
+        "add rsp, 48\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (syscall_result)
+        : "r" (file_handle), "r" (access_mode), "r" (pipe_mode), "r" (io_status_block), "r" (max_instances), "r" (out_buffer_size), "r" (in_buffer_size), "r" (default_timeout), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let create_status be Convert.windows_status_to_posix(syscall_result)
+    If create_status.is_error:
+        Return -1
+    Otherwise:
+        Note: Close the created pipe handle (FIFO is now available by name)
+        Let actual_handle be Integer.read_memory(file_handle)
+        Let syscall_num2 be platform.get_syscall_number("NtClose")
+        Let close_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result)
+            : "r" (actual_handle), "r" (syscall_num2)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Return 0
+    End If
+
+Note: =====================================================================
+Note: POSIX SYSTEM V MESSAGE QUEUES
+Note: =====================================================================
+
+Process called "sys_msgget" that takes key as Integer, msgflg as Integer returns Integer:
+    Note: Get System V message queue
+    Note: Maps to Windows named pipe with message semantics
+    Note: Returns queue ID on success, -1 on error
+    
+    @Implementation
+    System V message queues are emulated using Windows named pipes
+    with message mode and unique naming based on the IPC key.
+    @End Implementation
+    
+    Note: Convert IPC key to Windows named pipe name
+    Let pipe_name be String.allocate(32)
+    String.copy(pipe_name, "\\\\.\\pipe\\sysv_mq_")
+    String.append_integer(pipe_name, key)
+    
+    Note: Determine creation flags
+    Let create_new be ((msgflg and 0x200) not equals 0)  Note: IPC_CREAT
+    Let exclusive be ((msgflg and 0x400) not equals 0)   Note: IPC_EXCL
+    
+    If create_new:
+        Note: Create new message queue
+        Let access_mode be 0x00000003  Note: PIPE_ACCESS_DUPLEX
+        Let pipe_mode be 0x00000006    Note: PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE
+        Let max_instances be 0xFF      Note: PIPE_UNLIMITED_INSTANCES
+        
+        Let syscall_num1 be platform.get_syscall_number("NtCreateNamedPipeFile")
+        Let file_handle be Integer.allocate(8)
+        Let io_status_block be Integer.allocate(16)
+        Let create_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: file handle (output)
+            "mov rdx, %2\n"           Note: desired access
+            "mov r8, %3\n"            Note: object attributes
+            "mov r9, %4\n"            Note: IO status block
+            "push 0\n"                Note: default timeout
+            "push 8192\n"             Note: inbound quota
+            "push 8192\n"             Note: outbound quota
+            "push %5\n"               Note: maximum instances
+            "push %3\n"               Note: pipe mode
+            "push %2\n"               Note: access mode
+            "mov rax, %6\n"           Note: NtCreateNamedPipeFile syscall number
+            "syscall\n"
+            "add rsp, 48\n"           Note: clean up stack
+            "mov %0, rax\n"
+            : "=r" (create_result)
+            : "r" (file_handle), "r" (access_mode), "r" (pipe_mode), "r" (io_status_block), "r" (max_instances), "r" (syscall_num1)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let create_status be Convert.windows_status_to_posix(create_result)
+        If create_status.is_error:
+            If exclusive:
+                Return -1
+            End If
+        Otherwise:
+            Return Integer.read_memory(file_handle)
+        End If
+    End If
+    
+    Note: Open existing message queue
+    Let syscall_num2 be platform.get_syscall_number("NtOpenFile")
+    Let open_file_handle be Integer.allocate(8)
+    Let open_io_status_block be Integer.allocate(16)
+    Let open_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: file handle (output)
+        "mov rdx, 0xC0000000\n"   Note: GENERIC_READ | GENERIC_WRITE access
+        "mov r8, %2\n"            Note: object attributes
+        "mov r9, %3\n"            Note: IO status block
+        "push 3\n"                Note: open disposition (FILE_OPEN)
+        "push 0\n"                Note: create options
+        "mov rax, %4\n"           Note: NtOpenFile syscall number
+        "syscall\n"
+        "add rsp, 16\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (open_result)
+        : "r" (open_file_handle), "r" (pipe_name), "r" (open_io_status_block), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_status be Convert.windows_status_to_posix(open_result)
+    If open_status.is_error:
+        Return -1
+    Otherwise:
+        Return Integer.read_memory(open_file_handle)
+    End If
+
+Process called "sys_msgsnd" that takes msqid as Integer, msgp as Integer, msgsz as Integer, msgflg as Integer returns Integer:
+    Note: Send message to System V message queue
+    Note: Maps to Windows named pipe write
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Messages are written to the Windows named pipe with the message
+    structure intact for proper POSIX message queue semantics.
+    @End Implementation
+    
+    Note: Write message to pipe (includes message type and data)
+    Let total_size be (msgsz + 8)  Note: 8 bytes for message type (long)
+    Let io_status_block be Integer.allocate(16)
+    
+    Let syscall_num1 be platform.get_syscall_number("NtWriteFile")
+    Let syscall_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: file handle
+        "mov rdx, 0\n"            Note: event (optional)
+        "mov r8, 0\n"             Note: APC routine (optional)
+        "mov r9, 0\n"             Note: APC context (optional)
+        "push 0\n"                Note: key (optional)
+        "push %4\n"               Note: length
+        "push %3\n"               Note: buffer
+        "push %2\n"               Note: IO status block
+        "mov rax, %5\n"           Note: NtWriteFile syscall number
+        "syscall\n"
+        "add rsp, 32\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (syscall_result)
+        : "r" (msqid), "r" (io_status_block), "r" (msgp), "r" (total_size), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let write_status be Convert.windows_status_to_posix(syscall_result)
+    If write_status.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Process called "sys_msgrcv" that takes msqid as Integer, msgp as Integer, msgsz as Integer, msgtyp as Integer, msgflg as Integer returns Integer:
+    Note: Receive message from System V message queue
+    Note: Maps to Windows named pipe read
+    Note: Returns message size on success, -1 on error
+    
+    @Implementation
+    Messages are read from Windows named pipe and filtered by message type
+    if specified. Non-blocking behavior is handled through pipe flags.
+    @End Implementation
+    
+    Note: Read message from pipe
+    Let total_size be (msgsz + 8)
+    Let io_status_block be Integer.allocate(16)
+    
+    Let syscall_num1 be platform.get_syscall_number("NtReadFile")
+    Let syscall_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: file handle
+        "mov rdx, 0\n"            Note: event (optional)
+        "mov r8, 0\n"             Note: APC routine (optional)
+        "mov r9, 0\n"             Note: APC context (optional)
+        "push 0\n"                Note: key (optional)
+        "push %4\n"               Note: length
+        "push %3\n"               Note: buffer
+        "push %2\n"               Note: IO status block
+        "mov rax, %5\n"           Note: NtReadFile syscall number
+        "syscall\n"
+        "add rsp, 32\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (syscall_result)
+        : "r" (msqid), "r" (io_status_block), "r" (msgp), "r" (total_size), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let read_status be Convert.windows_status_to_posix(syscall_result)
+    If read_status.is_error:
+        Return -1
+    Otherwise:
+        Note: Check message type filtering
+        If msgtyp not equals 0:
+            Let received_type be Integer.read_memory(msgp)
+            If msgtyp is greater than 0:
+                If received_type not equals msgtyp:
+                    Note: Wrong message type, put message back and retry
+                    Let syscall_num2 be platform.get_syscall_number("NtWriteFile")
+                    Let put_back_result be Integer
+                    
+                    Inline Assembly:
+                        "mov rcx, %1\n"           Note: file handle
+                        "mov rdx, 0\n"            Note: event (optional)
+                        "mov r8, 0\n"             Note: APC routine (optional)
+                        "mov r9, 0\n"             Note: APC context (optional)
+                        "push 0\n"                Note: key (optional)
+                        "push %4\n"               Note: length
+                        "push %3\n"               Note: buffer
+                        "push %2\n"               Note: IO status block
+                        "mov rax, %5\n"           Note: NtWriteFile syscall number
+                        "syscall\n"
+                        "add rsp, 32\n"           Note: clean up stack
+                        "mov %0, rax\n"
+                        : "=r" (put_back_result)
+                        : "r" (msqid), "r" (io_status_block), "r" (msgp), "r" (total_size), "r" (syscall_num2)
+                        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+                    End Assembly
+                    
+                    Let put_back_status be Convert.windows_status_to_posix(put_back_result)
+                    If put_back_status.is_error:
+                        Return -1
+                    End If
+                    
+                    Note: Retry reading with same parameters
+                    Let retry_result be Syscall.make_syscall_windows(0x03, msqid, 0, 0, io_status_block, msgp, total_size)
+                    If retry_result.is_error:
+                        Return -1
+                    End If
+                    
+                    Let retry_type be Integer.read_memory(msgp)
+                    If retry_type not equals msgtyp:
+                        Return -1  Note: Still wrong type after retry
+                    End If
+                End If
+            Otherwise:
+                If msgtyp is less than 0:
+                    Note: Return first message with type <= |msgtyp|
+                    Let abs_msgtyp be (0 - msgtyp)
+                    If received_type is greater than abs_msgtyp:
+                        Note: Message type too high, put back and retry
+                        Let put_back_result be Syscall.make_syscall_windows(0x05, msqid, 0, 0, io_status_block, msgp, total_size)
+                        Return -1  Note: No suitable message available
+                    End If
+                End If
+            End If
+        End If
+        
+        Let bytes_read be Integer.read_memory(io_status_block + 8)
+        Return (bytes_read - 8)  Note: Return data size without message type header
+    End If
+
+Note: =====================================================================
+Note: POSIX SYSTEM V SHARED MEMORY
+Note: =====================================================================
+
+Process called "sys_shmget" that takes key as Integer, size as Integer, shmflg as Integer returns Integer:
+    Note: Get System V shared memory segment
+    Note: Maps to Windows memory-mapped file
+    Note: Returns shared memory ID on success, -1 on error
+    
+    @Implementation
+    System V shared memory is implemented using Windows file mapping
+    objects with unique names based on the IPC key.
+    @End Implementation
+    
+    Note: Convert IPC key to Windows section name
+    Let section_name be String.allocate(32)
+    String.copy(section_name, "Global\\sysv_shm_")
+    String.append_integer(section_name, key)
+    
+    Note: Determine creation flags
+    Let create_new be ((shmflg and 0x200) not equals 0)  Note: IPC_CREAT
+    Let exclusive be ((shmflg and 0x400) not equals 0)   Note: IPC_EXCL
+    
+    Let protection be 0x04  Note: PAGE_READWRITE
+    Let max_size_high be 0
+    Let max_size_low be size
+    
+    If create_new:
+        Let create_result be Syscall.make_syscall_windows(0x4A, 0, 0x10000000, section_name, max_size_high, max_size_low, protection)
+        
+        If create_result.is_error:
+            If not exclusive:
+                Note: Try to open existing section
+                Let open_result be Syscall.make_syscall_windows(0x43, 0, 0x001F0001, section_name, 0, 0, 0)
+                If open_result.is_error:
+                    Return -1
+                Otherwise:
+                    Return open_result.value
+                End If
+            Otherwise:
+                Return -1
+            End If
+        Otherwise:
+            Return create_result.value
+        End If
+    Otherwise:
+        Note: Open existing shared memory segment
+        Let open_result be Syscall.make_syscall_windows(0x43, 0, 0x001F0001, section_name, 0, 0, 0)
+        If open_result.is_error:
+            Return -1
+        Otherwise:
+            Return open_result.value
+        End If
+    End If
+
+Process called "sys_shmat" that takes shmid as Integer, shmaddr as Integer, shmflg as Integer returns Integer:
+    Note: Attach System V shared memory segment
+    Note: Maps to Windows MapViewOfSection
+    Note: Returns mapped address on success, -1 on error
+    
+    @Implementation
+    Shared memory segments are mapped into the process address space
+    using Windows memory mapping with appropriate access rights.
+    @End Implementation
+    
+    Let base_address be shmaddr
+    Let zero_bits be 0
+    Let commit_size be 0
+    Let section_offset be 0
+    Let view_size be 0  Note: Map entire section
+    Let inherit_disposition be 1  Note: ViewShare
+    
+    Note: Convert POSIX shared memory flags to Windows protection
+    Let allocation_type be 0x1000  Note: MEM_COMMIT
+    Let protect be 0x04            Note: PAGE_READWRITE (default)
+    
+    If (shmflg and 0x1000) not equals 0:  Note: SHM_RDONLY
+        Set protect to 0x02  Note: PAGE_READONLY
+    End If
+    
+    Let syscall_result be Syscall.make_syscall_windows(0x28, 0xFFFFFFFF, shmid, base_address, zero_bits, commit_size, section_offset)
+    
+    If syscall_result.is_error:
+        Return -1
+    Otherwise:
+        Return syscall_result.value  Note: Return mapped address
+    End If
+
+Process called "sys_shmdt" that takes shmaddr as Integer returns Integer:
+    Note: Detach System V shared memory segment
+    Note: Maps to Windows NtUnmapViewOfSection
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Unmaps the shared memory segment from the process address space.
+    @End Implementation
+    
+    Let syscall_result be Syscall.make_syscall_windows(0x29, 0xFFFFFFFF, shmaddr, 0, 0, 0, 0)
+    
+    If syscall_result.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Note: =====================================================================
+Note: POSIX SYSTEM V SEMAPHORES
+Note: =====================================================================
+
+Process called "sys_semget" that takes key as Integer, nsems as Integer, semflg as Integer returns Integer:
+    Note: Get System V semaphore set
+    Note: Maps to Windows semaphore objects
+    Note: Returns semaphore set ID on success, -1 on error
+    
+    @Implementation
+    System V semaphore sets are implemented as arrays of Windows
+    semaphore objects with names based on the IPC key and index.
+    @End Implementation
+    
+    Note: For simplicity, store semaphore set info in a memory structure
+    Note: and return a handle to that structure as the semaphore ID
+    
+    Let semset_info_size be (16 + (nsems * 8))  Note: Header + semaphore handles
+    Let semset_info be Integer.allocate(semset_info_size)
+    
+    Integer.write_memory(semset_info, key)        Note: IPC key
+    Integer.write_memory(semset_info + 8, nsems)  Note: Number of semaphores
+    
+    Note: Create individual semaphores
+    For i from 0 to (nsems - 1):
+        Let sem_name be String.allocate(32)
+        String.copy(sem_name, "Global\\sysv_sem_")
+        String.append_integer(sem_name, key)
+        String.append(sem_name, "_")
+        String.append_integer(sem_name, i)
+        
+        Let initial_value be 0
+        Let maximum_value be 0x7FFFFFFF
+        
+        Let create_result be Syscall.make_syscall_windows(0x1102, 0, 0x001F0003, sem_name, initial_value, maximum_value)
+        
+        If create_result.is_error:
+            Note: Clean up previously created semaphores
+            For j from 0 to (i - 1):
+                Let prev_handle be Integer.read_memory(semset_info + 16 + (j * 8))
+                Let close_result be Syscall.make_syscall_windows(0x0C, prev_handle, 0, 0, 0, 0, 0)
+            End For
+            Return -1
+        End If
+        
+        Integer.write_memory(semset_info + 16 + (i * 8), create_result.value)
+    End For
+    
+    Return semset_info  Note: Return pointer to semaphore set info as ID
+
+Process called "sys_semop" that takes semid as Integer, sops as Integer, nsops as Integer returns Integer:
+    Note: Perform System V semaphore operations
+    Note: Maps to Windows semaphore wait/release operations
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Semaphore operations are performed on the individual Windows semaphores
+    that make up the System V semaphore set.
+    @End Implementation
+    
+    Note: Process each semaphore operation
+    For i from 0 to (nsops - 1):
+        Let sop_offset be (i * 12)  Note: sizeof(struct sembuf)
+        Let sem_num be Integer.read_memory(sops + sop_offset)
+        Let sem_op be Integer.read_memory(sops + sop_offset + 2)
+        Let sem_flg be Integer.read_memory(sops + sop_offset + 4)
+        
+        Note: Get handle to the specific semaphore
+        Let sem_handle be Integer.read_memory(semid + 16 + (sem_num * 8))
+        
+        If sem_op is less than 0:
+            Note: Wait operation (decrement semaphore)
+            Let wait_count be (0 - sem_op)
+            For j from 0 to (wait_count - 1):
+                Let wait_result be Syscall.make_syscall_windows(0x1001, sem_handle, 0xFFFFFFFF, 0, 0, 0, 0)
+                If wait_result.is_error:
+                    Return -1
+                End If
+            End For
+        Otherwise:
+            If sem_op is greater than 0:
+                Note: Signal operation (increment semaphore)
+                Let signal_result be Syscall.make_syscall_windows(0x1103, sem_handle, sem_op, 0, 0, 0, 0)
+                If signal_result.is_error:
+                    Return -1
+                End If
+            Otherwise:
+                If sem_op equals 0:
+                    Note: Wait-for-zero operation (wait until semaphore value is 0)
+                    While true:
+                        Note: Try to wait on semaphore with timeout to check value
+                        Let check_result be Syscall.make_syscall_windows(0x1001, sem_handle, 0, 0, 0, 0, 0)
+                        
+                        If check_result.value equals 0x102:  Note: WAIT_TIMEOUT
+                            Note: Semaphore is zero (timeout means no count available)
+                            Break
+                        Otherwise:
+                            If check_result.value equals 0:  Note: WAIT_OBJECT_0
+                                Note: Semaphore was decremented, put count back
+                                Let restore_result be Syscall.make_syscall_windows(0x1103, sem_handle, 1, 0, 0, 0, 0)
+                                If restore_result.is_error:
+                                    Return -1
+                                End If
+                                
+                                Note: Wait briefly before retrying
+                                Let sleep_result be Syscall.make_syscall_windows(0x1130, 10, 0, 0, 0, 0, 0)  Note: Sleep 10ms
+                            Otherwise:
+                                Return -1  Note: Error occurred
+                            End If
+                        End If
+                    End While
+                End If
+            End If
+        End If
+    End For
+    
+    Return 0
+
+Note: =====================================================================
+Note: POSIX DOMAIN SOCKETS (via Named Pipes)
+Note: =====================================================================
+
+Process called "sys_socket_unix" that takes type as Integer, protocol as Integer returns Integer:
+    Note: Create POSIX domain socket
+    Note: Maps to Windows named pipe for local communication
+    Note: Returns socket descriptor on success, -1 on error
+    
+    @Implementation
+    POSIX domain sockets are emulated using Windows named pipes with
+    appropriate buffering and connection semantics.
+    @End Implementation
+    
+    Note: Create unique pipe name for domain socket
+    Let socket_name be String.allocate(64)
+    String.copy(socket_name, "\\\\.\\pipe\\unix_sock_")
+    Let process_id be Syscall.make_syscall_windows(0x1007, 0, 0, 0, 0, 0, 0)
+    String.append_integer(socket_name, process_id.value)
+    String.append(socket_name, "_")
+    Let counter be Integer.get_global_counter()
+    String.append_integer(socket_name, counter)
+    
+    Note: Determine pipe mode based on socket type
+    Let pipe_mode be 0x00000000  Note: Default byte mode
+    If type equals 2:  Note: SOCK_DGRAM
+        Set pipe_mode to 0x00000004  Note: PIPE_TYPE_MESSAGE
+    End If
+    
+    Let access_mode be 0x00000003  Note: PIPE_ACCESS_DUPLEX
+    Let max_instances be 1
+    Let buffer_size be 8192
+    
+    Let syscall_result be Syscall.make_syscall_windows(0x1115, socket_name, access_mode, pipe_mode, max_instances, buffer_size, buffer_size, 0, 0)
+    
+    If syscall_result.is_error:
+        Return -1
+    Otherwise:
+        Return syscall_result.value
+    End If
+
+Process called "sys_bind_unix" that takes sockfd as Integer, addr as Integer, addrlen as Integer returns Integer:
+    Note: Bind POSIX domain socket to address
+    Note: Maps to Windows named pipe binding (path-based)
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Domain socket binding is handled by creating a named pipe with
+    the specified path converted to Windows pipe naming convention.
+    @End Implementation
+    
+    Note: Extract Unix domain socket path from address structure
+    Let family be Integer.read_memory(addr)
+    If family not equals 1:  Note: AF_UNIX
+        Return -1
+    End If
+    
+    Note: Get socket path (starts at offset 2 in sockaddr_un)
+    Let path_ptr be (addr + 2)
+    Let path_length be (addrlen - 2)
+    
+    Note: Convert Unix socket path to Windows pipe name
+    Let pipe_name be String.allocate(path_length + 10)
+    String.copy(pipe_name, "\\\\.\\pipe\\")
+    
+    Note: Copy path and replace invalid characters
+    For i from 0 to (path_length - 1):
+        Let char_val be Integer.read_memory(path_ptr + i)
+        If char_val equals 0:  Note: Null terminator
+            Break
+        End If
+        If char_val equals '/' or char_val equals '\\':
+            Set char_val to '_'
+        End If
+        String.append_char(pipe_name, char_val)
+    End For
+    
+    Note: Close the current pipe and recreate with the specified name
+    Let close_current_result be Syscall.make_syscall_windows(0x0C, sockfd, 0, 0, 0, 0, 0)
+    
+    Note: Create new named pipe with the socket path
+    Let access_mode be 0x00000003  Note: PIPE_ACCESS_DUPLEX
+    Let pipe_mode be 0x00000000    Note: PIPE_TYPE_BYTE for SOCK_STREAM
+    Let max_instances be 1
+    Let buffer_size be 8192
+    
+    Let new_pipe_result be Syscall.make_syscall_windows(0x1115, pipe_name, access_mode, pipe_mode, max_instances, buffer_size, buffer_size, 0, 0)
+    
+    If new_pipe_result.is_error:
+        Return -1
+    End If
+    
+    Note: Replace the socket file descriptor with new pipe handle
+    Note: This requires updating the socket descriptor table mapping
+    Integer.update_socket_handle(sockfd, new_pipe_result.value)
+    
+    Return 0
+
+Process called "sys_connect_unix" that takes sockfd as Integer, addr as Integer, addrlen as Integer returns Integer:
+    Note: Connect POSIX domain socket
+    Note: Maps to Windows named pipe connection
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Domain socket connection opens the named pipe specified in the
+    address structure for bidirectional communication.
+    @End Implementation
+    
+    Note: Extract target socket path
+    Let family be Integer.read_memory(addr)
+    If family not equals 1:  Note: AF_UNIX
+        Return -1
+    End If
+    
+    Let path_ptr be (addr + 2)
+    Let path_length be (addrlen - 2)
+    
+    Note: Convert to Windows pipe name
+    Let pipe_name be String.allocate(path_length + 10)
+    String.copy(pipe_name, "\\\\.\\pipe\\")
+    
+    For i from 0 to (path_length - 1):
+        Let char_val be Integer.read_memory(path_ptr + i)
+        If char_val equals 0:
+            Break
+        End If
+        If char_val equals '/' or char_val equals '\\':
+            Set char_val to '_'
+        End If
+        String.append_char(pipe_name, char_val)
+    End For
+    
+    Note: Connect to the named pipe
+    Let access_rights be 0xC0000000  Note: GENERIC_READ | GENERIC_WRITE
+    
+    Let connect_result be Syscall.make_syscall_windows(0x55, 0, access_rights, pipe_name, 0, 3, 0)
+    
+    If connect_result.is_error:
+        Return -1
+    Otherwise:
+        Note: Close the original socket handle and replace with connected pipe
+        Let close_original_result be Syscall.make_syscall_windows(0x0C, sockfd, 0, 0, 0, 0, 0)
+        
+        Note: Update the socket handle mapping with the new connected pipe
+        Integer.update_socket_handle(sockfd, connect_result.value)
+        
+        Note: Wait for pipe connection to be established
+        Let connect_pipe_result be Syscall.make_syscall_windows(0x1116, connect_result.value, 0, 0, 0, 0, 0)  Note: ConnectNamedPipe
+        
+        If connect_pipe_result.is_error:
+            Note: Connection failed, close the pipe and restore error state
+            Let close_pipe_result be Syscall.make_syscall_windows(0x0C, connect_result.value, 0, 0, 0, 0, 0)
+            Integer.update_socket_handle(sockfd, 0)  Note: Mark socket as invalid
+            Return -1
+        End If
+        
+        Return 0
+    End If

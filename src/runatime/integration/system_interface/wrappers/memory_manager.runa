@@ -1,0 +1,723 @@
+Note: Memory Manager Wrapper - Direct syscall interface for memory management
+Note: Provides self-contained memory operations without stdlib dependencies
+
+@Reasoning
+The memory manager wrapper provides direct syscall access for memory management
+operations. This is fundamental for the runtime to allocate, deallocate, and
+manage memory regions without relying on any stdlib functionality. It provides
+the foundation for implementing higher-level allocators and memory pools.
+@End Reasoning
+
+Import module "compiler/frontend/primitives/types/compiler_internals" as "Internals"
+
+Note: =====================================================================
+Note: MEMORY CONSTANTS
+Note: =====================================================================
+
+Note: Memory protection flags
+Let PROT_NONE be 0x0       Note: No permissions
+Let PROT_READ be 0x1       Note: Read permission
+Let PROT_WRITE be 0x2      Note: Write permission
+Let PROT_EXEC be 0x4       Note: Execute permission
+Let PROT_GROWSDOWN be 0x01000000  Note: Stack-like growth
+Let PROT_GROWSUP be 0x02000000    Note: Heap-like growth
+
+Note: Memory mapping flags
+Let MAP_SHARED be 0x01     Note: Share changes with other processes
+Let MAP_PRIVATE be 0x02    Note: Changes are private
+Let MAP_FIXED be 0x10      Note: Use exact address
+Let MAP_ANONYMOUS be 0x20  Note: Not backed by file
+Let MAP_GROWSDOWN be 0x0100  Note: Stack-like segment
+Let MAP_DENYWRITE be 0x0800  Note: Deny writes to underlying file
+Let MAP_EXECUTABLE be 0x1000 Note: Mark as executable
+Let MAP_LOCKED be 0x2000   Note: Lock pages in memory
+Let MAP_NORESERVE be 0x4000  Note: Don't reserve swap space
+Let MAP_POPULATE be 0x8000 Note: Prefault page tables
+Let MAP_NONBLOCK be 0x10000   Note: Don't block on I/O
+Let MAP_STACK be 0x20000   Note: Stack allocation
+Let MAP_HUGETLB be 0x40000 Note: Use huge pages
+
+Note: Memory advice flags (madvise)
+Let MADV_NORMAL be 0       Note: Default behavior
+Let MADV_RANDOM be 1       Note: Random access pattern
+Let MADV_SEQUENTIAL be 2   Note: Sequential access pattern
+Let MADV_WILLNEED be 3     Note: Will need these pages soon
+Let MADV_DONTNEED be 4     Note: Won't need these pages soon
+Let MADV_REMOVE be 9       Note: Remove pages from backing store
+Let MADV_DONTFORK be 10    Note: Don't inherit on fork
+Let MADV_DOFORK be 11      Note: Do inherit on fork
+Let MADV_MERGEABLE be 12   Note: Pages can be merged
+Let MADV_UNMERGEABLE be 13 Note: Pages cannot be merged
+Let MADV_HUGEPAGE be 14    Note: Use transparent huge pages
+Let MADV_NOHUGEPAGE be 15  Note: Don't use transparent huge pages
+Let MADV_DONTDUMP be 16    Note: Exclude from core dumps
+Let MADV_DODUMP be 17      Note: Include in core dumps
+
+Note: =====================================================================
+Note: MEMORY STRUCTURES
+Note: =====================================================================
+
+Type called "MemoryRegion":
+    address as Integer                    Note: Start address of region
+    size as Integer                       Note: Size in bytes
+    protection as Integer                 Note: Protection flags
+    flags as Integer                      Note: Mapping flags
+    is_mapped as Boolean                  Note: Whether region is mapped
+End Type
+
+Type called "MemoryInfo":
+    total_virtual as Integer              Note: Total virtual memory
+    available_virtual as Integer          Note: Available virtual memory
+    total_physical as Integer             Note: Total physical memory
+    available_physical as Integer         Note: Available physical memory
+    page_size as Integer                  Note: System page size
+    allocation_granularity as Integer     Note: Allocation granularity
+End Type
+
+Type called "AllocationStats":
+    total_allocated as Integer            Note: Total bytes allocated
+    total_freed as Integer                Note: Total bytes freed
+    current_usage as Integer              Note: Current memory usage
+    peak_usage as Integer                 Note: Peak memory usage
+    allocation_count as Integer           Note: Number of allocations
+    free_count as Integer                 Note: Number of frees
+End Type
+
+Note: =====================================================================
+Note: MEMORY ALLOCATION
+Note: =====================================================================
+
+Note: Allocate memory region
+Process called "allocate_memory" that takes size as Integer, protection as Integer, flags as Integer returns MemoryRegion:
+    @Implementation
+    Allocates a memory region using mmap syscall with specified protection
+    and flags. Returns a MemoryRegion structure with the allocated address.
+    @End Implementation
+    
+    Let region be MemoryRegion
+    Set region.size to size
+    Set region.protection to protection
+    Set region.flags to flags | MAP_ANONYMOUS | MAP_PRIVATE
+    
+    Let address be Integer
+    Inline Assembly:
+        "xor rdi, rdi\n"          Note: NULL address (let kernel choose)
+        "mov rsi, %1\n"           Note: Size
+        "mov rdx, %2\n"           Note: Protection
+        "mov r10, %3\n"           Note: Flags
+        "mov r8, -1\n"            Note: No file descriptor
+        "xor r9, r9\n"            Note: Offset 0
+        "mov rax, 9\n"            Note: mmap syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(address)
+        : "r"(size), "r"(protection), "r"(region.flags)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Set region.address to address
+    Set region.is_mapped to address > 0 and address < -4096  Note: Check for error
+    
+    Return region
+End Process
+
+Note: Allocate memory at specific address
+Process called "allocate_at_address" that takes address as Integer, size as Integer, protection as Integer, flags as Integer returns MemoryRegion:
+    @Implementation
+    Allocates memory at a specific address using mmap with MAP_FIXED flag.
+    @End Implementation
+    
+    Let region be MemoryRegion
+    Set region.size to size
+    Set region.protection to protection
+    Set region.flags to flags | MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
+    
+    Let result_addr be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Requested address
+        "mov rsi, %2\n"           Note: Size
+        "mov rdx, %3\n"           Note: Protection
+        "mov r10, %4\n"           Note: Flags
+        "mov r8, -1\n"            Note: No file descriptor
+        "xor r9, r9\n"            Note: Offset 0
+        "mov rax, 9\n"            Note: mmap syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result_addr)
+        : "r"(address), "r"(size), "r"(protection), "r"(region.flags)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Set region.address to result_addr
+    Set region.is_mapped to result_addr equals address
+    
+    Return region
+End Process
+
+Note: Free memory region
+Process called "free_memory" that takes region as MemoryRegion returns Integer:
+    @Implementation
+    Frees a memory region using munmap syscall.
+    @End Implementation
+    
+    If not region.is_mapped:
+        Return -1
+    End If
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Address
+        "mov rsi, %2\n"           Note: Size
+        "mov rax, 11\n"           Note: munmap syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(region.address), "r"(region.size)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    If result equals 0:
+        Set region.is_mapped to false
+    End If
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: MEMORY PROTECTION
+Note: =====================================================================
+
+Note: Change memory protection
+Process called "protect_memory" that takes region as MemoryRegion, new_protection as Integer returns Integer:
+    @Implementation
+    Changes memory protection flags using mprotect syscall.
+    @End Implementation
+    
+    If not region.is_mapped:
+        Return -1
+    End If
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Address
+        "mov rsi, %2\n"           Note: Size
+        "mov rdx, %3\n"           Note: New protection
+        "mov rax, 10\n"           Note: mprotect syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(region.address), "r"(region.size), "r"(new_protection)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11"
+    End Assembly
+    
+    If result equals 0:
+        Set region.protection to new_protection
+    End If
+    
+    Return result
+End Process
+
+Note: Lock memory in RAM
+Process called "lock_memory" that takes region as MemoryRegion returns Integer:
+    @Implementation
+    Locks memory pages in RAM using mlock syscall to prevent swapping.
+    @End Implementation
+    
+    If not region.is_mapped:
+        Return -1
+    End If
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Address
+        "mov rsi, %2\n"           Note: Size
+        "mov rax, 149\n"          Note: mlock syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(region.address), "r"(region.size)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Unlock memory
+Process called "unlock_memory" that takes region as MemoryRegion returns Integer:
+    @Implementation
+    Unlocks memory pages using munlock syscall.
+    @End Implementation
+    
+    If not region.is_mapped:
+        Return -1
+    End If
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Address
+        "mov rsi, %2\n"           Note: Size
+        "mov rax, 150\n"          Note: munlock syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(region.address), "r"(region.size)
+        : "rax", "rdi", "rsi", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: MEMORY RESIZING
+Note: =====================================================================
+
+Note: Resize memory region
+Process called "resize_memory" that takes region as MemoryRegion, new_size as Integer returns MemoryRegion:
+    @Implementation
+    Resizes a memory region using mremap syscall.
+    @End Implementation
+    
+    If not region.is_mapped:
+        Return region
+    End If
+    
+    Let new_address be Integer
+    Let MREMAP_MAYMOVE be 1  Note: Allow relocation if needed
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Old address
+        "mov rsi, %2\n"           Note: Old size
+        "mov rdx, %3\n"           Note: New size
+        "mov r10, %4\n"           Note: Flags (MREMAP_MAYMOVE)
+        "xor r8, r8\n"            Note: New address (unused)
+        "mov rax, 25\n"           Note: mremap syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(new_address)
+        : "r"(region.address), "r"(region.size), "r"(new_size), "r"(MREMAP_MAYMOVE)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory"
+    End Assembly
+    
+    If new_address > 0 and new_address < -4096:
+        Set region.address to new_address
+        Set region.size to new_size
+    Otherwise:
+        Set region.is_mapped to false
+    End If
+    
+    Return region
+End Process
+
+Note: Extend heap
+Process called "extend_heap" that takes increment as Integer returns Integer:
+    @Implementation
+    Extends the program heap using brk syscall.
+    Returns the new break address.
+    @End Implementation
+    
+    Note: Get current break
+    Let current_brk be Integer
+    Inline Assembly:
+        "xor rdi, rdi\n"          Note: NULL to get current brk
+        "mov rax, 12\n"           Note: brk syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(current_brk)
+        :
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+    
+    Note: Set new break
+    Let new_brk be current_brk + increment
+    Let result_brk be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: New break address
+        "mov rax, 12\n"           Note: brk syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result_brk)
+        : "r"(new_brk)
+        : "rax", "rdi", "rcx", "r11"
+    End Assembly
+    
+    Return result_brk
+End Process
+
+Note: =====================================================================
+Note: MEMORY ADVICE
+Note: =====================================================================
+
+Note: Advise kernel about memory usage
+Process called "advise_memory" that takes region as MemoryRegion, advice as Integer returns Integer:
+    @Implementation
+    Provides memory usage hints to kernel using madvise syscall.
+    @End Implementation
+    
+    If not region.is_mapped:
+        Return -1
+    End If
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Address
+        "mov rsi, %2\n"           Note: Size
+        "mov rdx, %3\n"           Note: Advice
+        "mov rax, 28\n"           Note: madvise syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(region.address), "r"(region.size), "r"(advice)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: Prefault memory pages
+Process called "prefault_memory" that takes region as MemoryRegion returns Integer:
+    @Implementation
+    Prefaults memory pages to avoid page faults during use.
+    @End Implementation
+    
+    Return advise_memory(region, MADV_WILLNEED)
+End Process
+
+Note: Release unused memory
+Process called "release_unused_memory" that takes region as MemoryRegion returns Integer:
+    @Implementation
+    Hints to kernel that memory won't be needed soon.
+    @End Implementation
+    
+    Return advise_memory(region, MADV_DONTNEED)
+End Process
+
+Note: =====================================================================
+Note: MEMORY INFORMATION
+Note: =====================================================================
+
+Note: Get system memory info
+Process called "get_memory_info" returns MemoryInfo:
+    @Implementation
+    Gets system memory information including page size and available memory.
+    @End Implementation
+    
+    Let info be MemoryInfo
+    
+    Note: Get page size using sysconf-like approach
+    Let page_size be Integer
+    Inline Assembly:
+        "mov rax, 4096\n"         Note: Common page size
+        "mov %0, rax\n"
+        : "=r"(page_size)
+        :
+        : "rax"
+    End Assembly
+    Set info.page_size to page_size
+    Set info.allocation_granularity to page_size
+    
+    Note: Get memory info using sysinfo syscall for efficiency
+    Let sysinfo_buffer be allocate_sysinfo_buffer()
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: sysinfo buffer
+        "mov rax, 99\n"           Note: sysinfo syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(sysinfo_buffer)
+        : "rax", "rdi", "rcx", "r11", "memory"
+    End Assembly
+    
+    If result equals 0:
+        parse_sysinfo_memory(sysinfo_buffer, info)
+    End If
+    
+    Return info
+End Process
+
+Note: Check if address is mapped
+Process called "is_address_mapped" that takes address as Integer returns Boolean:
+    @Implementation
+    Checks if an address is currently mapped by attempting to access it.
+    @End Implementation
+    
+    Note: Try to read from the address using mincore
+    Let vec be Integer
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Address
+        "mov rsi, 1\n"            Note: Check 1 byte
+        "lea rdx, [%2]\n"         Note: Result vector
+        "mov rax, 27\n"           Note: mincore syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(address), "m"(vec)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return result equals 0
+End Process
+
+Note: =====================================================================
+Note: MEMORY SYNCHRONIZATION
+Note: =====================================================================
+
+Note: Sync memory to disk
+Process called "sync_memory" that takes region as MemoryRegion, flags as Integer returns Integer:
+    @Implementation
+    Synchronizes memory with backing store using msync syscall.
+    @End Implementation
+    
+    If not region.is_mapped:
+        Return -1
+    End If
+    
+    Let result be Integer
+    Inline Assembly:
+        "mov rdi, %1\n"           Note: Address
+        "mov rsi, %2\n"           Note: Size
+        "mov rdx, %3\n"           Note: Flags
+        "mov rax, 26\n"           Note: msync syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(result)
+        : "r"(region.address), "r"(region.size), "r"(flags)
+        : "rax", "rdi", "rsi", "rdx", "rcx", "r11"
+    End Assembly
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: SHARED MEMORY
+Note: =====================================================================
+
+Note: Create shared memory
+Process called "create_shared_memory" that takes size as Integer, protection as Integer returns MemoryRegion:
+    @Implementation
+    Creates a shared memory region that can be accessed by multiple processes.
+    @End Implementation
+    
+    Let region be MemoryRegion
+    Set region.size to size
+    Set region.protection to protection
+    Set region.flags to MAP_SHARED | MAP_ANONYMOUS
+    
+    Let address be Integer
+    Inline Assembly:
+        "xor rdi, rdi\n"          Note: NULL address
+        "mov rsi, %1\n"           Note: Size
+        "mov rdx, %2\n"           Note: Protection
+        "mov r10, %3\n"           Note: Flags
+        "mov r8, -1\n"            Note: No file descriptor
+        "xor r9, r9\n"            Note: Offset 0
+        "mov rax, 9\n"            Note: mmap syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(address)
+        : "r"(size), "r"(protection), "r"(region.flags)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Set region.address to address
+    Set region.is_mapped to address > 0 and address < -4096
+    
+    Return region
+End Process
+
+Note: =====================================================================
+Note: HUGE PAGES
+Note: =====================================================================
+
+Note: Allocate huge pages
+Process called "allocate_huge_pages" that takes size as Integer, protection as Integer returns MemoryRegion:
+    @Implementation
+    Allocates memory using huge pages for better TLB performance.
+    @End Implementation
+    
+    Let region be MemoryRegion
+    Set region.size to size
+    Set region.protection to protection
+    Set region.flags to MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB
+    
+    Let address be Integer
+    Inline Assembly:
+        "xor rdi, rdi\n"          Note: NULL address
+        "mov rsi, %1\n"           Note: Size (must be huge page aligned)
+        "mov rdx, %2\n"           Note: Protection
+        "mov r10, %3\n"           Note: Flags
+        "mov r8, -1\n"            Note: No file descriptor
+        "xor r9, r9\n"            Note: Offset 0
+        "mov rax, 9\n"            Note: mmap syscall
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(address)
+        : "r"(size), "r"(protection), "r"(region.flags)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Set region.address to address
+    Set region.is_mapped to address > 0 and address < -4096
+    
+    Return region
+End Process
+
+Note: =====================================================================
+Note: MEMORY UTILITIES
+Note: =====================================================================
+
+Note: Copy memory
+Process called "copy_memory" that takes dest as Integer, src as Integer, size as Integer:
+    @Implementation
+    Copies memory from source to destination.
+    @End Implementation
+    
+    Let i be 0
+    While i < size:
+        Let byte be read_byte_at(src + i)
+        write_byte_at(dest + i, byte)
+        Set i to i + 1
+    End While
+End Process
+
+Note: Fill memory
+Process called "fill_memory" that takes addr as Integer, value as Integer, size as Integer:
+    @Implementation
+    Fills memory region with a specific byte value.
+    @End Implementation
+    
+    Let i be 0
+    While i < size:
+        write_byte_at(addr + i, value)
+        Set i to i + 1
+    End While
+End Process
+
+Note: Compare memory
+Process called "compare_memory" that takes addr1 as Integer, addr2 as Integer, size as Integer returns Integer:
+    @Implementation
+    Compares two memory regions byte by byte.
+    Returns 0 if equal, negative if addr1 < addr2, positive if addr1 > addr2.
+    @End Implementation
+    
+    Let i be 0
+    While i < size:
+        Let byte1 be read_byte_at(addr1 + i)
+        Let byte2 be read_byte_at(addr2 + i)
+        
+        If byte1 < byte2:
+            Return -1
+        End If
+        
+        If byte1 > byte2:
+            Return 1
+        End If
+        
+        Set i to i + 1
+    End While
+    
+    Return 0
+End Process
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Note: Allocate sysinfo buffer
+Process called "allocate_sysinfo_buffer" returns Integer:
+    Let sysinfo_size be 112  Note: sizeof(struct sysinfo)
+    Let buffer be Integer
+    
+    Inline Assembly:
+        "mov rdi, %1\n"
+        "mov rax, 9\n"            Note: mmap
+        "xor rsi, rsi\n"
+        "mov rdx, 3\n"            Note: PROT_READ | PROT_WRITE
+        "mov r10, 0x22\n"         Note: MAP_PRIVATE | MAP_ANONYMOUS
+        "mov r8, -1\n"
+        "xor r9, r9\n"
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r"(buffer)
+        : "r"(sysinfo_size)
+        : "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", "rcx", "r11", "memory"
+    End Assembly
+    
+    Return buffer
+End Process
+
+Note: Parse sysinfo for memory
+Process called "parse_sysinfo_memory" that takes buffer as Integer, info as MemoryInfo:
+    @Implementation
+    Extracts memory information from sysinfo structure.
+    @End Implementation
+    
+    Set info.total_physical to read_long_at_offset(buffer, 32)
+    Set info.available_physical to read_long_at_offset(buffer, 40)
+    Set info.total_virtual to read_long_at_offset(buffer, 32) + read_long_at_offset(buffer, 64)
+    Set info.available_virtual to read_long_at_offset(buffer, 40) + read_long_at_offset(buffer, 72)
+End Process
+
+Note: Read byte at address
+Process called "read_byte_at" that takes addr as Integer returns Integer:
+    Let value be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"
+        "movzx rbx, byte [rax]\n"
+        "mov %0, rbx\n"
+        : "=r"(value)
+        : "r"(addr)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return value
+End Process
+
+Note: Write byte at address
+Process called "write_byte_at" that takes addr as Integer, value as Integer:
+    Inline Assembly:
+        "mov rax, %0\n"
+        "mov bl, %1b\n"
+        "mov [rax], bl\n"
+        :
+        : "r"(addr), "r"(value)
+        : "rax", "rbx", "memory"
+    End Assembly
+End Process
+
+Note: Read long at offset
+Process called "read_long_at_offset" that takes buffer as Integer, offset as Integer returns Integer:
+    Let value be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"
+        "add rax, %2\n"
+        "mov rbx, [rax]\n"
+        "mov %0, rbx\n"
+        : "=r"(value)
+        : "r"(buffer), "r"(offset)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return value
+End Process
+
+Note: Align address to page boundary
+Process called "align_to_page" that takes addr as Integer, page_size as Integer returns Integer:
+    Return (addr + page_size - 1) & ~(page_size - 1)
+End Process
+
+Note: Check if size is page aligned
+Process called "is_page_aligned" that takes size as Integer, page_size as Integer returns Boolean:
+    Return (size & (page_size - 1)) equals 0
+End Process
+
+Note: Calculate number of pages
+Process called "calculate_pages" that takes size as Integer, page_size as Integer returns Integer:
+    Return (size + page_size - 1) / page_size
+End Process

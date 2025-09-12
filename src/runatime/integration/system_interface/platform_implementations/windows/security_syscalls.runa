@@ -1,0 +1,1546 @@
+Note:
+runa/src/runatime/integration/system_interface/platform_syscalls/windows/security_syscalls.runa
+Windows POSIX Security Syscalls Compatibility Layer
+
+This module provides POSIX-compatible security syscall implementations for Windows,
+mapping POSIX security operations to equivalent Windows NT API calls.
+
+Key compatibility features:
+- POSIX getuid/geteuid → Windows token queries
+- POSIX getgid/getegid → Windows group SID queries
+- POSIX setuid/setgid → Windows token manipulation
+- POSIX access() → Windows access checking
+- POSIX chmod/chown → Windows ACL manipulation
+- POSIX umask → Windows security descriptor defaults
+- POSIX capabilities → Windows privileges
+- POSIX file permissions → Windows ACL entries
+- POSIX process credentials → Windows access tokens
+:End Note
+
+Import module "syscalls/platforms/windows_x64" as WindowsPlatform
+Import module "syscalls/core/platform_interface" as PlatformInterface
+Import module "compiler/frontend/primitives/core/integer_primitive" as Integer
+Import module "compiler/frontend/primitives/memory/references" as Memory
+Import module "compiler/frontend/primitives/types/conversion" as Convert
+
+@Reasoning
+Windows security model differs significantly from POSIX. This compatibility layer
+provides POSIX security semantics while using Windows access tokens, security
+descriptors, and privilege systems for the underlying implementation.
+@End Reasoning
+
+Note: =====================================================================
+Note: POSIX USER AND GROUP IDENTIFICATION
+Note: =====================================================================
+
+Process called "sys_getuid" that returns Integer:
+    Note: Get real user ID
+    Note: Maps to Windows token user SID query
+    Note: Returns numeric user ID representation
+    
+    @Implementation
+    POSIX user ID is derived from Windows user SID by querying the current
+    process token and extracting the user information.
+    @End Implementation
+    
+    Note: Open current process token
+    Let token_handle as Integer
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtOpenProcessToken")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: token handle (output)
+        "mov r8, 0x0008\n"        Note: TOKEN_QUERY access
+        "mov rax, %2\n"           Note: NtOpenProcessToken syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (token_handle), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_result be Convert.windows_status_to_posix(result)
+    
+    If open_result.is_error:
+        Return 1000  Note: Default user ID on error
+    End If
+    
+    Set token_handle to open_result.value
+    
+    Note: Query token user information
+    Let user_info_size be 128
+    Let user_info be Integer.allocate(user_info_size)
+    Let return_length be Integer.allocate(4)
+    
+    Let platform2 be PlatformInterface.get_current_platform()
+    Let syscall_num2 be platform2.get_syscall_number("NtQueryInformationToken")
+    Let query_result_code be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"               Note: token handle
+        "mov rdx, 1\n"                Note: TokenUser information class
+        "mov r8, %2\n"                Note: token information buffer
+        "mov r9, %3\n"                Note: token information length
+        "push %4\n"                   Note: return length
+        "mov rax, %5\n"               Note: NtQueryInformationToken syscall number
+        "syscall\n"
+        "add rsp, 8\n"                Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (query_result_code)
+        : "r" (token_handle), "r" (user_info), "r" (user_info_size), "r" (return_length), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let query_result be Convert.windows_status_to_posix(query_result_code)
+    
+    Let platform3 be PlatformInterface.get_current_platform()
+    Let syscall_num3 be platform3.get_syscall_number("NtClose")
+    Let close_result_code be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"               Note: handle to close
+        "mov rax, %2\n"               Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_result_code)
+        : "r" (token_handle), "r" (syscall_num3)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let close_result be Convert.windows_status_to_posix(close_result_code)
+    
+    If query_result.is_error:
+        Return 1000
+    End If
+    
+    Note: Extract SID and convert to numeric UID
+    Let sid_ptr be Integer.read_memory(user_info + 8)  Note: TOKEN_USER.User.Sid
+    
+    Note: Get RID (Relative ID) from SID as UID approximation
+    Let rid_offset be Integer.read_memory(sid_ptr + 1)  Note: SubAuthorityCount
+    Let rid_offset_bytes be ((rid_offset - 1) * 4) + 8
+    Let uid be Integer.read_memory(sid_ptr + rid_offset_bytes)
+    
+    Return uid
+
+Process called "sys_geteuid" that returns Integer:
+    Note: Get effective user ID
+    Note: Maps to Windows impersonation token query
+    Note: Returns effective user ID (same as real on Windows)
+    
+    @Implementation
+    Windows doesn't distinguish between real and effective user ID in the same
+    way as POSIX. Returns the same value as getuid().
+    @End Implementation
+    
+    Return sys_getuid()
+
+Process called "sys_getgid" that returns Integer:
+    Note: Get real group ID
+    Note: Maps to Windows primary group SID query
+    Note: Returns numeric group ID representation
+    
+    @Implementation
+    POSIX group ID is derived from Windows primary group SID by querying
+    the current process token's primary group information.
+    @End Implementation
+    
+    Note: Open current process token
+    Let token_handle be Integer.allocate(8)
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtOpenProcessToken")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: token handle (output)
+        "mov r8, 0x0008\n"        Note: TOKEN_QUERY access
+        "mov rax, %2\n"           Note: NtOpenProcessToken syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (token_handle), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_result be Convert.windows_status_to_posix(result)
+    
+    If open_result.is_error:
+        Return 1000  Note: Default group ID
+    End If
+    
+    Let actual_token_handle be Integer.read_memory(token_handle)
+    
+    Note: Query token primary group
+    Let group_info_size be 64
+    Let group_info be Integer.allocate(group_info_size)
+    Let return_length be Integer.allocate(4)
+    
+    Let platform2 be PlatformInterface.get_current_platform()
+    Let syscall_num2 be platform2.get_syscall_number("NtQueryInformationToken")
+    Let query_result_code be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"               Note: token handle
+        "mov rdx, 5\n"                Note: TokenPrimaryGroup information class
+        "mov r8, %2\n"                Note: token information buffer
+        "mov r9, %3\n"                Note: token information length
+        "push %4\n"                   Note: return length
+        "mov rax, %5\n"               Note: NtQueryInformationToken syscall number
+        "syscall\n"
+        "add rsp, 8\n"                Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (query_result_code)
+        : "r" (actual_token_handle), "r" (group_info), "r" (group_info_size), "r" (return_length), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let query_result be Convert.windows_status_to_posix(query_result_code)
+    
+    Let platform3 be PlatformInterface.get_current_platform()
+    Let syscall_num3 be platform3.get_syscall_number("NtClose")
+    Let close_result_code be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"               Note: handle to close
+        "mov rax, %2\n"               Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_result_code)
+        : "r" (actual_token_handle), "r" (syscall_num3)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let close_result be Convert.windows_status_to_posix(close_result_code)
+    
+    If query_result.is_error:
+        Return 1000
+    End If
+    
+    Note: Extract group SID and convert to GID
+    Let group_sid_ptr be Integer.read_memory(group_info)  Note: TOKEN_PRIMARY_GROUP.PrimaryGroup
+    
+    Note: Get RID from group SID
+    Let rid_offset be Integer.read_memory(group_sid_ptr + 1)
+    Let rid_offset_bytes be ((rid_offset - 1) * 4) + 8
+    Let gid be Integer.read_memory(group_sid_ptr + rid_offset_bytes)
+    
+    Return gid
+
+Process called "sys_getegid" that returns Integer:
+    Note: Get effective group ID
+    Note: Same as real group ID on Windows
+    Note: Returns effective group ID
+    
+    @Implementation
+    Windows doesn't have separate effective group ID concept.
+    Returns the same as getgid().
+    @End Implementation
+    
+    Return sys_getgid()
+
+Note: =====================================================================
+Note: POSIX USER AND GROUP MODIFICATION
+Note: =====================================================================
+
+Process called "sys_setuid" that takes uid as Integer returns Integer:
+    Note: Set user ID
+    Note: Maps to Windows token manipulation
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Setting user ID requires creating a new token with the specified user.
+    This is a privileged operation requiring appropriate Windows privileges.
+    @End Implementation
+    
+    Note: This operation requires SE_TCB_PRIVILEGE (Act as part of operating system)
+    Note: Most user processes don't have this privilege, so this will typically fail
+    
+    Note: Open current process token for duplication
+    Let current_token be Integer.allocate(8)
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtOpenProcessToken")
+    Let result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: token handle (output)
+        "mov r8, 0x0002\n"        Note: TOKEN_DUPLICATE access
+        "mov rax, %2\n"           Note: NtOpenProcessToken syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (result)
+        : "r" (current_token), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_result be Convert.windows_status_to_posix(result)
+    
+    If open_result.is_error:
+        Return -1
+    End If
+    
+    Let actual_current_token be Integer.read_memory(current_token)
+    
+    Note: Check if process has SE_TCB_PRIVILEGE (Act as part of operating system)
+    Let privilege_check be Integer.allocate(4)
+    Let platform2 be PlatformInterface.get_current_platform()
+    Let syscall_num2 be platform2.get_syscall_number("NtPrivilegeCheck")
+    Let privilege_result_code be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"               Note: token handle
+        "mov rdx, 0x7\n"              Note: SE_TCB_PRIVILEGE
+        "mov r8, %2\n"                Note: privilege check result
+        "mov rax, %3\n"               Note: NtPrivilegeCheck syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (privilege_result_code)
+        : "r" (actual_current_token), "r" (privilege_check), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let privilege_result be Convert.windows_status_to_posix(privilege_result_code)
+    Let privilege_check_result be Integer.read_memory(privilege_check)
+    
+    If privilege_result.is_error or privilege_check_result equals 0:
+        Note: Process lacks required privilege for setuid operation
+        Let platform3 be PlatformInterface.get_current_platform()
+        Let syscall_num3 be platform3.get_syscall_number("NtClose")
+        Let close_result_code be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"               Note: handle to close
+            "mov rax, %2\n"               Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result_code)
+            : "r" (actual_current_token), "r" (syscall_num3)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let close_result be Convert.windows_status_to_posix(close_result_code)
+        Return -1  Note: EPERM - Operation not permitted
+    End If
+    
+    Note: Create security identifier for the specified user ID
+    Let user_sid as Integer
+    Let sid_size be 68  Note: Maximum SID size
+    Let domain_size be 256
+    Let sid_name_use as Integer
+    
+    Note: Allocate memory for SID and domain name
+    Let sid_buffer be Memory.allocate(sid_size)
+    Let domain_buffer be Memory.allocate(domain_size)
+    
+    Note: Convert numeric UID to Windows SID
+    Note: For simplicity, create a well-known SID pattern
+    Let authority_array be Memory.allocate(6)
+    Integer.write_memory(authority_array, 0)     Note: SECURITY_NULL_SID_AUTHORITY high bytes
+    Integer.write_memory(authority_array + 4, 5) Note: SECURITY_NT_AUTHORITY
+    
+    Let platform4 be PlatformInterface.get_current_platform()
+    Let syscall_num4 be platform4.get_syscall_number("RtlAllocateAndInitializeSid")
+    Let create_sid_result_code be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"               Note: identifier authority
+        "mov rdx, 1\n"                Note: sub authority count
+        "mov r8, %2\n"                Note: sub authority 0 (uid)
+        "mov r9, 0\n"                 Note: sub authority 1 (unused)
+        "push 0\n"                    Note: sub authority 7 (unused)
+        "push 0\n"                    Note: sub authority 6 (unused)
+        "push 0\n"                    Note: sub authority 5 (unused)
+        "push 0\n"                    Note: sub authority 4 (unused)
+        "push 0\n"                    Note: sub authority 3 (unused)
+        "push 0\n"                    Note: sub authority 2 (unused)
+        "push %3\n"                   Note: SID pointer (output)
+        "mov rax, %4\n"               Note: RtlAllocateAndInitializeSid syscall number
+        "syscall\n"
+        "add rsp, 56\n"               Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (create_sid_result_code)
+        : "r" (authority_array), "r" (uid), "r" (sid_buffer), "r" (syscall_num4)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let create_sid_result be Convert.windows_status_to_posix(create_sid_result_code)
+    
+    If create_sid_result.is_error:
+        Memory.deallocate(sid_buffer)
+        Memory.deallocate(domain_buffer)
+        Memory.deallocate(authority_array)
+        Let platform5 be PlatformInterface.get_current_platform()
+        Let syscall_num5 be platform5.get_syscall_number("NtClose")
+        Let close_result_code2 be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"               Note: handle to close
+            "mov rax, %2\n"               Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result_code2)
+            : "r" (actual_current_token), "r" (syscall_num5)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let close_result be Convert.windows_status_to_posix(close_result_code2)
+        Return -1  Note: EINVAL - Invalid user ID
+    End If
+    
+    Note: Create new token with specified user SID
+    Let new_token be Integer.allocate(8)
+    Let platform6 be PlatformInterface.get_current_platform()
+    Let syscall_num6 be platform6.get_syscall_number("NtDuplicateToken")
+    Let duplicate_result_code be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"               Note: existing token handle
+        "mov rdx, 0x0002\n"           Note: TOKEN_DUPLICATE access
+        "mov r8, 0\n"                 Note: object attributes
+        "mov r9, 1\n"                 Note: effective only
+        "push 1\n"                    Note: token type (TokenPrimary)
+        "push %2\n"                   Note: new token handle (output)
+        "mov rax, %3\n"               Note: NtDuplicateToken syscall number
+        "syscall\n"
+        "add rsp, 16\n"               Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (duplicate_result_code)
+        : "r" (actual_current_token), "r" (new_token), "r" (syscall_num6)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let duplicate_result be Convert.windows_status_to_posix(duplicate_result_code)
+    
+    If duplicate_result.is_error:
+        Memory.deallocate(sid_buffer)
+        Memory.deallocate(domain_buffer)
+        Memory.deallocate(authority_array)
+        Let platform7 be PlatformInterface.get_current_platform()
+        Let syscall_num7 be platform7.get_syscall_number("NtClose")
+        Let close_result_code3 be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"               Note: handle to close
+            "mov rax, %2\n"               Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result_code3)
+            : "r" (actual_current_token), "r" (syscall_num7)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Let close_result be Convert.windows_status_to_posix(close_result_code3)
+        Return -1  Note: Failed to duplicate token
+    End If
+    
+    Note: Set the user SID in the new token
+    Let token_user_struct be Memory.allocate(12)  Note: TOKEN_USER structure
+    Memory.write_pointer(token_user_struct, sid_buffer)     Note: User.Sid
+    Memory.write_dword(token_user_struct + 8, 0)           Note: User.Attributes
+    
+    Note: Set token user information
+    Let syscall_num5 be platform.get_syscall_number("NtSetInformationToken")
+    Let set_info_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: token handle
+        "mov rdx, 1\n"            Note: TokenUser
+        "mov r8, %2\n"            Note: token information
+        "mov r9, 12\n"            Note: token information length
+        "mov rax, %3\n"           Note: NtSetInformationToken syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (set_info_result)
+        : "r" (new_token), "r" (token_user_struct), "r" (syscall_num5)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let set_info_status be Convert.windows_status_to_posix(set_info_result)
+    If set_info_status.is_error:
+        Memory.deallocate(token_user_struct)
+        Memory.deallocate(sid_buffer)
+        Memory.deallocate(domain_buffer) 
+        Memory.deallocate(authority_array)
+        
+        Note: Close new token handle
+        Let syscall_num6 be platform.get_syscall_number("NtClose")
+        Let close_new_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_new_result)
+            : "r" (new_token), "r" (syscall_num6)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Note: Close current token handle
+        Let close_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result)
+            : "r" (current_token), "r" (syscall_num6)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Return -1  Note: Failed to set token user
+    End If
+    
+    Note: Apply the new token to current thread
+    Let syscall_num7 be platform.get_syscall_number("NtSetInformationThread")
+    Let set_thread_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFE\n"   Note: current thread handle
+        "mov rdx, 5\n"            Note: ThreadImpersonationToken
+        "mov r8, %1\n"            Note: thread information (token)
+        "mov r9, 8\n"             Note: thread information length
+        "mov rax, %2\n"           Note: NtSetInformationThread syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (set_thread_result)
+        : "r" (new_token), "r" (syscall_num7)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Note: Clean up resources
+    Memory.deallocate(token_user_struct)
+    Memory.deallocate(sid_buffer)
+    Memory.deallocate(domain_buffer)
+    Memory.deallocate(authority_array)
+    
+    Note: Close new token handle
+    Let syscall_num8 be platform.get_syscall_number("NtClose")
+    Let close_new_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_new_result)
+        : "r" (new_token), "r" (syscall_num8)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Note: Close current token handle
+    Let close_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_result)
+        : "r" (current_token), "r" (syscall_num8)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let set_thread_status be Convert.windows_status_to_posix(set_thread_result)
+    If set_thread_status.is_error:
+        Return -1  Note: Failed to apply new token
+    End If
+    
+    Return 0  Note: Success
+
+Process called "sys_setgid" that takes gid as Integer returns Integer:
+    Note: Set group ID
+    Note: Maps to Windows primary group modification
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Similar to setuid, setting group ID requires privileged operations
+    not available in user mode.
+    @End Implementation
+    
+    Note: Open current process token for group modification
+    Let platform be PlatformInterface.get_current_platform()
+    Let current_token as Integer
+    Let syscall_num1 be platform.get_syscall_number("NtOpenProcessToken")
+    Let open_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: token handle (output)
+        "mov r8, 0x0008\n"        Note: TOKEN_ADJUST_GROUPS access
+        "mov rax, %2\n"           Note: NtOpenProcessToken syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (open_result)
+        : "r" (&current_token), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_status be Convert.windows_status_to_posix(open_result)
+    If open_status.is_error:
+        Return -1  Note: EPERM - Cannot open process token
+    End If
+    
+    Note: Check if process has SE_TCB_PRIVILEGE for group modification
+    Let privilege_check as Integer
+    Let syscall_num2 be platform.get_syscall_number("NtPrivilegeCheck")
+    Let privilege_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: token handle
+        "mov rdx, %2\n"           Note: privilege set
+        "mov r8, %3\n"            Note: result (output)
+        "mov rax, %4\n"           Note: NtPrivilegeCheck syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (privilege_result)
+        : "r" (current_token), "r" (0x7), "r" (&privilege_check), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let privilege_status be Convert.windows_status_to_posix(privilege_result)
+    If privilege_status.is_error or privilege_check equals 0:
+        Note: Process lacks required privilege for setgid operation
+        Let syscall_num3 be platform.get_syscall_number("NtClose")
+        Let close_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result)
+            : "r" (current_token), "r" (syscall_num3)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Return -1  Note: EPERM - Operation not permitted
+    End If
+    
+    Note: Create security identifier for the specified group ID
+    Let group_sid as Integer
+    Let sid_size be 68  Note: Maximum SID size
+    
+    Note: Allocate memory for group SID
+    Let sid_buffer be Memory.allocate(sid_size)
+    
+    Note: Convert numeric GID to Windows SID
+    Let authority_array be Memory.allocate(6)
+    Integer.write_memory(authority_array, 0)     Note: SECURITY_NULL_SID_AUTHORITY high bytes  
+    Integer.write_memory(authority_array + 4, 5) Note: SECURITY_NT_AUTHORITY
+    
+    Let syscall_num4 be platform.get_syscall_number("RtlAllocateAndInitializeSid")
+    Let create_sid_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: identifier authority
+        "mov rdx, 1\n"            Note: sub authority count
+        "mov r8, %2\n"            Note: sub authority 0
+        "mov r9, 0\n"             Note: sub authority 1
+        "push 0\n"                Note: sub authority 7
+        "push 0\n"                Note: sub authority 6
+        "push 0\n"                Note: sub authority 5
+        "push 0\n"                Note: sub authority 4
+        "push 0\n"                Note: sub authority 3
+        "push 0\n"                Note: sub authority 2
+        "push %3\n"               Note: sid pointer (output)
+        "mov rax, %4\n"           Note: RtlAllocateAndInitializeSid syscall number
+        "syscall\n"
+        "add rsp, 56\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (create_sid_result)
+        : "r" (authority_array), "r" (gid), "r" (&sid_buffer), "r" (syscall_num4)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let create_sid_status be Convert.windows_status_to_posix(create_sid_result)
+    If create_sid_status.is_error:
+        Memory.deallocate(sid_buffer)
+        Memory.deallocate(authority_array)
+        
+        Let syscall_num5 be platform.get_syscall_number("NtClose")
+        Let close_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result)
+            : "r" (current_token), "r" (syscall_num5)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Return -1  Note: EINVAL - Invalid group ID
+    End If
+    
+    Note: Set the primary group SID in the token
+    Let token_primary_group be Memory.allocate(8)  Note: TOKEN_PRIMARY_GROUP structure
+    Memory.write_pointer(token_primary_group, sid_buffer)  Note: PrimaryGroup
+    
+    Let syscall_num6 be platform.get_syscall_number("NtSetInformationToken")
+    Let set_info_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: token handle
+        "mov rdx, 5\n"            Note: TokenPrimaryGroup
+        "mov r8, %2\n"            Note: token information
+        "mov r9, 8\n"             Note: token information length
+        "mov rax, %3\n"           Note: NtSetInformationToken syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (set_info_result)
+        : "r" (current_token), "r" (token_primary_group), "r" (syscall_num6)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Note: Clean up resources
+    Memory.deallocate(token_primary_group)
+    Memory.deallocate(sid_buffer)
+    Memory.deallocate(authority_array)
+    
+    Let syscall_num7 be platform.get_syscall_number("NtClose")
+    Let close_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_result)
+        : "r" (current_token), "r" (syscall_num7)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let set_info_status be Convert.windows_status_to_posix(set_info_result)
+    If set_info_status.is_error:
+        Return -1  Note: Failed to set primary group
+    End If
+    
+    Return 0  Note: Success
+
+Note: =====================================================================
+Note: POSIX FILE ACCESS AND PERMISSIONS
+Note: =====================================================================
+
+Process called "sys_access" that takes pathname as String, mode as Integer returns Integer:
+    Note: Check file access permissions
+    Note: Maps to Windows access checking
+    Note: Returns 0 if accessible, -1 if not
+    
+    @Implementation
+    File access checking uses Windows access control mechanisms to verify
+    if the current user has the requested permissions on the file.
+    @End Implementation
+    
+    Note: Convert POSIX access mode to Windows desired access
+    Let desired_access be 0
+    
+    If (mode and 0x04) not equals 0:  Note: R_OK
+        Set desired_access to (desired_access or 0x80000000)  Note: GENERIC_READ
+    End If
+    If (mode and 0x02) not equals 0:  Note: W_OK
+        Set desired_access to (desired_access or 0x40000000)  Note: GENERIC_WRITE
+    End If
+    If (mode and 0x01) not equals 0:  Note: X_OK
+        Set desired_access to (desired_access or 0x20000000)  Note: GENERIC_EXECUTE
+    End If
+    If mode equals 0:  Note: F_OK (file exists)
+        Set desired_access to 0x80  Note: FILE_READ_ATTRIBUTES
+    End If
+    
+    Note: Try to open file with requested access
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num1 be platform.get_syscall_number("NtOpenFile")
+    Let file_handle be Integer.allocate(8)
+    Let io_status_block be Integer.allocate(16)
+    Let access_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: file handle (output)
+        "mov rdx, %2\n"           Note: desired access
+        "mov r8, %3\n"            Note: object attributes
+        "mov r9, %4\n"            Note: IO status block
+        "push 3\n"                Note: open disposition (FILE_OPEN)
+        "push 0\n"                Note: create options
+        "mov rax, %5\n"           Note: NtOpenFile syscall number
+        "syscall\n"
+        "add rsp, 16\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (access_result)
+        : "r" (file_handle), "r" (desired_access), "r" (pathname), "r" (io_status_block), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let access_status be Convert.windows_status_to_posix(access_result)
+    If access_status.is_error:
+        Return -1  Note: Access denied or file doesn't exist
+    Otherwise:
+        Note: File is accessible, close the handle
+        Let actual_handle be Integer.read_memory(file_handle)
+        Let syscall_num2 be platform.get_syscall_number("NtClose")
+        Let close_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result)
+            : "r" (actual_handle), "r" (syscall_num2)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Return 0
+    End If
+
+Process called "sys_chmod" that takes pathname as String, mode as Integer returns Integer:
+    Note: Change file permissions
+    Note: Maps to Windows security descriptor modification
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    File permission changes require modifying the Windows security descriptor
+    and ACL entries to reflect the POSIX permission bits.
+    @End Implementation
+    
+    Note: Open file for WRITE_DAC access to modify permissions
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num1 be platform.get_syscall_number("NtOpenFile")
+    Let file_handle be Integer.allocate(8)
+    Let io_status_block be Integer.allocate(16)
+    Let open_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: file handle (output)
+        "mov rdx, 0x00040000\n"   Note: WRITE_DAC access
+        "mov r8, %2\n"            Note: object attributes
+        "mov r9, %3\n"            Note: IO status block
+        "push 3\n"                Note: open disposition (FILE_OPEN)
+        "push 0\n"                Note: create options
+        "mov rax, %4\n"           Note: NtOpenFile syscall number
+        "syscall\n"
+        "add rsp, 16\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (open_result)
+        : "r" (file_handle), "r" (pathname), "r" (io_status_block), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_status be Convert.windows_status_to_posix(open_result)
+    If open_status.is_error:
+        Return -1
+    End If
+    
+    Let actual_handle be Integer.read_memory(file_handle)
+    
+    Note: Get current security descriptor
+    Let security_info be 4  Note: DACL_SECURITY_INFORMATION
+    Let sd_buffer_size be 1024
+    Let sd_buffer be Integer.allocate(sd_buffer_size)
+    Let sd_length be Integer.allocate(4)
+    
+    Let syscall_num2 be platform.get_syscall_number("NtQuerySecurityObject")
+    Let get_sd_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: object handle
+        "mov rdx, %2\n"           Note: security information
+        "mov r8, %3\n"            Note: security descriptor
+        "mov r9, %4\n"            Note: length
+        "push %5\n"               Note: return length
+        "mov rax, %6\n"           Note: NtQuerySecurityObject syscall number
+        "syscall\n"
+        "add rsp, 8\n"            Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (get_sd_result)
+        : "r" (actual_handle), "r" (security_info), "r" (sd_buffer), "r" (sd_buffer_size), "r" (sd_length), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let get_sd_status be Convert.windows_status_to_posix(get_sd_result)
+    If get_sd_status.is_error:
+        Let syscall_num3 be platform.get_syscall_number("NtClose")
+        Let close_result be Integer
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: handle to close
+            "mov rax, %2\n"           Note: NtClose syscall number
+            "syscall\n"
+            "mov %0, rax\n"
+            : "=r" (close_result)
+            : "r" (actual_handle), "r" (syscall_num3)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+        
+        Return -1
+    End If
+    
+    Note: Modify DACL based on POSIX mode bits
+    Note: Create new ACL with proper Windows ACE entries
+    
+    Note: Create new ACL entries based on permission bits
+    Let new_acl_size be 256
+    Let new_acl be Integer.allocate(new_acl_size)
+    
+    Note: Initialize ACL header
+    Integer.write_memory(new_acl, 2)      Note: AclRevision
+    Integer.write_memory(new_acl + 2, new_acl_size)  Note: AclSize
+    
+    Note: Add ACE entries based on mode (owner, group, other)
+    Let ace_count be 0
+    
+    Note: Add owner permissions
+    If (mode and 0x100) not equals 0:  Note: S_IRUSR
+        Let ace_offset be (8 + (ace_count * 20))  Note: ACL header + ACE size
+        Integer.write_memory(new_acl + ace_offset, 0)     Note: ACCESS_ALLOWED_ACE_TYPE
+        Integer.write_memory(new_acl + ace_offset + 1, 0) Note: AceFlags
+        Integer.write_memory(new_acl + ace_offset + 2, 20) Note: AceSize
+        Integer.write_memory(new_acl + ace_offset + 4, 0x80000000) Note: GENERIC_READ
+        Set ace_count to (ace_count + 1)
+    End If
+    
+    If (mode and 0x80) not equals 0:  Note: S_IWUSR
+        Let ace_offset be (8 + (ace_count * 20))
+        Integer.write_memory(new_acl + ace_offset, 0)
+        Integer.write_memory(new_acl + ace_offset + 1, 0)
+        Integer.write_memory(new_acl + ace_offset + 2, 20)
+        Integer.write_memory(new_acl + ace_offset + 4, 0x40000000) Note: GENERIC_WRITE
+        Set ace_count to (ace_count + 1)
+    End If
+    
+    If (mode and 0x40) not equals 0:  Note: S_IXUSR
+        Let ace_offset be (8 + (ace_count * 20))
+        Integer.write_memory(new_acl + ace_offset, 0)
+        Integer.write_memory(new_acl + ace_offset + 1, 0)
+        Integer.write_memory(new_acl + ace_offset + 2, 20)
+        Integer.write_memory(new_acl + ace_offset + 4, 0x20000000) Note: GENERIC_EXECUTE
+        Set ace_count to (ace_count + 1)
+    End If
+    
+    Note: Add group permissions
+    If (mode and 0x20) not equals 0:  Note: S_IRGRP
+        Let ace_offset be (8 + (ace_count * 20))
+        Integer.write_memory(new_acl + ace_offset, 0)
+        Integer.write_memory(new_acl + ace_offset + 1, 0)
+        Integer.write_memory(new_acl + ace_offset + 2, 20)
+        Integer.write_memory(new_acl + ace_offset + 4, 0x80000000) Note: GENERIC_READ
+        Set ace_count to (ace_count + 1)
+    End If
+    
+    If (mode and 0x10) not equals 0:  Note: S_IWGRP
+        Let ace_offset be (8 + (ace_count * 20))
+        Integer.write_memory(new_acl + ace_offset, 0)
+        Integer.write_memory(new_acl + ace_offset + 1, 0)
+        Integer.write_memory(new_acl + ace_offset + 2, 20)
+        Integer.write_memory(new_acl + ace_offset + 4, 0x40000000) Note: GENERIC_WRITE
+        Set ace_count to (ace_count + 1)
+    End If
+    
+    If (mode and 0x8) not equals 0:  Note: S_IXGRP
+        Let ace_offset be (8 + (ace_count * 20))
+        Integer.write_memory(new_acl + ace_offset, 0)
+        Integer.write_memory(new_acl + ace_offset + 1, 0)
+        Integer.write_memory(new_acl + ace_offset + 2, 20)
+        Integer.write_memory(new_acl + ace_offset + 4, 0x20000000) Note: GENERIC_EXECUTE
+        Set ace_count to (ace_count + 1)
+    End If
+    
+    Note: Add other permissions
+    If (mode and 0x4) not equals 0:  Note: S_IROTH
+        Let ace_offset be (8 + (ace_count * 20))
+        Integer.write_memory(new_acl + ace_offset, 0)
+        Integer.write_memory(new_acl + ace_offset + 1, 0)
+        Integer.write_memory(new_acl + ace_offset + 2, 20)
+        Integer.write_memory(new_acl + ace_offset + 4, 0x80000000) Note: GENERIC_READ
+        Set ace_count to (ace_count + 1)
+    End If
+    
+    If (mode and 0x2) not equals 0:  Note: S_IWOTH
+        Let ace_offset be (8 + (ace_count * 20))
+        Integer.write_memory(new_acl + ace_offset, 0)
+        Integer.write_memory(new_acl + ace_offset + 1, 0)
+        Integer.write_memory(new_acl + ace_offset + 2, 20)
+        Integer.write_memory(new_acl + ace_offset + 4, 0x40000000) Note: GENERIC_WRITE
+        Set ace_count to (ace_count + 1)
+    End If
+    
+    If (mode and 0x1) not equals 0:  Note: S_IXOTH
+        Let ace_offset be (8 + (ace_count * 20))
+        Integer.write_memory(new_acl + ace_offset, 0)
+        Integer.write_memory(new_acl + ace_offset + 1, 0)
+        Integer.write_memory(new_acl + ace_offset + 2, 20)
+        Integer.write_memory(new_acl + ace_offset + 4, 0x20000000) Note: GENERIC_EXECUTE
+        Set ace_count to (ace_count + 1)
+    End If
+    
+    Integer.write_memory(new_acl + 4, ace_count)  Note: AceCount
+    
+    Note: Update security descriptor to reference new ACL
+    Integer.write_memory(sd_buffer + 12, new_acl)  Note: DACL offset in security descriptor
+    
+    Note: Set the new security descriptor
+    Let syscall_num4 be platform.get_syscall_number("NtSetSecurityObject")
+    Let set_sd_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: object handle
+        "mov rdx, %2\n"           Note: security information
+        "mov r8, %3\n"            Note: security descriptor
+        "mov rax, %4\n"           Note: NtSetSecurityObject syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (set_sd_result)
+        : "r" (actual_handle), "r" (security_info), "r" (sd_buffer), "r" (syscall_num4)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_num5 be platform.get_syscall_number("NtClose")
+    Let close_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_result)
+        : "r" (actual_handle), "r" (syscall_num5)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let set_sd_status be Convert.windows_status_to_posix(set_sd_result)
+    If set_sd_status.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Process called "sys_chown" that takes pathname as String, owner as Integer, group as Integer returns Integer:
+    Note: Change file ownership
+    Note: Maps to Windows security descriptor owner modification
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    File ownership changes require modifying the Windows security descriptor
+    to set new owner and group SIDs based on the provided UIDs/GIDs.
+    @End Implementation
+    
+    Note: Open file for WRITE_OWNER and WRITE_DAC access
+    Let platform be PlatformInterface.get_current_platform()
+    Let desired_access be 0x00080000 or 0x00040000  Note: WRITE_OWNER | WRITE_DAC
+    Let syscall_num1 be platform.get_syscall_number("NtOpenFile")
+    Let file_handle be Integer.allocate(8)
+    Let io_status_block be Integer.allocate(16)
+    Let open_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: file handle (output)
+        "mov rdx, %2\n"           Note: desired access
+        "mov r8, %3\n"            Note: object attributes
+        "mov r9, %4\n"            Note: IO status block
+        "push 3\n"                Note: open disposition (FILE_OPEN)
+        "push 0\n"                Note: create options
+        "mov rax, %5\n"           Note: NtOpenFile syscall number
+        "syscall\n"
+        "add rsp, 16\n"           Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (open_result)
+        : "r" (file_handle), "r" (desired_access), "r" (pathname), "r" (io_status_block), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_status be Convert.windows_status_to_posix(open_result)
+    If open_status.is_error:
+        Return -1
+    End If
+    
+    Let actual_handle be Integer.read_memory(file_handle)
+    
+    Note: Convert UID/GID to Windows SIDs
+    Note: Construct Windows SIDs from numeric IDs using standard Windows SID format
+    
+    Let security_info be 0
+    If owner not equals -1:
+        Set security_info to (security_info or 1)  Note: OWNER_SECURITY_INFORMATION
+    End If
+    If group not equals -1:
+        Set security_info to (security_info or 2)  Note: GROUP_SECURITY_INFORMATION
+    End If
+    
+    Note: Create security descriptor with new owner/group
+    Let sd_size be 512
+    Let sd_buffer be Integer.allocate(sd_size)
+    
+    Note: Initialize security descriptor structure
+    Integer.write_memory(sd_buffer, 1)      Note: Revision
+    Integer.write_memory(sd_buffer + 2, 0)  Note: Control flags
+    
+    Let sid_offset be 20  Note: Start SID data after SD header
+    
+    If owner not equals -1:
+        Note: Construct owner SID from UID
+        Integer.write_memory(sd_buffer + 4, sid_offset)  Note: Owner SID offset
+        
+        Note: Build SID structure: S-1-5-32-{UID}
+        Integer.write_memory(sd_buffer + sid_offset, 1)     Note: Revision
+        Integer.write_memory(sd_buffer + sid_offset + 1, 4) Note: SubAuthorityCount
+        Integer.write_memory(sd_buffer + sid_offset + 2, 0) Note: IdentifierAuthority high
+        Integer.write_memory(sd_buffer + sid_offset + 4, 5) Note: IdentifierAuthority low
+        Integer.write_memory(sd_buffer + sid_offset + 8, 32) Note: SubAuthority[0]
+        Integer.write_memory(sd_buffer + sid_offset + 12, owner) Note: SubAuthority[1] = UID
+        
+        Set sid_offset to (sid_offset + 16)
+    End If
+    
+    If group not equals -1:
+        Note: Construct group SID from GID
+        Integer.write_memory(sd_buffer + 8, sid_offset)  Note: Group SID offset
+        
+        Integer.write_memory(sd_buffer + sid_offset, 1)
+        Integer.write_memory(sd_buffer + sid_offset + 1, 4)
+        Integer.write_memory(sd_buffer + sid_offset + 2, 0)
+        Integer.write_memory(sd_buffer + sid_offset + 4, 5)
+        Integer.write_memory(sd_buffer + sid_offset + 8, 32)
+        Integer.write_memory(sd_buffer + sid_offset + 12, group)
+    End If
+    
+    Note: Set the security descriptor
+    Let syscall_num2 be platform.get_syscall_number("NtSetSecurityObject")
+    Let set_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: object handle
+        "mov rdx, %2\n"           Note: security information
+        "mov r8, %3\n"            Note: security descriptor
+        "mov rax, %4\n"           Note: NtSetSecurityObject syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (set_result)
+        : "r" (actual_handle), "r" (security_info), "r" (sd_buffer), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_num3 be platform.get_syscall_number("NtClose")
+    Let close_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_result)
+        : "r" (actual_handle), "r" (syscall_num3)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let set_status be Convert.windows_status_to_posix(set_result)
+    If set_status.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If
+
+Note: =====================================================================
+Note: POSIX PROCESS SECURITY
+Note: =====================================================================
+
+Process called "sys_umask" that takes mask as Integer returns Integer:
+    Note: Set file mode creation mask
+    Note: Maps to Windows default security descriptor
+    Note: Returns previous mask value
+    
+    @Implementation
+    POSIX umask is emulated using a global variable since Windows doesn't
+    have an equivalent concept. This affects default permissions for new files.
+    @End Implementation
+    
+    Note: Get current umask from global storage
+    Let old_mask be Integer.get_global_umask()
+    
+    Note: Set new umask
+    Integer.set_global_umask(mask)
+    
+    Return old_mask
+
+Process called "sys_getgroups" that takes size as Integer, list as Integer returns Integer:
+    Note: Get supplementary group IDs
+    Note: Maps to Windows token groups query
+    Note: Returns number of groups on success, -1 on error
+    
+    @Implementation
+    Supplementary groups are retrieved from Windows token group information
+    and converted to POSIX group ID format.
+    @End Implementation
+    
+    Note: Open current process token
+    Let platform be PlatformInterface.get_current_platform()
+    Let token_handle as Integer
+    Let syscall_num1 be platform.get_syscall_number("NtOpenProcessToken")
+    Let open_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: token handle (output)
+        "mov r8, 0x0008\n"        Note: TOKEN_QUERY access
+        "mov rax, %2\n"           Note: NtOpenProcessToken syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (open_result)
+        : "r" (&token_handle), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_status be Convert.windows_status_to_posix(open_result)
+    If open_status.is_error:
+        Return -1
+    End If
+    
+    Note: Query token groups
+    Let groups_info_size be 1024
+    Let groups_info be Integer.allocate(groups_info_size)
+    Let return_length be Integer.allocate(4)
+    
+    Let syscall_num2 be platform.get_syscall_number("NtQueryInformationToken")
+    Let query_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: token handle
+        "mov rdx, 2\n"            Note: TokenGroups
+        "mov r8, %2\n"            Note: token information
+        "mov r9, %3\n"            Note: token information length
+        "push %4\n"               Note: return length
+        "mov rax, %5\n"           Note: NtQueryInformationToken syscall number
+        "syscall\n"
+        "add rsp, 8\n"            Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (query_result)
+        : "r" (token_handle), "r" (groups_info), "r" (groups_info_size), "r" (return_length), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_num3 be platform.get_syscall_number("NtClose")
+    Let close_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_result)
+        : "r" (token_handle), "r" (syscall_num3)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let query_status be Convert.windows_status_to_posix(query_result)
+    If query_status.is_error:
+        Return -1
+    End If
+    
+    Note: Extract group count
+    Let group_count be Integer.read_memory(groups_info)  Note: TOKEN_GROUPS.GroupCount
+    
+    Note: If size is 0, just return count
+    If size equals 0:
+        Return group_count
+    End If
+    
+    Note: If provided buffer is too small, return error
+    If size is less than group_count:
+        Return -1
+    End If
+    
+    Note: Convert group SIDs to GIDs and store in list
+    For i from 0 to (group_count - 1):
+        Let group_entry_offset be 4 + (i * 8)  Note: Skip GroupCount, each SID_AND_ATTRIBUTES is 8 bytes
+        Let group_sid_ptr be Integer.read_memory(groups_info + group_entry_offset)
+        
+        Note: Extract RID from SID as GID
+        Let rid_offset be Integer.read_memory(group_sid_ptr + 1)
+        Let rid_offset_bytes be ((rid_offset - 1) * 4) + 8
+        Let gid be Integer.read_memory(group_sid_ptr + rid_offset_bytes)
+        
+        Integer.write_memory(list + (i * 4), gid)
+    End For
+    
+    Return group_count
+
+Note: =====================================================================
+Note: POSIX CAPABILITIES AND PRIVILEGES
+Note: =====================================================================
+
+Process called "sys_capget" that takes hdrp as Integer, datap as Integer returns Integer:
+    Note: Get process capabilities
+    Note: Maps to Windows privilege enumeration
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    POSIX capabilities are mapped to Windows privileges. The current process
+    token is queried for enabled privileges and converted to capability format.
+    @End Implementation
+    
+    Note: Open current process token
+    Let platform be PlatformInterface.get_current_platform()
+    Let token_handle as Integer
+    Let syscall_num1 be platform.get_syscall_number("NtOpenProcessToken")
+    Let open_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: token handle (output)
+        "mov r8, 0x0008\n"        Note: TOKEN_QUERY access
+        "mov rax, %2\n"           Note: NtOpenProcessToken syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (open_result)
+        : "r" (&token_handle), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_status be Convert.windows_status_to_posix(open_result)
+    If open_status.is_error:
+        Return -1
+    End If
+    
+    Note: Query token privileges
+    Let privs_info_size be 1024
+    Let privs_info be Integer.allocate(privs_info_size)
+    Let return_length be Integer.allocate(4)
+    
+    Let syscall_num2 be platform.get_syscall_number("NtQueryInformationToken")
+    Let query_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: token handle
+        "mov rdx, 3\n"            Note: TokenPrivileges
+        "mov r8, %2\n"            Note: token information
+        "mov r9, %3\n"            Note: token information length
+        "push %4\n"               Note: return length
+        "mov rax, %5\n"           Note: NtQueryInformationToken syscall number
+        "syscall\n"
+        "add rsp, 8\n"            Note: clean up stack
+        "mov %0, rax\n"
+        : "=r" (query_result)
+        : "r" (token_handle), "r" (privs_info), "r" (privs_info_size), "r" (return_length), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let syscall_num3 be platform.get_syscall_number("NtClose")
+    Let close_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_result)
+        : "r" (token_handle), "r" (syscall_num3)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let query_status be Convert.windows_status_to_posix(query_result)
+    If query_status.is_error:
+        Return -1
+    End If
+    
+    Note: Convert Windows privileges to POSIX capabilities
+    Let privilege_count be Integer.read_memory(privs_info)
+    Let capabilities_effective be 0
+    Let capabilities_permitted be 0
+    Let capabilities_inheritable be 0
+    
+    Note: Map common Windows privileges to POSIX capabilities
+    For i from 0 to (privilege_count - 1):
+        Let priv_entry_offset be 4 + (i * 12)  Note: LUID_AND_ATTRIBUTES structure
+        Let priv_luid_low be Integer.read_memory(privs_info + priv_entry_offset)
+        Let priv_attributes be Integer.read_memory(privs_info + priv_entry_offset + 8)
+        
+        Note: Map specific privileges to capabilities
+        Match priv_luid_low:
+            When 2:  Note: SE_CREATE_TOKEN_PRIVILEGE (approximate)
+                If (priv_attributes and 2) not equals 0:  Note: SE_PRIVILEGE_ENABLED
+                    Set capabilities_effective to (capabilities_effective or 1)  Note: CAP_SETPCAP
+                End If
+                Set capabilities_permitted to (capabilities_permitted or 1)
+            When 7:  Note: SE_TCB_PRIVILEGE
+                If (priv_attributes and 2) not equals 0:
+                    Set capabilities_effective to (capabilities_effective or 2)  Note: CAP_SYS_ADMIN
+                End If
+                Set capabilities_permitted to (capabilities_permitted or 2)
+            When 9:  Note: SE_SECURITY_PRIVILEGE
+                If (priv_attributes and 2) not equals 0:
+                    Set capabilities_effective to (capabilities_effective or 4)  Note: CAP_AUDIT_WRITE
+                End If
+                Set capabilities_permitted to (capabilities_permitted or 4)
+        End Match
+    End For
+    
+    Note: Fill capability data structure
+    If datap not equals 0:
+        Integer.write_memory(datap, capabilities_effective)     Note: effective
+        Integer.write_memory(datap + 4, capabilities_permitted) Note: permitted
+        Integer.write_memory(datap + 8, capabilities_inheritable) Note: inheritable
+    End If
+    
+    Return 0
+
+Process called "sys_capset" that takes hdrp as Integer, datap as Integer returns Integer:
+    Note: Set process capabilities
+    Note: Maps to Windows privilege adjustment
+    Note: Returns 0 on success, -1 on error
+    
+    @Implementation
+    Setting capabilities attempts to enable/disable corresponding Windows
+    privileges in the current process token.
+    @End Implementation
+    
+    Note: Capability modification requires specific privileges
+    Note: Most user processes cannot modify their capabilities
+    
+    If datap equals 0:
+        Return -1
+    End If
+    
+    Note: Read requested capabilities
+    Let capabilities_effective be Integer.read_memory(datap)
+    Let capabilities_permitted be Integer.read_memory(datap + 4)
+    Let capabilities_inheritable be Integer.read_memory(datap + 8)
+    
+    Note: Open current process token for privilege adjustment
+    Let platform be PlatformInterface.get_current_platform()
+    Let token_handle as Integer
+    Let desired_access be 0x0020  Note: TOKEN_ADJUST_PRIVILEGES
+    Let syscall_num1 be platform.get_syscall_number("NtOpenProcessToken")
+    Let open_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, 0xFFFFFFFF\n"   Note: current process handle
+        "mov rdx, %1\n"           Note: token handle (output)
+        "mov r8, %2\n"            Note: desired access
+        "mov rax, %3\n"           Note: NtOpenProcessToken syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (open_result)
+        : "r" (&token_handle), "r" (desired_access), "r" (syscall_num1)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let open_status be Convert.windows_status_to_posix(open_result)
+    If open_status.is_error:
+        Return -1
+    End If
+    
+    Note: Prepare privilege adjustment structure
+    Let token_privs_size be 64
+    Let token_privs be Integer.allocate(token_privs_size)
+    
+    Integer.write_memory(token_privs, 1)  Note: PrivilegeCount = 1
+    
+    Note: Adjust privileges based on capability flags
+    Note: Map all relevant capabilities to Windows privileges systematically
+    
+    Let adjust_result as Integer
+    Let privilege_count be 0
+    
+    Note: CAP_SYS_ADMIN (21) -> SE_TCB_PRIVILEGE (7) and SE_DEBUG_PRIVILEGE (20)
+    If (capabilities_effective and 0x200000) not equals 0:
+        Integer.write_memory(token_privs + 4 + (privilege_count * 12), 7)  Note: SE_TCB_PRIVILEGE LUID low
+        Integer.write_memory(token_privs + 8 + (privilege_count * 12), 0)  Note: LUID high
+        Integer.write_memory(token_privs + 12 + (privilege_count * 12), 2) Note: SE_PRIVILEGE_ENABLED
+        Set privilege_count to (privilege_count + 1)
+        
+        Integer.write_memory(token_privs + 4 + (privilege_count * 12), 20) Note: SE_DEBUG_PRIVILEGE LUID low
+        Integer.write_memory(token_privs + 8 + (privilege_count * 12), 0)
+        Integer.write_memory(token_privs + 12 + (privilege_count * 12), 2)
+        Set privilege_count to (privilege_count + 1)
+    End If
+    
+    Note: CAP_CHOWN (0) -> SE_TAKE_OWNERSHIP_PRIVILEGE (9)
+    If (capabilities_effective and 0x1) not equals 0:
+        Integer.write_memory(token_privs + 4 + (privilege_count * 12), 9)
+        Integer.write_memory(token_privs + 8 + (privilege_count * 12), 0)
+        Integer.write_memory(token_privs + 12 + (privilege_count * 12), 2)
+        Set privilege_count to (privilege_count + 1)
+    End If
+    
+    Note: CAP_DAC_OVERRIDE (1) -> SE_SECURITY_PRIVILEGE (8)
+    If (capabilities_effective and 0x2) not equals 0:
+        Integer.write_memory(token_privs + 4 + (privilege_count * 12), 8)
+        Integer.write_memory(token_privs + 8 + (privilege_count * 12), 0)
+        Integer.write_memory(token_privs + 12 + (privilege_count * 12), 2)
+        Set privilege_count to (privilege_count + 1)
+    End If
+    
+    Note: CAP_KILL (5) -> SE_DEBUG_PRIVILEGE (20) for terminating processes
+    If (capabilities_effective and 0x20) not equals 0:
+        Integer.write_memory(token_privs + 4 + (privilege_count * 12), 20)
+        Integer.write_memory(token_privs + 8 + (privilege_count * 12), 0)
+        Integer.write_memory(token_privs + 12 + (privilege_count * 12), 2)
+        Set privilege_count to (privilege_count + 1)
+    End If
+    
+    Note: CAP_SYS_TIME (25) -> SE_SYSTEMTIME_PRIVILEGE (12)
+    If (capabilities_effective and 0x2000000) not equals 0:
+        Integer.write_memory(token_privs + 4 + (privilege_count * 12), 12)
+        Integer.write_memory(token_privs + 8 + (privilege_count * 12), 0)
+        Integer.write_memory(token_privs + 12 + (privilege_count * 12), 2)
+        Set privilege_count to (privilege_count + 1)
+    End If
+    
+    Note: CAP_SYS_BOOT (22) -> SE_SHUTDOWN_PRIVILEGE (19)
+    If (capabilities_effective and 0x400000) not equals 0:
+        Integer.write_memory(token_privs + 4 + (privilege_count * 12), 19)
+        Integer.write_memory(token_privs + 8 + (privilege_count * 12), 0)
+        Integer.write_memory(token_privs + 12 + (privilege_count * 12), 2)
+        Set privilege_count to (privilege_count + 1)
+    End If
+    
+    Note: Update privilege count
+    Integer.write_memory(token_privs, privilege_count)
+    
+    Note: Adjust all privileges at once
+    Let adjust_result be Integer
+    If privilege_count is greater than 0:
+        Let syscall_num2 be platform.get_syscall_number("NtAdjustPrivilegesToken")
+        
+        Inline Assembly:
+            "mov rcx, %1\n"           Note: token handle
+            "mov rdx, 0\n"            Note: disable all privileges flag
+            "mov r8, %2\n"            Note: new state
+            "mov r9, %3\n"            Note: buffer length
+            "push 0\n"                Note: previous state
+            "push 0\n"                Note: return length
+            "mov rax, %4\n"           Note: NtAdjustPrivilegesToken syscall number
+            "syscall\n"
+            "add rsp, 16\n"           Note: clean up stack
+            "mov %0, rax\n"
+            : "=r" (adjust_result)
+            : "r" (token_handle), "r" (token_privs), "r" (token_privs_size), "r" (syscall_num2)
+            : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+        End Assembly
+    Otherwise:
+        Set adjust_result to 0  Note: No privileges to adjust
+    End If
+    
+    Let syscall_num3 be platform.get_syscall_number("NtClose")
+    Let close_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"           Note: handle to close
+        "mov rax, %2\n"           Note: NtClose syscall number
+        "syscall\n"
+        "mov %0, rax\n"
+        : "=r" (close_result)
+        : "r" (token_handle), "r" (syscall_num3)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let adjust_status be Convert.windows_status_to_posix(adjust_result)
+    If adjust_status.is_error:
+        Return -1
+    Otherwise:
+        Return 0
+    End If

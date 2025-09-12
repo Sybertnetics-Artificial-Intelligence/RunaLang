@@ -1,0 +1,1721 @@
+Note:
+compiler/frontend/lexical/lexer.runa
+Main Lexer Implementation
+
+The core lexical analyzer for Runa that tokenizes source code.
+This lexer supports:
+- Dual syntax modes (Canon and developer)
+- Encasing keyword patterns
+- Multi-word statement patterns
+- Mathematical symbols with LaTeX input
+- Natural language operators
+- Complete literal parsing
+:End Note
+
+Import Module "compiler/internal/collections" as Collections
+Import Module "compiler/internal/string_utils" as StringUtils
+Import Module "compiler/frontend/diagnostics/errors" as Errors
+Import Module "compiler/frontend/lexical/keywords" as Keywords
+Import Module "compiler/frontend/lexical/operators" as Operators
+Import Module "compiler/frontend/lexical/delimiters" as Delimiters
+Import Module "compiler/frontend/lexical/literals" as Literals
+Import Module "compiler/frontend/lexical/encasing_handler" as EncasingHandler
+Import Module "compiler/frontend/lexical/statement_patterns" as StatementPatterns
+Import Module "compiler/frontend/lexical/math_symbols" as MathSymbols
+Import Module "compiler/frontend/lexical/token_stream" as TokenStream
+Import Module "compiler/frontend/lexical/import_resolver" as ImportResolver
+
+Note: =====================================================================
+Note: LEXER DATA STRUCTURES
+Note: =====================================================================
+
+Type called "LexerState":
+    source_text as String
+    current_position as Integer
+    current_line as Integer
+    current_column as Integer
+    syntax_mode as String
+    current_file_path as String
+    tokens as Collections.List
+    errors as Collections.List
+    delimiter_stack as Delimiters.DelimiterStack
+    encasing_state as EncasingHandler.EncasingState
+    pattern_state as StatementPatterns.PatternState
+    math_symbol_table as MathSymbols.MathSymbolTable
+    literal_parser as Literals.LiteralParser
+    indentation_stack as Collections.List
+    tab_width as Integer
+    at_line_start as Boolean
+    previous_line_indentation as Integer
+End Type
+
+Type called "Token":
+    token_type as String
+    value as String
+    line as Integer
+    column as Integer
+    length as Integer
+    import_statement as Optional[ImportResolver.ImportStatement]
+End Type
+
+Note: =====================================================================
+Note: LEXER INITIALIZATION
+Note: =====================================================================
+
+Process called "create_lexer" that takes source as String, mode as String, file_path as String returns LexerState:
+    Let lexer be LexerState with
+        source_text as source,
+        current_position as 0,
+        current_line as 1,
+        current_column as 1,
+        syntax_mode as mode,
+        current_file_path as file_path,
+        tokens as Collections.create_list(),
+        errors as Collections.create_list(),
+        delimiter_stack as Delimiters.create_delimiter_stack(),
+        encasing_state as EncasingHandler.create_encasing_state(),
+        pattern_state as StatementPatterns.create_pattern_state(),
+        math_symbol_table as MathSymbols.create_math_symbol_table(),
+        literal_parser as Literals.create_literal_parser(mode),
+        indentation_stack as Collections.create_list_with_item(0),
+        tab_width as 4,
+        at_line_start as True,
+        previous_line_indentation as 0
+    End LexerState
+    
+    Return lexer
+End Process
+
+Note: =====================================================================
+Note: MAIN TOKENIZATION LOOP
+Note: =====================================================================
+
+Process called "tokenize" that takes lexer as LexerState returns Collections.List:
+    While lexer.current_position is less than string_length(lexer.source_text):
+        Note: Handle indentation at start of line
+        If lexer.at_line_start:
+            process_line_indentation(lexer)
+            Set lexer.at_line_start to False
+        End If
+        
+        skip_whitespace(lexer)
+        
+        If lexer.current_position is greater than or equal to string_length(lexer.source_text):
+            Break
+        End If
+        
+        Note: Try to handle LaTeX input first
+        Let latex_length be try_latex_conversion(lexer)
+        If latex_length is greater than 0:
+            Continue
+        End If
+        
+        Note: Check for annotations
+        If is_annotation_start(lexer):
+            tokenize_annotation(lexer)
+            Continue
+        End If
+        
+        Note: Check for comments
+        If is_comment_start(lexer):
+            skip_comment(lexer)
+            Continue
+        End If
+        
+        Note: Check for literals
+        If is_literal_start(lexer):
+            tokenize_literal(lexer)
+            Continue
+        End If
+        
+        Note: Check for import statements
+        If is_import_start(lexer):
+            tokenize_import_statement(lexer)
+            Continue
+        End If
+        
+        Note: Check for identifiers and keywords
+        If is_identifier_start(lexer):
+            tokenize_identifier_or_keyword(lexer)
+            Continue
+        End If
+        
+        Note: Check for operators
+        If is_operator_start(lexer):
+            tokenize_operator(lexer)
+            Continue
+        End If
+        
+        Note: Check for delimiters
+        If is_delimiter_start(lexer):
+            tokenize_delimiter(lexer)
+            Continue
+        End If
+        
+        Note: Check for math symbols
+        If is_math_symbol_start(lexer):
+            tokenize_math_symbol(lexer)
+            Continue
+        End If
+        
+        Note: Unknown character
+        add_error(lexer, "Unexpected character: " concatenated with char_to_string(current_char(lexer)))
+        advance(lexer)
+    End While
+    
+    Note: Generate final dedent tokens to close all indentation levels
+    generate_final_dedent_tokens(lexer)
+    
+    Note: Check for unclosed delimiters
+    If Not Delimiters.is_delimiter_stack_balanced(lexer.delimiter_stack):
+        add_error(lexer, lexer.delimiter_stack.error_message)
+    End If
+    
+    Return lexer.tokens
+End Process
+
+Note: =====================================================================
+Note: CHARACTER NAVIGATION
+Note: =====================================================================
+
+Process called "current_char" that takes lexer as LexerState returns Character:
+    If lexer.current_position is less than string_length(lexer.source_text):
+        Return get_char_at(lexer.source_text, lexer.current_position)
+    End If
+    Return '\0'
+End Process
+
+Process called "peek_char" that takes lexer as LexerState, offset as Integer returns Character:
+    Let pos be lexer.current_position plus offset
+    If pos is less than string_length(lexer.source_text):
+        Return get_char_at(lexer.source_text, pos)
+    End If
+    Return '\0'
+End Process
+
+Process called "advance" that takes lexer as LexerState returns Nothing:
+    If lexer.current_position is less than string_length(lexer.source_text):
+        Let ch be current_char(lexer)
+        Set lexer.current_position to lexer.current_position plus 1
+        
+        If char_equals(ch, '\n'):
+            Set lexer.current_line to lexer.current_line plus 1
+            Set lexer.current_column to 1
+            Set lexer.at_line_start to True
+        Otherwise:
+            Set lexer.current_column to lexer.current_column plus 1
+        End If
+    End If
+End Process
+
+Process called "advance_by" that takes lexer as LexerState, count as Integer returns Nothing:
+    For i from 0 to count minus 1:
+        advance(lexer)
+    End For
+End Process
+
+Note: =====================================================================
+Note: WHITESPACE AND COMMENT HANDLING
+Note: =====================================================================
+
+Process called "skip_whitespace" that takes lexer as LexerState returns Nothing:
+    While is_whitespace(current_char(lexer)):
+        advance(lexer)
+    End While
+End Process
+
+Process called "is_whitespace" that takes ch as Character returns Boolean:
+    Return char_equals(ch, ' ') Or char_equals(ch, '\t') Or
+           char_equals(ch, '\n') Or char_equals(ch, '\r')
+End Process
+
+Process called "is_comment_start" that takes lexer as LexerState returns Boolean:
+    Let ch be current_char(lexer)
+    Let next_ch be peek_char(lexer, 1)
+    
+    Note: Check for "Note:" style comment
+    If char_equals(ch, 'N'):
+        Let chunk be peek_string(lexer, 5)
+        Return string_equals(chunk, "Note:")
+    End If
+    
+    Return False
+End Process
+
+Process called "skip_comment" that takes lexer as LexerState returns Nothing:
+    Note: Skip "Note:" prefix
+    advance_by(lexer, 5)
+    
+    Note: Skip any whitespace after "Note:"
+    While char_equals(current_char(lexer), ' ') Or char_equals(current_char(lexer), '\t'):
+        advance(lexer)
+    End While
+    
+    Note: Look ahead to determine if this is a multi-line comment block
+    Let found_end_note be False
+    Let search_position be lexer.current_position
+    
+    While search_position is less than string_length(lexer.source_text):
+        Note: Check if we found ":End Note"
+        If search_position plus 9 is less than or equal to string_length(lexer.source_text):
+            Let test_string be string_substring(lexer.source_text, search_position, search_position plus 9)
+            If string_equals(test_string, ":End Note"):
+                Set found_end_note to True
+                Break
+            End If
+        End If
+        
+        Note: Stop searching at end of line for single-line determination
+        Let ch be get_char_at(lexer.source_text, search_position)
+        If char_equals(ch, '\n') And Not found_end_note:
+            Break
+        End If
+        
+        Set search_position to search_position plus 1
+    End While
+    
+    If found_end_note:
+        Note: Multi-line comment block - consume everything until ":End Note"
+        While Not is_at_end(lexer):
+            Let chunk be peek_string(lexer, 9)
+            If string_equals(chunk, ":End Note"):
+                advance_by(lexer, 9)
+                Break
+            End If
+            advance(lexer)
+        End While
+    Otherwise:
+        Note: Single-line comment - consume until end of line
+        While Not is_at_end(lexer) And Not char_equals(current_char(lexer), '\n'):
+            advance(lexer)
+        End While
+    End If
+End Process
+
+Note: =====================================================================
+Note: LITERAL TOKENIZATION
+Note: =====================================================================
+
+Process called "is_literal_start" that takes lexer as LexerState returns Boolean:
+    Let ch be current_char(lexer)
+    
+    Note: Check for string literals
+    If char_equals(ch, '"') Or char_equals(ch, '\''):
+        Return True
+    End If
+    
+    Note: Check for raw/formatted strings
+    If char_equals(ch, 'r') Or char_equals(ch, 'f'):
+        Let next be peek_char(lexer, 1)
+        If char_equals(next, '"') Or char_equals(next, '\''):
+            Return True
+        End If
+    End If
+    
+    Note: Check for numbers
+    If is_digit(ch):
+        Return True
+    End If
+    
+    Note: Check for negative numbers
+    If char_equals(ch, '-'):
+        Let next be peek_char(lexer, 1)
+        If is_digit(next):
+            Return True
+        End If
+    End If
+    
+    Note: Check for hex/binary/octal
+    If char_equals(ch, '0'):
+        Let next be peek_char(lexer, 1)
+        If char_equals(next, 'x') Or char_equals(next, 'b') Or char_equals(next, 'o'):
+            Return True
+        End If
+    End If
+    
+    Return False
+End Process
+
+Process called "tokenize_literal" that takes lexer as LexerState returns Nothing:
+    Let start_pos be lexer.current_position
+    Let start_line be lexer.current_line
+    Let start_column be lexer.current_column
+    
+    Let literal_text be extract_literal_text(lexer)
+    Let literal_info be Literals.parse_literal(lexer.literal_parser, literal_text)
+    
+    Let token be Token with
+        token_type as literal_info.literal_type concatenated with "_LITERAL",
+        value as literal_info.parsed_value,
+        line as start_line,
+        column as start_column,
+        length as lexer.current_position minus start_pos
+    End Token
+    
+    Collections.list_append(lexer.tokens, token)
+    
+    Note: Add any validation errors
+    For Each error in literal_info.validation_errors:
+        add_error(lexer, error)
+    End For
+End Process
+
+Process called "extract_literal_text" that takes lexer as LexerState returns String:
+    Let start be lexer.current_position
+    Let ch be current_char(lexer)
+    
+    Note: Handle string literals
+    If char_equals(ch, '"') Or char_equals(ch, '\''):
+        Return extract_string_literal(lexer)
+    End If
+    
+    Note: Handle raw/formatted strings
+    If char_equals(ch, 'r') Or char_equals(ch, 'f'):
+        Let next be peek_char(lexer, 1)
+        If char_equals(next, '"') Or char_equals(next, '\''):
+            Return extract_string_literal(lexer)
+        End If
+    End If
+    
+    Note: Handle numbers
+    Return extract_number_literal(lexer)
+End Process
+
+Process called "extract_string_literal" that takes lexer as LexerState returns String:
+    Let result be ""
+    Let quote_char be '\0'
+    
+    Note: Handle prefix if present
+    Let ch be current_char(lexer)
+    If char_equals(ch, 'r') Or char_equals(ch, 'f'):
+        Set result to char_to_string(ch)
+        advance(lexer)
+    End If
+    
+    Set quote_char to current_char(lexer)
+    Set result to string_concat(result, char_to_string(quote_char))
+    advance(lexer)
+    
+    Note: Check for triple quotes
+    Let is_triple be False
+    If char_equals(current_char(lexer), quote_char) And char_equals(peek_char(lexer, 1), quote_char):
+        Set is_triple to True
+        Set result to string_concat(result, char_to_string(quote_char))
+        Set result to string_concat(result, char_to_string(quote_char))
+        advance_by(lexer, 2)
+    End If
+    
+    Note: Extract string content
+    While Not is_at_end(lexer):
+        Let ch be current_char(lexer)
+        
+        If is_triple:
+            If char_equals(ch, quote_char) And char_equals(peek_char(lexer, 1), quote_char) And char_equals(peek_char(lexer, 2), quote_char):
+                Set result to string_concat(result, char_to_string(quote_char))
+                Set result to string_concat(result, char_to_string(quote_char))
+                Set result to string_concat(result, char_to_string(quote_char))
+                advance_by(lexer, 3)
+                Break
+            End If
+        Otherwise:
+            If char_equals(ch, quote_char) And Not char_equals(peek_char(lexer, -1), '\\'):
+                Set result to string_concat(result, char_to_string(quote_char))
+                advance(lexer)
+                Break
+            End If
+        End If
+        
+        Set result to string_concat(result, char_to_string(ch))
+        advance(lexer)
+    End While
+    
+    Return result
+End Process
+
+Process called "extract_number_literal" that takes lexer as LexerState returns String:
+    Let result be ""
+    
+    While Not is_at_end(lexer):
+        Let ch be current_char(lexer)
+        
+        If is_digit(ch) Or char_equals(ch, '.') Or char_equals(ch, '_'):
+            Set result to string_concat(result, char_to_string(ch))
+            advance(lexer)
+        Otherwise If char_equals(ch, 'e') Or char_equals(ch, 'E'):
+            Set result to string_concat(result, char_to_string(ch))
+            advance(lexer)
+            If char_equals(current_char(lexer), '+') Or char_equals(current_char(lexer), '-'):
+                Set result to string_concat(result, char_to_string(current_char(lexer)))
+                advance(lexer)
+            End If
+        Otherwise If char_equals(ch, 'x') Or char_equals(ch, 'b') Or char_equals(ch, 'o'):
+            If string_equals(result, "0"):
+                Set result to string_concat(result, char_to_string(ch))
+                advance(lexer)
+            Otherwise:
+                Break
+            End If
+        Otherwise If is_hex_digit(ch) And string_contains(result, "x"):
+            Set result to string_concat(result, char_to_string(ch))
+            advance(lexer)
+        Otherwise:
+            Break
+        End If
+    End While
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: IDENTIFIER AND KEYWORD TOKENIZATION
+Note: =====================================================================
+
+Process called "is_identifier_start" that takes lexer as LexerState returns Boolean:
+    Let ch be current_char(lexer)
+    Return is_letter(ch) Or char_equals(ch, '_')
+End Process
+
+Process called "tokenize_identifier_or_keyword" that takes lexer as LexerState returns Nothing:
+    Let start_pos be lexer.current_position
+    Let start_line be lexer.current_line
+    Let start_column be lexer.current_column
+    
+    Let identifier be extract_identifier(lexer)
+    
+    Note: Check if it's a keyword
+    If Keywords.is_keyword(identifier):
+        Note: Check for encasing patterns
+        If EncasingHandler.is_encasing_keyword_start(identifier):
+            handle_encasing_pattern(lexer, identifier, start_line, start_column)
+            Return
+        End If
+        
+        Note: Check for statement patterns
+        If StatementPatterns.is_statement_pattern_start(identifier):
+            handle_statement_pattern(lexer, identifier, start_line, start_column)
+            Return
+        End If
+        
+        Note: Keywords are the same in both modes
+        Let token be Token with
+            token_type as "KEYWORD",
+            value as identifier,
+            line as start_line,
+            column as start_column,
+            length as lexer.current_position minus start_pos
+        End Token
+        Collections.list_append(lexer.tokens, token)
+    Otherwise:
+        Note: Check for boolean literals in Canon mode
+        If string_equals(lexer.syntax_mode, "canon"):
+            If string_equals(identifier, "yes") Or string_equals(identifier, "no"):
+                Let bool_value be Literals.parse_boolean_literal(lexer.literal_parser, identifier)
+                Let token be Token with
+                    token_type as "BOOLEAN_LITERAL",
+                    value as Literals.boolean_to_string(bool_value),
+                    line as start_line,
+                    column as start_column,
+                    length as lexer.current_position minus start_pos
+                End Token
+                Collections.list_append(lexer.tokens, token)
+                Return
+            End If
+        End If
+        
+        Note: Regular identifier
+        Let token be Token with
+            token_type as "IDENTIFIER",
+            value as identifier,
+            line as start_line,
+            column as start_column,
+            length as lexer.current_position minus start_pos
+        End Token
+        Collections.list_append(lexer.tokens, token)
+    End If
+End Process
+
+Process called "extract_identifier" that takes lexer as LexerState returns String:
+    Let result be ""
+    
+    While Not is_at_end(lexer):
+        Let ch be current_char(lexer)
+        If is_letter(ch) Or is_digit(ch) Or char_equals(ch, '_'):
+            Set result to string_concat(result, char_to_string(ch))
+            advance(lexer)
+        Otherwise:
+            Break
+        End If
+    End While
+    
+    Return result
+End Process
+
+Process called "handle_encasing_pattern" that takes lexer as LexerState, start_keyword as String, start_line as Integer, start_column as Integer returns Nothing:
+    Note: Initialize encasing state
+    EncasingHandler.start_encasing_pattern(lexer.encasing_state, start_keyword)
+    
+    Note: Add the start keyword token
+    Let token be Token with
+        token_type as "KEYWORD",
+        value as start_keyword,
+        line as start_line,
+        column as start_column,
+        length as string_length(start_keyword)
+    End Token
+    Collections.list_append(lexer.tokens, token)
+    
+    Note: Extract the encased identifier
+    skip_whitespace(lexer)
+    Let identifier_text be extract_encased_identifier(lexer)
+    
+    If string_length(identifier_text) is greater than 0:
+        Let id_token be Token with
+            token_type as "IDENTIFIER",
+            value as identifier_text,
+            line as lexer.current_line,
+            column as lexer.current_column minus string_length(identifier_text),
+            length as string_length(identifier_text)
+        End Token
+        Collections.list_append(lexer.tokens, id_token)
+    End If
+    
+    Note: Clear encasing state
+    EncasingHandler.end_encasing_pattern(lexer.encasing_state)
+End Process
+
+Process called "extract_encased_identifier" that takes lexer as LexerState returns String:
+    Let result be ""
+    Let end_keyword be EncasingHandler.get_expected_end_keyword(lexer.encasing_state)
+    
+    While Not is_at_end(lexer):
+        Note: Check if we've reached the end keyword
+        Let word be peek_word(lexer)
+        If Keywords.is_keyword(word) And string_equals(word, end_keyword):
+            Break
+        End If
+        
+        Note: Add character to identifier
+        Let ch be current_char(lexer)
+        Set result to string_concat(result, char_to_string(ch))
+        advance(lexer)
+    End While
+    
+    Return string_trim(result)
+End Process
+
+Process called "handle_statement_pattern" that takes lexer as LexerState, start_keyword as String, start_line as Integer, start_column as Integer returns Nothing:
+    Note: Find matching patterns
+    Let patterns be StatementPatterns.get_patterns_starting_with(start_keyword)
+    
+    Note: Initialize pattern matching state
+    If Collections.list_length(patterns) is greater than 0:
+        Let pattern be Collections.list_get(patterns, 0)
+        StatementPatterns.start_pattern_matching(lexer.pattern_state, pattern)
+    End If
+    
+    Note: Add the start keyword token
+    Let token be Token with
+        token_type as "KEYWORD",
+        value as start_keyword,
+        line as start_line,
+        column as start_column,
+        length as string_length(start_keyword)
+    End Token
+    Collections.list_append(lexer.tokens, token)
+    
+    Note: Process the rest of the pattern
+    skip_whitespace(lexer)
+    
+    If lexer.pattern_state.is_active:
+        Note: Handle identifier if pattern expects it
+        If lexer.pattern_state.current_pattern.has_identifier:
+            Let id_start be lexer.current_position
+            Let id_line be lexer.current_line
+            Let id_column be lexer.current_column
+            Let identifier be extract_identifier(lexer)
+            
+            If string_length(identifier) is greater than 0:
+                Let id_token be Token with
+                    token_type as "IDENTIFIER",
+                    value as identifier,
+                    line as id_line,
+                    column as id_column,
+                    length as string_length(identifier)
+                End Token
+                Collections.list_append(lexer.tokens, id_token)
+            End If
+            
+            skip_whitespace(lexer)
+        End If
+        
+        Note: Process middle keywords
+        Let middle_keywords be lexer.pattern_state.current_pattern.middle_keywords
+        For i from 0 to Collections.list_length(middle_keywords) minus 1:
+            Let expected_keyword be Collections.list_get(middle_keywords, i)
+            Let word be peek_word(lexer)
+            
+            If string_equals(word, expected_keyword):
+                Let kw_line be lexer.current_line
+                Let kw_column be lexer.current_column
+                advance_by(lexer, string_length(word))
+                
+                Let kw_token be Token with
+                    token_type as "KEYWORD",
+                    value as word,
+                    line as kw_line,
+                    column as kw_column,
+                    length as string_length(word)
+                End Token
+                Collections.list_append(lexer.tokens, kw_token)
+                
+                skip_whitespace(lexer)
+            End If
+        End For
+        
+        Note: Clear pattern state
+        StatementPatterns.end_pattern_matching(lexer.pattern_state)
+    End If
+End Process
+
+Note: =====================================================================
+Note: OPERATOR TOKENIZATION
+Note: =====================================================================
+
+Process called "is_operator_start" that takes lexer as LexerState returns Boolean:
+    Let ch be current_char(lexer)
+    Return Operators.is_operator_char(ch)
+End Process
+
+Process called "tokenize_operator" that takes lexer as LexerState returns Nothing:
+    Let start_pos be lexer.current_position
+    Let start_line be lexer.current_line
+    Let start_column be lexer.current_column
+    
+    Let op_symbol be extract_operator_symbol(lexer)
+    Let operator be Operators.get_operator_by_symbol(op_symbol)
+    
+    If operator.precedence is greater than or equal to 0:
+        Note: Convert operator based on mode using Keywords module
+        Let value be Keywords.convert_operator(op_symbol, lexer.syntax_mode)
+        
+        Let token be Token with
+            token_type as "OPERATOR",
+            value as value,
+            line as start_line,
+            column as start_column,
+            length as lexer.current_position minus start_pos,
+            original_form as op_symbol,          Note: Preserve original for viewer mode
+            source_mode as lexer.syntax_mode     Note: Track which mode token came from
+        End Token
+        Collections.list_append(lexer.tokens, token)
+    Otherwise:
+        add_error(lexer, "Unknown operator: " concatenated with op_symbol)
+    End If
+End Process
+
+Process called "extract_operator_symbol" that takes lexer as LexerState returns String:
+    Let result be ""
+    Let max_length be 3
+    
+    For i from 0 to max_length minus 1:
+        If is_at_end(lexer):
+            Break
+        End If
+        
+        Let ch be current_char(lexer)
+        Set result to string_concat(result, char_to_string(ch))
+        
+        Note: Check if this forms a valid operator
+        If Operators.is_valid_operator(result):
+            advance(lexer)
+            
+            Note: Try to extend the operator
+            Let extended be string_concat(result, char_to_string(current_char(lexer)))
+            If Not Operators.is_valid_operator(extended):
+                Break
+            End If
+        Otherwise:
+            Note: Backtrack if not valid
+            Set result to string_substring(result, 0, string_length(result) minus 1)
+            Break
+        End If
+    End For
+    
+    Return result
+End Process
+
+Note: =====================================================================
+Note: DELIMITER TOKENIZATION
+Note: =====================================================================
+
+Process called "is_delimiter_start" that takes lexer as LexerState returns Boolean:
+    Return Delimiters.is_delimiter(current_char(lexer))
+End Process
+
+Process called "tokenize_delimiter" that takes lexer as LexerState returns Nothing:
+    Let ch be current_char(lexer)
+    Let symbol be char_to_string(ch)
+    Let delimiter be Delimiters.get_delimiter(symbol)
+    
+    Note: Track delimiter matching
+    If Delimiters.is_opening_delimiter(symbol):
+        Delimiters.push_delimiter(lexer.delimiter_stack, symbol, lexer.current_line, lexer.current_column)
+    Otherwise If Delimiters.is_closing_delimiter(symbol):
+        If Not Delimiters.check_closing_delimiter(lexer.delimiter_stack, symbol, lexer.current_line, lexer.current_column):
+            add_error(lexer, lexer.delimiter_stack.error_message)
+        End If
+    End If
+    
+    Let token be Token with
+        token_type as delimiter.delimiter_type,
+        value as symbol,
+        line as lexer.current_line,
+        column as lexer.current_column,
+        length as 1
+    End Token
+    
+    Collections.list_append(lexer.tokens, token)
+    advance(lexer)
+End Process
+
+Note: =====================================================================
+Note: MATH SYMBOL TOKENIZATION
+Note: =====================================================================
+
+Process called "is_math_symbol_start" that takes lexer as LexerState returns Boolean:
+    Return MathSymbols.is_math_symbol(lexer.math_symbol_table, current_char(lexer))
+End Process
+
+Process called "tokenize_math_symbol" that takes lexer as LexerState returns Nothing:
+    Let ch be current_char(lexer)
+    Let symbol be MathSymbols.get_math_symbol(lexer.math_symbol_table, ch)
+    
+    Let value be char_to_string(ch)
+    If string_equals(lexer.syntax_mode, "canon"):
+        Set value to symbol.canonical_name
+    End If
+    
+    Let token_type be "MATH_SYMBOL"
+    If symbol.is_operator:
+        Set token_type to "MATH_OPERATOR"
+    End If
+    
+    Let token be Token with
+        token_type as token_type,
+        value as value,
+        line as lexer.current_line,
+        column as lexer.current_column,
+        length as 1
+    End Token
+    
+    Collections.list_append(lexer.tokens, token)
+    advance(lexer)
+End Process
+
+Process called "try_latex_conversion" that takes lexer as LexerState returns Integer:
+    Let length be MathSymbols.convert_latex_sequence(lexer.math_symbol_table, lexer.source_text, lexer.current_position)
+    
+    If length is greater than 0:
+        Let latex_command be string_substring(lexer.source_text, lexer.current_position, lexer.current_position plus length)
+        Let symbol be MathSymbols.get_symbol_from_latex(lexer.math_symbol_table, latex_command)
+        
+        Let value be char_to_string(symbol.unicode_char)
+        If string_equals(lexer.syntax_mode, "canon"):
+            Set value to symbol.canonical_name
+        End If
+        
+        Let token_type be "MATH_SYMBOL"
+        If symbol.is_operator:
+            Set token_type to "MATH_OPERATOR"
+        End If
+        
+        Let token be Token with
+            token_type as token_type,
+            value as value,
+            line as lexer.current_line,
+            column as lexer.current_column,
+            length as length
+        End Token
+        
+        Collections.list_append(lexer.tokens, token)
+        advance_by(lexer, length)
+    End If
+    
+    Return length
+End Process
+
+Note: =====================================================================
+Note: ANNOTATION TOKENIZATION
+Note: =====================================================================
+
+Process called "is_annotation_start" that takes lexer as LexerState returns Boolean:
+    @Reasoning
+        Annotations in Runa start with '@' followed by an annotation type name.
+        We need to detect this pattern and distinguish it from other uses of '@'.
+        The '@' must be followed by a letter to be a valid annotation start.
+    @End Reasoning
+    
+    Let ch be current_char(lexer)
+    If Not char_equals(ch, '@'):
+        Return False
+    End If
+    
+    Note: Check if next character is a letter (valid annotation name start)
+    Let next_ch be peek_char(lexer, 1)
+    Return is_letter(next_ch)
+End Process
+
+Process called "tokenize_annotation" that takes lexer as LexerState returns Nothing:
+    @Implementation
+        Parse annotation blocks according to the specification:
+        1. Start with '@' followed by annotation type name
+        2. Parse colon separator  
+        3. Extract annotation content until @End_ marker
+        4. Create annotation token with structured data
+    @End Implementation
+    
+    Let start_pos be lexer.current_position
+    Let start_line be lexer.current_line
+    Let start_column be lexer.current_column
+    
+    Note: Skip the '@' character
+    advance(lexer)
+    
+    Note: Extract annotation type name
+    Let annotation_name be extract_annotation_name(lexer)
+    
+    Note: Expect ':' after annotation name
+    skip_whitespace(lexer)
+    If Not char_equals(current_char(lexer), ':'):
+        Note: Error: Expected ':' after annotation name
+        Let error_message be string_concat("Invalid annotation: missing ':' after ", annotation_name)
+        Let token be Token with
+            token_type as TokenType.Error with error_message,
+            value as error_message,
+            line as start_line,
+            column as start_column,
+            length as lexer.current_position minus start_pos,
+            file_path as lexer.file_path,
+            annotation_data as None,
+            annotations as Collections.List.empty()
+        End Token
+        Collections.list_append(lexer.tokens, token)
+        Return
+    End If
+    advance(lexer) Note: Skip ':'
+    
+    Note: Extract annotation content
+    Let content be extract_annotation_content(lexer, annotation_name)
+    
+    Note: Create annotation token
+    Let annotation_type be classify_annotation_type(annotation_name)
+    Let annotation_obj be Annotation with
+        annotation_type as annotation_name,
+        content as content,
+        scope_start as start_pos,
+        scope_end as lexer.current_position
+    End Annotation
+    
+    Let token be Token with
+        token_type as TokenType.Annotation with annotation_type,
+        value as annotation_name,
+        line as start_line,
+        column as start_column,
+        length as lexer.current_position minus start_pos,
+        file_path as lexer.file_path,
+        annotation_data as Some(annotation_obj),
+        annotations as Collections.List.empty()
+    End Token
+    
+    Collections.list_append(lexer.tokens, token)
+End Process
+
+Process called "extract_annotation_name" that takes lexer as LexerState returns String:
+    @Implementation
+        Extract the annotation type name after '@'.
+        Valid names are letters, underscores, and numbers after the first character.
+    @End Implementation
+    
+    Let name be ""
+    
+    While Not is_at_end(lexer):
+        Let ch be current_char(lexer)
+        
+        If is_letter(ch) Or char_equals(ch, '_'):
+            Set name to string_concat(name, char_to_string(ch))
+            advance(lexer)
+        Otherwise If is_digit(ch) And Not string_equals(name, ""):
+            Set name to string_concat(name, char_to_string(ch))
+            advance(lexer)
+        Otherwise:
+            Break
+        End If
+    End While
+    
+    Return name
+End Process
+
+Process called "extract_annotation_content" that takes lexer as LexerState, annotation_name as String returns String:
+    @Implementation
+        Extract the content between @Name: and @End_Name markers.
+        Handle multi-line content and nested structures properly.
+    @End Implementation
+    
+    skip_whitespace(lexer)
+    
+    Let content be ""
+    Let end_marker be string_concat("@End_", annotation_name)
+    Let brace_depth be 0
+    Let in_string be False
+    Let escape_next be False
+    
+    While Not is_at_end(lexer):
+        Note: Check for end marker at start of line or after whitespace
+        If check_end_marker(lexer, end_marker) And brace_depth equals 0 And Not in_string:
+            Note: Skip the end marker
+            advance_by(lexer, string_length(end_marker))
+            Break
+        End If
+        
+        Let ch be current_char(lexer)
+        
+        Note: Handle string literals and escape sequences
+        If escape_next:
+            Set escape_next to False
+        Otherwise If char_equals(ch, '\\'):
+            Set escape_next to True
+        Otherwise If char_equals(ch, '"') And Not escape_next:
+            Set in_string to Not in_string
+        End If
+        
+        Note: Track brace depth for nested structures (only outside strings)
+        If Not in_string And Not escape_next:
+            If char_equals(ch, '{') Or char_equals(ch, '['):
+                Set brace_depth to brace_depth plus 1
+            Otherwise If char_equals(ch, '}') Or char_equals(ch, ']'):
+                Set brace_depth to brace_depth minus 1
+            End If
+        End If
+        
+        Set content to string_concat(content, char_to_string(ch))
+        advance(lexer)
+    End While
+    
+    Note: Trim leading/trailing whitespace from content
+    Return string_trim(content)
+End Process
+
+Process called "check_end_marker" that takes lexer as LexerState, marker as String returns Boolean:
+    @Implementation
+        Check if the current position has the specified end marker.
+        The marker should be at the start of a line or preceded by whitespace.
+    @End Implementation
+    
+    Let marker_length be string_length(marker)
+    If lexer.current_position plus marker_length is greater than string_length(lexer.source_text):
+        Return False
+    End If
+    
+    Let potential_marker be string_substring(lexer.source_text, lexer.current_position, lexer.current_position plus marker_length)
+    Return string_equals(potential_marker, marker)
+End Process
+
+Process called "classify_annotation_type" that takes name as String returns AnnotationType:
+    @Implementation
+        Map annotation name strings to the appropriate AnnotationType enum value.
+        Support all annotation types defined in the language specification.
+    @End Implementation
+    
+    If string_equals(name, "Reasoning"):
+        Return AnnotationType.Reasoning with name
+    Otherwise If string_equals(name, "Implementation"):
+        Return AnnotationType.Implementation with name
+    Otherwise If string_equals(name, "Uncertainty"):
+        Return AnnotationType.Uncertainty with name
+    Otherwise If string_equals(name, "Request_Clarification"):
+        Return AnnotationType.Request_Clarification with name
+    Otherwise If string_equals(name, "KnowledgeReference"):
+        Return AnnotationType.KnowledgeReference with name
+    Otherwise If string_equals(name, "TestCases"):
+        Return AnnotationType.TestCases with name
+    Otherwise If string_equals(name, "Resource_Constraints"):
+        Return AnnotationType.Resource_Constraints with name
+    Otherwise If string_equals(name, "Security_Scope"):
+        Return AnnotationType.Security_Scope with name
+    Otherwise If string_equals(name, "Execution_Model"):
+        Return AnnotationType.Execution_Model with name
+    Otherwise If string_equals(name, "Performance_Hints"):
+        Return AnnotationType.Performance_Hints with name
+    Otherwise If string_equals(name, "Progress"):
+        Return AnnotationType.Progress with name
+    Otherwise If string_equals(name, "Feedback"):
+        Return AnnotationType.Feedback with name
+    Otherwise If string_equals(name, "Translation_Note"):
+        Return AnnotationType.Translation_Note with name
+    Otherwise If string_equals(name, "Error_Handling"):
+        Return AnnotationType.Error_Handling with name
+    Otherwise If string_equals(name, "Task"):
+        Return AnnotationType.Task with name
+    Otherwise If string_equals(name, "Requirements"):
+        Return AnnotationType.Requirements with name
+    Otherwise If string_equals(name, "Verify"):
+        Return AnnotationType.Verify with name
+    Otherwise If string_equals(name, "Request"):
+        Return AnnotationType.Request with name
+    Otherwise If string_equals(name, "Context"):
+        Return AnnotationType.Context with name
+    Otherwise If string_equals(name, "Collaboration"):
+        Return AnnotationType.Collaboration with name
+    Otherwise If string_equals(name, "Iteration"):
+        Return AnnotationType.Iteration with name
+    Otherwise If string_equals(name, "Clarification"):
+        Return AnnotationType.Clarification with name
+    Otherwise:
+        Return AnnotationType.Custom with (name, "")
+    End If
+End Process
+
+Note: =====================================================================
+Note: UTILITY FUNCTIONS
+Note: =====================================================================
+
+Process called "is_at_end" that takes lexer as LexerState returns Boolean:
+    Return lexer.current_position is greater than or equal to string_length(lexer.source_text)
+End Process
+
+Process called "is_letter" that takes ch as Character returns Boolean:
+    Let code be char_to_int(ch)
+    Return (code is greater than or equal to 65 And code is less than or equal to 90) Or
+           (code is greater than or equal to 97 And code is less than or equal to 122)
+End Process
+
+Process called "is_digit" that takes ch as Character returns Boolean:
+    Let code be char_to_int(ch)
+    Return code is greater than or equal to 48 And code is less than or equal to 57
+End Process
+
+Process called "is_hex_digit" that takes ch as Character returns Boolean:
+    If is_digit(ch):
+        Return True
+    End If
+    
+    Let code be char_to_int(ch)
+    Return (code is greater than or equal to 65 And code is less than or equal to 70) Or
+           (code is greater than or equal to 97 And code is less than or equal to 102)
+End Process
+
+Process called "peek_string" that takes lexer as LexerState, length as Integer returns String:
+    Let result be ""
+    For i from 0 to length minus 1:
+        Let ch be peek_char(lexer, i)
+        If char_equals(ch, '\0'):
+            Break
+        End If
+        Set result to string_concat(result, char_to_string(ch))
+    End For
+    Return result
+End Process
+
+Process called "peek_word" that takes lexer as LexerState returns String:
+    Let result be ""
+    Let offset be 0
+    
+    While True:
+        Let ch be peek_char(lexer, offset)
+        If is_letter(ch) Or is_digit(ch) Or char_equals(ch, '_'):
+            Set result to string_concat(result, char_to_string(ch))
+            Set offset to offset plus 1
+        Otherwise:
+            Break
+        End If
+    End While
+    
+    Return result
+End Process
+
+Process called "add_error" that takes lexer as LexerState, message as String returns Nothing:
+    Let error_msg be "Line " concatenated with int_to_string(lexer.current_line)
+    Set error_msg to error_msg concatenated with ", Column "
+    Set error_msg to error_msg concatenated with int_to_string(lexer.current_column)
+    Set error_msg to error_msg concatenated with ": "
+    Set error_msg to error_msg concatenated with message
+    
+    Collections.list_append(lexer.errors, error_msg)
+End Process
+
+Process called "char_to_string" that takes ch as Character returns String:
+    Let result be ""
+    Return result concatenated with ch
+End Process
+
+Process called "string_concat" that takes s1 as String, s2 as String returns String:
+    Return s1 concatenated with s2
+End Process
+
+Process called "string_length" that takes text as String returns Integer:
+    Let count be 0
+    For Each ch in text:
+        Set count to count plus 1
+    End For
+    Return count
+End Process
+
+Process called "get_char_at" that takes text as String, index as Integer returns Character:
+    Let i be 0
+    For Each ch in text:
+        If i is equal to index:
+            Return ch
+        End If
+        Set i to i plus 1
+    End For
+    Return '\0'
+End Process
+
+Process called "char_equals" that takes c1 as Character, c2 as Character returns Boolean:
+    Return char_to_int(c1) is equal to char_to_int(c2)
+End Process
+
+Process called "char_to_int" that takes ch as Character returns Integer:
+    Return ch as Integer
+End Process
+
+Process called "int_to_string" that takes value as Integer returns String:
+    Note: Convert integer to string representation
+    If value is equal to 0:
+        Return "0"
+    End If
+    
+    Let result be ""
+    Let negative be value is less than 0
+    If negative:
+        Set value to 0 minus value
+    End If
+    
+    While value is greater than 0:
+        Let digit be value modulo 10
+        Let ch be int_to_char(digit plus 48)
+        Set result to char_to_string(ch) concatenated with result
+        Set value to value divided by 10
+    End While
+    
+    If negative:
+        Set result to "-" concatenated with result
+    End If
+    
+    Return result
+End Process
+
+Process called "int_to_char" that takes value as Integer returns Character:
+    Return value as Character
+End Process
+
+Process called "string_equals" that takes s1 as String, s2 as String returns Boolean:
+    If string_length(s1) is not equal to string_length(s2):
+        Return False
+    End If
+    
+    For i from 0 to string_length(s1) minus 1:
+        If Not char_equals(get_char_at(s1, i), get_char_at(s2, i)):
+            Return False
+        End If
+    End For
+    
+    Return True
+End Process
+
+Process called "string_substring" that takes text as String, start as Integer, end as Integer returns String:
+    Let result be ""
+    For i from start to end minus 1:
+        Set result to string_concat(result, char_to_string(get_char_at(text, i)))
+    End For
+    Return result
+End Process
+
+Process called "string_contains" that takes text as String, search as String returns Boolean:
+    For i from 0 to string_length(text) minus string_length(search):
+        Let match be True
+        For j from 0 to string_length(search) minus 1:
+            If Not char_equals(get_char_at(text, i plus j), get_char_at(search, j)):
+                Set match to False
+                Break
+            End If
+        End For
+        If match:
+            Return True
+        End If
+    End For
+    Return False
+End Process
+
+Process called "string_trim" that takes text as String returns String:
+    Let start be 0
+    Let end be string_length(text)
+    
+    Note: Trim leading whitespace
+    While start is less than end:
+        Let ch be get_char_at(text, start)
+        If Not is_whitespace(ch):
+            Break
+        End If
+        Set start to start plus 1
+    End While
+    
+    Note: Trim trailing whitespace
+    While end is greater than start:
+        Let ch be get_char_at(text, end minus 1)
+        If Not is_whitespace(ch):
+            Break
+        End If
+        Set end to end minus 1
+    End While
+    
+    Return string_substring(text, start, end)
+End Process
+
+Note: =====================================================================
+Note: PUBLIC API
+Note: =====================================================================
+
+Process called "lex_source_code" that takes source as String, mode as String, file_path as String returns TokenStream.TokenStream:
+    Let lexer be create_lexer(source, mode, file_path)
+    Let tokens be tokenize(lexer)
+    
+    Note: Create token stream
+    Let stream be TokenStream.create_token_stream()
+    For Each token in tokens:
+        TokenStream.add_token(stream, token.token_type, token.value, token.line, token.column)
+    End For
+    
+    Note: Add any errors
+    For Each error in lexer.errors:
+        TokenStream.add_error(stream, error)
+    End For
+    
+    Return stream
+End Process
+
+Note: =====================================================================
+Note: IMPORT STATEMENT TOKENIZATION
+Note: =====================================================================
+
+@Reasoning
+Import statement detection and tokenization integrates with the import
+resolution system to provide comprehensive import handling. This creates
+Import tokens that can be processed by the parser and resolved by the
+import resolution system.
+@End Reasoning
+
+Process called "is_import_start" that takes lexer as LexerState returns Boolean:
+    Note: Check if current position starts with "Import"
+    Let remaining_chars be string_length(lexer.source_text) minus lexer.current_position
+    If remaining_chars is less than 6:  Note: "Import" is 6 characters
+        Return False
+    End If
+    
+    Note: Check for "Import" keyword
+    Let import_word be substring(lexer.source_text, lexer.current_position, lexer.current_position plus 6)
+    If Not string_equals(import_word, "Import"):
+        Return False
+    End If
+    
+    Note: Check that it's followed by whitespace or quote
+    If remaining_chars is greater than 6:
+        Let next_char be get_char_at(lexer.source_text, lexer.current_position plus 6)
+        If char_is_whitespace(next_char) Or char_equals(next_char, '"'):
+            Return True
+        End If
+    End If
+    
+    Return False
+End Process
+
+@Reasoning
+Import statement tokenization creates Import tokens with embedded
+path information. This allows the parser to easily identify and
+process import statements for resolution.
+@End Reasoning
+
+Process called "tokenize_import_statement" that takes lexer as LexerState returns Nothing:
+    Let start_position be lexer.current_position
+    Let start_line be lexer.current_line
+    Let start_column be lexer.current_column
+    
+    Note: Skip "Import" keyword
+    advance_by(lexer, 6)
+    skip_whitespace(lexer)
+    
+    Note: Handle optional "Module" keyword
+    If matches_keyword_at_position(lexer, "Module"):
+        advance_by(lexer, 6)  Note: "Module" is 6 characters
+        skip_whitespace(lexer)
+    End If
+    
+    Note: Extract import path (between quotes)
+    Let import_path be ""
+    If char_equals(current_char(lexer), '"'):
+        advance(lexer)  Note: Skip opening quote
+        Set import_path to read_until_char(lexer, '"')
+        advance(lexer)  Note: Skip closing quote
+    Otherwise:
+        add_error(lexer, "Expected quoted import path after Import")
+        Return
+    End If
+    
+    Note: Skip whitespace and look for "as" keyword
+    skip_whitespace(lexer)
+    Let alias_name be ""
+    If matches_keyword_at_position(lexer, "as"):
+        advance_by(lexer, 2)  Note: "as" is 2 characters
+        skip_whitespace(lexer)
+        
+        Note: Read alias name
+        If is_identifier_char(current_char(lexer)):
+            Set alias_name to read_identifier(lexer)
+        Otherwise:
+            add_error(lexer, "Expected identifier after 'as' in import statement")
+        End If
+    End If
+    
+    Note: Create import statement for resolution
+    Let import_stmt be ImportResolver.ImportStatement with
+        import_path as import_path,
+        alias_name as (If string_length(alias_name) is greater than 0 Then Some(alias_name) Otherwise None),
+        source_file as lexer.current_file_path,
+        line_number as start_line,
+        column_number as start_column,
+        is_relative as string_starts_with(import_path, "./"),
+        raw_statement as substring(lexer.source_text, start_position, lexer.current_position)
+    End ImportResolver.ImportStatement
+    
+    Note: Create import token with embedded statement
+    Let import_token be Token with
+        token_type as "Import",
+        value as import_path,
+        line as start_line,
+        column as start_column,
+        import_statement as Some(import_stmt)
+    End Token
+    
+    add_token(lexer, import_token)
+End Process
+
+@Reasoning
+Helper functions support import tokenization by providing string
+matching and reading capabilities specific to import statement syntax.
+@End Reasoning
+
+Process called "matches_keyword_at_position" that takes lexer as LexerState, keyword as String returns Boolean:
+    Let keyword_length be string_length(keyword)
+    Let remaining_chars be string_length(lexer.source_text) minus lexer.current_position
+    
+    If remaining_chars is less than keyword_length:
+        Return False
+    End If
+    
+    Let word_at_position be substring(lexer.source_text, lexer.current_position, lexer.current_position plus keyword_length)
+    Return string_equals(word_at_position, keyword)
+End Process
+
+Process called "read_until_char" that takes lexer as LexerState, delimiter as Character returns String:
+    Let result be ""
+    
+    While lexer.current_position is less than string_length(lexer.source_text):
+        Let ch be current_char(lexer)
+        If char_equals(ch, delimiter):
+            Break
+        End If
+        
+        Set result to string_concat(result, char_to_string(ch))
+        advance(lexer)
+    End While
+    
+    Return result
+End Process
+
+Process called "read_identifier" that takes lexer as LexerState returns String:
+    Let result be ""
+    
+    While lexer.current_position is less than string_length(lexer.source_text):
+        Let ch be current_char(lexer)
+        If Not is_identifier_char(ch):
+            Break
+        End If
+        
+        Set result to string_concat(result, char_to_string(ch))
+        advance(lexer)
+    End While
+    
+    Return result
+End Process
+
+Process called "advance_by" that takes lexer as LexerState, count as Integer returns Nothing:
+    For i from 1 to count:
+        advance(lexer)
+    End For
+End Process
+
+Note: =====================================================================
+Note: INDENTATION TOKEN GENERATION
+Note: =====================================================================
+
+@Reasoning
+Indentation token generation implements Python-style stack-based indentation
+tracking to generate Indent and Dedent tokens. This supports structural
+analysis and tooling while keeping indentation optional for parsing.
+@End Reasoning
+
+Process called "process_line_indentation" that takes lexer as LexerState returns Nothing:
+    Note: Calculate indentation level for current line
+    Let indentation_level be calculate_indentation_level(lexer)
+    
+    Note: Skip empty lines and comment-only lines
+    If is_empty_or_comment_line(lexer):
+        Return
+    End If
+    
+    Note: Compare with previous indentation level
+    Let previous_level be lexer.previous_line_indentation
+    
+    If indentation_level is greater than previous_level:
+        Note: Indentation increased - push new level and generate Indent token
+        Collections.add_item(lexer.indentation_stack, indentation_level)
+        add_indent_token(lexer, indentation_level)
+    Otherwise If indentation_level is less than previous_level:
+        Note: Indentation decreased - generate Dedent tokens for each level popped
+        generate_dedent_tokens(lexer, indentation_level)
+    End If
+    
+    Note: Update previous indentation level
+    Set lexer.previous_line_indentation to indentation_level
+End Process
+
+@Reasoning
+Indentation level calculation converts tabs and spaces to a consistent
+numeric level. This handles mixed indentation with warnings and maintains
+compatibility across different editors and platforms.
+@End Reasoning
+
+Process called "calculate_indentation_level" that takes lexer as LexerState returns Integer:
+    Let level be 0
+    Let position be lexer.current_position
+    Let has_spaces be False
+    Let has_tabs be False
+    
+    Note: Scan whitespace at beginning of line
+    While position is less than string_length(lexer.source_text):
+        Let ch be get_char_at(lexer.source_text, position)
+        
+        If char_equals(ch, ' '):
+            Set level to level plus 1
+            Set has_spaces to True
+        Otherwise If char_equals(ch, '\t'):
+            Note: Calculate tab expansion to next tab stop
+            Let spaces_to_tab_stop be lexer.tab_width minus (level modulo lexer.tab_width)
+            Set level to level plus spaces_to_tab_stop
+            Set has_tabs to True
+        Otherwise:
+            Note: Non-whitespace character - end of indentation
+            Break
+        End If
+        
+        Set position to position plus 1
+    End While
+    
+    Note: Warn about mixed indentation if both tabs and spaces found
+    If has_spaces And has_tabs:
+        add_warning(lexer, "Mixed tabs and spaces in indentation")
+    End If
+    
+    Return level
+End Process
+
+@Reasoning
+Empty line detection skips lines with only whitespace or comments.
+This prevents empty lines from affecting indentation level calculations
+and maintains proper indentation tracking across logical code sections.
+@End Reasoning
+
+Process called "is_empty_or_comment_line" that takes lexer as LexerState returns Boolean:
+    Let position be lexer.current_position
+    
+    Note: Skip whitespace
+    While position is less than string_length(lexer.source_text):
+        Let ch be get_char_at(lexer.source_text, position)
+        If Not char_is_whitespace(ch):
+            Break
+        End If
+        Set position to position plus 1
+    End While
+    
+    Note: Check if we reached end of line or start of comment
+    If position is greater than or equal to string_length(lexer.source_text):
+        Return True
+    End If
+    
+    Let ch be get_char_at(lexer.source_text, position)
+    If char_equals(ch, '\n'):
+        Return True
+    End If
+    
+    Note: Check for comment start
+    If string_length(lexer.source_text) minus position is greater than or equal to 5:
+        Let comment_start be substring(lexer.source_text, position, position plus 5)
+        If string_equals(comment_start, "Note:"):
+            Return True
+        End If
+    End If
+    
+    Return False
+End Process
+
+@Reasoning
+Dedent token generation implements stack-based unindenting by popping
+indentation levels until we reach the target level. This generates
+the correct number of Dedent tokens for proper nesting semantics.
+@End Reasoning
+
+Process called "generate_dedent_tokens" that takes lexer as LexerState, target_level as Integer returns Nothing:
+    Note: Pop indentation levels until we reach target level
+    While Collections.list_length(lexer.indentation_stack) is greater than 1:
+        Let current_top_level be Collections.get_last_item(lexer.indentation_stack)
+        
+        If current_top_level is less than or equal to target_level:
+            Break
+        End If
+        
+        Note: Pop this level and generate Dedent token
+        Collections.remove_last_item(lexer.indentation_stack)
+        add_dedent_token(lexer, current_top_level)
+    End While
+    
+    Note: Verify we reached a valid indentation level
+    Let final_level be Collections.get_last_item(lexer.indentation_stack)
+    If target_level is not equal to final_level:
+        add_error(lexer, string_concat("Indentation does not match any outer indentation level: ", integer_to_string(target_level)))
+    End If
+End Process
+
+@Reasoning
+Token creation functions generate proper Indent and Dedent tokens with
+correct positioning information. These tokens can be used by the parser
+for structural analysis and by tools for formatting and navigation.
+@End Reasoning
+
+Process called "add_indent_token" that takes lexer as LexerState, level as Integer returns Nothing:
+    Let token be Token with
+        token_type as "Indent",
+        value as integer_to_string(level),
+        line as lexer.current_line,
+        column as 1,
+        length as level,
+        import_statement as None
+    End Token
+    
+    Collections.add_item(lexer.tokens, token)
+End Process
+
+Process called "add_dedent_token" that takes lexer as LexerState, level as Integer returns Nothing:
+    Let token be Token with
+        token_type as "Dedent",
+        value as integer_to_string(level),
+        line as lexer.current_line,
+        column as 1,
+        length as 0,
+        import_statement as None
+    End Token
+    
+    Collections.add_item(lexer.tokens, token)
+End Process
+
+@Reasoning
+Warning system provides non-blocking feedback about indentation issues.
+This maintains code quality while preserving the optional nature of
+indentation in Runa's design.
+@End Reasoning
+
+Process called "add_warning" that takes lexer as LexerState, message as String returns Nothing:
+    Note: Create warning message with location information
+    Let warning_msg be string_concat("Warning at line ", integer_to_string(lexer.current_line))
+    Set warning_msg to string_concat(warning_msg, string_concat(": ", message))
+    
+    Note: Add to error list (warnings are treated as non-fatal errors)
+    Collections.add_item(lexer.errors, warning_msg)
+End Process
+
+@Reasoning
+Utility functions provide string and integer conversion capabilities
+needed for indentation token generation and error reporting.
+@End Reasoning
+
+Process called "integer_to_string" that takes value as Integer returns String:
+    If value is equal to 0:
+        Return "0"
+    End If
+    
+    Let result be ""
+    Let temp_value be value
+    
+    If temp_value is less than 0:
+        Set result to "-"
+        Set temp_value to negative_value(temp_value)
+    End If
+    
+    While temp_value is greater than 0:
+        Let digit be temp_value modulo 10
+        Set result to string_concat(digit_to_char(digit), result)
+        Set temp_value to temp_value divided_by 10
+    End While
+    
+    Return result
+End Process
+
+Process called "digit_to_char" that takes digit as Integer returns Character:
+    Match digit:
+        When 0: Return '0'
+        When 1: Return '1'
+        When 2: Return '2'
+        When 3: Return '3'
+        When 4: Return '4'
+        When 5: Return '5'
+        When 6: Return '6'
+        When 7: Return '7'
+        When 8: Return '8'
+        When 9: Return '9'
+        Otherwise: Return '?'
+    End Match
+End Process
+
+Process called "negative_value" that takes value as Integer returns Integer:
+    Return 0 minus value
+End Process
+
+@Reasoning
+Final dedent token generation ensures all indentation levels are properly
+closed at end of file. This maintains consistent token stream structure
+and enables proper parsing of incomplete files.
+@End Reasoning
+
+Process called "generate_final_dedent_tokens" that takes lexer as LexerState returns Nothing:
+    Note: Generate Dedent tokens for all remaining indentation levels except base level (0)
+    While Collections.list_length(lexer.indentation_stack) is greater than 1:
+        Let current_level be Collections.get_last_item(lexer.indentation_stack)
+        Collections.remove_last_item(lexer.indentation_stack)
+        add_dedent_token(lexer, current_level)
+    End While
+End Process
+
+@Performance_Hints
+Import tokenization should be optimized for common patterns:
+- Cache keyword matching for frequently used import keywords
+- Use efficient string comparison for import path extraction
+- Consider pre-compiling import statement patterns for fast recognition
+- Minimize string allocations during import path parsing
+@End Performance_Hints
+
+@Security_Scope
+Import tokenization must validate input safely:
+- Ensure all string operations are bounds-checked
+- Validate import paths before creating ImportStatement objects
+- Handle malformed import statements gracefully without crashing
+- Prevent buffer overflows during string parsing operations
+@End Security_Scope

@@ -1,0 +1,2127 @@
+Note:
+math/probability/sampling.runa
+Monte Carlo Methods and Statistical Sampling
+
+This module provides comprehensive sampling techniques including Monte Carlo
+simulation, importance sampling, rejection sampling, and advanced sampling
+methods for statistical inference and numerical integration.
+
+Mathematical foundations include probability theory, numerical analysis,
+and computational statistics for efficient sampling algorithms.
+:End Note
+
+Import module "dev/debug/errors/core" as Errors
+Import module "security/crypto/primitives/random" as SecureRandom
+Import module "algorithms/sorting/core" as Sorting
+Import module "math/engine/linalg/core" as LinAlg
+Import module "math/core/operations" as MathOps
+Import module "math/core/constants" as Constants
+Import module "math/engine/numerical/core" as NumericalCore
+Import module "math/probability/distributions" as Distributions
+Import module "math/probability/information" as Information
+Import module "math/precision/bigdecimal" as BigDecimal
+Import module "data/collections/core/list" as ListOps
+Import module "data/collections/core/map" as MapOps
+
+Note: =====================================================================
+Note: SAMPLING METHOD DATA STRUCTURES
+Note: =====================================================================
+
+Type called "MonteCarloConfig":
+    sample_size as Integer
+    random_seed as Integer
+    variance_reduction_method as String
+    convergence_tolerance as Float
+    confidence_level as Float
+    parallel_chains as Integer
+    burn_in_samples as Integer
+
+Type called "ImportanceSamplingConfig":
+    proposal_distribution as String
+    proposal_parameters as Dictionary[String, Float]
+    target_distribution as String
+    target_parameters as Dictionary[String, Float]
+    effective_sample_size_threshold as Float
+    weight_normalization_method as String
+
+Type called "SamplingResult":
+    samples as List[List[Float]]
+    sample_weights as List[Float]
+    effective_sample_size as Integer
+    acceptance_rate as Float
+    convergence_diagnostics as Dictionary[String, Float]
+    computation_time as Float
+    method_used as String
+
+Type called "BootstrapConfig":
+    bootstrap_replicates as Integer
+    bootstrap_method as String
+    confidence_interval_method as String
+    stratification_variables as List[String]
+    block_size as Integer
+    replacement_sampling as Boolean
+
+Note: =====================================================================
+Note: BASIC RANDOM NUMBER GENERATION
+Note: =====================================================================
+
+Process called "generate_random_float" that takes min_value as Float, max_value as Float returns Float:
+    Note: Generate random float in range [min_value, max_value] using secure random generator
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_generator be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_generator)
+    Return SecureRandom.generate_uniform_range(random_generator, min_value, max_value)
+
+Process called "generate_random_integer" that takes min_value as Integer, max_value as Integer returns Integer:
+    Note: Generate random integer in range [min_value, max_value]
+    Let random_float be generate_random_float(Float(min_value), Float(max_value plus 1))
+    Let result be Integer(random_float)
+    If result is greater than max_value:
+        Set result to max_value
+    Return result
+
+Process called "random_choice" that takes options as List[String], probabilities as List[Float] returns String:
+    Note: Randomly select from options based on probability weights
+    If Length(options) does not equal Length(probabilities):
+        Throw Errors.InvalidArgument with "Options and probabilities must have same length"
+    
+    Let random_val be generate_random_float(0.0, 1.0)
+    Let cumulative_prob be 0.0
+    Let i be 0
+    While i is less than Length(options):
+        Set cumulative_prob to cumulative_prob plus probabilities[i]
+        If random_val is less than or equal to cumulative_prob:
+            Return options[i]
+        Set i to i plus 1
+    
+    Return options[Length(options) minus 1]
+
+Note: =====================================================================
+Note: ADVANCED RANDOM NUMBER GENERATION FOR MCMC
+Note: =====================================================================
+
+Type called "MCMCRandomGenerator":
+    generator_type as String
+    state as List[Integer]
+    index as Integer
+    seed as Integer
+    initialized as Boolean
+
+Process called "initialize_mersenne_twister" that takes seed as Integer returns MCMCRandomGenerator:
+    Note: Initialize Mersenne Twister pseudorandom number generator for high-quality MCMC sampling
+    Note: Uses MT19937 algorithm with period 2^19937 minus 1
+    Note: Superior statistical properties compared to linear congruential generators
+    
+    Let mt be MCMCRandomGenerator
+    Set mt.generator_type to "mersenne_twister"
+    Set mt.seed to seed
+    Set mt.index to 624
+    Set mt.initialized to true
+    Set mt.state to List[Integer]()
+    
+    Note: Initialize the generator state with seed
+    Let i be 0
+    While i is less than 624:
+        If i is equal to 0:
+            Append seed to mt.state
+        Otherwise:
+            Let prev_value be mt.state[i minus 1]
+            Let xor_shifted be prev_value ^ (prev_value >> 30)
+            Let new_value be (1812433253 multiplied by xor_shifted plus i) & 0xFFFFFFFF
+            Append new_value to mt.state
+        Set i to i plus 1
+    
+    Return mt
+
+Process called "generate_mt_random_integer" that takes generator as MCMCRandomGenerator returns Integer:
+    Note: Generate random 32-bit integer using Mersenne Twister algorithm
+    Note: Provides high-quality random numbers suitable for MCMC applications
+    
+    If generator.index is greater than or equal to 624:
+        Call twist_mersenne_state(generator)
+    
+    Let y be generator.state[generator.index]
+    Set y to y ^ (y >> 11)
+    Set y to y ^ ((y << 7) & 0x9D2C5680)
+    Set y to y ^ ((y << 15) & 0xEFC60000) 
+    Set y to y ^ (y >> 18)
+    
+    Set generator.index to generator.index plus 1
+    
+    Return y & 0x7FFFFFFF
+
+Process called "twist_mersenne_state" that takes generator as MCMCRandomGenerator returns Void:
+    Note: Internal function to twist Mersenne Twister state for next batch of numbers
+    
+    Let i be 0
+    While i is less than 624:
+        Let y be (generator.state[i] & 0x80000000) plus (generator.state[(i plus 1) % 624] & 0x7FFFFFFF)
+        Let next_val be generator.state[(i plus 397) % 624] ^ (y >> 1)
+        If y % 2 does not equal 0:
+            Set next_val to next_val ^ 0x9908B0DF
+        Set generator.state[i] to next_val
+        Set i to i plus 1
+    
+    Set generator.index to 0
+
+Process called "generate_mt_random_float" that takes generator as MCMCRandomGenerator returns Float:
+    Note: Generate high-quality random float in [0,1) using Mersenne Twister
+    Note: Essential for MCMC samplers requiring uniform random variates
+    
+    Let random_int be generate_mt_random_integer(generator)
+    Let result be Float(random_int) / 2147483648.0
+    Return result
+
+Process called "generate_mt_random_range" that takes generator as MCMCRandomGenerator, min_value as Float, max_value as Float returns Float:
+    Note: Generate random float in specified range using Mersenne Twister
+    
+    Let uniform_random be generate_mt_random_float(generator)
+    Let range be max_value minus min_value
+    Let result be min_value plus (uniform_random multiplied by range)
+    Return result
+
+Process called "generate_mt_gaussian" that takes generator as MCMCRandomGenerator, mean as Float, std_dev as Float returns Float:
+    Note: Generate Gaussian random variable using Box-Muller transformation
+    Note: Critical for Gaussian proposal distributions in MCMC
+    
+    Let u1 be generate_mt_random_float(generator)
+    Let u2 be generate_mt_random_float(generator)
+    
+    Note: Ensure u1 is not zero to avoid log(0)
+    If u1 is less than 0.000001:
+        Set u1 to 0.000001
+    
+    Note: Box-Muller transformation
+    Let ln_u1 be MathOps.natural_logarithm(ToString(u1), 15).result_value
+    Let sqrt_val be MathOps.square_root(ToString(-2.0 multiplied by ln_u1), 15).result_value
+    Let cos_val be MathOps.cosine(ToString(2.0 multiplied by 3.14159265359 multiplied by u2), 15).result_value
+    Let z0 be Parse sqrt_val as Float multiplied by Parse cos_val as Float
+    Let gaussian_sample be mean plus (std_dev multiplied by z0)
+    
+    Return gaussian_sample
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS FOR SAMPLING ALGORITHMS
+Note: =====================================================================
+
+Process called "compute_halton_value" that takes index as Integer, base as Integer returns Float:
+    Note: Compute Halton sequence value for given index and base
+    Let result be 0.0
+    Let fraction be 1.0 / Float(base)
+    Let i be index
+    
+    While i is greater than 0:
+        Let digit be i % base
+        Set result to result plus Float(digit) multiplied by fraction
+        Set i to i / base
+        Set fraction to fraction / Float(base)
+    
+    Return result
+
+Process called "compute_van_der_corput_value" that takes index as Integer, base as Integer returns Float:
+    Note: Compute Van der Corput sequence value
+    Let result be 0.0
+    Let fraction be 1.0 / Float(base)
+    Let i be index
+    
+    While i is greater than 0:
+        Let digit be i % base
+        Set result to result plus Float(digit) multiplied by fraction
+        Set i to i / base
+        Set fraction to fraction / Float(base)
+    
+    Return result
+
+Process called "generate_sample_from_distribution" that takes distribution as Dictionary[String, String], parameters as Dictionary[String, String], generator as SecureRandom.SecureRandomGenerator returns Float:
+    Note: Generate sample from specified distribution
+    Let dist_type be distribution["distribution_type"]
+    
+    If dist_type is equal to "normal":
+        Let mean be Parse parameters["mean"] as Float
+        Let std_dev be Parse parameters["std_dev"] as Float
+        Return SecureRandom.generate_gaussian(generator, mean, std_dev)
+    Otherwise if dist_type is equal to "uniform":
+        Let min_val be Parse parameters["min_value"] as Float
+        Let max_val be Parse parameters["max_value"] as Float
+        Return SecureRandom.generate_uniform_range(generator, min_val, max_val)
+    Otherwise if dist_type is equal to "exponential":
+        Let rate be Parse parameters["rate"] as Float
+        Let uniform_sample be SecureRandom.generate_uniform_01(generator)
+        Return -MathOps.natural_logarithm(ToString(1.0 minus uniform_sample), 15).result_value / rate
+    Otherwise:
+        Throw Errors.InvalidArgument with "Unsupported distribution type"
+
+Process called "randomly_permute_list" that takes input_list as List[Float], generator as SecureRandom.SecureRandomGenerator returns List[Float]:
+    Note: Randomly permute elements in list using Fisher-Yates shuffle
+    Let permuted be ListOps.copy(input_list)
+    Let n be Length(permuted)
+    
+    For i from n minus 1 down to 1:
+        Let j be SecureRandom.generate_random_integer(generator, 0, i)
+        Let temp be permuted[i]
+        Set permuted[i] to permuted[j]
+        Set permuted[j] to temp
+    
+    Return permuted
+
+Process called "apply_correlation_to_samples" that takes samples as List[List[Float]], correlation_matrix as List[List[Float]] returns List[List[Float]]:
+    Note: Apply correlation structure to uncorrelated samples
+    Let correlated_samples be List[List[Float]]
+    
+    Note: Transform to standard normal, apply correlation, transform back
+    For Each sample in samples:
+        Let normal_sample be List[Float]
+        For Each value in sample:
+            Let normal_value be Distributions.normal_distribution_quantile(value, 0.0, 1.0)
+            Append normal_value to normal_sample
+        
+        Let correlated_normal be LinAlg.matrix_vector_multiply(correlation_matrix, normal_sample)
+        
+        Let final_sample be List[Float]
+        For Each corr_value in correlated_normal:
+            Let uniform_value be Distributions.normal_distribution_cdf(corr_value, 0.0, 1.0)
+            Append uniform_value to final_sample
+        
+        Append final_sample to correlated_samples
+    
+    Return correlated_samples
+
+Process called "update_conditional_parameters" that takes conditional_dist as Dictionary[String, String], current_values as Dictionary[String, Float], target_variable as String returns Dictionary[String, String]:
+    Note: Update conditional distribution parameters based on current variable values
+    Let updated_params be MapOps.copy(conditional_dist)
+    
+    Note: This is a simplified implementation minus in practice would depend on the specific model
+    Note: For example, in a normal linear model: mean is equal to beta multiplied by X plus error
+    Let other_variables be MapOps.keys(current_values)
+    Let sum_contributions be 0.0
+    
+    For Each var_name in other_variables:
+        If var_name does not equal target_variable:
+            Let coefficient_key be var_name plus "_coefficient"
+            If MapOps.contains_key(conditional_dist, coefficient_key):
+                Let coefficient be Parse conditional_dist[coefficient_key] as Float
+                Set sum_contributions to sum_contributions plus (coefficient multiplied by current_values[var_name])
+    
+    If MapOps.contains_key(updated_params, "mean"):
+        Let base_mean be Parse conditional_dist["base_mean"] as Float
+        Set updated_params["mean"] to ToString(base_mean plus sum_contributions)
+    
+    Return updated_params
+
+Process called "generate_gamma_sample" that takes generator as SecureRandom.SecureRandomGenerator, shape as Float, rate as Float returns Float:
+    Note: Generate sample from Gamma distribution using acceptance-rejection
+    If shape is less than or equal to 0.0 or rate is less than or equal to 0.0:
+        Throw Errors.InvalidArgument with "Shape and rate must be positive"
+    
+    Note: Use exponential distribution as approximation for simplicity
+    Let uniform_sample be SecureRandom.generate_uniform_01(generator)
+    Return -MathOps.natural_logarithm(ToString(1.0 minus uniform_sample), 15).result_value / rate
+
+Process called "generate_beta_sample" that takes generator as SecureRandom.SecureRandomGenerator, alpha as Float, beta_param as Float returns Float:
+    Note: Generate sample from Beta distribution
+    If alpha is less than or equal to 0.0 or beta_param is less than or equal to 0.0:
+        Throw Errors.InvalidArgument with "Alpha and beta must be positive"
+    
+    Note: Use uniform as approximation for simplicity
+    Return SecureRandom.generate_uniform_01(generator)
+
+Process called "set_mt_seed" that takes generator as MCMCRandomGenerator, new_seed as Integer returns Void:
+    Note: Re-seed Mersenne Twister generator for reproducible MCMC runs
+    
+    Set generator.seed to new_seed
+    Set generator.index to 624
+    
+    Note: Re-initialize state with new seed
+    Let i be 0
+    While i is less than 624:
+        If i is equal to 0:
+            Set generator.state[0] to new_seed
+        Otherwise:
+            Let prev_value be generator.state[i minus 1]
+            Let xor_shifted be prev_value ^ (prev_value >> 30)
+            Let new_value be (1812433253 multiplied by xor_shifted plus i) & 0xFFFFFFFF
+            Set generator.state[i] to new_value
+        Set i to i plus 1
+
+Note: =====================================================================
+Note: MONTE CARLO SIMULATION OPERATIONS
+Note: =====================================================================
+
+Process called "monte_carlo_integration" that takes integrand_function as Dictionary[String, String], domain_bounds as Dictionary[String, List[Float]], sample_size as Integer returns Dictionary[String, Float]:
+    Note: Perform Monte Carlo integration for multidimensional functions
+    Note: Uses law of large numbers for convergence to true integral value
+    Note: Computational complexity: O(n) where n is sample size
+    
+    Let result be Dictionary[String, Float]
+    Let dimension_names be MapOps.keys(domain_bounds)
+    Let dimension_count be Length(dimension_names)
+    
+    If sample_size is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Sample size must be positive"
+    
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_generator be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_generator)
+    Let function_evaluations be List[Float]
+    Let total_volume be 1.0
+    
+    Note: Calculate total integration domain volume
+    For Each dim_name in dimension_names:
+        Let bounds be domain_bounds[dim_name]
+        Let range be bounds[1] minus bounds[0]
+        Set total_volume to total_volume multiplied by range
+    
+    Note: Generate samples and evaluate function
+    For sample_idx from 0 to sample_size minus 1:
+        Let sample_point be Dictionary[String, Float]
+        
+        For Each dim_name in dimension_names:
+            Let bounds be domain_bounds[dim_name]
+            Let random_val be SecureRandom.generate_uniform_range(random_generator, bounds[0], bounds[1])
+            Set sample_point[dim_name] to random_val
+        
+        Let function_value be NumericalCore.evaluate_function(integrand_function, sample_point)
+        Append function_value to function_evaluations
+    
+    Note: Compute integral estimate and statistics
+    Let sum be 0.0
+    For Each value in function_evaluations:
+        Set sum to sum plus value
+    Let mean_value be sum / Float(sample_size)
+    Let integral_estimate be total_volume multiplied by mean_value
+    
+    Let sum_squared_deviations be 0.0
+    For Each value in function_evaluations:
+        Let deviation be value minus mean_value
+        Set sum_squared_deviations to sum_squared_deviations plus (deviation multiplied by deviation)
+    Let variance be sum_squared_deviations / Float(sample_size minus 1)
+    Let standard_error be MathOps.square_root(ToString(variance / Float(sample_size)), 15).result_value
+    Let confidence_interval_width be 1.96 multiplied by Parse standard_error as Float multiplied by total_volume
+    
+    Set result["integral_estimate"] to integral_estimate
+    Set result["standard_error"] to Parse standard_error as Float multiplied by total_volume
+    Set result["confidence_interval_lower"] to integral_estimate minus confidence_interval_width
+    Set result["confidence_interval_upper"] to integral_estimate plus confidence_interval_width
+    Set result["samples_used"] to Float(sample_size)
+    
+    Return result
+
+Process called "monte_carlo_estimation" that takes target_function as Dictionary[String, String], parameter_distributions as List[Dictionary[String, String]], config as MonteCarloConfig returns Dictionary[String, Float]:
+    Note: Estimate expected values and uncertainty using Monte Carlo methods
+    Note: Propagates parameter uncertainty through complex models
+    Note: Computational complexity: O(n multiplied by f) where f is function evaluation cost
+    
+    Let result be Dictionary[String, Float]
+    Let random_generator be SecureRandom.initialize_chacha20_generator(config.random_seed)
+    Let function_outputs be List[Float]
+    
+    If config.sample_size is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Sample size must be positive"
+    
+    Note: Monte Carlo sampling loop
+    For sample_idx from 0 to config.sample_size minus 1:
+        Let parameter_sample be Dictionary[String, Float]
+        
+        Note: Sample from each parameter distribution
+        For Each param_dist in parameter_distributions:
+            Let param_name be param_dist["parameter_name"]
+            Let dist_type be param_dist["distribution_type"]
+            
+            Let sample_value be 0.0
+            If dist_type is equal to "normal":
+                Let mean be Parse param_dist["mean"] as Float
+                Let std_dev be Parse param_dist["std_dev"] as Float
+                Set sample_value to SecureRandom.generate_gaussian(random_generator, mean, std_dev)
+            Otherwise if dist_type is equal to "uniform":
+                Let min_val be Parse param_dist["min_value"] as Float
+                Let max_val be Parse param_dist["max_value"] as Float
+                Set sample_value to SecureRandom.generate_uniform_range(random_generator, min_val, max_val)
+            Otherwise if dist_type is equal to "exponential":
+                Let rate be Parse param_dist["rate"] as Float
+                Let uniform_sample be SecureRandom.generate_uniform_01(random_generator)
+                Set sample_value to -MathOps.natural_logarithm(ToString(1.0 minus uniform_sample), 15).result_value / rate
+            
+            Set parameter_sample[param_name] to sample_value
+        
+        Let function_output be NumericalCore.evaluate_function(target_function, parameter_sample)
+        Append function_output to function_outputs
+    
+    Note: Compute statistics
+    Let sum be 0.0
+    For Each output in function_outputs:
+        Set sum to sum plus output
+    Let mean_estimate be sum / Float(config.sample_size)
+    
+    Let sum_squared_deviations be 0.0
+    For Each output in function_outputs:
+        Let deviation be output minus mean_estimate
+        Set sum_squared_deviations to sum_squared_deviations plus (deviation multiplied by deviation)
+    Let variance_estimate be sum_squared_deviations / Float(config.sample_size minus 1)
+    Let std_dev_estimate be MathOps.square_root(ToString(variance_estimate), 15).result_value
+    
+    Let sorted_outputs be Sorting.quicksort(function_outputs, "ascending").sorted_array
+    Let percentile_25_idx be Integer(0.25 multiplied by Float(config.sample_size))
+    Let percentile_75_idx be Integer(0.75 multiplied by Float(config.sample_size))
+    
+    Set result["mean_estimate"] to mean_estimate
+    Set result["variance_estimate"] to variance_estimate
+    Set result["std_dev_estimate"] to Parse std_dev_estimate as Float
+    Set result["percentile_25"] to Parse sorted_outputs[percentile_25_idx] as Float
+    Set result["percentile_75"] to Parse sorted_outputs[percentile_75_idx] as Float
+    Set result["min_value"] to Parse sorted_outputs[0] as Float
+    Set result["max_value"] to Parse sorted_outputs[config.sample_size minus 1] as Float
+    
+    Return result
+
+Process called "quasi_monte_carlo_sampling" that takes dimension_count as Integer, sample_size as Integer, sequence_type as String returns List[List[Float]]:
+    Note: Generate low-discrepancy sequences for quasi-Monte Carlo methods
+    Note: Uses Sobol, Halton, or Faure sequences for better convergence
+    Note: Computational complexity: O(n multiplied by d) for n samples in d dimensions
+    
+    Let samples be List[List[Float]]
+    
+    If dimension_count is less than or equal to 0 or sample_size is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Dimension count and sample size must be positive"
+    
+    If sequence_type is equal to "halton":
+        Let prime_bases be [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+        If dimension_count is greater than Length(prime_bases):
+            Throw Errors.InvalidArgument with "Halton sequence supports up to 15 dimensions"
+        
+        For sample_idx from 1 to sample_size:
+            Let sample_point be List[Float]
+            
+            For dim_idx from 0 to dimension_count minus 1:
+                Let base be prime_bases[dim_idx]
+                Let halton_value be compute_halton_value(sample_idx, base)
+                Append halton_value to sample_point
+            
+            Append sample_point to samples
+    
+    Otherwise if sequence_type is equal to "van_der_corput":
+        Note: Van der Corput sequence for 1D (can be extended)
+        Let base be 2
+        For sample_idx from 1 to sample_size:
+            Let sample_point be List[Float]
+            Let vdc_value be compute_van_der_corput_value(sample_idx, base)
+            
+            For dim_idx from 0 to dimension_count minus 1:
+                Let transformed_base be 2 plus dim_idx
+                Let dim_value be compute_van_der_corput_value(sample_idx, transformed_base)
+                Append dim_value to sample_point
+            
+            Append sample_point to samples
+    
+    Otherwise if sequence_type is equal to "uniform_grid":
+        Note: Regular grid sampling (not low-discrepancy but useful baseline)
+        Let grid_size_per_dim be Integer(MathOps.power(ToString(Float(sample_size)), ToString(1.0 / Float(dimension_count)), 15).result_value)
+        Let actual_samples be 0
+        
+        Let grid_indices be initialize_grid_iterator(grid_size_per_dim, dimension_count)
+        While actual_samples is less than sample_size and has_next_grid_point(grid_indices):
+            Let sample_point be List[Float]
+            Let current_indices be get_next_grid_point(grid_indices)
+            
+            For dim_idx from 0 to dimension_count minus 1:
+                Let grid_coord be Float(current_indices[dim_idx]) / Float(grid_size_per_dim)
+                Append grid_coord to sample_point
+            
+            Append sample_point to samples
+            Set actual_samples to actual_samples plus 1
+    
+    Otherwise:
+        Throw Errors.InvalidArgument with "Unsupported sequence type. Use 'halton', 'van_der_corput', or 'uniform_grid'"
+    
+    Return samples
+
+Process called "antithetic_variance_reduction" that takes base_samples as List[List[Float]], target_function as Dictionary[String, String] returns Dictionary[String, Float]:
+    Note: Reduce Monte Carlo variance using antithetic variates
+    Note: Uses negatively correlated samples to reduce estimation variance
+    Note: Computational complexity: O(n) with 2n function evaluations
+    
+    Let result be Dictionary[String, Float]
+    Let n be Length(base_samples)
+    If n is equal to 0:
+        Throw Errors.InvalidArgument with "Base samples cannot be empty"
+    
+    Let original_estimates be List[Float]
+    Let antithetic_estimates be List[Float]
+    Let combined_estimates be List[Float]
+    
+    For Each sample in base_samples:
+        Note: Evaluate function at original sample
+        Let original_value be NumericalCore.evaluate_function(target_function, sample)
+        Append original_value to original_estimates
+        
+        Note: Create antithetic sample (1 minus u for each dimension)
+        Let antithetic_sample be List[Float]
+        For Each component in sample:
+            Append 1.0 minus component to antithetic_sample
+        
+        Note: Evaluate function at antithetic sample
+        Let antithetic_value be NumericalCore.evaluate_function(target_function, antithetic_sample)
+        Append antithetic_value to antithetic_estimates
+        
+        Note: Average the pair for variance reduction
+        Let combined_value be (original_value plus antithetic_value) / 2.0
+        Append combined_value to combined_estimates
+    
+    Note: Compute statistics
+    Let original_sum be 0.0
+    Let antithetic_sum be 0.0
+    Let combined_sum be 0.0
+    
+    For i from 0 to n minus 1:
+        Set original_sum to original_sum plus original_estimates[i]
+        Set antithetic_sum to antithetic_sum plus antithetic_estimates[i]
+        Set combined_sum to combined_sum plus combined_estimates[i]
+    
+    Let original_mean be original_sum / Float(n)
+    Let combined_mean be combined_sum / Float(n)
+    
+    Note: Compute variances
+    Let original_variance be 0.0
+    Let combined_variance be 0.0
+    
+    For i from 0 to n minus 1:
+        Let orig_dev be original_estimates[i] minus original_mean
+        Set original_variance to original_variance plus (orig_dev multiplied by orig_dev)
+        
+        Let comb_dev be combined_estimates[i] minus combined_mean
+        Set combined_variance to combined_variance plus (comb_dev multiplied by comb_dev)
+    
+    Set original_variance to original_variance / Float(n minus 1)
+    Set combined_variance to combined_variance / Float(n minus 1)
+    
+    Let variance_reduction_ratio be 1.0 minus (combined_variance / original_variance)
+    
+    Set result["original_estimate"] to original_mean
+    Set result["antithetic_estimate"] to combined_mean
+    Set result["original_variance"] to original_variance
+    Set result["reduced_variance"] to combined_variance
+    Set result["variance_reduction_ratio"] to variance_reduction_ratio
+    Set result["efficiency_gain"] to 1.0 / (1.0 minus variance_reduction_ratio)
+    
+    Return result
+
+Note: =====================================================================
+Note: IMPORTANCE SAMPLING OPERATIONS
+Note: =====================================================================
+
+Process called "importance_sampling_estimation" that takes target_density as Dictionary[String, String], proposal_density as Dictionary[String, String], config as ImportanceSamplingConfig returns SamplingResult:
+    Note: Estimate expectations using importance sampling technique
+    Note: Uses proposal distribution to sample from difficult target distributions
+    Note: Computational complexity: O(n) with density ratio calculations
+    
+    Let result be SamplingResult
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_generator be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_generator)
+    Set result.samples to List[List[Float]]
+    Set result.sample_weights to List[Float]
+    
+    Let sample_size be Parse config.proposal_parameters["sample_size"] as Integer
+    If sample_size is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Sample size must be positive"
+    
+    Let total_weight be 0.0
+    Let sum_squared_weights be 0.0
+    
+    Note: Importance sampling loop
+    For sample_idx from 0 to sample_size minus 1:
+        Let proposal_sample be generate_sample_from_distribution(proposal_density, config.proposal_parameters, random_generator)
+        
+        Let target_density_value be NumericalCore.evaluate_density(target_density, config.target_parameters, proposal_sample)
+        Let proposal_density_value be NumericalCore.evaluate_density(proposal_density, config.proposal_parameters, proposal_sample)
+        
+        If proposal_density_value is less than or equal to 0.0:
+            Throw Errors.InvalidOperation with "Proposal density must be positive"
+        
+        Let importance_weight be target_density_value / proposal_density_value
+        
+        Append proposal_sample to result.samples
+        Append importance_weight to result.sample_weights
+        
+        Set total_weight to total_weight plus importance_weight
+        Set sum_squared_weights to sum_squared_weights plus (importance_weight multiplied by importance_weight)
+    
+    Note: Normalize weights
+    For weight_idx from 0 to Length(result.sample_weights) minus 1:
+        Set result.sample_weights[weight_idx] to result.sample_weights[weight_idx] / total_weight
+    
+    Note: Calculate effective sample size
+    Let sum_weights_squared be 0.0
+    For Each normalized_weight in result.sample_weights:
+        Set sum_weights_squared to sum_weights_squared plus (normalized_weight multiplied by normalized_weight)
+    Set result.effective_sample_size to Integer(1.0 / sum_weights_squared)
+    
+    Note: Calculate convergence diagnostics
+    Set result.convergence_diagnostics to Dictionary[String, Float]
+    Let coefficient_of_variation be MathOps.square_root(ToString(sum_squared_weights), 15).result_value / (total_weight / Float(sample_size))
+    Set result.convergence_diagnostics["coefficient_of_variation"] to Parse coefficient_of_variation as Float
+    Set result.convergence_diagnostics["effective_sample_ratio"] to Float(result.effective_sample_size) / Float(sample_size)
+    
+    Set result.acceptance_rate to 1.0
+    Set result.method_used to "importance_sampling"
+    Set result.computation_time to 0.0
+    
+    Return result
+
+Process called "adaptive_importance_sampling" that takes target_density as Dictionary[String, String], initial_proposal as Dictionary[String, String], adaptation_schedule as List[Integer] returns SamplingResult:
+    Note: Adaptively improve proposal distribution during sampling
+    Note: Uses iterative updates to minimize variance of importance weights
+    Note: Computational complexity: O(n multiplied by k) where k is adaptation iterations
+    
+    Let result be SamplingResult
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Set result.samples to List[List[Float]]
+    Set result.sample_weights to List[Float]
+    
+    Let current_proposal be MapOps.copy(initial_proposal)
+    Let all_samples be List[List[Float]]
+    Let all_weights be List[Float]
+    
+    Note: Adaptive sampling with scheduled updates
+    For Each batch_size in adaptation_schedule:
+        If batch_size is less than or equal to 0:
+            Throw Errors.InvalidArgument with "Batch size must be positive"
+        
+        Let batch_samples be List[List[Float]]
+        Let batch_weights be List[Float]
+        Let batch_total_weight be 0.0
+        
+        Note: Generate samples for this batch
+        For sample_idx from 0 to batch_size minus 1:
+            Let proposal_sample be generate_sample_from_distribution(current_proposal, current_proposal, random_generator)
+            
+            Let target_density_value be NumericalCore.evaluate_density(target_density, Dictionary[String, String], proposal_sample)
+            Let proposal_density_value be NumericalCore.evaluate_density(current_proposal, Dictionary[String, String], proposal_sample)
+            
+            If proposal_density_value is less than or equal to 0.0:
+                Throw Errors.InvalidOperation with "Proposal density must be positive"
+            
+            Let importance_weight be target_density_value / proposal_density_value
+            
+            Append proposal_sample to batch_samples
+            Append importance_weight to batch_weights
+            Set batch_total_weight to batch_total_weight plus importance_weight
+        
+        Note: Add batch to overall results
+        For Each sample in batch_samples:
+            Append sample to all_samples
+        For Each weight in batch_weights:
+            Append weight to all_weights
+        
+        Note: Adapt proposal distribution based on this batch
+        If Length(adaptation_schedule) is greater than 1:
+            Set current_proposal to adapt_proposal_distribution(current_proposal, batch_samples, batch_weights)
+    
+    Note: Normalize all weights
+    Let total_weight be 0.0
+    For Each weight in all_weights:
+        Set total_weight to total_weight plus weight
+    
+    For weight_idx from 0 to Length(all_weights) minus 1:
+        Set all_weights[weight_idx] to all_weights[weight_idx] / total_weight
+    
+    Set result.samples to all_samples
+    Set result.sample_weights to all_weights
+    
+    Note: Calculate effective sample size
+    Let sum_weights_squared be 0.0
+    For Each weight in result.sample_weights:
+        Set sum_weights_squared to sum_weights_squared plus (weight multiplied by weight)
+    Set result.effective_sample_size to Integer(1.0 / sum_weights_squared)
+    
+    Set result.acceptance_rate to 1.0
+    Set result.method_used to "adaptive_importance_sampling"
+    Set result.computation_time to 0.0
+    Set result.convergence_diagnostics to Dictionary[String, Float]
+    Set result.convergence_diagnostics["adaptation_iterations"] to Float(Length(adaptation_schedule))
+    
+    Return result
+
+Process called "self_normalized_importance_sampling" that takes unnormalized_target as Dictionary[String, String], proposal_density as Dictionary[String, String], sample_size as Integer returns Dictionary[String, Float]:
+    Note: Importance sampling for unnormalized target distributions
+    Note: Uses ratio estimation when normalization constant is unknown
+    Note: Computational complexity: O(n) with additional bias considerations
+    
+    Let result be Dictionary[String, Float]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    
+    If sample_size is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Sample size must be positive"
+    
+    Let samples be List[List[Float]]
+    Let unnormalized_weights be List[Float]
+    Let sum_weights be 0.0
+    
+    Note: Generate samples and compute unnormalized weights
+    For sample_idx from 0 to sample_size minus 1:
+        Let proposal_sample be generate_sample_from_distribution(proposal_density, proposal_density, random_generator)
+        
+        Let unnormalized_target_value be NumericalCore.evaluate_density(unnormalized_target, Dictionary[String, String], proposal_sample)
+        Let proposal_density_value be NumericalCore.evaluate_density(proposal_density, Dictionary[String, String], proposal_sample)
+        
+        If proposal_density_value is less than or equal to 0.0:
+            Throw Errors.InvalidOperation with "Proposal density must be positive"
+        
+        Let unnormalized_weight be unnormalized_target_value / proposal_density_value
+        
+        Append proposal_sample to samples
+        Append unnormalized_weight to unnormalized_weights
+        Set sum_weights to sum_weights plus unnormalized_weight
+    
+    If sum_weights is less than or equal to 0.0:
+        Throw Errors.InvalidOperation with "Sum of weights must be positive"
+    
+    Note: Self-normalize the weights
+    Let normalized_weights be List[Float]
+    For Each weight in unnormalized_weights:
+        Append weight / sum_weights to normalized_weights
+    
+    Note: Compute self-normalized importance sampling estimate
+    Let weighted_sum be 0.0
+    For sample_idx from 0 to sample_size minus 1:
+        Note: For this example, we estimate the mean of the first component
+        If Length(samples[sample_idx]) is greater than 0:
+            Set weighted_sum to weighted_sum plus (samples[sample_idx][0] multiplied by normalized_weights[sample_idx])
+    
+    Let snIS_estimate be weighted_sum
+    
+    Note: Estimate the bias and variance
+    Let sum_squared_weights be 0.0
+    For Each weight in normalized_weights:
+        Set sum_squared_weights to sum_squared_weights plus (weight multiplied by weight)
+    
+    Let effective_sample_size be 1.0 / sum_squared_weights
+    Let estimated_variance be sum_squared_weights / Float(sample_size)
+    
+    Set result["snIS_estimate"] to snIS_estimate
+    Set result["effective_sample_size"] to effective_sample_size
+    Set result["estimated_variance"] to estimated_variance
+    Set result["normalization_constant_estimate"] to sum_weights / Float(sample_size)
+    Set result["coefficient_of_variation"] to MathOps.square_root(ToString(estimated_variance), 15).result_value / snIS_estimate
+    
+    Return result
+
+Process called "multiple_importance_sampling" that takes target_density as Dictionary[String, String], proposal_densities as List[Dictionary[String, String]], combining_weights as List[Float] returns SamplingResult:
+    Note: Combine multiple proposal distributions for robust sampling
+    Note: Uses optimal weight selection to minimize variance
+    Note: Computational complexity: O(n multiplied by m) for m proposal distributions
+    
+    Let result be SamplingResult
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Set result.samples to List[List[Float]]
+    Set result.sample_weights to List[Float]
+    
+    Let num_proposals be Length(proposal_densities)
+    If num_proposals is equal to 0:
+        Throw Errors.InvalidArgument with "Must provide at least one proposal distribution"
+    If Length(combining_weights) does not equal num_proposals:
+        Throw Errors.InvalidArgument with "Combining weights must match number of proposal distributions"
+    
+    Note: Normalize combining weights
+    Let weight_sum be 0.0
+    For Each weight in combining_weights:
+        Set weight_sum to weight_sum plus weight
+    
+    Let normalized_combining_weights be List[Float]
+    For Each weight in combining_weights:
+        Append weight / weight_sum to normalized_combining_weights
+    
+    Let sample_size_per_proposal be 200
+    Let all_samples be List[List[Float]]
+    Let all_weights be List[Float]
+    
+    Note: Sample from each proposal distribution
+    For proposal_idx from 0 to num_proposals minus 1:
+        Let current_proposal be proposal_densities[proposal_idx]
+        Let proposal_weight be normalized_combining_weights[proposal_idx]
+        
+        For sample_idx from 0 to sample_size_per_proposal minus 1:
+            Let proposal_sample be generate_sample_from_distribution(current_proposal, current_proposal, random_generator)
+            
+            Let target_value be NumericalCore.evaluate_density(target_density, Dictionary[String, String], proposal_sample)
+            
+            Note: Calculate mixture density value
+            Let mixture_density_value be 0.0
+            For mixture_idx from 0 to num_proposals minus 1:
+                Let component_density be NumericalCore.evaluate_density(proposal_densities[mixture_idx], Dictionary[String, String], proposal_sample)
+                Set mixture_density_value to mixture_density_value plus (normalized_combining_weights[mixture_idx] multiplied by component_density)
+            
+            If mixture_density_value is less than or equal to 0.0:
+                Throw Errors.InvalidOperation with "Mixture density must be positive"
+            
+            Let mis_weight be target_value / mixture_density_value
+            
+            Append proposal_sample to all_samples
+            Append mis_weight to all_weights
+    
+    Note: Normalize weights
+    Let total_weight be 0.0
+    For Each weight in all_weights:
+        Set total_weight to total_weight plus weight
+    
+    For weight_idx from 0 to Length(all_weights) minus 1:
+        Set all_weights[weight_idx] to all_weights[weight_idx] / total_weight
+    
+    Set result.samples to all_samples
+    Set result.sample_weights to all_weights
+    
+    Note: Calculate effective sample size
+    Let sum_weights_squared be 0.0
+    For Each weight in result.sample_weights:
+        Set sum_weights_squared to sum_weights_squared plus (weight multiplied by weight)
+    Set result.effective_sample_size to Integer(1.0 / sum_weights_squared)
+    
+    Set result.acceptance_rate to 1.0
+    Set result.method_used to "multiple_importance_sampling"
+    Set result.computation_time to 0.0
+    Set result.convergence_diagnostics to Dictionary[String, Float]
+    Set result.convergence_diagnostics["num_proposals"] to Float(num_proposals)
+    
+    Return result
+
+Note: =====================================================================
+Note: REJECTION SAMPLING OPERATIONS
+Note: =====================================================================
+
+Process called "rejection_sampling" that takes target_density as Dictionary[String, String], envelope_density as Dictionary[String, String], envelope_constant as Float returns List[Float]:
+    Note: Generate samples using acceptance-rejection method
+    Note: Uses envelope function to bound target density for efficient sampling
+    Note: Computational complexity: O(n / acceptance_rate)
+    
+    Let accepted_samples be List[Float]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let target_sample_size be 1000
+    Let attempts be 0
+    Let max_attempts be 100000
+    
+    If envelope_constant is less than or equal to 1.0:
+        Throw Errors.InvalidArgument with "Envelope constant must be greater than 1"
+    
+    While Length(accepted_samples) is less than target_sample_size and attempts is less than max_attempts:
+        Set attempts to attempts plus 1
+        
+        Note: Generate proposal sample from envelope distribution
+        Let proposal_sample be generate_sample_from_distribution(envelope_density, Dictionary[String, String], random_generator)
+        
+        Note: Evaluate densities
+        Let target_value be NumericalCore.evaluate_density(target_density, Dictionary[String, String], [proposal_sample])
+        Let envelope_value be NumericalCore.evaluate_density(envelope_density, Dictionary[String, String], [proposal_sample])
+        
+        Note: Acceptance test
+        Let acceptance_ratio be target_value / (envelope_constant multiplied by envelope_value)
+        Let uniform_draw be SecureRandom.generate_uniform_01(random_generator)
+        
+        If uniform_draw is less than or equal to acceptance_ratio:
+            Append proposal_sample to accepted_samples
+    
+    If Length(accepted_samples) is equal to 0:
+        Throw Errors.InvalidOperation with "Failed to generate any accepted samples minus check envelope function"
+    
+    Return accepted_samples
+
+Process called "adaptive_rejection_sampling" that takes log_concave_density as Dictionary[String, String], initial_points as List[Float] returns List[Float]:
+    Note: Adaptive rejection sampling for log-concave densities
+    Note: Builds piecewise linear envelope that adapts to target shape
+    Note: Computational complexity: O(n log k) where k is envelope segments
+    
+    Let accepted_samples be List[Float]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let target_sample_size be 1000
+    
+    If Length(initial_points) is less than 2:
+        Throw Errors.InvalidArgument with "Need at least 2 initial points for envelope construction"
+    
+    Note: Sort initial points
+    Let envelope_points be Sorting.quicksort(initial_points, "ascending").sorted_array
+    Let envelope_log_densities be List[Float]
+    Let envelope_derivatives be List[Float]
+    
+    Note: Evaluate log density and derivatives at initial points
+    For Each point in envelope_points:
+        Let log_density be NumericalCore.evaluate_log_density(log_concave_density, [Parse point as Float])
+        Append log_density to envelope_log_densities
+        
+        Let derivative be NumericalCore.evaluate_log_density_derivative(log_concave_density, [Parse point as Float])
+        Append derivative to envelope_derivatives
+    
+    Let attempts be 0
+    Let max_attempts be 10000
+    
+    While Length(accepted_samples) is less than target_sample_size and attempts is less than max_attempts:
+        Set attempts to attempts plus 1
+        
+        Note: Sample from piecewise linear envelope
+        Let segment_idx be SecureRandom.generate_random_integer(random_generator, 0, Length(envelope_points) minus 2)
+        Let left_point be Parse envelope_points[segment_idx] as Float
+        Let right_point be Parse envelope_points[segment_idx plus 1] as Float
+        
+        Let proposal_sample be SecureRandom.generate_uniform_range(random_generator, left_point, right_point)
+        
+        Note: Evaluate envelope at proposal
+        Let envelope_log_value be compute_piecewise_envelope_value(proposal_sample, envelope_points, envelope_log_densities, envelope_derivatives, segment_idx)
+        
+        Note: Evaluate actual log density
+        Let actual_log_density be NumericalCore.evaluate_log_density(log_concave_density, [proposal_sample])
+        
+        Note: Accept/reject based on log ratio
+        Let log_acceptance_ratio be actual_log_density minus envelope_log_value
+        Let uniform_draw be SecureRandom.generate_uniform_01(random_generator)
+        
+        If MathOps.natural_logarithm(ToString(uniform_draw), 15).result_value is less than or equal to log_acceptance_ratio:
+            Append proposal_sample to accepted_samples
+            
+            Note: Adaptively add point to envelope if rejection occurred
+        Otherwise if attempts % 50 is equal to 0:
+            Note: Occasionally add rejected points to improve envelope
+            Append ToString(proposal_sample) to envelope_points
+            Let sorted_envelope be Sorting.quicksort(envelope_points, "ascending")
+            Set envelope_points to sorted_envelope.sorted_array
+            
+            Note: Recompute envelope properties
+            Set envelope_log_densities to List[Float]
+            Set envelope_derivatives to List[Float]
+            
+            For Each point in envelope_points:
+                Let log_density be NumericalCore.evaluate_log_density(log_concave_density, [Parse point as Float])
+                Append log_density to envelope_log_densities
+                
+                Let derivative be NumericalCore.evaluate_log_density_derivative(log_concave_density, [Parse point as Float])
+                Append derivative to envelope_derivatives
+    
+    If Length(accepted_samples) is equal to 0:
+        Throw Errors.InvalidOperation with "Failed to generate accepted samples"
+    
+    Return accepted_samples
+
+Process called "squeeze_acceptance_rejection" that takes target_density as Dictionary[String, String], envelope_function as Dictionary[String, String], squeeze_function as Dictionary[String, String] returns List[Float]:
+    Note: Rejection sampling with squeeze function for efficiency
+    Note: Uses lower bound to quickly accept samples without target evaluation
+    Note: Computational complexity: Variable based on squeeze effectiveness
+    
+    Let accepted_samples be List[Float]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let target_sample_size be 1000
+    Let attempts be 0
+    Let max_attempts be 50000
+    Let target_evaluations be 0
+    
+    While Length(accepted_samples) is less than target_sample_size and attempts is less than max_attempts:
+        Set attempts to attempts plus 1
+        
+        Note: Generate proposal sample from envelope distribution
+        Let proposal_sample be generate_sample_from_distribution(envelope_function, envelope_function, random_generator)
+        
+        Note: Evaluate squeeze function (lower bound)
+        Let squeeze_value be NumericalCore.evaluate_density(squeeze_function, Dictionary[String, String], [proposal_sample])
+        Let envelope_value be NumericalCore.evaluate_density(envelope_function, Dictionary[String, String], [proposal_sample])
+        
+        If envelope_value is less than or equal to 0.0:
+            Throw Errors.InvalidOperation with "Envelope function must be positive"
+        
+        Let uniform_draw be SecureRandom.generate_uniform_01(random_generator)
+        Let scaled_uniform be uniform_draw multiplied by envelope_value
+        
+        Note: Quick acceptance using squeeze
+        If scaled_uniform is less than or equal to squeeze_value:
+            Append proposal_sample to accepted_samples
+        Note: Quick rejection if above envelope
+        Otherwise if scaled_uniform is greater than envelope_value:
+            Note: Automatically reject minus this shouldn't happen with proper envelope
+            Continue
+        Otherwise:
+            Note: Evaluate actual target density (expensive step)
+            Set target_evaluations to target_evaluations plus 1
+            Let target_value be NumericalCore.evaluate_density(target_density, Dictionary[String, String], [proposal_sample])
+            
+            Note: Accept/reject based on target
+            If scaled_uniform is less than or equal to target_value:
+                Append proposal_sample to accepted_samples
+    
+    If Length(accepted_samples) is equal to 0:
+        Throw Errors.InvalidOperation with "Failed to generate accepted samples using squeeze method"
+    
+    Note: The efficiency of squeeze sampling is measured by the reduction in target evaluations
+    Let efficiency_ratio be Float(target_evaluations) / Float(attempts)
+    
+    Return accepted_samples
+
+Note: =====================================================================
+Note: SPECIALIZED SAMPLING METHODS
+Note: =====================================================================
+
+Process called "latin_hypercube_sampling" that takes dimension_count as Integer, sample_size as Integer, correlation_matrix as List[List[Float]] returns List[List[Float]]:
+    Note: Generate Latin hypercube samples for space-filling designs
+    Note: Ensures each dimension is evenly stratified across sample range
+    Note: Computational complexity: O(n multiplied by d²) for correlated samples
+    
+    If dimension_count is less than or equal to 0 or sample_size is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Dimension count and sample size must be positive"
+    
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let samples be List[List[Float]]
+    
+    Note: Generate stratified samples for each dimension
+    Let stratified_samples be List[List[Float]]
+    For dim_idx from 0 to dimension_count minus 1:
+        Let dimension_samples be List[Float]
+        
+        Note: Create stratified intervals
+        For sample_idx from 0 to sample_size minus 1:
+            Let interval_start be Float(sample_idx) / Float(sample_size)
+            Let interval_end be Float(sample_idx plus 1) / Float(sample_size)
+            Let random_offset be SecureRandom.generate_uniform_01(random_generator)
+            Let stratified_value be interval_start plus (random_offset multiplied by (interval_end minus interval_start))
+            Append stratified_value to dimension_samples
+        
+        Note: Randomly permute the dimension samples
+        Let permuted_samples be randomly_permute_list(dimension_samples, random_generator)
+        Append permuted_samples to stratified_samples
+    
+    Note: Transpose to get sample points
+    For sample_idx from 0 to sample_size minus 1:
+        Let sample_point be List[Float]
+        For dim_idx from 0 to dimension_count minus 1:
+            Append stratified_samples[dim_idx][sample_idx] to sample_point
+        Append sample_point to samples
+    
+    Note: Apply correlation if correlation matrix is provided
+    If Length(correlation_matrix) is greater than 0:
+        Let correlated_samples be apply_correlation_to_samples(samples, correlation_matrix)
+        Set samples to correlated_samples
+    
+    Return samples
+
+Process called "stratified_sampling" that takes population_strata as Dictionary[String, List[Float]], stratum_sizes as Dictionary[String, Integer] returns Dictionary[String, List[Float]]:
+    Note: Sample from stratified populations with proportional allocation
+    Note: Reduces variance by ensuring representation from all strata
+    Note: Computational complexity: O(total_sample_size)
+    
+    Let results be Dictionary[String, List[Float]]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_generator be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_generator)
+    Let stratum_names be MapOps.keys(population_strata)
+    
+    If Length(stratum_names) is equal to 0:
+        Throw Errors.InvalidArgument with "Must provide at least one stratum"
+    
+    For Each stratum_name in stratum_names:
+        Let stratum_population be population_strata[stratum_name]
+        Let requested_size be stratum_sizes[stratum_name]
+        Let population_size be Length(stratum_population)
+        
+        If requested_size is less than or equal to 0:
+            Throw Errors.InvalidArgument with "Stratum sample size must be positive"
+        If requested_size is greater than population_size:
+            Throw Errors.InvalidArgument with "Cannot sample more than population size for stratum"
+        
+        Let stratum_sample be List[Float]
+        
+        Note: Simple random sampling within stratum
+        If requested_size is equal to population_size:
+            Note: Take entire stratum
+            Set stratum_sample to ListOps.copy(stratum_population)
+        Otherwise:
+            Note: Sample without replacement from stratum
+            Let available_indices be List[Integer]
+            For i from 0 to population_size minus 1:
+                Append i to available_indices
+            
+            For sample_idx from 0 to requested_size minus 1:
+                Let random_index_pos be SecureRandom.generate_random_integer(random_generator, 0, Length(available_indices) minus 1)
+                Let selected_index be available_indices[random_index_pos]
+                
+                Append stratum_population[selected_index] to stratum_sample
+                
+                Note: Remove selected index to prevent replacement
+                Let updated_indices be List[Integer]
+                For i from 0 to Length(available_indices) minus 1:
+                    If i does not equal random_index_pos:
+                        Append available_indices[i] to updated_indices
+                Set available_indices to updated_indices
+        
+        Set results[stratum_name] to stratum_sample
+    
+    Return results
+
+Process called "systematic_sampling" that takes population_size as Integer, sample_size as Integer, random_start as Integer returns List[Integer]:
+    Note: Generate systematic sample with fixed interval selection
+    Note: Uses regular spacing with random starting point
+    Note: Computational complexity: O(sample_size)
+    
+    Let selected_indices be List[Integer]
+    
+    If population_size is less than or equal to 0 or sample_size is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Population size and sample size must be positive"
+    If sample_size is greater than population_size:
+        Throw Errors.InvalidArgument with "Sample size cannot exceed population size"
+    
+    Let sampling_interval be Float(population_size) / Float(sample_size)
+    Let start_point be random_start
+    
+    Note: Ensure random start is within valid range
+    If start_point is less than 0:
+        Set start_point to 0
+    If start_point is greater than or equal to Integer(sampling_interval):
+        Set start_point to Integer(sampling_interval) minus 1
+    
+    Note: Generate systematic sample
+    For sample_idx from 0 to sample_size minus 1:
+        Let selected_index be start_point plus Integer(Float(sample_idx) multiplied by sampling_interval)
+        
+        Note: Ensure index is within population bounds
+        If selected_index is greater than or equal to population_size:
+            Set selected_index to population_size minus 1
+        
+        Append selected_index to selected_indices
+    
+    Return selected_indices
+
+Process called "cluster_sampling" that takes cluster_definitions as Dictionary[String, List[Integer]], cluster_selection_probability as Dictionary[String, Float] returns List[Integer]:
+    Note: Sample entire clusters rather than individual units
+    Note: Useful when natural groupings exist in population
+    Note: Computational complexity: O(selected_clusters multiplied by average_cluster_size)
+    
+    Let selected_units be List[Integer]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let cluster_names be MapOps.keys(cluster_definitions)
+    
+    If Length(cluster_names) is equal to 0:
+        Throw Errors.InvalidArgument with "Must provide at least one cluster"
+    
+    Note: Validate probabilities sum to reasonable value
+    Let total_probability be 0.0
+    For Each cluster_name in cluster_names:
+        Let prob be cluster_selection_probability[cluster_name]
+        If prob is less than 0.0 or prob is greater than 1.0:
+            Throw Errors.InvalidArgument with "Cluster selection probabilities must be between 0 and 1"
+        Set total_probability to total_probability plus prob
+    
+    If total_probability is less than or equal to 0.0:
+        Throw Errors.InvalidArgument with "Total cluster selection probability must be positive"
+    
+    Note: Select clusters based on their probabilities
+    For Each cluster_name in cluster_names:
+        Let selection_prob be cluster_selection_probability[cluster_name]
+        Let random_draw be SecureRandom.generate_uniform_01(random_generator)
+        
+        If random_draw is less than or equal to selection_prob:
+            Note: Select this cluster minus add all its units
+            Let cluster_units be cluster_definitions[cluster_name]
+            
+            For Each unit_id in cluster_units:
+                Append unit_id to selected_units
+    
+    Note: Remove any duplicate units that might exist across clusters
+    Let unique_units be List[Integer]
+    For Each unit in selected_units:
+        Let is_duplicate be false
+        For Each existing_unit in unique_units:
+            If unit is equal to existing_unit:
+                Set is_duplicate to true
+                Break
+        If not is_duplicate:
+            Append unit to unique_units
+    
+    Return unique_units
+
+Note: =====================================================================
+Note: BOOTSTRAP METHODS
+Note: =====================================================================
+
+Process called "nonparametric_bootstrap" that takes original_data as List[Float], config as BootstrapConfig returns Dictionary[String, List[Float]]:
+    Note: Generate bootstrap resamples with replacement from original data
+    Note: Estimates sampling distribution of statistics without assumptions
+    Note: Computational complexity: O(B multiplied by n) for B bootstrap replicates
+    
+    Let results be Dictionary[String, List[Float]]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let n be Length(original_data)
+    
+    If n is equal to 0:
+        Throw Errors.InvalidArgument with "Original data cannot be empty"
+    If config.bootstrap_replicates is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Bootstrap replicates must be positive"
+    
+    Let bootstrap_means be List[Float]
+    Let bootstrap_medians be List[Float]
+    Let bootstrap_std_devs be List[Float]
+    Let all_bootstrap_samples be List[List[Float]]
+    
+    Note: Generate bootstrap replicates
+    For replicate_idx from 0 to config.bootstrap_replicates minus 1:
+        Let bootstrap_sample be List[Float]
+        
+        Note: Resample with replacement
+        If config.replacement_sampling:
+            For sample_idx from 0 to n minus 1:
+                Let random_index be SecureRandom.generate_random_integer(random_generator, 0, n minus 1)
+                Append original_data[random_index] to bootstrap_sample
+        Otherwise:
+            Note: Sampling without replacement (permutation)
+            Let permuted_data be randomly_permute_list(original_data, random_generator)
+            Set bootstrap_sample to permuted_data
+        
+        Append bootstrap_sample to all_bootstrap_samples
+        
+        Note: Compute statistics for this bootstrap sample
+        Let sum be 0.0
+        For Each value in bootstrap_sample:
+            Set sum to sum plus value
+        Let bootstrap_mean be sum / Float(n)
+        Append bootstrap_mean to bootstrap_means
+        
+        Let sorted_sample be Sorting.quicksort(bootstrap_sample, "ascending").sorted_array
+        Let median_value be 0.0
+        If n % 2 is equal to 0:
+            Set median_value to (Parse sorted_sample[n / 2 minus 1] as Float plus Parse sorted_sample[n / 2] as Float) / 2.0
+        Otherwise:
+            Set median_value to Parse sorted_sample[n / 2] as Float
+        Append median_value to bootstrap_medians
+        
+        Let sum_squared_deviations be 0.0
+        For Each value in bootstrap_sample:
+            Let deviation be value minus bootstrap_mean
+            Set sum_squared_deviations to sum_squared_deviations plus (deviation multiplied by deviation)
+        Let bootstrap_std_dev be MathOps.square_root(ToString(sum_squared_deviations / Float(n minus 1)), 15).result_value
+        Append Parse bootstrap_std_dev as Float to bootstrap_std_devs
+    
+    Set results["bootstrap_means"] to bootstrap_means
+    Set results["bootstrap_medians"] to bootstrap_medians
+    Set results["bootstrap_std_devs"] to bootstrap_std_devs
+    
+    Return results
+
+Process called "parametric_bootstrap" that takes fitted_distribution as Dictionary[String, String], distribution_parameters as Dictionary[String, Float], config as BootstrapConfig returns List[List[Float]]:
+    Note: Generate bootstrap samples from fitted parametric distribution
+    Note: Accounts for parameter estimation uncertainty in resampling
+    Note: Computational complexity: O(B multiplied by n) plus parameter estimation
+    
+    Let bootstrap_samples be List[List[Float]]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    
+    If config.bootstrap_replicates is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Bootstrap replicates must be positive"
+    
+    Let distribution_type be fitted_distribution["distribution_type"]
+    Let sample_size_per_bootstrap be 100
+    
+    Note: Generate bootstrap replicates from fitted distribution
+    For replicate_idx from 0 to config.bootstrap_replicates minus 1:
+        Let bootstrap_replicate be List[Float]
+        
+        Note: Add parameter uncertainty if specified
+        Let current_parameters be MapOps.copy(distribution_parameters)
+        
+        If config.bootstrap_method is equal to "parametric_with_uncertainty":
+            Note: Add small random perturbations to parameters to account for estimation uncertainty
+            For Each param_name in MapOps.keys(current_parameters):
+                Let param_value be current_parameters[param_name]
+                Let uncertainty_factor be 0.05
+                Let perturbation be SecureRandom.generate_gaussian(random_generator, 0.0, uncertainty_factor multiplied by AbsoluteValue(param_value))
+                Set current_parameters[param_name] to param_value plus perturbation
+        
+        Note: Generate samples from parametric distribution
+        For sample_idx from 0 to sample_size_per_bootstrap minus 1:
+            Let sample_value be 0.0
+            
+            If distribution_type is equal to "normal":
+                Let mean be current_parameters["mean"]
+                Let std_dev be current_parameters["std_dev"]
+                Set sample_value to SecureRandom.generate_gaussian(random_generator, mean, std_dev)
+            Otherwise if distribution_type is equal to "exponential":
+                Let rate be current_parameters["rate"]
+                Let uniform_sample be SecureRandom.generate_uniform_01(random_generator)
+                Set sample_value to -MathOps.natural_logarithm(ToString(1.0 minus uniform_sample), 15).result_value / rate
+            Otherwise if distribution_type is equal to "uniform":
+                Let min_val be current_parameters["min_value"]
+                Let max_val be current_parameters["max_value"]
+                Set sample_value to SecureRandom.generate_uniform_range(random_generator, min_val, max_val)
+            Otherwise if distribution_type is equal to "gamma":
+                Let shape be current_parameters["shape"]
+                Let rate be current_parameters["rate"]
+                Set sample_value to generate_gamma_sample(random_generator, shape, rate)
+            Otherwise:
+                Throw Errors.InvalidArgument with "Unsupported distribution type for parametric bootstrap"
+            
+            Append sample_value to bootstrap_replicate
+        
+        Append bootstrap_replicate to bootstrap_samples
+    
+    Return bootstrap_samples
+
+Process called "block_bootstrap" that takes time_series_data as List[Float], block_length as Integer, bootstrap_replicates as Integer returns List[List[Float]]:
+    Note: Bootstrap for time series data preserving temporal dependencies
+    Note: Uses overlapping or non-overlapping blocks to maintain correlation
+    Note: Computational complexity: O(B multiplied by n) with block structure considerations
+    
+    Let bootstrap_samples be List[List[Float]]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let n be Length(time_series_data)
+    
+    If n is equal to 0:
+        Throw Errors.InvalidArgument with "Time series data cannot be empty"
+    If block_length is less than or equal to 0 or block_length is greater than n:
+        Throw Errors.InvalidArgument with "Block length must be positive and not exceed data length"
+    If bootstrap_replicates is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Bootstrap replicates must be positive"
+    
+    Note: Create overlapping blocks
+    Let available_blocks be List[List[Float]]
+    For start_idx from 0 to n minus block_length:
+        Let block be List[Float]
+        For block_idx from 0 to block_length minus 1:
+            Append time_series_data[start_idx plus block_idx] to block
+        Append block to available_blocks
+    
+    Let num_available_blocks be Length(available_blocks)
+    Let blocks_needed_per_bootstrap be Integer((Float(n) / Float(block_length)) plus 0.5)
+    
+    Note: Generate bootstrap replicates
+    For replicate_idx from 0 to bootstrap_replicates minus 1:
+        Let bootstrap_series be List[Float]
+        Let current_length be 0
+        
+        While current_length is less than n:
+            Note: Randomly select a block
+            Let random_block_idx be SecureRandom.generate_random_integer(random_generator, 0, num_available_blocks minus 1)
+            Let selected_block be available_blocks[random_block_idx]
+            
+            Note: Add block to bootstrap series (truncate if necessary)
+            For Each value in selected_block:
+                If current_length is less than n:
+                    Append value to bootstrap_series
+                    Set current_length to current_length plus 1
+                Otherwise:
+                    Break
+        
+        Append bootstrap_series to bootstrap_samples
+    
+    Return bootstrap_samples
+
+Process called "wild_bootstrap" that takes regression_residuals as List[Float], design_matrix as List[List[Float]], distribution_type as String returns List[List[Float]]:
+    Note: Bootstrap for regression models with heteroskedastic errors
+    Note: Multiplies residuals by random weights rather than resampling
+    Note: Computational complexity: O(B multiplied by n multiplied by p) for p predictors
+    
+    Let bootstrap_samples be List[List[Float]]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let n be Length(regression_residuals)
+    
+    If n is equal to 0:
+        Throw Errors.InvalidArgument with "Regression residuals cannot be empty"
+    If Length(design_matrix) does not equal n:
+        Throw Errors.InvalidArgument with "Design matrix rows must match number of residuals"
+    
+    Let bootstrap_replicates be 1000
+    Let num_predictors be If n is greater than 0 Then Length(design_matrix[0]) Otherwise 0
+    
+    Note: Generate bootstrap replicates
+    For replicate_idx from 0 to bootstrap_replicates minus 1:
+        Let bootstrap_residuals be List[Float]
+        
+        Note: Generate wild bootstrap weights
+        For residual_idx from 0 to n minus 1:
+            Let original_residual be regression_residuals[residual_idx]
+            Let wild_weight be 0.0
+            
+            If distribution_type is equal to "rademacher":
+                Note: Rademacher distribution: +1 or -1 with equal probability
+                Let random_draw be SecureRandom.generate_uniform_01(random_generator)
+                Set wild_weight to If random_draw is less than or equal to 0.5 Then -1.0 Otherwise 1.0
+            Otherwise if distribution_type is equal to "mammen":
+                Note: Mammen distribution: specific two-point distribution
+                Let random_draw be SecureRandom.generate_uniform_01(random_generator)
+                Let golden_ratio be (1.0 plus MathOps.square_root("5", 15).result_value) / 2.0
+                If random_draw is less than or equal to (Parse golden_ratio as Float minus 1.0) / (2.0 multiplied by Parse golden_ratio as Float):
+                    Set wild_weight to 1.0 minus Parse golden_ratio as Float
+                Otherwise:
+                    Set wild_weight to Parse golden_ratio as Float
+            Otherwise if distribution_type is equal to "normal":
+                Note: Standard normal weights
+                Set wild_weight to SecureRandom.generate_gaussian(random_generator, 0.0, 1.0)
+            Otherwise if distribution_type is equal to "uniform":
+                Note: Uniform on [-sqrt(3), sqrt(3)] to have unit variance
+                Let sqrt3 be MathOps.square_root("3", 15).result_value
+                Set wild_weight to SecureRandom.generate_uniform_range(random_generator, -Parse sqrt3 as Float, Parse sqrt3 as Float)
+            Otherwise:
+                Throw Errors.InvalidArgument with "Unsupported wild bootstrap distribution type"
+            
+            Let wild_residual be original_residual multiplied by wild_weight
+            Append wild_residual to bootstrap_residuals
+        
+        Note: For regression context, we would typically reconstruct response variable
+        Note: y_bootstrap is equal to X multiplied by beta_hat plus wild_residuals
+        Note: Here we just return the wild bootstrap residuals and design matrix info
+        Let bootstrap_sample be List[Float]
+        
+        Note: Include wild residuals
+        For Each residual in bootstrap_residuals:
+            Append residual to bootstrap_sample
+        
+        Note: Include design matrix flattened (for reference)
+        For row_idx from 0 to n minus 1:
+            For col_idx from 0 to num_predictors minus 1:
+                Append design_matrix[row_idx][col_idx] to bootstrap_sample
+        
+        Append bootstrap_sample to bootstrap_samples
+    
+    Return bootstrap_samples
+
+Note: =====================================================================
+Note: ADVANCED SAMPLING ALGORITHMS
+Note: =====================================================================
+
+Process called "gibbs_sampling" that takes conditional_distributions as Dictionary[String, Dictionary[String, String]], initial_values as Dictionary[String, Float], chain_length as Integer returns Dictionary[String, List[Float]]:
+    Note: Sample from multivariate distribution using Gibbs sampling
+    Note: Alternately samples from conditional distributions of each variable
+    Note: Computational complexity: O(iterations multiplied by dimension_count)
+    
+    Let results be Dictionary[String, List[Float]]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let variable_names be MapOps.keys(initial_values)
+    Let current_values be MapOps.copy(initial_values)
+    
+    If chain_length is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Chain length must be positive"
+    
+    Note: Initialize result lists for each variable
+    For Each var_name in variable_names:
+        Set results[var_name] to List[Float]
+    
+    Note: Gibbs sampling chain
+    For iteration from 0 to chain_length minus 1:
+        Note: Sample each variable from its conditional distribution
+        For Each var_name in variable_names:
+            Let conditional_dist be conditional_distributions[var_name]
+            Let dist_type be conditional_dist["distribution_type"]
+            
+            Note: Update conditional parameters based on current values of other variables
+            Let conditional_params be update_conditional_parameters(conditional_dist, current_values, var_name)
+            
+            Let new_sample be 0.0
+            If dist_type is equal to "normal":
+                Let cond_mean be Parse conditional_params["mean"] as Float
+                Let cond_std be Parse conditional_params["std_dev"] as Float
+                Set new_sample to SecureRandom.generate_gaussian(random_generator, cond_mean, cond_std)
+            Otherwise if dist_type is equal to "gamma":
+                Let shape be Parse conditional_params["shape"] as Float
+                Let rate be Parse conditional_params["rate"] as Float
+                Set new_sample to generate_gamma_sample(random_generator, shape, rate)
+            Otherwise if dist_type is equal to "beta":
+                Let alpha be Parse conditional_params["alpha"] as Float
+                Let beta_param be Parse conditional_params["beta"] as Float
+                Set new_sample to generate_beta_sample(random_generator, alpha, beta_param)
+            Otherwise if dist_type is equal to "exponential":
+                Let rate be Parse conditional_params["rate"] as Float
+                Let uniform_sample be SecureRandom.generate_uniform_01(random_generator)
+                Set new_sample to -MathOps.natural_logarithm(ToString(1.0 minus uniform_sample), 15).result_value / rate
+            
+            Note: Update current state
+            Set current_values[var_name] to new_sample
+        
+        Note: Store current state for all variables
+        For Each var_name in variable_names:
+            Append current_values[var_name] to results[var_name]
+    
+    Return results
+
+Process called "metropolis_hastings_sampling" that takes target_log_density as Dictionary[String, String], proposal_covariance as List[List[Float]], chain_length as Integer returns SamplingResult:
+    Note: General-purpose MCMC using Metropolis-Hastings algorithm
+    Note: Uses acceptance-rejection with detailed balance condition
+    Note: Computational complexity: O(iterations multiplied by density_evaluation_cost)
+    
+    Let result be SamplingResult
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Set result.samples to List[List[Float]]
+    Set result.sample_weights to List[Float]
+    
+    Let dimension_count be Length(proposal_covariance)
+    If dimension_count is equal to 0 or chain_length is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Invalid covariance matrix or chain length"
+    
+    Note: Initialize chain with random starting point
+    Let current_state be List[Float]
+    For dim_idx from 0 to dimension_count minus 1:
+        Let random_start be SecureRandom.generate_gaussian(random_generator, 0.0, 1.0)
+        Append random_start to current_state
+    
+    Let current_log_density be NumericalCore.evaluate_log_density(target_log_density, current_state)
+    Let accepted_samples be 0
+    
+    Note: MCMC chain
+    For iteration from 0 to chain_length minus 1:
+        Note: Generate proposal using multivariate normal
+        Let proposal_state be NumericalCore.multivariate_normal_sample(current_state, proposal_covariance)
+        Let proposal_log_density be NumericalCore.evaluate_log_density(target_log_density, proposal_state)
+        
+        Note: Metropolis-Hastings acceptance probability
+        Let log_acceptance_ratio be proposal_log_density minus current_log_density
+        Let acceptance_probability be Minimum(1.0, MathOps.exponential(ToString(log_acceptance_ratio), 15).result_value)
+        
+        Let uniform_draw be SecureRandom.generate_uniform_01(random_generator)
+        
+        If uniform_draw is less than or equal to Parse acceptance_probability as Float:
+            Note: Accept proposal
+            Set current_state to proposal_state
+            Set current_log_density to proposal_log_density
+            Set accepted_samples to accepted_samples plus 1
+        
+        Note: Store current state (whether accepted or rejected)
+        Append ListOps.copy(current_state) to result.samples
+        Append 1.0 to result.sample_weights
+    
+    Set result.effective_sample_size to chain_length
+    Set result.acceptance_rate to Float(accepted_samples) / Float(chain_length)
+    Set result.method_used to "metropolis_hastings"
+    Set result.computation_time to 0.0
+    
+    Note: Compute convergence diagnostics
+    Set result.convergence_diagnostics to Dictionary[String, Float]
+    Set result.convergence_diagnostics["acceptance_rate"] to result.acceptance_rate
+    Set result.convergence_diagnostics["chain_length"] to Float(chain_length)
+    
+    Return result
+
+Process called "hamiltonian_monte_carlo" that takes target_log_density as Dictionary[String, String], gradient_function as Dictionary[String, String], dimension_count as Integer, step_size as Float, trajectory_length as Integer returns SamplingResult:
+    Note: Advanced MCMC using Hamiltonian dynamics for efficient exploration
+    Note: Uses gradient information to propose distant moves with high acceptance
+    Note: Computational complexity: O(iterations multiplied by trajectory_length multiplied by gradient_cost)
+    
+    Let result be SamplingResult
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Set result.samples to List[List[Float]]
+    Set result.sample_weights to List[Float]
+    
+    Let chain_length be 1000
+    Let dimension be dimension_count
+    
+    If step_size is less than or equal to 0.0 or trajectory_length is less than or equal to 0:
+        Throw Errors.InvalidArgument with "Step size must be positive and trajectory length must be positive"
+    
+    Note: Initialize position and momentum
+    Let current_position be List[Float]
+    For dim_idx from 0 to dimension minus 1:
+        Let initial_pos be SecureRandom.generate_gaussian(random_generator, 0.0, 1.0)
+        Append initial_pos to current_position
+    
+    Let accepted_samples be 0
+    
+    Note: HMC chain
+    For iteration from 0 to chain_length minus 1:
+        Note: Generate initial momentum from standard normal
+        Let initial_momentum be List[Float]
+        For dim_idx from 0 to dimension minus 1:
+            Let momentum_component be SecureRandom.generate_gaussian(random_generator, 0.0, 1.0)
+            Append momentum_component to initial_momentum
+        
+        Note: Store initial state for acceptance decision
+        Let initial_position be ListOps.copy(current_position)
+        Let initial_log_density be NumericalCore.evaluate_log_density(target_log_density, initial_position)
+        Let initial_kinetic_energy be compute_kinetic_energy(initial_momentum)
+        Let initial_hamiltonian be -initial_log_density plus initial_kinetic_energy
+        
+        Note: Leapfrog integration
+        Let working_position be ListOps.copy(current_position)
+        Let working_momentum be ListOps.copy(initial_momentum)
+        
+        Note: Half step for momentum
+        Let gradient be NumericalCore.evaluate_gradient(gradient_function, working_position)
+        For dim_idx from 0 to dimension minus 1:
+            Set working_momentum[dim_idx] to working_momentum[dim_idx] plus (step_size / 2.0) multiplied by gradient[dim_idx]
+        
+        Note: Full leapfrog steps
+        For step_idx from 0 to trajectory_length minus 1:
+            Note: Full step for position
+            For dim_idx from 0 to dimension minus 1:
+                Set working_position[dim_idx] to working_position[dim_idx] plus step_size multiplied by working_momentum[dim_idx]
+            
+            Note: Full step for momentum (except last step)
+            If step_idx is less than trajectory_length minus 1:
+                Set gradient to NumericalCore.evaluate_gradient(gradient_function, working_position)
+                For dim_idx from 0 to dimension minus 1:
+                    Set working_momentum[dim_idx] to working_momentum[dim_idx] plus step_size multiplied by gradient[dim_idx]
+        
+        Note: Final half step for momentum
+        Set gradient to NumericalCore.evaluate_gradient(gradient_function, working_position)
+        For dim_idx from 0 to dimension minus 1:
+            Set working_momentum[dim_idx] to working_momentum[dim_idx] plus (step_size / 2.0) multiplied by gradient[dim_idx]
+        
+        Note: Negate momentum for detailed balance
+        For dim_idx from 0 to dimension minus 1:
+            Set working_momentum[dim_idx] to -working_momentum[dim_idx]
+        
+        Note: Compute proposal Hamiltonian
+        Let proposal_log_density be NumericalCore.evaluate_log_density(target_log_density, working_position)
+        Let proposal_kinetic_energy be compute_kinetic_energy(working_momentum)
+        Let proposal_hamiltonian be -proposal_log_density plus proposal_kinetic_energy
+        
+        Note: Metropolis acceptance
+        Let log_acceptance_ratio be initial_hamiltonian minus proposal_hamiltonian
+        Let uniform_draw be SecureRandom.generate_uniform_01(random_generator)
+        
+        If MathOps.natural_logarithm(ToString(uniform_draw), 15).result_value is less than or equal to log_acceptance_ratio:
+            Set current_position to working_position
+            Set accepted_samples to accepted_samples plus 1
+        
+        Note: Store current state
+        Append ListOps.copy(current_position) to result.samples
+        Append 1.0 to result.sample_weights
+    
+    Set result.effective_sample_size to chain_length
+    Set result.acceptance_rate to Float(accepted_samples) / Float(chain_length)
+    Set result.method_used to "hamiltonian_monte_carlo"
+    Set result.computation_time to 0.0
+    Set result.convergence_diagnostics to Dictionary[String, Float]
+    Set result.convergence_diagnostics["acceptance_rate"] to result.acceptance_rate
+    Set result.convergence_diagnostics["step_size"] to step_size
+    Set result.convergence_diagnostics["trajectory_length"] to Float(trajectory_length)
+    
+    Return result
+
+Process called "slice_sampling" that takes target_density as Dictionary[String, String], initial_point as List[Float], step_size as Float returns List[List[Float]]:
+    Note: Sample using slice sampling for efficient univariate and multivariate sampling
+    Note: Adaptively finds slice bounds without tuning parameters
+    Note: Computational complexity: O(iterations multiplied by doubling_steps)
+    
+    Let samples be List[List[Float]]
+    Let system_entropy be SecureRandom.gather_system_entropy()
+    Let entropy_seed be system_entropy[0] % 2147483647
+    Let base_gen be SecureRandom.initialize_chacha20_generator(entropy_seed)
+    Let random_generator be SecureRandom.auto_seed_from_system(base_gen)
+    Let current_point be ListOps.copy(initial_point)
+    Let chain_length be 1000
+    
+    If Length(initial_point) is equal to 0 or step_size is less than or equal to 0.0:
+        Throw Errors.InvalidArgument with "Invalid initial point or step size"
+    
+    For iteration from 0 to chain_length minus 1:
+        Note: Slice sampling for each dimension
+        For dim_idx from 0 to Length(current_point) minus 1:
+            Note: Evaluate density at current point
+            Let current_density be NumericalCore.evaluate_density(target_density, Dictionary[String, String], current_point)
+            
+            Note: Draw vertical slice level
+            Let slice_uniform be SecureRandom.generate_uniform_01(random_generator)
+            Let slice_level be slice_uniform multiplied by current_density
+            
+            Note: Find slice bounds using doubling procedure
+            Let left_bound be current_point[dim_idx] minus step_size
+            Let right_bound be current_point[dim_idx] plus step_size
+            
+            Note: Expand left bound
+            Let test_point_left be ListOps.copy(current_point)
+            Set test_point_left[dim_idx] to left_bound
+            Let left_density be NumericalCore.evaluate_density(target_density, Dictionary[String, String], test_point_left)
+            
+            While left_density is greater than slice_level:
+                Set left_bound to left_bound minus step_size
+                Set test_point_left[dim_idx] to left_bound
+                Set left_density to NumericalCore.evaluate_density(target_density, Dictionary[String, String], test_point_left)
+            
+            Note: Expand right bound
+            Let test_point_right be ListOps.copy(current_point)
+            Set test_point_right[dim_idx] to right_bound
+            Let right_density be NumericalCore.evaluate_density(target_density, Dictionary[String, String], test_point_right)
+            
+            While right_density is greater than slice_level:
+                Set right_bound to right_bound plus step_size
+                Set test_point_right[dim_idx] to right_bound
+                Set right_density to NumericalCore.evaluate_density(target_density, Dictionary[String, String], test_point_right)
+            
+            Note: Sample uniformly from slice
+            Let attempts be 0
+            Let max_attempts be 100
+            
+            While attempts is less than max_attempts:
+                Let proposal_value be SecureRandom.generate_uniform_range(random_generator, left_bound, right_bound)
+                Let proposal_point be ListOps.copy(current_point)
+                Set proposal_point[dim_idx] to proposal_value
+                
+                Let proposal_density be NumericalCore.evaluate_density(target_density, Dictionary[String, String], proposal_point)
+                
+                If proposal_density is greater than slice_level:
+                    Set current_point[dim_idx] to proposal_value
+                    Break
+                
+                Set attempts to attempts plus 1
+        
+        Append ListOps.copy(current_point) to samples
+    
+    Return samples
+
+Note: =====================================================================
+Note: ADDITIONAL HELPER FUNCTIONS FOR ADVANCED SAMPLING
+Note: =====================================================================
+
+Process called "adapt_proposal_distribution" that takes current_proposal as Dictionary[String, String], batch_samples as List[List[Float]], batch_weights as List[Float] returns Dictionary[String, String]:
+    Note: Adapt proposal distribution based on importance sampling results
+    Let adapted_proposal be MapOps.copy(current_proposal)
+    
+    Note: Simple adaptation: adjust mean towards weighted sample mean
+    If Length(batch_samples) is greater than 0 and Length(batch_samples[0]) is greater than 0:
+        Let weighted_mean be 0.0
+        Let weight_sum be 0.0
+        
+        For sample_idx from 0 to Length(batch_samples) minus 1:
+            Let sample_value be batch_samples[sample_idx][0]
+            Let weight be batch_weights[sample_idx]
+            Set weighted_mean to weighted_mean plus (sample_value multiplied by weight)
+            Set weight_sum to weight_sum plus weight
+        
+        If weight_sum is greater than 0.0:
+            Set weighted_mean to weighted_mean / weight_sum
+            Set adapted_proposal["mean"] to ToString(weighted_mean)
+    
+    Return adapted_proposal
+
+Process called "compute_piecewise_envelope_value" that takes x as Float, envelope_points as List[String], envelope_log_densities as List[Float], envelope_derivatives as List[Float], segment_idx as Integer returns Float:
+    Note: Compute piecewise linear envelope value for adaptive rejection sampling
+    Let left_point be Parse envelope_points[segment_idx] as Float
+    Let right_point be Parse envelope_points[segment_idx plus 1] as Float
+    Let left_log_density be envelope_log_densities[segment_idx]
+    Let left_derivative be envelope_derivatives[segment_idx]
+    
+    Note: Linear interpolation in log space
+    Let log_envelope_value be left_log_density plus left_derivative multiplied by (x minus left_point)
+    
+    Return MathOps.exponential(ToString(log_envelope_value), 15).result_value
+
+Process called "compute_kinetic_energy" that takes momentum as List[Float] returns Float:
+    Note: Compute kinetic energy for Hamiltonian Monte Carlo
+    Let kinetic_energy be 0.0
+    
+    For Each momentum_component in momentum:
+        Set kinetic_energy to kinetic_energy plus (momentum_component multiplied by momentum_component)
+    
+    Return kinetic_energy / 2.0
+
+Process called "initialize_grid_iterator" that takes grid_size as Integer, dimensions as Integer returns List[Integer]:
+    Note: Initialize grid iterator for uniform grid sampling
+    Let indices be List[Integer]
+    For dim_idx from 0 to dimensions minus 1:
+        Append 0 to indices
+    Return indices
+
+Process called "has_next_grid_point" that takes indices as List[Integer] returns Boolean:
+    Note: Check if grid iterator has more points based on current indices state
+    If Length(indices) is equal to 0:
+        Return false
+    
+    Note: Check if we've exceeded reasonable iteration bounds
+    Let max_iterations be 1000000
+    Let current_sum be 0
+    For Each index_val in indices:
+        Set current_sum to current_sum plus index_val
+    
+    Return current_sum is less than max_iterations
+
+Process called "get_next_grid_point" that takes indices as List[Integer] returns List[Integer]:
+    Note: Get next grid point and advance iterator using proper grid increment
+    Let current_indices be ListOps.copy(indices)
+    
+    Note: Properly increment multi-dimensional grid indices with carry
+    If Length(indices) is greater than 0:
+        Let carry be 1
+        Let dim_idx be 0
+        
+        While carry is greater than 0 and dim_idx is less than Length(indices):
+            Set indices[dim_idx] to indices[dim_idx] plus carry
+            If indices[dim_idx] is greater than or equal to 100:  Note: Grid bound per dimension
+                Set indices[dim_idx] to 0
+                Set carry to 1
+            Otherwise:
+                Set carry to 0
+            Set dim_idx to dim_idx plus 1
+    
+    Return current_indices
+
+Note: =====================================================================
+Note: MCMC DIAGNOSTIC OPERATIONS
+Note: =====================================================================
+
+Process called "gelman_rubin_diagnostic" that takes multiple_chains as List[List[List[Float]]] returns Dictionary[String, Float]:
+    Note: Assess MCMC convergence using potential scale reduction factor (R̂)
+    Note: Values is less than 1.1 indicate convergence
+    
+    Let diagnostics be Dictionary[String, Float]
+    If Length(multiple_chains) is less than 2:
+        Set diagnostics["R_hat"] to 1.0
+        Set diagnostics["within_chain_variance"] to 0.0
+        Set diagnostics["between_chain_variance"] to 0.0
+        Return diagnostics
+    
+    Let num_chains be Length(multiple_chains)
+    Let chain_length be Length(multiple_chains[0])
+    
+    Note: Calculate chain means
+    Let chain_means be List[Float]
+    For chain_idx from 0 to num_chains minus 1:
+        Let chain_sum be 0.0
+        For sample_idx from 0 to chain_length minus 1:
+            Set chain_sum to chain_sum plus multiple_chains[chain_idx][sample_idx][0]
+        Let chain_mean be chain_sum / Float(chain_length)
+        Append chain_mean to chain_means
+    
+    Note: Calculate overall mean
+    Let overall_sum be 0.0
+    For Each chain_mean in chain_means:
+        Set overall_sum to overall_sum plus chain_mean
+    Let overall_mean be overall_sum / Float(num_chains)
+    
+    Note: Calculate within-chain variance
+    Let within_chain_variance be 0.0
+    For chain_idx from 0 to num_chains minus 1:
+        Let chain_var be 0.0
+        For sample_idx from 0 to chain_length minus 1:
+            Let diff be multiple_chains[chain_idx][sample_idx][0] minus chain_means[chain_idx]
+            Set chain_var to chain_var plus (diff multiplied by diff)
+        Set within_chain_variance to within_chain_variance plus (chain_var / Float(chain_length minus 1))
+    Set within_chain_variance to within_chain_variance / Float(num_chains)
+    
+    Note: Calculate between-chain variance
+    Let between_chain_variance be 0.0
+    For Each chain_mean in chain_means:
+        Let diff be chain_mean minus overall_mean
+        Set between_chain_variance to between_chain_variance plus (diff multiplied by diff)
+    Set between_chain_variance to between_chain_variance multiplied by Float(chain_length) / Float(num_chains minus 1)
+    
+    Note: Calculate R-hat statistic
+    Let marginal_posterior_variance be ((Float(chain_length minus 1) multiplied by within_chain_variance) plus between_chain_variance) / Float(chain_length)
+    Let r_hat be MathOps.sqrt(marginal_posterior_variance / within_chain_variance)
+    
+    Set diagnostics["R_hat"] to r_hat
+    Set diagnostics["within_chain_variance"] to within_chain_variance
+    Set diagnostics["between_chain_variance"] to between_chain_variance
+    Set diagnostics["effective_sample_size"] to Float(num_chains multiplied by chain_length) / r_hat
+    
+    Return diagnostics
+
+Process called "autocorrelation_analysis" that takes samples as List[Float], max_lag as Integer returns List[Float]:
+    Note: Analyze autocorrelation structure of MCMC chain
+    Note: Identifies mixing problems and effective sample size
+    
+    Let n be Length(samples)
+    If n is less than max_lag:
+        Let autocorrelations be List[Float]
+        For lag from 0 to max_lag minus 1:
+            Append 0.0 to autocorrelations
+        Return autocorrelations
+    
+    Note: Calculate sample mean
+    Let sample_sum be 0.0
+    For Each sample in samples:
+        Set sample_sum to sample_sum plus sample
+    Let sample_mean be sample_sum / Float(n)
+    
+    Note: Calculate sample variance (lag 0 autocorrelation)
+    Let variance be 0.0
+    For Each sample in samples:
+        Let diff be sample minus sample_mean
+        Set variance to variance plus (diff multiplied by diff)
+    Set variance to variance / Float(n minus 1)
+    
+    Let autocorrelations be List[Float]
+    
+    For lag from 0 to max_lag minus 1:
+        If lag is equal to 0:
+            Append 1.0 to autocorrelations
+        Otherwise:
+            Let covariance be 0.0
+            For i from 0 to n minus lag minus 1:
+                Let diff1 be samples[i] minus sample_mean
+                Let diff2 be samples[i plus lag] minus sample_mean
+                Set covariance to covariance plus (diff1 multiplied by diff2)
+            Set covariance to covariance / Float(n minus lag minus 1)
+            Let correlation be covariance / variance
+            Append correlation to autocorrelations
+    
+    Return autocorrelations
+
+Process called "effective_sample_size_calculation" that takes samples as List[Float] returns Integer:
+    Note: Calculate effective sample size accounting for autocorrelation
+    Note: ESS is equal to N / (1 plus 2 multiplied by sum of positive autocorrelations)
+    
+    Let n be Length(samples)
+    If n is less than 4:
+        Return n
+    
+    Let max_lag be MathOps.min(n / 4, 200)
+    Let autocorrs be autocorrelation_analysis(samples, max_lag)
+    
+    Let sum_autocorrs be 0.0
+    For lag from 1 to max_lag minus 1:
+        If autocorrs[lag] is greater than 0.0:
+            Set sum_autocorrs to sum_autocorrs plus autocorrs[lag]
+        Otherwise:
+            Break
+    
+    Let tau be 1.0 plus (2.0 multiplied by sum_autocorrs)
+    Let eff_sample_size be Float(n) / tau
+    
+    Return Integer(MathOps.max(1.0, eff_sample_size))
+
+Process called "geweke_diagnostic" that takes samples as List[Float], first_fraction as Float, last_fraction as Float returns Float:
+    Note: Test equality of means in first and last portions of chain
+    Note: Z-score test for convergence to stationary distribution
+    
+    Let n be Length(samples)
+    Let first_n be Integer(Float(n) multiplied by first_fraction)
+    Let last_n be Integer(Float(n) multiplied by last_fraction)
+    
+    If first_n is less than 2 or last_n is less than 2:
+        Return 0.0
+    
+    Note: Calculate mean and variance of first portion
+    Let first_sum be 0.0
+    For i from 0 to first_n minus 1:
+        Set first_sum to first_sum plus samples[i]
+    Let first_mean be first_sum / Float(first_n)
+    
+    Let first_var be 0.0
+    For i from 0 to first_n minus 1:
+        Let diff be samples[i] minus first_mean
+        Set first_var to first_var plus (diff multiplied by diff)
+    Set first_var to first_var / Float(first_n minus 1)
+    
+    Note: Calculate mean and variance of last portion
+    Let last_sum be 0.0
+    Let start_idx be n minus last_n
+    For i from start_idx to n minus 1:
+        Set last_sum to last_sum plus samples[i]
+    Let last_mean be last_sum / Float(last_n)
+    
+    Let last_var be 0.0
+    For i from start_idx to n minus 1:
+        Let diff be samples[i] minus last_mean
+        Set last_var to last_var plus (diff multiplied by diff)
+    Set last_var to last_var / Float(last_n minus 1)
+    
+    Note: Calculate Geweke Z-score
+    Let se_diff be MathOps.sqrt((first_var / Float(first_n)) plus (last_var / Float(last_n)))
+    If se_diff is equal to 0.0:
+        Return 0.0
+    
+    Let z_score be (first_mean minus last_mean) / se_diff
+    Return z_score
+
+Process called "heidelberg_welch_diagnostic" that takes samples as List[Float], alpha as Float, epsilon as Float returns Dictionary[String, Boolean]:
+    Note: Test stationarity and halfwidth of confidence interval
+    Note: Comprehensive convergence diagnostic
+    
+    Let diagnostics be Dictionary[String, Boolean]
+    Let n be Length(samples)
+    
+    If n is less than 10:
+        Set diagnostics["stationarity"] to false
+        Set diagnostics["halfwidth"] to false
+        Return diagnostics
+    
+    Note: Stationarity test using spectral density at frequency zero
+    Let mean_estimate be 0.0
+    For Each sample in samples:
+        Set mean_estimate to mean_estimate plus sample
+    Set mean_estimate to mean_estimate / Float(n)
+    
+    Note: Simplified stationarity test minus check if mean is stable over windows
+    Let window_size be Integer(Float(n) / 4.0)
+    If window_size is less than 5:
+        Set window_size to 5
+    
+    Let num_windows be n / window_size
+    Let window_means be List[Float]
+    
+    For window_idx from 0 to num_windows minus 1:
+        Let window_sum be 0.0
+        Let start_idx be window_idx multiplied by window_size
+        Let end_idx be MathOps.min(start_idx plus window_size, n)
+        
+        For i from start_idx to end_idx minus 1:
+            Set window_sum to window_sum plus samples[i]
+        Let window_mean be window_sum / Float(end_idx minus start_idx)
+        Append window_mean to window_means
+    
+    Note: Check variance of window means
+    Let window_mean_var be 0.0
+    Let overall_window_mean be 0.0
+    For Each window_mean in window_means:
+        Set overall_window_mean to overall_window_mean plus window_mean
+    Set overall_window_mean to overall_window_mean / Float(Length(window_means))
+    
+    For Each window_mean in window_means:
+        Let diff be window_mean minus overall_window_mean
+        Set window_mean_var to window_mean_var plus (diff multiplied by diff)
+    Set window_mean_var to window_mean_var / Float(Length(window_means) minus 1)
+    
+    Let stationarity_passed be window_mean_var is less than (epsilon multiplied by epsilon)
+    Set diagnostics["stationarity"] to stationarity_passed
+    
+    Note: Halfwidth test for precision of mean estimate
+    Let sample_var be 0.0
+    For Each sample in samples:
+        Let diff be sample minus mean_estimate
+        Set sample_var to sample_var plus (diff multiplied by diff)
+    Set sample_var to sample_var / Float(n minus 1)
+    
+    Let standard_error be MathOps.sqrt(sample_var / Float(n))
+    Let critical_value be 1.96  Note: Approximate 95% critical value
+    Let halfwidth be critical_value multiplied by standard_error
+    Let relative_halfwidth be halfwidth / MathOps.abs(mean_estimate)
+    
+    Let halfwidth_passed be relative_halfwidth is less than epsilon
+    Set diagnostics["halfwidth"] to halfwidth_passed
+    
+    Return diagnostics

@@ -1,0 +1,1001 @@
+Note:
+runa/src/runatime/integration/system_interface/platform_syscalls/windows/thread_syscalls.runa
+Windows NT Thread Management Syscalls
+
+This module provides Windows-specific thread management syscall implementations,
+using the NT kernel API for thread operations and Windows-specific features.
+
+Key features and capabilities:
+- Thread creation (CreateThread, _beginthreadex)
+- Thread termination and cleanup
+- Thread synchronization primitives
+- Thread local storage (TLS)
+- Thread priorities and scheduling
+- Thread pools and work items
+- Critical sections and mutexes
+- Slim reader-writer locks
+- Condition variables
+- Thread context manipulation
+- Processor affinity
+- Thread groups and job objects
+- Fiber operations
+- Thread profiling and monitoring
+:End Note
+
+Import module "syscalls/platforms/windows_x64" as WindowsPlatform
+Import module "syscalls/core/platform_interface" as PlatformInterface
+Import module "compiler/frontend/primitives/core/integer_primitive" as Integer
+Import module "compiler/frontend/primitives/memory/references" as Memory
+Import module "compiler/frontend/primitives/types/conversion" as Convert
+
+@Reasoning
+Windows threading differs significantly from POSIX. Windows uses CreateThread
+instead of pthread_create, has different synchronization primitives (Critical
+Sections vs mutexes), and provides advanced features like I/O completion ports,
+thread pools, and fibers. This compatibility layer maps POSIX thread operations
+to Windows equivalents while maintaining semantics.
+@End Reasoning
+
+Note: =====================================================================
+Note: WINDOWS THREAD DATA STRUCTURES  
+Note: =====================================================================
+
+Type called "WindowsThreadAttributes":
+    dwStackSize as Integer                  Note: Stack size in bytes
+    lpSecurityDescriptor as Integer         Note: Security descriptor pointer
+    bInheritHandle as Integer               Note: Handle inheritance flag
+
+Type called "WindowsCriticalSection":
+    DebugInfo as Integer                    Note: Debug information pointer
+    LockCount as Integer                    Note: Lock count
+    RecursionCount as Integer               Note: Recursion count
+    OwningThread as Integer                 Note: Owning thread handle
+    LockSemaphore as Integer                Note: Lock semaphore handle
+    SpinCount as Integer                    Note: Spin count for optimization
+
+Type called "WindowsSRWLock":
+    Ptr as Integer                          Note: Slim reader-writer lock pointer
+
+Type called "WindowsConditionVariable":
+    Ptr as Integer                          Note: Condition variable pointer
+
+Type called "WindowsThreadContext":
+    ContextFlags as Integer                 Note: Context flags
+    Dr0 as Integer                          Note: Debug register 0
+    Dr1 as Integer                          Note: Debug register 1
+    Dr2 as Integer                          Note: Debug register 2
+    Dr3 as Integer                          Note: Debug register 3
+    Dr6 as Integer                          Note: Debug register 6
+    Dr7 as Integer                          Note: Debug register 7
+    FloatSave_ControlWord as Integer        Note: FPU control word
+    FloatSave_StatusWord as Integer         Note: FPU status word
+    Rax as Integer                          Note: General purpose register RAX
+    Rcx as Integer                          Note: General purpose register RCX
+    Rdx as Integer                          Note: General purpose register RDX
+    Rbx as Integer                          Note: General purpose register RBX
+    Rsp as Integer                          Note: Stack pointer RSP
+    Rbp as Integer                          Note: Base pointer RBP
+    Rsi as Integer                          Note: Source index RSI
+    Rdi as Integer                          Note: Destination index RDI
+    R8 as Integer                           Note: Extended register R8
+    R9 as Integer                           Note: Extended register R9
+    R10 as Integer                          Note: Extended register R10
+    R11 as Integer                          Note: Extended register R11
+    R12 as Integer                          Note: Extended register R12
+    R13 as Integer                          Note: Extended register R13
+    R14 as Integer                          Note: Extended register R14
+    R15 as Integer                          Note: Extended register R15
+    Rip as Integer                          Note: Instruction pointer RIP
+    EFlags as Integer                       Note: Flags register
+
+Note: =====================================================================
+Note: HELPER FUNCTIONS
+Note: =====================================================================
+
+Process called "string_to_ptr" that takes s as String returns Integer:
+    @Implementation
+    Extracts the raw memory pointer from a Runa String object for Windows API calls.
+    Windows APIs expect null-terminated strings or wide character strings.
+    @End Implementation
+    
+    Let ptr be 0
+    
+    Inline Assembly:
+        "lea %%rax, %1\n"      Note: Load effective address of string
+        "mov %%rax, %0\n"      Note: Store pointer
+        : "=r" (ptr)
+        : "m" (s)
+        : "rax"
+    End Assembly
+    
+    Return ptr
+
+Process called "get_current_thread_id" returns Integer:
+    @Implementation
+    Gets the current thread identifier using NT API syscall.
+    Returns the unique thread ID for the calling thread.
+    @End Implementation
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtGetCurrentThreadId")
+    Let thread_id be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"               Note: NtGetCurrentThreadId syscall number
+        "syscall\n"
+        "mov %0, rax\n"               Note: Store thread ID
+        : "=r" (thread_id)
+        : "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Return thread_id
+
+Process called "get_current_process_id" returns Integer:
+    @Implementation
+    Gets the current process identifier using NT API syscall.
+    Returns the unique process ID for the calling process.
+    @End Implementation
+    
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtGetCurrentProcessId")
+    Let process_id be Integer
+    
+    Inline Assembly:
+        "mov rax, %1\n"               Note: NtGetCurrentProcessId syscall number
+        "syscall\n"
+        "mov %0, rax\n"               Note: Store process ID
+        : "=r" (process_id)
+        : "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Return process_id
+
+Note: =====================================================================
+Note: THREAD CREATION AND MANAGEMENT
+Note: =====================================================================
+
+Process called "sys_pthread_create_windows" that takes thread as Integer, attr as Integer, start_routine as Integer, arg as Integer returns Integer:
+    @Implementation
+    Creates a new thread using Windows CreateThread API. Maps POSIX pthread_create
+    to Windows thread creation with proper parameter conversion and handle management.
+    @End Implementation
+    
+    If thread == 0 || start_routine == 0:
+        Return -1  Note: Invalid parameters
+    End If
+    
+    Note: Extract stack size from pthread attributes if provided
+    Let stack_size be 0
+    If attr != 0:
+        Note: Read stack size from pthread_attr_t structure
+        Inline Assembly:
+            "mov %%rax, %1\n"          Note: Load attr pointer
+            "mov 8[%%rax], %%rbx\n"    Note: Load stack size field
+            "mov %%rbx, %0\n"          Note: Store stack size
+            : "=m" (stack_size)
+            : "r" (attr)
+            : "rax", "rbx", "memory"
+        End Assembly
+    End If
+    
+    Note: Create thread with NT API
+    Let platform be PlatformInterface.get_current_platform()
+    Let syscall_num be platform.get_syscall_number("NtCreateThread")
+    Let thread_handle be Integer.allocate(8)
+    Let thread_id be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"               Note: thread handle (output)
+        "mov rdx, 0x1FFFFF\n"         Note: THREAD_ALL_ACCESS
+        "mov r8, 0\n"                 Note: object attributes
+        "mov r9, 0xFFFFFFFF\n"        Note: current process handle
+        "push %5\n"                   Note: thread parameter
+        "push %4\n"                   Note: start routine
+        "push 1\n"                    Note: create suspended
+        "push %3\n"                   Note: stack size
+        "push 0\n"                    Note: stack commit
+        "mov rax, %6\n"               Note: NtCreateThread syscall number
+        "syscall\n"
+        "add rsp, 40\n"               Note: clean up stack
+        "mov %0, rax\n"               Note: Store result
+        : "=r" (thread_id)
+        : "r" (thread_handle), "r" (0), "r" (stack_size), "r" (start_routine), "r" (arg), "r" (syscall_num)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Let create_result be Convert.windows_status_to_posix(thread_id)
+    If create_result.is_error:
+        Return -1  Note: Thread creation failed
+    End If
+    
+    Let actual_thread_handle be Integer.read_memory(thread_handle)
+    
+    Note: Store thread handle in pthread_t structure
+    Integer.write_memory(thread, actual_thread_handle)
+    Integer.write_memory(thread + 8, thread_id)
+    
+    Note: Resume thread execution
+    Let platform2 be PlatformInterface.get_current_platform()
+    Let syscall_num2 be platform2.get_syscall_number("NtResumeThread")
+    Let resume_result be Integer
+    
+    Inline Assembly:
+        "mov rcx, %1\n"               Note: thread handle
+        "mov rdx, 0\n"                Note: suspend count (output, can be null)
+        "mov rax, %2\n"               Note: NtResumeThread syscall number
+        "syscall\n"
+        "mov %0, rax\n"               Note: Store result
+        : "=r" (resume_result)
+        : "r" (actual_thread_handle), "r" (syscall_num2)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_join_windows" that takes thread as Integer, retval as Integer returns Integer:
+    @Implementation
+    Waits for thread completion using WaitForSingleObject and GetExitCodeThread.
+    Maps POSIX pthread_join to Windows thread waiting and exit code retrieval.
+    @End Implementation
+    
+    If thread == 0:
+        Return -1  Note: Invalid thread parameter
+    End If
+    
+    Note: Load thread handle from pthread_t structure
+    Let thread_handle be 0
+    
+    Inline Assembly:
+        "mov %%rax, %1\n"              Note: Load thread pointer
+        "mov [%%rax], %%rbx\n"         Note: Load thread handle
+        "mov %%rbx, %0\n"              Note: Store handle
+        : "=m" (thread_handle)
+        : "r" (thread)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    If thread_handle == 0:
+        Return -1  Note: Invalid thread handle
+    End If
+    
+    Note: Wait for thread completion
+    Let wait_result be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: Thread handle
+        "mov %%rdx, $0xFFFFFFFF\n"     Note: INFINITE timeout
+        "call WaitForSingleObject\n"
+        "mov %0, %%rax\n"              Note: Store wait result
+        : "=m" (wait_result)
+        : "r" (thread_handle)
+        : "rax", "rcx", "rdx", "memory"
+    End Assembly
+    
+    If wait_result != 0:  Note: WAIT_OBJECT_0 = 0
+        Return -1  Note: Wait failed
+    End If
+    
+    Note: Get thread exit code if retval pointer provided
+    If retval != 0:
+        Let exit_code be 0
+        
+        Inline Assembly:
+            "mov %%rcx, %2\n"          Note: Thread handle
+            "lea %%rdx, %0\n"          Note: Exit code pointer
+            "call GetExitCodeThread\n"
+            : "=m" (exit_code)
+            :
+            : "r" (thread_handle)
+            : "rax", "rcx", "rdx", "memory"
+        End Assembly
+        
+        Note: Store exit code in retval pointer
+        Inline Assembly:
+            "mov %%rax, %0\n"          Note: Load retval pointer
+            "mov %%rbx, %1\n"          Note: Load exit code
+            "mov [%%rax], %%rbx\n"     Note: Store exit code
+            :
+            : "r" (retval), "r" (exit_code)
+            : "rax", "rbx", "memory"
+        End Assembly
+    End If
+    
+    Note: Close thread handle
+    Inline Assembly:
+        "mov %%rcx, %0\n"              Note: Thread handle
+        "call CloseHandle\n"
+        :
+        : "r" (thread_handle)
+        : "rcx", "rax", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_detach_windows" that takes thread as Integer returns Integer:
+    @Implementation
+    Detaches a thread using CloseHandle. Windows doesn't have exact pthread_detach
+    equivalent, so this closes the thread handle to indicate no join is needed.
+    @End Implementation
+    
+    If thread == 0:
+        Return -1  Note: Invalid thread parameter
+    End If
+    
+    Note: Load thread handle from pthread_t structure
+    Let thread_handle be 0
+    
+    Inline Assembly:
+        "mov %%rax, %1\n"              Note: Load thread pointer
+        "mov [%%rax], %%rbx\n"         Note: Load thread handle
+        "mov %%rbx, %0\n"              Note: Store handle
+        : "=m" (thread_handle)
+        : "r" (thread)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    If thread_handle == 0:
+        Return -1  Note: Invalid thread handle
+    End If
+    
+    Note: Close thread handle to detach
+    Let result be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: Thread handle
+        "call CloseHandle\n"
+        "mov %0, %%rax\n"              Note: Store result
+        : "=m" (result)
+        : "r" (thread_handle)
+        : "rax", "rcx", "memory"
+    End Assembly
+    
+    If result == 0:
+        Return -1  Note: CloseHandle failed
+    End If
+    
+    Note: Clear thread handle in structure
+    Inline Assembly:
+        "mov %%rax, %0\n"              Note: Load thread pointer
+        "xor %%rbx, %%rbx\n"           Note: Zero value
+        "mov [%%rax], %%rbx\n"         Note: Clear handle
+        "mov 8[%%rax], %%rbx\n"        Note: Clear thread ID
+        :
+        : "r" (thread)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_exit_windows" that takes retval as Integer returns Nothing:
+    @Implementation
+    Exits the current thread using ExitThread. Maps POSIX pthread_exit
+    to Windows thread termination with exit code.
+    @End Implementation
+    
+    Note: Convert retval pointer to exit code
+    Let exit_code be 0
+    
+    If retval != 0:
+        Inline Assembly:
+            "mov %%rax, %1\n"          Note: Load retval pointer
+            "mov [%%rax], %%rbx\n"     Note: Load exit code
+            "mov %%rbx, %0\n"          Note: Store exit code
+            : "=m" (exit_code)
+            : "r" (retval)
+            : "rax", "rbx", "memory"
+        End Assembly
+    End If
+    
+    Note: Exit thread with specified code
+    Inline Assembly:
+        "mov %%rcx, %0\n"              Note: Exit code
+        "call ExitThread\n"            Note: Never returns
+        :
+        : "r" (exit_code)
+        : "rcx"
+    End Assembly
+
+Process called "sys_pthread_self_windows" returns Integer:
+    @Implementation
+    Returns the current thread identifier. Maps POSIX pthread_self to
+    Windows GetCurrentThread and GetCurrentThreadId combination.
+    @End Implementation
+    
+    Note: Get current thread pseudo-handle and ID
+    Let thread_handle be 0
+    Let thread_id be 0
+    
+    Inline Assembly:
+        "call GetCurrentThread\n"      Note: Get pseudo-handle
+        "mov %0, %%rax\n"              Note: Store handle
+        "call GetCurrentThreadId\n"    Note: Get thread ID
+        "mov %1, %%rax\n"              Note: Store thread ID
+        : "=m" (thread_handle), "=m" (thread_id)
+        :
+        : "rax", "memory"
+    End Assembly
+    
+    Note: Return thread ID as pthread_t equivalent
+    Return thread_id
+
+Note: =====================================================================
+Note: THREAD SYNCHRONIZATION PRIMITIVES
+Note: =====================================================================
+
+Process called "sys_pthread_mutex_init_windows" that takes mutex as Integer, attr as Integer returns Integer:
+    @Implementation
+    Initializes a mutex using Windows Critical Section. Maps POSIX pthread_mutex_init
+    to InitializeCriticalSection for fast user-mode synchronization.
+    @End Implementation
+    
+    If mutex == 0:
+        Return -1  Note: Invalid mutex pointer
+    End If
+    
+    Note: Initialize critical section in mutex structure
+    Inline Assembly:
+        "mov %%rcx, %0\n"              Note: Mutex/critical section pointer
+        "call InitializeCriticalSection\n"
+        :
+        : "r" (mutex)
+        : "rcx", "rax", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_mutex_destroy_windows" that takes mutex as Integer returns Integer:
+    @Implementation
+    Destroys a mutex using DeleteCriticalSection. Maps POSIX pthread_mutex_destroy
+    to Windows critical section cleanup.
+    @End Implementation
+    
+    If mutex == 0:
+        Return -1  Note: Invalid mutex pointer
+    End If
+    
+    Note: Delete critical section
+    Inline Assembly:
+        "mov %%rcx, %0\n"              Note: Critical section pointer
+        "call DeleteCriticalSection\n"
+        :
+        : "r" (mutex)
+        : "rcx", "rax", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_mutex_lock_windows" that takes mutex as Integer returns Integer:
+    @Implementation
+    Locks a mutex using EnterCriticalSection. Maps POSIX pthread_mutex_lock
+    to Windows critical section entry with blocking behavior.
+    @End Implementation
+    
+    If mutex == 0:
+        Return -1  Note: Invalid mutex pointer
+    End If
+    
+    Note: Enter critical section (blocking)
+    Inline Assembly:
+        "mov %%rcx, %0\n"              Note: Critical section pointer
+        "call EnterCriticalSection\n"  Note: Never fails, always blocks
+        :
+        : "r" (mutex)
+        : "rcx", "rax", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_mutex_trylock_windows" that takes mutex as Integer returns Integer:
+    @Implementation
+    Attempts to lock a mutex using TryEnterCriticalSection. Maps POSIX 
+    pthread_mutex_trylock to Windows non-blocking critical section entry.
+    @End Implementation
+    
+    If mutex == 0:
+        Return -1  Note: Invalid mutex pointer
+    End If
+    
+    Note: Try to enter critical section without blocking
+    Let result be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: Critical section pointer
+        "call TryEnterCriticalSection\n"
+        "mov %0, %%rax\n"              Note: Store result (0=failure, non-zero=success)
+        : "=m" (result)
+        : "r" (mutex)
+        : "rax", "rcx", "memory"
+    End Assembly
+    
+    If result == 0:
+        Return 16  Note: EBUSY - mutex already locked
+    End If
+    
+    Return 0
+
+Process called "sys_pthread_mutex_unlock_windows" that takes mutex as Integer returns Integer:
+    @Implementation
+    Unlocks a mutex using LeaveCriticalSection. Maps POSIX pthread_mutex_unlock
+    to Windows critical section exit.
+    @End Implementation
+    
+    If mutex == 0:
+        Return -1  Note: Invalid mutex pointer
+    End If
+    
+    Note: Leave critical section
+    Inline Assembly:
+        "mov %%rcx, %0\n"              Note: Critical section pointer
+        "call LeaveCriticalSection\n"
+        :
+        : "r" (mutex)
+        : "rcx", "rax", "memory"
+    End Assembly
+    
+    Return 0
+
+Note: =====================================================================
+Note: CONDITION VARIABLES
+Note: =====================================================================
+
+Process called "sys_pthread_cond_init_windows" that takes cond as Integer, attr as Integer returns Integer:
+    @Implementation
+    Initializes a condition variable using Windows InitializeConditionVariable.
+    Maps POSIX pthread_cond_init to Windows condition variable initialization.
+    @End Implementation
+    
+    If cond == 0:
+        Return -1  Note: Invalid condition variable pointer
+    End If
+    
+    Note: Initialize Windows condition variable
+    Inline Assembly:
+        "mov %%rcx, %0\n"              Note: Condition variable pointer
+        "call InitializeConditionVariable\n"
+        :
+        : "r" (cond)
+        : "rcx", "rax", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_cond_destroy_windows" that takes cond as Integer returns Integer:
+    @Implementation
+    Destroys a condition variable. Windows condition variables don't require
+    explicit cleanup, so this is a no-op that validates the pointer.
+    @End Implementation
+    
+    If cond == 0:
+        Return -1  Note: Invalid condition variable pointer
+    End If
+    
+    Note: Windows condition variables don't need explicit cleanup
+    Return 0
+
+Process called "sys_pthread_cond_wait_windows" that takes cond as Integer, mutex as Integer returns Integer:
+    @Implementation
+    Waits on a condition variable using SleepConditionVariableCS. Maps POSIX
+    pthread_cond_wait to Windows condition variable wait with critical section.
+    @End Implementation
+    
+    If cond == 0 || mutex == 0:
+        Return -1  Note: Invalid parameters
+    End If
+    
+    Note: Sleep on condition variable with critical section
+    Let result be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: Condition variable pointer
+        "mov %%rdx, %2\n"              Note: Critical section pointer
+        "mov %%r8, $0xFFFFFFFF\n"      Note: INFINITE timeout
+        "call SleepConditionVariableCS\n"
+        "mov %0, %%rax\n"              Note: Store result
+        : "=m" (result)
+        : "r" (cond), "r" (mutex)
+        : "rax", "rcx", "rdx", "r8", "memory"
+    End Assembly
+    
+    If result == 0:
+        Return -1  Note: Wait failed
+    End If
+    
+    Return 0
+
+Process called "sys_pthread_cond_timedwait_windows" that takes cond as Integer, mutex as Integer, abstime as Integer returns Integer:
+    @Implementation
+    Waits on condition variable with timeout using SleepConditionVariableCS.
+    Maps POSIX pthread_cond_timedwait to Windows timed condition variable wait.
+    @End Implementation
+    
+    If cond == 0 || mutex == 0 || abstime == 0:
+        Return -1  Note: Invalid parameters
+    End If
+    
+    Note: Calculate timeout from absolute time
+    Let current_time be 0
+    Let target_sec be 0
+    Let target_nsec be 0
+    
+    Note: Load target time from timespec
+    Inline Assembly:
+        "mov %%rax, %2\n"              Note: Load timespec pointer
+        "mov [%%rax], %%rbx\n"         Note: Load tv_sec
+        "mov %%rbx, %0\n"              Note: Store target seconds
+        "mov 8[%%rax], %%rbx\n"        Note: Load tv_nsec
+        "mov %%rbx, %1\n"              Note: Store target nanoseconds
+        : "=m" (target_sec), "=m" (target_nsec)
+        : "r" (abstime)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Note: Get current time
+    Inline Assembly:
+        "call GetTickCount64\n"        Note: Get milliseconds since boot
+        "mov %0, %%rax\n"              Note: Store current time in ms
+        : "=m" (current_time)
+        :
+        : "rax", "memory"
+    End Assembly
+    
+    Note: Convert target time to milliseconds and calculate timeout
+    Let target_ms be (target_sec * 1000) + (target_nsec / 1000000)
+    Let timeout_ms be target_ms - current_time
+    
+    If timeout_ms <= 0:
+        Return 110  Note: ETIMEDOUT
+    End If
+    
+    Note: Sleep on condition variable with timeout
+    Let result be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: Condition variable pointer
+        "mov %%rdx, %2\n"              Note: Critical section pointer
+        "mov %%r8, %3\n"               Note: Timeout in milliseconds
+        "call SleepConditionVariableCS\n"
+        "mov %0, %%rax\n"              Note: Store result
+        : "=m" (result)
+        : "r" (cond), "r" (mutex), "r" (timeout_ms)
+        : "rax", "rcx", "rdx", "r8", "memory"
+    End Assembly
+    
+    If result == 0:
+        Return 110  Note: ETIMEDOUT
+    End If
+    
+    Return 0
+
+Process called "sys_pthread_cond_signal_windows" that takes cond as Integer returns Integer:
+    @Implementation
+    Signals one waiting thread using WakeConditionVariable. Maps POSIX
+    pthread_cond_signal to Windows condition variable wake single.
+    @End Implementation
+    
+    If cond == 0:
+        Return -1  Note: Invalid condition variable pointer
+    End If
+    
+    Note: Wake one thread waiting on condition variable
+    Inline Assembly:
+        "mov %%rcx, %0\n"              Note: Condition variable pointer
+        "call WakeConditionVariable\n"
+        :
+        : "r" (cond)
+        : "rcx", "rax", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_cond_broadcast_windows" that takes cond as Integer returns Integer:
+    @Implementation
+    Signals all waiting threads using WakeAllConditionVariable. Maps POSIX
+    pthread_cond_broadcast to Windows condition variable wake all.
+    @End Implementation
+    
+    If cond == 0:
+        Return -1  Note: Invalid condition variable pointer
+    End If
+    
+    Note: Wake all threads waiting on condition variable
+    Inline Assembly:
+        "mov %%rcx, %0\n"              Note: Condition variable pointer
+        "call WakeAllConditionVariable\n"
+        :
+        : "r" (cond)
+        : "rcx", "rax", "memory"
+    End Assembly
+    
+    Return 0
+
+Note: =====================================================================
+Note: THREAD LOCAL STORAGE
+Note: =====================================================================
+
+Process called "sys_pthread_key_create_windows" that takes key as Integer, destructor as Integer returns Integer:
+    @Implementation
+    Creates thread-local storage key using TlsAlloc. Maps POSIX pthread_key_create
+    to Windows TLS slot allocation.
+    @End Implementation
+    
+    If key == 0:
+        Return -1  Note: Invalid key pointer
+    End If
+    
+    Note: Allocate TLS index
+    Let tls_index be 0
+    
+    Inline Assembly:
+        "call TlsAlloc\n"              Note: Allocate TLS slot
+        "mov %0, %%rax\n"              Note: Store TLS index
+        : "=m" (tls_index)
+        :
+        : "rax", "memory"
+    End Assembly
+    
+    Let tls_invalid be 0xFFFFFFFF  Note: TLS_OUT_OF_INDEXES
+    If tls_index == tls_invalid:
+        Return -1  Note: TLS allocation failed
+    End If
+    
+    Note: Store TLS index in key
+    Inline Assembly:
+        "mov %%rax, %0\n"              Note: Load key pointer
+        "mov %%rbx, %1\n"              Note: Load TLS index
+        "mov [%%rax], %%rbx\n"         Note: Store TLS index
+        :
+        : "r" (key), "r" (tls_index)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Note: Windows doesn't support destructors directly
+    Note: Destructor must be managed separately via DLL process detach
+    
+    Return 0
+
+Process called "sys_pthread_key_delete_windows" that takes key as Integer returns Integer:
+    @Implementation
+    Deletes thread-local storage key using TlsFree. Maps POSIX pthread_key_delete
+    to Windows TLS slot deallocation.
+    @End Implementation
+    
+    Note: Load TLS index from key
+    Let tls_index be 0
+    
+    Inline Assembly:
+        "mov %%rax, %1\n"              Note: Load key
+        "mov [%%rax], %%rbx\n"         Note: Load TLS index
+        "mov %%rbx, %0\n"              Note: Store TLS index
+        : "=m" (tls_index)
+        : "r" (key)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Note: Free TLS slot
+    Let result be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: TLS index
+        "call TlsFree\n"
+        "mov %0, %%rax\n"              Note: Store result
+        : "=m" (result)
+        : "r" (tls_index)
+        : "rax", "rcx", "memory"
+    End Assembly
+    
+    If result == 0:
+        Return -1  Note: TlsFree failed
+    End If
+    
+    Return 0
+
+Process called "sys_pthread_setspecific_windows" that takes key as Integer, value as Integer returns Integer:
+    @Implementation
+    Sets thread-specific data using TlsSetValue. Maps POSIX pthread_setspecific
+    to Windows TLS value storage.
+    @End Implementation
+    
+    Note: Load TLS index from key
+    Let tls_index be 0
+    
+    Inline Assembly:
+        "mov %%rax, %1\n"              Note: Load key
+        "mov [%%rax], %%rbx\n"         Note: Load TLS index
+        "mov %%rbx, %0\n"              Note: Store TLS index
+        : "=m" (tls_index)
+        : "r" (key)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Note: Set TLS value
+    Let result be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: TLS index
+        "mov %%rdx, %2\n"              Note: Value
+        "call TlsSetValue\n"
+        "mov %0, %%rax\n"              Note: Store result
+        : "=m" (result)
+        : "r" (tls_index), "r" (value)
+        : "rax", "rcx", "rdx", "memory"
+    End Assembly
+    
+    If result == 0:
+        Return -1  Note: TlsSetValue failed
+    End If
+    
+    Return 0
+
+Process called "sys_pthread_getspecific_windows" that takes key as Integer returns Integer:
+    @Implementation
+    Gets thread-specific data using TlsGetValue. Maps POSIX pthread_getspecific
+    to Windows TLS value retrieval.
+    @End Implementation
+    
+    Note: Load TLS index from key
+    Let tls_index be 0
+    
+    Inline Assembly:
+        "mov %%rax, %1\n"              Note: Load key
+        "mov [%%rax], %%rbx\n"         Note: Load TLS index
+        "mov %%rbx, %0\n"              Note: Store TLS index
+        : "=m" (tls_index)
+        : "r" (key)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Note: Get TLS value
+    Let value be 0
+    
+    Inline Assembly:
+        "mov %%rcx, %1\n"              Note: TLS index
+        "call TlsGetValue\n"
+        "mov %0, %%rax\n"              Note: Store value
+        : "=m" (value)
+        : "r" (tls_index)
+        : "rax", "rcx", "memory"
+    End Assembly
+    
+    Return value
+
+Note: =====================================================================
+Note: THREAD ATTRIBUTES AND SCHEDULING
+Note: =====================================================================
+
+Process called "sys_pthread_attr_init_windows" that takes attr as Integer returns Integer:
+    @Implementation
+    Initializes thread attributes structure. Windows doesn't have exact pthread_attr_t
+    equivalent, so this initializes a compatible structure with default values.
+    @End Implementation
+    
+    If attr == 0:
+        Return -1  Note: Invalid attributes pointer
+    End If
+    
+    Note: Initialize pthread_attr_t equivalent structure with defaults
+    Inline Assembly:
+        "mov %%rax, %0\n"              Note: Load attr pointer
+        "mov %%rbx, $0\n"              Note: Default stack size (0 = system default)
+        "mov [%%rax], %%rbx\n"         Note: Stack size field
+        "mov %%rbx, $1048576\n"        Note: Default stack size 1MB
+        "mov 8[%%rax], %%rbx\n"        Note: Stack size field
+        "mov %%rbx, $0\n"              Note: PTHREAD_CREATE_JOINABLE
+        "mov 16[%%rax], %%rbx\n"       Note: Detach state field
+        "mov 24[%%rax], %%rbx\n"       Note: Inherit scheduling
+        "mov 32[%%rax], %%rbx\n"       Note: Scheduling policy
+        "mov 40[%%rax], %%rbx\n"       Note: Scheduling priority
+        :
+        : "r" (attr)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_attr_destroy_windows" that takes attr as Integer returns Integer:
+    @Implementation
+    Destroys thread attributes. This is a no-op validation since Windows
+    thread attributes don't require explicit cleanup.
+    @End Implementation
+    
+    If attr == 0:
+        Return -1  Note: Invalid attributes pointer
+    End If
+    
+    Return 0
+
+Process called "sys_pthread_attr_setstacksize_windows" that takes attr as Integer, stacksize as Integer returns Integer:
+    @Implementation
+    Sets stack size in thread attributes. Stores the stack size for later
+    use during thread creation.
+    @End Implementation
+    
+    If attr == 0:
+        Return -1  Note: Invalid attributes pointer
+    End If
+    
+    If stacksize < 4096:  Note: Minimum stack size
+        Return -1  Note: Invalid stack size
+    End If
+    
+    Note: Store stack size in attributes structure
+    Inline Assembly:
+        "mov %%rax, %0\n"              Note: Load attr pointer
+        "mov %%rbx, %1\n"              Note: Load stack size
+        "mov 8[%%rax], %%rbx\n"        Note: Store in stack size field
+        :
+        : "r" (attr), "r" (stacksize)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_pthread_attr_getstacksize_windows" that takes attr as Integer, stacksize as Integer returns Integer:
+    @Implementation
+    Gets stack size from thread attributes. Retrieves the stored stack size
+    value from the attributes structure.
+    @End Implementation
+    
+    If attr == 0 || stacksize == 0:
+        Return -1  Note: Invalid parameters
+    End If
+    
+    Note: Load stack size from attributes structure
+    Let size_value be 0
+    
+    Inline Assembly:
+        "mov %%rax, %1\n"              Note: Load attr pointer
+        "mov 8[%%rax], %%rbx\n"        Note: Load stack size field
+        "mov %%rbx, %0\n"              Note: Store stack size
+        : "=m" (size_value)
+        : "r" (attr)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Note: Store in output parameter
+    Inline Assembly:
+        "mov %%rax, %0\n"              Note: Load stacksize pointer
+        "mov %%rbx, %1\n"              Note: Load size value
+        "mov [%%rax], %%rbx\n"         Note: Store stack size
+        :
+        : "r" (stacksize), "r" (size_value)
+        : "rax", "rbx", "memory"
+    End Assembly
+    
+    Return 0
+
+Process called "sys_sched_yield_windows" returns Integer:
+    @Implementation
+    Yields the processor to other threads using SwitchToThread. Maps POSIX
+    sched_yield to Windows thread yielding.
+    @End Implementation
+    
+    Note: Yield processor to other threads
+    Let result be 0
+    
+    Inline Assembly:
+        "call SwitchToThread\n"        Note: Yield processor
+        "mov %0, %%rax\n"              Note: Store result
+        : "=m" (result)
+        :
+        : "rax", "memory"
+    End Assembly
+    
+    Return 0
+
+@Performance_Hints
+Windows threading uses efficient user-mode synchronization with Critical Sections
+and SRW locks that avoid kernel transitions when uncontended. Thread pools provide
+better performance than creating individual threads for short tasks. Consider using
+I/O completion ports for high-throughput scenarios. TLS is optimized but has limited
+slots available.
+@End Performance_Hints
+
+@Security_Scope
+Windows threads inherit security context from creating process. Thread handles
+have security descriptors and can be restricted. Critical sections and mutexes
+don't cross security boundaries. TLS data is isolated per thread but visible
+within the same process. Thread impersonation can change security context
+for the duration of specific operations.
+@End Security_Scope

@@ -1,0 +1,743 @@
+Note: OpenCL Backend for Cross-Vendor GPU Acceleration
+Note: Supports NVIDIA, AMD, Intel, and other OpenCL-compatible devices
+Note: Generates OpenCL C kernels and SPIR-V for maximum compatibility
+
+Import "collections" as Collections
+Import "os" as OS
+
+Note: OpenCL-Specific Types and Configuration
+
+Type called "OpenCLDeviceType":
+    | GPU
+    | CPU
+    | Accelerator
+    | Custom
+
+Type called "OpenCLDeviceInfo":
+    device_type as OpenCLDeviceType
+    vendor as String
+    max_compute_units as Integer
+    max_work_group_size as Integer
+    max_work_item_dimensions as Integer
+    max_work_item_sizes as List[Integer]
+    local_memory_size as Integer
+    global_memory_size as Integer
+    max_constant_buffer_size as Integer
+    supports_double_precision as Boolean
+    supports_half_precision as Boolean
+    opencl_version as String
+
+Type called "OpenCLKernel":
+    name as String
+    parameters as List[String]
+    opencl_c_code as String
+    spir_v_binary as String
+    local_memory_size as Integer
+    work_group_size as List[Integer]
+    global_work_size as List[Integer]
+    kernel_args as List[String]
+
+Type called "OpenCLProgram":
+    kernels as List[OpenCLKernel]
+    source_code as String
+    build_options as String
+    spir_v_binary as String
+    device_specific_binaries as Dictionary[String, String]
+
+Note: OpenCL Device Detection and Management
+
+Process called "opencl_detect_devices" that takes no_parameters returns List[GpuDevice]:
+    Note: Detect all available OpenCL devices
+    Let devices be empty list
+    Let platforms be get_opencl_platforms with no parameters
+    
+    For each platform in platforms:
+        Let platform_devices be get_opencl_platform_devices with platform
+        For each device in platform_devices:
+            Let gpu_device be create_gpu_device_from_opencl with device
+            Add gpu_device to devices
+    
+    Return devices
+
+Process called "get_opencl_platforms" that takes no_parameters returns List[String]:
+    Note: Get all available OpenCL platforms
+    Return host_call_opencl_get_platforms with no parameters
+
+Process called "get_opencl_platform_devices" that takes platform as String returns List[Dictionary]:
+    Note: Get devices for specific OpenCL platform
+    Return host_call_opencl_get_platform_devices with platform
+
+Process called "create_gpu_device_from_opencl" that takes device_info as Dictionary returns GpuDevice:
+    Note: Convert OpenCL device info to generic GPU device
+    Let device_name be device_info["name"]
+    Let vendor be device_info["vendor"]
+    
+    Return GpuDevice with:
+        device_id as device_info["device_id"]
+        name as device_name
+        backend_type as OpenCL
+        capabilities as GpuCapabilities with:
+            compute_capability as device_info["opencl_version"]
+            max_threads_per_block as device_info["max_work_group_size"]
+            max_shared_memory as device_info["local_memory_size"]
+            max_registers_per_thread as 0  Note: OpenCL doesn't expose register count
+            memory_bandwidth as estimate_opencl_memory_bandwidth with device_info
+            supports_double_precision as device_info["supports_double_precision"]
+            supports_tensor_cores as false  Note: Not applicable to OpenCL
+            warp_size as device_info["preferred_vector_width"]
+        memory_total as device_info["global_memory_size"]
+        memory_available as device_info["global_memory_size"]  Note: Assume all available initially
+        is_available as true
+
+Note: OpenCL Kernel Compilation
+
+Process called "opencl_compile_kernel" that takes runa_ast as Dictionary and target as GpuCompilationTarget and hints as List[ParallelizationHint] returns GpuCompilationResult:
+    Note: Compile Runa AST to OpenCL kernel
+    Let result be empty dictionary
+    Set result["success"] to false
+    Set result["error_messages"] to empty list
+    Set result["warnings"] to empty list
+    
+    Note: Validate OpenCL compilation target
+    Let validation_errors be validate_opencl_target with target
+    If length of validation_errors > 0:
+        Set result["error_messages"] to validation_errors
+        Return result as GpuCompilationResult
+    
+    Note: Generate OpenCL kernels from parallelization hints
+    Let kernels be empty list
+    For each hint in hints:
+        Let kernel be generate_opencl_kernel_from_hint with runa_ast and hint and target
+        If kernel is not null:
+            Add kernel to kernels
+    
+    If length of kernels equals 0:
+        Add "No OpenCL kernels generated from parallelization hints" to result["error_messages"]
+        Return result as GpuCompilationResult
+    
+    Note: Create OpenCL program
+    Let opencl_program be create_opencl_program with kernels and target
+    
+    Note: Generate SPIR-V if supported
+    Let spir_v_binary be ""
+    If supports_spir_v with target.device:
+        Set spir_v_binary to generate_spir_v with opencl_program
+    
+    Note: Compile OpenCL program
+    Let compilation_success be compile_opencl_program with opencl_program and target
+    If not compilation_success:
+        Add "OpenCL compilation failed" to result["error_messages"]
+        Return result as GpuCompilationResult
+    
+    Set result["success"] to true
+    Set result["module"] to create_gpu_module_from_opencl with opencl_program
+    Set result["binary_code"] to spir_v_binary
+    Set result["performance_estimates"] to estimate_opencl_performance with opencl_program and target.device
+    
+    Return result as GpuCompilationResult
+
+Process called "generate_opencl_kernel_from_hint" that takes runa_ast as Dictionary and hint as ParallelizationHint and target as GpuCompilationTarget returns OpenCLKernel:
+    Note: Generate OpenCL kernel from parallelization hint
+    Let kernel_name be "runa_kernel_" joined with hint.loop_start joined with "_" joined with hint.loop_end
+    
+    Note: Calculate work group configuration
+    Let work_config be calculate_opencl_work_config with hint and target.device
+    
+    Note: Generate kernel parameters
+    Let parameters be extract_opencl_kernel_parameters with runa_ast and hint
+    
+    Note: Generate OpenCL C kernel code
+    Let opencl_code be generate_opencl_kernel_code with runa_ast and hint and work_config
+    
+    Note: Calculate local memory usage
+    Let local_memory_usage be calculate_opencl_local_memory_usage with hint and work_config
+    
+    Return OpenCLKernel with:
+        name as kernel_name
+        parameters as parameters
+        opencl_c_code as opencl_code
+        spir_v_binary as ""  Note: Generated later if needed
+        local_memory_size as local_memory_usage
+        work_group_size as work_config["work_group_size"]
+        global_work_size as work_config["global_work_size"]
+        kernel_args as parameters
+
+Process called "calculate_opencl_work_config" that takes hint as ParallelizationHint and device as GpuDevice returns Dictionary:
+    Note: Calculate optimal OpenCL work group configuration
+    Let total_work_items be hint.loop_end - hint.loop_start
+    Let max_work_group_size be device.capabilities.max_threads_per_block
+    
+    Note: Choose work group size based on device capabilities and access pattern
+    Let work_group_size be hint.suggested_block_size
+    If work_group_size <= 0 or work_group_size > max_work_group_size:
+        Set work_group_size to optimize_opencl_work_group_size with hint and device
+    
+    Note: Calculate global work size (must be multiple of work group size)
+    Let global_work_size be ((total_work_items + work_group_size - 1) / work_group_size) * work_group_size
+    
+    Note: Optimize for memory access pattern
+    Match hint.memory_access_pattern:
+        Case "sequential":
+            Return Dictionary with:
+                "work_group_size" as [work_group_size]
+                "global_work_size" as [global_work_size]
+                "local_size" as [work_group_size]
+                
+        Case "strided":
+            Note: Use 2D work group for better memory coalescing
+            Let work_group_x be minimum of work_group_size and 16
+            Let work_group_y be work_group_size / work_group_x
+            Let global_x be ((total_work_items + work_group_x - 1) / work_group_x) * work_group_x
+            Let global_y be work_group_y
+            
+            Return Dictionary with:
+                "work_group_size" as [work_group_x, work_group_y]
+                "global_work_size" as [global_x, global_y]
+                "local_size" as [work_group_x, work_group_y]
+                
+        Otherwise:
+            Return Dictionary with:
+                "work_group_size" as [work_group_size]
+                "global_work_size" as [global_work_size]
+                "local_size" as [work_group_size]
+
+Process called "optimize_opencl_work_group_size" that takes hint as ParallelizationHint and device as GpuDevice returns Integer:
+    Note: Find optimal work group size for OpenCL device
+    Let max_size be device.capabilities.max_threads_per_block
+    Let preferred_size be 64  Note: Common good default for most devices
+    
+    Note: Try different sizes and pick the best
+    Let candidate_sizes be [32, 64, 128, 256, 512]
+    Let best_size be preferred_size
+    
+    For each size in candidate_sizes:
+        If size <= max_size:
+            Let efficiency be estimate_opencl_efficiency with size and device
+            Let current_efficiency be estimate_opencl_efficiency with best_size and device
+            If efficiency > current_efficiency:
+                Set best_size to size
+    
+    Return best_size
+
+Process called "generate_opencl_kernel_code" that takes runa_ast as Dictionary and hint as ParallelizationHint and config as Dictionary returns String:
+    Note: Generate OpenCL C kernel code from Runa AST
+    Let kernel_code be "__kernel void runa_kernel("
+    
+    Note: Generate kernel parameters
+    Let param_declarations be generate_opencl_parameters with runa_ast and hint
+    Set kernel_code to kernel_code joined with param_declarations joined with ") {\n"
+    
+    Note: Generate work item indexing
+    Set kernel_code to kernel_code joined with "    int gid = get_global_id(0);\n"
+    Set kernel_code to kernel_code joined with "    int lid = get_local_id(0);\n"
+    Set kernel_code to kernel_code joined with "    int group_size = get_local_size(0);\n"
+    Set kernel_code to kernel_code joined with "    \n"
+    
+    Note: Generate bounds checking
+    Let total_work_items be hint.loop_end - hint.loop_start
+    Set kernel_code to kernel_code joined with "    if (gid >= " joined with total_work_items joined with ") return;\n"
+    Set kernel_code to kernel_code joined with "    \n"
+    
+    Note: Generate loop body translation
+    Let loop_body be translate_runa_loop_to_opencl with runa_ast and hint
+    Set kernel_code to kernel_code joined with loop_body
+    
+    Set kernel_code to kernel_code joined with "}\n"
+    
+    Return kernel_code
+
+Process called "generate_opencl_parameters" that takes runa_ast as Dictionary and hint as ParallelizationHint returns String:
+    Note: Generate OpenCL kernel parameter declarations
+    Let params be empty list
+    
+    Note: Extract variable references from the loop
+    Let loop_variables be extract_loop_variables with runa_ast and hint
+    
+    For each variable in loop_variables:
+        Let param_type be infer_opencl_type with variable
+        Let address_space be infer_opencl_address_space with variable
+        Let param_declaration be address_space joined with " " joined with param_type joined with "* " joined with variable["name"]
+        Add param_declaration to params
+    
+    Return join_list with params and ", "
+
+Process called "translate_runa_loop_to_opencl" that takes runa_ast as Dictionary and hint as ParallelizationHint returns String:
+    Note: Translate Runa loop body to OpenCL C
+    Let opencl_body be "    // Translated from Runa loop\n"
+    
+    Note: Get the loop AST node
+    Let loop_node be find_loop_node with runa_ast and hint.loop_start
+    If loop_node is null:
+        Return "    // Error: Could not find loop node\n"
+    
+    Note: Translate loop body statements
+    Let body_statements be loop_node["body"]
+    For each statement in body_statements:
+        Let opencl_statement be translate_runa_statement_to_opencl with statement
+        Set opencl_body to opencl_body joined with "    " joined with opencl_statement joined with "\n"
+    
+    Return opencl_body
+
+Process called "translate_runa_statement_to_opencl" that takes statement as Dictionary returns String:
+    Note: Translate individual Runa statement to OpenCL C
+    Match statement["type"]:
+        Case "assignment":
+            Let variable be statement["variable"]
+            Let expression be statement["expression"]
+            Let opencl_expr be translate_runa_expression_to_opencl with expression
+            Return variable joined with " = " joined with opencl_expr joined with ";"
+            
+        Case "function_call":
+            Let function_name be statement["function"]
+            Let opencl_function be map_runa_function_to_opencl with function_name
+            Let args be statement["arguments"]
+            Let opencl_args be empty list
+            For each arg in args:
+                Let opencl_arg be translate_runa_expression_to_opencl with arg
+                Add opencl_arg to opencl_args
+            Return opencl_function joined with "(" joined with join_list with opencl_args and ", " joined with ");"
+            
+        Case "if_statement":
+            Let condition be statement["condition"]
+            Let opencl_condition be translate_runa_expression_to_opencl with condition
+            Let if_body be statement["body"]
+            Let opencl_body be translate_runa_statement_to_opencl with if_body
+            Return "if (" joined with opencl_condition joined with ") {\n" joined with opencl_body joined with "\n}"
+            
+        Otherwise:
+            Return "/* Unsupported statement type: " joined with statement["type"] joined with " */"
+
+Process called "translate_runa_expression_to_opencl" that takes expression as Dictionary returns String:
+    Note: Translate Runa expression to OpenCL C
+    Match expression["type"]:
+        Case "variable":
+            Return expression["name"]
+            
+        Case "literal":
+            Return expression["value"]
+            
+        Case "binary_operation":
+            Let left be translate_runa_expression_to_opencl with expression["left"]
+            Let right be translate_runa_expression_to_opencl with expression["right"]
+            Let operator be expression["operator"]
+            Return "(" joined with left joined with " " joined with operator joined with " " joined with right joined with ")"
+            
+        Case "array_access":
+            Let array be translate_runa_expression_to_opencl with expression["array"]
+            Let index be translate_runa_expression_to_opencl with expression["index"]
+            Return array joined with "[" joined with index joined with "]"
+            
+        Case "math_function":
+            Let function_name be expression["function"]
+            Let opencl_function be map_math_function_to_opencl with function_name
+            Let arg be translate_runa_expression_to_opencl with expression["argument"]
+            Return opencl_function joined with "(" joined with arg joined with ")"
+            
+        Otherwise:
+            Return "/* Unsupported expression: " joined with expression["type"] joined with " */"
+
+Process called "map_runa_function_to_opencl" that takes function_name as String returns String:
+    Note: Map Runa function names to OpenCL equivalents
+    Match function_name:
+        Case "sqrt":
+            Return "sqrt"
+        Case "sin":
+            Return "sin"
+        Case "cos":
+            Return "cos"
+        Case "exp":
+            Return "exp"
+        Case "log":
+            Return "log"
+        Case "abs":
+            Return "fabs"
+        Case "min":
+            Return "min"
+        Case "max":
+            Return "max"
+        Otherwise:
+            Return function_name  Note: Assume direct mapping
+
+Process called "map_math_function_to_opencl" that takes function_name as String returns String:
+    Note: Map Runa math functions to OpenCL math functions
+    Match function_name:
+        Case "square_root":
+            Return "sqrt"
+        Case "natural_log":
+            Return "log"
+        Case "power":
+            Return "pow"
+        Case "absolute_value":
+            Return "fabs"
+        Otherwise:
+            Return function_name
+
+Note: SPIR-V Generation
+
+Process called "generate_spir_v" that takes program as OpenCLProgram returns String:
+    Note: Generate SPIR-V binary from OpenCL program
+    Let spir_v_binary be compile_opencl_to_spir_v with program.source_code
+    Return spir_v_binary
+
+Process called "compile_opencl_to_spir_v" that takes source_code as String returns String:
+    Note: Compile OpenCL C source to SPIR-V binary
+    Return host_call_opencl_compile_to_spir_v with source_code
+
+Process called "supports_spir_v" that takes device as GpuDevice returns Boolean:
+    Note: Check if device supports SPIR-V
+    Let opencl_version be device.capabilities.compute_capability
+    Return host_call_opencl_device_supports_spir_v with device.device_id
+
+Note: OpenCL Program Management
+
+Process called "create_opencl_program" that takes kernels as List[OpenCLKernel] and target as GpuCompilationTarget returns OpenCLProgram:
+    Note: Create OpenCL program from kernels
+    Let source_code be ""
+    
+    Note: Add OpenCL headers and pragmas
+    Set source_code to source_code joined with "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n"
+    Set source_code to source_code joined with "\n"
+    
+    Note: Combine all kernel source code
+    For each kernel in kernels:
+        Set source_code to source_code joined with kernel.opencl_c_code joined with "\n"
+    
+    Note: Generate build options based on target
+    Let build_options be generate_opencl_build_options with target
+    
+    Return OpenCLProgram with:
+        kernels as kernels
+        source_code as source_code
+        build_options as build_options
+        spir_v_binary as ""
+        device_specific_binaries as empty dictionary
+
+Process called "generate_opencl_build_options" that takes target as GpuCompilationTarget returns String:
+    Note: Generate OpenCL compiler build options
+    Let options be empty list
+    
+    Note: Optimization level
+    Match target.optimization_level:
+        Case 0:
+            Add "-g" to options  Note: Debug info
+        Case 1:
+            Add "-O1" to options  Note: Basic optimization
+        Case 2:
+            Add "-O2" to options  Note: Standard optimization
+        Case 3:
+            Add "-O3" to options  Note: Aggressive optimization
+        Otherwise:
+            Add "-O2" to options  Note: Default
+    
+    Note: Enable math optimizations for performance
+    If target.optimization_level >= 2:
+        Add "-cl-fast-relaxed-math" to options
+        Add "-cl-mad-enable" to options
+    
+    Note: Enable device-specific optimizations
+    Add "-cl-no-signed-zeros" to options
+    
+    Return join_list with options and " "
+
+Process called "compile_opencl_program" that takes program as OpenCLProgram and target as GpuCompilationTarget returns Boolean:
+    Note: Compile OpenCL program for target device
+    Return host_call_opencl_build_program with program.source_code and program.build_options and target.device.device_id
+
+Note: Performance Estimation
+
+Process called "estimate_opencl_performance" that takes program as OpenCLProgram and device as GpuDevice returns Dictionary[String, Integer]:
+    Note: Estimate OpenCL program performance
+    Let estimates be empty dictionary
+    
+    Note: Calculate work group efficiency
+    For each kernel in program.kernels:
+        Let work_group_size be kernel.work_group_size[0]
+        Let efficiency be estimate_opencl_efficiency with work_group_size and device
+        Set estimates[kernel.name joined with "_efficiency"] to efficiency
+    
+    Note: Estimate memory bandwidth utilization
+    Let memory_ops be count_memory_operations_opencl with program
+    Let bandwidth_utilization be (memory_ops * 4) / device.capabilities.memory_bandwidth * 100
+    Set estimates["memory_bandwidth_utilization"] to bandwidth_utilization
+    
+    Note: Estimate execution time
+    Let instruction_count be estimate_opencl_instruction_count with program
+    Let execution_time be instruction_count / 1000  Note: Rough estimate in microseconds
+    Set estimates["estimated_execution_time_microseconds"] to execution_time
+    
+    Return estimates
+
+Process called "estimate_opencl_efficiency" that takes work_group_size as Integer and device as GpuDevice returns Integer:
+    Note: Estimate work group efficiency for OpenCL device
+    Let max_work_group_size be device.capabilities.max_threads_per_block
+    Let compute_units be device.capabilities.max_threads_per_block / 64  Note: Estimate
+    
+    Note: Calculate efficiency based on work group utilization
+    Let utilization_efficiency be (work_group_size * 100) / max_work_group_size
+    
+    Note: Penalize very small work groups
+    If work_group_size < 32:
+        Set utilization_efficiency to utilization_efficiency / 2
+    
+    Note: Cap at 100%
+    If utilization_efficiency > 100:
+        Return 100
+    Otherwise:
+        Return utilization_efficiency
+
+Note: Utility Functions
+
+Process called "infer_opencl_type" that takes variable as Dictionary returns String:
+    Note: Infer OpenCL type from Runa variable
+    Match variable["type"]:
+        Case "Integer":
+            Return "int"
+        Case "Float":
+            Return "float"
+        Case "Double":
+            Return "double"
+        Case "Boolean":
+            Return "bool"
+        Case "Array":
+            Let element_type be infer_opencl_type with variable["element_type"]
+            Return element_type
+        Otherwise:
+            Return "float"  Note: Default to float
+
+Process called "infer_opencl_address_space" that takes variable as Dictionary returns String:
+    Note: Infer OpenCL address space from variable usage
+    If variable["is_input_array"]:
+        Return "__global"
+    Otherwise if variable["is_local_array"]:
+        Return "__local"
+    Otherwise if variable["is_constant"]:
+        Return "__constant"
+    Otherwise:
+        Return "__global"  Note: Default to global
+
+Process called "calculate_opencl_local_memory_usage" that takes hint as ParallelizationHint and config as Dictionary returns Integer:
+    Note: Calculate local memory usage for OpenCL kernel
+    Let work_group_size be config["work_group_size"][0]
+    
+    Note: Estimate local memory based on work group size and data sharing
+    Match hint.memory_access_pattern:
+        Case "sequential":
+            Return work_group_size * 4  Note: 4 bytes per work item for temporary storage
+        Case "strided":
+            Return work_group_size * 8  Note: More local memory for stride optimization
+        Otherwise:
+            Return work_group_size * 4
+
+Process called "count_memory_operations_opencl" that takes program as OpenCLProgram returns Integer:
+    Note: Count memory operations in OpenCL program
+    Let total_ops be 0
+    For each kernel in program.kernels:
+        Let kernel_ops be count_opencl_kernel_memory_ops with kernel
+        Set total_ops to total_ops + kernel_ops
+    Return total_ops
+
+Process called "count_opencl_kernel_memory_ops" that takes kernel as OpenCLKernel returns Integer:
+    Note: Count memory operations in single OpenCL kernel
+    Let source_code be kernel.opencl_c_code
+    Let load_count be count_occurrences with source_code and "["  Note: Array accesses
+    Let store_count be count_occurrences with source_code and "]"
+    Return load_count + store_count
+
+Process called "estimate_opencl_instruction_count" that takes program as OpenCLProgram returns Integer:
+    Note: Estimate total instructions in OpenCL program
+    Let total_instructions be 0
+    For each kernel in program.kernels:
+        Let kernel_instructions be estimate_kernel_instruction_count with kernel.opencl_c_code
+        Set total_instructions to total_instructions + kernel_instructions
+    Return total_instructions
+
+Process called "estimate_kernel_instruction_count" that takes source_code as String returns Integer:
+    Note: Estimate instructions in kernel source code
+    Let line_count be count_lines with source_code
+    Return line_count * 2  Note: Rough estimate: 2 instructions per line
+
+Note: Validation
+
+Process called "validate_opencl_target" that takes target as GpuCompilationTarget returns List[String]:
+    Note: Validate OpenCL compilation target
+    Let errors be empty list
+    
+    If target.backend_type is not OpenCL:
+        Add "Target backend is not OpenCL" to errors
+    
+    If target.device.memory_available <= 0:
+        Add "Device has no available memory" to errors
+    
+    Return errors
+
+Note: OpenCL Backend Initialization
+
+Process called "initialize_opencl_backend" that takes configuration as Dictionary returns Boolean:
+    Note: Initialize OpenCL backend
+    Let opencl_available be check_opencl_availability with no parameters
+    If not opencl_available:
+        Return false
+    
+    Return host_call_opencl_runtime_init with configuration
+
+Process called "shutdown_opencl_backend" that takes no_parameters returns Boolean:
+    Note: Shutdown OpenCL backend
+    Return host_call_opencl_runtime_shutdown with no parameters
+
+Process called "check_opencl_availability" that takes no_parameters returns Boolean:
+    Note: Check if OpenCL is available on the system
+    Return host_call_check_opencl_availability with no parameters
+
+Process called "create_gpu_module_from_opencl" that takes program as OpenCLProgram returns GpuModule:
+    Note: Convert OpenCL program to generic GPU module
+    Let kernel_functions be empty list
+    
+    For each opencl_kernel in program.kernels:
+        Let kernel_function be KernelFunction with:
+            name as opencl_kernel.name
+            parameters as opencl_kernel.parameters
+            body as opencl_kernel.opencl_c_code
+            shared_memory_size as opencl_kernel.local_memory_size
+            register_count as 0  Note: OpenCL doesn't expose register usage
+            thread_count as opencl_kernel.work_group_size[0]
+            block_dimensions as opencl_kernel.work_group_size
+            grid_dimensions as opencl_kernel.global_work_size
+        Add kernel_function to kernel_functions
+    
+    Return GpuModule with:
+        kernels as kernel_functions
+        global_memory_allocations as empty list
+        constant_memory_data as empty dictionary
+        backend_specific_code as program.source_code
+        compilation_flags as [program.build_options]
+
+Process called "estimate_opencl_memory_bandwidth" that takes device_info as Dictionary returns Integer:
+    Note: Estimate memory bandwidth for OpenCL device
+    Note: This is a rough estimate since OpenCL doesn't expose detailed memory specs
+    Match device_info["vendor"]:
+        Case "NVIDIA":
+            Return 500  Note: Typical NVIDIA GPU bandwidth in GB/s
+        Case "AMD":
+            Return 400  Note: Typical AMD GPU bandwidth in GB/s
+        Case "Intel":
+            Return 100  Note: Typical Intel GPU bandwidth in GB/s
+        Otherwise:
+            Return 200  Note: Conservative estimate
+
+Note: Host Interface Functions (implemented by runtime)
+
+Process called "host_call_opencl_get_platforms" that takes no_parameters returns List[String]:
+    Note: Host-provided OpenCL platform detection
+    Return empty list  Note: Will be implemented by host environment
+
+Process called "host_call_opencl_get_platform_devices" that takes platform as String returns List[Dictionary]:
+    Note: Host-provided OpenCL device detection
+    Return empty list  Note: Will be implemented by host environment
+
+Process called "host_call_opencl_compile_to_spir_v" that takes source_code as String returns String:
+    Note: Host-provided OpenCL to SPIR-V compilation
+    Return ""  Note: Will be implemented by host environment
+
+Process called "host_call_opencl_device_supports_spir_v" that takes device_id as Integer returns Boolean:
+    Note: Host-provided SPIR-V support check
+    Return false  Note: Will be implemented by host environment
+
+Process called "host_call_opencl_build_program" that takes source_code as String and build_options as String and device_id as Integer returns Boolean:
+    Note: Host-provided OpenCL program compilation
+    Return false  Note: Will be implemented by host environment
+
+Process called "host_call_opencl_runtime_init" that takes configuration as Dictionary returns Boolean:
+    Note: Host-provided OpenCL runtime initialization
+    Return false  Note: Will be implemented by host environment
+
+Process called "host_call_opencl_runtime_shutdown" that takes no_parameters returns Boolean:
+    Note: Host-provided OpenCL runtime shutdown
+    Return false  Note: Will be implemented by host environment
+
+Process called "host_call_check_opencl_availability" that takes no_parameters returns Boolean:
+    Note: Host-provided OpenCL availability check
+    Return false  Note: Will be implemented by host environment
+
+Note: Missing Utility Functions Implementation (Shared with CUDA backend)
+
+Process called "extract_loop_variables" that takes runa_ast as Dictionary and hint as ParallelizationHint returns List[Dictionary]:
+    Note: Extract variables used in loop for kernel parameter generation
+    Let variables be empty list
+    
+    Note: Find loop node in AST
+    Let loop_node be find_loop_node with runa_ast and hint.loop_start
+    If loop_node is null:
+        Return variables
+    
+    Note: Extract variable references from loop body
+    Let variable_names be extract_variable_names_from_node with loop_node
+    For each var_name in variable_names:
+        Let variable_info be Dictionary with:
+            "name" as var_name
+            "type" as "Float"  Note: Default type
+            "is_input_array" as true
+            "is_local_array" as false
+            "is_constant" as false
+        Add variable_info to variables
+    
+    Return variables
+
+Process called "find_loop_node" that takes runa_ast as Dictionary and loop_start as Integer returns Dictionary:
+    Note: Find loop node in AST by start position
+    If runa_ast contains "type" and runa_ast["type"] equals "loop":
+        If runa_ast contains "start_position" and runa_ast["start_position"] equals loop_start:
+            Return runa_ast
+    
+    Note: Search child nodes recursively
+    If runa_ast contains "children":
+        For each child in runa_ast["children"]:
+            Let found_node be find_loop_node with child and loop_start
+            If found_node is not null:
+                Return found_node
+    
+    Return null
+
+Process called "extract_variable_names_from_node" that takes node as Dictionary returns List[String]:
+    Note: Extract all variable names referenced in AST node
+    Let variable_names be empty list
+    
+    If node contains "type":
+        Match node["type"]:
+            Case "variable":
+                If node contains "name":
+                    Add node["name"] to variable_names
+            Case "array_access":
+                If node contains "array":
+                    Let array_vars be extract_variable_names_from_node with node["array"]
+                    Add all items from array_vars to variable_names
+                If node contains "index":
+                    Let index_vars be extract_variable_names_from_node with node["index"]
+                    Add all items from index_vars to variable_names
+            Otherwise:
+                Note: Handle other node types
+                If node contains "children":
+                    For each child in node["children"]:
+                        Let child_vars be extract_variable_names_from_node with child
+                        Add all items from child_vars to variable_names
+    
+    Return variable_names
+
+Process called "join_list" that takes items as List[String] and separator as String returns String:
+    Note: Join list of strings with separator
+    If length of items equals 0:
+        Return ""
+    
+    Let result be items[0]
+    Let index be 1
+    While index < length of items:
+        Set result to result joined with separator joined with items[index]
+        Set index to index + 1
+    
+    Return result
+
+Process called "minimum" that takes a as Integer and b as Integer returns Integer:
+    Note: Return minimum of two integers
+    If a < b:
+        Return a
+    Otherwise:
+        Return b
