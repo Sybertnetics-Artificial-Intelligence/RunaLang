@@ -28,7 +28,7 @@ Each stage compiles the next, with progressively richer language features and ca
 
 ## Stage v0.1: Bootstrap Compiler (Rust)
 
-**Status**: 🔄 **REBUILDING FROM SCRATCH**  
+**Status**: ✅ **COMPLETED - OPERATIONAL**  
 **Language**: Rust  
 **Location**: `runa/bootstrap/v0.1_runa-bootstrap/`
 
@@ -78,9 +78,42 @@ End Assembly
 - **Executable creation**: Link to create runnable programs
 - **Memory management**: Stack allocation, basic heap operations via syscalls
 
-### BRUTAL TIMELINE ESTIMATE: 100-150 HOURS
+### ✅ ACTUAL v0.1 CAPABILITIES ACHIEVED (AS OF 2024-09-13)
 
-This is a complete rewrite of a production-quality compiler backend.
+#### WHAT WE HAVE:
+- **✅ Complete Parser**: 20/20 parser tests passing including all syntax requirements
+- **✅ Type Definitions**: Struct types with fields fully working
+- **✅ Process Definitions**: Function declarations and returns working
+- **✅ Variable Operations**: Let/Set statements functional
+- **✅ Control Flow**: If/Otherwise/While implemented
+- **✅ Field Access**: Object.field notation working
+- **✅ Imports**: Module import statements parsed
+- **✅ Constructors**: "a value of type X with..." syntax working
+- **✅ Inline Assembly**: PARSING works perfectly, COMPILATION works with hardcoded immediate values
+- **✅ LLVM Backend**: Generates valid object files (.o)
+- **✅ Executable Generation**: Can link with gcc to create working executables
+- **✅ Return Values**: Programs return correct exit codes
+
+#### WHAT WE DON'T HAVE:
+- **❌ Function Calls**: Not implemented (functions can't call other functions)
+- **❌ Arithmetic Operations**: No +, -, *, / operations
+- **❌ Boolean Operations**: No &&, ||, ! operations  
+- **❌ Comparison Operations**: No ==, !=, <, > operations
+- **❌ String Operations**: Can't manipulate strings
+- **❌ Arrays/Lists**: No collection types
+- **❌ Dynamic Inline Assembly**: Only hardcoded immediate values work (mov $42, %0)
+- **❌ Cross-compilation**: Only compiles for host platform
+- **❌ Memory Management**: No heap allocation
+- **❌ Module Loading**: Can't actually load imported modules
+
+#### CRITICAL LIMITATION FOR v0.2:
+**v0.1 can only compile extremely simple Runa programs** - essentially just:
+- Process definitions with parameters
+- Return statements with literal values
+- Inline assembly with hardcoded immediate values
+- Basic control flow (if/while) without complex conditions
+
+This means **v0.2 must be written using ONLY these features** or v0.1 must be enhanced.
 
 ### THE CORRECTED CROSS-COMPILATION WORKFLOW (LINUX HOST)
 
@@ -164,11 +197,67 @@ rustc ./bootstrap/v0.1_runa-bootstrap/ --target=x86_64-unknown-netbsd --output .
 
 ## Stage v0.2: Micro-Runa Compiler 
 
-**Status**: 🔄 **COMPLETE REWRITE REQUIRED** - **CURRENT CODEBASE IS GARBAGE**  
+**Status**: 🔄 **REQUIRES STRATEGIC DECISION**  
 **Language**: Runa (compiled by v0.1)  
 **Location**: `runa/bootstrap/v0.2_micro-runa/`
 
-**BRUTAL ASSESSMENT**: Current v0.2 code violates every rule in CLAUDE.md with hundreds of placeholder implementations, hardcoded returns, and "would" comments. **ENTIRE CODEBASE MUST BE REWRITTEN.**
+### CRITICAL DECISION POINT: Two Paths Forward
+
+#### Option A: Direct Transpilation (RECOMMENDED - 40-60 hours)
+**Write v0.2 using ONLY what v0.1 can compile:**
+- Use inline assembly for ALL operations (arithmetic, comparisons, function calls)
+- No direct function calls - use inline assembly syscalls
+- No arithmetic operators - use inline assembly ADD/SUB/MUL/DIV
+- No string manipulation - use inline assembly memory operations
+- Essentially write assembly in Runa syntax
+
+**Pros**: Can start immediately, proves self-hosting concept
+**Cons**: Extremely tedious, v0.2 code will be ugly assembly-heavy
+
+#### Option B: Enhance v0.1 First (80-100 hours)
+**Add missing features to v0.1 Rust compiler:**
+- Implement function calls (20-30 hours)
+- Implement arithmetic operations (10-15 hours)
+- Implement comparison operations (10-15 hours)
+- Implement string operations (15-20 hours)
+- Fix dynamic inline assembly (10-15 hours)
+
+**Pros**: v0.2 can be written in readable Runa
+**Cons**: More time on Rust code we're trying to escape
+
+### EXAMPLE v0.2 CODE WITH OPTION A (Direct Transpilation)
+
+```runa
+Process called "add_numbers" that takes a as Integer, b as Integer returns Integer:
+    Let result be 0
+    Inline Assembly:
+        "movl %1, %%eax"     # Load a into eax
+        "addl %2, %%eax"     # Add b to eax  
+        "movl %%eax, %0"     # Store result
+        : "=r"(result)
+        : "r"(a), "r"(b)
+        : "eax"
+    End Assembly
+    Return result
+End Process
+
+Process called "compare_values" that takes x as Integer, y as Integer returns Boolean:
+    Let is_equal be 0
+    Inline Assembly:
+        "movl %1, %%eax"     # Load x
+        "cmpl %2, %%eax"     # Compare with y
+        "sete %%al"          # Set al if equal
+        "movzbl %%al, %%eax" # Zero extend
+        "movl %%eax, %0"     # Store result
+        : "=r"(is_equal)
+        : "r"(x), "r"(y)
+        : "eax"
+    End Assembly
+    Return is_equal
+End Process
+```
+
+**This is what ALL of v0.2 would look like** - assembly wrapped in Runa syntax.
 
 ### CORE REQUIREMENTS FOR v0.2
 

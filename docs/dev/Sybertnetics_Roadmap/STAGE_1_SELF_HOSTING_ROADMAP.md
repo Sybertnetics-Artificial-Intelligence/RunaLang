@@ -154,23 +154,23 @@ src/compiler/frontend/semantic/
 src/compiler/middle/
 ├── ir/
 │   ├── hir/                    # High-level IR
-│   │   ├── hir_builder.runa    # HIR construction
-│   │   ├── hir_nodes.runa      # HIR node definitions
-│   │   └── hir_visitor.runa    # HIR traversal
+│   │   ├── hir_builder.runa    # HIR construction (2)
+│   │   ├── hir_nodes.runa      # HIR node definitions (1)
+│   │   └── hir_visitor.runa    # HIR traversal (3)
 │   ├── mir/                    # Mid-level IR  
-│   │   ├── mir_builder.runa    # MIR construction
-│   │   ├── mir_nodes.runa      # MIR node definitions
-│   │   ├── mir_optimizer.runa  # Basic optimizations
-│   │   └── mir_verifier.runa   # IR validation
+│   │   ├── mir_builder.runa    # MIR construction (5)
+│   │   ├── mir_nodes.runa      # MIR node definitions (4)
+│   │   ├── mir_optimizer.runa  # Basic optimizations (7)
+│   │   └── mir_verifier.runa   # IR validation (6)
 │   └── lir/                    # Low-level IR
-│       ├── lir_builder.runa    # LIR construction
-│       ├── lir_nodes.runa      # LIR node definitions
-│       └── lir_optimizer.runa  # Target-specific opts
+│       ├── lir_builder.runa    # LIR construction (9)
+│       ├── lir_nodes.runa      # LIR node definitions (8)
+│       └── lir_optimizer.runa  # Target-specific opts (10)
 └── transformations/
-    ├── lowering.runa           # HIR → MIR → LIR
-    ├── monomorphization.runa   # Generic instantiation
-    ├── specialization.runa     # Performance specialization
-    └── optimization.runa       # Cross-pass optimization
+    ├── lowering.runa           # HIR → MIR → LIR (11)
+    ├── monomorphization.runa   # Generic instantiation (12)
+    ├── specialization.runa     # Performance specialization (13)
+    └── optimization.runa       # Cross-pass optimization (14)
 ```
 
 #### Success Criteria

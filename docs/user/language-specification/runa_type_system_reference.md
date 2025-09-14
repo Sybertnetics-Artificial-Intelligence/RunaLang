@@ -101,21 +101,110 @@ Type Tuple[T1, T2, ..., Tn]  Note: Fixed-size ordered collection of specific typ
 Type Optional[T]             Note: Value of type T or None
 ```
 
+### Collection Syntax Forms
+
+Runa supports both canonical (natural language) and technical (compact) syntax for collections:
+
+#### List Creation
+```runa
+Note: Canonical form
+Let numbers be a list containing 1, 2, 3, 4, 5
+Let names be a list of Strings, containing "Alice", "Bob", and "Charlie"
+
+Note: Technical form
+numbers = [1, 2, 3, 4, 5]
+names = ["Alice", "Bob", "Charlie"]
+
+Note: Both compile to identical bytecode: List[Integer] and List[String]
+```
+
+#### Dictionary Creation
+```runa
+Note: Canonical form
+Let user be a dictionary containing:
+    "name" as "Alice",
+    "age" as 30,
+    "is_active" as true
+End Dictionary
+
+Note: Technical form
+user = {
+    "name": "Alice",
+    "age": 30,
+    "is_active": true
+}
+
+Note: Both compile to: Dictionary[String, Any]
+```
+
+#### Array Types
+```runa
+Note: Canonical form
+Let coordinates be an Array of 3 Floats
+Let matrix be an Array of 9 Integers containing 1, 2, 3, 4, 5, 6, 7, 8, 9
+
+Note: Technical form
+coordinates: Array[Float, 3]
+matrix: Array[Integer, 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+```
+
 ## Type Declarations
 
 ### Variable Type Annotations
 
+#### Canonical Form
 ```runa
 Note: Explicit type annotation
-Let user_name (String) be "Alice"
-Let user_age (Integer) be 30
-Let user_scores (List[Integer]) be list containing 85, 92, 78
+Let user_name as String be "Alice"
+Let user_age as Integer be 30
+Let user_scores as List[Integer] be a list containing 85, 92, 78
 
 Note: Type inference (preferred when obvious)
 Let user_name be "Alice"          Note: Inferred as String
 Let user_age be 30                Note: Inferred as Integer
-Let user_scores be list containing 85, 92, 78  Note: Inferred as List[Integer]
+Let user_scores be a list containing 85, 92, 78  Note: Inferred as List[Integer]
 ```
+
+#### Technical Form
+```runa
+Note: Explicit type annotation
+user_name: String = "Alice"
+user_age: Integer = 30
+user_scores: List[Integer] = [85, 92, 78]
+
+Note: Type inference (preferred when obvious)
+user_name = "Alice"          Note: Inferred as String
+user_age = 30                Note: Inferred as Integer
+user_scores = [85, 92, 78]   Note: Inferred as List[Integer]
+```
+
+#### Multi-Type Collections
+
+##### The Any Type (Discouraged)
+```runa
+Note: Canonical - requires explicit type checking
+Let mixed_list as List[Any] be a list containing 1, "hello", 3.14
+
+Note: Technical - requires explicit type checking
+mixed_list: List[Any] = [1, "hello", 3.14]
+```
+
+##### Union Types (Recommended)
+```runa
+Note: Define union type first for type safety
+Type StringIntFloat is String OR Integer OR Float
+
+Note: Canonical - type-safe mixed list
+Let mixed_list as List[StringIntFloat] be a list containing 1, "hello", 3.14
+
+Note: Technical - type-safe mixed list
+mixed_list: List[StringIntFloat] = [1, "hello", 3.14]
+```
+
+The compiler's type inference engine automatically determines:
+1. `[1, 2, 3]` → All integers → `List[Integer]`
+2. `["a", "b"]` → All strings → `List[String]`
+3. `[1, "hello", 3.14]` → Mixed types → `List[Any]` (requires explicit handling)
 
 ### Function Type Annotations
 
