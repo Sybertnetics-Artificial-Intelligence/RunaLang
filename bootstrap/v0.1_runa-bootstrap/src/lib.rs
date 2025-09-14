@@ -1,3 +1,4 @@
-pub mod compiler;
-pub mod runtime;
-pub mod utils;
+pub mod lexer;
+pub mod parser;
+pub mod codegen;
+pub mod types;

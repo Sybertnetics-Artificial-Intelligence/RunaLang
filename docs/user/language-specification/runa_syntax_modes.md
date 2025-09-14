@@ -84,20 +84,49 @@ Only operators change between Canon and Developer modes:
 | String concat | `joined with` | `++` |
 | Membership | `contains` | `in` |
 
+### Collection Literals Change Between Modes
+
+| Collection Type | Canon Mode | Developer Mode |
+|-----------------|------------|----------------|
+| List creation | `a list containing 1, 2, 3` | `[1, 2, 3]` |
+| Dictionary creation | `a dictionary containing: "key" as value End Dictionary` | `{"key": value}` |
+| Array type | `Array of 3 Floats` | `Array[Float, 3]` |
+| Index access | `list at index 0` | `list[0]` |
+| Length operation | `length of list` | `list.length()` |
+| Dictionary access | `dict at key "name"` | `dict["name"]` |
+| Dictionary keys | `all keys in dict` | `dict.keys()` |
+| List append | `Add item to end of list` | `list.append(item)` |
+| List insert | `Insert item at index 0 in list` | `list.insert(0, item)` |
+
 ## Examples
 
 ### Canon Mode Example
 ```runa
 Process called "calculate_area" that takes width as Float, height as Float returns Float:
     Let area be width multiplied by height
-    
+
     If area is greater than 100.0:
         Display "Large area: " joined with area
     Otherwise:
         Display "Small area: " joined with area
     End If
-    
+
     Return area
+End Process
+
+Process called "process_data":
+    Let numbers be a list containing 1, 2, 3, 4, 5
+    Let user be a dictionary containing:
+        "name" as "Alice",
+        "age" as 30
+    End Dictionary
+
+    Let first_num be numbers at index 0
+    Let user_name be user at key "name"
+    Let size be length of numbers
+
+    Add 6 to end of numbers
+    Set user at key "email" to "alice@example.com"
 End Process
 ```
 
@@ -105,14 +134,29 @@ End Process
 ```runa
 Process called "calculate_area" that takes width as Float, height as Float returns Float:
     Let area be width * height
-    
+
     If area > 100.0:
         Display "Large area: " ++ area
     Otherwise:
         Display "Small area: " ++ area
     End If
-    
+
     Return area
+End Process
+
+Process called "process_data":
+    Let numbers = [1, 2, 3, 4, 5]
+    Let user = {
+        "name": "Alice",
+        "age": 30
+    }
+
+    Let first_num = numbers[0]
+    Let user_name = user["name"]
+    Let size = numbers.length()
+
+    numbers.append(6)
+    user["email"] = "alice@example.com"
 End Process
 ```
 
