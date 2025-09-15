@@ -5,81 +5,38 @@ pub enum Type {
     String,
     Boolean,
     Void,
-    Named(String),
+    List(Box<Type>),
+    Array(Box<Type>, usize),
+    Dictionary(Box<Type>, Box<Type>),
+    Custom(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct Function {
-    pub name: String,
-    pub params: Vec<(String, Type)>,
-    pub return_type: Type,
-    pub body: Vec<Statement>,
-}
+impl Type {
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, Type::Integer | Type::Float)
+    }
 
-#[derive(Debug, Clone)]
-pub enum Statement {
-    Let { name: String, value: Expression },
-    Set { name: String, value: Expression },
-    Return { value: Option<Expression> },
-    Expression(Expression),
-    If { 
-        condition: Expression, 
-        then_body: Vec<Statement>,
-        else_ifs: Vec<(Expression, Vec<Statement>)>,
-        else_body: Option<Vec<Statement>>
-    },
-    While { condition: Expression, body: Vec<Statement> },
-    ForEach { variable: String, collection: Expression, body: Vec<Statement> },
-    Print { message: Expression },
-    ReadFile { filename: Expression, target: String },
-    WriteFile { filename: Expression, content: Expression },
-    InlineAssembly {
-        instructions: Vec<String>,
-        output_constraints: Vec<(String, String)>, // (constraint, variable)
-        input_constraints: Vec<(String, String)>,  // (constraint, variable)
-        clobbers: Vec<String>,
-    },
-}
+    pub fn is_comparable(&self) -> bool {
+        matches!(self, Type::Integer | Type::Float | Type::String)
+    }
 
-#[derive(Debug, Clone)]
-pub enum Expression {
-    Integer(i64),
-    Float(f64),
-    String(String),
-    Boolean(bool),
-    Variable(String),
-    Call { name: String, args: Vec<Expression> },
-    Binary { left: Box<Expression>, op: BinOp, right: Box<Expression> },
-    FieldAccess { object: Box<Expression>, field: String },
-    Constructor { type_name: String, fields: Vec<(String, Expression)> },
-}
+    pub fn is_logical(&self) -> bool {
+        matches!(self, Type::Boolean)
+    }
 
-#[derive(Debug, Clone)]
-pub enum BinOp {
-    Add, Sub, Mul, Div,
-    // Comparison operators
-    Equal, NotEqual,
-    Greater, Less,
-    GreaterOrEqual, LessOrEqual,
-    // Logical operators
-    And, Or,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeDefinition {
-    pub name: String,
-    pub fields: Vec<(String, Type)>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Import {
-    pub module_name: String,
-    pub alias: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct Program {
-    pub imports: Vec<Import>,
-    pub functions: Vec<Function>,
-    pub types: Vec<TypeDefinition>,
+    pub fn to_llvm_type(&self) -> String {
+        match self {
+            Type::Integer => "i64".to_string(),
+            Type::Float => "double".to_string(),
+            Type::Boolean => "i1".to_string(),
+            Type::String => "%struct.String*".to_string(),
+            Type::Void => "void".to_string(),
+            Type::List(_) => "%struct.List*".to_string(),
+            Type::Array(elem_type, size) => {
+                format!("[{} x {}]", size, elem_type.to_llvm_type())
+            }
+            Type::Dictionary(_, _) => "%struct.Dictionary*".to_string(),
+            Type::Custom(name) => format!("%struct.{}*", name),
+        }
+    }
 }
