@@ -723,9 +723,13 @@ impl Parser {
         let value = self.parse_expression()?;
         self.consume(TokenType::To)?;
         // Skip "end of" if present
-        if let TokenType::Identifier(s) = &self.peek().token_type {
+        // Check for both End keyword (due to case-insensitive lexing) and identifier "end"
+        if self.check(&TokenType::End) {
+            self.advance(); // consume "end" (as End keyword)
+            self.consume(TokenType::Of)?;
+        } else if let TokenType::Identifier(s) = &self.peek().token_type {
             if s == "end" {
-                self.advance(); // consume "end"
+                self.advance(); // consume "end" (as identifier)
                 self.consume(TokenType::Of)?;
             }
         }
