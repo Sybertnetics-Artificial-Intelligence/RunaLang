@@ -11,8 +11,11 @@ pub enum AstNode {
         variable: String,
         value: Box<AstNode>,
     },
-    PrintStatement {
+    DisplayStatement {
         value: Box<AstNode>,
+    },
+    NoteStatement {
+        content: String,
     },
     ReturnStatement {
         value: Option<Box<AstNode>>,
@@ -31,6 +34,22 @@ pub enum AstNode {
         parameters: Vec<Parameter>,
         return_type: Option<String>,
         body: Vec<AstNode>,
+    },
+    TypeDefinition {
+        name: String,
+        fields: Vec<Field>,
+    },
+    StructCreation {
+        type_name: String,
+        field_values: Vec<(String, AstNode)>,
+    },
+    FieldAccess {
+        object: Box<AstNode>,
+        field: String,
+    },
+    IndexAccess {
+        object: Box<AstNode>,
+        index: Box<AstNode>,
     },
     BinaryExpression {
         left: Box<AstNode>,
@@ -56,6 +75,12 @@ pub struct Parameter {
 }
 
 #[derive(Debug, Clone)]
+pub struct Field {
+    pub name: String,
+    pub field_type: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum BinaryOperator {
     Add,
     Subtract,
@@ -63,6 +88,8 @@ pub enum BinaryOperator {
     NotEqual,
     LessThan,
     GreaterThan,
+    LogicalOr,
+    LogicalAnd,
 }
 
 pub struct Parser {
@@ -93,11 +120,18 @@ impl Parser {
         match &self.current_token().token_type {
             TokenType::Let => self.parse_let_statement(),
             TokenType::Set => self.parse_set_statement(),
-            TokenType::Print => self.parse_print_statement(),
+            TokenType::Display => self.parse_display_statement(),
+            TokenType::Note => self.parse_note_statement(),
             TokenType::Return => self.parse_return_statement(),
             TokenType::If => self.parse_if_statement(),
             TokenType::While => self.parse_while_statement(),
             TokenType::Process => self.parse_process_definition(),
+            TokenType::Type => self.parse_type_definition(),
+            TokenType::Identifier(_) => {
+                // Could be a function call statement
+                let expr = self.parse_expression()?;
+                Ok(expr)
+            }
             TokenType::Eof => Err("Unexpected end of file".to_string()),
             _ => Err(format!("Unexpected token: {:?}", self.current_token().token_type)),
         }
@@ -155,16 +189,72 @@ impl Parser {
         })
     }
 
-    fn parse_print_statement(&mut self) -> Result<AstNode, String> {
-        // Consume 'Print'
-        self.expect_token(TokenType::Print)?;
+    fn parse_display_statement(&mut self) -> Result<AstNode, String> {
+        // Consume 'Display'
+        self.expect_token(TokenType::Display)?;
 
         // Parse value expression
         let value = self.parse_expression()?;
 
-        Ok(AstNode::PrintStatement {
+        Ok(AstNode::DisplayStatement {
             value: Box::new(value),
         })
+    }
+
+    fn parse_note_statement(&mut self) -> Result<AstNode, String> {
+        // Consume 'Note'
+        self.expect_token(TokenType::Note)?;
+
+        // Expect colon
+        self.expect_token(TokenType::Colon)?;
+
+        // Read all tokens until we reach the end of the current line
+        let mut content = String::new();
+        let note_line = self.current_token().line;
+
+        while !self.is_at_end() && self.current_token().line == note_line {
+            match &self.current_token().token_type {
+                TokenType::StringLiteral(s) => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str(s);
+                    self.advance();
+                }
+                TokenType::Identifier(s) => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str(s);
+                    self.advance();
+                }
+                TokenType::Type => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str("Type");
+                    self.advance();
+                }
+                TokenType::If => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str("If");
+                    self.advance();
+                }
+                TokenType::While => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str("While");
+                    self.advance();
+                }
+                TokenType::Process => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str("Process");
+                    self.advance();
+                }
+                TokenType::Eof => {
+                    break;
+                }
+                _ => {
+                    // For other tokens, convert to string representation
+                    self.advance();
+                }
+            }
+        }
+
+        Ok(AstNode::NoteStatement { content })
     }
 
     fn parse_return_statement(&mut self) -> Result<AstNode, String> {
@@ -247,7 +337,11 @@ impl Parser {
         // Consume 'End'
         if matches!(self.current_token().token_type, TokenType::End) {
             self.advance();
-            // We should also check for 'While' after 'End' but we'll skip that for now
+            // Optionally consume 'While' after 'End' for proper syntax validation
+            if matches!(self.current_token().token_type, TokenType::While) {
+                self.advance();
+            }
+            // Note: We allow both "End" and "End While" for flexibility in the bootstrap compiler
         }
 
         Ok(AstNode::WhileStatement {
@@ -279,73 +373,76 @@ impl Parser {
             _ => return Err("Expected process name after 'called'".to_string()),
         };
 
-        // Consume 'that'
-        self.expect_token(TokenType::That)?;
-
-        // Consume 'takes'
-        self.expect_token(TokenType::Takes)?;
-
-        // Parse parameters
+        // Check if we have 'that' (for parameters/returns) or go directly to colon for minimal syntax
         let mut parameters = Vec::new();
+        let return_type = if matches!(self.current_token().token_type, TokenType::That) {
+            // Consume 'that'
+            self.advance();
 
-        // Handle no parameters case
-        if matches!(self.current_token().token_type, TokenType::Returns) {
-            // No parameters, skip to returns
-        } else {
-            // Parse parameter list
-            loop {
-                // Get parameter name
-                let param_name = match &self.current_token().token_type {
-                    TokenType::Identifier(name) => {
-                        let name = name.clone();
-                        self.advance();
-                        name
-                    }
-                    _ => return Err("Expected parameter name".to_string()),
-                };
-
-                // Expect 'as'
-                if !matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "as") {
-                    return Err("Expected 'as' after parameter name".to_string());
-                }
+            // Parse parameters - check for 'takes' or directly 'returns'
+            if matches!(self.current_token().token_type, TokenType::Takes) {
+                // Consume 'takes'
                 self.advance();
 
-                // Get parameter type
-                let param_type = match &self.current_token().token_type {
+                // Parse parameter list (at least one parameter expected after 'takes')
+                loop {
+                    // Get parameter name
+                    let param_name = match &self.current_token().token_type {
+                        TokenType::Identifier(name) => {
+                            let name = name.clone();
+                            self.advance();
+                            name
+                        }
+                        _ => return Err("Expected parameter name after 'takes'".to_string()),
+                    };
+
+                    // Expect 'as'
+                    self.expect_token(TokenType::As)?;
+
+                    // Get parameter type
+                    let param_type = match &self.current_token().token_type {
+                        TokenType::Identifier(type_name) => {
+                            let type_name = type_name.clone();
+                            self.advance();
+                            type_name
+                        }
+                        _ => return Err("Expected parameter type after 'as'".to_string()),
+                    };
+
+                    parameters.push(Parameter {
+                        name: param_name,
+                        param_type,
+                    });
+
+                    // Check for comma (more parameters) or break
+                    if matches!(self.current_token().token_type, TokenType::Comma) {
+                        self.advance(); // consume comma
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Parse optional return type after 'that'
+            if matches!(self.current_token().token_type, TokenType::Returns) {
+                // Consume 'returns'
+                self.advance();
+
+                // Get return type
+                match &self.current_token().token_type {
                     TokenType::Identifier(type_name) => {
                         let type_name = type_name.clone();
                         self.advance();
-                        type_name
+                        Some(type_name)
                     }
-                    _ => return Err("Expected parameter type after 'as'".to_string()),
-                };
-
-                parameters.push(Parameter {
-                    name: param_name,
-                    param_type,
-                });
-
-                // Check for comma (more parameters) or break
-                if matches!(self.current_token().token_type, TokenType::Comma) {
-                    self.advance(); // consume comma
-                    continue;
-                } else {
-                    break;
+                    _ => None, // Optional return type after 'returns'
                 }
+            } else {
+                None // No 'returns' keyword means void function
             }
-        }
-
-        // Consume 'returns'
-        self.expect_token(TokenType::Returns)?;
-
-        // Get return type
-        let return_type = match &self.current_token().token_type {
-            TokenType::Identifier(type_name) => {
-                let type_name = type_name.clone();
-                self.advance();
-                Some(type_name)
-            }
-            _ => None, // Optional return type
+        } else {
+            None // No 'that' means completely minimal function (no params, no return)
         };
 
         // Expect colon
@@ -375,8 +472,114 @@ impl Parser {
         })
     }
 
+    fn parse_type_definition(&mut self) -> Result<AstNode, String> {
+        // Consume 'Type'
+        self.expect_token(TokenType::Type)?;
+
+        // Consume 'called'
+        self.expect_token(TokenType::Called)?;
+
+        // Get type name (should be a string literal or identifier)
+        let name = match &self.current_token().token_type {
+            TokenType::StringLiteral(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            TokenType::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            _ => return Err("Expected type name after 'called'".to_string()),
+        };
+
+        // Expect colon
+        self.expect_token(TokenType::Colon)?;
+
+        // Parse fields
+        let mut fields = Vec::new();
+        while !matches!(self.current_token().token_type, TokenType::End | TokenType::Eof) {
+            // Get field name
+            let field_name = match &self.current_token().token_type {
+                TokenType::Identifier(name) => {
+                    let name = name.clone();
+                    self.advance();
+                    name
+                }
+                _ => return Err("Expected field name in type definition".to_string()),
+            };
+
+            // Expect 'as'
+            self.expect_token(TokenType::As)?;
+
+            // Get field type
+            let field_type = match &self.current_token().token_type {
+                TokenType::Identifier(type_name) => {
+                    let type_name = type_name.clone();
+                    self.advance();
+                    type_name
+                }
+                _ => return Err("Expected field type after 'as'".to_string()),
+            };
+
+            fields.push(Field {
+                name: field_name,
+                field_type,
+            });
+        }
+
+        // Consume 'End'
+        if matches!(self.current_token().token_type, TokenType::End) {
+            self.advance();
+            // Optionally consume 'Type' after 'End'
+            if matches!(self.current_token().token_type, TokenType::Type) {
+                self.advance();
+            }
+        }
+
+        Ok(AstNode::TypeDefinition {
+            name,
+            fields,
+        })
+    }
+
     fn parse_expression(&mut self) -> Result<AstNode, String> {
-        self.parse_comparison_expression()
+        self.parse_logical_or_expression()
+    }
+
+    fn parse_logical_or_expression(&mut self) -> Result<AstNode, String> {
+        let mut left = self.parse_logical_and_expression()?;
+
+        while matches!(self.current_token().token_type, TokenType::Or) {
+            self.advance(); // consume 'Or'
+            let right = self.parse_logical_and_expression()?;
+
+            left = AstNode::BinaryExpression {
+                left: Box::new(left),
+                operator: BinaryOperator::LogicalOr,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn parse_logical_and_expression(&mut self) -> Result<AstNode, String> {
+        let mut left = self.parse_comparison_expression()?;
+
+        while matches!(self.current_token().token_type, TokenType::And) {
+            self.advance(); // consume 'And'
+            let right = self.parse_comparison_expression()?;
+
+            left = AstNode::BinaryExpression {
+                left: Box::new(left),
+                operator: BinaryOperator::LogicalAnd,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
     }
 
     fn parse_comparison_expression(&mut self) -> Result<AstNode, String> {
@@ -450,6 +653,11 @@ impl Parser {
                     return self.parse_list_literal();
                 }
 
+                // Check for struct creation syntax: "a value of type TypeName"
+                if name == "a" && matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "value") {
+                    return self.parse_struct_creation();
+                }
+
                 // Check if this is a function call (identifier followed by left paren)
                 if matches!(self.current_token().token_type, TokenType::LeftParen) {
                     self.advance(); // consume '('
@@ -476,7 +684,48 @@ impl Parser {
 
                     Ok(AstNode::FunctionCall { name, arguments })
                 } else {
-                    Ok(AstNode::Identifier(name))
+                    // Check for field access (dot notation) and index access (bracket notation)
+                    let mut current_expr = AstNode::Identifier(name);
+
+                    while matches!(self.current_token().token_type, TokenType::Dot | TokenType::LeftBracket) {
+                        match self.current_token().token_type {
+                            TokenType::Dot => {
+                                self.advance(); // consume dot
+
+                                // Get field name
+                                let field_name = match &self.current_token().token_type {
+                                    TokenType::Identifier(field) => {
+                                        let field = field.clone();
+                                        self.advance();
+                                        field
+                                    }
+                                    _ => return Err("Expected field name after '.'".to_string()),
+                                };
+
+                                current_expr = AstNode::FieldAccess {
+                                    object: Box::new(current_expr),
+                                    field: field_name,
+                                };
+                            }
+                            TokenType::LeftBracket => {
+                                self.advance(); // consume '['
+
+                                // Parse index expression
+                                let index_expr = self.parse_expression()?;
+
+                                // Expect closing bracket
+                                self.expect_token(TokenType::RightBracket)?;
+
+                                current_expr = AstNode::IndexAccess {
+                                    object: Box::new(current_expr),
+                                    index: Box::new(index_expr),
+                                };
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    Ok(current_expr)
                 }
             }
             _ => Err(format!("Unexpected token in expression: {:?}", self.current_token().token_type)),
@@ -524,6 +773,73 @@ impl Parser {
         }
 
         Ok(AstNode::ListLiteral { elements })
+    }
+
+    fn parse_struct_creation(&mut self) -> Result<AstNode, String> {
+        // We already consumed "a", now expect "value"
+        self.expect_token(TokenType::Identifier("value".to_string()))?;
+
+        // Expect "of"
+        if !matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "of") {
+            return Err("Expected 'of' after 'value'".to_string());
+        }
+        self.advance();
+
+        // Expect "type"
+        if !matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "type") {
+            return Err("Expected 'type' after 'of'".to_string());
+        }
+        self.advance();
+
+        // Get type name
+        let type_name = match &self.current_token().token_type {
+            TokenType::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            _ => return Err("Expected type name after 'type'".to_string()),
+        };
+
+        // Check for optional field initialization with "with"
+        let mut field_values = Vec::new();
+        if matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "with") {
+            self.advance(); // consume "with"
+
+            // Parse field assignments
+            loop {
+                // Get field name
+                let field_name = match &self.current_token().token_type {
+                    TokenType::Identifier(name) => {
+                        let name = name.clone();
+                        self.advance();
+                        name
+                    }
+                    _ => return Err("Expected field name in struct creation".to_string()),
+                };
+
+                // Expect 'as'
+                self.expect_token(TokenType::As)?;
+
+                // Get field value
+                let field_value = self.parse_expression()?;
+
+                field_values.push((field_name, field_value));
+
+                // Check for comma (more fields) or break
+                if matches!(self.current_token().token_type, TokenType::Comma) {
+                    self.advance(); // consume comma
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(AstNode::StructCreation {
+            type_name,
+            field_values,
+        })
     }
 
     fn expect_token(&mut self, expected: TokenType) -> Result<(), String> {

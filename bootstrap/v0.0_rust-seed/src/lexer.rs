@@ -5,7 +5,7 @@ pub enum TokenType {
     Be,
     Set,
     To,
-    Print,
+    Display,
 
     // Control flow
     If,
@@ -13,6 +13,7 @@ pub enum TokenType {
     End,
     While,
     Return,
+    Or,
 
     // Function definition
     Process,
@@ -20,6 +21,13 @@ pub enum TokenType {
     That,
     Takes,
     Returns,
+
+    // Comments
+    Note,
+
+    // Type definitions
+    Type,
+    As,
 
     // List operations
     List,
@@ -29,8 +37,11 @@ pub enum TokenType {
     // Punctuation
     LeftParen,
     RightParen,
+    LeftBracket,
+    RightBracket,
     Comma,
     Colon,
+    Dot,
 
     // Arithmetic operators
     Plus,
@@ -126,6 +137,14 @@ impl Lexer {
                 self.advance();
                 TokenType::RightParen
             }
+            '[' => {
+                self.advance();
+                TokenType::LeftBracket
+            }
+            ']' => {
+                self.advance();
+                TokenType::RightBracket
+            }
             ',' => {
                 self.advance();
                 TokenType::Comma
@@ -133,6 +152,31 @@ impl Lexer {
             ':' => {
                 self.advance();
                 TokenType::Colon
+            }
+            '.' => {
+                self.advance();
+                TokenType::Dot
+            }
+            '\\' => {
+                // Skip backslashes outside of string literals (they're handled in string processing)
+                self.advance();
+                self.skip_whitespace(); // Skip any whitespace after backslash
+                return self.next_token(); // Continue to next token
+            }
+            '-' => {
+                self.advance();
+                TokenType::Minus
+            }
+            '+' => {
+                self.advance();
+                TokenType::Plus
+            }
+            // Skip other punctuation and symbols that appear in comments
+            '=' | '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '_' | '|' |
+            '~' | '`' | '?' | '/' | '<' | '>' | ';' => {
+                self.advance();
+                self.skip_whitespace(); // Skip any whitespace after symbols
+                return self.next_token(); // Continue to next token
             }
             _ => return Err(format!("Unexpected character '{}' at line {}, column {}", ch, line, column)),
         };
@@ -159,17 +203,21 @@ impl Lexer {
             "be" => TokenType::Be,
             "Set" => TokenType::Set,
             "to" => TokenType::To,
-            "Print" => TokenType::Print,
+            "Display" => TokenType::Display,
             "If" => TokenType::If,
             "Otherwise" => TokenType::Otherwise,
             "End" => TokenType::End,
             "While" => TokenType::While,
             "Return" => TokenType::Return,
+            "Or" => TokenType::Or,
+            "And" => TokenType::And,  // Uppercase And for logical operations
             "Process" => TokenType::Process,
             "called" => TokenType::Called,
             "that" => TokenType::That,
             "takes" => TokenType::Takes,
             "returns" => TokenType::Returns,
+            "Type" => TokenType::Type,
+            "as" => TokenType::As,
             "list" => TokenType::List,
             "containing" => TokenType::Containing,
             "and" => TokenType::And,
@@ -198,6 +246,7 @@ impl Lexer {
                     TokenType::Identifier(value)
                 }
             }
+            "Note" => TokenType::Note,
             _ => TokenType::Identifier(value),
         };
 
@@ -367,12 +416,12 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let mut lexer = Lexer::new("Let be Print");
+        let mut lexer = Lexer::new("Let be Display");
         let tokens = lexer.tokenize().unwrap();
 
         assert_eq!(tokens[0].token_type, TokenType::Let);
         assert_eq!(tokens[1].token_type, TokenType::Be);
-        assert_eq!(tokens[2].token_type, TokenType::Print);
+        assert_eq!(tokens[2].token_type, TokenType::Display);
         assert_eq!(tokens[3].token_type, TokenType::Eof);
     }
 
