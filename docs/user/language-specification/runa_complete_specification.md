@@ -113,17 +113,20 @@ EOF                   ::= end of file token
 ### Identifiers and Keywords
 
 ```ebnf
-identifier            ::= /[a-zA-Z_][a-zA-Z0-9_]*/
+identifier            ::= /[a-zA-Z_][a-zA-Z0-9_ ]*/
 multi_word_identifier ::= identifier (SPACE identifier)*
 ```
 
 Identifier semantics (mode-scoped):
 
-1. Identifiers are case-sensitive in all modes.
-2. Canon (writeable): preserves author-provided spacing and underscores; multi-word identifiers are valid (e.g., `user name`).
-3. Developer (writeable): translates spaces to underscores during parsing/formatting, and preserves existing underscores (e.g., `user name` ↔ `user_name`).
-4. Viewer (read-only): displays underscores as spaces for readability.
-5. Cross-mode translation: Developer ↔ Canon round-trips preserve identifier semantics and intent; Canon defaults to spaces when translating back.
+1. **Case Sensitivity**: Identifiers are strictly case-sensitive in all modes. `myVariable`, `MyVariable`, and `MYVARIABLE` are distinct identifiers.
+2. **Canonical Forms**: Identifiers containing spaces or underscores as word separators are canonical forms where spaces and underscores are equivalent: `user_name` ≡ `user name`.
+3. **Non-Canonical Forms**: Identifiers using camelCase or PascalCase (e.g., `userName`, `UserName`) are NOT normalized and remain distinct atomic identifiers.
+4. **Canon (writeable)**: Supports both canonical forms with spaces/underscores and non-canonical forms, but idiomatically prefers spaced canonical form.
+5. **Developer (writeable)**: Same identifier rules as Canon mode; spaces/underscores equivalent only for canonical forms.
+6. **Viewer (read-only)**: Displays for maximum readability, converting underscores to spaces.
+7. **Compiler Normalization**: Only canonical forms (with spaces/underscores) are normalized. Non-canonical forms (camelCase/PascalCase) are preserved as distinct identifiers.
+8. **Style Enforcement**: Tooling actively discourages non-canonical forms through linting and auto-formatting to establish the spaced form as idiomatic Runa.
 
 **Reserved Keywords**: Let, Define, Set, If, Otherwise, Unless, When, Match, Process, Type, Import, Export, Try, Catch, Finally, For, While, Loop, Return, Yield, Break, Continue, Throw, Assert, Display, Delete, Await, Send, Receive, Spawn, New, Static, Public, Private, Async, External, Protocol
 
@@ -275,6 +278,56 @@ Constant APP_NAME as String is "MyApplication"
 Note: Variable assignment (mutation)
 Set count to count plus 1
 Set user.name to "Bob"
+```
+
+#### Identifier Normalization and Style Strategy
+
+Runa implements a unified identifier strategy that balances natural language philosophy with pragmatic interoperability.
+
+**Canonical Representation:**
+
+The compiler implements a **canonical representation** for identifiers where spaces and underscores (`_`) are treated as equivalent, interchangeable word separators. Consequently, `user name` and `user_name` resolve to the exact same symbol in the compiler.
+
+**Non-Canonical Forms (Not Normalized):**
+
+Conventions like `camelCase` and `PascalCase` (e.g., `userName`, `UserName`) are **NOT** automatically normalized or split. They are treated as distinct, atomic identifiers to ensure unambiguous parsing and maintain compatibility with external systems.
+
+**Core Rules:**
+
+1. **Case Sensitivity is Strict**: Every character's case matters
+   - `userName` ≠ `UserName` ≠ `username` (all different identifiers)
+   - `user_name` ≠ `userName` (different identifiers - one canonical, one non-canonical)
+
+2. **Space/Underscore Equivalence (Canonical Forms Only)**:
+   - `calculate_area` ≡ `calculate area` (same identifier - both canonical)
+   - `user_input_value` ≡ `user input value` (same identifier - both canonical)
+   - BUT: `calculateArea` is a completely different identifier (non-canonical)
+
+3. **Idiomatic Style Strategy**: Runa actively "pushes away" from non-canonical forms:
+   - **Documentation**: All official examples use only spaced canonical form (`user name`)
+   - **Tooling**: Standard linter warns against camelCase/PascalCase
+   - **Formatter**: Automatically converts `snake_case` to spaced form by default
+   - **Purpose**: Establish the spaced form as the clear "Runa Way"
+
+**Examples of Canonical Equivalence:**
+```runa
+Note: These all refer to the SAME identifier (canonical forms)
+Let result1 be calculate area(5.0)
+Let result2 be calculate_area(5.0)
+
+Note: These all refer to the SAME variable (canonical forms)
+Set user name to "Alice"
+Display user_name
+Return user name
+```
+
+**Examples of Non-Equivalent Identifiers:**
+```runa
+Note: These are ALL DIFFERENT identifiers
+Let a be calculateArea(5.0)    Note: Non-canonical (camelCase) - distinct identifier
+Let b be CalculateArea(5.0)    Note: Non-canonical (PascalCase) - distinct identifier
+Let c be calculate area(5.0)   Note: Canonical (spaced) - distinct from above
+Let d be calculate_area(5.0)   Note: Canonical (underscored) - same as 'c'
 ```
 
 ### Object Creation and Constructors
@@ -625,7 +678,7 @@ When the lexer encounters an identifier that matches a known function name, it t
 ```runa
 Note: Zero-argument functions
 Let time be current timestamp      Note: Calls current_timestamp()
-Let area be calculate area         Note: Calls calculate_area()
+Let area be calculate area         Note: Equivalent to calculate_area()
 
 Note: Functions with arguments use "with" or "given"
 Let result be calculate area with radius
@@ -798,7 +851,8 @@ Let circle be Shape.Circle with radius as 5.0
 Let rectangle be Shape.Rectangle with width as 4.0 and height as 3.0
 
 Note: Calculate area based on shape type
-Process called "calculate_area" that takes shape as Shape returns Float:
+Note: Using canonical spaced form (idiomatic Runa style)
+Process called "calculate area" that takes shape as Shape returns Float:
     Match shape:
         When Circle with radius as r:
             Return 3.14159 multiplied by r multiplied by r
@@ -2311,6 +2365,107 @@ Process called "safe_string_pass" that takes text as String returns String:
 2. **Lock Ordering**: Avoid deadlocks when crossing language boundaries
 3. **Signal Safety**: Be careful with signal handlers in mixed code
 4. **Exception Propagation**: Handle exceptions across language boundaries safely
+
+---
+
+## Development Tooling and Style Enforcement
+
+### Idiomatic Style Strategy
+
+Runa maintains its natural language philosophy through strategic tooling that establishes clear idiomatic patterns while preserving interoperability flexibility.
+
+#### Standard Linter
+
+The Runa linter enforces idiomatic style through graduated warnings:
+
+**Error Level:**
+- None (all valid identifiers compile successfully)
+
+**Warning Level:**
+- Use of camelCase identifiers (e.g., `userName`)
+- Use of PascalCase identifiers (e.g., `UserName`)
+- Mixed conventions in the same file
+
+**Info Level:**
+- Use of underscore separators when spaces are available
+- Suggestions for more natural phrasing
+
+**Example Linter Output:**
+```
+Warning: Non-idiomatic identifier 'calculateArea' at line 15
+  Suggestion: Use 'calculate area' for idiomatic Runa style
+
+Warning: File mixes identifier styles (found both 'userName' and 'user_data')
+  Suggestion: Use consistent spaced form throughout
+```
+
+#### Standard Formatter
+
+The Runa formatter provides configurable style enforcement:
+
+**Default Configuration:**
+```toml
+[formatter]
+convert_snake_to_spaced = true      # user_name → user name
+convert_camel_to_spaced = false     # userName remains (warning only)
+preserve_external_names = true      # Don't modify FFI identifiers
+```
+
+**Formatting Examples:**
+```runa
+Note: Before formatting
+Let user_name be getUserName()
+Let total_price be calculate_price(item_cost)
+
+Note: After formatting (default settings)
+Let user name be getUserName()    Note: snake_case converted
+Let total price be calculate price(item cost)  Note: all canonical forms use spaces
+```
+
+#### Documentation Standards
+
+All official Runa documentation follows strict style guidelines:
+
+1. **Only use spaced canonical form** in all examples
+2. **Never show camelCase/PascalCase** except when discussing interop
+3. **Demonstrate natural language** patterns consistently
+4. **Use meaningful, descriptive** multi-word identifiers
+
+**Documentation Example:**
+```runa
+Note: CORRECT - Idiomatic Runa style
+Process called "calculate shopping cart total" that takes cart items as List[Item] returns Float:
+    Let running total be 0.0
+    For Each item in cart items:
+        Let item price be get item price(item)
+        Set running total to running total plus item price
+    End For
+    Return running total
+End Process
+```
+
+#### IDE Integration
+
+Runa language servers and IDE plugins provide:
+
+1. **Auto-completion** that prioritizes spaced forms
+2. **Refactoring tools** to convert non-idiomatic code
+3. **Style hints** in real-time as you type
+4. **Import organization** that groups by style
+
+#### Migration Tools
+
+For transitioning existing codebases:
+
+```bash
+runa migrate --style canonical MyProject/
+```
+
+This tool:
+- Converts all snake_case to spaced form
+- Flags (but doesn't auto-convert) camelCase/PascalCase
+- Generates a migration report
+- Preserves external API boundaries
 
 ---
 

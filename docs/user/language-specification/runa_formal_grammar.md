@@ -56,19 +56,40 @@ Note: Comments are preserved as tokens for documentation generation, LSP feature
 ### Identifiers
 
 ```ebnf
-identifier            ::= letter (letter | digit | '_')*
+identifier            ::= letter (letter | digit | '_' | ' ')*
 multi_word_identifier ::= identifier (WHITESPACE identifier)*
 letter                ::= [a-zA-Z_]
 digit                 ::= [0-9]
 ```
 
-Identifier semantics (mode-scoped, normative):
+Identifier semantics (normative specification):
 
-1. Identifiers are case-sensitive.
-2. Canon preserves spaces and underscores as authored; multi-word identifiers are valid.
-3. Developer translates spaces to underscores and preserves underscores (e.g., `user name` ↔ `user_name`).
-4. Viewer displays underscores as spaces.
-5. Round-trip Canon ↔ Developer preserves identifier intent; Canon defaults to spaces when translating back.
+1. **Case Sensitivity**: Identifiers are strictly case-sensitive. `myVar` ≠ `MyVar` ≠ `MYVAR`.
+
+2. **Canonical Forms (Space/Underscore Normalized)**:
+   - Identifiers containing spaces or underscores as word separators
+   - Compiler treats `calculate_area` ≡ `calculate area` as the same symbol
+   - This is the idiomatic form promoted by all tooling
+
+3. **Non-Canonical Forms (Not Normalized)**:
+   - camelCase (e.g., `calculateArea`) and PascalCase (e.g., `CalculateArea`)
+   - Treated as distinct atomic identifiers, NOT split or normalized
+   - Preserved for interoperability but actively discouraged
+
+4. **Compilation Strategy**:
+   - Canonical forms: Normalized internally (spaces ≡ underscores)
+   - Non-canonical forms: Preserved exactly as written
+   - No compilation errors for any valid identifier form
+
+5. **Tooling Enforcement**:
+   - Linter: Warns on non-canonical forms
+   - Formatter: Auto-converts snake_case → spaced form (configurable)
+   - Documentation: Uses only canonical spaced form
+
+6. **Mode Behavior**:
+   - Canon/Developer: Same identifier rules apply
+   - Viewer: Displays for maximum readability
+   - Round-trip: Preserves semantic equivalence
 
 ### Keywords
 
