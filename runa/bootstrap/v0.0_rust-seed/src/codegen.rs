@@ -79,6 +79,9 @@ impl CodeGenerator {
         self.generate_main_body(ast)?;
         self.emit_main_footer();
 
+        // Add file I/O helper functions
+        self.emit_file_io_functions();
+
         // Finally, emit all string literals in the rodata section
         self.emit_string_literals();
 
@@ -98,8 +101,8 @@ impl CodeGenerator {
             AstNode::SetStatement { variable, value } => {
                 self.generate_set_statement_with_context(variable, value, fn_ctx)?;
             }
-            AstNode::PrintStatement { value } => {
-                self.generate_print_statement_with_context(value, fn_ctx)?;
+            AstNode::DisplayStatement { value } => {
+                self.generate_display_statement_with_context(value, fn_ctx)?;
             }
             AstNode::ReturnStatement { value } => {
                 self.generate_return_statement_with_context(value, fn_ctx)?;
@@ -142,8 +145,8 @@ impl CodeGenerator {
             AstNode::SetStatement { variable, value } => {
                 self.generate_set_statement(variable, value)?;
             }
-            AstNode::PrintStatement { value } => {
-                self.generate_print_statement(value)?;
+            AstNode::DisplayStatement { value } => {
+                self.generate_display_statement(value)?;
             }
             AstNode::ReturnStatement { value } => {
                 self.generate_return_statement(value)?;
@@ -167,6 +170,10 @@ impl CodeGenerator {
             AstNode::FieldAccess { .. } => {
                 // TODO: Implement field access code generation
                 return Err("Field access not yet implemented in codegen".to_string());
+            }
+            AstNode::FunctionCall { .. } => {
+                // Handle standalone function calls (like write_file)
+                self.generate_expression(node)?;
             }
             _ => return Err("Unsupported node type in code generation".to_string()),
         }
@@ -216,7 +223,7 @@ impl CodeGenerator {
         Ok(())
     }
 
-    fn generate_print_statement(&mut self, value: &AstNode) -> Result<(), String> {
+    fn generate_display_statement(&mut self, value: &AstNode) -> Result<(), String> {
         // Generate code for the value and put result in %rax
         self.generate_expression(value)?;
 
@@ -421,11 +428,33 @@ impl CodeGenerator {
                 // As a placeholder, just load the number of elements
                 self.emit(&format!("    movl ${}, %eax", elements.len()));
             }
-            AstNode::StructCreation { .. } => {
-                return Err("Struct creation not yet implemented in expression codegen".to_string());
+            AstNode::StructCreation { type_name, field_values } => {
+                // For now, create a simple struct on the stack
+                // Each field is 8 bytes (simple approach)
+                self.emit(&format!("    # Creating struct of type {}", type_name));
+
+                // Allocate space on stack (assume max 4 fields = 32 bytes for simplicity)
+                self.emit("    subq $32, %rsp");
+                let struct_base = self.stack_offset;
+                self.stack_offset += 32;
+
+                // Initialize fields (for now, just put in first field value)
+                if !field_values.is_empty() {
+                    let (_field_name, field_value) = &field_values[0];
+                    self.generate_expression(field_value)?;
+                    self.emit(&format!("    movq %rax, {}(%rsp)", struct_base));
+                }
+
+                // Return pointer to struct in %rax
+                self.emit(&format!("    leaq {}(%rsp), %rax", struct_base));
             }
-            AstNode::FieldAccess { .. } => {
-                return Err("Field access not yet implemented in expression codegen".to_string());
+            AstNode::FieldAccess { object, field } => {
+                // Generate code for the object (should return a pointer)
+                self.generate_expression(object)?;
+
+                // For now, assume field is at offset 0 (first field only)
+                self.emit(&format!("    # Accessing field '{}' at offset 0", field));
+                self.emit("    movq (%rax), %rax");
             }
             _ => return Err("Unsupported expression type".to_string()),
         }
@@ -834,6 +863,37 @@ impl CodeGenerator {
                     self.emit("    call printf@PLT");
                     Ok(())
                 }
+                "read_file" => {
+                    if arguments.len() != 1 {
+                        return Err(format!("read_file expects 1 argument, got {}", arguments.len()));
+                    }
+
+                    // Generate code for the filename argument
+                    self.generate_expression(&arguments[0])?;
+                    self.emit("    movq %rax, %rdi");  // filename to %rdi
+
+                    // Call our read_file helper function (we'll need to add this to runtime)
+                    self.emit("    call read_file_impl");
+                    // Result (file content string) will be in %rax
+                    Ok(())
+                }
+                "write_file" => {
+                    if arguments.len() != 2 {
+                        return Err(format!("write_file expects 2 arguments, got {}", arguments.len()));
+                    }
+
+                    // Generate code for filename (first argument)
+                    self.generate_expression(&arguments[0])?;
+                    self.emit("    movq %rax, %rdi");  // filename to %rdi
+
+                    // Generate code for content (second argument)
+                    self.generate_expression(&arguments[1])?;
+                    self.emit("    movq %rax, %rsi");  // content to %rsi
+
+                    // Call our write_file helper function
+                    self.emit("    call write_file_impl");
+                    Ok(())
+                }
                 _ => Err(format!("Unknown function: {}", name))
             }
         }
@@ -855,6 +915,120 @@ impl CodeGenerator {
         self.emit("    ret");
         self.emit("");
         self.emit("    .size main, .-main");
+    }
+
+    fn emit_file_io_functions(&mut self) {
+        self.emit("# File I/O helper functions");
+
+        // read_file_impl function
+        self.emit("read_file_impl:");
+        self.emit("    .type read_file_impl, @function");
+        self.emit("    pushq %rbp");
+        self.emit("    movq %rsp, %rbp");
+        self.emit("    subq $32, %rsp");
+
+        // Open file for reading
+        self.emit("    movq %rdi, -8(%rbp)");  // Save filename
+        self.emit("    movq %rdi, %rdi");       // filename
+        self.emit("    leaq .Lread_mode(%rip), %rsi");  // "r" mode
+        self.emit("    call fopen@PLT");
+        self.emit("    movq %rax, -16(%rbp)"); // Save file handle
+
+        // Check if file opened successfully
+        self.emit("    testq %rax, %rax");
+        self.emit("    je .Lread_error");
+
+        // Get file size
+        self.emit("    movq %rax, %rdi");      // file handle
+        self.emit("    movl $0, %esi");        // offset
+        self.emit("    movl $2, %edx");        // SEEK_END
+        self.emit("    call fseek@PLT");
+
+        self.emit("    movq -16(%rbp), %rdi"); // file handle
+        self.emit("    call ftell@PLT");
+        self.emit("    movq %rax, -24(%rbp)"); // Save file size
+
+        // Reset to beginning
+        self.emit("    movq -16(%rbp), %rdi"); // file handle
+        self.emit("    movl $0, %esi");        // offset
+        self.emit("    movl $0, %edx");        // SEEK_SET
+        self.emit("    call fseek@PLT");
+
+        // Allocate buffer
+        self.emit("    movq -24(%rbp), %rdi"); // file size
+        self.emit("    addq $1, %rdi");        // +1 for null terminator
+        self.emit("    call malloc@PLT");
+        self.emit("    movq %rax, -32(%rbp)"); // Save buffer
+
+        // Read file content
+        self.emit("    movq %rax, %rdi");      // buffer
+        self.emit("    movl $1, %esi");        // size = 1
+        self.emit("    movq -24(%rbp), %rdx"); // count = file size
+        self.emit("    movq -16(%rbp), %rcx"); // file handle
+        self.emit("    call fread@PLT");
+
+        // Null terminate
+        self.emit("    movq -32(%rbp), %rax"); // buffer
+        self.emit("    movq -24(%rbp), %rdx"); // file size
+        self.emit("    movb $0, (%rax,%rdx,1)"); // null terminate
+
+        // Close file
+        self.emit("    movq -16(%rbp), %rdi"); // file handle
+        self.emit("    call fclose@PLT");
+
+        // Return buffer
+        self.emit("    movq -32(%rbp), %rax");
+        self.emit("    leave");
+        self.emit("    ret");
+
+        self.emit(".Lread_error:");
+        self.emit("    movq $0, %rax");        // Return null on error
+        self.emit("    leave");
+        self.emit("    ret");
+        self.emit("");
+
+        // write_file_impl function
+        self.emit("write_file_impl:");
+        self.emit("    .type write_file_impl, @function");
+        self.emit("    pushq %rbp");
+        self.emit("    movq %rsp, %rbp");
+        self.emit("    subq $16, %rsp");
+
+        // Open file for writing
+        self.emit("    movq %rdi, -8(%rbp)");  // Save filename
+        self.emit("    movq %rsi, -16(%rbp)"); // Save content
+        self.emit("    leaq .Lwrite_mode(%rip), %rsi"); // "w" mode
+        self.emit("    call fopen@PLT");
+
+        // Check if file opened successfully
+        self.emit("    testq %rax, %rax");
+        self.emit("    je .Lwrite_error");
+
+        // Write content
+        self.emit("    movq %rax, %rdi");      // file handle
+        self.emit("    movq -16(%rbp), %rsi"); // content
+        self.emit("    call fputs@PLT");
+
+        // Close file
+        self.emit("    movq %rax, %rdi");      // file handle (returned by fopen)
+        self.emit("    call fclose@PLT");
+
+        self.emit("    leave");
+        self.emit("    ret");
+
+        self.emit(".Lwrite_error:");
+        self.emit("    leave");
+        self.emit("    ret");
+        self.emit("");
+
+        // Add string constants
+        self.emit("    .section .rodata");
+        self.emit(".Lread_mode:");
+        self.emit("    .string \"r\"");
+        self.emit(".Lwrite_mode:");
+        self.emit("    .string \"w\"");
+        self.emit("    .text");
+        self.emit("");
     }
 
     fn generate_main_body(&mut self, ast: &AstNode) -> Result<(), String> {
@@ -938,7 +1112,7 @@ impl CodeGenerator {
         Ok(())
     }
 
-    fn generate_print_statement_with_context(&mut self, value: &AstNode, fn_ctx: &mut FunctionGenContext) -> Result<(), String> {
+    fn generate_display_statement_with_context(&mut self, value: &AstNode, fn_ctx: &mut FunctionGenContext) -> Result<(), String> {
         // Generate code for the value and put result in %rax
         self.generate_expression_with_context(value, fn_ctx)?;
 
@@ -1133,11 +1307,32 @@ impl CodeGenerator {
                 // As a placeholder, just load the number of elements
                 self.emit(&format!("    movl ${}, %eax", elements.len()));
             }
-            AstNode::StructCreation { .. } => {
-                return Err("Struct creation not yet implemented in expression codegen with context".to_string());
+            AstNode::StructCreation { type_name, field_values } => {
+                // For now, create a simple struct on the stack
+                // Each field is 8 bytes (simple approach)
+                self.emit(&format!("    # Creating struct of type {}", type_name));
+
+                // Allocate space on stack (assume max 4 fields = 32 bytes for simplicity)
+                self.emit("    subq $32, %rsp");
+                fn_ctx.stack_offset += 32;
+
+                // Initialize fields (for now, just put in first field value)
+                if !field_values.is_empty() {
+                    let (_field_name, field_value) = &field_values[0];
+                    self.generate_expression_with_context(field_value, fn_ctx)?;
+                    self.emit(&format!("    movq %rax, {}(%rbp)", -fn_ctx.stack_offset));
+                }
+
+                // Return pointer to struct in %rax
+                self.emit(&format!("    leaq {}(%rbp), %rax", -fn_ctx.stack_offset));
             }
-            AstNode::FieldAccess { .. } => {
-                return Err("Field access not yet implemented in expression codegen with context".to_string());
+            AstNode::FieldAccess { object, field } => {
+                // Generate code for the object (should return a pointer)
+                self.generate_expression_with_context(object, fn_ctx)?;
+
+                // For now, assume field is at offset 0 (first field only)
+                self.emit(&format!("    # Accessing field '{}' at offset 0", field));
+                self.emit("    movq (%rax), %rax");
             }
             _ => return Err("Unsupported expression type".to_string()),
         }
@@ -1364,6 +1559,39 @@ impl CodeGenerator {
 
                     // 4. Return buffer
                     self.emit("    movq -80(%rbp), %rax");  // Return buffer pointer
+                }
+                "read_file" => {
+                    if arguments.len() != 1 {
+                        return Err(format!("read_file expects 1 argument, got {}", arguments.len()));
+                    }
+
+                    // Generate code for the filename argument
+                    self.generate_expression_with_context(&arguments[0], fn_ctx)?;
+                    self.emit("    movq %rax, %rdi");  // filename to %rdi
+
+                    // Call our read_file helper function
+                    self.emit("    call read_file_impl");
+                    // Result (file content string) will be in %rax
+                }
+                "write_file" => {
+                    if arguments.len() != 2 {
+                        return Err(format!("write_file expects 2 arguments, got {}", arguments.len()));
+                    }
+
+                    // Generate code for filename (first argument)
+                    self.generate_expression_with_context(&arguments[0], fn_ctx)?;
+                    self.emit("    movq %rax, %rdi");  // filename to %rdi
+                    self.emit("    pushq %rdi");  // Save filename
+
+                    // Generate code for content (second argument)
+                    self.generate_expression_with_context(&arguments[1], fn_ctx)?;
+                    self.emit("    movq %rax, %rsi");  // content to %rsi
+
+                    // Restore filename
+                    self.emit("    popq %rdi");
+
+                    // Call our write_file helper function
+                    self.emit("    call write_file_impl");
                 }
                 _ => return Err(format!("Unknown built-in function: {}", name)),
             }

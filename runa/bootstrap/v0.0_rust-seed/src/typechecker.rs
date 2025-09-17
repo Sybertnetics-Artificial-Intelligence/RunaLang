@@ -58,6 +58,14 @@ impl TypeChecker {
             parameters: vec![Type::String],
             return_type: Type::Void,
         });
+        functions.insert("read_file".to_string(), FunctionSignature {
+            parameters: vec![Type::String],
+            return_type: Type::String,
+        });
+        functions.insert("write_file".to_string(), FunctionSignature {
+            parameters: vec![Type::String, Type::String],
+            return_type: Type::Void,
+        });
 
         Self {
             variables: HashMap::new(),
@@ -128,8 +136,8 @@ impl TypeChecker {
                     return Err(format!("Undefined variable: {}", variable));
                 }
             }
-            AstNode::PrintStatement { value } => {
-                // Print accepts any type for now
+            AstNode::DisplayStatement { value } => {
+                // Display accepts any type for now
                 self.infer_type(value)?;
             }
             AstNode::ReturnStatement { value } => {

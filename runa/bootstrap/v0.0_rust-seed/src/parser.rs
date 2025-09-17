@@ -549,6 +549,11 @@ impl Parser {
                     return self.parse_list_literal();
                 }
 
+                // Check for struct creation syntax: "a value of type TypeName"
+                if name == "a" && matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "value") {
+                    return self.parse_struct_creation();
+                }
+
                 // Check if this is a function call (identifier followed by left paren)
                 if matches!(self.current_token().token_type, TokenType::LeftParen) {
                     self.advance(); // consume '('
@@ -575,7 +580,29 @@ impl Parser {
 
                     Ok(AstNode::FunctionCall { name, arguments })
                 } else {
-                    Ok(AstNode::Identifier(name))
+                    // Check for field access (dot notation)
+                    let mut current_expr = AstNode::Identifier(name);
+
+                    while matches!(self.current_token().token_type, TokenType::Dot) {
+                        self.advance(); // consume dot
+
+                        // Get field name
+                        let field_name = match &self.current_token().token_type {
+                            TokenType::Identifier(field) => {
+                                let field = field.clone();
+                                self.advance();
+                                field
+                            }
+                            _ => return Err("Expected field name after '.'".to_string()),
+                        };
+
+                        current_expr = AstNode::FieldAccess {
+                            object: Box::new(current_expr),
+                            field: field_name,
+                        };
+                    }
+
+                    Ok(current_expr)
                 }
             }
             _ => Err(format!("Unexpected token in expression: {:?}", self.current_token().token_type)),
@@ -623,6 +650,73 @@ impl Parser {
         }
 
         Ok(AstNode::ListLiteral { elements })
+    }
+
+    fn parse_struct_creation(&mut self) -> Result<AstNode, String> {
+        // We already consumed "a", now expect "value"
+        self.expect_token(TokenType::Identifier("value".to_string()))?;
+
+        // Expect "of"
+        if !matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "of") {
+            return Err("Expected 'of' after 'value'".to_string());
+        }
+        self.advance();
+
+        // Expect "type"
+        if !matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "type") {
+            return Err("Expected 'type' after 'of'".to_string());
+        }
+        self.advance();
+
+        // Get type name
+        let type_name = match &self.current_token().token_type {
+            TokenType::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            _ => return Err("Expected type name after 'type'".to_string()),
+        };
+
+        // Check for optional field initialization with "with"
+        let mut field_values = Vec::new();
+        if matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "with") {
+            self.advance(); // consume "with"
+
+            // Parse field assignments
+            loop {
+                // Get field name
+                let field_name = match &self.current_token().token_type {
+                    TokenType::Identifier(name) => {
+                        let name = name.clone();
+                        self.advance();
+                        name
+                    }
+                    _ => return Err("Expected field name in struct creation".to_string()),
+                };
+
+                // Expect 'as'
+                self.expect_token(TokenType::As)?;
+
+                // Get field value
+                let field_value = self.parse_expression()?;
+
+                field_values.push((field_name, field_value));
+
+                // Check for comma (more fields) or break
+                if matches!(self.current_token().token_type, TokenType::Comma) {
+                    self.advance(); // consume comma
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(AstNode::StructCreation {
+            type_name,
+            field_values,
+        })
     }
 
     fn expect_token(&mut self, expected: TokenType) -> Result<(), String> {
