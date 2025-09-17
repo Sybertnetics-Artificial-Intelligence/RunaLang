@@ -32,6 +32,18 @@ pub enum AstNode {
         return_type: Option<String>,
         body: Vec<AstNode>,
     },
+    TypeDefinition {
+        name: String,
+        fields: Vec<Field>,
+    },
+    StructCreation {
+        type_name: String,
+        field_values: Vec<(String, AstNode)>,
+    },
+    FieldAccess {
+        object: Box<AstNode>,
+        field: String,
+    },
     BinaryExpression {
         left: Box<AstNode>,
         operator: BinaryOperator,
@@ -53,6 +65,12 @@ pub enum AstNode {
 pub struct Parameter {
     pub name: String,
     pub param_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub name: String,
+    pub field_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +116,7 @@ impl Parser {
             TokenType::If => self.parse_if_statement(),
             TokenType::While => self.parse_while_statement(),
             TokenType::Process => self.parse_process_definition(),
+            TokenType::Type => self.parse_type_definition(),
             TokenType::Eof => Err("Unexpected end of file".to_string()),
             _ => Err(format!("Unexpected token: {:?}", self.current_token().token_type)),
         }
@@ -373,6 +392,78 @@ impl Parser {
             parameters,
             return_type,
             body,
+        })
+    }
+
+    fn parse_type_definition(&mut self) -> Result<AstNode, String> {
+        // Consume 'Type'
+        self.expect_token(TokenType::Type)?;
+
+        // Consume 'called'
+        self.expect_token(TokenType::Called)?;
+
+        // Get type name (should be a string literal or identifier)
+        let name = match &self.current_token().token_type {
+            TokenType::StringLiteral(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            TokenType::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            _ => return Err("Expected type name after 'called'".to_string()),
+        };
+
+        // Expect colon
+        self.expect_token(TokenType::Colon)?;
+
+        // Parse fields
+        let mut fields = Vec::new();
+        while !matches!(self.current_token().token_type, TokenType::End | TokenType::Eof) {
+            // Get field name
+            let field_name = match &self.current_token().token_type {
+                TokenType::Identifier(name) => {
+                    let name = name.clone();
+                    self.advance();
+                    name
+                }
+                _ => return Err("Expected field name in type definition".to_string()),
+            };
+
+            // Expect 'as'
+            self.expect_token(TokenType::As)?;
+
+            // Get field type
+            let field_type = match &self.current_token().token_type {
+                TokenType::Identifier(type_name) => {
+                    let type_name = type_name.clone();
+                    self.advance();
+                    type_name
+                }
+                _ => return Err("Expected field type after 'as'".to_string()),
+            };
+
+            fields.push(Field {
+                name: field_name,
+                field_type,
+            });
+        }
+
+        // Consume 'End'
+        if matches!(self.current_token().token_type, TokenType::End) {
+            self.advance();
+            // Optionally consume 'Type' after 'End'
+            if matches!(self.current_token().token_type, TokenType::Type) {
+                self.advance();
+            }
+        }
+
+        Ok(AstNode::TypeDefinition {
+            name,
+            fields,
         })
     }
 

@@ -21,6 +21,10 @@ pub enum TokenType {
     Takes,
     Returns,
 
+    // Type definitions
+    Type,
+    As,
+
     // List operations
     List,
     Containing,
@@ -31,6 +35,7 @@ pub enum TokenType {
     RightParen,
     Comma,
     Colon,
+    Dot,
 
     // Arithmetic operators
     Plus,
@@ -134,6 +139,10 @@ impl Lexer {
                 self.advance();
                 TokenType::Colon
             }
+            '.' => {
+                self.advance();
+                TokenType::Dot
+            }
             _ => return Err(format!("Unexpected character '{}' at line {}, column {}", ch, line, column)),
         };
 
@@ -170,6 +179,8 @@ impl Lexer {
             "that" => TokenType::That,
             "takes" => TokenType::Takes,
             "returns" => TokenType::Returns,
+            "Type" => TokenType::Type,
+            "as" => TokenType::As,
             "list" => TokenType::List,
             "containing" => TokenType::Containing,
             "and" => TokenType::And,
