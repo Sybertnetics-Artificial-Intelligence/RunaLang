@@ -34,7 +34,16 @@ fn main() {
     // Tokenize
     let mut lexer = Lexer::new(&source);
     let tokens = match lexer.tokenize() {
-        Ok(tokens) => tokens,
+        Ok(tokens) => {
+            // Debug: print tokens if output is "debug"
+            if output_file == "debug" {
+                for token in &tokens {
+                    println!("{:?}", token);
+                }
+                process::exit(0);
+            }
+            tokens
+        },
         Err(err) => {
             eprintln!("Lexer error: {}", err);
             process::exit(1);
