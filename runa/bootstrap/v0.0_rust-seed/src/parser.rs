@@ -282,55 +282,56 @@ impl Parser {
         // Consume 'that'
         self.expect_token(TokenType::That)?;
 
-        // Consume 'takes'
-        self.expect_token(TokenType::Takes)?;
-
-        // Parse parameters
+        // Parse parameters - "takes" is optional for parameterless functions
         let mut parameters = Vec::new();
 
-        // Handle no parameters case
-        if matches!(self.current_token().token_type, TokenType::Returns) {
-            // No parameters, skip to returns
-        } else {
-            // Parse parameter list
-            loop {
-                // Get parameter name
-                let param_name = match &self.current_token().token_type {
-                    TokenType::Identifier(name) => {
-                        let name = name.clone();
-                        self.advance();
-                        name
+        // Check if we have 'takes' or directly 'returns'
+        if matches!(self.current_token().token_type, TokenType::Takes) {
+            // Consume 'takes'
+            self.advance();
+
+            // Check if parameters follow, or if it's directly 'returns'
+            if !matches!(self.current_token().token_type, TokenType::Returns) {
+                // Parse parameter list
+                loop {
+                    // Get parameter name
+                    let param_name = match &self.current_token().token_type {
+                        TokenType::Identifier(name) => {
+                            let name = name.clone();
+                            self.advance();
+                            name
+                        }
+                        _ => return Err("Expected parameter name".to_string()),
+                    };
+
+                    // Expect 'as'
+                    if !matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "as") {
+                        return Err("Expected 'as' after parameter name".to_string());
                     }
-                    _ => return Err("Expected parameter name".to_string()),
-                };
+                    self.advance();
 
-                // Expect 'as'
-                if !matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "as") {
-                    return Err("Expected 'as' after parameter name".to_string());
-                }
-                self.advance();
+                    // Get parameter type
+                    let param_type = match &self.current_token().token_type {
+                        TokenType::Identifier(type_name) => {
+                            let type_name = type_name.clone();
+                            self.advance();
+                            type_name
+                        }
+                        _ => return Err("Expected parameter type after 'as'".to_string()),
+                    };
 
-                // Get parameter type
-                let param_type = match &self.current_token().token_type {
-                    TokenType::Identifier(type_name) => {
-                        let type_name = type_name.clone();
-                        self.advance();
-                        type_name
+                    parameters.push(Parameter {
+                        name: param_name,
+                        param_type,
+                    });
+
+                    // Check for comma (more parameters) or break
+                    if matches!(self.current_token().token_type, TokenType::Comma) {
+                        self.advance(); // consume comma
+                        continue;
+                    } else {
+                        break;
                     }
-                    _ => return Err("Expected parameter type after 'as'".to_string()),
-                };
-
-                parameters.push(Parameter {
-                    name: param_name,
-                    param_type,
-                });
-
-                // Check for comma (more parameters) or break
-                if matches!(self.current_token().token_type, TokenType::Comma) {
-                    self.advance(); // consume comma
-                    continue;
-                } else {
-                    break;
                 }
             }
         }

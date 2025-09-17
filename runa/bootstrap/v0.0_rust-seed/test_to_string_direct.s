@@ -14,7 +14,7 @@ main:
     pushq %rbp
     movq %rsp, %rbp
     subq $64, %rsp
-    movl $42, %eax
+    movl $123, %eax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rax
     # Store integer_value in its stack slot: -8(%rbp)

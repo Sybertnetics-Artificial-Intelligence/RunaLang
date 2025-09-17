@@ -6,6 +6,7 @@ pub struct FunctionInfo {
     pub parameters: Vec<Parameter>,
     pub return_type: Option<String>,
     pub label: String,
+    pub returns_string: bool,  // Track if function returns a string type
 }
 
 struct FunctionGenContext {
@@ -158,8 +159,13 @@ impl CodeGenerator {
         let is_string = match value {
             AstNode::StringLiteral(_) => true,
             AstNode::FunctionCall { name, .. } => {
-                // Functions that return strings
-                matches!(name.as_str(), "substring" | "concat" | "to_string")
+                // Check if it's a built-in that returns strings
+                if matches!(name.as_str(), "substring" | "concat" | "to_string") {
+                    true
+                } else {
+                    // Check if it's a user-defined function that returns strings
+                    self.functions.get(name).map(|f| f.returns_string).unwrap_or(false)
+                }
             }
             _ => false,
         };
@@ -200,8 +206,13 @@ impl CodeGenerator {
                 self.variable_types.get(name).copied().unwrap_or(false)
             }
             AstNode::FunctionCall { name, .. } => {
-                // Functions that return strings
-                matches!(name.as_str(), "substring" | "concat" | "to_string")
+                // Check if it's a built-in that returns strings
+                if matches!(name.as_str(), "substring" | "concat" | "to_string") {
+                    true
+                } else {
+                    // Check if it's a user-defined function that returns strings
+                    self.functions.get(name).map(|f| f.returns_string).unwrap_or(false)
+                }
             }
             _ => false,
         };
@@ -407,6 +418,7 @@ impl CodeGenerator {
             parameters: parameters.to_vec(),
             return_type: return_type.clone(),
             label: function_label.clone(),
+            returns_string: return_type.as_deref() == Some("String"),
         };
         self.functions.insert(name.to_string(), func_info);
 
@@ -418,18 +430,28 @@ impl CodeGenerator {
         // Function prologue
         self.emit("    pushq %rbp");
         self.emit("    movq %rsp, %rbp");
-        self.emit("    subq $64, %rsp");  // Reserve stack space
+        self.emit("    subq $128, %rsp");  // Reserve 128 bytes for locals and built-in temps
 
         // Save parameter registers to stack for parameter access
         // System V ABI: first 6 args in %rdi, %rsi, %rdx, %rcx, %r8, %r9
-        let param_registers = ["%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"];
-        let mut param_offset = 4;
+        let mut param_offset = 8;  // Start at 8 for alignment
 
         for (i, param) in parameters.iter().enumerate() {
-            if i < param_registers.len() {
-                self.emit(&format!("    movl {}, -{}(%rbp)", param_registers[i], param_offset));
-                fn_ctx.variables.insert(param.name.clone(), param_offset);
-                param_offset += 4;
+            if i < 6 {  // Only handle first 6 parameters
+                // Check parameter type to determine size
+                if param.param_type == "String" {
+                    // String parameters are pointers (64-bit)
+                    let reg = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"][i];
+                    self.emit(&format!("    movq {}, -{}(%rbp)", reg, param_offset));
+                    fn_ctx.variables.insert(param.name.clone(), param_offset);
+                    param_offset += 8;
+                } else {
+                    // Integer parameters (32-bit)
+                    let reg = ["%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"][i];
+                    self.emit(&format!("    movl {}, -{}(%rbp)", reg, param_offset));
+                    fn_ctx.variables.insert(param.name.clone(), param_offset);
+                    param_offset += 8;  // Still use 8-byte alignment for simplicity
+                }
             }
         }
 
@@ -463,8 +485,8 @@ impl CodeGenerator {
             let func_label = func_info.label.clone();
 
             // Generate code for arguments and pass them in registers
-            // System V ABI: first 6 integer args in %rdi, %rsi, %rdx, %rcx, %r8, %r9
-            let arg_registers = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+            // System V ABI: first 6 integer/pointer args in %rdi, %rsi, %rdx, %rcx, %r8, %r9
+            let _arg_registers = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
 
             if arguments.len() > 6 {
                 return Err("Function calls with more than 6 arguments not supported".to_string());
@@ -480,17 +502,18 @@ impl CodeGenerator {
             }
 
             // Now pop arguments and put them in registers (in reverse order)
-            let registers = ["%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"];
+            // Use 64-bit registers for proper pointer/integer passing
+            let registers = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
             for i in (0..arguments.len()).rev() {
                 if i < registers.len() {
                     self.emit("    popq %rax");
-                    self.emit(&format!("    movl %eax, {}", registers[i]));
+                    self.emit(&format!("    movq %rax, {}", registers[i]));
                 }
             }
 
             // Call the function
             self.emit(&format!("    call {}", func_label));
-            // Return value is now in %eax
+            // Return value is now in %rax (64-bit for pointers/integers)
 
             Ok(())
         } else {
@@ -852,8 +875,13 @@ impl CodeGenerator {
         let is_string = match value {
             AstNode::StringLiteral(_) => true,
             AstNode::FunctionCall { name, .. } => {
-                // Functions that return strings
-                matches!(name.as_str(), "substring" | "concat" | "to_string")
+                // Check if it's a built-in that returns strings
+                if matches!(name.as_str(), "substring" | "concat" | "to_string") {
+                    true
+                } else {
+                    // Check if it's a user-defined function that returns strings
+                    self.functions.get(name).map(|f| f.returns_string).unwrap_or(false)
+                }
             }
             _ => false,
         };
@@ -894,8 +922,13 @@ impl CodeGenerator {
                 fn_ctx.variable_types.get(name).copied().unwrap_or(false)
             }
             AstNode::FunctionCall { name, .. } => {
-                // Functions that return strings
-                matches!(name.as_str(), "substring" | "concat" | "to_string")
+                // Check if it's a built-in that returns strings
+                if matches!(name.as_str(), "substring" | "concat" | "to_string") {
+                    true
+                } else {
+                    // Check if it's a user-defined function that returns strings
+                    self.functions.get(name).map(|f| f.returns_string).unwrap_or(false)
+                }
             }
             _ => false,
         };
@@ -1010,6 +1043,8 @@ impl CodeGenerator {
             }
             AstNode::Identifier(name) => {
                 if let Some(&offset) = fn_ctx.variables.get(name) {
+                    // For now, always use movq to load full 64 bits
+                    // This works because we're now storing strings as 64-bit
                     self.emit(&format!("    movq -{}(%rbp), %rax", offset));
                 } else {
                     return Err(format!("Undefined variable: {}", name));
@@ -1099,27 +1134,30 @@ impl CodeGenerator {
             }
 
             // Now pop arguments and put them in registers (in reverse order)
-            let registers = ["%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"];
+            // Use 64-bit registers for proper pointer/integer passing
+            let registers = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
             for i in (0..arguments.len()).rev() {
                 if i < registers.len() {
                     self.emit("    popq %rax");
-                    self.emit(&format!("    movl %eax, {}", registers[i]));
+                    self.emit(&format!("    movq %rax, {}", registers[i]));
                 }
             }
 
             // Call the function
             self.emit(&format!("    call {}", func_label));
-            // Return value is now in %eax
+            // Return value is now in %rax (64-bit for pointers/integers)
 
             Ok(())
         } else {
-            // Handle built-in functions with context-aware expression generation
+            // Handle built-in functions as self-contained assembly blocks
+            // These are inlined assembly, not actual function calls, so no register saving needed
             match name {
                 "length_of" => {
                     if arguments.len() != 1 {
                         return Err("length_of expects exactly one argument".to_string());
                     }
 
+                    // Self-contained: generate argument without modifying caller's fn_ctx
                     self.generate_expression_with_context(&arguments[0], fn_ctx)?;
                     self.emit("    movq %rax, %rdi");
                     self.emit("    movq $0, %rax");
@@ -1130,29 +1168,36 @@ impl CodeGenerator {
                         return Err(format!("char_at expects 2 arguments, got {}", arguments.len()));
                     }
 
-                    // Generate code for string argument
+                    // Safe Stack Frame pattern with hardcoded offsets (doesn't modify fn_ctx)
+                    // Use offsets that are beyond the caller's stack usage (-72, -80, -88)
+
+                    // 1. Evaluate and store string argument
                     self.generate_expression_with_context(&arguments[0], fn_ctx)?;
-                    self.emit("    pushq %rax");  // Save string pointer
-                    self.emit("    pushq %rax");  // Save another copy for strlen
+                    self.emit("    movq %rax, -72(%rbp)");  // Save string pointer
 
-                    // Get string length first for bounds checking
-                    self.emit("    movq %rax, %rdi");  // String pointer as argument
-                    self.emit("    call strlen@PLT");  // Get length in %rax
-                    self.emit("    movl %eax, %edx");  // Length in %edx
-
-                    // Generate code for index argument
+                    // 2. Evaluate and store index argument
                     self.generate_expression_with_context(&arguments[1], fn_ctx)?;
-                    self.emit("    movl %eax, %ecx");  // Index in %ecx
+                    self.emit("    movl %eax, -80(%rbp)");  // Save index
 
-                    // Check bounds: if (index >= length || index < 0) return -1
+                    // 3. Get string length for bounds checking
+                    self.emit("    movq -72(%rbp), %rdi");
+                    self.emit("    call strlen@PLT");
+                    self.emit("    movl %eax, -84(%rbp)");  // Save length
+
+                    // 4. Bounds checking
                     let safe_label = format!(".safe_char_at_{}", self.label_counter);
                     let done_label = format!(".done_char_at_{}", self.label_counter);
                     self.label_counter += 1;
 
-                    self.emit("    testl %ecx, %ecx");  // Check if index < 0
-                    self.emit(&format!("    js {}", done_label));  // Jump to done if negative (return -1 in %eax)
-                    self.emit("    cmpl %edx, %ecx");  // Compare index with length
-                    self.emit(&format!("    jl {}", safe_label));  // Jump to safe if index < length
+                    // Check if index < 0
+                    self.emit("    movl -80(%rbp), %ecx");
+                    self.emit("    testl %ecx, %ecx");
+                    self.emit(&format!("    js {}", done_label));
+
+                    // Check if index >= length
+                    self.emit("    movl -84(%rbp), %edx");
+                    self.emit("    cmpl %edx, %ecx");
+                    self.emit(&format!("    jl {}", safe_label));
 
                     // Index out of bounds - return -1
                     self.emit("    movl $-1, %eax");
@@ -1160,125 +1205,135 @@ impl CodeGenerator {
 
                     // Safe access
                     self.emit(&format!("{}:", safe_label));
-                    self.emit("    popq %rax");  // Get original string pointer back
-                    self.emit("    addq %rcx, %rax");  // Add index to string pointer
-                    self.emit("    movzbl (%rax), %eax");  // Load character and zero-extend to full register
+                    self.emit("    movq -72(%rbp), %rax");  // Get string pointer
+                    self.emit("    movslq -80(%rbp), %rcx"); // Sign-extend index to 64-bit
+                    self.emit("    addq %rcx, %rax");       // Add index to string pointer
+                    self.emit("    movzbl (%rax), %eax");   // Load character
 
                     self.emit(&format!("{}:", done_label));
-                    // Clean up stack (we pushed twice)
-                    self.emit("    addq $8, %rsp");  // Remove one saved pointer (other was popped)
                 }
                 "substring" => {
                     if arguments.len() != 3 {
                         return Err("substring expects exactly three arguments".to_string());
                     }
 
-                    self.generate_expression_with_context(&arguments[0], fn_ctx)?;
-                    self.emit("    pushq %rax");
-                    self.generate_expression_with_context(&arguments[1], fn_ctx)?;
-                    self.emit("    pushq %rax");
-                    self.generate_expression_with_context(&arguments[2], fn_ctx)?;
-                    self.emit("    movl %eax, %edx");
-                    self.emit("    popq %rsi");
-                    self.emit("    popq %rdi");
+                    // Safe Stack Frame with hardcoded offsets (doesn't modify fn_ctx)
+                    // Use offsets beyond the caller's stack usage
 
-                    self.emit("    incl %edx");
-                    self.emit("    movl %edx, %edi");
+                    // 1. Evaluate and store arguments
+                    self.generate_expression_with_context(&arguments[0], fn_ctx)?;  // string
+                    self.emit("    movq %rax, -72(%rbp)");  // Save string pointer
+
+                    self.generate_expression_with_context(&arguments[1], fn_ctx)?;  // start
+                    self.emit("    movl %eax, -80(%rbp)");  // Save start index
+
+                    self.generate_expression_with_context(&arguments[2], fn_ctx)?;  // length
+                    self.emit("    movl %eax, -84(%rbp)");  // Save length
+
+                    // 2. Allocate buffer (length + 1 for null terminator)
+                    self.emit("    movslq -84(%rbp), %rdi"); // Sign-extend length to 64-bit
+                    self.emit("    addq $1, %rdi");         // Add 1 for null terminator
                     self.emit("    call malloc@PLT");
-                    self.emit("    pushq %rax");
+                    self.emit("    movq %rax, -92(%rbp)");  // Save buffer pointer
 
-                    self.emit("    popq %rax");
-                    self.emit("    popq %rsi");
-                    self.emit("    popq %rdi");
-                    self.emit("    pushq %rax");
-                    self.emit("    pushq %rsi");
-                    self.emit("    pushq %rdi");
-
-                    self.emit("    addq %rsi, %rdi");
-                    self.emit("    movq %rax, %rsi");
-                    self.emit("    movl %edx, %ecx");
-                    self.emit("    decl %ecx");
+                    // 3. Copy substring: memcpy(buffer, string + start, length)
+                    self.emit("    movq -92(%rbp), %rdi");   // buffer (dest)
+                    self.emit("    movq -72(%rbp), %rsi");   // string (src base)
+                    self.emit("    movslq -80(%rbp), %rax"); // start index (sign-extended)
+                    self.emit("    addq %rax, %rsi");        // src + start
+                    self.emit("    movslq -84(%rbp), %rdx"); // length (sign-extended)
                     self.emit("    call memcpy@PLT");
 
-                    self.emit("    popq %rdi");
-                    self.emit("    popq %rsi");
-                    self.emit("    popq %rax");
-                    self.emit("    movl %edx, %ecx");
-                    self.emit("    decl %ecx");
-                    self.emit("    addq %rcx, %rax");
-                    self.emit("    movb $0, (%rax)");
-                    self.emit("    subq %rcx, %rax");
+                    // 4. Add null terminator
+                    self.emit("    movq -92(%rbp), %rax");   // buffer
+                    self.emit("    movslq -84(%rbp), %rdx"); // length (sign-extended)
+                    self.emit("    movb $0, (%rax,%rdx,1)");
+
+                    // 5. Return buffer
+                    self.emit("    movq -92(%rbp), %rax");   // Return buffer pointer
                 }
                 "concat" => {
                     if arguments.len() != 2 {
                         return Err("concat expects exactly two arguments".to_string());
                     }
 
-                    self.generate_expression_with_context(&arguments[0], fn_ctx)?;
-                    self.emit("    pushq %rax");
-                    self.generate_expression_with_context(&arguments[1], fn_ctx)?;
-                    self.emit("    movq %rax, %rsi");
-                    self.emit("    popq %rdi");
+                    // Safe Stack Frame with hardcoded offsets (doesn't modify fn_ctx)
+                    // Use offsets beyond the caller's stack usage
 
-                    self.emit("    pushq %rdi");
-                    self.emit("    pushq %rsi");
+                    // 1. Evaluate and store string arguments
+                    self.generate_expression_with_context(&arguments[0], fn_ctx)?;  // str1
+                    self.emit("    movq %rax, -72(%rbp)");  // Save str1 pointer
+
+                    self.generate_expression_with_context(&arguments[1], fn_ctx)?;  // str2
+                    self.emit("    movq %rax, -80(%rbp)");  // Save str2 pointer
+
+                    // 2. Get lengths of both strings
+                    self.emit("    movq -72(%rbp), %rdi");  // str1
                     self.emit("    call strlen@PLT");
-                    self.emit("    pushq %rax");
-                    self.emit("    movq -8(%rsp), %rdi");
+                    self.emit("    movq %rax, -88(%rbp)");  // Save len1
+
+                    self.emit("    movq -80(%rbp), %rdi");  // str2
                     self.emit("    call strlen@PLT");
-                    self.emit("    popq %rcx");
-                    self.emit("    addq %rcx, %rax");
-                    self.emit("    incq %rax");
+                    self.emit("    movq %rax, -96(%rbp)");  // Save len2
+
+                    // 3. Allocate buffer (len1 + len2 + 1)
+                    self.emit("    movq -88(%rbp), %rax");  // len1
+                    self.emit("    addq -96(%rbp), %rax");  // len1 + len2
+                    self.emit("    incq %rax");             // +1 for null terminator
                     self.emit("    movq %rax, %rdi");
                     self.emit("    call malloc@PLT");
-                    self.emit("    popq %rsi");
-                    self.emit("    popq %rdi");
+                    self.emit("    movq %rax, -104(%rbp)"); // Save buffer
 
-                    self.emit("    pushq %rax");
-                    self.emit("    movq %rax, %rdx");
-                    self.emit("    call strcpy@PLT");
-                    self.emit("    popq %rax");
-                    self.emit("    pushq %rax");
-                    self.emit("    movq %rax, %rdi");
-                    self.emit("    call strcat@PLT");
-                    self.emit("    popq %rax");
+                    // 4. Copy str1 to buffer
+                    self.emit("    movq -104(%rbp), %rdi"); // buffer (dest)
+                    self.emit("    movq -72(%rbp), %rsi");  // str1 (src)
+                    self.emit("    movq -88(%rbp), %rdx");  // len1
+                    self.emit("    call memcpy@PLT");
+
+                    // 5. Copy str2 to buffer + len1
+                    self.emit("    movq -104(%rbp), %rdi"); // buffer
+                    self.emit("    addq -88(%rbp), %rdi");  // buffer + len1
+                    self.emit("    movq -80(%rbp), %rsi");  // str2 (src)
+                    self.emit("    movq -96(%rbp), %rdx");  // len2
+                    self.emit("    call memcpy@PLT");
+
+                    // 6. Add null terminator
+                    self.emit("    movq -104(%rbp), %rax"); // buffer
+                    self.emit("    movq -88(%rbp), %rdx");  // len1
+                    self.emit("    addq -96(%rbp), %rdx");  // len1 + len2
+                    self.emit("    movb $0, (%rax,%rdx,1)");
+
+                    // 7. Return buffer
+                    self.emit("    movq -104(%rbp), %rax"); // Return buffer pointer
                 }
                 "to_string" => {
                     if arguments.len() != 1 {
                         return Err(format!("to_string expects 1 argument, got {}", arguments.len()));
                     }
 
-                    // --- Phase 1: Evaluate Argument and Store in Stack Slot ---
+                    // Safe Stack Frame with hardcoded offsets (doesn't modify fn_ctx)
 
-                    // Generate code for integer argument
+                    // 1. Evaluate and store integer argument
                     self.generate_expression_with_context(&arguments[0], fn_ctx)?;
-                    self.emit("    # Store integer_value in its stack slot: -8(%rbp)");
-                    self.emit("    movl %eax, -8(%rbp)");  // Store 32-bit integer
+                    self.emit("    movl %eax, -72(%rbp)");  // Save integer value
 
-                    // --- Phase 2: Allocate Buffer ---
+                    // 2. Allocate buffer
+                    self.emit("    movl $12, %edi");
+                    self.emit("    call malloc@PLT");
+                    self.emit("    movq %rax, -80(%rbp)");  // Save buffer pointer
 
-                    self.emit("\n    # --- ToString: Allocate buffer ---");
-                    self.emit("    movl $12, %edi");       // Allocate 12 bytes (enough for 32-bit int + null)
-                    self.emit("    call malloc@PLT");      // Buffer address in %rax
-                    self.emit("    # Store buffer_ptr in its stack slot: -16(%rbp)");
-                    self.emit("    movq %rax, -16(%rbp)"); // Store 64-bit buffer pointer
+                    // 3. Call sprintf(buffer, "%d", integer)
+                    self.emit("    movq -80(%rbp), %rdi");  // buffer
+                    self.emit("    leaq .LC2(%rip), %rsi");  // "%d" format string
+                    self.emit("    movl -72(%rbp), %edx");  // integer value
+                    self.emit("    call sprintf@PLT");
 
-                    // --- Phase 3: sprintf Call ---
-
-                    self.emit("\n    # --- ToString: sprintf Call ---");
-                    self.emit("    movq -16(%rbp), %rdi"); // arg1: buffer_ptr (destination)
-                    self.emit("    leaq .LC2(%rip), %rsi"); // arg2: format string "%d"
-                    self.emit("    movl -8(%rbp), %edx");  // arg3: integer_value
-                    self.emit("    movq $0, %rax");        // Clear %rax for variadic call
-                    self.emit("    call sprintf@PLT");     // sprintf(buffer_ptr, "%d", integer_value)
-
-                    // --- Phase 4: Return Buffer Pointer ---
-
-                    self.emit("\n    # --- ToString: Return buffer pointer ---");
-                    self.emit("    movq -16(%rbp), %rax"); // Return buffer pointer
+                    // 4. Return buffer
+                    self.emit("    movq -80(%rbp), %rax");  // Return buffer pointer
                 }
                 _ => return Err(format!("Unknown built-in function: {}", name)),
             }
+
             Ok(())
         }
     }

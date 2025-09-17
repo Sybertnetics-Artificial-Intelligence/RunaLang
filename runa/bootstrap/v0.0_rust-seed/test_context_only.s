@@ -54,26 +54,17 @@ runa_function_test_to_string_only:
     movl $42, %eax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rax
-    # Store integer_value in its stack slot: -8(%rbp)
-    movl %eax, -8(%rbp)
-
-    # --- ToString: Allocate buffer ---
+    movl %eax, -12(%rbp)
     movl $12, %edi
     call malloc@PLT
-    # Store buffer_ptr in its stack slot: -16(%rbp)
-    movq %rax, -16(%rbp)
-
-    # --- ToString: sprintf Call ---
-    movq -16(%rbp), %rdi
+    movq %rax, -20(%rbp)
+    movq -20(%rbp), %rdi
     leaq .LC2(%rip), %rsi
-    movl -8(%rbp), %edx
-    movq $0, %rax
+    movl -12(%rbp), %edx
     call sprintf@PLT
-
-    # --- ToString: Return buffer pointer ---
-    movq -16(%rbp), %rax
-    movq %rax, -16(%rbp)
-    movq -16(%rbp), %rax
+    movq -20(%rbp), %rax
+    movq %rax, -28(%rbp)
+    movq -28(%rbp), %rax
     leave
     ret
     movl $0, %eax
