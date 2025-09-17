@@ -5,7 +5,7 @@ pub enum TokenType {
     Be,
     Set,
     To,
-    Print,
+    Display,
 
     // Control flow
     If,
@@ -168,7 +168,7 @@ impl Lexer {
             "be" => TokenType::Be,
             "Set" => TokenType::Set,
             "to" => TokenType::To,
-            "Print" => TokenType::Print,
+            "Display" => TokenType::Display,
             "If" => TokenType::If,
             "Otherwise" => TokenType::Otherwise,
             "End" => TokenType::End,

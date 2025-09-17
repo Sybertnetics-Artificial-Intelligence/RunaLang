@@ -113,6 +113,17 @@ impl CodeGenerator {
             AstNode::ProcessDefinition { name, parameters, return_type, body } => {
                 return Err("Process definitions should not be nested".to_string());
             }
+            AstNode::TypeDefinition { .. } => {
+                // Type definitions don't generate code, they're just declarations
+            }
+            AstNode::StructCreation { .. } => {
+                // TODO: Implement struct creation code generation
+                return Err("Struct creation not yet implemented in codegen".to_string());
+            }
+            AstNode::FieldAccess { .. } => {
+                // TODO: Implement field access code generation
+                return Err("Field access not yet implemented in codegen".to_string());
+            }
             _ => return Err("Unsupported node type in code generation".to_string()),
         }
         Ok(())
@@ -145,6 +156,17 @@ impl CodeGenerator {
             }
             AstNode::ProcessDefinition { name, parameters, return_type, body } => {
                 self.generate_process_definition(name, parameters, return_type, body)?;
+            }
+            AstNode::TypeDefinition { .. } => {
+                // Type definitions don't generate code, they're just declarations
+            }
+            AstNode::StructCreation { .. } => {
+                // TODO: Implement struct creation code generation
+                return Err("Struct creation not yet implemented in codegen".to_string());
+            }
+            AstNode::FieldAccess { .. } => {
+                // TODO: Implement field access code generation
+                return Err("Field access not yet implemented in codegen".to_string());
             }
             _ => return Err("Unsupported node type in code generation".to_string()),
         }
@@ -398,6 +420,12 @@ impl CodeGenerator {
 
                 // As a placeholder, just load the number of elements
                 self.emit(&format!("    movl ${}, %eax", elements.len()));
+            }
+            AstNode::StructCreation { .. } => {
+                return Err("Struct creation not yet implemented in expression codegen".to_string());
+            }
+            AstNode::FieldAccess { .. } => {
+                return Err("Field access not yet implemented in expression codegen".to_string());
             }
             _ => return Err("Unsupported expression type".to_string()),
         }
@@ -1104,6 +1132,12 @@ impl CodeGenerator {
                 self.emit(&format!("    # List literal with {} elements", elements.len()));
                 // As a placeholder, just load the number of elements
                 self.emit(&format!("    movl ${}, %eax", elements.len()));
+            }
+            AstNode::StructCreation { .. } => {
+                return Err("Struct creation not yet implemented in expression codegen with context".to_string());
+            }
+            AstNode::FieldAccess { .. } => {
+                return Err("Field access not yet implemented in expression codegen with context".to_string());
             }
             _ => return Err("Unsupported expression type".to_string()),
         }

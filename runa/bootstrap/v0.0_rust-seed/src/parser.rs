@@ -11,7 +11,7 @@ pub enum AstNode {
         variable: String,
         value: Box<AstNode>,
     },
-    PrintStatement {
+    DisplayStatement {
         value: Box<AstNode>,
     },
     ReturnStatement {
@@ -111,12 +111,17 @@ impl Parser {
         match &self.current_token().token_type {
             TokenType::Let => self.parse_let_statement(),
             TokenType::Set => self.parse_set_statement(),
-            TokenType::Print => self.parse_print_statement(),
+            TokenType::Display => self.parse_display_statement(),
             TokenType::Return => self.parse_return_statement(),
             TokenType::If => self.parse_if_statement(),
             TokenType::While => self.parse_while_statement(),
             TokenType::Process => self.parse_process_definition(),
             TokenType::Type => self.parse_type_definition(),
+            TokenType::Identifier(_) => {
+                // Could be a function call statement
+                let expr = self.parse_expression()?;
+                Ok(expr)
+            }
             TokenType::Eof => Err("Unexpected end of file".to_string()),
             _ => Err(format!("Unexpected token: {:?}", self.current_token().token_type)),
         }
@@ -174,14 +179,14 @@ impl Parser {
         })
     }
 
-    fn parse_print_statement(&mut self) -> Result<AstNode, String> {
-        // Consume 'Print'
-        self.expect_token(TokenType::Print)?;
+    fn parse_display_statement(&mut self) -> Result<AstNode, String> {
+        // Consume 'Display'
+        self.expect_token(TokenType::Display)?;
 
         // Parse value expression
         let value = self.parse_expression()?;
 
-        Ok(AstNode::PrintStatement {
+        Ok(AstNode::DisplayStatement {
             value: Box::new(value),
         })
     }
@@ -298,20 +303,18 @@ impl Parser {
             _ => return Err("Expected process name after 'called'".to_string()),
         };
 
-        // Consume 'that'
-        self.expect_token(TokenType::That)?;
-
-        // Parse parameters - "takes" is optional for parameterless functions
+        // Check if we have 'that' (for parameters/returns) or go directly to colon for minimal syntax
         let mut parameters = Vec::new();
-
-        // Check if we have 'takes' or directly 'returns'
-        if matches!(self.current_token().token_type, TokenType::Takes) {
-            // Consume 'takes'
+        let return_type = if matches!(self.current_token().token_type, TokenType::That) {
+            // Consume 'that'
             self.advance();
 
-            // Check if parameters follow, or if it's directly 'returns'
-            if !matches!(self.current_token().token_type, TokenType::Returns) {
-                // Parse parameter list
+            // Parse parameters - check for 'takes' or directly 'returns'
+            if matches!(self.current_token().token_type, TokenType::Takes) {
+                // Consume 'takes'
+                self.advance();
+
+                // Parse parameter list (at least one parameter expected after 'takes')
                 loop {
                     // Get parameter name
                     let param_name = match &self.current_token().token_type {
@@ -320,14 +323,11 @@ impl Parser {
                             self.advance();
                             name
                         }
-                        _ => return Err("Expected parameter name".to_string()),
+                        _ => return Err("Expected parameter name after 'takes'".to_string()),
                     };
 
                     // Expect 'as'
-                    if !matches!(self.current_token().token_type, TokenType::Identifier(ref word) if word == "as") {
-                        return Err("Expected 'as' after parameter name".to_string());
-                    }
-                    self.advance();
+                    self.expect_token(TokenType::As)?;
 
                     // Get parameter type
                     let param_type = match &self.current_token().token_type {
@@ -353,19 +353,26 @@ impl Parser {
                     }
                 }
             }
-        }
 
-        // Consume 'returns'
-        self.expect_token(TokenType::Returns)?;
-
-        // Get return type
-        let return_type = match &self.current_token().token_type {
-            TokenType::Identifier(type_name) => {
-                let type_name = type_name.clone();
+            // Parse optional return type after 'that'
+            if matches!(self.current_token().token_type, TokenType::Returns) {
+                // Consume 'returns'
                 self.advance();
-                Some(type_name)
+
+                // Get return type
+                match &self.current_token().token_type {
+                    TokenType::Identifier(type_name) => {
+                        let type_name = type_name.clone();
+                        self.advance();
+                        Some(type_name)
+                    }
+                    _ => None, // Optional return type after 'returns'
+                }
+            } else {
+                None // No 'returns' keyword means void function
             }
-            _ => None, // Optional return type
+        } else {
+            None // No 'that' means completely minimal function (no params, no return)
         };
 
         // Expect colon
