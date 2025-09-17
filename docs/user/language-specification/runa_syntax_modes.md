@@ -50,6 +50,51 @@ All keywords remain the same across Canon and Developer modes:
 | While | While | While |
 | Return | Return | Return |
 
+### Identifier Rules Across Modes
+
+Identifiers follow consistent normalization rules across all syntax modes:
+
+#### Canonical vs Non-Canonical Forms
+
+1. **Canonical Forms** (Normalized):
+   - Identifiers with spaces or underscores as separators
+   - `calculate_area` ≡ `calculate area` (treated as same identifier)
+   - This is the idiomatic "Runa Way"
+
+2. **Non-Canonical Forms** (Not Normalized):
+   - camelCase: `calculateArea`
+   - PascalCase: `CalculateArea`
+   - These remain distinct, atomic identifiers
+   - Supported for interoperability but discouraged
+
+3. **Case Sensitivity**: Always enforced
+   - `calculate` ≠ `Calculate` ≠ `CALCULATE`
+   - Applies to both canonical and non-canonical forms
+
+#### Style Enforcement Strategy
+
+Runa actively promotes canonical spaced forms through:
+
+- **Documentation**: All examples use `calculate area` style
+- **Linter Warnings**: Flags non-canonical forms
+- **Auto-Formatting**: Converts `snake_case` to spaced form
+- **No Compiler Errors**: All forms compile successfully
+
+**Idiomatic Examples (Recommended):**
+```runa
+Note: Canonical spaced form - THE RUNA WAY
+Let result be calculate area(5.0)
+Let user data be fetch user data()
+Set shopping cart total to 0.0
+```
+
+**Supported but Discouraged:**
+```runa
+Note: These work but trigger linter warnings
+Let result be calculateArea(5.0)    Note: Warning: Non-idiomatic camelCase
+Let data be getUserData()           Note: Warning: Non-idiomatic camelCase
+```
+
 ### Operators Change Between Modes
 Only operators change between Canon and Developer modes:
 
