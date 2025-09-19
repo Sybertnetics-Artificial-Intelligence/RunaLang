@@ -25,6 +25,10 @@ pub enum TokenType {
     // Comments
     Note,
 
+    // Module system
+    Import,
+    Module,
+
     // Type definitions
     Type,
     As,
@@ -198,6 +202,26 @@ impl Lexer {
             self.advance();
         }
 
+        // Special handling for Note comments - if we see "Note:" skip to end of line
+        if value == "Note" {
+            self.skip_whitespace();
+            if !self.is_at_end() && self.current_char() == ':' {
+                // Skip the colon
+                self.advance();
+                // Skip everything until end of line
+                while !self.is_at_end() && self.current_char() != '\n' {
+                    self.advance();
+                }
+                // Skip the newline too
+                if !self.is_at_end() && self.current_char() == '\n' {
+                    self.advance();
+                }
+                // Skip any whitespace and get next token
+                self.skip_whitespace();
+                return self.next_token();
+            }
+        }
+
         let token_type = match value.as_str() {
             "Let" => TokenType::Let,
             "be" => TokenType::Be,
@@ -247,6 +271,8 @@ impl Lexer {
                 }
             }
             "Note" => TokenType::Note,
+            "Import" => TokenType::Import,
+            "module" => TokenType::Module,
             _ => TokenType::Identifier(value),
         };
 
