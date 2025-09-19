@@ -17,6 +17,10 @@ pub enum AstNode {
     NoteStatement {
         content: String,
     },
+    ImportStatement {
+        module_path: String,
+        alias_name: String,
+    },
     ReturnStatement {
         value: Option<Box<AstNode>>,
     },
@@ -122,6 +126,7 @@ impl Parser {
             TokenType::Set => self.parse_set_statement(),
             TokenType::Display => self.parse_display_statement(),
             TokenType::Note => self.parse_note_statement(),
+            TokenType::Import => self.parse_import_statement(),
             TokenType::Return => self.parse_return_statement(),
             TokenType::If => self.parse_if_statement(),
             TokenType::While => self.parse_while_statement(),
@@ -257,12 +262,47 @@ impl Parser {
         Ok(AstNode::NoteStatement { content })
     }
 
+    fn parse_import_statement(&mut self) -> Result<AstNode, String> {
+        // Consume 'Import'
+        self.expect_token(TokenType::Import)?;
+
+        // Consume 'module'
+        self.expect_token(TokenType::Module)?;
+
+        // Get module path (string literal)
+        let module_path = match &self.current_token().token_type {
+            TokenType::StringLiteral(path) => {
+                let path = path.clone();
+                self.advance();
+                path
+            }
+            _ => return Err("Expected string literal for module path after 'module'".to_string()),
+        };
+
+        // Consume 'as'
+        self.expect_token(TokenType::As)?;
+
+        // Get alias name
+        let alias_name = match &self.current_token().token_type {
+            TokenType::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            _ => return Err("Expected identifier for alias name after 'as'".to_string()),
+        };
+
+        Ok(AstNode::ImportStatement { module_path, alias_name })
+    }
+
     fn parse_return_statement(&mut self) -> Result<AstNode, String> {
         // Consume 'Return'
         self.expect_token(TokenType::Return)?;
 
         // Check if there's a value to return
-        let value = if matches!(self.current_token().token_type, TokenType::Eof) {
+        let value = if matches!(self.current_token().token_type,
+            TokenType::Eof | TokenType::End | TokenType::Otherwise
+        ) {
             None
         } else {
             Some(Box::new(self.parse_expression()?))
@@ -728,7 +768,7 @@ impl Parser {
                     Ok(current_expr)
                 }
             }
-            _ => Err(format!("Unexpected token in expression: {:?}", self.current_token().token_type)),
+            _ => Err(format!("Unexpected token in expression: {:?} at line {}", self.current_token().token_type, self.current_token().line)),
         }
     }
 
