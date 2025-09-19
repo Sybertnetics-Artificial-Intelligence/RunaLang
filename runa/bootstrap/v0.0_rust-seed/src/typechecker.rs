@@ -8,6 +8,7 @@ pub enum Type {
     Void,
     Unknown,
     Custom(String), // For user-defined types/structs
+    List(Box<Type>), // List type with element type
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +68,40 @@ impl TypeChecker {
             return_type: Type::Void,
         });
 
+        // String utility functions
+        functions.insert("split".to_string(), FunctionSignature {
+            parameters: vec![Type::String, Type::String],
+            return_type: Type::Integer, // Placeholder - will return array count
+        });
+        functions.insert("trim".to_string(), FunctionSignature {
+            parameters: vec![Type::String],
+            return_type: Type::String,
+        });
+        functions.insert("starts_with".to_string(), FunctionSignature {
+            parameters: vec![Type::String, Type::String],
+            return_type: Type::Integer, // Boolean as integer (0/1)
+        });
+        functions.insert("ends_with".to_string(), FunctionSignature {
+            parameters: vec![Type::String, Type::String],
+            return_type: Type::Integer, // Boolean as integer (0/1)
+        });
+        functions.insert("contains".to_string(), FunctionSignature {
+            parameters: vec![Type::String, Type::String],
+            return_type: Type::Integer, // Boolean as integer (0/1)
+        });
+        functions.insert("replace".to_string(), FunctionSignature {
+            parameters: vec![Type::String, Type::String, Type::String],
+            return_type: Type::String,
+        });
+        functions.insert("to_upper".to_string(), FunctionSignature {
+            parameters: vec![Type::String],
+            return_type: Type::String,
+        });
+        functions.insert("to_lower".to_string(), FunctionSignature {
+            parameters: vec![Type::String],
+            return_type: Type::String,
+        });
+
         Self {
             variables: HashMap::new(),
             functions,
@@ -82,9 +117,13 @@ impl TypeChecker {
     fn check_node(&mut self, node: &AstNode) -> Result<(), String> {
         match node {
             AstNode::Program(statements) => {
-                // First pass: collect function signatures and struct definitions
+                // First pass: collect function signatures, struct definitions, and global variables
                 for stmt in statements {
                     match stmt {
+                        AstNode::GlobalLetStatement { variable, value } => {
+                            let value_type = self.infer_type(value)?;
+                            self.variables.insert(variable.clone(), value_type);
+                        }
                         AstNode::ProcessDefinition { name, parameters, return_type, .. } => {
                             let param_types: Vec<Type> = parameters.iter()
                                 .map(|p| self.parse_type(&p.param_type))
@@ -118,6 +157,10 @@ impl TypeChecker {
                 for stmt in statements {
                     self.check_node(stmt)?;
                 }
+            }
+            AstNode::GlobalLetStatement { variable, value } => {
+                let value_type = self.infer_type(value)?;
+                self.variables.insert(variable.clone(), value_type);
             }
             AstNode::LetStatement { variable, value } => {
                 let value_type = self.infer_type(value)?;
@@ -205,6 +248,12 @@ impl TypeChecker {
                     self.check_node(stmt)?;
                 }
             }
+            AstNode::BreakStatement => {
+                // Valid inside loops; no type effect
+            }
+            AstNode::ContinueStatement => {
+                // Valid inside loops; no type effect
+            }
             AstNode::TypeDefinition { .. } => {
                 // Type definitions are handled in the first pass
             }
@@ -215,14 +264,73 @@ impl TypeChecker {
                 }
 
                 // Type check field assignments
-                for (field_name, value) in field_values {
-                    let _value_type = self.infer_type(value)?;
-                    // TODO: Check field name exists and type matches
+                let struct_def = self.structs.get(type_name).cloned();
+                if let Some(struct_def) = struct_def {
+                    for (field_name, value) in field_values {
+                        let value_type = self.infer_type(value)?;
+
+                        // Check if field exists in struct definition
+                        let mut field_found = false;
+                        for field_def in &struct_def.fields {
+                            if field_def.name == *field_name {
+                                field_found = true;
+
+                                // Check if value type matches expected field type
+                                let expected_type = self.parse_type(&field_def.field_type);
+                                if value_type != expected_type {
+                                    return Err(format!(
+                                        "Type mismatch for field '{}' in struct '{}': expected {:?}, got {:?}",
+                                        field_name, type_name, expected_type, value_type
+                                    ));
+                                }
+                                break;
+                            }
+                        }
+
+                        if !field_found {
+                            return Err(format!(
+                                "Field '{}' does not exist in struct '{}'",
+                                field_name, type_name
+                            ));
+                        }
+                    }
                 }
             }
-            AstNode::FieldAccess { object, field: _ } => {
+            AstNode::FieldAccess { object, field } => {
+                let object_type = self.infer_type(object)?;
+
+                // Validate field access based on object type
+                if let Type::Custom(struct_name) = object_type {
+                    if let Some(struct_def) = self.structs.get(&struct_name) {
+                        // Check if field exists in struct definition
+                        let mut field_found = false;
+                        for field_def in &struct_def.fields {
+                            if field_def.name == *field {
+                                field_found = true;
+                                break;
+                            }
+                        }
+
+                        if !field_found {
+                            return Err(format!(
+                                "Field '{}' does not exist in struct '{}'",
+                                field, struct_name
+                            ));
+                        }
+                    } else {
+                        return Err(format!("Unknown struct type: {}", struct_name));
+                    }
+                } else {
+                    return Err(format!(
+                        "Cannot access field '{}' on non-struct type {:?}",
+                        field, object_type
+                    ));
+                }
+            }
+            AstNode::IndexAccess { object, index } => {
                 let _object_type = self.infer_type(object)?;
-                // TODO: Check field exists and get its type
+                let _index_type = self.infer_type(index)?;
+                // Type checking for index access is handled in infer_type
             }
             _ => {
                 // For expressions, just infer their type
@@ -243,21 +351,48 @@ impl TypeChecker {
                     Err(format!("Undefined variable: {}", name))
                 }
             }
-            AstNode::BinaryExpression { left, right, .. } => {
-                let left_type = self.infer_type(left)?;
-                let right_type = self.infer_type(right)?;
+            AstNode::BinaryExpression { left, right, operator } => {
+                use crate::parser::BinaryOperator::*;
+                // Infer operand types first
+                let lt = self.infer_type(left)?;
+                let rt = self.infer_type(right)?;
 
-                // For arithmetic operations, both sides should be the same type
-                if left_type != right_type {
-                    return Err(format!(
-                        "Type mismatch in binary expression: {:?} and {:?}",
-                        left_type, right_type
-                    ));
+                match operator {
+                    // Arithmetic: require integers, return Integer
+                    Add | Subtract | Multiply | Divide => {
+                        if !matches!(lt, Type::Integer) || !matches!(rt, Type::Integer) {
+                            return Err(format!("Arithmetic operands must be Integer, got left={:?}, right={:?}", lt, rt));
+                        }
+                        Ok(Type::Integer)
+                    }
+                    // Comparisons: operands must be same type, result is Integer (boolean)
+                    Equal | NotEqual | LessThan | GreaterThan | LessThanOrEqual | GreaterThanOrEqual => {
+                        if lt != rt {
+                            return Err(format!("Comparison operands must have same type, got {:?} and {:?}", lt, rt));
+                        }
+                        Ok(Type::Integer)
+                    }
+                    // Logical ops: treat non-zero as true; both Integer; result Integer
+                    LogicalAnd | LogicalOr => {
+                        if !matches!(lt, Type::Integer) || !matches!(rt, Type::Integer) {
+                            return Err(format!("Logical operands must be Integer, got left={:?}, right={:?}", lt, rt));
+                        }
+                        Ok(Type::Integer)
+                    }
                 }
-
-                Ok(left_type)
             }
             AstNode::FunctionCall { name, arguments } => {
+                // Built-in functions without signatures
+                if name == "get_argc" {
+                    if !arguments.is_empty() { return Err("get_argc expects 0 arguments".to_string()); }
+                    return Ok(Type::Integer);
+                }
+                if name == "get_argv" {
+                    if arguments.len() != 1 { return Err("get_argv expects 1 argument".to_string()); }
+                    let idx_ty = self.infer_type(&arguments[0])?;
+                    if idx_ty != Type::Integer { return Err("get_argv index must be Integer".to_string()); }
+                    return Ok(Type::String);
+                }
                 // Clone the signature to avoid borrowing issues
                 if let Some(signature) = self.functions.get(name).cloned() {
                     // Check argument count
@@ -284,9 +419,27 @@ impl TypeChecker {
                     Err(format!("Unknown function: {}", name))
                 }
             }
-            AstNode::ListLiteral { .. } => {
-                // For now, lists are untyped
-                Ok(Type::Integer) // Placeholder - return count as integer
+            AstNode::ListLiteral { elements } => {
+                if elements.is_empty() {
+                    // Empty list - infer as List of Unknown for now
+                    Ok(Type::List(Box::new(Type::Unknown)))
+                } else {
+                    // Infer element type from first element
+                    let first_element_type = self.infer_type(&elements[0])?;
+
+                    // Check that all elements have the same type
+                    for element in &elements[1..] {
+                        let element_type = self.infer_type(element)?;
+                        if element_type != first_element_type {
+                            return Err(format!(
+                                "List elements must have the same type. Found {:?} and {:?}",
+                                first_element_type, element_type
+                            ));
+                        }
+                    }
+
+                    Ok(Type::List(Box::new(first_element_type)))
+                }
             }
             AstNode::StructCreation { type_name, .. } => {
                 // Return the custom type
@@ -308,6 +461,31 @@ impl TypeChecker {
                     }
                 } else {
                     Err(format!("Cannot access field '{}' on non-struct type {:?}", field, object_type))
+                }
+            }
+            AstNode::IndexAccess { object, index } => {
+                let object_type = self.infer_type(object)?;
+                let index_type = self.infer_type(index)?;
+
+                // Index must be an integer
+                if !matches!(index_type, Type::Integer) {
+                    return Err(format!("List index must be Integer, got {:?}", index_type));
+                }
+
+                // Check what type of object we're indexing
+                match object_type {
+                    Type::List(element_type) => {
+                        // Return the element type of the list
+                        Ok(*element_type)
+                    }
+                    Type::String => {
+                        // String indexing returns character (as Integer for simplicity)
+                        Ok(Type::Integer)
+                    }
+                    Type::Integer => Err(format!("Cannot index into Integer")),
+                    Type::Void => Err(format!("Cannot index into Void")),
+                    Type::Unknown => Err(format!("Cannot index into Unknown type")),
+                    Type::Custom(type_name) => Err(format!("Cannot index into custom type '{}'", type_name)),
                 }
             }
             _ => Ok(Type::Unknown),

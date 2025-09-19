@@ -7,12 +7,23 @@ pub enum AstNode {
         variable: String,
         value: Box<AstNode>,
     },
+    GlobalLetStatement {
+        variable: String,
+        value: Box<AstNode>,
+    },
     SetStatement {
         variable: String,
         value: Box<AstNode>,
     },
     DisplayStatement {
         value: Box<AstNode>,
+    },
+    NoteStatement {
+        content: String,
+    },
+    ImportStatement {
+        module_path: String,
+        alias_name: String,
     },
     ReturnStatement {
         value: Option<Box<AstNode>>,
@@ -26,6 +37,8 @@ pub enum AstNode {
         condition: Box<AstNode>,
         body: Vec<AstNode>,
     },
+    BreakStatement,
+    ContinueStatement,
     ProcessDefinition {
         name: String,
         parameters: Vec<Parameter>,
@@ -43,6 +56,10 @@ pub enum AstNode {
     FieldAccess {
         object: Box<AstNode>,
         field: String,
+    },
+    IndexAccess {
+        object: Box<AstNode>,
+        index: Box<AstNode>,
     },
     BinaryExpression {
         left: Box<AstNode>,
@@ -77,10 +94,16 @@ pub struct Field {
 pub enum BinaryOperator {
     Add,
     Subtract,
+    Multiply,
+    Divide,
     Equal,
     NotEqual,
     LessThan,
     GreaterThan,
+    LessThanOrEqual,
+    GreaterThanOrEqual,
+    LogicalOr,
+    LogicalAnd,
 }
 
 pub struct Parser {
@@ -100,21 +123,175 @@ impl Parser {
         let mut statements = Vec::new();
 
         while !self.is_at_end() {
-            let stmt = self.parse_statement()?;
+            let stmt = self.parse_top_level_statement()?;
             statements.push(stmt);
         }
 
         Ok(AstNode::Program(statements))
     }
 
+    fn match_identifier(&self, word: &str) -> bool {
+        match &self.current_token().token_type {
+            TokenType::Identifier(s) => s.eq_ignore_ascii_case(word),
+            _ => false,
+        }
+    }
+
+    fn consume_identifier(&mut self, word: &str) -> bool {
+        if self.match_identifier(word) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn try_parse_comparison_tail(&mut self, left: AstNode) -> Result<AstNode, String> {
+        // 1) Dedicated single tokens
+        let operator = match &self.current_token().token_type {
+            TokenType::IsEqualTo => {
+                self.advance();
+                Some(BinaryOperator::Equal)
+            }
+            TokenType::IsNotEqualTo => {
+                self.advance();
+                Some(BinaryOperator::NotEqual)
+            }
+            TokenType::IsLessThan => {
+                self.advance();
+                Some(BinaryOperator::LessThan)
+            }
+            TokenType::IsGreaterThan => {
+                self.advance();
+                Some(BinaryOperator::GreaterThan)
+            }
+            _ => None,
+        };
+
+        if let Some(op) = operator {
+            let right = self.parse_expression()?;
+            return Ok(AstNode::BinaryExpression {
+                left: Box::new(left),
+                operator: op,
+                right: Box::new(right),
+            });
+        }
+
+        // 2) Identifier-based multi-word phrases with lookahead (no partial consumption)
+        let save = self.current;
+        let take_if_word = |tokens: &Vec<Token>, idx: usize, word: &str| -> bool {
+            if idx >= tokens.len() { return false; }
+            match &tokens[idx].token_type {
+                TokenType::Identifier(s) => s.eq_ignore_ascii_case(word),
+                // Accept keyword 'to' in phrases as well as identifier 'to'
+                TokenType::To => word.eq_ignore_ascii_case("to"),
+                // Accept keyword Or in phrase "or equal to"
+                TokenType::Or => word.eq_ignore_ascii_case("or"),
+                _ => false,
+            }
+        };
+
+        // Patterns to check in order of specificity
+        let (matched, advance_by, op) = if take_if_word(&self.tokens, save, "is")
+            && take_if_word(&self.tokens, save + 1, "greater")
+            && take_if_word(&self.tokens, save + 2, "than")
+            && take_if_word(&self.tokens, save + 3, "or")
+            && take_if_word(&self.tokens, save + 4, "equal")
+            && take_if_word(&self.tokens, save + 5, "to")
+        {
+            (true, 6, BinaryOperator::GreaterThanOrEqual)
+        } else if take_if_word(&self.tokens, save, "is")
+            && take_if_word(&self.tokens, save + 1, "less")
+            && take_if_word(&self.tokens, save + 2, "than")
+            && take_if_word(&self.tokens, save + 3, "or")
+            && take_if_word(&self.tokens, save + 4, "equal")
+            && take_if_word(&self.tokens, save + 5, "to")
+        {
+            (true, 6, BinaryOperator::LessThanOrEqual)
+        } else if take_if_word(&self.tokens, save, "is")
+            && take_if_word(&self.tokens, save + 1, "not")
+            && take_if_word(&self.tokens, save + 2, "equal")
+            && take_if_word(&self.tokens, save + 3, "to")
+        {
+            (true, 4, BinaryOperator::NotEqual)
+        } else if take_if_word(&self.tokens, save, "is")
+            && take_if_word(&self.tokens, save + 1, "equal")
+            && take_if_word(&self.tokens, save + 2, "to")
+        {
+            (true, 3, BinaryOperator::Equal)
+        } else if take_if_word(&self.tokens, save, "is")
+            && take_if_word(&self.tokens, save + 1, "less")
+            && take_if_word(&self.tokens, save + 2, "than")
+        {
+            (true, 3, BinaryOperator::LessThan)
+        } else if take_if_word(&self.tokens, save, "is")
+            && take_if_word(&self.tokens, save + 1, "greater")
+            && take_if_word(&self.tokens, save + 2, "than")
+        {
+            (true, 3, BinaryOperator::GreaterThan)
+        } else {
+            (false, 0, BinaryOperator::Equal) // op unused when not matched
+        };
+
+        if !matched {
+            return Ok(left);
+        }
+
+        // Advance only after a full phrase match
+        self.current = save + advance_by;
+
+        let right = self.parse_expression()?;
+        Ok(AstNode::BinaryExpression {
+            left: Box::new(left),
+            operator: op,
+            right: Box::new(right),
+        })
+    }
+
+    fn parse_top_level_statement(&mut self) -> Result<AstNode, String> {
+        match &self.current_token().token_type {
+            TokenType::Let => {
+                // At the top level, Let creates global variables
+                let (variable, value) = self.parse_let_components()?;
+                Ok(AstNode::GlobalLetStatement {
+                    variable,
+                    value: Box::new(value),
+                })
+            },
+            TokenType::Process => self.parse_process_definition(),
+            TokenType::Type => self.parse_type_definition(),
+            TokenType::Note => self.parse_note_statement(),
+            TokenType::Import => self.parse_import_statement(),
+            TokenType::Display => self.parse_display_statement(),
+            TokenType::Set => self.parse_set_statement(),
+            TokenType::Identifier(_) => {
+                // Could be a function call at top level
+                let expr = self.parse_expression()?;
+                Ok(expr)
+            },
+            _ => return Err(format!("Unexpected top-level statement: {:?}", self.current_token().token_type)),
+        }
+    }
+
     fn parse_statement(&mut self) -> Result<AstNode, String> {
         match &self.current_token().token_type {
-            TokenType::Let => self.parse_let_statement(),
+            TokenType::Let => {
+                // Inside functions, Let creates local variables
+                let (variable, value) = self.parse_let_components()?;
+                Ok(AstNode::LetStatement {
+                    variable,
+                    value: Box::new(value),
+                })
+            },
             TokenType::Set => self.parse_set_statement(),
             TokenType::Display => self.parse_display_statement(),
+            TokenType::Note => self.parse_note_statement(),
+            TokenType::Import => self.parse_import_statement(),
             TokenType::Return => self.parse_return_statement(),
             TokenType::If => self.parse_if_statement(),
             TokenType::While => self.parse_while_statement(),
+            TokenType::Break => { self.advance(); Ok(AstNode::BreakStatement) }
+            TokenType::Continue => { self.advance(); Ok(AstNode::ContinueStatement) }
             TokenType::Process => self.parse_process_definition(),
             TokenType::Type => self.parse_type_definition(),
             TokenType::Identifier(_) => {
@@ -123,11 +300,17 @@ impl Parser {
                 Ok(expr)
             }
             TokenType::Eof => Err("Unexpected end of file".to_string()),
-            _ => Err(format!("Unexpected token: {:?}", self.current_token().token_type)),
+            _ => {
+                eprintln!("DEBUG: Unexpected token at line {}, column {}: {:?}",
+                         self.current_token().line,
+                         self.current_token().column,
+                         self.current_token().token_type);
+                Err(format!("Unexpected token: {:?}", self.current_token().token_type))
+            }
         }
     }
 
-    fn parse_let_statement(&mut self) -> Result<AstNode, String> {
+    fn parse_let_components(&mut self) -> Result<(String, AstNode), String> {
         // Consume 'Let'
         self.expect_token(TokenType::Let)?;
 
@@ -147,6 +330,11 @@ impl Parser {
         // Parse value expression
         let value = self.parse_expression()?;
 
+        Ok((variable, value))
+    }
+
+    fn parse_let_statement(&mut self) -> Result<AstNode, String> {
+        let (variable, value) = self.parse_let_components()?;
         Ok(AstNode::LetStatement {
             variable,
             value: Box::new(value),
@@ -191,12 +379,103 @@ impl Parser {
         })
     }
 
+    fn parse_note_statement(&mut self) -> Result<AstNode, String> {
+        // Consume 'Note'
+        self.expect_token(TokenType::Note)?;
+
+        // Expect colon
+        self.expect_token(TokenType::Colon)?;
+
+        // Read all tokens until we reach the end of the current line
+        let mut content = String::new();
+        let note_line = self.current_token().line;
+
+        while !self.is_at_end() && self.current_token().line == note_line {
+            match &self.current_token().token_type {
+                TokenType::StringLiteral(s) => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str(s);
+                    self.advance();
+                }
+                TokenType::Identifier(s) => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str(s);
+                    self.advance();
+                }
+                TokenType::Type => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str("Type");
+                    self.advance();
+                }
+                TokenType::If => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str("If");
+                    self.advance();
+                }
+                TokenType::While => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str("While");
+                    self.advance();
+                }
+                TokenType::Process => {
+                    if !content.is_empty() { content.push(' '); }
+                    content.push_str("Process");
+                    self.advance();
+                }
+                TokenType::Eof => {
+                    break;
+                }
+                _ => {
+                    // For other tokens, convert to string representation
+                    self.advance();
+                }
+            }
+        }
+
+        Ok(AstNode::NoteStatement { content })
+    }
+
+    fn parse_import_statement(&mut self) -> Result<AstNode, String> {
+        // Consume 'Import'
+        self.expect_token(TokenType::Import)?;
+
+        // Consume 'module'
+        self.expect_token(TokenType::Module)?;
+
+        // Get module path (string literal)
+        let module_path = match &self.current_token().token_type {
+            TokenType::StringLiteral(path) => {
+                let path = path.clone();
+                self.advance();
+                path
+            }
+            _ => return Err("Expected string literal for module path after 'module'".to_string()),
+        };
+
+        // Consume 'as'
+        self.expect_token(TokenType::As)?;
+
+        // Get alias name
+        let alias_name = match &self.current_token().token_type {
+            TokenType::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            _ => return Err("Expected identifier for alias name after 'as'".to_string()),
+        };
+
+        Ok(AstNode::ImportStatement { module_path, alias_name })
+    }
+
     fn parse_return_statement(&mut self) -> Result<AstNode, String> {
         // Consume 'Return'
         self.expect_token(TokenType::Return)?;
 
         // Check if there's a value to return
-        let value = if matches!(self.current_token().token_type, TokenType::Eof) {
+        let value = if matches!(self.current_token().token_type,
+            TokenType::Eof | TokenType::End | TokenType::Otherwise
+        ) {
             None
         } else {
             Some(Box::new(self.parse_expression()?))
@@ -212,7 +491,15 @@ impl Parser {
         // Parse condition
         let condition = self.parse_expression()?;
 
-        // Expect colon
+        // Expect colon; tolerate leftover words from multi-word comparisons
+        if !matches!(self.current_token().token_type, TokenType::Colon) {
+            // Tolerate leftover tokens until colon (bounded scan)
+            let mut steps = 0;
+            while !matches!(self.current_token().token_type, TokenType::Colon | TokenType::Eof | TokenType::End | TokenType::Otherwise) && steps < 16 {
+                self.advance();
+                steps += 1;
+            }
+        }
         self.expect_token(TokenType::Colon)?;
 
         // Parse then block
@@ -258,7 +545,15 @@ impl Parser {
         // Parse condition
         let condition = self.parse_expression()?;
 
-        // Expect colon
+        // Expect colon; tolerate leftover words from multi-word comparisons
+        if !matches!(self.current_token().token_type, TokenType::Colon) {
+            // Tolerate leftover tokens until colon (bounded scan)
+            let mut steps = 0;
+            while !matches!(self.current_token().token_type, TokenType::Colon | TokenType::Eof | TokenType::End) && steps < 16 {
+                self.advance();
+                steps += 1;
+            }
+        }
         self.expect_token(TokenType::Colon)?;
 
         // Parse loop body
@@ -271,7 +566,11 @@ impl Parser {
         // Consume 'End'
         if matches!(self.current_token().token_type, TokenType::End) {
             self.advance();
-            // We should also check for 'While' after 'End' but we'll skip that for now
+            // Optionally consume 'While' after 'End' for proper syntax validation
+            if matches!(self.current_token().token_type, TokenType::While) {
+                self.advance();
+            }
+            // Note: We allow both "End" and "End While" for flexibility in the bootstrap compiler
         }
 
         Ok(AstNode::WhileStatement {
@@ -303,7 +602,7 @@ impl Parser {
             _ => return Err("Expected process name after 'called'".to_string()),
         };
 
-        // Check if we have 'that' (for parameters/returns) or go directly to colon for minimal syntax
+        // Check if we have 'that' (for parameters/returns), allow direct 'returns', or go directly to colon for minimal syntax
         let mut parameters = Vec::new();
         let return_type = if matches!(self.current_token().token_type, TokenType::That) {
             // Consume 'that'
@@ -372,7 +671,22 @@ impl Parser {
                 None // No 'returns' keyword means void function
             }
         } else {
-            None // No 'that' means completely minimal function (no params, no return)
+            // Allow direct 'returns' without 'that'
+            if matches!(self.current_token().token_type, TokenType::Returns) {
+                // Consume 'returns'
+                self.advance();
+                // Get return type
+                match &self.current_token().token_type {
+                    TokenType::Identifier(type_name) => {
+                        let type_name = type_name.clone();
+                        self.advance();
+                        Some(type_name)
+                    }
+                    _ => None,
+                }
+            } else {
+                None // No 'that' and no 'returns' means minimal function
+            }
         };
 
         // Expect colon
@@ -475,12 +789,47 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<AstNode, String> {
-        self.parse_comparison_expression()
+        self.parse_logical_or_expression()
+    }
+
+    fn parse_logical_or_expression(&mut self) -> Result<AstNode, String> {
+        let mut left = self.parse_logical_and_expression()?;
+
+        while matches!(self.current_token().token_type, TokenType::Or) {
+            self.advance(); // consume 'Or'
+            let right = self.parse_logical_and_expression()?;
+
+            left = AstNode::BinaryExpression {
+                left: Box::new(left),
+                operator: BinaryOperator::LogicalOr,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn parse_logical_and_expression(&mut self) -> Result<AstNode, String> {
+        let mut left = self.parse_comparison_expression()?;
+
+        while matches!(self.current_token().token_type, TokenType::And) {
+            self.advance(); // consume 'And'
+            let right = self.parse_comparison_expression()?;
+
+            left = AstNode::BinaryExpression {
+                left: Box::new(left),
+                operator: BinaryOperator::LogicalAnd,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
     }
 
     fn parse_comparison_expression(&mut self) -> Result<AstNode, String> {
         let mut left = self.parse_additive_expression()?;
 
+        // First try dedicated comparison tokens
         while matches!(self.current_token().token_type,
                       TokenType::IsEqualTo | TokenType::IsNotEqualTo |
                       TokenType::IsLessThan | TokenType::IsGreaterThan) {
@@ -502,11 +851,52 @@ impl Parser {
             };
         }
 
+        // Also try identifier-based comparison forms like "is equal to"
+        left = self.try_parse_comparison_tail(left)?;
+
+        Ok(left)
+    }
+
+    fn parse_multiplicative_expression(&mut self) -> Result<AstNode, String> {
+        let mut left = self.parse_primary_expression()?;
+
+        // Handle phrases: "multiplied by" and "divided by"
+        loop {
+            let save = self.current;
+            let t1 = self.current_token().clone();
+            let op = match &t1.token_type {
+                TokenType::Identifier(w) if w.eq_ignore_ascii_case("multiplied") => {
+                    // Expect 'by'
+                    if self.tokens.get(save + 1).map(|t| match &t.token_type { TokenType::Identifier(s) => s.eq_ignore_ascii_case("by"), _ => false }).unwrap_or(false) {
+                        // consume 'multiplied' and 'by'
+                        self.advance();
+                        self.advance();
+                        Some(BinaryOperator::Multiply)
+                    } else { None }
+                }
+                TokenType::Identifier(w) if w.eq_ignore_ascii_case("divided") => {
+                    if self.tokens.get(save + 1).map(|t| match &t.token_type { TokenType::Identifier(s) => s.eq_ignore_ascii_case("by"), _ => false }).unwrap_or(false) {
+                        self.advance();
+                        self.advance();
+                        Some(BinaryOperator::Divide)
+                    } else { None }
+                }
+                _ => None,
+            };
+
+            if let Some(operator) = op {
+                let right = self.parse_primary_expression()?;
+                left = AstNode::BinaryExpression { left: Box::new(left), operator, right: Box::new(right) };
+            } else {
+                break;
+            }
+        }
+
         Ok(left)
     }
 
     fn parse_additive_expression(&mut self) -> Result<AstNode, String> {
-        let mut left = self.parse_primary_expression()?;
+        let mut left = self.parse_multiplicative_expression()?;
 
         while matches!(self.current_token().token_type, TokenType::Plus | TokenType::Minus) {
             let operator = match self.current_token().token_type {
@@ -516,7 +906,7 @@ impl Parser {
             };
             self.advance();
 
-            let right = self.parse_primary_expression()?;
+            let right = self.parse_multiplicative_expression()?;
 
             left = AstNode::BinaryExpression {
                 left: Box::new(left),
@@ -580,32 +970,51 @@ impl Parser {
 
                     Ok(AstNode::FunctionCall { name, arguments })
                 } else {
-                    // Check for field access (dot notation)
+                    // Check for field access (dot notation) and index access (bracket notation)
                     let mut current_expr = AstNode::Identifier(name);
 
-                    while matches!(self.current_token().token_type, TokenType::Dot) {
-                        self.advance(); // consume dot
+                    while matches!(self.current_token().token_type, TokenType::Dot | TokenType::LeftBracket) {
+                        match self.current_token().token_type {
+                            TokenType::Dot => {
+                                self.advance(); // consume dot
 
-                        // Get field name
-                        let field_name = match &self.current_token().token_type {
-                            TokenType::Identifier(field) => {
-                                let field = field.clone();
-                                self.advance();
-                                field
+                                // Get field name
+                                let field_name = match &self.current_token().token_type {
+                                    TokenType::Identifier(field) => {
+                                        let field = field.clone();
+                                        self.advance();
+                                        field
+                                    }
+                                    _ => return Err("Expected field name after '.'".to_string()),
+                                };
+
+                                current_expr = AstNode::FieldAccess {
+                                    object: Box::new(current_expr),
+                                    field: field_name,
+                                };
                             }
-                            _ => return Err("Expected field name after '.'".to_string()),
-                        };
+                            TokenType::LeftBracket => {
+                                self.advance(); // consume '['
 
-                        current_expr = AstNode::FieldAccess {
-                            object: Box::new(current_expr),
-                            field: field_name,
-                        };
+                                // Parse index expression
+                                let index_expr = self.parse_expression()?;
+
+                                // Expect closing bracket
+                                self.expect_token(TokenType::RightBracket)?;
+
+                                current_expr = AstNode::IndexAccess {
+                                    object: Box::new(current_expr),
+                                    index: Box::new(index_expr),
+                                };
+                            }
+                            _ => break,
+                        }
                     }
 
                     Ok(current_expr)
                 }
             }
-            _ => Err(format!("Unexpected token in expression: {:?}", self.current_token().token_type)),
+            _ => Err(format!("Unexpected token in expression: {:?} at line {}", self.current_token().token_type, self.current_token().line)),
         }
     }
 
@@ -724,7 +1133,13 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
-            Err(format!("Expected {:?}, found {:?}", expected, self.current_token().token_type))
+            Err(format!(
+                "Expected {:?}, found {:?} at line {}, column {}",
+                expected,
+                self.current_token().token_type,
+                self.current_token().line,
+                self.current_token().column
+            ))
         }
     }
 

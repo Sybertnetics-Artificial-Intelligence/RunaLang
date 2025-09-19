@@ -13,6 +13,9 @@ pub enum TokenType {
     End,
     While,
     Return,
+    Or,
+    Break,
+    Continue,
 
     // Function definition
     Process,
@@ -20,6 +23,13 @@ pub enum TokenType {
     That,
     Takes,
     Returns,
+
+    // Comments
+    Note,
+
+    // Module system
+    Import,
+    Module,
 
     // Type definitions
     Type,
@@ -33,6 +43,8 @@ pub enum TokenType {
     // Punctuation
     LeftParen,
     RightParen,
+    LeftBracket,
+    RightBracket,
     Comma,
     Colon,
     Dot,
@@ -131,6 +143,14 @@ impl Lexer {
                 self.advance();
                 TokenType::RightParen
             }
+            '[' => {
+                self.advance();
+                TokenType::LeftBracket
+            }
+            ']' => {
+                self.advance();
+                TokenType::RightBracket
+            }
             ',' => {
                 self.advance();
                 TokenType::Comma
@@ -142,6 +162,27 @@ impl Lexer {
             '.' => {
                 self.advance();
                 TokenType::Dot
+            }
+            '\\' => {
+                // Skip backslashes outside of string literals (they're handled in string processing)
+                self.advance();
+                self.skip_whitespace(); // Skip any whitespace after backslash
+                return self.next_token(); // Continue to next token
+            }
+            '-' => {
+                self.advance();
+                TokenType::Minus
+            }
+            '+' => {
+                self.advance();
+                TokenType::Plus
+            }
+            // Skip other punctuation and symbols that appear in comments
+            '=' | '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '_' | '|' |
+            '~' | '`' | '?' | '/' | '<' | '>' | ';' => {
+                self.advance();
+                self.skip_whitespace(); // Skip any whitespace after symbols
+                return self.next_token(); // Continue to next token
             }
             _ => return Err(format!("Unexpected character '{}' at line {}, column {}", ch, line, column)),
         };
@@ -163,6 +204,26 @@ impl Lexer {
             self.advance();
         }
 
+        // Special handling for Note comments - if we see "Note:" skip to end of line
+        if value == "Note" {
+            self.skip_whitespace();
+            if !self.is_at_end() && self.current_char() == ':' {
+                // Skip the colon
+                self.advance();
+                // Skip everything until end of line
+                while !self.is_at_end() && self.current_char() != '\n' {
+                    self.advance();
+                }
+                // Skip the newline too
+                if !self.is_at_end() && self.current_char() == '\n' {
+                    self.advance();
+                }
+                // Skip any whitespace and get next token
+                self.skip_whitespace();
+                return self.next_token();
+            }
+        }
+
         let token_type = match value.as_str() {
             "Let" => TokenType::Let,
             "be" => TokenType::Be,
@@ -174,6 +235,10 @@ impl Lexer {
             "End" => TokenType::End,
             "While" => TokenType::While,
             "Return" => TokenType::Return,
+            "Or" => TokenType::Or,
+            "Break" => TokenType::Break,
+            "Continue" => TokenType::Continue,
+            "And" => TokenType::And,  // Uppercase And for logical operations
             "Process" => TokenType::Process,
             "called" => TokenType::Called,
             "that" => TokenType::That,
@@ -209,6 +274,9 @@ impl Lexer {
                     TokenType::Identifier(value)
                 }
             }
+            "Note" => TokenType::Note,
+            "Import" => TokenType::Import,
+            "module" => TokenType::Module,
             _ => TokenType::Identifier(value),
         };
 
@@ -341,10 +409,14 @@ impl Lexer {
                 pos += 1;
             }
 
-            // Check if we can match this word
-            let word_chars: Vec<char> = word.chars().collect();
-            for &ch in &word_chars {
-                if pos >= self.input.len() || self.input[pos] != ch {
+            // Check if we can match this word (case-insensitive)
+            for wc in word.chars() {
+                if pos >= self.input.len() {
+                    return false;
+                }
+                let input_ch = self.input[pos].to_ascii_lowercase();
+                let want_ch = wc.to_ascii_lowercase();
+                if input_ch != want_ch {
                     return false;
                 }
                 pos += 1;
@@ -378,12 +450,12 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let mut lexer = Lexer::new("Let be Print");
+        let mut lexer = Lexer::new("Let be Display");
         let tokens = lexer.tokenize().unwrap();
 
         assert_eq!(tokens[0].token_type, TokenType::Let);
         assert_eq!(tokens[1].token_type, TokenType::Be);
-        assert_eq!(tokens[2].token_type, TokenType::Print);
+        assert_eq!(tokens[2].token_type, TokenType::Display);
         assert_eq!(tokens[3].token_type, TokenType::Eof);
     }
 
