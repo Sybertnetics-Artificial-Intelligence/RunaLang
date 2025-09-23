@@ -1,0 +1,170 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "codegen_x86.h"
+
+static char* string_duplicate(const char *str) {
+    if (!str) return NULL;
+    int len = strlen(str);
+    char *dup = malloc(len + 1);
+    strcpy(dup, str);
+    return dup;
+}
+
+static int codegen_find_variable(CodeGenerator *codegen, const char *name) {
+    for (int i = 0; i < codegen->variable_count; i++) {
+        if (strcmp(codegen->variables[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int codegen_add_variable(CodeGenerator *codegen, const char *name) {
+    if (codegen->variable_count >= MAX_VARIABLES) {
+        fprintf(stderr, "Codegen error: Too many variables\n");
+        exit(1);
+    }
+
+    codegen->stack_offset += 8; // 8 bytes for each variable
+    int var_index = codegen->variable_count;
+    codegen->variables[var_index].name = string_duplicate(name);
+    codegen->variables[var_index].stack_offset = codegen->stack_offset;
+    codegen->variable_count++;
+
+    return var_index;
+}
+
+static void codegen_generate_expression(CodeGenerator *codegen, Expression *expr) {
+    switch (expr->type) {
+        case EXPR_INTEGER:
+            fprintf(codegen->output_file, "    movq $%d, %%rax\n", expr->data.integer_value);
+            break;
+
+        case EXPR_VARIABLE: {
+            int var_index = codegen_find_variable(codegen, expr->data.variable_name);
+            if (var_index == -1) {
+                fprintf(stderr, "Codegen error: Unknown variable '%s'\n", expr->data.variable_name);
+                exit(1);
+            }
+            int offset = codegen->variables[var_index].stack_offset;
+            fprintf(codegen->output_file, "    movq -%d(%%rbp), %%rax\n", offset);
+            break;
+        }
+
+        case EXPR_BINARY_OP:
+            // Generate left operand (result in %rax)
+            codegen_generate_expression(codegen, expr->data.binary_op.left);
+            // Push left operand to stack
+            fprintf(codegen->output_file, "    pushq %%rax\n");
+            // Generate right operand (result in %rax)
+            codegen_generate_expression(codegen, expr->data.binary_op.right);
+            // Pop left operand from stack to %rbx
+            fprintf(codegen->output_file, "    popq %%rbx\n");
+
+            if (expr->data.binary_op.operator == TOKEN_PLUS) {
+                fprintf(codegen->output_file, "    addq %%rbx, %%rax\n");
+            } else if (expr->data.binary_op.operator == TOKEN_MINUS) {
+                fprintf(codegen->output_file, "    subq %%rax, %%rbx\n");
+                fprintf(codegen->output_file, "    movq %%rbx, %%rax\n");
+            }
+            break;
+    }
+}
+
+static void codegen_generate_statement(CodeGenerator *codegen, Statement *stmt) {
+    switch (stmt->type) {
+        case STMT_LET: {
+            // Add variable to symbol table
+            codegen_add_variable(codegen, stmt->data.let_stmt.variable_name);
+
+            // Generate expression (result in %rax)
+            codegen_generate_expression(codegen, stmt->data.let_stmt.expression);
+
+            // Store value in variable's stack slot
+            int var_index = codegen_find_variable(codegen, stmt->data.let_stmt.variable_name);
+            int offset = codegen->variables[var_index].stack_offset;
+            fprintf(codegen->output_file, "    movq %%rax, -%d(%%rbp)\n", offset);
+            break;
+        }
+
+        case STMT_SET: {
+            // Generate expression (result in %rax)
+            codegen_generate_expression(codegen, stmt->data.set_stmt.expression);
+
+            // Store value in variable's stack slot
+            int var_index = codegen_find_variable(codegen, stmt->data.set_stmt.variable_name);
+            if (var_index == -1) {
+                fprintf(stderr, "Codegen error: Unknown variable '%s'\n", stmt->data.set_stmt.variable_name);
+                exit(1);
+            }
+            int offset = codegen->variables[var_index].stack_offset;
+            fprintf(codegen->output_file, "    movq %%rax, -%d(%%rbp)\n", offset);
+            break;
+        }
+
+        case STMT_RETURN:
+            // Generate expression (result in %rax)
+            codegen_generate_expression(codegen, stmt->data.return_stmt.expression);
+            // Function epilogue
+            fprintf(codegen->output_file, "    movq %%rbp, %%rsp\n");
+            fprintf(codegen->output_file, "    popq %%rbp\n");
+            fprintf(codegen->output_file, "    ret\n");
+            break;
+    }
+}
+
+CodeGenerator* codegen_create(const char *output_filename) {
+    CodeGenerator *codegen = malloc(sizeof(CodeGenerator));
+    codegen->output_file = fopen(output_filename, "w");
+    codegen->variable_count = 0;
+    codegen->stack_offset = 0;
+
+    if (!codegen->output_file) {
+        fprintf(stderr, "Error: Could not open output file '%s'\n", output_filename);
+        free(codegen);
+        return NULL;
+    }
+
+    return codegen;
+}
+
+void codegen_destroy(CodeGenerator *codegen) {
+    if (codegen) {
+        if (codegen->output_file) {
+            fclose(codegen->output_file);
+        }
+        for (int i = 0; i < codegen->variable_count; i++) {
+            free(codegen->variables[i].name);
+        }
+        free(codegen);
+    }
+}
+
+void codegen_generate(CodeGenerator *codegen, Program *program) {
+    fprintf(codegen->output_file, ".text\n");
+    fprintf(codegen->output_file, ".globl main\n");
+    fprintf(codegen->output_file, "\n");
+    fprintf(codegen->output_file, "main:\n");
+
+    // Function prologue
+    fprintf(codegen->output_file, "    pushq %%rbp\n");
+    fprintf(codegen->output_file, "    movq %%rsp, %%rbp\n");
+
+    // Reserve stack space for variables (will be calculated after processing all variables)
+    int stack_reservation_pos = ftell(codegen->output_file);
+    fprintf(codegen->output_file, "                              \n"); // Placeholder
+
+    // Generate statements
+    for (int i = 0; i < program->statement_count; i++) {
+        codegen_generate_statement(codegen, program->statements[i]);
+    }
+
+    // Go back and fill in stack space reservation
+    long current_pos = ftell(codegen->output_file);
+    fseek(codegen->output_file, stack_reservation_pos, SEEK_SET);
+    if (codegen->stack_offset > 0) {
+        fprintf(codegen->output_file, "    subq $%d, %%rsp\n", (codegen->stack_offset + 15) & ~15); // Align to 16 bytes
+    }
+    fseek(codegen->output_file, current_pos, SEEK_SET);
+}
