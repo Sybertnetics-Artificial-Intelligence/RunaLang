@@ -8,7 +8,8 @@ typedef enum {
     EXPR_VARIABLE,
     EXPR_BINARY_OP,
     EXPR_COMPARISON,
-    EXPR_FUNCTION_CALL
+    EXPR_FUNCTION_CALL,
+    EXPR_STRING_LITERAL
 } ExpressionType;
 
 typedef struct Expression {
@@ -31,6 +32,7 @@ typedef struct Expression {
             struct Expression **arguments;
             int argument_count;
         } function_call;
+        char *string_literal;
     } data;
 } Expression;
 
@@ -39,7 +41,8 @@ typedef enum {
     STMT_SET,
     STMT_RETURN,
     STMT_IF,
-    STMT_WHILE
+    STMT_WHILE,
+    STMT_PRINT
 } StatementType;
 
 typedef struct Statement {
@@ -68,6 +71,9 @@ typedef struct Statement {
             struct Statement **body;
             int body_count;
         } while_stmt;
+        struct {
+            Expression *expression;
+        } print_stmt;
     } data;
 } Statement;
 

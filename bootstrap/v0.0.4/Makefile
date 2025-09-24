@@ -4,7 +4,7 @@ TARGET = runac
 SOURCES = main.c lexer.c parser.c codegen_x86.c
 OBJECTS = $(SOURCES:.c=.o)
 
-.PHONY: all clean test test2 test3 test4 test5 test6
+.PHONY: all clean test test2 test3 test4 test5 test6 test7 test8
 
 all: $(TARGET)
 
@@ -122,6 +122,35 @@ test6: $(TARGET)
 	./test6_program; echo "Exit code: $$?"
 	rm -f test6.runa test6.s test6_program
 
+test7: $(TARGET)
+	echo 'Process called "main" returns Integer:' > test7.runa
+	echo '    Print "Hello, Runa!"' >> test7.runa
+	echo '    Return 0' >> test7.runa
+	echo 'End Process' >> test7.runa
+	./$(TARGET) test7.runa test7.s
+	@echo ""
+	@echo "Generated assembly:"
+	@cat test7.s
+	@echo ""
+	gcc test7.s -o test7_program
+	./test7_program; echo "Exit code: $$?"
+	rm -f test7.runa test7.s test7_program
+
+test8: $(TARGET)
+	echo 'Process called "main" returns Integer:' > test8.runa
+	echo '    Let msg be "Hello, Runa!"' >> test8.runa
+	echo '    Print msg' >> test8.runa
+	echo '    Return 0' >> test8.runa
+	echo 'End Process' >> test8.runa
+	./$(TARGET) test8.runa test8.s
+	@echo ""
+	@echo "Generated assembly:"
+	@cat test8.s
+	@echo ""
+	gcc test8.s -o test8_program
+	./test8_program; echo "Exit code: $$?"
+	rm -f test8.runa test8.s test8_program
+
 help:
 	@echo "Available targets:"
 	@echo "  all      - Build the compiler"
@@ -132,4 +161,6 @@ help:
 	@echo "  test4    - Test with While loop (count from 0 to 5)"
 	@echo "  test5    - Test with function definition and call (double function)"
 	@echo "  test6    - Test with recursive function (factorial)"
+	@echo "  test7    - Test with Print statement and string literal"
+	@echo "  test8    - Test with string variable and Print statement"
 	@echo "  help     - Show this help"

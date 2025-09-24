@@ -6,6 +6,7 @@
 // Forward declarations
 static Statement* parser_parse_if_statement(Parser *parser);
 static Statement* parser_parse_while_statement(Parser *parser);
+static Statement* parser_parse_print_statement(Parser *parser);
 static Expression* parser_parse_expression(Parser *parser);
 
 static char* string_duplicate(const char *str) {
@@ -68,6 +69,13 @@ static Expression* expression_create_function_call(const char *function_name, Ex
     return expr;
 }
 
+static Expression* expression_create_string_literal(const char *string_value) {
+    Expression *expr = malloc(sizeof(Expression));
+    expr->type = EXPR_STRING_LITERAL;
+    expr->data.string_literal = string_duplicate(string_value);
+    return expr;
+}
+
 static Statement* statement_create_let(const char *var_name, Expression *expr) {
     Statement *stmt = malloc(sizeof(Statement));
     stmt->type = STMT_LET;
@@ -88,6 +96,13 @@ static Statement* statement_create_return(Expression *expr) {
     Statement *stmt = malloc(sizeof(Statement));
     stmt->type = STMT_RETURN;
     stmt->data.return_stmt.expression = expr;
+    return stmt;
+}
+
+static Statement* statement_create_print(Expression *expr) {
+    Statement *stmt = malloc(sizeof(Statement));
+    stmt->type = STMT_PRINT;
+    stmt->data.print_stmt.expression = expr;
     return stmt;
 }
 
@@ -155,6 +170,12 @@ static Expression* parser_parse_primary(Parser *parser) {
         int value = atoi(parser->current_token->value);
         parser_eat(parser, TOKEN_INTEGER);
         return expression_create_integer(value);
+    }
+
+    if (parser->current_token->type == TOKEN_STRING_LITERAL) {
+        char *string_value = string_duplicate(parser->current_token->value);
+        parser_eat(parser, TOKEN_STRING_LITERAL);
+        return expression_create_string_literal(string_value);
     }
 
     if (parser->current_token->type == TOKEN_IDENTIFIER) {
@@ -283,6 +304,12 @@ static Statement* parser_parse_return_statement(Parser *parser) {
     return statement_create_return(expr);
 }
 
+static Statement* parser_parse_print_statement(Parser *parser) {
+    parser_eat(parser, TOKEN_PRINT);
+    Expression *expr = parser_parse_expression(parser);
+    return statement_create_print(expr);
+}
+
 static Statement** parser_parse_statement_block(Parser *parser, int *count) {
     Statement **statements = NULL;
     int capacity = 0;
@@ -301,6 +328,8 @@ static Statement** parser_parse_statement_block(Parser *parser, int *count) {
             stmt = parser_parse_while_statement(parser);
         } else if (parser->current_token->type == TOKEN_RETURN) {
             stmt = parser_parse_return_statement(parser);
+        } else if (parser->current_token->type == TOKEN_PRINT) {
+            stmt = parser_parse_print_statement(parser);
         } else {
             break;
         }
@@ -410,6 +439,8 @@ static Function* parser_parse_function(Parser *parser) {
             stmt = parser_parse_if_statement(parser);
         } else if (parser->current_token->type == TOKEN_WHILE) {
             stmt = parser_parse_while_statement(parser);
+        } else if (parser->current_token->type == TOKEN_PRINT) {
+            stmt = parser_parse_print_statement(parser);
         } else {
             fprintf(stderr, "Parser error: Unexpected token in function body at line %d\n", parser->current_token->line);
             exit(1);
@@ -475,6 +506,8 @@ void expression_destroy(Expression *expr) {
                 expression_destroy(expr->data.function_call.arguments[i]);
             }
             free(expr->data.function_call.arguments);
+        } else if (expr->type == EXPR_STRING_LITERAL) {
+            free(expr->data.string_literal);
         }
         free(expr);
     }
@@ -511,6 +544,9 @@ static void statement_destroy(Statement *stmt) {
                     statement_destroy(stmt->data.while_stmt.body[i]);
                 }
                 free(stmt->data.while_stmt.body);
+                break;
+            case STMT_PRINT:
+                expression_destroy(stmt->data.print_stmt.expression);
                 break;
         }
         free(stmt);
