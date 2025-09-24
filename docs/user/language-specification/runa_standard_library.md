@@ -171,7 +171,7 @@ Let result be abs with x as -10                            Note: Returns 10
 #### Advanced Mathematical Functions
 
 ```runa
-Import module "math"
+Import "math" as math
 
 Note: Trigonometric functions
 Let sine_value be math.sine of (math.PI divided by 2)      Note: Returns 1.0
@@ -206,7 +206,7 @@ Let confirmed be input yes or no with prompt "Are you sure? "
 #### File Operations
 
 ```runa
-Import module "file"
+Import "file" as file
 
 Note: Reading files
 Let content be read file "data.txt"
@@ -236,7 +236,7 @@ Delete directory "old_folder"
 #### Date and Time Operations
 
 ```runa
-Import module "datetime"
+Import "datetime" as datetime
 
 Note: Current time
 Let now be current time
@@ -269,7 +269,7 @@ Let is_same_day be date1 is same day as date2
 #### HTTP Operations
 
 ```runa
-Import module "http"
+Import "http" as http
 
 Note: GET requests
 Let response be http get from "https://api.example.com/users"
@@ -304,7 +304,7 @@ Catch network_error:
 #### JSON Processing
 
 ```runa
-Import module "json"
+Import "json" as json
 
 Note: Parsing JSON
 Let json_string be '{"name": "Alice", "age": 30, "hobbies": ["reading", "coding"]}'
@@ -329,7 +329,7 @@ Let is_valid be is valid json json_string
 #### Pattern Matching
 
 ```runa
-Import module "regex"
+Import "regex" as regex
 
 Note: Basic pattern matching
 Let text be "The phone number is 555-1234"
@@ -355,7 +355,7 @@ Note: groups contains ["support", "example.com"]
 #### Random Number Generation
 
 ```runa
-Import module "random"
+Import "random" as random
 
 Note: Basic random numbers
 Let random_float be random number between 0.0 and 1.0
@@ -408,7 +408,7 @@ Process called "validate_age" that takes age as Integer:
 ### 1. Functional Programming Utilities
 
 ```runa
-Import module "functional"
+Import "functional" as functional
 
 Note: Higher-order functions
 Let numbers be list containing 1, 2, 3, 4, 5
@@ -438,7 +438,7 @@ Let result be add_ten with y as 5  Note: Returns 15
 ### 2. Concurrent Programming
 
 ```runa
-Import module "concurrent"
+Import "concurrent" as concurrent
 
 Note: Thread-based concurrency
 Let future1 be run in background: expensive_computation with data as data1
@@ -463,7 +463,7 @@ Close process_pool
 ### 3. Data Validation
 
 ```runa
-Import module "validation"
+Import "validation" as validation
 
 Note: Schema validation
 Type UserSchema is Dictionary with:
@@ -489,7 +489,7 @@ Process called "validate_positive" that takes value as Integer returns Integer:
 ### 4. Configuration Management
 
 ```runa
-Import module "config"
+Import "config" as config
 
 Note: Environment-based configuration
 Let database_url be environment variable "DATABASE_URL" defaults to "sqlite:///app.db"
@@ -513,7 +513,7 @@ When running in "production":
 ### 5. Logging
 
 ```runa
-Import module "logging"
+Import "logging" as logging
 
 Note: Basic logging
 Log info message "Application started"
@@ -539,7 +539,7 @@ db_logger.error with message "Database connection failed"
 ### 6. Testing Framework
 
 ```runa
-Import module "testing"
+Import "testing" as testing
 
 Note: Unit tests
 Test "addition works correctly":
@@ -580,7 +580,7 @@ The Runa standard library is engineered to be the premier toolkit for developing
 #### Agent Core Module
 
 ```runa
-Import module "agent"
+Import "agent" as agent
 
 Note: Create an agent with identity and capabilities
 Let my_agent be Agent with:
@@ -610,7 +610,7 @@ Let progress be get_progress for goal "increase_accuracy" of agent my_agent
 #### Intention Management Module
 
 ```runa
-Import module "intention"
+Import "intention" as intention
 
 Note: Create hierarchical task plans
 Let plan be create_plan with:
@@ -638,7 +638,7 @@ If status is "blocked":
 #### Memory Systems Module
 
 ```runa
-Import module "memory"
+Import "memory" as memory
 
 Note: Episodic memory for storing experiences
 Let episodic_memory be EpisodicMemory with capacity 10000
@@ -672,7 +672,7 @@ Set memory_policy for episodic_memory with:
 #### Reasoning Engine Module
 
 ```runa
-Import module "reasoning"
+Import "reasoning" as reasoning
 
 Note: Create belief sets and world models
 Let belief_set be BeliefSet with:
@@ -703,7 +703,7 @@ For each contradiction in contradictions:
 #### Agent Communication Module
 
 ```runa
-Import module "comms"
+Import "comms" as comms
 
 Note: Create secure messaging channels
 Let channel be create_channel with:
@@ -735,7 +735,7 @@ If unread_count is greater than 10:
 #### Protocol Management Module
 
 ```runa
-Import module "protocols"
+Import "protocols" as protocols
 
 Note: Contract Net Protocol for task allocation
 Let contract_net be ContractNet with:
@@ -769,7 +769,7 @@ Let agreement be execute_negotiation with negotiation as negotiation
 #### Trust Management Module
 
 ```runa
-Import module "trust"
+Import "trust" as trust
 
 Note: Dynamic trust scoring
 Let trust_score be calculate_trust_score for agent worker_agent with:
@@ -802,7 +802,7 @@ Let decision be make_trust_decision with:
 #### Ontology Management Module
 
 ```runa
-Import module "ontology"
+Import "ontology" as ontology
 
 Note: Create and manage knowledge representations
 Let ontology be create_ontology with:
@@ -828,7 +828,7 @@ Let results be query_ontology with:
 #### Context Management Module
 
 ```runa
-Import module "context"
+Import "context" as context
 
 Note: Session-scoped memory management
 Let context_window be create_context_window with:
@@ -854,7 +854,7 @@ For each constraint in constraints:
 #### Embedding and Vector Operations Module
 
 ```runa
-Import module "embed"
+Import "embed" as embed
 
 Note: Generate embeddings
 Let embedding be generate_embedding with:
@@ -879,7 +879,7 @@ Let combined_embedding be combine_embeddings with:
 #### Advanced Data Structures Module
 
 ```runa
-Import module "data"
+Import "data" as data
 
 Note: High-performance DataFrame
 Let df be DataFrame with:
@@ -914,7 +914,7 @@ Let communities be detect_communities in graph using "louvain"
 #### Advanced Mathematics Module
 
 ```runa
-Import module "statistics"
+Import "statistics" as statistics
 
 Note: Statistical analysis
 Let stats be calculate_statistics with data as dataset:
@@ -948,7 +948,7 @@ Let precise_result be calculate_precise with:
 #### Environment Interface Module
 
 ```runa
-Import module "env"
+Import "env" as env
 
 Note: Abstract sensor interface
 Let sensor be create_sensor with:
@@ -981,7 +981,7 @@ Let action_result be execute_action with:
 #### Simulation Environment Module
 
 ```runa
-Import module "sim"
+Import "sim" as sim
 
 Note: Create sandboxed simulation
 Let simulation be create_simulation with:
@@ -1008,7 +1008,7 @@ Let analysis be analyze_simulation with:
 #### Tool Registry Module
 
 ```runa
-Import module "tools"
+Import "tools" as tools
 
 Note: Register external tools
 Register tool "database_query" with:
@@ -1037,7 +1037,7 @@ Let result be execute_tool securely with:
 #### Meta-Cognition Module
 
 ```runa
-Import module "meta"
+Import "meta" as meta
 
 Note: Confidence estimation
 Let confidence be estimate_confidence with:
@@ -1068,7 +1068,7 @@ Let learning_needs be analyze_learning_needs with:
 #### Strategy Management Module
 
 ```runa
-Import module "strategy"
+Import "strategy" as strategy
 
 Note: Chain of Thought reasoning
 Let reasoning_chain be chain_of_thought with:
@@ -1104,7 +1104,7 @@ Let execution_plan be execute_strategy with:
 #### LLM Core Module
 
 ```runa
-Import module "llm"
+Import "llm" as llm
 
 Note: Unified LLM interface
 Let llm_client be create_llm_client with:
@@ -1127,7 +1127,7 @@ Let model_info be get_model_info for model "gpt-4"
 #### LLM Router Module
 
 ```runa
-Import module "llm.router"
+Import "llm.router" as llm.router
 
 Note: Intelligent model selection
 Let selected_model be route_request with:
@@ -1148,7 +1148,7 @@ Let balanced_model be select_balanced_model with:
 #### LLM Chain Module
 
 ```runa
-Import module "llm.chain"
+Import "llm.chain" as llm.chain
 
 Note: Create reasoning chains
 Let chain be create_chain with:
@@ -1170,7 +1170,7 @@ Let chain_result be execute_chain with:
 #### LLM Agent Module
 
 ```runa
-Import module "llm.agent"
+Import "llm.agent" as llm.agent
 
 Note: Central executive agent
 Let executive_agent be create_executive_agent with:
@@ -1189,7 +1189,7 @@ Let orchestration_result be orchestrate_agents with:
 #### LLM Memory Module
 
 ```runa
-Import module "llm.memory"
+Import "llm.memory" as llm.memory
 
 Note: Shared memory for LLM ensemble
 Let shared_memory be create_shared_memory with:
@@ -1209,7 +1209,7 @@ Let context be retrieve from shared_memory with key as "conversation_context"
 #### LLM Tools Module
 
 ```runa
-Import module "llm.tools"
+Import "llm.tools" as llm.tools
 
 Note: Function calling interface
 Let tool_registry be create_tool_registry with:
@@ -1228,7 +1228,7 @@ Let tool_result be execute_tool_call with:
 #### LLM Evaluation Module
 
 ```runa
-Import module "llm.evaluation"
+Import "llm.evaluation" as llm.evaluation
 
 Note: Model evaluation
 Let evaluation_result be evaluate_model with:
@@ -1250,7 +1250,7 @@ Let human_score be human_evaluate with:
 #### LLM Embedding Module
 
 ```runa
-Import module "llm.embedding"
+Import "llm.embedding" as llm.embedding
 
 Note: Embedding generation
 Let embeddings be generate_embeddings with:
@@ -1272,7 +1272,7 @@ Let cluster_assignments be cluster_embeddings with:
 #### Neural Network Module
 
 ```runa
-Import module "nn"
+Import "nn" as nn
 
 Note: Layer definitions
 Let dense_layer be DenseLayer with:
@@ -1305,7 +1305,7 @@ Let model be Sequential with layers as list containing:
 #### Model Definition Module
 
 ```runa
-Import module "model"
+Import "model" as model
 
 Note: High-level architecture definition
 Let architecture be define_architecture with:
@@ -1333,7 +1333,7 @@ Let config be ModelConfig with:
 #### Dataset Management Module
 
 ```runa
-Import module "dataset"
+Import "dataset" as dataset
 
 Note: Dataset loading and preprocessing
 Let dataset be load_dataset with:
@@ -1357,7 +1357,7 @@ Let dataloader be create_dataloader with:
 #### Tokenizer Module
 
 ```runa
-Import module "tokenizer"
+Import "tokenizer" as tokenizer
 
 Note: BPE tokenizer
 Let tokenizer be BPETokenizer with:
@@ -1390,7 +1390,7 @@ Let text be detokenize with:
 #### Training Module
 
 ```runa
-Import module "train"
+Import "train" as train
 
 Note: Training loop
 Let training_result be train_model with:
@@ -1413,7 +1413,7 @@ Display "Final accuracy:" with message metrics["accuracy"]
 #### Optimization Module
 
 ```runa
-Import module "opt"
+Import "opt" as opt
 
 Note: Optimizer configuration
 Let optimizer be AdamWOptimizer with:
@@ -1439,7 +1439,7 @@ Let clipped_gradients be clip_gradients with:
 #### Metrics Module
 
 ```runa
-Import module "metrics"
+Import "metrics" as metrics
 
 Note: Training metrics
 Let training_metrics be calculate_training_metrics with:
@@ -1461,7 +1461,7 @@ Let custom_metric be CustomMetric with:
 #### Distributed Training Module
 
 ```runa
-Import module "distribute"
+Import "distribute" as distribute
 
 Note: Distributed training setup
 Let distributed_config be DistributedConfig with:
@@ -1484,7 +1484,7 @@ Synchronize model parameters across devices
 #### Experiment Tracking Module
 
 ```runa
-Import module "experiment"
+Import "experiment" as experiment
 
 Note: Experiment tracking
 Let experiment be create_experiment with:
@@ -1515,7 +1515,7 @@ Save artifact for experiment with:
 #### Model Compilation Module
 
 ```runa
-Import module "compile"
+Import "compile" as compile
 
 Note: Model optimization
 Let optimized_model be optimize_model with:
@@ -1545,7 +1545,7 @@ Let quantized_model be quantize_model with:
 #### Security Module
 
 ```runa
-Import module "security"
+Import "security" as security
 
 Note: Sandboxing
 Let sandbox be create_sandbox with:
@@ -1582,7 +1582,7 @@ Let sanitized_prompt be sanitize_prompt with:
 #### Testing Framework Module
 
 ```runa
-Import module "testing"
+Import "testing" as testing
 
 Note: Unit testing for agents
 Test "agent_skill_execution":
@@ -1620,7 +1620,7 @@ Test "agent_response_time":
 #### Cryptographic Module
 
 ```runa
-Import module "crypto"
+Import "crypto" as crypto
 
 Note: Hashing
 Let hash_value be hash_data with:
@@ -1660,7 +1660,7 @@ Let decrypted_data be decrypt_data with:
 #### Foreign Function Interface Module
 
 ```runa
-Import module "interop"
+Import "interop" as interop
 
 Note: C library binding
 Let c_library be load_library with:
@@ -1698,7 +1698,7 @@ Let rust_library be load_rust_library with:
 ### 1. Memory-Efficient Operations
 
 ```runa
-Import module "itertools"
+Import "itertools" as itertools
 
 Note: Lazy evaluation with generators
 Process called "fibonacci_sequence":
@@ -1723,7 +1723,7 @@ Process called "process_large_file" that takes filename:
 ### 2. Performance Utilities
 
 ```runa
-Import module "performance"
+Import "performance" as performance
 
 Note: Timing operations
 Let start_time be current time
@@ -1818,22 +1818,22 @@ runa.train/
 
 ```runa
 Note: Import entire module
-Import module "math"
+Import "math" as math
 Let result be math.sine of angle
 
 Note: Import specific functions
-Import { sine, cosine, PI } from module "math"
+Import { sine, cosine, PI } from "math"
 Let result be sine of angle
 
 Note: Import with alias
-Import module "datetime" as "dt"
+Import "datetime" as dt
 Let now be dt.current_time
 
 Note: Conditional imports
 When target_language is "Python":
-    Import module "python_specific"
+    Import "python_specific" as python_specific
 When target_language is "JavaScript":
-    Import module "javascript_specific"
+    Import "javascript_specific" as javascript_specific
 ```
 
 ## Extension Points

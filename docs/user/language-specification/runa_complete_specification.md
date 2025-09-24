@@ -1190,13 +1190,13 @@ Process called "deep_mutual_recursion_b" that takes depth as Integer:
 ```runa
 Note: Circular import detection
 Note: File: module_a.runa
-Import module "module_b"  Note: Creates circular dependency
+Import "module_b" as module_b  Note: Creates circular dependency
 
 Export Process called "function_a":
     Return module_b.function_b()
 
 Note: File: module_b.runa  
-Import module "module_a"  Note: Error: circular import detected
+Import "module_a" as module_a  Note: Error: circular import detected
 
 Export Process called "function_b":
     Return module_a.function_a()
@@ -1294,8 +1294,8 @@ Process called "internal_helper":
 ### Import System
 
 ```ebnf
-import_statement      ::= "Import" "Module" string_literal "as" identifier
-                        | "Import" "{" import_list "}" "from" "Module" string_literal
+import_statement      ::= "Import" string_literal "as" identifier
+                        | "Import" "{" import_list "}" "from" string_literal
                         | "Import" import_list "from" identifier
 
 import_list           ::= identifier ("as" identifier)? ("," identifier ("as" identifier)?)*
@@ -1303,11 +1303,11 @@ import_list           ::= identifier ("as" identifier)? ("," identifier ("as" id
 
 ```runa
 Note: Import entire module (canonical form)
-Import Module "geometry" as geometry
+Import "geometry" as geometry
 Let c be New Circle from geometry with radius as 10
 
 Note: Import specific items
-Import { PI, Circle } from Module "geometry"
+Import { PI, Circle } from "geometry"
 Let c2 be New Circle with radius as 5
 
 Note: Using member access operators
@@ -1483,12 +1483,12 @@ Process called "resolve_circular_dependency" that takes cycle as CircularDepende
 Note: Example: Interface extraction for circular dependencies
 Note: Before resolution (circular):
 Note: File: user.runa
-Import module "order"
+Import "order" as order
 Type User is Record with:
     orders as List[order.Order]  Note: Circular dependency
 
 Note: File: order.runa  
-Import module "user"
+Import "user" as user
 Type Order is Record with:
     user as user.User           Note: Circular dependency
 
@@ -1504,15 +1504,15 @@ Type OrderInterface is Protocol with:
     Process get_total returns Float
 
 Note: File: user.runa
-Import module "user_interface"
-Import module "order_interface"
+Import "user_interface" as user_interface
+Import "order_interface" as order_interface
 Type User is Record with:
     orders as List[order_interface.OrderInterface]
     Process implements user_interface.UserInterface
 
 Note: File: order.runa
-Import module "user_interface" 
-Import module "order_interface"
+Import "user_interface" as user_interface 
+Import "order_interface" as order_interface
 Type Order is Record with:
     user as user_interface.UserInterface
     Process implements order_interface.OrderInterface
@@ -1600,22 +1600,22 @@ Process called "reload_module" that takes module_name as String and system as Mo
 Note: Conditional module loading
 Note: File: platform_specific.runa
 When target_platform is "windows":
-    Import module "windows_implementation" as impl
+    Import "windows_implementation" as impl
 When target_platform is "linux":
-    Import module "linux_implementation" as impl
+    Import "linux_implementation" as impl
 When target_platform is "macos":
-    Import module "macos_implementation" as impl
+    Import "macos_implementation" as impl
 Otherwise:
-    Import module "generic_implementation" as impl
+    Import "generic_implementation" as impl
 
 Export impl.primary_function
 Export impl.PlatformSpecificType
 
 Note: Feature-gated modules
 When feature_enabled("advanced_crypto"):
-    Import module "advanced_crypto" as crypto
+    Import "advanced_crypto" as crypto
 Otherwise:
-    Import module "basic_crypto" as crypto
+    Import "basic_crypto" as crypto
 
 Export crypto.encrypt
 Export crypto.decrypt

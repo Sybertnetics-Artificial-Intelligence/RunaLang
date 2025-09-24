@@ -110,6 +110,12 @@ Beyond the core memory wyrms, there are other beasts lurking in C code:
 
 #### **5. Logic Wyrms**
 
+*   **Type Dispatch Wyrms:**
+    *   **What it is:** Function calls that don't match the data type being processed (e.g., calling `print_string` with integer data).
+    *   **When you'll see it:** **Immediately.** Segfault when the function tries to use an integer value as a memory address.
+    *   **Defense:** Always check expression/data types before function calls. Use type-aware dispatch logic.
+    *   **Example Fix:** Check `expr->type` before calling print functions: `print_string` for strings, `print_integer` for integers.
+
 *   **Resource Leak Wyrms:**
     *   **What it is:** File handles, sockets, memory not properly released.
     *   **Defense:** Always pair `fopen()` with `fclose()`, `malloc()` with `free()` (or use arena allocators to avoid this entirely).
