@@ -35,6 +35,100 @@ static int codegen_add_variable(CodeGenerator *codegen, const char *name) {
     return var_index;
 }
 
+static int codegen_add_string_literal(CodeGenerator *codegen, const char *value) {
+    if (codegen->string_count >= MAX_STRINGS) {
+        fprintf(stderr, "Codegen error: Too many string literals\n");
+        exit(1);
+    }
+
+    int str_index = codegen->string_count;
+    codegen->strings[str_index].value = string_duplicate(value);
+
+    // Generate unique label for this string
+    int label_len = snprintf(NULL, 0, ".STR%d", str_index) + 1;
+    codegen->strings[str_index].label = malloc(label_len);
+    snprintf(codegen->strings[str_index].label, label_len, ".STR%d", str_index);
+
+    codegen->string_count++;
+    return str_index;
+}
+
+static void codegen_collect_strings_from_expression(CodeGenerator *codegen, Expression *expr) {
+    if (!expr) return;
+
+    switch (expr->type) {
+        case EXPR_STRING_LITERAL:
+            // Check if string already exists
+            for (int i = 0; i < codegen->string_count; i++) {
+                if (strcmp(codegen->strings[i].value, expr->data.string_literal) == 0) {
+                    return; // Already added
+                }
+            }
+            codegen_add_string_literal(codegen, expr->data.string_literal);
+            break;
+
+        case EXPR_BINARY_OP:
+            codegen_collect_strings_from_expression(codegen, expr->data.binary_op.left);
+            codegen_collect_strings_from_expression(codegen, expr->data.binary_op.right);
+            break;
+
+        case EXPR_COMPARISON:
+            codegen_collect_strings_from_expression(codegen, expr->data.comparison.left);
+            codegen_collect_strings_from_expression(codegen, expr->data.comparison.right);
+            break;
+
+        case EXPR_FUNCTION_CALL:
+            for (int i = 0; i < expr->data.function_call.argument_count; i++) {
+                codegen_collect_strings_from_expression(codegen, expr->data.function_call.arguments[i]);
+            }
+            break;
+
+        case EXPR_INTEGER:
+        case EXPR_VARIABLE:
+            // No strings to collect
+            break;
+    }
+}
+
+static void codegen_collect_strings_from_statement(CodeGenerator *codegen, Statement *stmt) {
+    if (!stmt) return;
+
+    switch (stmt->type) {
+        case STMT_LET:
+            codegen_collect_strings_from_expression(codegen, stmt->data.let_stmt.expression);
+            break;
+
+        case STMT_SET:
+            codegen_collect_strings_from_expression(codegen, stmt->data.set_stmt.expression);
+            break;
+
+        case STMT_RETURN:
+            codegen_collect_strings_from_expression(codegen, stmt->data.return_stmt.expression);
+            break;
+
+        case STMT_PRINT:
+            codegen_collect_strings_from_expression(codegen, stmt->data.print_stmt.expression);
+            break;
+
+        case STMT_IF:
+            codegen_collect_strings_from_expression(codegen, stmt->data.if_stmt.condition);
+            for (int i = 0; i < stmt->data.if_stmt.if_body_count; i++) {
+                codegen_collect_strings_from_statement(codegen, stmt->data.if_stmt.if_body[i]);
+            }
+            for (int i = 0; i < stmt->data.if_stmt.else_body_count; i++) {
+                codegen_collect_strings_from_statement(codegen, stmt->data.if_stmt.else_body[i]);
+            }
+            break;
+
+        case STMT_WHILE:
+            codegen_collect_strings_from_expression(codegen, stmt->data.while_stmt.condition);
+            for (int i = 0; i < stmt->data.while_stmt.body_count; i++) {
+                codegen_collect_strings_from_statement(codegen, stmt->data.while_stmt.body[i]);
+            }
+            break;
+    }
+}
+
 static void codegen_generate_expression(CodeGenerator *codegen, Expression *expr) {
     switch (expr->type) {
         case EXPR_INTEGER:
@@ -103,6 +197,24 @@ static void codegen_generate_expression(CodeGenerator *codegen, Expression *expr
             fprintf(codegen->output_file, "    call %s\n", expr->data.function_call.function_name);
             // Result is already in %rax
             break;
+
+        case EXPR_STRING_LITERAL: {
+            // Add string to string literals table if not already present
+            int str_index = -1;
+            for (int i = 0; i < codegen->string_count; i++) {
+                if (strcmp(codegen->strings[i].value, expr->data.string_literal) == 0) {
+                    str_index = i;
+                    break;
+                }
+            }
+            if (str_index == -1) {
+                str_index = codegen_add_string_literal(codegen, expr->data.string_literal);
+            }
+
+            // Load address of string literal into %rax
+            fprintf(codegen->output_file, "    leaq %s(%%rip), %%rax\n", codegen->strings[str_index].label);
+            break;
+        }
     }
 }
 
@@ -199,6 +311,16 @@ static void codegen_generate_statement(CodeGenerator *codegen, Statement *stmt) 
             fprintf(codegen->output_file, ".L%d:\n", loop_end);
             break;
         }
+
+        case STMT_PRINT: {
+            // Generate expression (string address in %rax)
+            codegen_generate_expression(codegen, stmt->data.print_stmt.expression);
+
+            // Call print function with string address in %rdi
+            fprintf(codegen->output_file, "    movq %%rax, %%rdi\n");
+            fprintf(codegen->output_file, "    call print_string\n");
+            break;
+        }
     }
 }
 
@@ -208,6 +330,7 @@ CodeGenerator* codegen_create(const char *output_filename) {
     codegen->variable_count = 0;
     codegen->stack_offset = 0;
     codegen->label_counter = 0;
+    codegen->string_count = 0;
 
     if (!codegen->output_file) {
         fprintf(stderr, "Error: Could not open output file '%s'\n", output_filename);
@@ -225,6 +348,10 @@ void codegen_destroy(CodeGenerator *codegen) {
         }
         for (int i = 0; i < codegen->variable_count; i++) {
             free(codegen->variables[i].name);
+        }
+        for (int i = 0; i < codegen->string_count; i++) {
+            free(codegen->strings[i].value);
+            free(codegen->strings[i].label);
         }
         free(codegen);
     }
@@ -269,6 +396,65 @@ static void codegen_generate_function(CodeGenerator *codegen, Function *func) {
 }
 
 void codegen_generate(CodeGenerator *codegen, Program *program) {
+    // First pass: collect all string literals by analyzing the AST
+    for (int i = 0; i < program->function_count; i++) {
+        Function *func = program->functions[i];
+        for (int j = 0; j < func->statement_count; j++) {
+            codegen_collect_strings_from_statement(codegen, func->statements[j]);
+        }
+    }
+
+    // Generate .rodata section with string literals
+    if (codegen->string_count > 0) {
+        fprintf(codegen->output_file, ".section .rodata\n");
+        for (int i = 0; i < codegen->string_count; i++) {
+            fprintf(codegen->output_file, "%s:\n", codegen->strings[i].label);
+            fprintf(codegen->output_file, "    .string \"%s\"\n", codegen->strings[i].value);
+        }
+        fprintf(codegen->output_file, "\n");
+    }
+
+    // Generate .text section
+    fprintf(codegen->output_file, ".text\n");
+
+    // Add print_string runtime function
+    fprintf(codegen->output_file, "print_string:\n");
+    fprintf(codegen->output_file, "    pushq %%rbp\n");
+    fprintf(codegen->output_file, "    movq %%rsp, %%rbp\n");
+    fprintf(codegen->output_file, "    \n");
+    fprintf(codegen->output_file, "    # Calculate string length\n");
+    fprintf(codegen->output_file, "    movq %%rdi, %%rsi  # Save string pointer\n");
+    fprintf(codegen->output_file, "    movq %%rdi, %%rcx  # Counter for strlen\n");
+    fprintf(codegen->output_file, "    xorq %%rax, %%rax  # Length accumulator\n");
+    fprintf(codegen->output_file, ".strlen_loop:\n");
+    fprintf(codegen->output_file, "    cmpb $0, (%%rcx)\n");
+    fprintf(codegen->output_file, "    je .strlen_done\n");
+    fprintf(codegen->output_file, "    incq %%rcx\n");
+    fprintf(codegen->output_file, "    incq %%rax\n");
+    fprintf(codegen->output_file, "    jmp .strlen_loop\n");
+    fprintf(codegen->output_file, ".strlen_done:\n");
+    fprintf(codegen->output_file, "    \n");
+    fprintf(codegen->output_file, "    # Call write syscall (sys_write = 1)\n");
+    fprintf(codegen->output_file, "    movq $1, %%rdi     # fd = stdout\n");
+    fprintf(codegen->output_file, "    movq %%rsi, %%rsi   # buf = string pointer (already in rsi)\n");
+    fprintf(codegen->output_file, "    movq %%rax, %%rdx   # count = string length\n");
+    fprintf(codegen->output_file, "    movq $1, %%rax     # syscall number for write\n");
+    fprintf(codegen->output_file, "    syscall\n");
+    fprintf(codegen->output_file, "    \n");
+    fprintf(codegen->output_file, "    # Print newline\n");
+    fprintf(codegen->output_file, "    movq $1, %%rdi     # fd = stdout\n");
+    fprintf(codegen->output_file, "    leaq .newline(%%rip), %%rsi  # newline string\n");
+    fprintf(codegen->output_file, "    movq $1, %%rdx     # count = 1\n");
+    fprintf(codegen->output_file, "    movq $1, %%rax     # syscall number for write\n");
+    fprintf(codegen->output_file, "    syscall\n");
+    fprintf(codegen->output_file, "    \n");
+    fprintf(codegen->output_file, "    popq %%rbp\n");
+    fprintf(codegen->output_file, "    ret\n");
+    fprintf(codegen->output_file, "\n");
+    fprintf(codegen->output_file, ".section .rodata\n");
+    fprintf(codegen->output_file, ".newline:\n");
+    fprintf(codegen->output_file, "    .string \"\\n\"\n");
+    fprintf(codegen->output_file, "\n");
     fprintf(codegen->output_file, ".text\n");
 
     // Generate all functions

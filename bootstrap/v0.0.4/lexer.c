@@ -186,6 +186,8 @@ Token* lexer_next_token(Lexer *lexer) {
                 type = TOKEN_MULTIPLIED;
             } else if (strcmp(word, "by") == 0) {
                 type = TOKEN_BY;
+            } else if (strcmp(word, "Print") == 0) {
+                type = TOKEN_PRINT;
             } else {
                 type = TOKEN_IDENTIFIER;
             }

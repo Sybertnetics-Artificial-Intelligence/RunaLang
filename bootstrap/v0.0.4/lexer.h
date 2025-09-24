@@ -30,6 +30,7 @@ typedef enum {
     TOKEN_AS,
     TOKEN_MULTIPLIED,
     TOKEN_BY,
+    TOKEN_PRINT,
     TOKEN_LPAREN,
     TOKEN_RPAREN,
     TOKEN_IDENTIFIER,
