@@ -608,8 +608,8 @@ delete_statement      ::= "Delete" expression
 ## Module System
 
 ```ebnf
-import_statement      ::= "Import" "Module" identifier ("as" identifier)?
-                        | "Import" '{' import_list '}' "from" "Module" identifier
+import_statement      ::= "Import" string_literal "as" identifier
+                        | "Import" '{' import_list '}' "from" string_literal
 
 import_list           ::= import_item (',' import_item)*
 

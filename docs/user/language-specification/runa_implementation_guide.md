@@ -2806,9 +2806,9 @@ Otherwise:
 
 # Target-based compilation
 When target "web":
-    Import module "web_utilities"
+    Import "web_utilities" as web_utilities
 When target "desktop":
-    Import module "desktop_utilities"
+    Import "desktop_utilities" as desktop_utilities
 
 # Debug vs Release
 When build_mode "debug":
