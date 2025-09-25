@@ -3,6 +3,11 @@
 #include <string.h>
 #include "codegen_x86.h"
 
+// Forward declarations for loop context management
+static void codegen_push_loop_context(CodeGenerator *codegen, int continue_label, int break_label);
+static void codegen_pop_loop_context(CodeGenerator *codegen);
+static LoopContext* codegen_current_loop_context(CodeGenerator *codegen);
+
 static char* string_duplicate(const char *str) {
     if (!str) return NULL;
     int len = strlen(str);
@@ -202,6 +207,19 @@ static void codegen_collect_strings_from_statement(CodeGenerator *codegen, State
         case STMT_IMPORT:
             // Imports don't have strings to collect
             break;
+
+        case STMT_BREAK:
+            // Break statements don't have expressions to collect strings from
+            break;
+
+        case STMT_CONTINUE:
+            // Continue statements don't have expressions to collect strings from
+            break;
+
+        case STMT_INLINE_ASSEMBLY:
+            // Inline assembly doesn't have string literals to collect
+            break;
+
         case STMT_MATCH:
             codegen_collect_strings_from_expression(codegen, stmt->data.match_stmt.expression);
             for (int i = 0; i < stmt->data.match_stmt.case_count; i++) {
@@ -391,6 +409,45 @@ static void codegen_generate_expression(CodeGenerator *codegen, Expression *expr
                 fprintf(codegen->output_file, "    movq $0, %%rax\n");
                 fprintf(codegen->output_file, ".Ldiv_done_%d:\n", codegen->label_counter);
                 codegen->label_counter++;
+            } else if (expr->data.binary_op.operator == TOKEN_MODULO) {
+                // Modulo: dividend in %rax, divisor in %rbx
+                // Move divisor to %rcx to preserve %rbx
+                fprintf(codegen->output_file, "    movq %%rax, %%rcx\n");  // Save divisor in %rcx
+                fprintf(codegen->output_file, "    movq %%rbx, %%rax\n");  // Move dividend to %rax
+
+                // Check for modulo by zero
+                fprintf(codegen->output_file, "    testq %%rcx, %%rcx\n");
+                fprintf(codegen->output_file, "    jz .Lmod_by_zero_%d\n", codegen->label_counter);
+
+                // Sign extend %rax to %rdx:%rax
+                fprintf(codegen->output_file, "    cqto\n");
+                // Divide by %rcx, quotient in %rax, remainder in %rdx
+                fprintf(codegen->output_file, "    idivq %%rcx\n");
+                // Move remainder to %rax
+                fprintf(codegen->output_file, "    movq %%rdx, %%rax\n");
+                fprintf(codegen->output_file, "    jmp .Lmod_done_%d\n", codegen->label_counter);
+
+                // Modulo by zero handler - return 0
+                fprintf(codegen->output_file, ".Lmod_by_zero_%d:\n", codegen->label_counter);
+                fprintf(codegen->output_file, "    movq $0, %%rax\n");
+                fprintf(codegen->output_file, ".Lmod_done_%d:\n", codegen->label_counter);
+                codegen->label_counter++;
+            } else if (expr->data.binary_op.operator == TOKEN_BIT_AND) {
+                fprintf(codegen->output_file, "    andq %%rbx, %%rax\n");
+            } else if (expr->data.binary_op.operator == TOKEN_BIT_OR) {
+                fprintf(codegen->output_file, "    orq %%rbx, %%rax\n");
+            } else if (expr->data.binary_op.operator == TOKEN_BIT_XOR) {
+                fprintf(codegen->output_file, "    xorq %%rbx, %%rax\n");
+            } else if (expr->data.binary_op.operator == TOKEN_BIT_SHIFT_LEFT) {
+                // For left shift, we need the shift amount in %rcx (cl register)
+                fprintf(codegen->output_file, "    movq %%rax, %%rcx\n");  // Move shift amount to %rcx
+                fprintf(codegen->output_file, "    movq %%rbx, %%rax\n");  // Move value to be shifted to %rax
+                fprintf(codegen->output_file, "    salq %%cl, %%rax\n");   // Shift left by %cl bits
+            } else if (expr->data.binary_op.operator == TOKEN_BIT_SHIFT_RIGHT) {
+                // For right shift, we need the shift amount in %rcx (cl register)
+                fprintf(codegen->output_file, "    movq %%rax, %%rcx\n");  // Move shift amount to %rcx
+                fprintf(codegen->output_file, "    movq %%rbx, %%rax\n");  // Move value to be shifted to %rax
+                fprintf(codegen->output_file, "    sarq %%cl, %%rax\n");   // Arithmetic shift right by %cl bits
             }
             break;
 
@@ -502,6 +559,98 @@ static void codegen_generate_expression(CodeGenerator *codegen, Expression *expr
                 func_name = "list_length";
             } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_DESTROY) {
                 func_name = "list_destroy";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_SET) {
+                func_name = "list_set";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_INSERT) {
+                func_name = "list_insert";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_REMOVE) {
+                func_name = "list_remove";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_CLEAR) {
+                func_name = "list_clear";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_FIND) {
+                func_name = "list_find";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_SORT) {
+                func_name = "list_sort";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_REVERSE) {
+                func_name = "list_reverse";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_COPY) {
+                func_name = "list_copy";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LIST_MERGE) {
+                func_name = "list_merge";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_STRING_CONCAT) {
+                func_name = "string_concat";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_STRING_COMPARE) {
+                func_name = "string_compare";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_STRING_TO_INTEGER) {
+                func_name = "string_to_integer";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_INTEGER_TO_STRING) {
+                func_name = "integer_to_string";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_STRING_FIND) {
+                func_name = "string_find";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_STRING_REPLACE) {
+                func_name = "string_replace";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_STRING_TRIM) {
+                func_name = "string_trim";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_STRING_SPLIT) {
+                func_name = "string_split";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_OPEN) {
+                func_name = "runtime_file_open";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_CLOSE) {
+                func_name = "runtime_file_close";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_READ_LINE) {
+                func_name = "runtime_file_read_line";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_WRITE_LINE) {
+                func_name = "runtime_file_write_line";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_EXISTS) {
+                func_name = "runtime_file_exists";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_DELETE) {
+                func_name = "runtime_file_delete";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_SIZE) {
+                func_name = "runtime_file_size";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_SEEK) {
+                func_name = "runtime_file_seek";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_TELL) {
+                func_name = "runtime_file_tell";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_EOF) {
+                func_name = "runtime_file_eof";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_SIN) {
+                func_name = "runtime_sin";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_COS) {
+                func_name = "runtime_cos";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_TAN) {
+                func_name = "runtime_tan";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_SQRT) {
+                func_name = "runtime_sqrt";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_POW) {
+                func_name = "runtime_pow";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_ABS) {
+                func_name = "runtime_abs";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FLOOR) {
+                func_name = "runtime_floor";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_CEIL) {
+                func_name = "runtime_ceil";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_MIN) {
+                func_name = "runtime_min";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_MAX) {
+                func_name = "runtime_max";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_RANDOM) {
+                func_name = "runtime_random";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_LOG) {
+                func_name = "runtime_log";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_EXP) {
+                func_name = "runtime_exp";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_GET_COMMAND_LINE_ARGS) {
+                func_name = "get_command_line_args_count";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_EXIT_WITH_CODE) {
+                func_name = "exit_with_code";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_PANIC) {
+                func_name = "panic";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_ASSERT) {
+                func_name = "assert";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_ALLOCATE) {
+                func_name = "allocate";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_DEALLOCATE) {
+                func_name = "deallocate";
             } else {
                 fprintf(stderr, "[CODEGEN ERROR] Unknown built-in function type\n");
                 exit(1);
@@ -558,6 +707,75 @@ static void codegen_generate_expression(CodeGenerator *codegen, Expression *expr
                       expr->data.builtin_call.builtin_type == TOKEN_LIST_APPEND) {
                 if (arg_count != 2) {
                     fprintf(stderr, "[CODEGEN ERROR] %s expects 2 arguments, got %d\n", func_name, arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_OPEN ||
+                      expr->data.builtin_call.builtin_type == TOKEN_FILE_WRITE_LINE) {
+                if (arg_count != 2) {
+                    fprintf(stderr, "[CODEGEN ERROR] %s expects 2 arguments, got %d\n", func_name, arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_CLOSE ||
+                      expr->data.builtin_call.builtin_type == TOKEN_FILE_READ_LINE ||
+                      expr->data.builtin_call.builtin_type == TOKEN_FILE_TELL ||
+                      expr->data.builtin_call.builtin_type == TOKEN_FILE_EOF ||
+                      expr->data.builtin_call.builtin_type == TOKEN_FILE_EXISTS ||
+                      expr->data.builtin_call.builtin_type == TOKEN_FILE_DELETE ||
+                      expr->data.builtin_call.builtin_type == TOKEN_FILE_SIZE) {
+                if (arg_count != 1) {
+                    fprintf(stderr, "[CODEGEN ERROR] %s expects 1 argument, got %d\n", func_name, arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_FILE_SEEK) {
+                if (arg_count != 3) {
+                    fprintf(stderr, "[CODEGEN ERROR] %s expects 3 arguments, got %d\n", func_name, arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_SIN ||
+                      expr->data.builtin_call.builtin_type == TOKEN_COS ||
+                      expr->data.builtin_call.builtin_type == TOKEN_TAN ||
+                      expr->data.builtin_call.builtin_type == TOKEN_SQRT ||
+                      expr->data.builtin_call.builtin_type == TOKEN_ABS ||
+                      expr->data.builtin_call.builtin_type == TOKEN_FLOOR ||
+                      expr->data.builtin_call.builtin_type == TOKEN_CEIL ||
+                      expr->data.builtin_call.builtin_type == TOKEN_LOG ||
+                      expr->data.builtin_call.builtin_type == TOKEN_EXP) {
+                if (arg_count != 1) {
+                    fprintf(stderr, "[CODEGEN ERROR] %s expects 1 argument, got %d\n", func_name, arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_POW ||
+                      expr->data.builtin_call.builtin_type == TOKEN_MIN ||
+                      expr->data.builtin_call.builtin_type == TOKEN_MAX) {
+                if (arg_count != 2) {
+                    fprintf(stderr, "[CODEGEN ERROR] %s expects 2 arguments, got %d\n", func_name, arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_RANDOM) {
+                if (arg_count != 0) {
+                    fprintf(stderr, "[CODEGEN ERROR] %s expects 0 arguments, got %d\n", func_name, arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_GET_COMMAND_LINE_ARGS) {
+                if (arg_count != 0) {
+                    fprintf(stderr, "[CODEGEN ERROR] get_command_line_args expects 0 arguments, got %d\n", arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_EXIT_WITH_CODE ||
+                      expr->data.builtin_call.builtin_type == TOKEN_ALLOCATE ||
+                      expr->data.builtin_call.builtin_type == TOKEN_DEALLOCATE) {
+                if (arg_count != 1) {
+                    fprintf(stderr, "[CODEGEN ERROR] %s expects 1 argument, got %d\n", func_name, arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_PANIC) {
+                if (arg_count != 1) {
+                    fprintf(stderr, "[CODEGEN ERROR] panic expects 1 argument (message), got %d\n", arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_ASSERT) {
+                if (arg_count != 2) {
+                    fprintf(stderr, "[CODEGEN ERROR] assert expects 2 arguments (condition, message), got %d\n", arg_count);
                     exit(1);
                 }
             }
@@ -843,12 +1061,18 @@ static void codegen_generate_statement(CodeGenerator *codegen, Statement *stmt) 
                 Expression *expr = stmt->data.let_stmt.expression;
                 if (expr->type == EXPR_BUILTIN_CALL &&
                     (expr->data.builtin_call.builtin_type == TOKEN_READ_FILE ||
-                     expr->data.builtin_call.builtin_type == TOKEN_STRING_SUBSTRING)) {
+                     expr->data.builtin_call.builtin_type == TOKEN_STRING_SUBSTRING ||
+                     expr->data.builtin_call.builtin_type == TOKEN_STRING_CONCAT ||
+                     expr->data.builtin_call.builtin_type == TOKEN_INTEGER_TO_STRING ||
+                     expr->data.builtin_call.builtin_type == TOKEN_STRING_REPLACE ||
+                     expr->data.builtin_call.builtin_type == TOKEN_STRING_TRIM)) {
                     // This is a string-returning expression
                     codegen_add_variable_with_type(codegen, stmt->data.let_stmt.variable_name, "String");
                 } else if (expr->type == EXPR_BUILTIN_CALL &&
-                          expr->data.builtin_call.builtin_type == TOKEN_LIST_CREATE) {
-                    // This is a list-returning expression
+                          (expr->data.builtin_call.builtin_type == TOKEN_LIST_CREATE ||
+                           expr->data.builtin_call.builtin_type == TOKEN_LIST_COPY ||
+                           expr->data.builtin_call.builtin_type == TOKEN_LIST_MERGE)) {
+                    // These are list-returning expressions
                     codegen_add_variable_with_type(codegen, stmt->data.let_stmt.variable_name, "List");
                 } else {
                     // Regular integer/other expression
@@ -923,6 +1147,9 @@ static void codegen_generate_statement(CodeGenerator *codegen, Statement *stmt) 
             int loop_start = label_num * 10 + 1;
             int loop_end = label_num * 10 + 2;
 
+            // Push loop context for break/continue statements
+            codegen_push_loop_context(codegen, loop_start, loop_end);
+
             // Loop start label
             fprintf(codegen->output_file, ".L%d:\n", loop_start);
 
@@ -942,6 +1169,102 @@ static void codegen_generate_statement(CodeGenerator *codegen, Statement *stmt) 
 
             // Loop end label
             fprintf(codegen->output_file, ".L%d:\n", loop_end);
+
+            // Pop loop context
+            codegen_pop_loop_context(codegen);
+            break;
+        }
+
+        case STMT_BREAK: {
+            LoopContext *loop_ctx = codegen_current_loop_context(codegen);
+            if (loop_ctx) {
+                fprintf(codegen->output_file, "    jmp .L%d\n", loop_ctx->break_label);
+            } else {
+                fprintf(stderr, "[CODEGEN ERROR] Break statement outside of loop\n");
+                exit(1);
+            }
+            break;
+        }
+
+        case STMT_CONTINUE: {
+            LoopContext *loop_ctx = codegen_current_loop_context(codegen);
+            if (loop_ctx) {
+                fprintf(codegen->output_file, "    jmp .L%d\n", loop_ctx->continue_label);
+            } else {
+                fprintf(stderr, "[CODEGEN ERROR] Continue statement outside of loop\n");
+                exit(1);
+            }
+            break;
+        }
+
+        case STMT_INLINE_ASSEMBLY: {
+            // Generate GCC inline assembly block
+            fprintf(codegen->output_file, "    asm volatile (\n");
+
+            // Output assembly instruction lines
+            for (int i = 0; i < stmt->data.inline_assembly_stmt.assembly_line_count; i++) {
+                fprintf(codegen->output_file, "        \"%s\"",
+                        stmt->data.inline_assembly_stmt.assembly_lines[i]);
+
+                // Add newline escape if not present
+                if (strlen(stmt->data.inline_assembly_stmt.assembly_lines[i]) > 0 &&
+                    stmt->data.inline_assembly_stmt.assembly_lines[i][strlen(stmt->data.inline_assembly_stmt.assembly_lines[i]) - 1] != 'n') {
+                    fprintf(codegen->output_file, "\\n");
+                }
+
+                if (i < stmt->data.inline_assembly_stmt.assembly_line_count - 1) {
+                    fprintf(codegen->output_file, "\n");
+                } else {
+                    fprintf(codegen->output_file, "\"\n");
+                }
+            }
+
+            // Output constraints (only if we have any)
+            if (stmt->data.inline_assembly_stmt.output_count > 0) {
+                fprintf(codegen->output_file, "        : ");
+                for (int i = 0; i < stmt->data.inline_assembly_stmt.output_count; i++) {
+                    fprintf(codegen->output_file, "%s", stmt->data.inline_assembly_stmt.output_constraints[i]);
+                    if (i < stmt->data.inline_assembly_stmt.output_count - 1) {
+                        fprintf(codegen->output_file, ", ");
+                    }
+                }
+                fprintf(codegen->output_file, "\n");
+            }
+
+            // Input constraints
+            if (stmt->data.inline_assembly_stmt.input_count > 0) {
+                if (stmt->data.inline_assembly_stmt.output_count == 0) {
+                    fprintf(codegen->output_file, "        :\n");  // Empty output section
+                }
+                fprintf(codegen->output_file, "        : ");
+                for (int i = 0; i < stmt->data.inline_assembly_stmt.input_count; i++) {
+                    fprintf(codegen->output_file, "%s", stmt->data.inline_assembly_stmt.input_constraints[i]);
+                    if (i < stmt->data.inline_assembly_stmt.input_count - 1) {
+                        fprintf(codegen->output_file, ", ");
+                    }
+                }
+                fprintf(codegen->output_file, "\n");
+            }
+
+            // Clobber list
+            if (stmt->data.inline_assembly_stmt.clobber_count > 0) {
+                if (stmt->data.inline_assembly_stmt.output_count == 0 &&
+                    stmt->data.inline_assembly_stmt.input_count == 0) {
+                    fprintf(codegen->output_file, "        :\n        :\n");  // Empty output and input sections
+                } else if (stmt->data.inline_assembly_stmt.input_count == 0) {
+                    fprintf(codegen->output_file, "        :\n");  // Empty input section
+                }
+                fprintf(codegen->output_file, "        : ");
+                for (int i = 0; i < stmt->data.inline_assembly_stmt.clobber_count; i++) {
+                    fprintf(codegen->output_file, "\"%s\"", stmt->data.inline_assembly_stmt.clobber_list[i]);
+                    if (i < stmt->data.inline_assembly_stmt.clobber_count - 1) {
+                        fprintf(codegen->output_file, ", ");
+                    }
+                }
+                fprintf(codegen->output_file, "\n");
+            }
+
+            fprintf(codegen->output_file, "    );\n");
             break;
         }
 
@@ -957,8 +1280,12 @@ static void codegen_generate_statement(CodeGenerator *codegen, Statement *stmt) 
                 fprintf(codegen->output_file, "    call print_string\n");
             } else if (expr->type == EXPR_BUILTIN_CALL &&
                       (expr->data.builtin_call.builtin_type == TOKEN_READ_FILE ||
-                       expr->data.builtin_call.builtin_type == TOKEN_STRING_SUBSTRING)) {
-                // read_file and string_substring return strings - call print_string
+                       expr->data.builtin_call.builtin_type == TOKEN_STRING_SUBSTRING ||
+                       expr->data.builtin_call.builtin_type == TOKEN_STRING_CONCAT ||
+                       expr->data.builtin_call.builtin_type == TOKEN_INTEGER_TO_STRING ||
+                       expr->data.builtin_call.builtin_type == TOKEN_STRING_REPLACE ||
+                       expr->data.builtin_call.builtin_type == TOKEN_STRING_TRIM)) {
+                // These functions return strings - call print_string
                 fprintf(codegen->output_file, "    movq %%rax, %%rdi\n");
                 fprintf(codegen->output_file, "    call print_string\n");
             } else if (expr->type == EXPR_VARIABLE) {
@@ -1109,11 +1436,15 @@ CodeGenerator* codegen_create(const char *output_filename) {
     codegen->string_capacity = 32;   // Start with space for 32 strings
     codegen->strings = malloc(sizeof(StringLiteral) * codegen->string_capacity);
     codegen->current_program = NULL;
+    codegen->loop_depth = 0;
+    codegen->loop_capacity = 8;  // Start with space for 8 nested loops
+    codegen->loop_stack = malloc(sizeof(LoopContext) * codegen->loop_capacity);
 
     if (!codegen->output_file) {
         fprintf(stderr, "[CODEGEN ERROR] Could not open output file '%s'\n", output_filename);
         free(codegen->variables);
         free(codegen->strings);
+        free(codegen->loop_stack);
         free(codegen);
         return NULL;
     }
@@ -1136,14 +1467,41 @@ void codegen_destroy(CodeGenerator *codegen) {
         }
         free(codegen->variables);
         free(codegen->strings);
+        free(codegen->loop_stack);
         free(codegen);
     }
+}
+
+static void codegen_push_loop_context(CodeGenerator *codegen, int continue_label, int break_label) {
+    // Expand loop stack if necessary
+    if (codegen->loop_depth >= codegen->loop_capacity) {
+        codegen->loop_capacity *= 2;
+        codegen->loop_stack = realloc(codegen->loop_stack, sizeof(LoopContext) * codegen->loop_capacity);
+    }
+
+    codegen->loop_stack[codegen->loop_depth].continue_label = continue_label;
+    codegen->loop_stack[codegen->loop_depth].break_label = break_label;
+    codegen->loop_depth++;
+}
+
+static void codegen_pop_loop_context(CodeGenerator *codegen) {
+    if (codegen->loop_depth > 0) {
+        codegen->loop_depth--;
+    }
+}
+
+static LoopContext* codegen_current_loop_context(CodeGenerator *codegen) {
+    if (codegen->loop_depth > 0) {
+        return &codegen->loop_stack[codegen->loop_depth - 1];
+    }
+    return NULL;
 }
 
 static void codegen_generate_function(CodeGenerator *codegen, Function *func) {
     // Reset variable state for each function
     codegen->variable_count = 0;
     codegen->stack_offset = 0;
+    codegen->loop_depth = 0;  // Reset loop depth for each function
 
     // Export function as global symbol for cross-module linking
     fprintf(codegen->output_file, ".globl %s\n", func->name);
@@ -1158,6 +1516,18 @@ static void codegen_generate_function(CodeGenerator *codegen, Function *func) {
     // Handle parameters (System V ABI: %rdi, %rsi, %rdx, %rcx, %r8, %r9)
     const char *param_registers[] = {"%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"};
     int max_register_params = sizeof(param_registers) / sizeof(param_registers[0]);
+
+    // If this is main function with argc/argv parameters, initialize command line args
+    if (strcmp(func->name, "main") == 0 && func->parameter_count >= 2) {
+        // Store original argc and argv before processing them as Runa parameters
+        fprintf(codegen->output_file, "    # Initialize command line arguments\n");
+        fprintf(codegen->output_file, "    pushq %%rdi  # Save argc\n");
+        fprintf(codegen->output_file, "    pushq %%rsi  # Save argv\n");
+        fprintf(codegen->output_file, "    call runtime_set_command_line_args@PLT\n");
+        fprintf(codegen->output_file, "    popq %%rsi   # Restore argv\n");
+        fprintf(codegen->output_file, "    popq %%rdi   # Restore argc\n");
+        fprintf(codegen->output_file, "\n");
+    }
 
     for (int i = 0; i < func->parameter_count && i < max_register_params; i++) {
         // Add parameter as a variable and store from appropriate register
@@ -1340,6 +1710,27 @@ void codegen_generate(CodeGenerator *codegen, Program *program) {
 
         fprintf(codegen->output_file, "\n");
         codegen_generate_function(codegen, func);
+    }
+
+    // Add a main function wrapper if no main function exists
+    int has_main = 0;
+    for (int i = 0; i < program->function_count; i++) {
+        if (strcmp(program->functions[i]->name, "main") == 0) {
+            has_main = 1;
+            break;
+        }
+    }
+
+    // If no main function exists, generate one that calls the first Process
+    if (!has_main && program->function_count > 0) {
+        fprintf(codegen->output_file, "\n.globl main\n");
+        fprintf(codegen->output_file, "main:\n");
+        fprintf(codegen->output_file, "    # Call the first Process function\n");
+        fprintf(codegen->output_file, "    call %s\n", program->functions[0]->name);
+        fprintf(codegen->output_file, "    # Exit with the return value\n");
+        fprintf(codegen->output_file, "    movq %%rax, %%rdi\n");
+        fprintf(codegen->output_file, "    movq $60, %%rax\n");
+        fprintf(codegen->output_file, "    syscall\n");
     }
 
     // Add GNU stack note to prevent executable stack warning

@@ -15,6 +15,11 @@ typedef struct {
 } StringLiteral;
 
 typedef struct {
+    int continue_label;  // Label to jump to for continue
+    int break_label;     // Label to jump to for break
+} LoopContext;
+
+typedef struct {
     FILE *output_file;
     Variable *variables;      // Dynamic array
     int variable_count;
@@ -25,6 +30,9 @@ typedef struct {
     int string_count;
     int string_capacity;      // Current capacity
     Program *current_program; // To access type definitions
+    LoopContext *loop_stack;  // Stack of nested loops
+    int loop_depth;           // Current loop nesting depth
+    int loop_capacity;        // Capacity of loop stack
 } CodeGenerator;
 
 CodeGenerator* codegen_create(const char *output_filename);

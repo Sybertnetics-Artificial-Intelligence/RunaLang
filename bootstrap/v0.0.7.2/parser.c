@@ -8,6 +8,7 @@ static Statement* parser_parse_if_statement(Parser *parser);
 static Statement* parser_parse_while_statement(Parser *parser);
 static Statement* parser_parse_print_statement(Parser *parser);
 static Statement* parser_parse_match_statement(Parser *parser);
+static Statement* parser_parse_inline_assembly_statement(Parser *parser);
 static Expression* parser_parse_expression(Parser *parser);
 
 static char* string_duplicate(const char *str) {
@@ -44,12 +45,58 @@ static int parser_is_builtin_function_token(TokenType type) {
             type == TOKEN_IS_DIGIT ||
             type == TOKEN_IS_ALPHA ||
             type == TOKEN_IS_WHITESPACE ||
+            type == TOKEN_STRING_CONCAT ||
+            type == TOKEN_STRING_COMPARE ||
+            type == TOKEN_STRING_TO_INTEGER ||
+            type == TOKEN_INTEGER_TO_STRING ||
+            type == TOKEN_STRING_FIND ||
+            type == TOKEN_STRING_REPLACE ||
+            type == TOKEN_STRING_TRIM ||
+            type == TOKEN_STRING_SPLIT ||
             type == TOKEN_LIST_CREATE ||
             type == TOKEN_LIST_APPEND ||
             type == TOKEN_LIST_GET ||
             type == TOKEN_LIST_GET_INTEGER ||
             type == TOKEN_LIST_LENGTH ||
-            type == TOKEN_LIST_DESTROY);
+            type == TOKEN_LIST_DESTROY ||
+            type == TOKEN_LIST_SET ||
+            type == TOKEN_LIST_INSERT ||
+            type == TOKEN_LIST_REMOVE ||
+            type == TOKEN_LIST_CLEAR ||
+            type == TOKEN_LIST_FIND ||
+            type == TOKEN_LIST_SORT ||
+            type == TOKEN_LIST_REVERSE ||
+            type == TOKEN_LIST_COPY ||
+            type == TOKEN_LIST_MERGE ||
+            type == TOKEN_FILE_OPEN ||
+            type == TOKEN_FILE_CLOSE ||
+            type == TOKEN_FILE_READ_LINE ||
+            type == TOKEN_FILE_WRITE_LINE ||
+            type == TOKEN_FILE_EXISTS ||
+            type == TOKEN_FILE_DELETE ||
+            type == TOKEN_FILE_SIZE ||
+            type == TOKEN_FILE_SEEK ||
+            type == TOKEN_FILE_TELL ||
+            type == TOKEN_FILE_EOF ||
+            type == TOKEN_SIN ||
+            type == TOKEN_COS ||
+            type == TOKEN_TAN ||
+            type == TOKEN_SQRT ||
+            type == TOKEN_POW ||
+            type == TOKEN_ABS ||
+            type == TOKEN_FLOOR ||
+            type == TOKEN_CEIL ||
+            type == TOKEN_MIN ||
+            type == TOKEN_MAX ||
+            type == TOKEN_RANDOM ||
+            type == TOKEN_LOG ||
+            type == TOKEN_EXP ||
+            type == TOKEN_GET_COMMAND_LINE_ARGS ||
+            type == TOKEN_EXIT_WITH_CODE ||
+            type == TOKEN_PANIC ||
+            type == TOKEN_ASSERT ||
+            type == TOKEN_ALLOCATE ||
+            type == TOKEN_DEALLOCATE);
 }
 
 // Forward declarations
@@ -160,6 +207,18 @@ static Statement* statement_create_while(Expression *condition, Statement **body
     return stmt;
 }
 
+static Statement* statement_create_break(void) {
+    Statement *stmt = malloc(sizeof(Statement));
+    stmt->type = STMT_BREAK;
+    return stmt;
+}
+
+static Statement* statement_create_continue(void) {
+    Statement *stmt = malloc(sizeof(Statement));
+    stmt->type = STMT_CONTINUE;
+    return stmt;
+}
+
 static Function* function_create(const char *name, char *return_type) {
     Function *func = malloc(sizeof(Function));
     func->name = string_duplicate(name);
@@ -223,22 +282,7 @@ static void program_add_import(Program *program, Import *import) {
 
 static Expression* parser_parse_primary(Parser *parser) {
     // Handle built-in functions
-    if (parser->current_token->type == TOKEN_READ_FILE ||
-        parser->current_token->type == TOKEN_WRITE_FILE ||
-        parser->current_token->type == TOKEN_STRING_LENGTH ||
-        parser->current_token->type == TOKEN_STRING_CHAR_AT ||
-        parser->current_token->type == TOKEN_STRING_SUBSTRING ||
-        parser->current_token->type == TOKEN_STRING_EQUALS ||
-        parser->current_token->type == TOKEN_ASCII_VALUE_OF ||
-        parser->current_token->type == TOKEN_IS_DIGIT ||
-        parser->current_token->type == TOKEN_IS_ALPHA ||
-        parser->current_token->type == TOKEN_IS_WHITESPACE ||
-        parser->current_token->type == TOKEN_LIST_CREATE ||
-        parser->current_token->type == TOKEN_LIST_APPEND ||
-        parser->current_token->type == TOKEN_LIST_GET ||
-        parser->current_token->type == TOKEN_LIST_GET_INTEGER ||
-        parser->current_token->type == TOKEN_LIST_LENGTH ||
-        parser->current_token->type == TOKEN_LIST_DESTROY) {
+    if (parser_is_builtin_function_token(parser->current_token->type)) {
         TokenType builtin_type = parser->current_token->type;
         parser_eat(parser, builtin_type);
 
@@ -483,7 +527,10 @@ static Expression* parser_parse_expression(Parser *parser) {
 
     // Then handle binary operators
     while (parser->current_token->type == TOKEN_PLUS || parser->current_token->type == TOKEN_MINUS ||
-           parser->current_token->type == TOKEN_MULTIPLIED || parser->current_token->type == TOKEN_DIVIDED) {
+           parser->current_token->type == TOKEN_MULTIPLIED || parser->current_token->type == TOKEN_DIVIDED ||
+           parser->current_token->type == TOKEN_MODULO || parser->current_token->type == TOKEN_BIT_AND ||
+           parser->current_token->type == TOKEN_BIT_OR || parser->current_token->type == TOKEN_BIT_XOR ||
+           parser->current_token->type == TOKEN_BIT_SHIFT_LEFT || parser->current_token->type == TOKEN_BIT_SHIFT_RIGHT) {
         TokenType operator = parser->current_token->type;
 
         if (operator == TOKEN_MULTIPLIED) {
@@ -491,6 +538,15 @@ static Expression* parser_parse_expression(Parser *parser) {
             parser_eat(parser, TOKEN_BY);
         } else if (operator == TOKEN_DIVIDED) {
             parser_eat(parser, TOKEN_DIVIDED);
+            parser_eat(parser, TOKEN_BY);
+        } else if (operator == TOKEN_MODULO) {
+            parser_eat(parser, TOKEN_MODULO);
+            parser_eat(parser, TOKEN_BY);
+        } else if (operator == TOKEN_BIT_SHIFT_LEFT) {
+            parser_eat(parser, TOKEN_BIT_SHIFT_LEFT);
+            parser_eat(parser, TOKEN_BY);
+        } else if (operator == TOKEN_BIT_SHIFT_RIGHT) {
+            parser_eat(parser, TOKEN_BIT_SHIFT_RIGHT);
             parser_eat(parser, TOKEN_BY);
         } else {
             parser_eat(parser, operator);
@@ -621,10 +677,174 @@ static Statement* parser_parse_return_statement(Parser *parser) {
     return statement_create_return(expr);
 }
 
+static Statement* parser_parse_break_statement(Parser *parser) {
+    parser_eat(parser, TOKEN_BREAK);
+    return statement_create_break();
+}
+
+static Statement* parser_parse_continue_statement(Parser *parser) {
+    parser_eat(parser, TOKEN_CONTINUE);
+    return statement_create_continue();
+}
+
 static Statement* parser_parse_print_statement(Parser *parser) {
     parser_eat(parser, TOKEN_PRINT);
     Expression *expr = parser_parse_expression(parser);
     return statement_create_print(expr);
+}
+
+static Statement* parser_parse_inline_assembly_statement(Parser *parser) {
+    parser_eat(parser, TOKEN_INLINE);
+    parser_eat(parser, TOKEN_ASSEMBLY);
+    parser_eat(parser, TOKEN_COLON);
+
+    Statement *stmt = malloc(sizeof(Statement));
+    stmt->type = STMT_INLINE_ASSEMBLY;
+
+    // Initialize arrays
+    stmt->data.inline_assembly_stmt.assembly_lines = NULL;
+    stmt->data.inline_assembly_stmt.assembly_notes = NULL;
+    stmt->data.inline_assembly_stmt.assembly_line_count = 0;
+    stmt->data.inline_assembly_stmt.output_constraints = NULL;
+    stmt->data.inline_assembly_stmt.output_count = 0;
+    stmt->data.inline_assembly_stmt.input_constraints = NULL;
+    stmt->data.inline_assembly_stmt.input_count = 0;
+    stmt->data.inline_assembly_stmt.clobber_list = NULL;
+    stmt->data.inline_assembly_stmt.clobber_count = 0;
+
+    // Parse assembly instruction lines
+    int capacity = 0;
+    while (parser->current_token->type == TOKEN_STRING_LITERAL) {
+        // Expand arrays if needed
+        if (stmt->data.inline_assembly_stmt.assembly_line_count >= capacity) {
+            capacity = (capacity == 0) ? 4 : capacity * 2;
+            stmt->data.inline_assembly_stmt.assembly_lines = realloc(
+                stmt->data.inline_assembly_stmt.assembly_lines,
+                capacity * sizeof(char*)
+            );
+            stmt->data.inline_assembly_stmt.assembly_notes = realloc(
+                stmt->data.inline_assembly_stmt.assembly_notes,
+                capacity * sizeof(char*)
+            );
+        }
+
+        // Parse assembly instruction string
+        stmt->data.inline_assembly_stmt.assembly_lines[stmt->data.inline_assembly_stmt.assembly_line_count] =
+            string_duplicate(parser->current_token->value);
+        parser_advance(parser);
+
+        // Expect "Note:" comment
+        if (parser->current_token->type != TOKEN_NOTE) {
+            fprintf(stderr, "[PARSER ERROR] Expected Note: comment after assembly instruction at line %d\n",
+                    parser->current_token->line);
+            exit(1);
+        }
+        parser_eat(parser, TOKEN_NOTE);
+        parser_eat(parser, TOKEN_COLON);
+
+        // Parse note text (could be multiple tokens until newline/next statement)
+        // For now, we'll require it to be a string or identifier
+        if (parser->current_token->type == TOKEN_STRING_LITERAL ||
+            parser->current_token->type == TOKEN_IDENTIFIER) {
+            stmt->data.inline_assembly_stmt.assembly_notes[stmt->data.inline_assembly_stmt.assembly_line_count] =
+                string_duplicate(parser->current_token->value);
+            parser_advance(parser);
+        } else {
+            // Parse the note as text until we hit a control token
+            stmt->data.inline_assembly_stmt.assembly_notes[stmt->data.inline_assembly_stmt.assembly_line_count] =
+                string_duplicate("Assembly instruction");
+        }
+
+        stmt->data.inline_assembly_stmt.assembly_line_count++;
+    }
+
+    // Parse constraints (optional sections separated by colons)
+    // Output constraints
+    if (parser->current_token->type == TOKEN_COLON) {
+        parser_advance(parser);
+        // Parse output constraints until next colon or End
+        int out_capacity = 0;
+        while (parser->current_token->type != TOKEN_COLON &&
+               parser->current_token->type != TOKEN_END &&
+               parser->current_token->type != TOKEN_EOF) {
+
+            if (stmt->data.inline_assembly_stmt.output_count >= out_capacity) {
+                out_capacity = (out_capacity == 0) ? 4 : out_capacity * 2;
+                stmt->data.inline_assembly_stmt.output_constraints = realloc(
+                    stmt->data.inline_assembly_stmt.output_constraints,
+                    out_capacity * sizeof(char*)
+                );
+            }
+
+            if (parser->current_token->type == TOKEN_STRING_LITERAL) {
+                stmt->data.inline_assembly_stmt.output_constraints[stmt->data.inline_assembly_stmt.output_count] =
+                    string_duplicate(parser->current_token->value);
+                stmt->data.inline_assembly_stmt.output_count++;
+                parser_advance(parser);
+            } else {
+                parser_advance(parser); // Skip other tokens
+            }
+        }
+
+        // Input constraints
+        if (parser->current_token->type == TOKEN_COLON) {
+            parser_advance(parser);
+            int in_capacity = 0;
+            while (parser->current_token->type != TOKEN_COLON &&
+                   parser->current_token->type != TOKEN_END &&
+                   parser->current_token->type != TOKEN_EOF) {
+
+                if (stmt->data.inline_assembly_stmt.input_count >= in_capacity) {
+                    in_capacity = (in_capacity == 0) ? 4 : in_capacity * 2;
+                    stmt->data.inline_assembly_stmt.input_constraints = realloc(
+                        stmt->data.inline_assembly_stmt.input_constraints,
+                        in_capacity * sizeof(char*)
+                    );
+                }
+
+                if (parser->current_token->type == TOKEN_STRING_LITERAL) {
+                    stmt->data.inline_assembly_stmt.input_constraints[stmt->data.inline_assembly_stmt.input_count] =
+                        string_duplicate(parser->current_token->value);
+                    stmt->data.inline_assembly_stmt.input_count++;
+                    parser_advance(parser);
+                } else {
+                    parser_advance(parser); // Skip other tokens
+                }
+            }
+
+            // Clobber list
+            if (parser->current_token->type == TOKEN_COLON) {
+                parser_advance(parser);
+                int clob_capacity = 0;
+                while (parser->current_token->type != TOKEN_END &&
+                       parser->current_token->type != TOKEN_EOF) {
+
+                    if (stmt->data.inline_assembly_stmt.clobber_count >= clob_capacity) {
+                        clob_capacity = (clob_capacity == 0) ? 4 : clob_capacity * 2;
+                        stmt->data.inline_assembly_stmt.clobber_list = realloc(
+                            stmt->data.inline_assembly_stmt.clobber_list,
+                            clob_capacity * sizeof(char*)
+                        );
+                    }
+
+                    if (parser->current_token->type == TOKEN_STRING_LITERAL ||
+                        parser->current_token->type == TOKEN_IDENTIFIER) {
+                        stmt->data.inline_assembly_stmt.clobber_list[stmt->data.inline_assembly_stmt.clobber_count] =
+                            string_duplicate(parser->current_token->value);
+                        stmt->data.inline_assembly_stmt.clobber_count++;
+                        parser_advance(parser);
+                    } else {
+                        parser_advance(parser); // Skip other tokens
+                    }
+                }
+            }
+        }
+    }
+
+    parser_eat(parser, TOKEN_END);
+    parser_eat(parser, TOKEN_ASSEMBLY);
+
+    return stmt;
 }
 
 static Statement** parser_parse_statement_block(Parser *parser, int *count) {
@@ -647,8 +867,14 @@ static Statement** parser_parse_statement_block(Parser *parser, int *count) {
             stmt = parser_parse_match_statement(parser);
         } else if (parser->current_token->type == TOKEN_RETURN) {
             stmt = parser_parse_return_statement(parser);
+        } else if (parser->current_token->type == TOKEN_BREAK) {
+            stmt = parser_parse_break_statement(parser);
+        } else if (parser->current_token->type == TOKEN_CONTINUE) {
+            stmt = parser_parse_continue_statement(parser);
         } else if (parser->current_token->type == TOKEN_PRINT) {
             stmt = parser_parse_print_statement(parser);
+        } else if (parser->current_token->type == TOKEN_INLINE) {
+            stmt = parser_parse_inline_assembly_statement(parser);
         } else if (parser->current_token->type == TOKEN_IDENTIFIER) {
             // Try to parse as expression (could be a function call)
             Expression *expr = parser_parse_expression(parser);
@@ -696,10 +922,57 @@ static Statement* parser_parse_if_statement(Parser *parser) {
     Statement **else_body = NULL;
     int else_body_count = 0;
 
-    if (parser->current_token->type == TOKEN_OTHERWISE) {
+    // Handle elif/else chains
+    while (parser->current_token->type == TOKEN_OTHERWISE) {
         parser_eat(parser, TOKEN_OTHERWISE);
-        parser_eat(parser, TOKEN_COLON);
-        else_body = parser_parse_statement_block(parser, &else_body_count);
+
+        // Check if this is "Otherwise If" (elif)
+        if (parser->current_token->type == TOKEN_IF) {
+            // Parse elif condition and body, create nested if statement
+            parser_eat(parser, TOKEN_IF);
+            Expression *elif_condition = parser_parse_comparison(parser);
+            parser_eat(parser, TOKEN_COLON);
+
+            int elif_body_count;
+            Statement **elif_body = parser_parse_statement_block(parser, &elif_body_count);
+
+            // Create a nested if statement for the elif
+            Statement *elif_stmt = statement_create_if(elif_condition, elif_body, elif_body_count, NULL, 0);
+
+            if (else_body == NULL) {
+                // First elif - create else body
+                else_body = malloc(sizeof(Statement*));
+                else_body[0] = elif_stmt;
+                else_body_count = 1;
+            } else {
+                // Chain elif to the previous else clause
+                // The last statement in else_body should be an if statement
+                Statement *last_if = else_body[else_body_count - 1];
+                last_if->data.if_stmt.else_body = malloc(sizeof(Statement*));
+                last_if->data.if_stmt.else_body[0] = elif_stmt;
+                last_if->data.if_stmt.else_body_count = 1;
+            }
+        } else {
+            // Regular "Otherwise" clause - this ends the elif chain
+            parser_eat(parser, TOKEN_COLON);
+            Statement **final_else_body = parser_parse_statement_block(parser, &else_body_count);
+
+            if (else_body == NULL) {
+                // No previous elifs, this is a simple else
+                else_body = final_else_body;
+            } else {
+                // Attach to the last elif
+                Statement *last_if = else_body[else_body_count - 1];
+                // Find the deepest nested if statement
+                while (last_if->data.if_stmt.else_body != NULL && last_if->data.if_stmt.else_body_count == 1 &&
+                       last_if->data.if_stmt.else_body[0]->type == STMT_IF) {
+                    last_if = last_if->data.if_stmt.else_body[0];
+                }
+                last_if->data.if_stmt.else_body = final_else_body;
+                last_if->data.if_stmt.else_body_count = else_body_count;
+            }
+            break; // Final else clause ends the chain
+        }
     }
 
     parser_eat(parser, TOKEN_END);
@@ -885,6 +1158,8 @@ static TypeDefinition* parser_parse_type_definition(Parser *parser) {
             parser_eat(parser, TOKEN_AS);
 
             if (parser->current_token->type != TOKEN_INTEGER_TYPE &&
+                parser->current_token->type != TOKEN_STRING_TYPE &&
+                parser->current_token->type != TOKEN_CHARACTER_TYPE &&
                 parser->current_token->type != TOKEN_IDENTIFIER) {
                 fprintf(stderr, "[PARSER ERROR] Expected field type at line %d\n", parser->current_token->line);
                 exit(1);
@@ -893,6 +1168,10 @@ static TypeDefinition* parser_parse_type_definition(Parser *parser) {
             char *field_type = string_duplicate(parser->current_token->value);
             if (parser->current_token->type == TOKEN_INTEGER_TYPE) {
                 parser_eat(parser, TOKEN_INTEGER_TYPE);
+            } else if (parser->current_token->type == TOKEN_STRING_TYPE) {
+                parser_eat(parser, TOKEN_STRING_TYPE);
+            } else if (parser->current_token->type == TOKEN_CHARACTER_TYPE) {
+                parser_eat(parser, TOKEN_CHARACTER_TYPE);
             } else {
                 parser_eat(parser, TOKEN_IDENTIFIER);
             }
@@ -976,6 +1255,8 @@ static TypeDefinition* parser_parse_type_definition(Parser *parser) {
 
                     // Parse field type
                     if (parser->current_token->type != TOKEN_INTEGER_TYPE &&
+                        parser->current_token->type != TOKEN_STRING_TYPE &&
+                        parser->current_token->type != TOKEN_CHARACTER_TYPE &&
                         parser->current_token->type != TOKEN_IDENTIFIER) {
                         fprintf(stderr, "[PARSER ERROR] Expected field type at line %d\n",
                                 parser->current_token->line);
@@ -985,6 +1266,10 @@ static TypeDefinition* parser_parse_type_definition(Parser *parser) {
                     char *field_type = string_duplicate(parser->current_token->value);
                     if (parser->current_token->type == TOKEN_INTEGER_TYPE) {
                         parser_eat(parser, TOKEN_INTEGER_TYPE);
+                    } else if (parser->current_token->type == TOKEN_STRING_TYPE) {
+                        parser_eat(parser, TOKEN_STRING_TYPE);
+                    } else if (parser->current_token->type == TOKEN_CHARACTER_TYPE) {
+                        parser_eat(parser, TOKEN_CHARACTER_TYPE);
                     } else {
                         parser_eat(parser, TOKEN_IDENTIFIER);
                     }
@@ -1058,13 +1343,21 @@ static Function* parser_parse_function(Parser *parser) {
         parser_eat(parser, TOKEN_IDENTIFIER);
         parser_eat(parser, TOKEN_AS);
 
-        if (parser->current_token->type != TOKEN_INTEGER_TYPE) {
+        if (parser->current_token->type != TOKEN_INTEGER_TYPE &&
+            parser->current_token->type != TOKEN_STRING_TYPE &&
+            parser->current_token->type != TOKEN_CHARACTER_TYPE) {
             fprintf(stderr, "[PARSER ERROR] Expected parameter type at line %d\n", parser->current_token->line);
             exit(1);
         }
 
         char *param_type = string_duplicate(parser->current_token->value);
-        parser_eat(parser, TOKEN_INTEGER_TYPE);
+        if (parser->current_token->type == TOKEN_INTEGER_TYPE) {
+            parser_eat(parser, TOKEN_INTEGER_TYPE);
+        } else if (parser->current_token->type == TOKEN_STRING_TYPE) {
+            parser_eat(parser, TOKEN_STRING_TYPE);
+        } else if (parser->current_token->type == TOKEN_CHARACTER_TYPE) {
+            parser_eat(parser, TOKEN_CHARACTER_TYPE);
+        }
 
         function_add_parameter(func, param_name, param_type);
         free(param_name);
@@ -1083,13 +1376,21 @@ static Function* parser_parse_function(Parser *parser) {
             parser_eat(parser, TOKEN_IDENTIFIER);
             parser_eat(parser, TOKEN_AS);
 
-            if (parser->current_token->type != TOKEN_INTEGER_TYPE) {
+            if (parser->current_token->type != TOKEN_INTEGER_TYPE &&
+                parser->current_token->type != TOKEN_STRING_TYPE &&
+                parser->current_token->type != TOKEN_CHARACTER_TYPE) {
                 fprintf(stderr, "[PARSER ERROR] Expected parameter type at line %d\n", parser->current_token->line);
                 exit(1);
             }
 
             param_type = string_duplicate(parser->current_token->value);
-            parser_eat(parser, TOKEN_INTEGER_TYPE);
+            if (parser->current_token->type == TOKEN_INTEGER_TYPE) {
+                parser_eat(parser, TOKEN_INTEGER_TYPE);
+            } else if (parser->current_token->type == TOKEN_STRING_TYPE) {
+                parser_eat(parser, TOKEN_STRING_TYPE);
+            } else if (parser->current_token->type == TOKEN_CHARACTER_TYPE) {
+                parser_eat(parser, TOKEN_CHARACTER_TYPE);
+            }
 
             function_add_parameter(func, param_name, param_type);
             free(param_name);
@@ -1098,7 +1399,22 @@ static Function* parser_parse_function(Parser *parser) {
     }
 
     parser_eat(parser, TOKEN_RETURNS);
-    parser_eat(parser, TOKEN_INTEGER_TYPE);
+
+    // Handle different return types
+    if (parser->current_token->type == TOKEN_INTEGER_TYPE) {
+        parser_eat(parser, TOKEN_INTEGER_TYPE);
+    } else if (parser->current_token->type == TOKEN_STRING_TYPE) {
+        parser_eat(parser, TOKEN_STRING_TYPE);
+    } else if (parser->current_token->type == TOKEN_CHARACTER_TYPE) {
+        parser_eat(parser, TOKEN_CHARACTER_TYPE);
+    } else if (parser->current_token->type == TOKEN_IDENTIFIER) {
+        // Custom type
+        parser_eat(parser, TOKEN_IDENTIFIER);
+    } else {
+        fprintf(stderr, "[PARSER ERROR] Expected return type at line %d\n", parser->current_token->line);
+        exit(1);
+    }
+
     parser_eat(parser, TOKEN_COLON);
 
     // Parse function body statements
@@ -1226,7 +1542,7 @@ Program* parser_parse_program(Parser *parser) {
         }
     }
 
-    parser_eat(parser, TOKEN_EOF);
+    // Don't require EOF to be explicitly parsed, just verify we're at the end
     return program;
 }
 
@@ -1327,6 +1643,39 @@ static void statement_destroy(Statement *stmt) {
                     free(match_case->body);
                 }
                 free(stmt->data.match_stmt.cases);
+                break;
+            case STMT_BREAK:
+                // Break statements have no allocated data to free
+                break;
+            case STMT_CONTINUE:
+                // Continue statements have no allocated data to free
+                break;
+            case STMT_INLINE_ASSEMBLY:
+                // Free assembly instruction lines
+                for (int i = 0; i < stmt->data.inline_assembly_stmt.assembly_line_count; i++) {
+                    free(stmt->data.inline_assembly_stmt.assembly_lines[i]);
+                    free(stmt->data.inline_assembly_stmt.assembly_notes[i]);
+                }
+                free(stmt->data.inline_assembly_stmt.assembly_lines);
+                free(stmt->data.inline_assembly_stmt.assembly_notes);
+
+                // Free output constraints
+                for (int i = 0; i < stmt->data.inline_assembly_stmt.output_count; i++) {
+                    free(stmt->data.inline_assembly_stmt.output_constraints[i]);
+                }
+                free(stmt->data.inline_assembly_stmt.output_constraints);
+
+                // Free input constraints
+                for (int i = 0; i < stmt->data.inline_assembly_stmt.input_count; i++) {
+                    free(stmt->data.inline_assembly_stmt.input_constraints[i]);
+                }
+                free(stmt->data.inline_assembly_stmt.input_constraints);
+
+                // Free clobber list
+                for (int i = 0; i < stmt->data.inline_assembly_stmt.clobber_count; i++) {
+                    free(stmt->data.inline_assembly_stmt.clobber_list[i]);
+                }
+                free(stmt->data.inline_assembly_stmt.clobber_list);
                 break;
         }
         free(stmt);

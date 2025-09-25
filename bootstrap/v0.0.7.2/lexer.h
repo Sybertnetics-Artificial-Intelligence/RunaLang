@@ -41,6 +41,14 @@ typedef enum {
     TOKEN_DIVIDED,
     TOKEN_MODULO,
     TOKEN_BY,
+    TOKEN_BIT_AND,
+    TOKEN_BIT_OR,
+    TOKEN_BIT_XOR,
+    TOKEN_BIT_SHIFT_LEFT,
+    TOKEN_BIT_SHIFT_RIGHT,
+    TOKEN_BREAK,
+    TOKEN_CONTINUE,
+    TOKEN_OTHERWISE_IF,
     TOKEN_PRINT,
     TOKEN_LPAREN,
     TOKEN_RPAREN,
@@ -65,6 +73,16 @@ typedef enum {
     TOKEN_LIST_GET_INTEGER,
     TOKEN_LIST_LENGTH,
     TOKEN_LIST_DESTROY,
+    // Enhanced list operations
+    TOKEN_LIST_SET,
+    TOKEN_LIST_INSERT,
+    TOKEN_LIST_REMOVE,
+    TOKEN_LIST_CLEAR,
+    TOKEN_LIST_FIND,
+    TOKEN_LIST_SORT,
+    TOKEN_LIST_REVERSE,
+    TOKEN_LIST_COPY,
+    TOKEN_LIST_MERGE,
     // String manipulation functions
     TOKEN_STRING_CONCAT,
     TOKEN_STRING_COMPARE,
@@ -74,11 +92,47 @@ typedef enum {
     TOKEN_STRING_REPLACE,
     TOKEN_STRING_TRIM,
     TOKEN_STRING_SPLIT,
+    // Enhanced file I/O operations
+    TOKEN_FILE_OPEN,
+    TOKEN_FILE_CLOSE,
+    TOKEN_FILE_READ_LINE,
+    TOKEN_FILE_WRITE_LINE,
+    TOKEN_FILE_EXISTS,
+    TOKEN_FILE_DELETE,
+    TOKEN_FILE_SIZE,
+    TOKEN_FILE_SEEK,
+    TOKEN_FILE_TELL,
+    TOKEN_FILE_EOF,
+    // Math operations
+    TOKEN_SIN,
+    TOKEN_COS,
+    TOKEN_TAN,
+    TOKEN_SQRT,
+    TOKEN_POW,
+    TOKEN_ABS,
+    TOKEN_FLOOR,
+    TOKEN_CEIL,
+    TOKEN_MIN,
+    TOKEN_MAX,
+    TOKEN_RANDOM,
+    TOKEN_LOG,
+    TOKEN_EXP,
     // ADT/Variant tokens
     TOKEN_PIPE,         // | for variant definitions
     TOKEN_MATCH,        // Match keyword
     TOKEN_WHEN,         // When keyword in match cases
     TOKEN_WITH,         // with keyword for variant fields
+    // System/Runtime functions
+    TOKEN_GET_COMMAND_LINE_ARGS,
+    TOKEN_EXIT_WITH_CODE,
+    TOKEN_PANIC,
+    TOKEN_ASSERT,
+    TOKEN_ALLOCATE,
+    TOKEN_DEALLOCATE,
+    // Inline Assembly tokens
+    TOKEN_INLINE,
+    TOKEN_ASSEMBLY,
+    TOKEN_NOTE,
     TOKEN_ERROR
 } TokenType;
 

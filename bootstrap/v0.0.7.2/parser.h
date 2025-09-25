@@ -73,7 +73,10 @@ typedef enum {
     STMT_PRINT,
     STMT_EXPRESSION,
     STMT_MATCH,
-    STMT_IMPORT
+    STMT_IMPORT,
+    STMT_BREAK,
+    STMT_CONTINUE,
+    STMT_INLINE_ASSEMBLY
 } StatementType;
 
 typedef struct Statement {
@@ -117,6 +120,23 @@ typedef struct Statement {
             char *filename;
             char *module_name;
         } import_stmt;
+        struct {
+            // Break statement has no additional data
+        } break_stmt;
+        struct {
+            // Continue statement has no additional data
+        } continue_stmt;
+        struct {
+            char **assembly_lines;           // Array of assembly instruction strings
+            char **assembly_notes;           // Array of Note: comments
+            int assembly_line_count;         // Number of assembly lines
+            char **output_constraints;       // Output constraint strings
+            int output_count;
+            char **input_constraints;        // Input constraint strings
+            int input_count;
+            char **clobber_list;            // Clobber register list
+            int clobber_count;
+        } inline_assembly_stmt;
     } data;
 } Statement;
 

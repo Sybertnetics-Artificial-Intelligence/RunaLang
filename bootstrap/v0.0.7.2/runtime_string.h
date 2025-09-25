@@ -26,4 +26,31 @@ int64_t is_digit(const char* c);
 int64_t is_alpha(const char* c);
 int64_t is_whitespace(const char* c);
 
+// Additional string manipulation functions for v0.0.7.2
+
+// Concatenate two strings (returns newly allocated string)
+char* string_concat(const char* s1, const char* s2);
+
+// Compare two strings lexicographically
+// Returns: < 0 if s1 < s2, 0 if equal, > 0 if s1 > s2
+int64_t string_compare(const char* s1, const char* s2);
+
+// Convert string to integer
+int64_t string_to_integer(const char* s);
+
+// Convert integer to string (returns newly allocated string)
+char* integer_to_string(int64_t value);
+
+// Find substring in string (returns index or -1 if not found)
+int64_t string_find(const char* haystack, const char* needle);
+
+// Replace all occurrences of old_substr with new_substr
+char* string_replace(const char* str, const char* old_substr, const char* new_substr);
+
+// Trim whitespace from both ends of string
+char* string_trim(const char* s);
+
+// Split string by delimiter (returns list)
+void* string_split(const char* s, const char* delimiter);
+
 #endif // RUNTIME_STRING_H
