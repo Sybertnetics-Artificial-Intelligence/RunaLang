@@ -1,0 +1,29 @@
+#ifndef RUNTIME_STRING_H
+#define RUNTIME_STRING_H
+
+#include <stdint.h>
+
+// String manipulation runtime functions for Runa v0.0.7.1
+// These functions are called from generated assembly code
+
+// Get string length
+int64_t string_length(const char* s);
+
+// Get character at position (returns 0 if out of bounds)
+char string_char_at(const char* s, int64_t index);
+
+// Extract substring (start is 0-based, returns allocated string)
+char* string_substring(const char* s, int64_t start, int64_t length);
+
+// String comparison (returns 1 if equal, 0 if not equal)
+int64_t string_equals(const char* s1, const char* s2);
+
+// Get ASCII value of first character in string
+int64_t ascii_value_of(const char* c);
+
+// Character classification functions (return 1 if true, 0 if false)
+int64_t is_digit(const char* c);
+int64_t is_alpha(const char* c);
+int64_t is_whitespace(const char* c);
+
+#endif // RUNTIME_STRING_H
