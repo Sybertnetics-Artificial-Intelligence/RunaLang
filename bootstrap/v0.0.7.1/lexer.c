@@ -1,0 +1,307 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "lexer.h"
+
+static char* string_duplicate(const char *str) {
+    if (!str) return NULL;
+    int len = strlen(str);
+    char *dup = malloc(len + 1);
+    strcpy(dup, str);
+    return dup;
+}
+
+static void lexer_advance(Lexer *lexer) {
+    if (lexer->current_char == '\n') {
+        lexer->line++;
+        lexer->column = 0;
+    }
+    lexer->position++;
+    lexer->column++;
+
+    if (lexer->position >= (int)strlen(lexer->source)) {
+        lexer->current_char = '\0';
+    } else {
+        lexer->current_char = lexer->source[lexer->position];
+    }
+}
+
+static void lexer_skip_whitespace(Lexer *lexer) {
+    while (lexer->current_char != '\0' && isspace(lexer->current_char)) {
+        lexer_advance(lexer);
+    }
+}
+
+// Create token with an owned string (we take ownership)
+static Token* token_create_owned(TokenType type, char *value, int line, int column) {
+    Token *token = malloc(sizeof(Token));
+    token->type = type;
+    token->value = value;  // Take ownership
+    token->line = line;
+    token->column = column;
+    return token;
+}
+
+// Create token with a string literal or constant (we duplicate)
+static Token* token_create(TokenType type, const char *value, int line, int column) {
+    Token *token = malloc(sizeof(Token));
+    token->type = type;
+    token->value = value ? string_duplicate(value) : NULL;
+    token->line = line;
+    token->column = column;
+    return token;
+}
+
+static char* lexer_read_string_literal(Lexer *lexer) {
+    lexer_advance(lexer); // Skip opening quote
+    int start_pos = lexer->position;
+
+    while (lexer->current_char != '\0' && lexer->current_char != '"') {
+        lexer_advance(lexer);
+    }
+
+    if (lexer->current_char == '"') {
+        int length = lexer->position - start_pos;
+        char *string = malloc(length + 1);
+        strncpy(string, lexer->source + start_pos, length);
+        string[length] = '\0';
+        lexer_advance(lexer); // Skip closing quote
+        return string;
+    }
+
+    return NULL; // Unterminated string
+}
+
+static char* lexer_read_word(Lexer *lexer) {
+    int start_pos = lexer->position;
+
+    while (lexer->current_char != '\0' && (isalnum(lexer->current_char) || lexer->current_char == '_')) {
+        lexer_advance(lexer);
+    }
+
+    int length = lexer->position - start_pos;
+    char *word = malloc(length + 1);
+    strncpy(word, lexer->source + start_pos, length);
+    word[length] = '\0';
+
+    return word;
+}
+
+static char* lexer_read_integer(Lexer *lexer) {
+    int start_pos = lexer->position;
+
+    while (lexer->current_char != '\0' && isdigit(lexer->current_char)) {
+        lexer_advance(lexer);
+    }
+
+    int length = lexer->position - start_pos;
+    char *integer = malloc(length + 1);
+    strncpy(integer, lexer->source + start_pos, length);
+    integer[length] = '\0';
+
+    return integer;
+}
+
+Lexer* lexer_create(char *source) {
+    Lexer *lexer = malloc(sizeof(Lexer));
+    lexer->source = string_duplicate(source);
+    lexer->position = 0;
+    lexer->line = 1;
+    lexer->column = 1;
+    lexer->current_char = source[0];
+    return lexer;
+}
+
+void lexer_destroy(Lexer *lexer) {
+    if (lexer) {
+        free(lexer->source);
+        free(lexer);
+    }
+}
+
+Token* lexer_next_token(Lexer *lexer) {
+    while (lexer->current_char != '\0') {
+        int line = lexer->line;
+        int column = lexer->column;
+
+        if (isspace(lexer->current_char)) {
+            lexer_skip_whitespace(lexer);
+            continue;
+        }
+
+        if (lexer->current_char == '"') {
+            char *string = lexer_read_string_literal(lexer);
+            if (string) {
+                return token_create_owned(TOKEN_STRING_LITERAL, string, line, column);
+            } else {
+                fprintf(stderr, "[LEXER ERROR] Unterminated string literal at line %d, column %d\n",
+                        line, column);
+                return token_create(TOKEN_ERROR, "Unterminated string", line, column);
+            }
+        }
+
+        if (isdigit(lexer->current_char)) {
+            char *integer = lexer_read_integer(lexer);
+            return token_create_owned(TOKEN_INTEGER, integer, line, column);
+        }
+
+        if (isalpha(lexer->current_char)) {
+            char *word = lexer_read_word(lexer);
+            TokenType type = TOKEN_ERROR;
+
+            if (strcmp(word, "Process") == 0) {
+                type = TOKEN_PROCESS;
+            } else if (strcmp(word, "called") == 0) {
+                type = TOKEN_CALLED;
+            } else if (strcmp(word, "returns") == 0) {
+                type = TOKEN_RETURNS;
+            } else if (strcmp(word, "Integer") == 0) {
+                type = TOKEN_INTEGER_TYPE;
+            } else if (strcmp(word, "Return") == 0) {
+                type = TOKEN_RETURN;
+            } else if (strcmp(word, "End") == 0) {
+                type = TOKEN_END;
+            } else if (strcmp(word, "Let") == 0) {
+                type = TOKEN_LET;
+            } else if (strcmp(word, "be") == 0) {
+                type = TOKEN_BE;
+            } else if (strcmp(word, "Set") == 0) {
+                type = TOKEN_SET;
+            } else if (strcmp(word, "to") == 0) {
+                type = TOKEN_TO;
+            } else if (strcmp(word, "plus") == 0) {
+                type = TOKEN_PLUS;
+            } else if (strcmp(word, "minus") == 0) {
+                type = TOKEN_MINUS;
+            } else if (strcmp(word, "If") == 0) {
+                type = TOKEN_IF;
+            } else if (strcmp(word, "Otherwise") == 0) {
+                type = TOKEN_OTHERWISE;
+            } else if (strcmp(word, "While") == 0) {
+                type = TOKEN_WHILE;
+            } else if (strcmp(word, "is") == 0) {
+                type = TOKEN_IS;
+            } else if (strcmp(word, "equal") == 0) {
+                type = TOKEN_EQUAL;
+            } else if (strcmp(word, "less") == 0) {
+                type = TOKEN_LESS;
+            } else if (strcmp(word, "greater") == 0) {
+                type = TOKEN_GREATER;
+            } else if (strcmp(word, "than") == 0) {
+                type = TOKEN_THAN;
+            } else if (strcmp(word, "not") == 0) {
+                type = TOKEN_NOT;
+            } else if (strcmp(word, "and") == 0) {
+                type = TOKEN_AND;
+            } else if (strcmp(word, "or") == 0) {
+                type = TOKEN_OR;
+            } else if (strcmp(word, "that") == 0) {
+                type = TOKEN_THAT;
+            } else if (strcmp(word, "takes") == 0) {
+                type = TOKEN_TAKES;
+            } else if (strcmp(word, "as") == 0) {
+                type = TOKEN_AS;
+            } else if (strcmp(word, "multiplied") == 0) {
+                type = TOKEN_MULTIPLIED;
+            } else if (strcmp(word, "divided") == 0) {
+                type = TOKEN_DIVIDED;
+            } else if (strcmp(word, "by") == 0) {
+                type = TOKEN_BY;
+            } else if (strcmp(word, "Print") == 0) {
+                type = TOKEN_PRINT;
+            } else if (strcmp(word, "Type") == 0) {
+                type = TOKEN_TYPE;
+            } else if (strcmp(word, "read_file") == 0) {
+                type = TOKEN_READ_FILE;
+            } else if (strcmp(word, "write_file") == 0) {
+                type = TOKEN_WRITE_FILE;
+            } else if (strcmp(word, "Import") == 0) {
+                type = TOKEN_IMPORT;
+            } else if (strcmp(word, "string_length") == 0) {
+                type = TOKEN_STRING_LENGTH;
+            } else if (strcmp(word, "string_char_at") == 0) {
+                type = TOKEN_STRING_CHAR_AT;
+            } else if (strcmp(word, "string_substring") == 0) {
+                type = TOKEN_STRING_SUBSTRING;
+            } else if (strcmp(word, "string_equals") == 0) {
+                type = TOKEN_STRING_EQUALS;
+            } else if (strcmp(word, "ascii_value_of") == 0) {
+                type = TOKEN_ASCII_VALUE_OF;
+            } else if (strcmp(word, "is_digit") == 0) {
+                type = TOKEN_IS_DIGIT;
+            } else if (strcmp(word, "is_alpha") == 0) {
+                type = TOKEN_IS_ALPHA;
+            } else if (strcmp(word, "is_whitespace") == 0) {
+                type = TOKEN_IS_WHITESPACE;
+            } else if (strcmp(word, "list_create") == 0) {
+                type = TOKEN_LIST_CREATE;
+            } else if (strcmp(word, "list_append") == 0) {
+                type = TOKEN_LIST_APPEND;
+            } else if (strcmp(word, "list_get") == 0) {
+                type = TOKEN_LIST_GET;
+            } else if (strcmp(word, "list_get_integer") == 0) {
+                type = TOKEN_LIST_GET_INTEGER;
+            } else if (strcmp(word, "list_length") == 0) {
+                type = TOKEN_LIST_LENGTH;
+            } else if (strcmp(word, "list_destroy") == 0) {
+                type = TOKEN_LIST_DESTROY;
+            } else if (strcmp(word, "Match") == 0) {
+                type = TOKEN_MATCH;
+            } else if (strcmp(word, "When") == 0) {
+                type = TOKEN_WHEN;
+            } else if (strcmp(word, "with") == 0) {
+                type = TOKEN_WITH;
+            } else {
+                type = TOKEN_IDENTIFIER;
+            }
+
+            return token_create_owned(type, word, line, column);
+        }
+
+        if (lexer->current_char == ':') {
+            lexer_advance(lexer);
+            return token_create(TOKEN_COLON, ":", line, column);
+        }
+
+        if (lexer->current_char == '(') {
+            lexer_advance(lexer);
+            return token_create(TOKEN_LPAREN, "(", line, column);
+        }
+
+        if (lexer->current_char == ')') {
+            lexer_advance(lexer);
+            return token_create(TOKEN_RPAREN, ")", line, column);
+        }
+
+        if (lexer->current_char == '.') {
+            lexer_advance(lexer);
+            return token_create(TOKEN_DOT, ".", line, column);
+        }
+
+        if (lexer->current_char == ',') {
+            lexer_advance(lexer);
+            return token_create(TOKEN_COMMA, ",", line, column);
+        }
+
+        if (lexer->current_char == '|') {
+            lexer_advance(lexer);
+            return token_create(TOKEN_PIPE, "|", line, column);
+        }
+
+        fprintf(stderr, "[LEXER ERROR] Unexpected character '%c' at line %d, column %d\n",
+                lexer->current_char, lexer->line, lexer->column);
+        lexer_advance(lexer);
+        return token_create(TOKEN_ERROR, "Unexpected character", line, column);
+    }
+
+    return token_create(TOKEN_EOF, NULL, lexer->line, lexer->column);
+}
+
+void token_destroy(Token *token) {
+    if (token) {
+        free(token->value);
+        free(token);
+    }
+}
