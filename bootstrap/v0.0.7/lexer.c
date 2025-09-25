@@ -187,8 +187,14 @@ Token* lexer_next_token(Lexer *lexer) {
                 type = TOKEN_EQUAL;
             } else if (strcmp(word, "less") == 0) {
                 type = TOKEN_LESS;
+            } else if (strcmp(word, "greater") == 0) {
+                type = TOKEN_GREATER;
             } else if (strcmp(word, "than") == 0) {
                 type = TOKEN_THAN;
+            } else if (strcmp(word, "not") == 0) {
+                type = TOKEN_NOT;
+            } else if (strcmp(word, "or") == 0) {
+                type = TOKEN_OR;
             } else if (strcmp(word, "that") == 0) {
                 type = TOKEN_THAT;
             } else if (strcmp(word, "takes") == 0) {

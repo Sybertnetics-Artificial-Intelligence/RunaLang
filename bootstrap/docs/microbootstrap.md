@@ -439,7 +439,7 @@ End Process
 
 ---
 
-# 🚀 Handoff to Runa: v0.1 (First Self-Host)
+# 🚀 Handoff to Runa: v0.0.7.5 (First Self-Host)
 
 At this stage, the C compiler (`v0.0.7`) can compile enough Runa to write a compiler in Runa itself.
 
@@ -453,7 +453,7 @@ At this stage, the C compiler (`v0.0.7`) can compile enough Runa to write a comp
 * File I/O.
 * Module system.
 
-**Runa compiler in Runa (`v0.1`) will implement:**
+**Runa compiler in Runa (`v0.0.7.5`) will implement:**
 
 * Lexer in Runa.
 * Parser in Runa.
@@ -480,5 +480,329 @@ End Process
 
 ---
 
-✅ So the **minimum Runa subset for v0.1** is exactly what’s in `v0.0.7`.
+✅ So the **minimum Runa subset for v0.0.7.5** is exactly what’s in `v0.0.7`.
 From there, future versions (v0.2+) add *For Each*, *Match*, IR, optimizations, etc.
+
+
+
+Migration Plan: v0.0.7 (C) → v0.0.7.5 (Runa Self-Host)
+
+  Based on my analysis of the v0.0.7 C compiler, here's the comprehensive migration plan:
+
+  🏗️ Architecture Overview
+
+  The v0.0.7 C compiler consists of 4 core modules + runtime:
+  - main.c: Entry point and orchestration
+  - lexer.c/h: Tokenization
+  - parser.c/h: AST generation
+  - codegen_x86.c/h: x86-64 assembly generation
+  - Runtime: I/O and list operations
+
+  🔄 Migration Strategy
+
+  Components That Need DIRECT COPY (C → C)
+
+  These components should remain in C and be copied/adapted to v0.0.7.5:
+
+  1. Runtime Libraries (runtime/ directory):
+    - runtime_io.c/h → Keep as C (File I/O operations)
+    - runtime_list.c/h → Keep as C (List operations)
+    - Rationale: Runtime functions need direct system calls and memory management. Runa at v0.0.7.5 isn't ready to replace these low-level operations.
+  2. Build System:
+    - Makefile logic → build.sh
+    - Assembly/linking commands → Keep as shell scripts
+    - Rationale: Build orchestration still needs external tools (as, ld)
+
+  Components That Need TRANSLITERATION (C → Runa)
+
+  These need to be rewritten in Runa following the language specification:
+
+  1. Main Driver (src/main.runa)
+
+  Current C structure:
+  int main(int argc, char **argv) {
+      char *source_code = read_file(input_filename);
+      Lexer *lexer = lexer_create(source_code);
+      Parser *parser = parser_create(lexer);
+      Program *program = parser_parse_program(parser);
+      CodeGenerator *codegen = codegen_create(output_filename);
+      codegen_generate(codegen, program);
+      // cleanup...
+  }
+
+  Runa equivalent:
+  Process called "main" that takes args as List[String] returns Integer:
+      Let input_filename be args.get(1)
+      Let output_filename be args.get(2)
+      Let source_code be read_file(input_filename)
+      Let lexer be Lexer.create(source_code)
+      Let parser be Parser.create(lexer)
+      Let program be parser.parse_program()
+      Let codegen be CodeGenerator.create(output_filename)
+      codegen.generate(program)
+      Return 0
+  End Process
+
+  2. Lexer Module (src/lexer.runa)
+
+  Key Transliterations:
+  - TokenType enum → Runa enum with same values
+  - Token struct → Runa type
+  - Lexer struct → Runa type
+  - lexer_create(), lexer_next_token() → Runa processes
+
+  Critical Details:
+  - Keep exact same token types from lexer.h:4-49
+  - Preserve tokenization logic for all v0.0.7 features
+  - String handling will use Runa's built-in string type
+
+  3. Parser Module (src/parser.runa)
+
+  Key Transliterations:
+  - All AST node types (Expression, Statement, etc.) → Runa types
+  - parser_create(), parser_parse_program() → Runa processes
+  - Recursive descent parsing logic → Equivalent Runa control flow
+
+  Critical Details:
+  - AST structure must remain identical for codegen compatibility
+  - All expression types from parser.h:7-16 need direct equivalents
+  - Statement types from parser.h:52-61 need preservation
+
+  4. Code Generator (src/codegen.runa)
+
+  Key Transliterations:
+  - CodeGenerator struct → Runa type with file I/O
+  - Variable tracking and stack management → Runa data structures
+  - x86-64 assembly emission → String building and file writing
+
+  Critical Details:
+  - Must generate identical assembly output to v0.0.7
+  - Preserve calling conventions and register usage
+  - Keep string literal handling and label generation logic
+
+  📋 Detailed Module Breakdown
+Migration Plan: v0.0.7 (C) → v0.0.7.5 (Runa Self-Host)
+
+  Based on my analysis of the v0.0.7 C compiler, here's the comprehensive migration plan:
+
+  🏗️ Architecture Overview
+
+  The v0.0.7 C compiler consists of 4 core modules + runtime:
+  - main.c: Entry point and orchestration
+  - lexer.c/h: Tokenization
+  - parser.c/h: AST generation
+  - codegen_x86.c/h: x86-64 assembly generation
+  - Runtime: I/O and list operations
+
+  🔄 Migration Strategy
+
+  Components That Need DIRECT COPY (C → C)
+
+  These components should remain in C and be copied/adapted to v0.0.7.5:
+
+  1. Runtime Libraries (runtime/ directory):
+    - runtime_io.c/h → Keep as C (File I/O operations)
+    - runtime_list.c/h → Keep as C (List operations)
+    - Rationale: Runtime functions need direct system calls and memory management. Runa at v0.0.7.5 isn't ready to replace these low-level operations.
+  2. Build System:
+    - Makefile logic → build.sh
+    - Assembly/linking commands → Keep as shell scripts
+    - Rationale: Build orchestration still needs external tools (as, ld)
+
+  Components That Need TRANSLITERATION (C → Runa)
+
+  These need to be rewritten in Runa following the language specification:
+
+  1. Main Driver (src/main.runa)
+
+  Current C structure:
+  int main(int argc, char **argv) {
+      char *source_code = read_file(input_filename);
+      Lexer *lexer = lexer_create(source_code);
+      Parser *parser = parser_create(lexer);
+      Program *program = parser_parse_program(parser);
+      CodeGenerator *codegen = codegen_create(output_filename);
+      codegen_generate(codegen, program);
+      // cleanup...
+  }
+
+  Runa equivalent:
+  Process called "main" that takes args as List[String] returns Integer:
+      Let input_filename be args.get(1)
+      Let output_filename be args.get(2)
+      Let source_code be read_file(input_filename)
+      Let lexer be Lexer.create(source_code)
+      Let parser be Parser.create(lexer)
+      Let program be parser.parse_program()
+      Let codegen be CodeGenerator.create(output_filename)
+      codegen.generate(program)
+      Return 0
+  End Process
+
+  2. Lexer Module (src/lexer.runa)
+
+  Key Transliterations:
+  - TokenType enum → Runa enum with same values
+  - Token struct → Runa type
+  - Lexer struct → Runa type
+  - lexer_create(), lexer_next_token() → Runa processes
+
+  Critical Details:
+  - Keep exact same token types from lexer.h:4-49
+  - Preserve tokenization logic for all v0.0.7 features
+  - String handling will use Runa's built-in string type
+
+  3. Parser Module (src/parser.runa)
+
+  Key Transliterations:
+  - All AST node types (Expression, Statement, etc.) → Runa types
+  - parser_create(), parser_parse_program() → Runa processes
+  - Recursive descent parsing logic → Equivalent Runa control flow
+
+  Critical Details:
+  - AST structure must remain identical for codegen compatibility
+  - All expression types from parser.h:7-16 need direct equivalents
+  - Statement types from parser.h:52-61 need preservation
+
+  4. Code Generator (src/codegen.runa)
+
+  Key Transliterations:
+  - CodeGenerator struct → Runa type with file I/O
+  - Variable tracking and stack management → Runa data structures
+  - x86-64 assembly emission → String building and file writing
+
+  Critical Details:
+  - Must generate identical assembly output to v0.0.7
+  - Preserve calling conventions and register usage
+  - Keep string literal handling and label generation logic
+
+  📋 Detailed Module Breakdown
+
+  Files to Create in v0.0.7.5:
+
+  v0.0.7.5/
+  ├── src/
+  │   ├── main.runa          # Main compiler driver [TRANSLITERATE]
+  │   ├── lexer.runa         # Token scanner [TRANSLITERATE]
+  │   ├── parser.runa        # AST builder [TRANSLITERATE]
+  │   ├── codegen.runa       # x86-64 generator [TRANSLITERATE]
+  │   └── types.runa         # Shared type definitions [NEW]
+  ├── runtime/
+  │   ├── runtime_io.c       # File I/O [DIRECT COPY]
+  │   ├── runtime_io.h       # I/O headers [DIRECT COPY]
+  │   ├── runtime_list.c     # List operations [DIRECT COPY]
+  │   └── runtime_list.h     # List headers [DIRECT COPY]
+  └── build.sh               # Build script [ADAPT FROM MAKEFILE]
+
+  🎯 Implementation Priority
+
+  1. Phase 1: Runtime setup (copy C runtime files)
+  2. Phase 2: Core types (types.runa - AST definitions)
+  3. Phase 3: Lexer (lexer.runa)
+  4. Phase 4: Parser (parser.runa)
+  5. Phase 5: Code generator (codegen.runa)
+  6. Phase 6: Main driver (main.runa)
+  7. Phase 7: Build system integration
+
+  🔧 Key Technical Considerations
+
+  Data Structure Translations:
+
+  - C structs → Runa Type definitions
+  - C arrays → Runa Lists
+  - C pointers → Runa object references
+  - C file handles → Use runtime functions via FFI
+
+  Memory Management:
+
+  - C manual malloc/free → Runa automatic memory management
+  - Dynamic arrays → Runa Lists with automatic resizing
+  - String handling → Runa built-in strings
+
+  Function Calling:
+
+  - C function pointers → Runa process references
+  - C parameter passing → Runa parameter syntax
+  - C return values → Runa Return statements
+
+  🚨 Critical Success Factors
+
+  1. AST Compatibility: The Runa parser must produce identical AST structure to ensure codegen works
+  2. Token Compatibility: Lexer must recognize exact same tokens with same precedence
+  3. Assembly Output: Generated assembly must be functionally equivalent to v0.0.7
+  4. Runtime Integration: Runa code must correctly call C runtime functions
+  5. Error Handling: Preserve error reporting and debugging information
+
+  🎯 Success Criteria
+
+  The v0.0.7.5 self-hosted compiler succeeds when:
+  - It can compile the same Runa programs as v0.0.7
+  - Generated executables behave identically
+  - All v0.0.7 test cases pass
+  - The v0.0.7.5 compiler can compile itself (true self-hosting)
+
+  This plan maintains the proven architecture of v0.0.7 while transitioning the compiler logic to Runa, achieving true self-hosting while preserving all functionality.
+  Files to Create in v0.0.7.5:
+
+  v0.0.7.5/
+  ├── src/
+  │   ├── main.runa          # Main compiler driver [TRANSLITERATE]
+  │   ├── lexer.runa         # Token scanner [TRANSLITERATE]
+  │   ├── parser.runa        # AST builder [TRANSLITERATE]
+  │   ├── codegen.runa       # x86-64 generator [TRANSLITERATE]
+  │   └── types.runa         # Shared type definitions [NEW]
+  ├── runtime/
+  │   ├── runtime_io.c       # File I/O [DIRECT COPY]
+  │   ├── runtime_io.h       # I/O headers [DIRECT COPY]
+  │   ├── runtime_list.c     # List operations [DIRECT COPY]
+  │   └── runtime_list.h     # List headers [DIRECT COPY]
+  └── build.sh               # Build script [ADAPT FROM MAKEFILE]
+
+  🎯 Implementation Priority
+
+  1. Phase 1: Runtime setup (copy C runtime files)
+  2. Phase 2: Core types (types.runa - AST definitions)
+  3. Phase 3: Lexer (lexer.runa)
+  4. Phase 4: Parser (parser.runa)
+  5. Phase 5: Code generator (codegen.runa)
+  6. Phase 6: Main driver (main.runa)
+  7. Phase 7: Build system integration
+
+  🔧 Key Technical Considerations
+
+  Data Structure Translations:
+
+  - C structs → Runa Type definitions
+  - C arrays → Runa Lists
+  - C pointers → Runa object references
+  - C file handles → Use runtime functions via FFI
+
+  Memory Management:
+
+  - C manual malloc/free → Runa automatic memory management
+  - Dynamic arrays → Runa Lists with automatic resizing
+  - String handling → Runa built-in strings
+
+  Function Calling:
+
+  - C function pointers → Runa process references
+  - C parameter passing → Runa parameter syntax
+  - C return values → Runa Return statements
+
+  🚨 Critical Success Factors
+
+  1. AST Compatibility: The Runa parser must produce identical AST structure to ensure codegen works
+  2. Token Compatibility: Lexer must recognize exact same tokens with same precedence
+  3. Assembly Output: Generated assembly must be functionally equivalent to v0.0.7
+  4. Runtime Integration: Runa code must correctly call C runtime functions
+  5. Error Handling: Preserve error reporting and debugging information
+
+  🎯 Success Criteria
+
+  The v0.0.7.5 self-hosted compiler succeeds when:
+  - It can compile the same Runa programs as v0.0.7
+  - Generated executables behave identically
+  - All v0.0.7 test cases pass
+  - The v0.0.7.5 compiler can compile itself (true self-hosting)
+
+  This plan maintains the proven architecture of v0.0.7 while transitioning the compiler logic to Runa, achieving true self-hosting while preserving all functionality.
