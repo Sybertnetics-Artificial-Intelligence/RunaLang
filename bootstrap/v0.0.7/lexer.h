@@ -38,6 +38,9 @@ typedef enum {
     TOKEN_DOT,
     TOKEN_COMMA,
     TOKEN_IDENTIFIER,
+    TOKEN_READ_FILE,
+    TOKEN_WRITE_FILE,
+    TOKEN_IMPORT,
     TOKEN_ERROR
 } TokenType;
 

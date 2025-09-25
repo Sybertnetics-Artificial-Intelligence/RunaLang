@@ -32,6 +32,9 @@ static void parser_eat(Parser *parser, TokenType expected_type) {
     }
 }
 
+// Forward declarations
+static Expression* parser_parse_comparison(Parser *parser);
+
 static Expression* expression_create_integer(int value) {
     Expression *expr = malloc(sizeof(Expression));
     expr->type = EXPR_INTEGER;
@@ -168,6 +171,9 @@ static Program* program_create(void) {
     program->types = NULL;
     program->type_count = 0;
     program->type_capacity = 0;
+    program->imports = NULL;
+    program->import_count = 0;
+    program->import_capacity = 0;
     return program;
 }
 
@@ -187,7 +193,58 @@ static void program_add_type(Program *program, TypeDefinition *type) {
     program->types[program->type_count++] = type;
 }
 
+static void program_add_import(Program *program, Import *import) {
+    if (program->import_count >= program->import_capacity) {
+        program->import_capacity = program->import_capacity == 0 ? 4 : program->import_capacity * 2;
+        program->imports = realloc(program->imports, sizeof(Import*) * program->import_capacity);
+    }
+    program->imports[program->import_count++] = import;
+}
+
 static Expression* parser_parse_primary(Parser *parser) {
+    // Handle built-in functions
+    if (parser->current_token->type == TOKEN_READ_FILE ||
+        parser->current_token->type == TOKEN_WRITE_FILE) {
+        TokenType builtin_type = parser->current_token->type;
+        parser_eat(parser, builtin_type);
+
+        parser_eat(parser, TOKEN_LPAREN);
+
+        // Parse arguments
+        Expression **arguments = NULL;
+        int argument_count = 0;
+
+        if (parser->current_token->type != TOKEN_RPAREN) {
+            int capacity = 2;
+            arguments = malloc(sizeof(Expression*) * capacity);
+
+            do {
+                if (parser->current_token->type == TOKEN_COMMA) {
+                    parser_eat(parser, TOKEN_COMMA);
+                }
+
+                Expression *arg = parser_parse_comparison(parser);
+
+                if (argument_count >= capacity) {
+                    capacity *= 2;
+                    arguments = realloc(arguments, sizeof(Expression*) * capacity);
+                }
+
+                arguments[argument_count++] = arg;
+            } while (parser->current_token->type == TOKEN_COMMA);
+        }
+
+        parser_eat(parser, TOKEN_RPAREN);
+
+        // Create builtin call expression
+        Expression *expr = malloc(sizeof(Expression));
+        expr->type = EXPR_BUILTIN_CALL;
+        expr->data.builtin_call.builtin_type = builtin_type;
+        expr->data.builtin_call.arguments = arguments;
+        expr->data.builtin_call.argument_count = argument_count;
+        return expr;
+    }
+
     if (parser->current_token->type == TOKEN_INTEGER) {
         int value = atoi(parser->current_token->value);
         parser_eat(parser, TOKEN_INTEGER);
@@ -766,9 +823,39 @@ Program* parser_parse_program(Parser *parser) {
     Program *program = program_create();
     parser->current_program = program;  // Set current program for type lookups
 
-    // Parse type definitions and functions until EOF
+    // Parse imports, type definitions and functions until EOF
     while (parser->current_token->type != TOKEN_EOF) {
-        if (parser->current_token->type == TOKEN_TYPE) {
+        if (parser->current_token->type == TOKEN_IMPORT) {
+            // Parse Import statement
+            parser_eat(parser, TOKEN_IMPORT);
+
+            // Get filename (must be a string literal)
+            if (parser->current_token->type != TOKEN_STRING_LITERAL) {
+                fprintf(stderr, "[PARSER ERROR] Expected string literal after Import at line %d\n",
+                        parser->current_token->line);
+                exit(1);
+            }
+            char *filename = string_duplicate(parser->current_token->value);
+            parser_eat(parser, TOKEN_STRING_LITERAL);
+
+            // Expect "as"
+            parser_eat(parser, TOKEN_AS);
+
+            // Get module name
+            if (parser->current_token->type != TOKEN_IDENTIFIER) {
+                fprintf(stderr, "[PARSER ERROR] Expected module name after 'as' at line %d\n",
+                        parser->current_token->line);
+                exit(1);
+            }
+            char *module_name = string_duplicate(parser->current_token->value);
+            parser_eat(parser, TOKEN_IDENTIFIER);
+
+            // Create and add import
+            Import *import = malloc(sizeof(Import));
+            import->filename = filename;
+            import->module_name = module_name;
+            program_add_import(program, import);
+        } else if (parser->current_token->type == TOKEN_TYPE) {
             TypeDefinition *type = parser_parse_type_definition(parser);
             program_add_type(program, type);
         } else if (parser->current_token->type == TOKEN_PROCESS) {
@@ -808,6 +895,11 @@ void expression_destroy(Expression *expr) {
             free(expr->data.field_access.field_name);
         } else if (expr->type == EXPR_TYPE_NAME) {
             free(expr->data.type_name);
+        } else if (expr->type == EXPR_BUILTIN_CALL) {
+            for (int i = 0; i < expr->data.builtin_call.argument_count; i++) {
+                expression_destroy(expr->data.builtin_call.arguments[i]);
+            }
+            free(expr->data.builtin_call.arguments);
         }
         free(expr);
     }
@@ -851,6 +943,10 @@ static void statement_destroy(Statement *stmt) {
                 break;
             case STMT_EXPRESSION:
                 expression_destroy(stmt->data.expr_stmt.expression);
+                break;
+            case STMT_IMPORT:
+                free(stmt->data.import_stmt.filename);
+                free(stmt->data.import_stmt.module_name);
                 break;
         }
         free(stmt);
@@ -896,6 +992,12 @@ void program_destroy(Program *program) {
             type_destroy(program->types[i]);
         }
         free(program->types);
+        for (int i = 0; i < program->import_count; i++) {
+            free(program->imports[i]->filename);
+            free(program->imports[i]->module_name);
+            free(program->imports[i]);
+        }
+        free(program->imports);
         free(program);
     }
 }
