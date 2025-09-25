@@ -1198,73 +1198,35 @@ static void codegen_generate_statement(CodeGenerator *codegen, Statement *stmt) 
         }
 
         case STMT_INLINE_ASSEMBLY: {
-            // Generate GCC inline assembly block
-            fprintf(codegen->output_file, "    asm volatile (\n");
-
-            // Output assembly instruction lines
+            // Generate raw assembly instructions
             for (int i = 0; i < stmt->data.inline_assembly_stmt.assembly_line_count; i++) {
-                fprintf(codegen->output_file, "        \"%s\"",
-                        stmt->data.inline_assembly_stmt.assembly_lines[i]);
+                // Output the assembly instruction directly
+                char *instruction = stmt->data.inline_assembly_stmt.assembly_lines[i];
 
-                // Add newline escape if not present
-                if (strlen(stmt->data.inline_assembly_stmt.assembly_lines[i]) > 0 &&
-                    stmt->data.inline_assembly_stmt.assembly_lines[i][strlen(stmt->data.inline_assembly_stmt.assembly_lines[i]) - 1] != 'n') {
-                    fprintf(codegen->output_file, "\\n");
-                }
-
-                if (i < stmt->data.inline_assembly_stmt.assembly_line_count - 1) {
-                    fprintf(codegen->output_file, "\n");
-                } else {
-                    fprintf(codegen->output_file, "\"\n");
-                }
-            }
-
-            // Output constraints (only if we have any)
-            if (stmt->data.inline_assembly_stmt.output_count > 0) {
-                fprintf(codegen->output_file, "        : ");
-                for (int i = 0; i < stmt->data.inline_assembly_stmt.output_count; i++) {
-                    fprintf(codegen->output_file, "%s", stmt->data.inline_assembly_stmt.output_constraints[i]);
-                    if (i < stmt->data.inline_assembly_stmt.output_count - 1) {
-                        fprintf(codegen->output_file, ", ");
+                // Process escape sequences (especially \n)
+                char *processed = malloc(strlen(instruction) + 1);
+                int src = 0, dst = 0;
+                while (instruction[src] != '\0') {
+                    if (instruction[src] == '\\' && instruction[src + 1] == 'n') {
+                        // Skip the \n escape sequence - we don't need newlines in assembly instructions
+                        src += 2;
+                    } else if (instruction[src] == '\\' && instruction[src + 1] == 't') {
+                        processed[dst++] = '\t';
+                        src += 2;
+                    } else if (instruction[src] == '\\' && instruction[src + 1] == '\\') {
+                        processed[dst++] = '\\';
+                        src += 2;
+                    } else {
+                        processed[dst++] = instruction[src++];
                     }
                 }
-                fprintf(codegen->output_file, "\n");
-            }
+                processed[dst] = '\0';
 
-            // Input constraints
-            if (stmt->data.inline_assembly_stmt.input_count > 0) {
-                if (stmt->data.inline_assembly_stmt.output_count == 0) {
-                    fprintf(codegen->output_file, "        :\n");  // Empty output section
-                }
-                fprintf(codegen->output_file, "        : ");
-                for (int i = 0; i < stmt->data.inline_assembly_stmt.input_count; i++) {
-                    fprintf(codegen->output_file, "%s", stmt->data.inline_assembly_stmt.input_constraints[i]);
-                    if (i < stmt->data.inline_assembly_stmt.input_count - 1) {
-                        fprintf(codegen->output_file, ", ");
-                    }
-                }
-                fprintf(codegen->output_file, "\n");
+                fprintf(codegen->output_file, "    %s\n", processed);
+                free(processed);
             }
-
-            // Clobber list
-            if (stmt->data.inline_assembly_stmt.clobber_count > 0) {
-                if (stmt->data.inline_assembly_stmt.output_count == 0 &&
-                    stmt->data.inline_assembly_stmt.input_count == 0) {
-                    fprintf(codegen->output_file, "        :\n        :\n");  // Empty output and input sections
-                } else if (stmt->data.inline_assembly_stmt.input_count == 0) {
-                    fprintf(codegen->output_file, "        :\n");  // Empty input section
-                }
-                fprintf(codegen->output_file, "        : ");
-                for (int i = 0; i < stmt->data.inline_assembly_stmt.clobber_count; i++) {
-                    fprintf(codegen->output_file, "\"%s\"", stmt->data.inline_assembly_stmt.clobber_list[i]);
-                    if (i < stmt->data.inline_assembly_stmt.clobber_count - 1) {
-                        fprintf(codegen->output_file, ", ");
-                    }
-                }
-                fprintf(codegen->output_file, "\n");
-            }
-
-            fprintf(codegen->output_file, "    );\n");
+            // Note: Constraints are parsed but not used in raw assembly output
+            // The Note comments are available in assembly_notes array if needed
             break;
         }
 

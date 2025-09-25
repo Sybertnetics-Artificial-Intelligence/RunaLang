@@ -743,14 +743,31 @@ static Statement* parser_parse_inline_assembly_statement(Parser *parser) {
         parser_eat(parser, TOKEN_COLON);
 
         // Parse note text (could be multiple tokens until newline/next statement)
-        // For now, we'll require it to be a string or identifier
-        if (parser->current_token->type == TOKEN_STRING_LITERAL ||
-            parser->current_token->type == TOKEN_IDENTIFIER) {
-            stmt->data.inline_assembly_stmt.assembly_notes[stmt->data.inline_assembly_stmt.assembly_line_count] =
-                string_duplicate(parser->current_token->value);
+        // Build note text from multiple identifiers/strings
+        char note_buffer[1024] = "";
+        int note_length = 0;
+
+        while (parser->current_token->type != TOKEN_STRING_LITERAL &&
+               parser->current_token->type != TOKEN_COLON &&
+               parser->current_token->type != TOKEN_END &&
+               parser->current_token->type != TOKEN_EOF &&
+               parser->current_token->type != TOKEN_ASSEMBLY &&
+               parser->current_token->type != TOKEN_NOTE) {
+            if (note_length > 0) {
+                note_buffer[note_length++] = ' '; // Add space between words
+            }
+            int token_len = strlen(parser->current_token->value);
+            if (note_length + token_len < sizeof(note_buffer) - 1) {
+                strcpy(note_buffer + note_length, parser->current_token->value);
+                note_length += token_len;
+            }
             parser_advance(parser);
+        }
+
+        if (note_length > 0) {
+            stmt->data.inline_assembly_stmt.assembly_notes[stmt->data.inline_assembly_stmt.assembly_line_count] =
+                string_duplicate(note_buffer);
         } else {
-            // Parse the note as text until we hit a control token
             stmt->data.inline_assembly_stmt.assembly_notes[stmt->data.inline_assembly_stmt.assembly_line_count] =
                 string_duplicate("Assembly instruction");
         }
@@ -1433,6 +1450,8 @@ static Function* parser_parse_function(Parser *parser) {
             stmt = parser_parse_match_statement(parser);
         } else if (parser->current_token->type == TOKEN_PRINT) {
             stmt = parser_parse_print_statement(parser);
+        } else if (parser->current_token->type == TOKEN_INLINE) {
+            stmt = parser_parse_inline_assembly_statement(parser);
         } else if (parser->current_token->type == TOKEN_IDENTIFIER) {
             // Try to parse as expression (could be a function call)
             Expression *expr = parser_parse_expression(parser);
