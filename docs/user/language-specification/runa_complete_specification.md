@@ -484,20 +484,71 @@ parameter             ::= identifier ("as" type_expression)? ("defaults" "to" ex
 
 ### Type Definitions
 
+**Consistency Principle**: All type definitions end with `End Type` to maintain consistency with other block structures in Runa.
+
 ```ebnf
-type_definition       ::= "Type" identifier generic_params? "is" type_body
+type_definition       ::= "Type" type_header type_body "End" "Type"
 
-generic_params        ::= "[" identifier ("," identifier)* "]"
+type_header          ::= called_syntax | is_syntax
 
-type_body             ::= record_definition | adt_definition | type_alias
+called_syntax        ::= "called" string_literal ":"
+is_syntax            ::= identifier generic_params? "is" ":"
 
-record_definition     ::= "Dictionary" "with" inheritance_clause? protocol_conformance_clause? ":"
-                         INDENT (field_declaration | method_definition | static_member_definition)+ DEDENT "End" "Type"
+generic_params       ::= "[" identifier ("," identifier)* "]"
 
-adt_definition        ::= ":" INDENT ("|" adt_variant)+ DEDENT "End" "Type"
-adt_variant           ::= identifier ("with" variant_fields)? NEWLINE
+type_body            ::= struct_body | variant_body | array_body | function_pointer_body
 
-type_alias            ::= type_expression
+struct_body          ::= INDENT field_declaration+ DEDENT
+
+variant_body         ::= INDENT ("|" variant_definition)+ DEDENT
+
+array_body           ::= INDENT "array" "[" expression "]" "of" type_expression DEDENT
+
+function_pointer_body ::= INDENT "Pointer" "to" "Process" function_signature DEDENT
+
+variant_definition   ::= identifier ("with" field_list)? NEWLINE
+
+field_list           ::= field_declaration ("and" field_declaration)*
+
+field_declaration    ::= identifier "as" type_expression
+```
+
+#### Type Definition Examples
+
+**Struct Types:**
+```runa
+Type called "Point":
+    x as Float,
+    y as Float,
+    z as Float
+End Type
+```
+
+**Variant Types (Algebraic Data Types):**
+```runa
+Type Shape is:
+    | Circle with radius as Float
+    | Rectangle with width as Float and height as Float
+    | Triangle with base as Float and height as Float
+End Type
+```
+
+**Array Types:**
+```runa
+Type Vector3 is:
+    array[3] of Float
+End Type
+
+Type Matrix4x4 is:
+    array[16] of Float
+End Type
+```
+
+**Function Pointer Types:**
+```runa
+Type BinaryOperation is:
+    Pointer to Process that takes left as Integer and right as Integer returns Integer
+End Type
 ```
 
 ### Pattern Matching
@@ -2019,17 +2070,10 @@ External Process called "move_point"
 Note: Fixed-size arrays
 Type FloatArray10 is C_Array[Float, 10]
 
-External Process called "process_array"
-    that takes data as FloatArray10
-    returns Float
-    from library "math_utils"
+External Process called "process_array" that takes data as FloatArray10 returns Float from library "math_utils"
 
 Note: Dynamic arrays with explicit size
-External Process called "sum_array"
-    that takes data as Pointer[Float] and size as Integer
-    returns Float
-    from library "math_utils"
-    unsafe
+External Process called "sum_array" that takes data as Pointer[Float] and size as Integer returns Float from library "math_utils" unsafe
 
 Note: Usage with safety checks
 Process called "safe_sum_array" that takes values as List[Float] returns Float:
