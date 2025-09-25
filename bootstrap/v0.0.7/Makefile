@@ -1,9 +1,9 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -g -O0
 TARGET = runac
-SOURCES = main.c lexer.c parser.c codegen_x86.c runtime_list.c
+SOURCES = main.c lexer.c parser.c codegen_x86.c runtime_list.c runtime_io.c
 OBJECTS = $(SOURCES:.c=.o)
-RUNTIME_OBJ = runtime_list.o
+RUNTIME_OBJ = runtime_list.o runtime_io.o
 
 .PHONY: all clean test test2 test3 test4 test5 test6 test7 test8 test9 test10
 

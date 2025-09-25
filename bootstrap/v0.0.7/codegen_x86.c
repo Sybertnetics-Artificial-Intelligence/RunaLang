@@ -143,6 +143,12 @@ static void codegen_collect_strings_from_expression(CodeGenerator *codegen, Expr
         case EXPR_FIELD_ACCESS:
             codegen_collect_strings_from_expression(codegen, expr->data.field_access.object);
             break;
+
+        case EXPR_BUILTIN_CALL:
+            for (int i = 0; i < expr->data.builtin_call.argument_count; i++) {
+                codegen_collect_strings_from_expression(codegen, expr->data.builtin_call.arguments[i]);
+            }
+            break;
     }
 }
 
@@ -185,6 +191,10 @@ static void codegen_collect_strings_from_statement(CodeGenerator *codegen, State
 
         case STMT_EXPRESSION:
             codegen_collect_strings_from_expression(codegen, stmt->data.expr_stmt.expression);
+            break;
+
+        case STMT_IMPORT:
+            // Imports don't have strings to collect
             break;
     }
 }
@@ -309,6 +319,52 @@ static void codegen_generate_expression(CodeGenerator *codegen, Expression *expr
                 fprintf(codegen->output_file, "    call %s\n", func_name);
             }
             // Result is already in %rax
+            break;
+        }
+
+        case EXPR_BUILTIN_CALL: {
+            // Handle built-in file I/O functions
+            const char *func_name;
+            if (expr->data.builtin_call.builtin_type == TOKEN_READ_FILE) {
+                func_name = "runtime_read_file";
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_WRITE_FILE) {
+                func_name = "runtime_write_file";
+            } else {
+                fprintf(stderr, "[CODEGEN ERROR] Unknown built-in function type\n");
+                exit(1);
+            }
+
+            // System V ABI: arguments go in %rdi, %rsi
+            const char *arg_registers[] = {"%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"};
+            int arg_count = expr->data.builtin_call.argument_count;
+
+            // Validate argument count
+            if (expr->data.builtin_call.builtin_type == TOKEN_READ_FILE) {
+                if (arg_count != 1) {
+                    fprintf(stderr, "[CODEGEN ERROR] read_file expects 1 argument, got %d\n", arg_count);
+                    exit(1);
+                }
+            } else if (expr->data.builtin_call.builtin_type == TOKEN_WRITE_FILE) {
+                if (arg_count != 2) {
+                    fprintf(stderr, "[CODEGEN ERROR] write_file expects 2 arguments, got %d\n", arg_count);
+                    exit(1);
+                }
+            }
+
+            // Evaluate arguments in reverse order and push them to stack
+            for (int i = arg_count - 1; i >= 0; i--) {
+                codegen_generate_expression(codegen, expr->data.builtin_call.arguments[i]);
+                fprintf(codegen->output_file, "    pushq %%rax\n");
+            }
+
+            // Pop arguments into correct registers
+            for (int i = 0; i < arg_count; i++) {
+                fprintf(codegen->output_file, "    popq %s\n", arg_registers[i]);
+            }
+
+            // Call the runtime function
+            fprintf(codegen->output_file, "    call %s@PLT\n", func_name);
+            // Result is in %rax
             break;
         }
 
@@ -580,8 +636,18 @@ static void codegen_generate_statement(CodeGenerator *codegen, Statement *stmt) 
                 // String literal - call print_string
                 fprintf(codegen->output_file, "    movq %%rax, %%rdi\n");
                 fprintf(codegen->output_file, "    call print_string\n");
+            } else if (expr->type == EXPR_BUILTIN_CALL &&
+                      expr->data.builtin_call.builtin_type == TOKEN_READ_FILE) {
+                // read_file returns a string - call print_string
+                fprintf(codegen->output_file, "    movq %%rax, %%rdi\n");
+                fprintf(codegen->output_file, "    call print_string\n");
+            } else if (expr->type == EXPR_VARIABLE) {
+                // For variables, we can't tell the type at compile time without a proper type system
+                // For now, assume integer (this is a limitation we'll fix with proper type tracking)
+                fprintf(codegen->output_file, "    movq %%rax, %%rdi\n");
+                fprintf(codegen->output_file, "    call print_integer\n");
             } else {
-                // Integer expression (variable, literal, arithmetic) - call print_integer
+                // Integer expression (literal, arithmetic) - call print_integer
                 fprintf(codegen->output_file, "    movq %%rax, %%rdi\n");
                 fprintf(codegen->output_file, "    call print_integer\n");
             }
@@ -591,6 +657,10 @@ static void codegen_generate_statement(CodeGenerator *codegen, Statement *stmt) 
         case STMT_EXPRESSION:
             // Generate the expression and ignore its result
             codegen_generate_expression(codegen, stmt->data.expr_stmt.expression);
+            break;
+
+        case STMT_IMPORT:
+            // Imports are handled at program level, no code generation needed
             break;
     }
 }
@@ -687,6 +757,17 @@ static void codegen_generate_function(CodeGenerator *codegen, Function *func) {
 void codegen_generate(CodeGenerator *codegen, Program *program) {
     // Store program reference for type lookups
     codegen->current_program = program;
+
+    // Generate import comments (for documentation)
+    if (program->import_count > 0) {
+        fprintf(codegen->output_file, "# Imports:\n");
+        for (int i = 0; i < program->import_count; i++) {
+            fprintf(codegen->output_file, "#   Import \"%s\" as %s\n",
+                    program->imports[i]->filename,
+                    program->imports[i]->module_name);
+        }
+        fprintf(codegen->output_file, "\n");
+    }
 
     // First pass: collect all string literals by analyzing the AST
     for (int i = 0; i < program->function_count; i++) {

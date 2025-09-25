@@ -205,6 +205,12 @@ Token* lexer_next_token(Lexer *lexer) {
                 type = TOKEN_PRINT;
             } else if (strcmp(word, "Type") == 0) {
                 type = TOKEN_TYPE;
+            } else if (strcmp(word, "read_file") == 0) {
+                type = TOKEN_READ_FILE;
+            } else if (strcmp(word, "write_file") == 0) {
+                type = TOKEN_WRITE_FILE;
+            } else if (strcmp(word, "Import") == 0) {
+                type = TOKEN_IMPORT;
             } else {
                 type = TOKEN_IDENTIFIER;
             }

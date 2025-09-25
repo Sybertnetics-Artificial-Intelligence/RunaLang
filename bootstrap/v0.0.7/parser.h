@@ -11,7 +11,8 @@ typedef enum {
     EXPR_FUNCTION_CALL,
     EXPR_STRING_LITERAL,
     EXPR_FIELD_ACCESS,
-    EXPR_TYPE_NAME
+    EXPR_TYPE_NAME,
+    EXPR_BUILTIN_CALL
 } ExpressionType;
 
 typedef struct Expression {
@@ -40,6 +41,11 @@ typedef struct Expression {
             char *field_name;
         } field_access;
         char *type_name;  // For EXPR_TYPE_NAME
+        struct {
+            TokenType builtin_type;  // TOKEN_READ_FILE or TOKEN_WRITE_FILE
+            struct Expression **arguments;
+            int argument_count;
+        } builtin_call;
     } data;
 } Expression;
 
@@ -50,7 +56,8 @@ typedef enum {
     STMT_IF,
     STMT_WHILE,
     STMT_PRINT,
-    STMT_EXPRESSION
+    STMT_EXPRESSION,
+    STMT_IMPORT
 } StatementType;
 
 typedef struct Statement {
@@ -86,6 +93,10 @@ typedef struct Statement {
         struct {
             Expression *expression;
         } expr_stmt;
+        struct {
+            char *filename;
+            char *module_name;
+        } import_stmt;
     } data;
 } Statement;
 
@@ -117,6 +128,11 @@ typedef struct {
     int statement_count;
 } Function;
 
+typedef struct Import {
+    char *filename;
+    char *module_name;
+} Import;
+
 typedef struct {
     Function **functions;
     int function_count;
@@ -124,6 +140,9 @@ typedef struct {
     TypeDefinition **types;
     int type_count;
     int type_capacity;
+    Import **imports;
+    int import_count;
+    int import_capacity;
 } Program;
 
 typedef struct {
