@@ -34,6 +34,16 @@ static void lexer_skip_whitespace(Lexer *lexer) {
     }
 }
 
+static void lexer_skip_comment(Lexer *lexer) {
+    // Skip the '#' character
+    lexer_advance(lexer);
+
+    // Skip until end of line or end of file
+    while (lexer->current_char != '\0' && lexer->current_char != '\n') {
+        lexer_advance(lexer);
+    }
+}
+
 // Create token with an owned string (we take ownership)
 static Token* token_create_owned(TokenType type, char *value, int line, int column) {
     Token *token = malloc(sizeof(Token));
@@ -131,6 +141,11 @@ Token* lexer_next_token(Lexer *lexer) {
             continue;
         }
 
+        if (lexer->current_char == '#') {
+            lexer_skip_comment(lexer);
+            continue;
+        }
+
         if (lexer->current_char == '"') {
             char *string = lexer_read_string_literal(lexer);
             if (string) {
@@ -215,6 +230,22 @@ Token* lexer_next_token(Lexer *lexer) {
                 type = TOKEN_MODULO;
             } else if (strcmp(word, "by") == 0) {
                 type = TOKEN_BY;
+            } else if (strcmp(word, "bit_and") == 0) {
+                type = TOKEN_BIT_AND;
+            } else if (strcmp(word, "bit_or") == 0) {
+                type = TOKEN_BIT_OR;
+            } else if (strcmp(word, "bit_xor") == 0) {
+                type = TOKEN_BIT_XOR;
+            } else if (strcmp(word, "bit_shift_left") == 0) {
+                type = TOKEN_BIT_SHIFT_LEFT;
+            } else if (strcmp(word, "bit_shift_right") == 0) {
+                type = TOKEN_BIT_SHIFT_RIGHT;
+            } else if (strcmp(word, "Break") == 0) {
+                type = TOKEN_BREAK;
+            } else if (strcmp(word, "Continue") == 0) {
+                type = TOKEN_CONTINUE;
+            } else if (strcmp(word, "Otherwise If") == 0) {
+                type = TOKEN_OTHERWISE_IF;
             } else if (strcmp(word, "Print") == 0) {
                 type = TOKEN_PRINT;
             } else if (strcmp(word, "Type") == 0) {
@@ -253,6 +284,70 @@ Token* lexer_next_token(Lexer *lexer) {
                 type = TOKEN_LIST_LENGTH;
             } else if (strcmp(word, "list_destroy") == 0) {
                 type = TOKEN_LIST_DESTROY;
+            } else if (strcmp(word, "list_set") == 0) {
+                type = TOKEN_LIST_SET;
+            } else if (strcmp(word, "list_insert") == 0) {
+                type = TOKEN_LIST_INSERT;
+            } else if (strcmp(word, "list_remove") == 0) {
+                type = TOKEN_LIST_REMOVE;
+            } else if (strcmp(word, "list_clear") == 0) {
+                type = TOKEN_LIST_CLEAR;
+            } else if (strcmp(word, "list_find") == 0) {
+                type = TOKEN_LIST_FIND;
+            } else if (strcmp(word, "list_sort") == 0) {
+                type = TOKEN_LIST_SORT;
+            } else if (strcmp(word, "list_reverse") == 0) {
+                type = TOKEN_LIST_REVERSE;
+            } else if (strcmp(word, "list_copy") == 0) {
+                type = TOKEN_LIST_COPY;
+            } else if (strcmp(word, "list_merge") == 0) {
+                type = TOKEN_LIST_MERGE;
+            } else if (strcmp(word, "file_open") == 0) {
+                type = TOKEN_FILE_OPEN;
+            } else if (strcmp(word, "file_close") == 0) {
+                type = TOKEN_FILE_CLOSE;
+            } else if (strcmp(word, "file_read_line") == 0) {
+                type = TOKEN_FILE_READ_LINE;
+            } else if (strcmp(word, "file_write_line") == 0) {
+                type = TOKEN_FILE_WRITE_LINE;
+            } else if (strcmp(word, "file_exists") == 0) {
+                type = TOKEN_FILE_EXISTS;
+            } else if (strcmp(word, "file_delete") == 0) {
+                type = TOKEN_FILE_DELETE;
+            } else if (strcmp(word, "file_size") == 0) {
+                type = TOKEN_FILE_SIZE;
+            } else if (strcmp(word, "file_seek") == 0) {
+                type = TOKEN_FILE_SEEK;
+            } else if (strcmp(word, "file_tell") == 0) {
+                type = TOKEN_FILE_TELL;
+            } else if (strcmp(word, "file_eof") == 0) {
+                type = TOKEN_FILE_EOF;
+            } else if (strcmp(word, "sin") == 0) {
+                type = TOKEN_SIN;
+            } else if (strcmp(word, "cos") == 0) {
+                type = TOKEN_COS;
+            } else if (strcmp(word, "tan") == 0) {
+                type = TOKEN_TAN;
+            } else if (strcmp(word, "sqrt") == 0) {
+                type = TOKEN_SQRT;
+            } else if (strcmp(word, "pow") == 0) {
+                type = TOKEN_POW;
+            } else if (strcmp(word, "abs") == 0) {
+                type = TOKEN_ABS;
+            } else if (strcmp(word, "floor") == 0) {
+                type = TOKEN_FLOOR;
+            } else if (strcmp(word, "ceil") == 0) {
+                type = TOKEN_CEIL;
+            } else if (strcmp(word, "min") == 0) {
+                type = TOKEN_MIN;
+            } else if (strcmp(word, "max") == 0) {
+                type = TOKEN_MAX;
+            } else if (strcmp(word, "random") == 0) {
+                type = TOKEN_RANDOM;
+            } else if (strcmp(word, "log") == 0) {
+                type = TOKEN_LOG;
+            } else if (strcmp(word, "exp") == 0) {
+                type = TOKEN_EXP;
             } else if (strcmp(word, "string_concat") == 0) {
                 type = TOKEN_STRING_CONCAT;
             } else if (strcmp(word, "string_compare") == 0) {
@@ -275,6 +370,24 @@ Token* lexer_next_token(Lexer *lexer) {
                 type = TOKEN_WHEN;
             } else if (strcmp(word, "with") == 0) {
                 type = TOKEN_WITH;
+            } else if (strcmp(word, "get_command_line_args") == 0) {
+                type = TOKEN_GET_COMMAND_LINE_ARGS;
+            } else if (strcmp(word, "exit_with_code") == 0) {
+                type = TOKEN_EXIT_WITH_CODE;
+            } else if (strcmp(word, "panic") == 0) {
+                type = TOKEN_PANIC;
+            } else if (strcmp(word, "assert") == 0) {
+                type = TOKEN_ASSERT;
+            } else if (strcmp(word, "allocate") == 0) {
+                type = TOKEN_ALLOCATE;
+            } else if (strcmp(word, "deallocate") == 0) {
+                type = TOKEN_DEALLOCATE;
+            } else if (strcmp(word, "Inline") == 0) {
+                type = TOKEN_INLINE;
+            } else if (strcmp(word, "Assembly") == 0) {
+                type = TOKEN_ASSEMBLY;
+            } else if (strcmp(word, "Note") == 0) {
+                type = TOKEN_NOTE;
             } else {
                 type = TOKEN_IDENTIFIER;
             }
