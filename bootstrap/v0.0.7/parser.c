@@ -413,16 +413,49 @@ static Expression* parser_parse_comparison(Parser *parser) {
         parser_eat(parser, TOKEN_IS);
 
         TokenType comparison_op;
-        if (parser->current_token->type == TOKEN_EQUAL) {
+        if (parser->current_token->type == TOKEN_NOT) {
+            parser_eat(parser, TOKEN_NOT);
+            parser_eat(parser, TOKEN_EQUAL);
+            parser_eat(parser, TOKEN_TO);
+            comparison_op = TOKEN_NOT_EQUAL;
+        } else if (parser->current_token->type == TOKEN_EQUAL) {
             parser_eat(parser, TOKEN_EQUAL);
             parser_eat(parser, TOKEN_TO);
             comparison_op = TOKEN_EQUAL;
         } else if (parser->current_token->type == TOKEN_LESS) {
             parser_eat(parser, TOKEN_LESS);
-            parser_eat(parser, TOKEN_THAN);
-            comparison_op = TOKEN_LESS;
+            if (parser->current_token->type == TOKEN_THAN) {
+                parser_eat(parser, TOKEN_THAN);
+                if (parser->current_token->type == TOKEN_OR) {
+                    parser_eat(parser, TOKEN_OR);
+                    parser_eat(parser, TOKEN_EQUAL);
+                    parser_eat(parser, TOKEN_TO);
+                    comparison_op = TOKEN_LESS_EQUAL;
+                } else {
+                    comparison_op = TOKEN_LESS;
+                }
+            } else {
+                fprintf(stderr, "[PARSER ERROR] Expected 'than' after 'less' at line %d\n", parser->current_token->line);
+                exit(1);
+            }
+        } else if (parser->current_token->type == TOKEN_GREATER) {
+            parser_eat(parser, TOKEN_GREATER);
+            if (parser->current_token->type == TOKEN_THAN) {
+                parser_eat(parser, TOKEN_THAN);
+                if (parser->current_token->type == TOKEN_OR) {
+                    parser_eat(parser, TOKEN_OR);
+                    parser_eat(parser, TOKEN_EQUAL);
+                    parser_eat(parser, TOKEN_TO);
+                    comparison_op = TOKEN_GREATER_EQUAL;
+                } else {
+                    comparison_op = TOKEN_GREATER;
+                }
+            } else {
+                fprintf(stderr, "[PARSER ERROR] Expected 'than' after 'greater' at line %d\n", parser->current_token->line);
+                exit(1);
+            }
         } else {
-            fprintf(stderr, "[PARSER ERROR] Expected 'equal' or 'less' after 'is' at line %d\n", parser->current_token->line);
+            fprintf(stderr, "[PARSER ERROR] Expected 'equal', 'less', or 'greater' after 'is' at line %d\n", parser->current_token->line);
             exit(1);
         }
 
