@@ -228,14 +228,15 @@ long memory_set_byte(void* ptr, long offset, long value) {
     return 0;
 }
 
+// 32-bit integer access functions for struct fields
 long memory_get_integer(void* ptr, long offset) {
-    long* int_ptr = (long*)((char*)ptr + offset);
-    return *int_ptr;
+    int* int_ptr = (int*)((char*)ptr + offset);
+    return (long)*int_ptr;
 }
 
 long memory_set_integer(void* ptr, long offset, long value) {
-    long* int_ptr = (long*)((char*)ptr + offset);
-    *int_ptr = value;
+    int* int_ptr = (int*)((char*)ptr + offset);
+    *int_ptr = (int)value;
     return 0;
 }
 
@@ -247,18 +248,6 @@ long memory_get_pointer(void* ptr, long offset) {
 long memory_set_pointer(void* ptr, long offset, long value) {
     void** ptr_ptr = (void**)((char*)ptr + offset);
     *ptr_ptr = (void*)value;
-    return 0;
-}
-
-// 32-bit integer access functions for struct fields
-long memory_get_int32(void* ptr, long offset) {
-    int* int_ptr = (int*)((char*)ptr + offset);
-    return (long)*int_ptr;
-}
-
-long memory_set_int32(void* ptr, long offset, long value) {
-    int* int_ptr = (int*)((char*)ptr + offset);
-    *int_ptr = (int)value;
     return 0;
 }
 

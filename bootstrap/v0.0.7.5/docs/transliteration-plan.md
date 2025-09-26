@@ -287,23 +287,68 @@ This plan will be supplemented with:
 
 
 
-  Phase 1: Create Memory Layout Reference
+ Current Issues with v0.0.7.5 Compiler
 
-  1. Extract all C struct definitions from v0.0.7.3 (Token, Expression, Function, Program, Lexer, Parser, etc.)
-  2. Document the correct memory layout for each - which fields are pointers vs integers
-  3. Create a mapping document showing correct Runa memory access patterns
+  3. Limited Statement Support ⚠️
 
-  Phase 2: Systematic Fix Pattern
+  - Severity: High for real programs
+  - Currently Working: Only RETURN statements
+  - Not Implemented:
+    - LET statements (variable declarations)
+    - SET statements (assignments)
+    - IF/OTHERWISE statements (conditionals)
+    - WHILE statements (loops)
+    - Function calls
+    - Binary operations (+, -, *, /, etc.)
 
-  For each module (lexer → parser → codegen → containers → hashtable):
-  1. Audit all memory_set_integer calls - change to memory_set_pointer for pointer fields
-  2. Audit all memory_get_integer calls - change to memory_get_pointer for pointer fields
-  3. Verify structure sizes match C struct alignment
-  4. Test each module incrementally
+  4. Memory Access Function Inconsistencies 🔍
 
-  Phase 3: Validation
+  - Severity: Medium
+  - Many places still using memory_get_integer (64-bit) for 32-bit fields
+  - Should use memory_get_int32 for int fields
+  - Should use memory_get_pointer for pointer fields
+  - Partially fixed but needs complete audit
 
-  1. Test lexer standalone - should tokenize basic input correctly
-  2. Test parser with fixed lexer - should parse simple programs
-  3. Full pipeline test - compile a basic Runa program
-  4. Bootstrap test - v0.0.7.5 compiling itself
+  5. Hardcoded Structure Offsets 🏗️
+
+  - Severity: Low (currently working)
+  - Magic numbers throughout instead of constants
+  - Makes code fragile to structure changes
+  - Example: memory_get_int32(func, 40) instead of FUNCTION_STATEMENT_COUNT
+
+  6. No Error Handling ❌
+
+  - Severity: Medium
+  - Segfaults instead of error messages for:
+    - Invalid input files
+    - Syntax errors
+    - Type errors
+    - Missing functions
+
+  7. Incomplete Type System 📦
+
+  - Severity: High for complex programs
+  - Can't handle:
+    - Custom types/structs
+    - Arrays
+    - Strings (beyond literals)
+    - Pointers
+
+  8. No Variable Management 📊
+
+  - Severity: Critical for real programs
+  - Variable table exists but not used
+  - Can't generate code for local variables
+  - No stack frame management beyond basic prologue/epilogue
+
+  Priority Order for Fixes:
+
+  1. Remove debug output - Quick win, makes compiler usable
+  2. Implement LET statements - Essential for any real program
+  3. Implement function calls - Needed for print/system functions
+  4. Add variable lookups - Required for SET and expressions
+  5. Implement IF statements - Basic control flow
+  6. Fix memory access functions - Prevent future bugs
+  7. Add error handling - Better user experience
+
+  The compiler core is working but needs these issues addressed to handle real Runa programs beyond trivial "Return N" examples.

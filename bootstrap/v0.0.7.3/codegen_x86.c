@@ -1691,7 +1691,8 @@ static void codegen_generate_function(CodeGenerator *codegen, Function *func) {
 
     // CRITICAL FIX: Allocate stack space BEFORE any stack access to prevent Valgrind violations
     // Pre-allocate generous stack space for all function variables and temporaries
-    fprintf(codegen->output_file, "    subq $512, %%rsp  # Pre-allocate generous stack space\n");
+    // Increased from 512 to 2048 to handle parser functions with many locals
+    fprintf(codegen->output_file, "    subq $2048, %%rsp  # Pre-allocate generous stack space\n");
     fprintf(codegen->output_file, "          \n");
 
     for (int i = 0; i < func->parameter_count && i < max_register_params; i++) {
