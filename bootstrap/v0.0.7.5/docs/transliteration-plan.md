@@ -284,3 +284,26 @@ This plan will be supplemented with:
 ---
 
 **This is not a rewrite or reimplementation. This is a complete, faithful, line-for-line transliteration preserving every detail of the original C compiler.**
+
+
+
+  Phase 1: Create Memory Layout Reference
+
+  1. Extract all C struct definitions from v0.0.7.3 (Token, Expression, Function, Program, Lexer, Parser, etc.)
+  2. Document the correct memory layout for each - which fields are pointers vs integers
+  3. Create a mapping document showing correct Runa memory access patterns
+
+  Phase 2: Systematic Fix Pattern
+
+  For each module (lexer → parser → codegen → containers → hashtable):
+  1. Audit all memory_set_integer calls - change to memory_set_pointer for pointer fields
+  2. Audit all memory_get_integer calls - change to memory_get_pointer for pointer fields
+  3. Verify structure sizes match C struct alignment
+  4. Test each module incrementally
+
+  Phase 3: Validation
+
+  1. Test lexer standalone - should tokenize basic input correctly
+  2. Test parser with fixed lexer - should parse simple programs
+  3. Full pipeline test - compile a basic Runa program
+  4. Bootstrap test - v0.0.7.5 compiling itself

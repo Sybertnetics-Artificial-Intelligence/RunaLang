@@ -68,29 +68,9 @@ int64_t ascii_value_of(const char* c) {
     return (int64_t)c[0];
 }
 
-int64_t is_digit(const char* c) {
-    if (!c || c[0] == '\0') {
-        return 0;
-    }
+// is_digit and is_alpha removed - conflicts with string_utils versions that take Integer character
 
-    return isdigit(c[0]) ? 1 : 0;
-}
-
-int64_t is_alpha(const char* c) {
-    if (!c || c[0] == '\0') {
-        return 0;
-    }
-
-    return isalpha(c[0]) ? 1 : 0;
-}
-
-int64_t is_whitespace(const char* c) {
-    if (!c || c[0] == '\0') {
-        return 0;
-    }
-
-    return isspace(c[0]) ? 1 : 0;
-}
+// is_whitespace removed - conflicts with string_utils version that takes Integer character
 
 // Concatenate two strings (returns newly allocated string)
 char* string_concat(const char* s1, const char* s2) {
