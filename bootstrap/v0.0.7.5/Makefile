@@ -3,13 +3,19 @@
 
 # Compiler settings
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -O2 -g -fPIC
+CFLAGS ?= -Wall -Wextra -std=c99 -O2 -g -fPIC
 RUNAC_V0073 = ../v0.0.7.3/runac
 RUNAC_FLAGS =
 AS = as
 ASFLAGS = --64
 LD = gcc
-LDFLAGS = -lm -ldl -lpthread
+LDFLAGS ?= -lm -ldl -lpthread
+
+# AddressSanitizer build variant
+ifdef ASAN
+CFLAGS = -g -O0 -fsanitize=address -fno-omit-frame-pointer -Wall -Wextra -std=c99 -fPIC
+LDFLAGS = -fsanitize=address -lm -ldl -lpthread
+endif
 
 # Additional flags for runtime/Runa interop
 RUNTIME_CFLAGS = $(CFLAGS) -I$(RUNTIME_DIR)
@@ -51,8 +57,29 @@ $(BUILD_DIR)/%.o: $(RUNTIME_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.s: $(SRC_DIR)/%.runa | $(BUILD_DIR)
 	$(RUNAC_V0073) $< $@ $(RUNAC_FLAGS)
 
+# Rule to compile assembly files to object files with automatic symbol handling
 $(BUILD_DIR)/%.o: $(BUILD_DIR)/%.s
 	$(AS) $(ASFLAGS) $< -o $@
+	@# Strip main symbol from all objects except main.o
+	@if [ "$@" != "$(BUILD_DIR)/main.o" ]; then \
+		objcopy --strip-symbol=main $@ 2>/dev/null || true; \
+	fi
+	@# Weaken runtime symbols that conflict with C runtime
+	@if [ "$@" = "$(BUILD_DIR)/hashtable.o" ] || [ "$@" = "$(BUILD_DIR)/string_utils.o" ]; then \
+		objcopy --weaken-symbol=allocate --weaken-symbol=deallocate --weaken-symbol=memory_set_pointer --weaken-symbol=memory_set_integer --weaken-symbol=memory_get_pointer --weaken-symbol=memory_get_integer --weaken-symbol=memory_get_byte --weaken-symbol=string_compare $@ 2>/dev/null || true; \
+	fi
+	@# Weaken ALL TOKEN constants and shared functions in parser.o (let lexer.o be definitive)
+	@if [ "$@" = "$(BUILD_DIR)/parser.o" ]; then \
+		for token in $$(nm $@ | grep " TOKEN" | awk '{print $$3}' | sort -u); do \
+			objcopy --weaken-symbol=$$token $@ 2>/dev/null || true; \
+		done; \
+		objcopy --weaken-symbol=token_destroy $@ 2>/dev/null || true; \
+	fi
+	@# Weaken string utility functions in string_utils.o that conflict with runtime
+	@# NOTE: is_whitespace, is_digit, is_alpha NOT weakened - runtime versions removed
+	@if [ "$@" = "$(BUILD_DIR)/string_utils.o" ]; then \
+		objcopy --weaken-symbol=string_length --weaken-symbol=string_char_at --weaken-symbol=string_equals --weaken-symbol=integer_to_string --weaken-symbol=string_to_integer --weaken-symbol=memory_reallocate $@ 2>/dev/null || true; \
+	fi
 
 # Link final executable with runtime libraries
 $(TARGET): $(ALL_OBJECTS)

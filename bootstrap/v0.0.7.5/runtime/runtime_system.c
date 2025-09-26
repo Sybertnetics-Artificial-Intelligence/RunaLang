@@ -250,6 +250,18 @@ long memory_set_pointer(void* ptr, long offset, long value) {
     return 0;
 }
 
+// 32-bit integer access functions for struct fields
+long memory_get_int32(void* ptr, long offset) {
+    int* int_ptr = (int*)((char*)ptr + offset);
+    return (long)*int_ptr;
+}
+
+long memory_set_int32(void* ptr, long offset, long value) {
+    int* int_ptr = (int*)((char*)ptr + offset);
+    *int_ptr = (int)value;
+    return 0;
+}
+
 // System call wrapper for Runa
 long system_call(long syscall_num, long arg1, long arg2, long arg3) {
     long result;
