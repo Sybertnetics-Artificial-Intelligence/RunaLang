@@ -114,10 +114,17 @@ void* allocate(long size) {
         return NULL;
     }
 
+    // Safety: Ensure all allocations are at least 64 bytes to prevent offset overflows
+    long original_size = size;
+    if (size <= 48) {
+        fprintf(stderr, "[DEBUG] Upgrading %ld-byte allocation to 64 bytes\n", size);
+        size = 64;
+    }
+
     void* ptr = malloc((size_t)size);
     if (!ptr) {
         runtime_print_string("ERROR: Failed to allocate ");
-        runtime_print_integer(size);
+        runtime_print_integer(original_size);
         runtime_print_string(" bytes of memory\n");
         return NULL;
     }
@@ -241,6 +248,10 @@ long memory_set_integer(void* ptr, long offset, long value) {
 }
 
 long memory_get_pointer(void* ptr, long offset) {
+    if (offset == 24) {
+        fprintf(stderr, "[DEBUG] memory_get_pointer at offset 24: ptr=%p, target=%p\n",
+                ptr, (char*)ptr + offset);
+    }
     void** ptr_ptr = (void**)((char*)ptr + offset);
     return (long)*ptr_ptr;
 }
