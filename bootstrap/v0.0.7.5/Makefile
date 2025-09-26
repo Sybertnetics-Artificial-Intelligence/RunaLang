@@ -3,13 +3,17 @@
 
 # Compiler settings
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -O2 -g
+CFLAGS = -Wall -Wextra -std=c99 -O2 -g -fPIC
 RUNAC_V0073 = ../v0.0.7.3/runac
 RUNAC_FLAGS =
 AS = as
 ASFLAGS = --64
 LD = gcc
-LDFLAGS = -lm
+LDFLAGS = -lm -ldl -lpthread
+
+# Additional flags for runtime/Runa interop
+RUNTIME_CFLAGS = $(CFLAGS) -I$(RUNTIME_DIR)
+RUNA_LDFLAGS = $(LDFLAGS) -Wl,--export-dynamic
 
 # Directories
 BUILD_DIR = build
@@ -41,7 +45,7 @@ $(BUILD_DIR):
 
 # Runtime library compilation (C to object files)
 $(BUILD_DIR)/%.o: $(RUNTIME_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(RUNTIME_CFLAGS) -c $< -o $@
 
 # Runa source compilation (Runa -> Assembly -> Object)
 $(BUILD_DIR)/%.s: $(SRC_DIR)/%.runa | $(BUILD_DIR)
@@ -50,9 +54,9 @@ $(BUILD_DIR)/%.s: $(SRC_DIR)/%.runa | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: $(BUILD_DIR)/%.s
 	$(AS) $(ASFLAGS) $< -o $@
 
-# Link final executable
+# Link final executable with runtime libraries
 $(TARGET): $(ALL_OBJECTS)
-	$(LD) $(ALL_OBJECTS) $(LDFLAGS) -o $@
+	$(LD) $(ALL_OBJECTS) $(RUNA_LDFLAGS) -o $@
 
 # Individual component targets
 runtime: $(RUNTIME_OBJECTS)
@@ -65,18 +69,48 @@ link: $(TARGET)
 
 # Testing targets
 test: $(TARGET)
-	@echo "Running test suite..."
-	@./tests/run_unit_tests.sh
-	@./tests/run_integration_tests.sh
+	@echo "Running complete test suite..."
+	@$(MAKE) test-compile
+	@$(MAKE) test-runtime
+	@$(MAKE) test-integration
+	@$(MAKE) test-bootstrap
 
-test-units: $(TARGET)
-	@./tests/run_unit_tests.sh
+test-compile: $(TARGET)
+	@echo "Testing Runa compilation..."
+	@echo "Process called \"test\" takes x as Integer returns Integer:" > $(TEST_DIR)/test_minimal.runa
+	@echo "    Return 42" >> $(TEST_DIR)/test_minimal.runa
+	@echo "End Process" >> $(TEST_DIR)/test_minimal.runa
+	@$(TARGET) $(TEST_DIR)/test_minimal.runa $(TEST_DIR)/test_minimal.s
+	@$(AS) $(ASFLAGS) $(TEST_DIR)/test_minimal.s -o $(TEST_DIR)/test_minimal.o
+	@$(LD) $(TEST_DIR)/test_minimal.o $(RUNTIME_OBJECTS) $(LDFLAGS) -o $(TEST_DIR)/test_minimal
+	@$(TEST_DIR)/test_minimal && echo "✓ Basic compilation test passed"
+
+test-runtime: $(RUNTIME_OBJECTS)
+	@echo "Testing runtime libraries..."
+	@$(CC) $(CFLAGS) -DRUNTIME_TEST $(RUNTIME_DIR)/runtime_test.c $(RUNTIME_OBJECTS) -o $(BUILD_DIR)/runtime_test
+	@$(BUILD_DIR)/runtime_test && echo "✓ Runtime tests passed"
 
 test-integration: $(TARGET)
-	@./tests/run_integration_tests.sh
+	@echo "Running integration tests..."
+	@for test in $(TEST_DIR)/*.runa; do \
+		echo "  Testing $$test..."; \
+		$(TARGET) $$test $${test%.runa}.s || exit 1; \
+	done
+	@echo "✓ All integration tests passed"
 
 test-bootstrap: $(TARGET)
-	@./tests/test_bootstrap.sh
+	@echo "Running bootstrap self-compilation test..."
+	@echo "  Stage 1: Compiling with v0.0.7.3..."
+	@$(RUNAC_V0073) $(SRC_DIR)/main.runa $(BUILD_DIR)/stage1_main.s
+	@echo "  Stage 2: Self-compiling..."
+	@$(TARGET) $(SRC_DIR)/main.runa $(BUILD_DIR)/stage2_main.s
+	@echo "  Comparing outputs..."
+	@diff -q $(BUILD_DIR)/stage1_main.s $(BUILD_DIR)/stage2_main.s && echo "✓ Bootstrap test passed"
+
+test-valgrind: $(TARGET)
+	@echo "Running memory tests with Valgrind..."
+	@valgrind --leak-check=full --error-exitcode=1 $(TARGET) $(TEST_DIR)/test_minimal.runa $(TEST_DIR)/test_minimal_valgrind.s
+	@echo "✓ Memory tests passed"
 
 # Development targets
 debug: CFLAGS += -DDEBUG -O0
@@ -124,10 +158,24 @@ help:
 # Dependency tracking for development
 .PHONY: all runtime runa-compile runa-assemble link test test-units test-integration test-bootstrap debug verbose clean clean-runa clean-runtime install help
 
-# Component dependencies (will be updated as components are implemented)
-# $(BUILD_DIR)/hashtable.o: $(BUILD_DIR)/string_utils.o
-# $(BUILD_DIR)/containers.o: $(BUILD_DIR)/hashtable.o
-# $(BUILD_DIR)/lexer.o: $(BUILD_DIR)/string_utils.o $(BUILD_DIR)/containers.o
-# $(BUILD_DIR)/parser.o: $(BUILD_DIR)/lexer.o $(BUILD_DIR)/containers.o $(BUILD_DIR)/hashtable.o
-# $(BUILD_DIR)/codegen.o: $(BUILD_DIR)/parser.o $(BUILD_DIR)/string_utils.o
-# $(BUILD_DIR)/main.o: $(BUILD_DIR)/lexer.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/codegen.o
+# Component dependencies - enforced for proper build order
+$(BUILD_DIR)/string_utils.s: $(SRC_DIR)/string_utils.runa | $(BUILD_DIR)
+	$(RUNAC_V0073) $< $@ $(RUNAC_FLAGS)
+
+$(BUILD_DIR)/hashtable.s: $(SRC_DIR)/hashtable.runa $(BUILD_DIR)/string_utils.o | $(BUILD_DIR)
+	$(RUNAC_V0073) $< $@ $(RUNAC_FLAGS)
+
+$(BUILD_DIR)/containers.s: $(SRC_DIR)/containers.runa $(BUILD_DIR)/string_utils.o $(BUILD_DIR)/hashtable.o | $(BUILD_DIR)
+	$(RUNAC_V0073) $< $@ $(RUNAC_FLAGS)
+
+$(BUILD_DIR)/lexer.s: $(SRC_DIR)/lexer.runa $(BUILD_DIR)/string_utils.o $(BUILD_DIR)/containers.o | $(BUILD_DIR)
+	$(RUNAC_V0073) $< $@ $(RUNAC_FLAGS)
+
+$(BUILD_DIR)/parser.s: $(SRC_DIR)/parser.runa $(BUILD_DIR)/lexer.o $(BUILD_DIR)/containers.o $(BUILD_DIR)/hashtable.o | $(BUILD_DIR)
+	$(RUNAC_V0073) $< $@ $(RUNAC_FLAGS)
+
+$(BUILD_DIR)/codegen.s: $(SRC_DIR)/codegen.runa $(BUILD_DIR)/parser.o $(BUILD_DIR)/string_utils.o | $(BUILD_DIR)
+	$(RUNAC_V0073) $< $@ $(RUNAC_FLAGS)
+
+$(BUILD_DIR)/main.s: $(SRC_DIR)/main.runa $(BUILD_DIR)/lexer.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/codegen.o | $(BUILD_DIR)
+	$(RUNAC_V0073) $< $@ $(RUNAC_FLAGS)
