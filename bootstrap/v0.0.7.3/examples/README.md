@@ -1,4 +1,4 @@
-# v0.0.7.1 Test Suite
+# v0.0.7.3 Test Suite
 
 This directory contains test programs for the v0.0.7.1 Runa compiler.
 
