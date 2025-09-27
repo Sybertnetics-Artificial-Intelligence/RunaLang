@@ -22,6 +22,14 @@ static void runtime_print_integer(long value) {
     runtime_print_string(buffer);
 }
 
+// Public function for compiled Runa code to print strings
+void system_print(const char* str) {
+    if (str) {
+        size_t len = strlen(str);
+        write(STDOUT_FILENO, str, len);
+    }
+}
+
 //=============================================================================
 // COMMAND LINE ARGUMENTS
 //=============================================================================
@@ -117,7 +125,6 @@ void* allocate(long size) {
     // Safety: Ensure all allocations are at least 64 bytes to prevent offset overflows
     long original_size = size;
     if (size <= 48) {
-        fprintf(stderr, "[DEBUG] Upgrading %ld-byte allocation to 64 bytes\n", size);
         size = 64;
     }
 
@@ -248,10 +255,6 @@ long memory_set_integer(void* ptr, long offset, long value) {
 }
 
 long memory_get_pointer(void* ptr, long offset) {
-    if (offset == 24) {
-        fprintf(stderr, "[DEBUG] memory_get_pointer at offset 24: ptr=%p, target=%p\n",
-                ptr, (char*)ptr + offset);
-    }
     void** ptr_ptr = (void**)((char*)ptr + offset);
     return (long)*ptr_ptr;
 }
