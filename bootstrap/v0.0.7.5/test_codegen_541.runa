@@ -1,0 +1,541 @@
+# Code Generator for x86-64 Assembly
+# Transliterated from codegen_x86.c (v0.0.7.3)
+# Generates x86-64 assembly from parsed AST
+
+# Program structure offsets (defined in parser.runa)
+# Using numeric values to avoid duplicate symbol errors
+# PROGRAM_FUNCTIONS = 0
+# PROGRAM_FUNCTION_COUNT = 8
+# PROGRAM_TYPES = 16
+# PROGRAM_TYPE_COUNT = 24
+# PROGRAM_IMPORTS = 32
+# PROGRAM_IMPORT_COUNT = 40
+# PROGRAM_GLOBAL_VARS = 48
+# PROGRAM_GLOBAL_COUNT = 56
+
+# Forward declarations for loop context management
+# These will be implemented later in the file
+
+# Note: string_duplicate is provided by string_utils module
+
+# Helper to emit a line with newline
+Process called "emit_line" takes output_file as Integer, line as Integer returns Integer:
+    file_write_fd(output_file, line)
+    file_write_fd(output_file, "\n")
+    Return 0
+End Process
+
+# Find variable in current scope - equivalent to codegen_find_variable
+Process called "codegen_find_variable" takes codegen as Integer, name as Integer returns Integer:
+    Let variable_count be memory_get_integer(codegen, 16)  # codegen->variable_count (int)
+    Let variables be memory_get_pointer(codegen, 8)        # codegen->variables
+    Let i be 0
+    While i is less than variable_count:
+        Let var_offset be i multiplied by 32
+        Let var_ptr be variables plus var_offset  # sizeof(Variable) = 32
+        Let var_name be memory_get_pointer(var_ptr, 0)
+        If string_equals(var_name, name) is equal to 1:
+            Return i
+        End If
+        Let i be i plus 1
+    End While
+    Return 0 minus 1  # -1 for not found
+End Process
+
+# Calculate size of a type in bytes - equivalent to codegen_calculate_type_size
+Process called "codegen_calculate_type_size" takes type_name as Integer, program as Integer returns Integer:
+    # Built-in types
+    If string_equals(type_name, "Integer") is equal to 1:
+        Return 8  # 64-bit integer
+    End If
+    If string_equals(type_name, "Byte") is equal to 1:
+        Return 1  # 8-bit byte
+    End If
+    If string_equals(type_name, "Short") is equal to 1:
+        Return 2  # 16-bit short
+    End If
+    If string_equals(type_name, "Long") is equal to 1:
+        Return 8  # 64-bit long
+    End If
+
+    # Custom types - look up in the program
+    If program is not equal to 0:
+        Let type_count be memory_get_integer(program, 24)  # PROGRAM_TYPE_COUNT - use int32
+        Let types be memory_get_pointer(program, 16)       # PROGRAM_TYPES - use pointer
+        Let i be 0
+        While i is less than type_count:
+            Let type_offset be i multiplied by 8
+            Let type_ptr be memory_get_pointer(types, type_offset)
+            Let type_name_ptr be memory_get_pointer(type_ptr, 0)  # type->name
+            If string_equals(type_name_ptr, type_name) is equal to 1:
+                Let type_size be memory_get_integer(type_ptr, 16)  # type->size
+                Return type_size
+            End If
+            Let i be i plus 1
+        End While
+    End If
+
+    # Unknown type - default to 8 bytes
+    Return 8
+End Process
+
+# Add variable with type and parameter flag - equivalent to codegen_add_variable_with_type_and_param_flag
+Process called "codegen_add_variable_with_type_and_param_flag" takes codegen as Integer, name as Integer, type_name as Integer, is_parameter as Integer returns Integer:
+    # Get current counts and capacity
+
+    Let variable_count be memory_get_integer(codegen, 16)      # codegen->variable_count (int)
+    Let variable_capacity be memory_get_integer(codegen, 20)   # codegen->variable_capacity (int)
+    Let variables be memory_get_pointer(codegen, 8)            # codegen->variables
+
+    # DEBUG: Show what we read
+    # print_integer(variable_count)
+    # print_integer(variable_capacity)
+
+    # Grow array if needed
+    If variable_count is greater than or equal to variable_capacity:
+        Let new_capacity be variable_capacity multiplied by 2
+        Let new_size be new_capacity multiplied by 32  # sizeof(Variable)
+        Let new_variables be allocate(new_size)
+
+        # Copy existing variables
+        Let i be 0
+        While i is less than variable_count:
+            Let var_offset be i multiplied by 32
+            Let old_var be variables plus var_offset
+            Let var_offset be i multiplied by 32
+            Let new_var be new_variables plus var_offset
+            # Copy Variable struct (32 bytes)
+            Let j be 0
+            While j is less than 32:
+                Let byte_val be memory_get_byte(old_var plus j, 0)
+                memory_set_byte(new_var plus j, 0, byte_val)
+                Let j be j plus 1
+            End While
+            Let i be i plus 1
+        End While
+
+        # Free old array and update
+        deallocate(variables)
+        memory_set_pointer(codegen, 8, new_variables)      # codegen->variables
+        memory_set_integer(codegen, 20, new_capacity)      # codegen->variable_capacity (int)
+        Let variables be new_variables
+    End If
+
+    # Calculate size based on type
+    Let current_program be memory_get_pointer(codegen, 48)  # codegen->current_program (pointer with padding)
+    Let size be codegen_calculate_type_size(type_name, current_program)
+    If type_name is equal to 0:
+        Let size be codegen_calculate_type_size("Integer", current_program)
+    End If
+
+    # Update stack offset
+    Let stack_offset be memory_get_integer(codegen, 24)  # codegen->stack_offset (int)
+    Let new_stack_offset be stack_offset plus size
+    memory_set_integer(codegen, 24, new_stack_offset)  # codegen->stack_offset (int)
+
+    # Get variable index
+    Let var_index be variable_count
+    Let var_offset be var_index multiplied by 32  # Calculate offset separately
+    Let var_ptr be variables plus var_offset      # Then add to base pointer
+
+
+    # Set variable fields
+    memory_set_pointer(var_ptr, 0, string_duplicate(name))       # name
+    memory_set_integer(var_ptr, 8, new_stack_offset)            # stack_offset (int)
+    If type_name is equal to 0:
+        memory_set_pointer(var_ptr, 16, string_duplicate("Integer")) # type_name - use literal directly
+    Otherwise:
+        memory_set_pointer(var_ptr, 16, string_duplicate(type_name)) # type_name
+    End If
+    memory_set_integer(var_ptr, 24, is_parameter)               # is_parameter (int)
+
+    # Increment count
+    memory_set_integer(codegen, 16, variable_count plus 1)  # codegen->variable_count (int)
+
+    Return var_index
+End Process
+
+# Add variable with type - equivalent to codegen_add_variable_with_type
+Process called "codegen_add_variable_with_type" takes codegen as Integer, name as Integer, type_name as Integer returns Integer:
+    Return codegen_add_variable_with_type_and_param_flag(codegen, name, type_name, 0)
+End Process
+
+# Add variable with default Integer type - equivalent to codegen_add_variable
+Process called "codegen_add_variable" takes codegen as Integer, name as Integer returns Integer:
+    Return codegen_add_variable_with_type(codegen, name, "Integer")
+End Process
+
+# Add string literal - equivalent to codegen_add_string_literal
+Process called "codegen_add_string_literal" takes codegen as Integer, value as Integer returns Integer:
+    # Get current counts and capacity
+    Let string_count be memory_get_integer(codegen, 40)      # codegen->string_count (int)
+    Let string_capacity be memory_get_integer(codegen, 44)   # codegen->string_capacity (int)
+    Let strings be memory_get_pointer(codegen, 32)           # codegen->strings (pointer with padding)
+
+
+    # Grow array if needed
+    If string_count is greater than or equal to string_capacity:
+        Let new_capacity be string_capacity multiplied by 2
+        Let new_size be new_capacity multiplied by 16  # sizeof(StringLiteral)
+        Let new_strings be allocate(new_size)
+
+        # Copy existing strings
+        Let i be 0
+        While i is less than string_count:
+            Let str_offset be i multiplied by 16
+            Let old_str be strings plus str_offset
+            Let str_offset be i multiplied by 16
+            Let new_str be new_strings plus str_offset
+            # Copy StringLiteral struct (16 bytes)
+            Let j be 0
+            While j is less than 16:
+                Let byte_val be memory_get_byte(old_str plus j, 0)
+                memory_set_byte(new_str plus j, 0, byte_val)
+                Let j be j plus 1
+            End While
+            Let i be i plus 1
+        End While
+
+        # Free old array and update
+        deallocate(strings)
+        memory_set_pointer(codegen, 32, new_strings)      # codegen->strings (pointer)
+        memory_set_integer(codegen, 44, new_capacity)     # codegen->string_capacity (int)
+        Let strings be new_strings
+    End If
+
+    Let str_index be string_count
+    Let str_offset be str_index multiplied by 16
+    Let str_ptr be strings plus str_offset
+
+    # Set string value
+    memory_set_pointer(str_ptr, 0, string_duplicate(value))  # value
+
+    # Generate unique label for this string
+    Let label be string_concat(".STR", integer_to_string(str_index))
+    memory_set_pointer(str_ptr, 8, label)  # label
+
+    # Increment count
+    memory_set_integer(codegen, 40, string_count plus 1)  # codegen->string_count (int)
+
+
+    Return str_index
+End Process
+
+# Collect strings from expression - equivalent to codegen_collect_strings_from_expression
+Process called "codegen_collect_strings_from_expression" takes codegen as Integer, expr as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+    # Safety check for invalid pointers
+    If expr is less than 65536:
+        Return 0
+    End If
+
+    Let expr_type be memory_get_integer(expr, 0)  # expr->type
+
+
+    If expr_type is equal to 5:  # EXPR_STRING_LITERAL
+        # Check if string already exists
+        Let string_count be memory_get_integer(codegen, 40)  # codegen->string_count (int)
+        Let strings be memory_get_pointer(codegen, 32)  # codegen->strings (pointer)
+        Let string_literal be memory_get_pointer(expr, 8)  # expr->data.string_literal
+
+        # Safety check for string_literal
+        If string_literal is equal to 0:
+            Return 0
+        End If
+        If string_literal is less than 65536:
+            Return 0
+        End If
+
+        # Safety check - string_count should be reasonable
+        If string_count is less than 0:
+            Return 0
+        End If
+        If string_count is greater than 1000:
+            Return 0
+        End If
+
+        Let i be 0
+        While i is less than string_count:
+            Let str_offset be i multiplied by 16
+            Let str_ptr be strings plus str_offset
+            Let existing_value be memory_get_pointer(str_ptr, 0)  # Should be pointer, not integer!
+            # Safety check for existing_value before comparison
+            If existing_value is not equal to 0:
+                If existing_value is greater than 65536:
+                    If string_equals(existing_value, string_literal) is equal to 1:
+                        Return 0  # Already added
+                    End If
+                End If
+            End If
+            Let i be i plus 1
+        End While
+
+        codegen_add_string_literal(codegen, string_literal)
+        Return 0
+    End If
+
+    If expr_type is equal to 2:  # EXPR_BINARY_OP
+        Let left be memory_get_pointer(expr, 8)   # binary_op.left
+        Let right be memory_get_pointer(expr, 16) # binary_op.right
+        codegen_collect_strings_from_expression(codegen, left)
+        codegen_collect_strings_from_expression(codegen, right)
+        Return 0
+    End If
+
+    If expr_type is equal to 3:  # EXPR_COMPARISON
+        Let left be memory_get_pointer(expr, 8)   # comparison.left
+        Let right be memory_get_pointer(expr, 16) # comparison.right
+        codegen_collect_strings_from_expression(codegen, left)
+        codegen_collect_strings_from_expression(codegen, right)
+        Return 0
+    End If
+
+    If expr_type is equal to 4:  # EXPR_FUNCTION_CALL
+        Let func_call_ptr be expr plus 8  # &expr->data.function_call
+        # function_call structure: function_name (char*) at 0, arguments (Expression**) at 8, argument_count (int) at 16
+        Let function_name be memory_get_pointer(func_call_ptr, 0)  # function_call.function_name
+        Let arguments be memory_get_pointer(func_call_ptr, 8)      # function_call.arguments - this is a pointer!
+        Let argument_count be memory_get_integer(func_call_ptr, 16) # function_call.argument_count
+
+
+        Let i be 0
+        While i is less than argument_count:
+            Let arg_offset be i multiplied by 8
+            Let arg_ptr be memory_get_pointer(arguments, arg_offset)
+
+
+            codegen_collect_strings_from_expression(codegen, arg_ptr)
+            Let i be i plus 1
+        End While
+        Return 0
+    End If
+
+    If expr_type is equal to 6:  # EXPR_FIELD_ACCESS
+        Let object be memory_get_pointer(expr, 8)  # field_access.object
+        codegen_collect_strings_from_expression(codegen, object)
+        Return 0
+    End If
+
+    If expr_type is equal to 8:  # EXPR_BUILTIN_CALL
+        Let builtin_call_ptr be expr plus 8  # &expr->data.builtin_call
+        # builtin_call structure: builtin_type (int) at 0, arguments (Expression**) at 8, argument_count (int) at 16
+        Let builtin_type be memory_get_integer(builtin_call_ptr, 0)  # builtin_call.builtin_type
+        Let arguments be memory_get_pointer(builtin_call_ptr, 8)      # builtin_call.arguments - this is a pointer!
+        Let argument_count be memory_get_integer(builtin_call_ptr, 16) # builtin_call.argument_count
+
+        Let i be 0
+        While i is less than argument_count:
+            Let arg_offset be i multiplied by 8
+            Let arg_ptr be memory_get_pointer(arguments, arg_offset)
+            codegen_collect_strings_from_expression(codegen, arg_ptr)
+            Let i be i plus 1
+        End While
+        Return 0
+    End If
+
+    If expr_type is equal to 9:  # EXPR_VARIANT_CONSTRUCTOR
+        Let variant_constructor_ptr be expr plus 8  # &expr->data.variant_constructor
+        # variant_constructor structure: type_name (char*) at 0, variant_name (char*) at 8, field_values (Expression**) at 16, field_count (int) at 24
+        Let type_name be memory_get_pointer(variant_constructor_ptr, 0)     # variant_constructor.type_name
+        Let variant_name be memory_get_pointer(variant_constructor_ptr, 8)  # variant_constructor.variant_name
+        Let field_values be memory_get_pointer(variant_constructor_ptr, 16) # variant_constructor.field_values - this is a pointer!
+        Let field_count be memory_get_integer(variant_constructor_ptr, 24)  # variant_constructor.field_count
+
+        Let i be 0
+        While i is less than field_count:
+            Let field_offset be i multiplied by 8
+            Let field_value_ptr be memory_get_pointer(field_values, field_offset)  # This is also a pointer!
+            codegen_collect_strings_from_expression(codegen, field_value_ptr)
+            Let i be i plus 1
+        End While
+        Return 0
+    End If
+
+    If expr_type is equal to 16:  # EXPR_ARRAY_INDEX
+        Let array_index_ptr be expr plus 8  # &expr->data.array_index
+        Let arr be memory_get_integer(array_index_ptr, 0)  # array_index.array
+        Let index be memory_get_integer(array_index_ptr, 8)  # array_index.index
+        codegen_collect_strings_from_expression(codegen, arr)
+        codegen_collect_strings_from_expression(codegen, index)
+        Return 0
+    End If
+
+    # Other expression types (INTEGER, VARIABLE, TYPE_NAME, FUNCTION_POINTER) have no strings to collect
+    Return 0
+End Process
+
+# Collect strings from statement - equivalent to codegen_collect_strings_from_statement
+Process called "codegen_collect_strings_from_statement" takes codegen as Integer, stmt as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+
+    # Safety check - if stmt is a small number, it's likely corrupt
+    If stmt is less than 65536:  # 0x10000 - reasonable minimum address
+        Return 0
+    End If
+
+    Let stmt_type be memory_get_integer(stmt, 0)  # stmt->type
+
+
+    # Safety check - statement types should be 0-12
+    If stmt_type is less than 0:
+        Return 0
+    End If
+    If stmt_type is greater than 12:
+        Return 1
+    End If
+
+    If stmt_type is equal to 1:  # STMT_LET
+        # Statement structure: type at 0, data union at 8
+        # let_stmt in union: var_name at 0, expression at 8
+        Let var_name be memory_get_pointer(stmt, 8)   # stmt+8 = let_stmt.var_name
+        Let expression be memory_get_pointer(stmt, 16) # stmt+16 = let_stmt.expression
+
+
+        codegen_collect_strings_from_expression(codegen, expression)
+        Return 0
+    End If
+
+    If stmt_type is equal to 2:  # STMT_SET
+        # Statement structure: type at 0, data union at 8
+        # set_stmt in union: target at 0, expression at 8
+        Let target be memory_get_pointer(stmt, 8)      # stmt+8 = set_stmt.target
+        Let expression be memory_get_pointer(stmt, 16) # stmt+16 = set_stmt.expression
+        codegen_collect_strings_from_expression(codegen, target)
+        codegen_collect_strings_from_expression(codegen, expression)
+        Return 0
+    End If
+
+    If stmt_type is equal to 3:  # STMT_RETURN
+        Let return_stmt_ptr be stmt plus 8  # &stmt->data.return_stmt
+        Let expression be memory_get_pointer(return_stmt_ptr, 0)  # return_stmt.expression
+        codegen_collect_strings_from_expression(codegen, expression)
+        Return 0
+    End If
+
+    If stmt_type is equal to 4:  # STMT_PRINT
+        Let print_stmt_ptr be stmt plus 8  # &stmt->data.print_stmt
+        Let expression be memory_get_pointer(print_stmt_ptr, 0)  # print_stmt.expression
+        codegen_collect_strings_from_expression(codegen, expression)
+        Return 0
+    End If
+
+    If stmt_type is equal to 5:  # STMT_IF
+
+        Let if_stmt_ptr be stmt plus 8  # &stmt->data.if_stmt
+        Let condition be memory_get_pointer(if_stmt_ptr, 0)        # if_stmt.condition (offset 8)
+        Let if_body be memory_get_pointer(if_stmt_ptr, 8)          # if_stmt.if_body (offset 16)
+        Let if_body_count be memory_get_integer(if_stmt_ptr, 16)   # if_stmt.if_body_count (offset 24)
+        Let else_body be memory_get_pointer(if_stmt_ptr, 24)       # if_stmt.else_body (offset 32)
+        Let else_body_count be memory_get_integer(if_stmt_ptr, 32) # if_stmt.else_body_count (offset 40)
+
+
+        codegen_collect_strings_from_expression(codegen, condition)
+
+        # Process if body - add safety check
+        If if_body is greater than 65536:  # Valid pointer check
+            Let i be 0
+            While i is less than if_body_count:
+                Let stmt_offset be i multiplied by 8
+
+
+                Let stmt_ptr be memory_get_pointer(if_body, stmt_offset)
+
+
+                codegen_collect_strings_from_statement(codegen, stmt_ptr)
+                Let i be i plus 1
+            End While
+        End If
+
+        # Process else body - add safety check
+        If else_body is greater than 65536:  # Valid pointer check
+            Let i be 0
+            While i is less than else_body_count:
+                Let stmt_offset be i multiplied by 8
+                Let stmt_ptr be memory_get_pointer(else_body, stmt_offset)
+                codegen_collect_strings_from_statement(codegen, stmt_ptr)
+                Let i be i plus 1
+            End While
+        End If
+        Return 0
+    End If
+
+    If stmt_type is equal to 6:  # STMT_WHILE
+        Let while_stmt_ptr be stmt plus 8  # &stmt->data.while_stmt
+        Let condition be memory_get_pointer(while_stmt_ptr, 0)   # while_stmt.condition (offset 8)
+        Let body be memory_get_pointer(while_stmt_ptr, 8)        # while_stmt.body (offset 16)
+        Let body_count be memory_get_integer(while_stmt_ptr, 16) # while_stmt.body_count (offset 24)
+
+        codegen_collect_strings_from_expression(codegen, condition)
+
+        # Process body
+        Let i be 0
+        While i is less than body_count:
+            Let stmt_offset be i multiplied by 8
+            Let stmt_ptr be memory_get_pointer(body, stmt_offset)
+            codegen_collect_strings_from_statement(codegen, stmt_ptr)
+            Let i be i plus 1
+        End While
+        Return 0
+    End If
+
+    If stmt_type is equal to 6:  # STMT_WHILE
+        # This is the duplicate WHILE check, should be removed but keeping for now
+        Let while_stmt_ptr be stmt plus 8  # &stmt->data.while_stmt
+        Let condition be memory_get_pointer(while_stmt_ptr, 0)   # while_stmt.condition (offset 8)
+        Let body be memory_get_pointer(while_stmt_ptr, 8)        # while_stmt.body (offset 16)
+        Let body_count be memory_get_integer(while_stmt_ptr, 16) # while_stmt.body_count (offset 24)
+
+        codegen_collect_strings_from_expression(codegen, condition)
+
+        Let i be 0
+        While i is less than body_count:
+            Let stmt_offset be i multiplied by 8
+            Let stmt_ptr be memory_get_pointer(body, stmt_offset)
+            codegen_collect_strings_from_statement(codegen, stmt_ptr)
+            Let i be i plus 1
+        End While
+        Return 0
+    End If
+
+    If stmt_type is equal to 7:  # STMT_EXPRESSION
+        Let expr_stmt_ptr be stmt plus 8  # &stmt->data.expr_stmt
+        Let expression be memory_get_pointer(expr_stmt_ptr, 0)  # expr_stmt.expression - this is a pointer!
+        codegen_collect_strings_from_expression(codegen, expression)
+        Return 0
+    End If
+
+    If stmt_type is equal to 8:  # STMT_MATCH
+        Let match_stmt_ptr be stmt plus 8  # &stmt->data.match_stmt
+        Let expression be memory_get_pointer(match_stmt_ptr, 0)   # match_stmt.expression - this is a pointer!
+        Let case_count be memory_get_integer(match_stmt_ptr, 8)   # match_stmt.case_count
+        Let cases be memory_get_pointer(match_stmt_ptr, 16)       # match_stmt.cases - this is a pointer!
+
+        codegen_collect_strings_from_expression(codegen, expression)
+
+        # Process each match case
+        Let i be 0
+        While i is less than case_count:
+            Let case_offset be i multiplied by 32
+            Let match_case_ptr be cases plus case_offset  # sizeof(MatchCase)
+            Let body_count be memory_get_integer(match_case_ptr, 16)  # match_case.body_count
+            Let body be memory_get_pointer(match_case_ptr, 24)        # match_case.body - this is a pointer!
+
+            Let j be 0
+            While j is less than body_count:
+                Let stmt_offset be j multiplied by 8
+                Let stmt_ptr be memory_get_pointer(body, stmt_offset)
+                codegen_collect_strings_from_statement(codegen, stmt_ptr)
+                Let j be j plus 1
+            End While
+            Let i be i plus 1
+        End While
+        Return 0
+    End If
+
+    # Other statement types (IMPORT, BREAK, CONTINUE, INLINE_ASSEMBLY) don't have strings to collect
+    Return 0
+End Process
