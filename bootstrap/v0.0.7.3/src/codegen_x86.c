@@ -1748,8 +1748,20 @@ void codegen_generate(CodeGenerator *codegen, Program *program) {
     }
 
     // First pass: collect all string literals by analyzing the AST
+    // Collect strings from global variable initializers
+    for (int i = 0; i < program->global_count; i++) {
+        if (program->globals[i]->initial_value != NULL) {
+            codegen_collect_strings_from_expression(codegen, program->globals[i]->initial_value);
+        }
+    }
+
     for (int i = 0; i < program->function_count; i++) {
         Function *func = program->functions[i];
+        // Collect strings from function name if it's a string literal
+        if (func->name && func->name[0] != '\0') {
+            // Function name might be a string literal in Runa syntax
+            codegen_add_string_literal(codegen, func->name);
+        }
         for (int j = 0; j < func->statement_count; j++) {
             codegen_collect_strings_from_statement(codegen, func->statements[j]);
         }

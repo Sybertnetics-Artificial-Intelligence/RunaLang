@@ -32,6 +32,27 @@ void* memory_reallocate(void* ptr, int64_t new_size) {
     return realloc(ptr, (size_t)new_size);
 }
 
+// Array element access functions
+void* memory_get_pointer_at_index(void* base_ptr, int64_t index, int64_t element_size) {
+    if (!base_ptr) return NULL;
+    char* ptr = (char*)base_ptr;
+    return ptr + (index * element_size);
+}
+
+void memory_set_pointer_at_index(void* base_ptr, int64_t index, int64_t element_size, void* value) {
+    if (!base_ptr) return;
+    char* ptr = (char*)base_ptr;
+    void** target = (void**)(ptr + (index * element_size));
+    *target = value;
+}
+
+// Stub for builtin_func that Stage 1 generates but doesn't implement
+int64_t builtin_func(int64_t arg1, int64_t arg2) {
+    // This is a placeholder for builtin functions that aren't fully implemented
+    // Return 0 to allow compilation to proceed
+    return 0;
+}
+
 // File I/O wrappers for file descriptors directly
 #include <unistd.h>
 #include <string.h>
