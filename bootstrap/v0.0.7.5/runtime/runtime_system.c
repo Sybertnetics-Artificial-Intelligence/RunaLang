@@ -231,39 +231,10 @@ long get_allocation_count(void) {
 // LOW-LEVEL MEMORY OPERATIONS
 //=============================================================================
 
-long memory_get_byte(void* ptr, long offset) {
-    unsigned char* byte_ptr = (unsigned char*)ptr + offset;
-    return (long)*byte_ptr;
-}
-
-long memory_set_byte(void* ptr, long offset, long value) {
-    unsigned char* byte_ptr = (unsigned char*)ptr + offset;
-    *byte_ptr = (unsigned char)(value & 0xFF);
-    return 0;
-}
-
-// 32-bit integer access functions for struct fields
-long memory_get_integer(void* ptr, long offset) {
-    int* int_ptr = (int*)((char*)ptr + offset);
-    return (long)*int_ptr;
-}
-
-long memory_set_integer(void* ptr, long offset, long value) {
-    int* int_ptr = (int*)((char*)ptr + offset);
-    *int_ptr = (int)value;
-    return 0;
-}
-
-long memory_get_pointer(void* ptr, long offset) {
-    void** ptr_ptr = (void**)((char*)ptr + offset);
-    return (long)*ptr_ptr;
-}
-
-long memory_set_pointer(void* ptr, long offset, long value) {
-    void** ptr_ptr = (void**)((char*)ptr + offset);
-    *ptr_ptr = (void*)value;
-    return 0;
-}
+// These functions are provided by runtime_wrappers.s for v0.0.7.5
+// They're kept here for backwards compatibility but disabled for v0.0.7.5
+// Memory access functions are now provided by assembly wrappers in runtime_wrappers.s
+// The C versions here had ABI mismatches - assembly wrappers handle the 32-bit/64-bit conversion properly
 
 // System call wrapper for Runa
 long system_call(long syscall_num, long arg1, long arg2, long arg3) {
