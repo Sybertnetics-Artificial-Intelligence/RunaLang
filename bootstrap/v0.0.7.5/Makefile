@@ -33,8 +33,10 @@ TEST_DIR = tests
 TEST_UNIT_DIR = tests/unit
 TEST_OUTPUT_DIR = tests/output
 
-# Runtime library source files (C)
-RUNTIME_SOURCES = $(wildcard $(RUNTIME_DIR)/*.c)
+# Runtime library source files (C and assembly)
+RUNTIME_C_SOURCES = $(wildcard $(RUNTIME_DIR)/*.c)
+RUNTIME_ASM_SOURCES = $(RUNTIME_DIR)/runtime_wrappers.s
+RUNTIME_SOURCES = $(RUNTIME_C_SOURCES)
 
 # Runa source files
 RUNA_MODULES = string_utils hashtable containers lexer parser codegen main
@@ -44,12 +46,14 @@ RUNA_SOURCES = $(RUNA_MODULES:%=$(SRC_DIR)/%.runa)
 STAGE1_ASSEMBLY = $(RUNA_MODULES:%=$(STAGE1_DIR)/%.s)
 STAGE1_OBJECTS = $(RUNA_MODULES:%=$(STAGE1_DIR)/%.o)
 STAGE1_RUNTIME = $(RUNTIME_SOURCES:$(RUNTIME_DIR)/%.c=$(STAGE1_DIR)/%.o)
+STAGE1_WRAPPERS = $(STAGE1_DIR)/runtime_wrappers.o
 STAGE1_TARGET = $(STAGE1_DIR)/runac
 
 # Stage 2 files (compiled by Stage 1)
 STAGE2_ASSEMBLY = $(RUNA_MODULES:%=$(STAGE2_DIR)/%.s)
 STAGE2_OBJECTS = $(RUNA_MODULES:%=$(STAGE2_DIR)/%.o)
 STAGE2_RUNTIME = $(RUNTIME_SOURCES:$(RUNTIME_DIR)/%.c=$(STAGE2_DIR)/%.o)
+STAGE2_WRAPPERS = $(STAGE2_DIR)/runtime_wrappers.o
 STAGE2_TARGET = $(STAGE2_DIR)/runac
 
 # Stage 3 files (compiled by Stage 2)
@@ -107,9 +111,13 @@ $(STAGE1_DIR)/%.o: $(STAGE1_DIR)/%.s
 		objcopy --weaken-symbol=string_length --weaken-symbol=string_char_at --weaken-symbol=string_equals --weaken-symbol=integer_to_string --weaken-symbol=string_to_integer --weaken-symbol=memory_reallocate $@ 2>/dev/null || true; \
 	fi
 
+# Assemble runtime wrappers for Stage 1
+$(STAGE1_WRAPPERS): $(RUNTIME_ASM_SOURCES)
+	$(AS) $(RUNTIME_ASM_SOURCES) -o $@
+
 # Link Stage 1 executable
-$(STAGE1_TARGET): $(STAGE1_OBJECTS) $(STAGE1_RUNTIME)
-	$(LD) $(STAGE1_OBJECTS) $(STAGE1_RUNTIME) $(RUNA_LDFLAGS) -o $@
+$(STAGE1_TARGET): $(STAGE1_OBJECTS) $(STAGE1_RUNTIME) $(STAGE1_WRAPPERS)
+	$(LD) $(STAGE1_OBJECTS) $(STAGE1_WRAPPERS) $(STAGE1_RUNTIME) $(RUNA_LDFLAGS) -o $@
 
 # ===== STAGE 2: Compiled by Stage 1 (self-hosted) =====
 
@@ -147,9 +155,13 @@ $(STAGE2_DIR)/%.o: $(STAGE2_DIR)/%.s
 		objcopy --weaken-symbol=string_length --weaken-symbol=string_char_at --weaken-symbol=string_equals --weaken-symbol=integer_to_string --weaken-symbol=string_to_integer --weaken-symbol=memory_reallocate $@ 2>/dev/null || true; \
 	fi
 
+# Assemble runtime wrappers for Stage 2
+$(STAGE2_WRAPPERS): $(RUNTIME_ASM_SOURCES)
+	$(AS) $(RUNTIME_ASM_SOURCES) -o $@
+
 # Link Stage 2 executable
-$(STAGE2_TARGET): $(STAGE2_OBJECTS) $(STAGE2_RUNTIME)
-	$(LD) $(STAGE2_OBJECTS) $(STAGE2_RUNTIME) $(RUNA_LDFLAGS) -o $@
+$(STAGE2_TARGET): $(STAGE2_OBJECTS) $(STAGE2_RUNTIME) $(STAGE2_WRAPPERS)
+	$(LD) $(STAGE2_OBJECTS) $(STAGE2_WRAPPERS) $(STAGE2_RUNTIME) $(RUNA_LDFLAGS) -o $@
 
 # ===== STAGE 3: Compiled by Stage 2 (verification) =====
 
