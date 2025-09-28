@@ -131,9 +131,9 @@ $(STAGE2_DIR)/%.o: $(STAGE2_DIR)/%.s
 	@if [ "$@" != "$(STAGE2_DIR)/main.o" ]; then \
 		objcopy --strip-symbol=main $@ 2>/dev/null || true; \
 	fi
-	@# Weaken runtime symbols that conflict with C runtime
+	@# Weaken runtime symbols that conflict with C runtime (EXCEPT memory_get_integer/memory_set_integer)
 	@if [ "$@" = "$(STAGE2_DIR)/hashtable.o" ] || [ "$@" = "$(STAGE2_DIR)/string_utils.o" ]; then \
-		objcopy --weaken-symbol=allocate --weaken-symbol=deallocate --weaken-symbol=memory_set_pointer --weaken-symbol=memory_set_integer --weaken-symbol=memory_get_pointer --weaken-symbol=memory_get_integer --weaken-symbol=memory_get_byte --weaken-symbol=string_compare $@ 2>/dev/null || true; \
+		objcopy --weaken-symbol=allocate --weaken-symbol=deallocate --weaken-symbol=memory_set_pointer --weaken-symbol=memory_get_pointer --weaken-symbol=memory_get_byte --weaken-symbol=string_compare $@ 2>/dev/null || true; \
 	fi
 	@# Weaken ALL TOKEN constants and shared functions in parser.o
 	@if [ "$@" = "$(STAGE2_DIR)/parser.o" ]; then \
