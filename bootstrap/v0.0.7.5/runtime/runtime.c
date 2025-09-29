@@ -13,7 +13,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Memory functions
+// Memory functions - v0.0.7.5 expects these exact names
 void* allocate(int64_t size) { return calloc(1, size); }
 void deallocate(void* ptr) { free(ptr); }
 void* reallocate(void* ptr, int64_t old_size, int64_t new_size) {
@@ -24,11 +24,13 @@ void* reallocate(void* ptr, int64_t old_size, int64_t new_size) {
     return new_ptr;
 }
 
-void* memory_allocate(int64_t size) { return allocate(size); }
-void memory_free(void* ptr) { deallocate(ptr); }
-void* memory_reallocate(void* ptr, int64_t old_size, int64_t new_size) {
-    return reallocate(ptr, old_size, new_size);
-}
+// These are already implemented in v0.0.7.5 Runa code
+// void* memory_allocate(int64_t size) - implemented in string_utils.runa
+// void* memory_reallocate() - implemented in string_utils.runa
+
+// But v0.0.7.3-generated code might need it
+// Commented out - already defined in string_utils.o
+// void* memory_allocate(int64_t size) { return calloc(1, size); }
 
 int64_t memory_get_byte(void* ptr, int64_t offset) {
     return ((unsigned char*)ptr)[offset];
@@ -52,6 +54,12 @@ void* memory_get_pointer(void* ptr, int64_t offset) {
 
 void memory_set_pointer(void* ptr, int64_t offset, void* value) {
     *(void**)((char*)ptr + offset) = value;
+}
+
+// 32-bit memory access function for setting struct fields that are int32_t
+// (memory_get_int32 is already defined in the generated assembly)
+void memory_set_int32(void* ptr, int64_t offset, int32_t value) {
+    *(int32_t*)((char*)ptr + offset) = value;
 }
 
 void memory_copy(void* dest, void* src, int64_t size) {
@@ -80,7 +88,11 @@ void* memory_get_substring(const char* str, int64_t start, int64_t length) {
 }
 
 // File I/O
-int64_t file_open_fd(const char* path, int64_t flags) {
+int64_t file_open_fd(const char* path) {
+    return open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+}
+
+int64_t file_open_fd_with_flags(const char* path, int64_t flags) {
     int open_flags = O_RDONLY;
     if (flags == 1) {
         open_flags = O_WRONLY | O_CREAT | O_TRUNC;
@@ -90,15 +102,19 @@ int64_t file_open_fd(const char* path, int64_t flags) {
     return open(path, open_flags, 0644);
 }
 
-int64_t file_write_fd(int64_t fd, const char* buffer, int64_t size) {
+void file_write_fd(int64_t fd, const char* buffer) {
+    write(fd, buffer, strlen(buffer));
+}
+
+int64_t file_write_fd_with_size(int64_t fd, const char* buffer, int64_t size) {
     if (size == 0 && buffer) {
         size = strlen(buffer);
     }
     return write(fd, buffer, size);
 }
 
-int64_t file_close_fd(int64_t fd) {
-    return close(fd);
+void file_close_fd(int64_t fd) {
+    close(fd);
 }
 
 // System functions
@@ -114,25 +130,17 @@ void exit_with_code(int64_t code) {
 char* string_concat(const char* a, const char* b) {
     if (!a) return strdup(b);
     if (!b) return strdup(a);
-    
+
     size_t len_a = strlen(a);
     size_t len_b = strlen(b);
     char* result = malloc(len_a + len_b + 1);
-    
+
     if (result) {
         strcpy(result, a);
         strcat(result, b);
     }
-    
+
     return result;
-}
-
-char* string_copy(const char* src) {
-    return strdup(src);
-}
-
-char* string_duplicate(const char* src) {
-    return strdup(src);
 }
 
 int64_t string_compare(const char* a, const char* b) {
@@ -232,17 +240,39 @@ double runtime_cos(double degrees) {
     return cos(radians);
 }
 
-// Function calling helpers
-int64_t call_function_1(void* fn, int64_t arg1) {
-    typedef int64_t (*fn_t)(int64_t);
-    return ((fn_t)fn)(arg1);
+// Function calling helpers - commented out, already in assembly
+// int64_t call_function_1(void* fn, void* arg) - in hashtable.o
+// int64_t call_function_2(void* fn, void* arg1, void* arg2) - in hashtable.o
+
+// This one is needed by containers.o but not defined there
+int64_t call_function_pointer_2args(void* fn, void* arg1, void* arg2) {
+    typedef int64_t (*func_ptr)(void*, void*);
+    return ((func_ptr)fn)(arg1, arg2);
 }
 
-int64_t call_function_2(void* fn, int64_t arg1, int64_t arg2) {
-    typedef int64_t (*fn_t)(int64_t, int64_t);
-    return ((fn_t)fn)(arg1, arg2);
+// String functions needed by v0.0.7.3-generated code
+// These are already defined in the assembly:
+// void string_copy(char* dest, char* src) - in lexer.o
+// char* string_duplicate(char* str) - in string_utils.o
+// void string_copy_n(char* dest, char* src, int64_t start, int64_t length) - in lexer.o
+// void print_char(int64_t ch) - in lexer.o
+
+// These are already defined in string_utils.s:
+// char* integer_to_string(int64_t value) - in string_utils.o
+// int64_t string_length(char* str) - in string_utils.o
+// int64_t string_equals(char* str1, char* str2) - in string_utils.o
+
+void print(char* str) {
+    printf("%s\n", str);
 }
 
-int64_t call_function_pointer_2args(void* fn, int64_t arg1, int64_t arg2) {
-    return call_function_2(fn, arg1, arg2);
+int64_t write_file(char* filename, char* content) {
+    FILE* file = fopen(filename, "w");
+    if (!file) return 0;
+
+    int64_t length = strlen(content);
+    int64_t written = fwrite(content, 1, length, file);
+    fclose(file);
+
+    return written == length;
 }

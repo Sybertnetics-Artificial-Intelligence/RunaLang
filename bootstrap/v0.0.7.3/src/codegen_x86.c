@@ -622,14 +622,14 @@ static void codegen_generate_expression(CodeGenerator *codegen, Expression *expr
             int arg_count = expr->data.function_call.argument_count;
             int register_arg_count = arg_count < max_register_args ? arg_count : max_register_args;
 
-            // Evaluate arguments in reverse order and push them to stack to preserve order
-            for (int i = register_arg_count - 1; i >= 0; i--) {
+            // Evaluate arguments in forward order and push them to stack
+            for (int i = 0; i < register_arg_count; i++) {
                 codegen_generate_expression(codegen, expr->data.function_call.arguments[i]);
                 fprintf(codegen->output_file, "    pushq %%rax\n");
             }
 
-            // Pop arguments into correct registers
-            for (int i = 0; i < register_arg_count; i++) {
+            // Pop arguments into correct registers (reverse order since stack is LIFO)
+            for (int i = register_arg_count - 1; i >= 0; i--) {
                 fprintf(codegen->output_file, "    popq %s\n", arg_registers[i]);
             }
 
@@ -912,14 +912,14 @@ static void codegen_generate_expression(CodeGenerator *codegen, Expression *expr
                 }
             }
 
-            // Evaluate arguments in reverse order and push them to stack
-            for (int i = arg_count - 1; i >= 0; i--) {
+            // Evaluate arguments in forward order and push them to stack
+            for (int i = 0; i < arg_count; i++) {
                 codegen_generate_expression(codegen, expr->data.builtin_call.arguments[i]);
                 fprintf(codegen->output_file, "    pushq %%rax\n");
             }
 
-            // Pop arguments into correct registers
-            for (int i = 0; i < arg_count; i++) {
+            // Pop arguments into correct registers (reverse order since stack is LIFO)
+            for (int i = arg_count - 1; i >= 0; i--) {
                 fprintf(codegen->output_file, "    popq %s\n", arg_registers[i]);
             }
 
