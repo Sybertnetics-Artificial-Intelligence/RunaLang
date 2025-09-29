@@ -35,7 +35,6 @@ TEST_OUTPUT_DIR = tests/output
 
 # Runtime library source files (C and assembly)
 RUNTIME_C_SOURCES = $(wildcard $(RUNTIME_DIR)/*.c)
-RUNTIME_ASM_SOURCES = $(RUNTIME_DIR)/runtime_wrappers.s
 RUNTIME_SOURCES = $(RUNTIME_C_SOURCES)
 
 # Runa source files
@@ -46,14 +45,12 @@ RUNA_SOURCES = $(RUNA_MODULES:%=$(SRC_DIR)/%.runa)
 STAGE1_ASSEMBLY = $(RUNA_MODULES:%=$(STAGE1_DIR)/%.s)
 STAGE1_OBJECTS = $(RUNA_MODULES:%=$(STAGE1_DIR)/%.o)
 STAGE1_RUNTIME = $(RUNTIME_SOURCES:$(RUNTIME_DIR)/%.c=$(STAGE1_DIR)/%.o)
-STAGE1_WRAPPERS = $(STAGE1_DIR)/runtime_wrappers.o
 STAGE1_TARGET = $(STAGE1_DIR)/runac
 
 # Stage 2 files (compiled by Stage 1)
 STAGE2_ASSEMBLY = $(RUNA_MODULES:%=$(STAGE2_DIR)/%.s)
 STAGE2_OBJECTS = $(RUNA_MODULES:%=$(STAGE2_DIR)/%.o)
 STAGE2_RUNTIME = $(RUNTIME_SOURCES:$(RUNTIME_DIR)/%.c=$(STAGE2_DIR)/%.o)
-STAGE2_WRAPPERS = $(STAGE2_DIR)/runtime_wrappers.o
 STAGE2_TARGET = $(STAGE2_DIR)/runac
 
 # Stage 3 files (compiled by Stage 2)
