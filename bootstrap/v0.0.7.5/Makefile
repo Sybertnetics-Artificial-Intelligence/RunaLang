@@ -108,13 +108,9 @@ $(STAGE1_DIR)/%.o: $(STAGE1_DIR)/%.s
 		objcopy --weaken-symbol=string_length --weaken-symbol=string_char_at --weaken-symbol=string_equals --weaken-symbol=integer_to_string --weaken-symbol=string_to_integer --weaken-symbol=memory_reallocate $@ 2>/dev/null || true; \
 	fi
 
-# Assemble runtime wrappers for Stage 1
-$(STAGE1_WRAPPERS): $(RUNTIME_ASM_SOURCES)
-	$(AS) $(RUNTIME_ASM_SOURCES) -o $@
-
 # Link Stage 1 executable
-$(STAGE1_TARGET): $(STAGE1_OBJECTS) $(STAGE1_RUNTIME) $(STAGE1_WRAPPERS)
-	$(LD) $(STAGE1_OBJECTS) $(STAGE1_WRAPPERS) $(STAGE1_RUNTIME) $(RUNA_LDFLAGS) -o $@
+$(STAGE1_TARGET): $(STAGE1_OBJECTS) $(STAGE1_RUNTIME)
+	$(LD) $(STAGE1_OBJECTS) $(STAGE1_RUNTIME) $(RUNA_LDFLAGS) -o $@
 
 # ===== STAGE 2: Compiled by Stage 1 (self-hosted) =====
 
