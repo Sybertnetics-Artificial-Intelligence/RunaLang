@@ -1,3 +1,18 @@
+/*
+ * Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,12 +31,21 @@
 // Memory functions - v0.0.7.5 expects these exact names
 void* allocate(int64_t size) { return calloc(1, size); }
 void deallocate(void* ptr) { free(ptr); }
+// No need to redefine realloc - it's a standard C function
+// The Runa compiler generates calls to the standard realloc
+
+// Three-parameter version for backward compatibility
 void* reallocate(void* ptr, int64_t old_size, int64_t new_size) {
     void* new_ptr = realloc(ptr, new_size);
     if (new_ptr && new_size > old_size) {
         memset((char*)new_ptr + old_size, 0, new_size - old_size);
     }
     return new_ptr;
+}
+
+// Simple realloc wrapper that preserves existing data without zeroing
+void* memory_realloc(void* ptr, int64_t new_size) {
+    return realloc(ptr, new_size);
 }
 
 // These are already implemented in v0.0.7.5 Runa code
@@ -56,8 +80,11 @@ void memory_set_pointer(void* ptr, int64_t offset, void* value) {
     *(void**)((char*)ptr + offset) = value;
 }
 
-// 32-bit memory access function for setting struct fields that are int32_t
-// (memory_get_int32 is already defined in the generated assembly)
+// 32-bit memory access functions for struct fields that are int32_t
+int32_t memory_get_int32(void* ptr, int64_t offset) {
+    return *(int32_t*)((char*)ptr + offset);
+}
+
 void memory_set_int32(void* ptr, int64_t offset, int32_t value) {
     *(int32_t*)((char*)ptr + offset) = value;
 }
@@ -275,4 +302,120 @@ int64_t write_file(char* filename, char* content) {
     fclose(file);
 
     return written == length;
+}
+
+// Buffered file writing for codegen
+// This provides fprintf-like buffered writing using file descriptors
+typedef struct {
+    int fd;
+    char *buffer;
+    int64_t buffer_size;
+    int64_t buffer_capacity;
+} BufferedFile;
+
+static BufferedFile *buffered_files[256] = {0};  // Handle table (max 256 open files)
+static int next_handle = 1;
+
+// Open file with buffering - returns handle (not fd)
+int64_t file_open_buffered(const char *path, int64_t flags) {
+    int open_flags = O_RDONLY;
+    if (flags == 1) {
+        open_flags = O_WRONLY | O_CREAT | O_TRUNC;
+    } else if (flags == 2) {
+        open_flags = O_RDWR | O_CREAT;
+    }
+
+    int fd = open(path, open_flags, 0644);
+    if (fd == -1) {
+        return -1;
+    }
+
+    // Create buffered file structure
+    BufferedFile *bf = malloc(sizeof(BufferedFile));
+    if (!bf) {
+        close(fd);
+        return -1;
+    }
+
+    bf->fd = fd;
+    bf->buffer_capacity = 65536;  // 64KB initial buffer
+    bf->buffer = malloc(bf->buffer_capacity);
+    if (!bf->buffer) {
+        free(bf);
+        close(fd);
+        return -1;
+    }
+    bf->buffer_size = 0;
+
+    // Find free handle slot
+    int handle = next_handle;
+    for (int i = 1; i < 256; i++) {
+        if (buffered_files[i] == NULL) {
+            handle = i;
+            break;
+        }
+    }
+
+    buffered_files[handle] = bf;
+    if (handle >= next_handle) {
+        next_handle = handle + 1;
+    }
+
+    return handle;
+}
+
+// Write to buffered file
+int64_t file_write_buffered(int64_t handle, const char *data, int64_t size) {
+    if (handle < 1 || handle >= 256 || !buffered_files[handle]) {
+        return -1;
+    }
+
+    BufferedFile *bf = buffered_files[handle];
+
+    // Calculate actual size if 0 (use strlen)
+    if (size == 0 && data) {
+        size = strlen(data);
+    }
+
+    if (size == 0) {
+        return 0;
+    }
+
+
+    // Grow buffer if needed
+    while (bf->buffer_size + size > bf->buffer_capacity) {
+        bf->buffer_capacity *= 2;
+        char *new_buffer = realloc(bf->buffer, bf->buffer_capacity);
+        if (!new_buffer) {
+            return -1;
+        }
+        bf->buffer = new_buffer;
+    }
+
+    // Append to buffer
+    memcpy(bf->buffer + bf->buffer_size, data, size);
+    bf->buffer_size += size;
+
+    return size;
+}
+
+// Close buffered file (flushes and frees resources)
+void file_close_buffered(int64_t handle) {
+
+    if (handle < 1 || handle >= 256 || !buffered_files[handle]) {
+        return;
+    }
+
+    BufferedFile *bf = buffered_files[handle];
+
+    // Flush buffer to disk
+    if (bf->buffer_size > 0) {
+        ssize_t written = write(bf->fd, bf->buffer, bf->buffer_size);
+    }
+
+    // Close and free
+    close(bf->fd);
+    free(bf->buffer);
+    free(bf);
+    buffered_files[handle] = NULL;
 }
