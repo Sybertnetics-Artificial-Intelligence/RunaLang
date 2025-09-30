@@ -63,7 +63,7 @@ VERIFY_RUNTIME = $(RUNTIME_SOURCES:$(RUNTIME_DIR)/%.c=$(VERIFY_DIR)/%.o)
 VERIFY_TARGET = $(VERIFY_DIR)/runac
 
 # List of unit tests
-UNIT_TESTS = test_minimal test_let test_if test_args test_display test_strings test_file test_compiler
+UNIT_TESTS = test_minimal test_let test_if test_args test_display test_strings test_file test_compiler test_negative test_is_not test_parentheses test_note_comments test_true_false test_compound
 
 # Default target
 all: build

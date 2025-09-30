@@ -2,7 +2,7 @@
 
 **Focus:** Fix critical bugs, add inline assembly, comprehensive testing
 
-**Implementation Status:** ✅ 3/5 CRITICAL FIXES COMPLETED
+**Implementation Status:** ✅ 5/5 CRITICAL FIXES COMPLETED
 
 ---
 
@@ -92,7 +92,7 @@ If c is not less than or equal to d:        # ✅ Works (>)
 ---
 
 ### 4. **Parentheses for Expression Grouping**
-**Status:** ❌ NOT IMPLEMENTED
+**Status:** ✅ FIXED - IMPLEMENTED
 
 **Implementation:**
 ```runa
@@ -135,7 +135,7 @@ Let nested be (((5 plus 3) multiplied by 2) minus 4) divided by 2  # = 6
 ---
 
 ### 5. **Comment System**
-**Status:** ❌ NOT IMPLEMENTED
+**Status:** ✅ FIXED - IMPLEMENTED
 
 **Runa has THREE comment types:**
 
