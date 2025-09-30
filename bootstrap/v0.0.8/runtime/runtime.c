@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <math.h>
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -31,6 +32,7 @@
 // Memory functions - v0.0.7.5 expects these exact names
 void* allocate(int64_t size) { return calloc(1, size); }
 void deallocate(void* ptr) { free(ptr); }
+void memory_deallocate(void* ptr) { free(ptr); }  // Alias for deallocate
 // No need to redefine realloc - it's a standard C function
 // The Runa compiler generates calls to the standard realloc
 
@@ -417,4 +419,23 @@ void file_close_buffered(int64_t handle) {
     free(bf->buffer);
     free(bf);
     buffered_files[handle] = NULL;
+}
+
+// Get current time in microseconds (for profiling)
+int64_t get_time_microseconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000LL;
+}
+
+// Forward declarations for hash table functions
+// These are implemented in hashtable.o (compiled from hashtable.runa)
+extern void* hashtable_create(int64_t initial_buckets, void* hash_func, void* compare_func);
+extern int64_t hash_djb2(const char* str);
+extern int64_t string_equals(const char* str1, const char* str2);
+
+// Helper function to create a string-keyed hash table
+// This wraps the Runa hashtable_create with proper function pointers
+void* hashtable_create_for_strings(int64_t initial_buckets) {
+    return hashtable_create(initial_buckets, (void*)hash_djb2, (void*)string_equals);
 }

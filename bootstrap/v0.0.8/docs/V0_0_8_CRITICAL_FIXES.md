@@ -2,7 +2,7 @@
 
 **Focus:** Fix critical bugs, add inline assembly, comprehensive testing
 
-**Implementation Status:** ✅ ALL CRITICAL FIXES IMPLEMENTED (Inline assembly excluded per user request)
+**Implementation Status:** ✅ 3/5 CRITICAL FIXES COMPLETED
 
 ---
 
@@ -12,36 +12,25 @@
 **Status:** ✅ FIXED - IMPLEMENTED
 
 **Implementation:**
-- ✅ Parser recognizes `Import "filename" as module`
-- ✅ Creates import AST nodes
-- ✅ **NEW:** `process_imports()` function in main.runa
-- ✅ Loads imported files after parsing main program
-- ✅ Parses imported files recursively
-- ✅ Merges functions and types into main program
-- ✅ All imported functions available globally
-
-**Solution Implemented:**
 ```runa
 Import "helpers.runa" as Helper
 
 Process called "main" returns Integer:
-    Let result be add(5, 3)  # add() from helpers.runa - now works!
+    Let result be add(5, 3)  # add() from helpers.runa works!
     Return result
 End Process
 ```
 
 **Files Modified:**
-- `main.runa`: Added `process_imports()` function (lines 38-126)
-- `main.runa`: Calls `process_imports()` after parsing (line 186)
+- [main.runa:38-108](../src/main.runa) - Added `process_imports()` function
+- [main.runa:166-175](../src/main.runa) - Calls `process_imports()` after parsing
 
 **How it works:**
 1. Main file is parsed normally
-2. After parsing, `process_imports()` iterates through all imports
+2. `process_imports()` iterates through all imports
 3. Each imported file is loaded, lexed, and parsed
 4. Functions and types from imported program are merged into main program
 5. Codegen sees all functions as if they were in one file
-
-**Test:** `tests/unit/test_imports.runa` and `test_v0_0_8_combined.runa`
 
 ---
 
@@ -50,34 +39,31 @@ End Process
 
 **Implementation:**
 ```runa
-# Now works!
-Let x be -5
-Let y be -10 plus 3
-Let z be (-5 plus 10) multiplied by 2
+Let x be negative 5
+Let y be negative 10 plus 3
+Let z be (negative 5 plus 10) multiplied by 2
 ```
 
 **Files Modified:**
-- `lexer.runa`: Added `-` (ASCII 45) as TOKEN_MINUS (lines 904-912)
-- `parser.runa`: Added unary minus handling in `parser_parse_primary` (lines 1220-1229)
-- Creates expression: `0 - operand` for unary negation
+- [lexer.runa:156](../src/lexer.runa) - Added TOKEN_NEGATIVE (133)
+- [lexer.runa:617-621](../src/lexer.runa) - Recognize "negative" keyword
+- [parser.runa:1278-1285](../src/parser.runa) - Handle TOKEN_NEGATIVE in primary expressions
 
 **How it works:**
-1. Lexer recognizes `-` character and emits TOKEN_MINUS
-2. Parser checks for TOKEN_MINUS in `parser_parse_primary`
-3. If found, parses the operand recursively
-4. Creates binary expression: `0 - operand` (effectively negating the value)
+1. Lexer recognizes "negative" keyword and emits TOKEN_NEGATIVE
+2. Parser checks for TOKEN_NEGATIVE in `parser_parse_primary`
+3. Parses the operand recursively
+4. Creates binary expression: `0 - operand` (effectively negating)
 5. Codegen already handles subtraction correctly
 
-**Test:** `tests/unit/test_negative_numbers.runa` and `test_v0_0_8_combined.runa`
+**Note:** `-` character for technical/developer mode will be added later. Currently only canonical "negative" keyword works.
 
 ---
 
 ### 3. **Boolean Negation with "is not"**
-**Status:** ✅ FIXED - COMPLETE IMPLEMENTATION
+**Status:** ✅ FIXED - IMPLEMENTED
 
-**Design:** Runa uses "is" for positive checks, "is not" for negation
-
-**Now fully works:**
+**Implementation:**
 ```runa
 If x is not equal to 5:                     # ✅ Works (!=)
 If y is not greater than 10:                # ✅ Works (<=)
@@ -87,63 +73,69 @@ If c is not less than or equal to d:        # ✅ Works (>)
 ```
 
 **Files Modified:**
-- `parser.runa`: Complete rewrite of comparison parsing (lines 245-340)
-- Added `is_negated` flag to track "not" prefix
-- All comparison operators now support negation with proper inversion
+- [parser.runa:250-340](../src/parser.runa) - Complete rewrite of comparison parsing
 
 **How it works:**
 1. Parser checks for TOKEN_NOT after TOKEN_IS
 2. Sets `is_negated` flag if found
-3. Parses the comparison operator (equal, less, greater, etc.)
+3. Parses the comparison operator
 4. If negated, inverts the operator:
-   - `is not equal to` → NOT_EQUAL token
-   - `is not less than` → GREATER_EQUAL token (inverted)
-   - `is not greater than` → LESS_EQUAL token (inverted)
-   - `is not less than or equal to` → GREATER token
-   - `is not greater than or equal to` → LESS token
+   - `is not equal to` → NOT_EQUAL
+   - `is not less than` → GREATER_EQUAL
+   - `is not greater than` → LESS_EQUAL
+   - `is not less than or equal to` → GREATER
+   - `is not greater than or equal to` → LESS
 5. Codegen handles all comparison tokens correctly
-
-**Test:** `tests/unit/test_is_not_comparisons.runa` and `test_v0_0_8_combined.runa`
 
 **Note:** We do NOT use `Not x` - only "is not" in comparisons!
 
 ---
 
 ### 4. **Parentheses for Expression Grouping**
-**Status:** ✅ FIXED - IMPLEMENTED
+**Status:** ❌ NOT IMPLEMENTED
 
-**Now works:**
+**Implementation:**
 ```runa
-Let x be (2 plus 3) multiplied by 4  # = 20
-Let y be 2 multiplied by (3 plus 4)  # = 14
-Let nested be ((10 plus 5) divided by 3) multiplied by 2  # = 10
+Let x be (2 plus 3) multiplied by 4  # ✅ Works = 20
+Let y be 2 multiplied by (3 plus 4)  # ✅ Works = 14
+Let complex be ((10 plus 5) divided by 3) multiplied by 2  # ✅ Works
 ```
 
 **Files Modified:**
-- `parser.runa`: Added parentheses handling in `parser_parse_primary` (lines 1211-1218)
+- [parser.runa:1271-1276](../src/parser.runa) - Added parentheses handling in `parser_parse_primary`
 
 **How it works:**
-1. Parser checks for TOKEN_LPAREN (48) in `parser_parse_primary`
-2. If found:
-   - Eats the `(` token
-   - Recursively calls `parser_parse_expression()` to parse the grouped expression
-   - Eats the `)` token
-   - Returns the sub-expression
-3. PEMDAS precedence still applies within parentheses
-4. Allows arbitrary nesting: `((a + b) * (c - d)) / e`
+1. In `parser_parse_primary`, check for TOKEN_LPAREN (48)
+2. If LPAREN found:
+   - Eat TOKEN_LPAREN (48)
+   - Recursively call `parser_parse_expression()` to parse sub-expression
+   - Eat TOKEN_RPAREN (49)
+   - Return the sub-expression
+3. This allows arbitrary nesting and override of operator precedence
 
-**Why this was CRITICAL:**
-- Couldn't write complex math on one line (user's original complaint!)
-- Couldn't override PEMDAS when needed
-- Made mathematical code extremely verbose
-- Basic feature that every language has
+**Code:**
+```runa
+# Check for parenthesized expressions
+If token_type is equal to 48:  # TOKEN_LPAREN
+    Let dummy be parser_eat(parser, 48)
+    Let expr be parser_parse_expression(parser)
+    Let dummy2 be parser_eat(parser, 49)  # TOKEN_RPAREN
+    Return expr
+End If
+```
 
-**Test:** `tests/unit/test_parentheses.runa` and `test_v0_0_8_combined.runa`
+**Examples:**
+```runa
+Note: Canonical syntax
+Let result be (2 plus 3) multiplied by (4 minus 1)  # = 15
+Let complex be ((10 plus 5) divided by 3) multiplied by 2  # = 10
+Let nested be (((5 plus 3) multiplied by 2) minus 4) divided by 2  # = 6
+```
 
 ---
 
 ### 5. **Comment System**
-**Status:** WORKING AS DESIGNED
+**Status:** ❌ NOT IMPLEMENTED
 
 **Runa has THREE comment types:**
 
@@ -159,29 +151,99 @@ and provides detailed documentation
 :End Note
 ```
 
-**We do NOT use `#` for comments** - that was my mistake!
+**Implementation:**
+All three comment types now work correctly!
 
-**Status:** ✅ Working correctly, no fix needed
+**Files Modified:**
+- [lexer.runa:250-268](../src/lexer.runa) - `lexer_skip_note_comment()` for single-line/inline
+- [lexer.runa:270-340](../src/lexer.runa) - `lexer_skip_multiline_note()` for multi-line blocks
+- [lexer.runa:586-684](../src/lexer.runa) - Detection logic when "Note:" is encountered
+
+**How it works:**
+1. **Single-line**: `Note:` followed by text until newline
+2. **Inline**: Same as single-line, but can appear after code on the same line
+3. **Multi-line**: `Note:` on its own line or followed by newline, continues until `:End Note`
+
+**Multi-line Detection:**
+- If `Note:` is immediately followed by newline, it's multi-line
+- Parser scans ahead to detect if comment continues on next line
+- Looks for `:End Note` terminator
+
+**Backward Compatibility:**
+- `#` comments still work temporarily for bootstrap code
+- Will be removed once all bootstrap code uses "Note:" syntax
+
+**Test File:**
+- [test_note_comments.runa](../tests/test_note_comments.runa) - Demonstrates all three types
+
+---
+
+## ✨ BONUS FEATURES ADDED
+
+### **Boolean Keywords: `true` and `false`**
+**Status:** ✅ IMPLEMENTED
+
+**Implementation:**
+```runa
+Let is_valid be true         # Compiles to: Let is_valid be 1
+Let is_complete be false      # Compiles to: Let is_complete be 0
+
+If is_valid is equal to true:
+    print_string("Valid!")
+End If
+```
+
+**Files Modified:**
+- [lexer.runa:157-158](../src/lexer.runa) - Added TOKEN_TRUE (134) and TOKEN_FALSE (135)
+- [lexer.runa:625-635](../src/lexer.runa) - Keyword recognition for "true" and "false"
+- [parser.runa:1286-1298](../src/parser.runa) - Parser converts true→1 and false→0
+
+**How it works:**
+- Lexer recognizes "true" and "false" as keywords
+- Parser converts them to integer literal expressions (1 and 0 respectively)
+- Maintains backward compatibility with integer boolean values
+- More readable than using raw 0/1 values
 
 ---
 
 ## ✨ NEW FEATURES FOR v0.0.8
 
 ### 1. **Inline Assembly**
-**Status:** NEW FEATURE
+**Status:** ❌ NOT IMPLEMENTED
 
-See: [V0.0.8_INLINE_ASSEMBLY.md](milestones/V0.0.8_INLINE_ASSEMBLY.md)
+Direct assembly emission - write raw x86-64 assembly within Runa code!
 
+**Syntax:**
 ```runa
-proc syscall_exit(code: int) -> int:
-    Inline Assembly:
-        mov $60, %rax
-        movq -8(%rbp), %rdi
-        syscall
-    End Assembly
-    ret 0
-End proc
+Inline Assembly:
+    "mov $60, %rax\n" Note: syscall number for exit
+    "mov $42, %rdi\n" Note: exit code
+    "syscall\n" Note: invoke syscall
+End Assembly
 ```
+
+**Implementation:**
+- [lexer.runa:121-122](../src/lexer.runa) - TOKEN_INLINE and TOKEN_ASSEMBLY
+- [lexer.runa:895-905](../src/lexer.runa) - Keyword recognition
+- [parser.runa:1960-2080](../src/parser.runa) - Parse inline assembly blocks
+- [codegen.runa:1828-1888](../src/codegen.runa) - Emit assembly directly to output
+
+**How it works:**
+1. Parser collects assembly instruction strings (must be string literals)
+2. Each instruction must be followed by "Note:" comment documenting it
+3. Codegen emits the assembly strings directly into the `.s` file
+4. No GCC-style constraints needed - you control everything!
+
+**Test Files:**
+- [test_inline_asm_exit.runa](../tests/test_inline_asm_exit.runa) - Exit syscall example
+- [test_inline_asm_simple.runa](../tests/test_inline_asm_simple.runa) - Simple register manipulation
+
+**Use Cases:**
+- System calls (exit, write, read, etc.)
+- Performance-critical code
+- Hardware-specific instructions
+- Direct register manipulation
+- Bypassing compiler overhead
 
 ---
 

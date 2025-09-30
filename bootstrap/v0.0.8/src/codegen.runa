@@ -40,20 +40,16 @@ Process called "emit_line" takes output_file as Integer, line as Integer returns
 End Process
 
 # Find variable in current scope - equivalent to codegen_find_variable
+# Now uses O(1) hash table lookup instead of O(n) linear search
 Process called "codegen_find_variable" takes codegen as Integer, name as Integer returns Integer:
-    Let variable_count be memory_get_int32(codegen, 16)  # codegen->variable_count (int)
-    Let variables be memory_get_pointer(codegen, 8)        # codegen->variables
-    Let i be 0
-    While i is less than variable_count:
-        Let var_offset be i multiplied by 32
-        Let var_ptr be variables plus var_offset  # sizeof(Variable) = 32
-        Let var_name be memory_get_pointer(var_ptr, 0)
-        If string_equals(var_name, name) is equal to 1:
-            Return i
-        End If
-        Let i be i plus 1
-    End While
-    Return 0 minus 1  # -1 for not found
+    # Get variable lookup hash table
+    Let variable_lookup_table be memory_get_pointer(codegen, 80)  # codegen->variable_lookup_table
+
+    # Lookup variable index in hash table (O(1))
+    Let index be hashtable_get(variable_lookup_table, name)
+
+    # hashtable_get returns -1 if not found
+    Return index
 End Process
 
 # Calculate size of a type in bytes - equivalent to codegen_calculate_type_size
@@ -160,6 +156,10 @@ Process called "codegen_add_variable_with_type_and_param_flag" takes codegen as 
 
     # Increment count
     memory_set_int32(codegen, 16, variable_count plus 1)  # codegen->variable_count (int)
+
+    # Add to variable lookup hash table for O(1) lookups
+    Let variable_lookup_table be memory_get_pointer(codegen, 80)  # codegen->variable_lookup_table
+    hashtable_put(variable_lookup_table, name, var_index)
 
     Return var_index
 End Process
@@ -275,21 +275,18 @@ Process called "codegen_collect_strings_from_expression" takes codegen as Intege
             Return 0
         End If
 
-        Let i be 0
-        While i is less than string_count:
-            Let str_offset be i multiplied by 16
-            Let str_ptr be strings plus str_offset
-            Let existing_value be memory_get_pointer(str_ptr, 0)  # Should be pointer, not integer!
-            # Safety check for existing_value before comparison
-            If existing_value is not equal to 0:
-                If existing_value is greater than 65536:
-                    If string_equals(existing_value, string_literal) is equal to 1:
-                        Return 0  # Already added
-                    End If
-                End If
+        # Use hash table for O(1) deduplication instead of O(n) linear search
+        Let string_dedup_table be memory_get_pointer(codegen, 72)
+        If string_dedup_table is not equal to 0:
+            If hashtable_contains(string_dedup_table, string_literal) is equal to 1:
+                Return 0  # Already added
             End If
-            Let i be i plus 1
-        End While
+        End If
+
+        # Add string to dedup hash table for future O(1) lookups
+        If string_dedup_table is not equal to 0:
+            hashtable_put(string_dedup_table, string_literal, string_literal)
+        End If
 
         codegen_add_string_literal(codegen, string_literal)
         Return 0
@@ -1830,8 +1827,8 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
 
     If stmt_type is equal to 16:  # STMT_INLINE_ASSEMBLY
         # Generate raw assembly instructions
-        Let assembly_line_count be memory_get_int32(stmt, 8)  # stmt->data.inline_assembly_stmt.assembly_line_count
-        Let assembly_lines be memory_get_pointer(stmt, 16)  # stmt->data.inline_assembly_stmt.assembly_lines
+        Let assembly_lines be memory_get_pointer(stmt, 8)  # stmt->data.inline_assembly_stmt.assembly_lines (offset 8)
+        Let assembly_line_count be memory_get_integer(stmt, 24)  # stmt->data.inline_assembly_stmt.assembly_line_count (offset 24)
 
         Let i be 0
         While i is less than assembly_line_count:
@@ -1887,7 +1884,7 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
             deallocate(processed)
             Let i be i plus 1
         End While
-        Return 0
+        # Don't return - continue processing other statements
     End If
 
     If stmt_type is equal to 4:  # STMT_PRINT
@@ -2144,7 +2141,7 @@ End Process
 
 # Create a new code generator - equivalent to codegen_create
 Process called "codegen_create" takes output_filename as Integer returns Integer:
-    Let codegen be allocate(72)  # sizeof(CodeGenerator)
+    Let codegen be allocate(88)  # sizeof(CodeGenerator) - added variable_lookup_table
 
     # Note: allocate() uses calloc() which already zeros the memory,
     # so no explicit initialization loop is needed
@@ -2176,6 +2173,14 @@ Process called "codegen_create" takes output_filename as Integer returns Integer
 
     Let loop_stack be allocate(8 multiplied by 16)  # 8 * sizeof(LoopContext)
     memory_set_pointer(codegen, 56, loop_stack)  # codegen->loop_stack (pointer)
+
+    # Initialize string deduplication hash table for O(1) lookups
+    Let string_dedup_table be hashtable_create_for_strings(8192)
+    memory_set_pointer(codegen, 72, string_dedup_table)  # codegen->string_dedup_table
+
+    # Initialize variable lookup hash table for O(1) variable lookups
+    Let variable_lookup_table be hashtable_create_for_strings(8192)
+    memory_set_pointer(codegen, 80, variable_lookup_table)  # codegen->variable_lookup_table
 
     If output_file is equal to 0:
         deallocate(variables)
@@ -2264,6 +2269,19 @@ Process called "codegen_destroy" takes codegen as Integer returns Integer:
         If loop_stack is not equal to 0:
             deallocate(loop_stack)
         End If
+
+        # Destroy string dedup hash table
+        Let string_dedup_table be memory_get_pointer(codegen, 72)
+        If string_dedup_table is not equal to 0:
+            hashtable_destroy(string_dedup_table)
+        End If
+
+        # Destroy variable lookup hash table
+        Let variable_lookup_table be memory_get_pointer(codegen, 80)
+        If variable_lookup_table is not equal to 0:
+            hashtable_destroy(variable_lookup_table)
+        End If
+
         deallocate(codegen)
     End If
     Return 0
@@ -2319,6 +2337,10 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     memory_set_int32(codegen, 24, 0)  # codegen->stack_offset = 0
     memory_set_int32(codegen, 64, 0)  # codegen->loop_depth = 0 (int)
 
+    # Clear variable lookup hash table for new function scope
+    Let variable_lookup_table be memory_get_pointer(codegen, 80)  # codegen->variable_lookup_table
+    hashtable_clear(variable_lookup_table)
+
     Let output_file be memory_get_integer(codegen, 0)  # codegen->output_file
     Let func_name be memory_get_pointer(func, 0)  # func->name
 
@@ -2360,7 +2382,6 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
         End If
     End If
 
-    # CRITICAL FIX: Allocate stack space BEFORE any stack access to prevent Valgrind violations
     # Pre-allocate generous stack space for all function variables and temporaries
     # Increased from 512 to 2048 to handle parser functions with many locals
     emit_line(output_file, "    subq $2048, %rsp  # Pre-allocate generous stack space")
