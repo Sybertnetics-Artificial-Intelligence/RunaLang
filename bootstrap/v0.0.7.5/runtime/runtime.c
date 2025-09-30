@@ -381,7 +381,6 @@ int64_t file_write_buffered(int64_t handle, const char *data, int64_t size) {
         return 0;
     }
 
-
     // Grow buffer if needed
     while (bf->buffer_size + size > bf->buffer_capacity) {
         bf->buffer_capacity *= 2;
@@ -401,7 +400,6 @@ int64_t file_write_buffered(int64_t handle, const char *data, int64_t size) {
 
 // Close buffered file (flushes and frees resources)
 void file_close_buffered(int64_t handle) {
-
     if (handle < 1 || handle >= 256 || !buffered_files[handle]) {
         return;
     }
@@ -411,6 +409,7 @@ void file_close_buffered(int64_t handle) {
     // Flush buffer to disk
     if (bf->buffer_size > 0) {
         ssize_t written = write(bf->fd, bf->buffer, bf->buffer_size);
+        (void)written;  // Suppress unused variable warning
     }
 
     // Close and free
