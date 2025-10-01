@@ -607,6 +607,16 @@ These are Runa modules (.runa files) that users import
 
 **Goal:** Prevent memory bugs through ownership and lifetime tracking.
 
+**CURRENT STATUS (v0.0.7.6): MEMORY UNSAFE**
+- ❌ No reference counting
+- ❌ No garbage collection
+- ❌ No automatic lifetime tracking
+- ❌ No borrow checker
+- ❌ No ownership system
+- ❌ Manual malloc/free (same memory bugs as C)
+
+**See:** `UNIVERSAL_LANGUAGE_GAP_ANALYSIS.md` for detailed analysis
+
 ## What Belongs Where:
 
 ### COMPILER (Type System/Semantic Analysis):
@@ -637,21 +647,41 @@ These are Runa modules (.runa files) that users import
 - ❌ **Drop/Destructor System** - Automatic cleanup
 
 ### RUNTIME (Implemented in Runa):
-- ❌ **Reference Counting (Optional)** - Rc<T> type
+- ❌ **Automatic Reference Counting (ARC)** - Primary memory management strategy
+  ```runa
+  # Automatic - user doesn't see this:
+  # Object header includes reference count
+  # Compiler inserts increment/decrement automatically
+  # Object freed when count reaches zero
+  ```
+
+- ❌ **Garbage Collection (GC)** - For handling cyclic references
+  ```runa
+  # Mark-and-sweep GC for cycles that ARC can't handle
+  # Triggered automatically when memory pressure increases
+  # Optional, can be disabled with compiler flag
+  ```
+
+- ❌ **Reference Counted Types (Rc<T>)** - Manual shared ownership
   ```runa
   Type called "RcString":
       data as String
       ref_count as Integer
   End Type
   ```
-- ❌ **Arena Allocators** - Bulk deallocation
+
+- ❌ **Arena Allocators** - Bulk deallocation for performance
   ```runa
   Let arena be arena_create(1024)  # 1KB arena
   Let data be arena_allocate(arena, 256)
   # ... use data ...
   arena_destroy(arena)  # Frees all at once
   ```
+
 - ❌ **Leak Detection** - Runtime tracking (debug mode)
+  - Track all allocations
+  - Report leaked objects on program exit
+  - Source location for leak origin
 
 ### COMPILER (Code Generation):
 - ❌ **Automatic drop insertion** - Insert cleanup calls
