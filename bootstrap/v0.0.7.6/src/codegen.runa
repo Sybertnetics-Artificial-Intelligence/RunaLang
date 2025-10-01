@@ -41,6 +41,8 @@ End Process
 
 # Find variable in current scope - equivalent to codegen_find_variable
 Process called "codegen_find_variable" takes codegen as Integer, name as Integer returns Integer:
+    # TODO: Use hash table for O(1) lookup - needs function pointer support
+    # For now, use linear search but with larger initial capacity to reduce reallocations
     Let variable_count be memory_get_int32(codegen, 16)  # codegen->variable_count (int)
     Let variables be memory_get_pointer(codegen, 8)        # codegen->variables
     Let i be 0
@@ -376,9 +378,9 @@ Process called "codegen_collect_strings_from_expression" takes codegen as Intege
     If expr_type is equal to 16:  # EXPR_ARRAY_INDEX
         Let array_index_ptr be expr plus 8  # &expr->data.array_index
         Let arr be memory_get_integer(array_index_ptr, 0)  # array_index.array
-        Let index be memory_get_integer(array_index_ptr, 8)  # array_index.index
+        Let idx be memory_get_integer(array_index_ptr, 8)  # array_index.index
         codegen_collect_strings_from_expression(codegen, arr)
-        codegen_collect_strings_from_expression(codegen, index)
+        codegen_collect_strings_from_expression(codegen, idx)
         Return 0
     End If
 
@@ -802,7 +804,7 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
     If expr_type is equal to 16:  # EXPR_ARRAY_INDEX
         Let array_index_ptr be expr plus 8  # &expr->data.array_index
         Let arr be memory_get_integer(array_index_ptr, 0)  # array_index.array
-        Let index be memory_get_integer(array_index_ptr, 8)  # array_index.index
+        Let idx be memory_get_integer(array_index_ptr, 8)  # array_index.index
 
         # Check if the array is a parameter or local variable
         Let array_type be memory_get_int32(arr, 0)  # array->type
@@ -839,7 +841,7 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
         emit_line(output_file, "    pushq %rbx")
 
         # Generate index expression
-        codegen_generate_expression(codegen, index)
+        codegen_generate_expression(codegen, idx)
 
         # Pop base address
         emit_line(output_file, "    popq %rbx")
@@ -991,6 +993,44 @@ Process called "codegen_generate_variable_expr" takes codegen as Integer, expr a
         file_write_buffered(output_file, "(%rbp), %rax\n", 0)
     End If
 
+    Return 0
+End Process
+
+# Helper function to load a variable into %rax
+Process called "codegen_emit_load_variable" takes codegen as Integer, variable_name as Integer returns Integer:
+    Let output_file be memory_get_integer(codegen, 0)
+    Let var_index be codegen_find_variable(codegen, variable_name)
+
+    If var_index is less than 0:
+        print_string("[CODEGEN ERROR] Undefined variable in load: ")
+        print_string(variable_name)
+        exit_with_code(1)
+    End If
+
+    Let variables be memory_get_pointer(codegen, 8)
+    Let offset be memory_get_integer(variables, var_index multiplied by 32 plus 8)
+    file_write_buffered(output_file, "    movq -", 0)
+    file_write_buffered(output_file, integer_to_string(offset), 0)
+    file_write_buffered(output_file, "(%rbp), %rax\n", 0)
+    Return 0
+End Process
+
+# Helper function to store %rax into a variable
+Process called "codegen_emit_store_variable" takes codegen as Integer, variable_name as Integer returns Integer:
+    Let output_file be memory_get_integer(codegen, 0)
+    Let var_index be codegen_find_variable(codegen, variable_name)
+
+    If var_index is less than 0:
+        print_string("[CODEGEN ERROR] Undefined variable in store: ")
+        print_string(variable_name)
+        exit_with_code(1)
+    End If
+
+    Let variables be memory_get_pointer(codegen, 8)
+    Let offset be memory_get_integer(variables, var_index multiplied by 32 plus 8)
+    file_write_buffered(output_file, "    movq %rax, -", 0)
+    file_write_buffered(output_file, integer_to_string(offset), 0)
+    file_write_buffered(output_file, "(%rbp)\n", 0)
     Return 0
 End Process
 
@@ -2232,7 +2272,7 @@ End Process
 
 # Create a new code generator - equivalent to codegen_create
 Process called "codegen_create" takes output_filename as Integer returns Integer:
-    Let codegen be allocate(72)  # sizeof(CodeGenerator)
+    Let codegen be allocate(80)  # sizeof(CodeGenerator) - increased from 72 to 80 to add variable_map
 
     # Note: allocate() uses calloc() which already zeros the memory,
     # so no explicit initialization loop is needed
@@ -2245,24 +2285,23 @@ Process called "codegen_create" takes output_filename as Integer returns Integer
     End If
     memory_set_integer(codegen, 0, output_file)  # codegen->output_file
 
-    Let variables be allocate(16 multiplied by 32)  # 16 * sizeof(Variable) - Variable is 32 bytes
+    Let variables be allocate(256 multiplied by 32)  # 256 * sizeof(Variable) - increased from 16
     memory_set_pointer(codegen, 8, variables)  # codegen->variables
     memory_set_int32(codegen, 16, 0)  # codegen->variable_count (int)
-    memory_set_int32(codegen, 20, 16)  # codegen->variable_capacity (int) - Start with space for 16 variables
-
+    memory_set_int32(codegen, 20, 256)  # codegen->variable_capacity (int) - increased from 16
 
     memory_set_int32(codegen, 24, 0)  # codegen->stack_offset (int)
     memory_set_int32(codegen, 28, 0)  # codegen->label_counter (int)
     memory_set_int32(codegen, 40, 0)  # codegen->string_count (int)
-    memory_set_int32(codegen, 44, 512)  # codegen->string_capacity (int) - Start with space for 512 strings
+    memory_set_int32(codegen, 44, 2048)  # codegen->string_capacity (int) - increased from 512 to 2048
 
-    Let strings be allocate(512 multiplied by 16)  # 512 * sizeof(StringLiteral)
+    Let strings be allocate(2048 multiplied by 16)  # 2048 * sizeof(StringLiteral)
     memory_set_pointer(codegen, 32, strings)  # codegen->strings (pointer with padding)
     memory_set_pointer(codegen, 48, 0)  # codegen->current_program (pointer with padding)
     memory_set_int32(codegen, 64, 0)  # codegen->loop_depth (int)
-    memory_set_int32(codegen, 68, 8)  # codegen->loop_capacity (int) - Start with space for 8 nested loops
+    memory_set_int32(codegen, 68, 16)  # codegen->loop_capacity (int) - increased from 8 to 16
 
-    Let loop_stack be allocate(8 multiplied by 16)  # 8 * sizeof(LoopContext)
+    Let loop_stack be allocate(16 multiplied by 16)  # 16 * sizeof(LoopContext)
     memory_set_pointer(codegen, 56, loop_stack)  # codegen->loop_stack (pointer)
 
     If output_file is equal to 0:
@@ -2800,7 +2839,7 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, "    pushq %rbp")
     emit_line(output_file, "    movq %rsp, %rbp")
     emit_line(output_file, "")
-    emit_line(output_file, "    # Calculate string length")
+    emit_line(output_file, "    # Calculate string len")
     emit_line(output_file, "    movq %rdi, %rsi  # Save string pointer")
     emit_line(output_file, "    movq %rdi, %rcx  # Counter for strlen")
     emit_line(output_file, "    xorq %rax, %rax  # Length accumulator")
@@ -2815,7 +2854,7 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, "    # Call write syscall (sys_write = 1)")
     emit_line(output_file, "    movq $1, %rdi     # fd = stdout")
     emit_line(output_file, "    movq %rsi, %rsi   # buf = string pointer (already in rsi)")
-    emit_line(output_file, "    movq %rax, %rdx   # count = string length")
+    emit_line(output_file, "    movq %rax, %rdx   # count = string len")
     emit_line(output_file, "    movq $1, %rax     # syscall number for write")
     emit_line(output_file, "    syscall")
     emit_line(output_file, "")
@@ -2864,7 +2903,7 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, ".convert_done:")
     emit_line(output_file, "    incq %rsi  # point to first character")
     emit_line(output_file, "")
-    emit_line(output_file, "    # Calculate string length")
+    emit_line(output_file, "    # Calculate string len")
     emit_line(output_file, "    movq %rsi, %rcx  # Counter for strlen")
     emit_line(output_file, "    xorq %rax, %rax  # Length accumulator")
     emit_line(output_file, ".int_strlen_loop:")
@@ -2878,7 +2917,7 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, "    # Call write syscall (sys_write = 1)")
     emit_line(output_file, "    movq $1, %rdi     # fd = stdout")
     emit_line(output_file, "    # %rsi already points to string")
-    emit_line(output_file, "    movq %rax, %rdx   # count = string length")
+    emit_line(output_file, "    movq %rax, %rdx   # count = string len")
     emit_line(output_file, "    movq $1, %rax     # syscall number for write")
     emit_line(output_file, "    syscall")
     emit_line(output_file, "")

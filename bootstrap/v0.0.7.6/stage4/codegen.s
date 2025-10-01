@@ -258,7 +258,7 @@ print_string:
     pushq %rbp
     movq %rsp, %rbp
 
-    # Calculate string length
+    # Calculate string len
     movq %rdi, %rsi  # Save string pointer
     movq %rdi, %rcx  # Counter for strlen
     xorq %rax, %rax  # Length accumulator
@@ -273,7 +273,7 @@ print_string:
     # Call write syscall (sys_write = 1)
     movq $1, %rdi     # fd = stdout
     movq %rsi, %rsi   # buf = string pointer (already in rsi)
-    movq %rax, %rdx   # count = string length
+    movq %rax, %rdx   # count = string len
     movq $1, %rax     # syscall number for write
     syscall
 
@@ -321,7 +321,7 @@ print_integer:
 .convert_done:
     incq %rsi  # point to first character
 
-    # Calculate string length
+    # Calculate string len
     movq %rsi, %rcx  # Counter for strlen
     xorq %rax, %rax  # Length accumulator
 .int_strlen_loop:
@@ -335,7 +335,7 @@ print_integer:
     # Call write syscall (sys_write = 1)
     movq $1, %rdi     # fd = stdout
     # %rsi already points to string
-    movq %rax, %rdx   # count = string length
+    movq %rax, %rdx   # count = string len
     movq $1, %rax     # syscall number for write
     syscall
 
