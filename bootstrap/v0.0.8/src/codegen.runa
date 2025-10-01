@@ -156,6 +156,424 @@ Process called "regalloc_add_liverange" takes ra as Integer, var_index as Intege
     Return lr
 End Process
 
+# Analyze expression to find all variable uses
+Process called "analyze_expression_uses" takes expr as Integer, ra as Integer, current_point as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    Let expr_type be memory_get_int32(expr, 0)
+
+    # EXPR_VARIABLE = 2
+    If expr_type is equal to 2:
+        Let var_index be memory_get_integer(expr, 8)
+
+        # Update end point of this variable's live range
+        Let count be memory_get_int32(ra, REGALLOC_LR_COUNT)
+        Let ranges be memory_get_pointer(ra, REGALLOC_LIVE_RANGES)
+        Let i be 0
+        While i is less than count:
+            Let lr be memory_get_pointer(ranges, i multiplied by 8)
+            Let lr_var be memory_get_integer(lr, LIVERANGE_VAR_INDEX)
+            If lr_var is equal to var_index:
+                memory_set_integer(lr, LIVERANGE_END, current_point)
+            End If
+            Let i be i plus 1
+        End While
+        Return 0
+    End If
+
+    # EXPR_BINARY_OP = 3
+    If expr_type is equal to 3:
+        Let left be memory_get_pointer(expr, 8)
+        Let right be memory_get_pointer(expr, 16)
+        analyze_expression_uses(left, ra, current_point)
+        analyze_expression_uses(right, ra, current_point)
+        Return 0
+    End If
+
+    # EXPR_FUNCTION_CALL = 4
+    If expr_type is equal to 4:
+        Let args be memory_get_pointer(expr, 16)
+        Let arg_count be memory_get_integer(expr, 24)
+        Let i be 0
+        While i is less than arg_count:
+            Let arg be memory_get_pointer(args, i multiplied by 8)
+            analyze_expression_uses(arg, ra, current_point)
+            Let i be i plus 1
+        End While
+        Return 0
+    End If
+
+    Return 0
+End Process
+
+# Analyze all statements in a function to build live ranges
+Process called "analyze_function_liveness" takes func as Integer, codegen as Integer returns Integer:
+    Let ra be regalloc_create()
+    Let current_point be 0
+
+    # Get variable count from codegen
+    Let var_count be memory_get_integer(codegen, 72)
+
+    # Create initial live ranges for all variables (start at 0, end at 0)
+    Let i be 0
+    While i is less than var_count:
+        regalloc_add_liverange(ra, i, 0, 0)
+        Let i be i plus 1
+    End While
+
+    # Get function statements
+    Let statements be memory_get_pointer(func, 16)
+    Let stmt_count be memory_get_integer(func, 24)
+
+    # Scan through statements
+    Let stmt_idx be 0
+    While stmt_idx is less than stmt_count:
+        Let stmt be memory_get_pointer(statements, stmt_idx multiplied by 8)
+        Let stmt_type be memory_get_int32(stmt, 0)
+
+        # STMT_LET = 1: Variable creation
+        If stmt_type is equal to 1:
+            Let var_index be memory_get_integer(stmt, 8)
+            Let init_expr be memory_get_pointer(stmt, 16)
+
+            # Mark variable as starting at this point
+            Let ranges be memory_get_pointer(ra, REGALLOC_LIVE_RANGES)
+            Let lr be memory_get_pointer(ranges, var_index multiplied by 8)
+            memory_set_integer(lr, LIVERANGE_START, current_point)
+            memory_set_integer(lr, LIVERANGE_END, current_point)
+
+            # Analyze initialization expression
+            If init_expr is not equal to 0:
+                analyze_expression_uses(init_expr, ra, current_point)
+            End If
+        End If
+
+        # STMT_SET = 2: Variable assignment
+        If stmt_type is equal to 2:
+            Let var_index be memory_get_integer(stmt, 8)
+            Let value_expr be memory_get_pointer(stmt, 16)
+
+            # Update end point
+            Let ranges be memory_get_pointer(ra, REGALLOC_LIVE_RANGES)
+            Let lr be memory_get_pointer(ranges, var_index multiplied by 8)
+            memory_set_integer(lr, LIVERANGE_END, current_point)
+
+            # Analyze value expression
+            If value_expr is not equal to 0:
+                analyze_expression_uses(value_expr, ra, current_point)
+            End If
+        End If
+
+        # STMT_RETURN = 6: Return statement
+        If stmt_type is equal to 6:
+            Let return_expr be memory_get_pointer(stmt, 8)
+            If return_expr is not equal to 0:
+                analyze_expression_uses(return_expr, ra, current_point)
+            End If
+        End If
+
+        # STMT_IF = 3: If statement
+        If stmt_type is equal to 3:
+            Let condition be memory_get_pointer(stmt, 8)
+            analyze_expression_uses(condition, ra, current_point)
+        End If
+
+        # STMT_WHILE = 4: While statement
+        If stmt_type is equal to 4:
+            Let condition be memory_get_pointer(stmt, 8)
+            analyze_expression_uses(condition, ra, current_point)
+        End If
+
+        Let current_point be current_point plus 1
+        Let stmt_idx be stmt_idx plus 1
+    End While
+
+    Return ra
+End Process
+
+# Sort live ranges by start point (bubble sort for simplicity)
+Process called "sort_live_ranges_by_start" takes ra as Integer returns Integer:
+    Let count be memory_get_int32(ra, REGALLOC_LR_COUNT)
+    Let ranges be memory_get_pointer(ra, REGALLOC_LIVE_RANGES)
+
+    Let i be 0
+    While i is less than count:
+        Let j be 0
+        While j is less than count minus 1:
+            Let lr1 be memory_get_pointer(ranges, j multiplied by 8)
+            Let lr2 be memory_get_pointer(ranges, j plus 1 multiplied by 8)
+
+            Let start1 be memory_get_integer(lr1, LIVERANGE_START)
+            Let start2 be memory_get_integer(lr2, LIVERANGE_START)
+
+            If start1 is greater than start2:
+                # Swap
+                memory_set_pointer(ranges, j multiplied by 8, lr2)
+                memory_set_pointer(ranges, j plus 1 multiplied by 8, lr1)
+            End If
+
+            Let j be j plus 1
+        End While
+        Let i be i plus 1
+    End While
+
+    Return 0
+End Process
+
+# Linear scan register allocation algorithm
+Process called "linear_scan_allocate" takes ra as Integer returns Integer:
+    # Sort live ranges by start point
+    sort_live_ranges_by_start(ra)
+
+    # Available registers for allocation (callee-saved to avoid save/restore):
+    # %rbx, %r12, %r13, %r14, %r15
+    # We'll use indices 1, 10, 11, 12, 13
+    Let available_regs be memory_allocate(40)  # 5 registers * 8 bytes
+    memory_set_int32(available_regs, 0, 1)   # REG_RBX
+    memory_set_int32(available_regs, 8, 10)  # REG_R12
+    memory_set_int32(available_regs, 16, 11) # REG_R13
+    memory_set_int32(available_regs, 24, 12) # REG_R14
+    memory_set_int32(available_regs, 32, 13) # REG_R15
+    Let available_count be 5
+
+    # Active list: currently allocated live ranges
+    Let active be memory_allocate(800)  # Max 100 active ranges
+    Let active_count be 0
+
+    # Process each live range
+    Let count be memory_get_int32(ra, REGALLOC_LR_COUNT)
+    Let ranges be memory_get_pointer(ra, REGALLOC_LIVE_RANGES)
+
+    Let i be 0
+    While i is less than count:
+        Let lr be memory_get_pointer(ranges, i multiplied by 8)
+        Let start be memory_get_integer(lr, LIVERANGE_START)
+        Let end_val be memory_get_integer(lr, LIVERANGE_END)
+
+        # Expire old intervals - free registers from ranges that ended before this one starts
+        Let j be 0
+        While j is less than active_count:
+            Let active_lr be memory_get_pointer(active, j multiplied by 8)
+            Let active_end be memory_get_integer(active_lr, LIVERANGE_END)
+
+            If active_end is less than start:
+                # This interval has ended, free its register
+                Let freed_reg be memory_get_int32(active_lr, LIVERANGE_REGISTER)
+                If freed_reg is not equal to REG_NONE:
+                    # Add back to available registers
+                    memory_set_int32(available_regs, available_count multiplied by 8, freed_reg)
+                    Let available_count be available_count plus 1
+                End If
+
+                # Remove from active list by shifting
+                Let k be j
+                While k is less than active_count minus 1:
+                    Let next_lr be memory_get_pointer(active, k plus 1 multiplied by 8)
+                    memory_set_pointer(active, k multiplied by 8, next_lr)
+                    Let k be k plus 1
+                End While
+                Let active_count be active_count minus 1
+            Otherwise:
+                Let j be j plus 1
+            End If
+        End While
+
+        # Try to allocate a register
+        If available_count is greater than 0:
+            # Allocate a register
+            Let available_count be available_count minus 1
+            Let reg be memory_get_int32(available_regs, available_count multiplied by 8)
+            memory_set_int32(lr, LIVERANGE_REGISTER, reg)
+
+            # Add to active list
+            memory_set_pointer(active, active_count multiplied by 8, lr)
+            Let active_count be active_count plus 1
+        Otherwise:
+            # No registers available - spill to stack
+            memory_set_int32(lr, LIVERANGE_REGISTER, REG_NONE)
+            # Spilling will be handled later if needed
+        End If
+
+        Let i be i plus 1
+    End While
+
+    Return 0
+End Process
+
+# Get register name for a variable from register allocator
+Process called "get_variable_register" takes ra as Integer, var_index as Integer returns Integer:
+    If ra is equal to 0:
+        Return REG_NONE
+    End If
+
+    Let count be memory_get_int32(ra, REGALLOC_LR_COUNT)
+    Let ranges be memory_get_pointer(ra, REGALLOC_LIVE_RANGES)
+
+    Let i be 0
+    While i is less than count:
+        Let lr be memory_get_pointer(ranges, i multiplied by 8)
+        Let lr_var be memory_get_integer(lr, LIVERANGE_VAR_INDEX)
+        If lr_var is equal to var_index:
+            Let reg be memory_get_int32(lr, LIVERANGE_REGISTER)
+            Return reg
+        End If
+        Let i be i plus 1
+    End While
+
+    Return REG_NONE
+End Process
+
+# Collect all used callee-saved registers from register allocator
+# Returns a bit mask where bit N indicates register N is used
+Process called "get_used_callee_saved_registers" takes ra as Integer returns Integer:
+    If ra is equal to 0:
+        Return 0
+    End If
+
+    Let used_mask be 0
+    Let count be memory_get_int32(ra, REGALLOC_LR_COUNT)
+    Let ranges be memory_get_pointer(ra, REGALLOC_LIVE_RANGES)
+
+    Let i be 0
+    While i is less than count:
+        Let lr be memory_get_pointer(ranges, i multiplied by 8)
+        Let reg be memory_get_int32(lr, LIVERANGE_REGISTER)
+
+        # Check if register is allocated and is callee-saved
+        # Callee-saved: REG_RBX=1, REG_R12=4, REG_R13=5, REG_R14=6, REG_R15=7
+        If reg is not equal to REG_NONE:
+            If reg is equal to 1:  # REG_RBX
+                Set used_mask to used_mask bit_or 1
+            End If
+            If reg is equal to 4:  # REG_R12
+                Set used_mask to used_mask bit_or 16
+            End If
+            If reg is equal to 5:  # REG_R13
+                Set used_mask to used_mask bit_or 32
+            End If
+            If reg is equal to 6:  # REG_R14
+                Set used_mask to used_mask bit_or 64
+            End If
+            If reg is equal to 7:  # REG_R15
+                Set used_mask to used_mask bit_or 128
+            End If
+        End If
+
+        Let i be i plus 1
+    End While
+
+    Return used_mask
+End Process
+
+# Generate register-aware expression code
+# target_reg: which register to put the result in (REG_NONE = use %rax)
+Process called "codegen_generate_expr_to_reg" takes codegen as Integer, expr as Integer, ra as Integer, target_reg as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    Let expr_type be memory_get_int32(expr, 0)
+    Let output_file be memory_get_integer(codegen, 0)
+
+    # Determine which register to use for output
+    Let out_reg be target_reg
+    If out_reg is equal to REG_NONE:
+        Let out_reg be 0  # REG_RAX
+    End If
+    Let out_reg_name be register_name(out_reg)
+
+    # EXPR_INTEGER = 0
+    If expr_type is equal to 0:
+        Let integer_value be memory_get_integer(expr, 8)
+        file_write_buffered(output_file, "    movq $", 0)
+        file_write_buffered(output_file, integer_to_string(integer_value), 0)
+        file_write_buffered(output_file, ", ", 0)
+        file_write_buffered(output_file, out_reg_name, 0)
+        file_write_buffered(output_file, "\n", 0)
+        Return 0
+    End If
+
+    # EXPR_VARIABLE = 2
+    If expr_type is equal to 2:
+        Let var_index be memory_get_integer(expr, 8)
+        Let var_reg be get_variable_register(ra, var_index)
+
+        If var_reg is not equal to REG_NONE:
+            # Variable is in a register
+            Let var_reg_name be register_name(var_reg)
+            If var_reg is not equal to out_reg:
+                file_write_buffered(output_file, "    movq ", 0)
+                file_write_buffered(output_file, var_reg_name, 0)
+                file_write_buffered(output_file, ", ", 0)
+                file_write_buffered(output_file, out_reg_name, 0)
+                file_write_buffered(output_file, "\n", 0)
+            End If
+        Otherwise:
+            # Variable is on stack - use old codegen
+            Let stack_offset be memory_get_integer(codegen, 64)
+            Let var_offset_from_map be var_index multiplied by 8
+            Let var_offset be var_offset_from_map minus stack_offset
+            file_write_buffered(output_file, "    movq ", 0)
+            file_write_buffered(output_file, integer_to_string(var_offset), 0)
+            file_write_buffered(output_file, "(%rbp), ", 0)
+            file_write_buffered(output_file, out_reg_name, 0)
+            file_write_buffered(output_file, "\n", 0)
+        End If
+        Return 0
+    End If
+
+    # EXPR_BINARY_OP = 3
+    If expr_type is equal to 3:
+        Let left be memory_get_pointer(expr, 8)
+        Let right be memory_get_pointer(expr, 16)
+        Let operator be memory_get_integer(expr, 24)
+
+        # Generate left into output register
+        codegen_generate_expr_to_reg(codegen, left, ra, out_reg)
+
+        # Generate right into a temp register (use %r10 as scratch)
+        Let scratch_reg be 8  # REG_R10
+        codegen_generate_expr_to_reg(codegen, right, ra, scratch_reg)
+        Let scratch_name be register_name(scratch_reg)
+
+        # Perform operation: out_reg = out_reg OP scratch_reg
+        # TOKEN_PLUS = 32
+        If operator is equal to 32:
+            file_write_buffered(output_file, "    addq ", 0)
+            file_write_buffered(output_file, scratch_name, 0)
+            file_write_buffered(output_file, ", ", 0)
+            file_write_buffered(output_file, out_reg_name, 0)
+            file_write_buffered(output_file, "\n", 0)
+        End If
+
+        # TOKEN_MINUS = 33
+        If operator is equal to 33:
+            file_write_buffered(output_file, "    subq ", 0)
+            file_write_buffered(output_file, scratch_name, 0)
+            file_write_buffered(output_file, ", ", 0)
+            file_write_buffered(output_file, out_reg_name, 0)
+            file_write_buffered(output_file, "\n", 0)
+        End If
+
+        # TOKEN_MULTIPLIED = 35
+        If operator is equal to 35:
+            file_write_buffered(output_file, "    imulq ", 0)
+            file_write_buffered(output_file, scratch_name, 0)
+            file_write_buffered(output_file, ", ", 0)
+            file_write_buffered(output_file, out_reg_name, 0)
+            file_write_buffered(output_file, "\n", 0)
+        End If
+
+        Return 0
+    End If
+
+    # For other expression types, fall back to old codegen
+    # This is temporary - full implementation would handle all types
+    Return 0
+End Process
+
 # ===== END REGISTER ALLOCATION INFRASTRUCTURE =====
 
 # Helper to emit a line with newline
@@ -405,7 +823,7 @@ Process called "codegen_collect_strings_from_expression" takes codegen as Intege
         Let string_dedup_table be memory_get_pointer(codegen, 72)
         If string_dedup_table is not equal to 0:
             If hashtable_contains(string_dedup_table, string_literal) is equal to 1:
-                Return 0  # Already added
+                Return 0
             End If
         End If
 
@@ -643,6 +1061,29 @@ Process called "codegen_collect_strings_from_statement" takes codegen as Integer
         Return 0
     End If
 
+    If stmt_type is equal to 11:  # STMT_FOR
+        Let start_expr be memory_get_pointer(stmt, 16)
+        Let end_expr be memory_get_pointer(stmt, 24)
+        Let step_expr be memory_get_pointer(stmt, 32)
+        Let body be memory_get_pointer(stmt, 40)
+        Let body_count be memory_get_int32(stmt, 48)
+
+        codegen_collect_strings_from_expression(codegen, start_expr)
+        codegen_collect_strings_from_expression(codegen, end_expr)
+        If step_expr is not equal to 0:
+            codegen_collect_strings_from_expression(codegen, step_expr)
+        End If
+
+        Let i be 0
+        While i is less than body_count:
+            Let stmt_offset be i multiplied by 8
+            Let stmt_ptr be memory_get_pointer(body, stmt_offset)
+            codegen_collect_strings_from_statement(codegen, stmt_ptr)
+            Let i be i plus 1
+        End While
+        Return 0
+    End If
+
     If stmt_type is equal to 7:  # STMT_EXPRESSION
         Let expr_stmt_ptr be stmt plus 8  # &stmt->data.expr_stmt
         Let expression be memory_get_pointer(expr_stmt_ptr, 0)  # expr_stmt.expression - this is a pointer!
@@ -775,8 +1216,6 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
                 Let i be i plus 1
             End While
         End If
-
-        Return 0
     End If
 
     # Other expression types don't have determinable types in this context
@@ -1809,13 +2248,29 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                 # Generate expression (result in %rax)
                 codegen_generate_expression(codegen, let_expr)
 
-                # Store value in variable's stack slot
+                # Store value in variable's register or stack slot
                 Let var_index be codegen_find_variable(codegen, variable_name)
-                Let variables be memory_get_pointer(codegen, 8)  # codegen->variables
-                Let offset be memory_get_integer(variables, var_index multiplied by 32 plus 8)  # variables[var_index].stack_offset
-                file_write_buffered(output_file, "    movq %rax, -", 0)
-                file_write_buffered(output_file, integer_to_string(offset), 0)
-                file_write_buffered(output_file, "(%rbp)\n", 0)
+
+                # Check if this variable has been allocated a register
+                Let ra be memory_get_pointer(codegen, 88)
+                Let var_reg be get_variable_register(ra, var_index)
+
+                If var_reg is not equal to REG_NONE:
+                    # Variable is in a register - move from %rax to allocated register
+                    If var_reg is not equal to 0:  # If not already in %rax
+                        Let var_reg_name be register_name(var_reg)
+                        file_write_buffered(output_file, "    movq %rax, ", 0)
+                        file_write_buffered(output_file, var_reg_name, 0)
+                        file_write_buffered(output_file, "\n", 0)
+                    End If
+                Otherwise:
+                    # Variable is on stack - use old code
+                    Let variables be memory_get_pointer(codegen, 8)  # codegen->variables
+                    Let offset be memory_get_integer(variables, var_index multiplied by 32 plus 8)  # variables[var_index].stack_offset
+                    file_write_buffered(output_file, "    movq %rax, -", 0)
+                    file_write_buffered(output_file, integer_to_string(offset), 0)
+                    file_write_buffered(output_file, "(%rbp)\n", 0)
+                End If
             End If
         End If
         Return 0
@@ -1826,11 +2281,39 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         Let set_expr be memory_get_pointer(stmt, 16)  # stmt->data.set_stmt.expression
         codegen_generate_expression(codegen, set_expr)
 
+        # Check if target is a simple variable with allocated register
+        Let set_target be memory_get_pointer(stmt, 8)  # stmt->data.set_stmt.target
+        Let target_type be memory_get_int32(set_target, 0)
+
+        # EXPR_VARIABLE = 2 (note: different from EXPR_VARIABLE in lvalue context which is 1)
+        # Actually check the code - in lvalue_address it checks for type 1
+        If target_type is equal to 2:  # EXPR_VARIABLE
+            Let target_var_name be memory_get_pointer(set_target, 8)
+            Let target_var_index be codegen_find_variable(codegen, target_var_name)
+
+            If target_var_index is greater than or equal to 0:  # Local variable found
+                # Check if this variable has an allocated register
+                Let ra be memory_get_pointer(codegen, 88)
+                Let target_reg be get_variable_register(ra, target_var_index)
+
+                If target_reg is not equal to REG_NONE:
+                    # Direct register move
+                    If target_reg is not equal to 0:  # If not already in %rax
+                        Let target_reg_name be register_name(target_reg)
+                        file_write_buffered(output_file, "    movq %rax, ", 0)
+                        file_write_buffered(output_file, target_reg_name, 0)
+                        file_write_buffered(output_file, "\n", 0)
+                    End If
+                    Return 0
+                End If
+            End If
+        End If
+
+        # Fall back to general lvalue address approach for complex targets
         # Save the value on the stack
         emit_line(output_file, "    pushq %rax")
 
         # Generate the address of the target (result in %rbx)
-        Let set_target be memory_get_pointer(stmt, 8)  # stmt->data.set_stmt.target
         codegen_generate_lvalue_address(codegen, set_target)
 
         # Restore value and store to target address
@@ -1844,7 +2327,41 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         Let return_expr be memory_get_pointer(stmt, 8)  # stmt->data.return_stmt.expression - use pointer
         codegen_generate_expression(codegen, return_expr)
 
-        # Function epilogue
+        # Function epilogue - restore callee-saved registers
+        Let ra be memory_get_pointer(codegen, 88)
+        Let used_regs_mask be get_used_callee_saved_registers(ra)
+
+        # Restore callee-saved registers in reverse order (last pushed = first popped)
+        # REG_R15=7 (bit 7)
+        Let test_ret_bit be used_regs_mask bit_and 128
+        If test_ret_bit is not equal to 0:
+            file_write_buffered(output_file, "    popq %r15\n", 0)
+        End If
+
+        # REG_R14=6 (bit 6)
+        Set test_ret_bit to used_regs_mask bit_and 64
+        If test_ret_bit is not equal to 0:
+            file_write_buffered(output_file, "    popq %r14\n", 0)
+        End If
+
+        # REG_R13=5 (bit 5)
+        Set test_ret_bit to used_regs_mask bit_and 32
+        If test_ret_bit is not equal to 0:
+            file_write_buffered(output_file, "    popq %r13\n", 0)
+        End If
+
+        # REG_R12=4 (bit 4)
+        Set test_ret_bit to used_regs_mask bit_and 16
+        If test_ret_bit is not equal to 0:
+            file_write_buffered(output_file, "    popq %r12\n", 0)
+        End If
+
+        # REG_RBX=1 (bit 0)
+        Set test_ret_bit to used_regs_mask bit_and 1
+        If test_ret_bit is not equal to 0:
+            file_write_buffered(output_file, "    popq %rbx\n", 0)
+        End If
+
         file_write_buffered(output_file, "    movq %rbp, %rsp\n", 0)
         file_write_buffered(output_file, "    popq %rbp\n", 0)
         file_write_buffered(output_file, "    ret\n", 0)
@@ -1956,6 +2473,141 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         emit_line(output_file, loop_end_line)
         deallocate(loop_end_str)
         deallocate(loop_end_line)
+
+        # Pop loop context
+        codegen_pop_loop_context(codegen)
+        Return 0
+    End If
+
+    If stmt_type is equal to 11:  # STMT_FOR
+        Let label_counter be memory_get_int32(codegen, 28)
+        Let label_num be label_counter
+        memory_set_int32(codegen, 28, label_counter plus 1)
+
+        Let loop_start be label_num multiplied by 10 plus 1
+        Let loop_end be label_num multiplied by 10 plus 2
+        Let loop_continue be label_num multiplied by 10 plus 3
+
+        # Push loop context for break/continue statements
+        codegen_push_loop_context(codegen, loop_start, loop_end)
+
+        # Get for loop components
+        Let var_name be memory_get_pointer(stmt, 8)
+        Let start_expr be memory_get_pointer(stmt, 16)
+        Let end_expr be memory_get_pointer(stmt, 24)
+        Let step_expr be memory_get_pointer(stmt, 32)
+        Let body be memory_get_pointer(stmt, 40)
+        Let body_count be memory_get_int32(stmt, 48)
+
+        # Initialize loop variable: Let var = start_expr
+        codegen_generate_expression(codegen, start_expr)
+        emit_line(output_file, "    pushq %rax")
+
+        # Add variable to symbol table
+        Let current_function be memory_get_pointer(codegen, 8)
+        Let local_vars be memory_get_pointer(current_function, 64)
+        Let local_count_ptr be current_function plus 72
+        Let local_count be memory_get_int32(local_count_ptr, 0)
+
+        # Store variable name and offset
+        memory_set_pointer(local_vars, local_count multiplied by 16, var_name)
+        Let stack_offset be (local_count plus 1) multiplied by 8
+        memory_set_int32(local_vars, local_count multiplied by 16 plus 8, stack_offset)
+        memory_set_int32(local_count_ptr, 0, local_count plus 1)
+
+        # Loop start label
+        file_write_buffered(output_file, ".L", 0)
+        Let loop_start_str be integer_to_string(loop_start)
+        file_write_buffered(output_file, loop_start_str, 0)
+        file_write_buffered(output_file, ":\n", 0)
+        deallocate(loop_start_str)
+
+        # Load loop variable and compare with end
+        Let var_offset_neg be 0 minus stack_offset
+        Let load_var be string_concat("    movq ", integer_to_string(var_offset_neg))
+        Let load_var2 be string_concat(load_var, "(%rbp), %rax")
+        emit_line(output_file, load_var2)
+        deallocate(load_var)
+        deallocate(load_var2)
+
+        # Generate end expression (in %rbx)
+        codegen_generate_expression(codegen, end_expr)
+        emit_line(output_file, "    movq %rax, %rbx")
+
+        # Load loop variable again for comparison
+        Let load_var3 be string_concat("    movq ", integer_to_string(var_offset_neg))
+        Let load_var4 be string_concat(load_var3, "(%rbp), %rax")
+        emit_line(output_file, load_var4)
+        deallocate(load_var3)
+        deallocate(load_var4)
+
+        # Compare: if var > end, exit loop
+        emit_line(output_file, "    cmpq %rbx, %rax")
+        Let jg_instruction be string_concat("    jg .L", integer_to_string(loop_end))
+        emit_line(output_file, jg_instruction)
+        deallocate(jg_instruction)
+
+        # Generate loop body
+        Let body_i be 0
+        While body_i is less than body_count:
+            Let body_stmt be memory_get_pointer(body, body_i multiplied by 8)
+            codegen_generate_statement(codegen, body_stmt)
+            Let body_i be body_i plus 1
+        End While
+
+        # Continue label (for continue statements)
+        file_write_buffered(output_file, ".L", 0)
+        Let loop_continue_str be integer_to_string(loop_continue)
+        file_write_buffered(output_file, loop_continue_str, 0)
+        file_write_buffered(output_file, ":\n", 0)
+        deallocate(loop_continue_str)
+
+        # Increment: var = var + step (or var + 1 if no step)
+        Let load_var5 be string_concat("    movq ", integer_to_string(var_offset_neg))
+        Let load_var6 be string_concat(load_var5, "(%rbp), %rax")
+        emit_line(output_file, load_var6)
+        deallocate(load_var5)
+        deallocate(load_var6)
+
+        If step_expr is not equal to 0:
+            codegen_generate_expression(codegen, step_expr)
+            emit_line(output_file, "    movq %rax, %rbx")
+            Let load_var7 be string_concat("    movq ", integer_to_string(var_offset_neg))
+            Let load_var8 be string_concat(load_var7, "(%rbp), %rax")
+            emit_line(output_file, load_var8)
+            deallocate(load_var7)
+            deallocate(load_var8)
+            emit_line(output_file, "    addq %rbx, %rax")
+        Otherwise:
+            emit_line(output_file, "    addq $1, %rax")
+        End If
+
+        # Store updated variable
+        Let store_var be string_concat("    movq %rax, ", integer_to_string(var_offset_neg))
+        Let store_var2 be string_concat(store_var, "(%rbp)")
+        emit_line(output_file, store_var2)
+        deallocate(store_var)
+        deallocate(store_var2)
+
+        # Jump back to loop start
+        file_write_buffered(output_file, "    jmp .L", 0)
+        Let loop_start_jmp be integer_to_string(loop_start)
+        file_write_buffered(output_file, loop_start_jmp, 0)
+        file_write_buffered(output_file, "\n", 0)
+        deallocate(loop_start_jmp)
+
+        # Loop end label
+        file_write_buffered(output_file, ".L", 0)
+        Let loop_end_str be integer_to_string(loop_end)
+        file_write_buffered(output_file, loop_end_str, 0)
+        file_write_buffered(output_file, ":\n", 0)
+        deallocate(loop_end_str)
+
+        # Pop the loop variable from stack
+        emit_line(output_file, "    addq $8, %rsp")
+
+        # Remove variable from symbol table
+        memory_set_int32(local_count_ptr, 0, local_count)
 
         # Pop loop context
         codegen_pop_loop_context(codegen)
@@ -2611,6 +3263,48 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
         Let i be i plus 1
     End While
 
+    # Perform register allocation analysis for this function
+    Let ra be analyze_function_liveness(func, codegen)
+    linear_scan_allocate(ra)
+
+    # Store register allocator in codegen for use during statement generation
+    # We'll use offset 88 (after variable_lookup_table at 80)
+    memory_set_pointer(codegen, 88, ra)
+
+    # Save callee-saved registers that we're using
+    Let used_regs_mask be get_used_callee_saved_registers(ra)
+
+    # Check each callee-saved register and save if used
+    # REG_RBX=1 (bit 0)
+    Let test_bit be used_regs_mask bit_and 1
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    pushq %rbx  # Save callee-saved register")
+    End If
+
+    # REG_R12=4 (bit 4)
+    Set test_bit to used_regs_mask bit_and 16
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    pushq %r12  # Save callee-saved register")
+    End If
+
+    # REG_R13=5 (bit 5)
+    Set test_bit to used_regs_mask bit_and 32
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    pushq %r13  # Save callee-saved register")
+    End If
+
+    # REG_R14=6 (bit 6)
+    Set test_bit to used_regs_mask bit_and 64
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    pushq %r14  # Save callee-saved register")
+    End If
+
+    # REG_R15=7 (bit 7)
+    Set test_bit to used_regs_mask bit_and 128
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    pushq %r15  # Save callee-saved register")
+    End If
+
     # Generate function body statements
     # Function structure has:
     # offset 24: return_type (string)
@@ -2632,6 +3326,37 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     End If
 
     # Add function epilogue if function doesn't end with explicit return
+    # Restore callee-saved registers in reverse order
+    # REG_R15=7 (bit 7)
+    Set test_bit to used_regs_mask bit_and 128
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    popq %r15  # Restore callee-saved register")
+    End If
+
+    # REG_R14=6 (bit 6)
+    Set test_bit to used_regs_mask bit_and 64
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    popq %r14  # Restore callee-saved register")
+    End If
+
+    # REG_R13=5 (bit 5)
+    Set test_bit to used_regs_mask bit_and 32
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    popq %r13  # Restore callee-saved register")
+    End If
+
+    # REG_R12=4 (bit 4)
+    Set test_bit to used_regs_mask bit_and 16
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    popq %r12  # Restore callee-saved register")
+    End If
+
+    # REG_RBX=1 (bit 0)
+    Set test_bit to used_regs_mask bit_and 1
+    If test_bit is not equal to 0:
+        emit_line(output_file, "    popq %rbx  # Restore callee-saved register")
+    End If
+
     emit_line(output_file, "    movq %rbp, %rsp")
     emit_line(output_file, "    popq %rbp")
     emit_line(output_file, "    ret")
