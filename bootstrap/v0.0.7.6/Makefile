@@ -18,7 +18,7 @@
 # Compiler settings
 CC = gcc
 CFLAGS ?= -Wall -Wextra -std=c99 -O2 -g -fPIC
-RUNAC_V0073 = ../v0.0.7.3/bin/runac
+RUNAC_V0073 = ../v0.0.7.5/build/runac
 RUNAC_FLAGS =
 AS = as
 ASFLAGS = --64
