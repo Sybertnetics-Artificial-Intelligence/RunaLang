@@ -18,7 +18,7 @@
 # Compiler settings
 CC = gcc
 CFLAGS ?= -Wall -Wextra -std=c99 -O2 -g -fPIC
-RUNAC_V0073 = ../v0.0.7.5/build/runac
+RUNAC_LASTBOOTSTRAP = ../v0.0.7.5/stage1/runac
 RUNAC_FLAGS =
 AS = as
 ASFLAGS = --64
@@ -96,7 +96,7 @@ $(STAGE1_DIR)/%.o: $(RUNTIME_DIR)/%.c
 
 # Stage 1 Runa compilation (using v0.0.7.3)
 $(STAGE1_DIR)/%.s: $(SRC_DIR)/%.runa
-	$(RUNAC_V0073) $< $@ $(RUNAC_FLAGS)
+	$(RUNAC_LASTBOOTSTRAP) $< $@ $(RUNAC_FLAGS)
 
 # Stage 1 assembly to object with symbol handling
 $(STAGE1_DIR)/%.o: $(STAGE1_DIR)/%.s
