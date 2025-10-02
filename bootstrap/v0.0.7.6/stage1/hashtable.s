@@ -275,7 +275,10 @@ hashtable_create_with_destructors:
     popq %rdx
     call memory_set_pointer_at_index@PLT
     movq -72(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
@@ -479,8 +482,9 @@ hashtable_put:
     movq -40(%rbp), %rax
     pushq %rax
     movq -48(%rbp), %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_9
     cqto
@@ -497,7 +501,11 @@ hashtable_put:
     imulq %rbx, %rax
     movq %rax, -64(%rbp)
     movq -40(%rbp), %rax
-    subq -64(%rbp), %rax
+    pushq %rax
+    movq -64(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -72(%rbp)
     movq $0, %rax
     pushq %rax
@@ -755,7 +763,10 @@ hashtable_put:
     call memory_get_integer@PLT
     movq %rax, -160(%rbp)
     movq -160(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
@@ -840,8 +851,9 @@ hashtable_get:
     movq -32(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_19
     cqto
@@ -858,7 +870,11 @@ hashtable_get:
     imulq %rbx, %rax
     movq %rax, -56(%rbp)
     movq -32(%rbp), %rax
-    subq -56(%rbp), %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -64(%rbp)
     movq $0, %rax
     pushq %rax
@@ -1022,8 +1038,9 @@ hashtable_remove:
     movq -32(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_24
     cqto
@@ -1040,7 +1057,11 @@ hashtable_remove:
     imulq %rbx, %rax
     movq %rax, -56(%rbp)
     movq -32(%rbp), %rax
-    subq -56(%rbp), %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -64(%rbp)
     movq $0, %rax
     pushq %rax
@@ -1244,7 +1265,11 @@ hashtable_remove:
     call memory_get_integer@PLT
     movq %rax, -152(%rbp)
     movq -152(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
@@ -1555,7 +1580,10 @@ hashtable_clear:
     popq %rdx
     call memory_set_pointer_at_index@PLT
     movq -48(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
@@ -1726,7 +1754,10 @@ hashtable_iterator_create:
 .L441:
 .L442:
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
@@ -2053,7 +2084,10 @@ hashtable_iterator_next:
     call memory_get_integer@PLT
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -96(%rbp)
 .L561:    movq -96(%rbp), %rax
     pushq %rax
@@ -2109,7 +2143,10 @@ hashtable_iterator_next:
 .L571:
 .L572:
     movq -96(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -96(%rbp), %rbx
     popq %rax
@@ -2183,19 +2220,28 @@ hash_string:
     imulq %rbx, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rax
-    addq -24(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -24(%rbp), %rax
-    addq -32(%rbp), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
@@ -2290,8 +2336,9 @@ hash_integer:
     movq -16(%rbp), %rax
     pushq %rax
     movq $1073741824, %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_60
     cqto
@@ -2302,7 +2349,10 @@ hash_integer:
 .Ldiv_done_60:
     movq %rax, -32(%rbp)
     movq -16(%rbp), %rax
-    addq -32(%rbp), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
@@ -2321,8 +2371,9 @@ hash_integer:
     movq -16(%rbp), %rax
     pushq %rax
     movq $134217728, %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_61
     cqto
@@ -2333,7 +2384,10 @@ hash_integer:
 .Ldiv_done_61:
     movq %rax, -48(%rbp)
     movq -16(%rbp), %rax
-    addq -48(%rbp), %rax
+    pushq %rax
+    movq -48(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
@@ -2348,7 +2402,11 @@ hash_integer:
     testq %rax, %rax
     jz .L621
     movq $0, %rax
-    subq -16(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
@@ -2424,8 +2482,9 @@ hash_pointer:
     movq -16(%rbp), %rax
     pushq %rax
     movq $4294967296, %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_64
     cqto
@@ -2436,7 +2495,10 @@ hash_pointer:
 .Ldiv_done_64:
     movq %rax, -24(%rbp)
     movq -16(%rbp), %rax
-    addq -24(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
@@ -2455,8 +2517,9 @@ hash_pointer:
     movq -16(%rbp), %rax
     pushq %rax
     movq $4294967296, %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_65
     cqto
@@ -2467,7 +2530,10 @@ hash_pointer:
 .Ldiv_done_65:
     movq %rax, -40(%rbp)
     movq -16(%rbp), %rax
-    addq -40(%rbp), %rax
+    pushq %rax
+    movq -40(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
@@ -2482,7 +2548,11 @@ hash_pointer:
     testq %rax, %rax
     jz .L661
     movq $0, %rax
-    subq -16(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
@@ -2693,7 +2763,10 @@ hashtable_get_stats:
     testq %rax, %rax
     jz .L701
     movq -64(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
@@ -2712,7 +2785,10 @@ hashtable_get_stats:
     testq %rax, %rax
     jz .L712
     movq -88(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -88(%rbp), %rbx
     popq %rax
@@ -2731,7 +2807,10 @@ hashtable_get_stats:
     jmp .L711
 .L712:
     movq -48(%rbp), %rax
-    addq -88(%rbp), %rax
+    pushq %rax
+    movq -88(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
@@ -2755,7 +2834,10 @@ hashtable_get_stats:
 .L722:
 .L702:
     movq -72(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
@@ -2783,7 +2865,11 @@ hashtable_get_stats:
     popq %rdx
     call memory_set_integer@PLT
     movq -24(%rbp), %rax
-    subq -64(%rbp), %rax
+    pushq %rax
+    movq -64(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -96(%rbp)
     movq $0, %rax
     movq %rax, -104(%rbp)
@@ -2808,8 +2894,9 @@ hashtable_get_stats:
     movq -104(%rbp), %rax
     pushq %rax
     movq -96(%rbp), %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_74
     cqto
@@ -2844,8 +2931,9 @@ hashtable_get_stats:
     movq -112(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_75
     cqto

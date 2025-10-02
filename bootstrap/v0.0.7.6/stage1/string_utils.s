@@ -162,7 +162,10 @@ string_length:
     jmp .L22
 .L21:
     movq -16(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -16(%rbp)
 .L22:
     jmp .L11
@@ -330,7 +333,10 @@ string_equals:
     jmp .L92
 .L91:
     movq -24(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -24(%rbp)
 .L92:
     jmp .L71
@@ -620,7 +626,11 @@ integer_to_string:
     movq $1, %rax
     movq %rax, -24(%rbp)
     movq $0, %rax
-    subq -8(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -32(%rbp)
     jmp .L212
 .L211:
@@ -639,13 +649,17 @@ integer_to_string:
     testq %rax, %rax
     jz .L222
     movq -56(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -56(%rbp)
     movq -64(%rbp), %rax
     pushq %rax
     movq $10, %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_23
     cqto
@@ -658,7 +672,10 @@ integer_to_string:
     jmp .L221
 .L222:
     movq -56(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -88(%rbp)
     movq -24(%rbp), %rax
     pushq %rax
@@ -670,7 +687,10 @@ integer_to_string:
     testq %rax, %rax
     jz .L241
     movq -88(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -88(%rbp)
     jmp .L242
 .L241:
@@ -692,7 +712,10 @@ integer_to_string:
     testq %rax, %rax
     jz .L251
     movq -112(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -112(%rbp)
     jmp .L252
 .L251:
@@ -710,7 +733,11 @@ integer_to_string:
     movq -32(%rbp), %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -112(%rbp)
     movq -24(%rbp), %rax
     pushq %rax
@@ -722,7 +749,10 @@ integer_to_string:
     testq %rax, %rax
     jz .L261
     movq -112(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -112(%rbp)
     jmp .L262
 .L261:
@@ -739,8 +769,9 @@ integer_to_string:
     movq -64(%rbp), %rax
     pushq %rax
     movq $10, %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_28
     cqto
@@ -757,10 +788,17 @@ integer_to_string:
     imulq %rbx, %rax
     movq %rax, -160(%rbp)
     movq -64(%rbp), %rax
-    subq -160(%rbp), %rax
+    pushq %rax
+    movq -160(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -168(%rbp)
     movq -168(%rbp), %rax
-    addq $48, %rax
+    pushq %rax
+    movq $48, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -176(%rbp)
     movq -176(%rbp), %rax
     pushq %rax
@@ -773,13 +811,18 @@ integer_to_string:
     popq %rdx
     call memory_set_byte@PLT
     movq -112(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -112(%rbp)
     movq -64(%rbp), %rax
     pushq %rax
     movq $10, %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_29
     cqto
@@ -829,10 +872,17 @@ bit_not:
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -16(%rbp)
     movq $0, %rax
-    subq -16(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rax
     movq %rbp, %rsp
@@ -985,13 +1035,23 @@ string_to_integer:
     movq $48, %rax
     movq %rax, -112(%rbp)
     movq -80(%rbp), %rax
-    subq -112(%rbp), %rax
+    pushq %rax
+    movq -112(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -120(%rbp)
     movq -16(%rbp), %rax
-    addq -120(%rbp), %rax
+    pushq %rax
+    movq -120(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -16(%rbp)
     movq -24(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -24(%rbp)
     jmp .L352
 .L351:
@@ -1011,7 +1071,11 @@ string_to_integer:
     testq %rax, %rax
     jz .L361
     movq $0, %rax
-    subq -16(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -16(%rbp)
     jmp .L362
 .L361:
@@ -1251,7 +1315,10 @@ string_builder_ensure_capacity:
     call memory_get_integer@PLT
     movq %rax, -32(%rbp)
     movq -24(%rbp), %rax
-    addq -16(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
     pushq %rax
@@ -1460,7 +1527,10 @@ string_builder_append:
     popq %rdx
     call memory_copy_string
     movq -48(%rbp), %rax
-    addq -24(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
@@ -1553,7 +1623,10 @@ string_builder_append_char:
     popq %rdx
     call memory_set_byte@PLT
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -40(%rbp)
     movq $0, %rax
     pushq %rax
@@ -2094,7 +2167,10 @@ string_tokenizer_next:
     jmp .L622
 .L621:
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -40(%rbp)
 .L622:
 .L612:
@@ -2190,14 +2266,21 @@ string_tokenizer_next:
     jmp .L662
 .L661:
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -40(%rbp)
 .L662:
 .L652:
     jmp .L641
 .L642:
     movq -40(%rbp), %rax
-    subq -104(%rbp), %rax
+    pushq %rax
+    movq -104(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -160(%rbp)
     movq -160(%rbp), %rax
     pushq %rax
@@ -2238,7 +2321,10 @@ string_tokenizer_next:
     popq %rdx
     call memory_set_byte@PLT
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -2393,7 +2479,10 @@ string_tokenizer_has_next:
     jmp .L722
 .L721:
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -40(%rbp)
 .L722:
 .L712:
@@ -2746,7 +2835,10 @@ string_array_add:
     popq %rdx
     call memory_set_pointer@PLT
     movq -24(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
@@ -2826,7 +2918,10 @@ string_array_destroy:
     popq %rdi
     call deallocate@PLT
     movq -32(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -32(%rbp)
     jmp .L821
 .L822:
@@ -2862,7 +2957,10 @@ string_duplicate:
     call string_length@PLT
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     popq %rdi
     call allocate@PLT
@@ -3002,7 +3100,11 @@ string_ends_with:
 .L861:
 .L862:
     movq -24(%rbp), %rax
-    subq -32(%rbp), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -3240,7 +3342,10 @@ string_is_whitespace:
 .L961:
 .L962:
     movq -24(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -24(%rbp)
     jmp .L911
 .L912:
@@ -3364,7 +3469,10 @@ string_is_numeric:
 .L1011:
 .L1012:
     movq -24(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -24(%rbp)
     jmp .L1001
 .L1002:
@@ -3430,7 +3538,10 @@ string_contains_char_value:
 .L1031:
 .L1032:
     movq -32(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -32(%rbp)
     jmp .L1021
 .L1022:
@@ -3551,7 +3662,10 @@ memory_copy_string:
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
     movq -8(%rbp), %rax
-    addq -16(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -24(%rbp), %rax
     movq %rax, -40(%rbp)
@@ -3600,7 +3714,10 @@ memory_copy_string:
     jmp .L1082
 .L1081:
     movq -48(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -48(%rbp)
 .L1082:
     jmp .L1071
@@ -3668,7 +3785,10 @@ memory_copy_string_to_buffer:
     jmp .L1102
 .L1101:
     movq -32(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -32(%rbp)
 .L1102:
     jmp .L1091
@@ -3690,7 +3810,10 @@ memory_pointer_offset:
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
-    addq -16(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
