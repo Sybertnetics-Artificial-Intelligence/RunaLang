@@ -610,6 +610,14 @@ main:
     pushq %rax
     popq %rdi
     call print_string
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -654,6 +662,14 @@ main:
     popq %rdi
     call lexer_destroy
     movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -734,6 +750,14 @@ main:
     pushq %rax
     popq %rdi
     call deallocate@PLT
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -768,6 +792,14 @@ main:
     popq %rdi
     call lexer_destroy
     movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -849,6 +881,10 @@ main:
     pushq %rax
     popq %rdi
     call deallocate@PLT
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call codegen_destroy
     movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -862,6 +898,14 @@ main:
     popq %rdi
     call lexer_destroy
     movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT

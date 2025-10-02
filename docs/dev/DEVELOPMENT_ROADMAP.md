@@ -2,8 +2,24 @@
 ## From v0.0.8 to v1.0
 
 **Current Status:** v0.0.8 (Self-Hosting Achieved ✅, First Self-Hosted Compiler)
-**Previous:** v0.0.7.5 (Minimal Bootstrap in C - no longer used)
+**Previous:** v0.0.7.6 (Minimal Bootstrap in C - no longer used)
 **Target:** v1.0 (Production-Ready Language)
+
+---
+
+## 🎯 Critical Path to v0.1.0 (Minimum Viable Stdlib)
+
+Before starting standard library development in v0.1.0, these features are **ABSOLUTE REQUIREMENTS**:
+
+1. ✅ **v0.0.8.1: Struct Construction & Field Access** - Can't write natural code without this
+2. ✅ **v0.0.8.2: Collections & For Each Loops** - Stdlib needs lists, dicts, sets
+3. ✅ **v0.0.8.3: Pattern Matching & ADT Construction** - Type system incomplete without it
+4. ✅ **v0.0.8.4: Lambda & Type Inference** - Functional patterns + DX improvement
+5. ⚠️ **v0.3.0: Error Handling (Try/Catch)** - Stdlib needs error handling
+6. ⚠️ **v0.6.0: Generics** - Stdlib will be severely limited without generic collections
+
+**Without features 1-4, stdlib code will look like C with English keywords.**
+**Without features 5-6, stdlib will be non-idiomatic and error-prone.**
 
 ---
 
@@ -13,9 +29,11 @@
 |---------|-----------|--------|
 | **v0.0.7.5** | Self-hosting compiler (C bootstrap) | ✅ **COMPLETE** |
 | **v0.0.8** | Core Language Complete (inline asm, imports, for loops, bitwise) | 🔄 **IN PROGRESS** |
-| **v0.0.8.1** | Collections (Lists, Dictionaries, Sets) | 📋 Planned |
-| **v0.0.8.2** | Match/Pattern Matching, Lambda Expressions | 📋 Planned |
-| **v0.0.8.3** | String Interpolation, Ternary Operator | 📋 Planned |
+| **v0.0.8.1** | Struct Construction & Field Access Syntax | 📋 Planned |
+| **v0.0.8.2** | Collections (Lists, Dictionaries, Sets) + For Each Loops | 📋 Planned |
+| **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | 📋 Planned |
+| **v0.0.8.4** | Lambda Expressions + Type Inference | 📋 Planned |
+| **v0.0.8.5** | String Interpolation, Ternary Operator | 📋 Planned |
 | **v0.0.9** | Native Object Writer, Linker & Pure Runa Runtime | 📋 Planned |
 | **v0.1.0** | Beta Release - Toolchain Independence | 🎯 Milestone |
 | **v0.2.0** | Standard Library Expansion + Triple Syntax (--canon/--developer/--viewer) | 📋 Planned |
@@ -184,18 +202,98 @@ End For
 
 ---
 
-# 🔹 v0.0.8.1: Collections
+# 🔹 v0.0.8.1: Struct Construction & Field Access Syntax
 
-**Goal:** Implement essential collection types - Lists, Dictionaries, Sets
+**Goal:** Implement natural language syntax for creating and accessing structs - the #1 blocker for writing natural Runa code.
+
+**Priority:** CRITICAL - Without this, all code looks like C with manual memory management.
 
 ## What Belongs Where:
 
 ### COMPILER (Parser/Codegen):
-- ❌ List literals: `[1, 2, 3]` or `a list containing 1, 2, 3`
-- ❌ Dictionary literals: `{"key": value}`
-- ❌ Set literals: `set containing 1, 2, 3`
-- ❌ List comprehensions: `[x multiplied by 2 for each x in numbers]`
-- ❌ Slicing syntax: `list from index 1 to 5`
+- ❌ **Struct construction syntax**: `Let point be a value of type Point with x as 10 and y as 20`
+  - Parser: Recognize `a value of type TypeName with field as value and field as value`
+  - Codegen: Generate allocate() + memory_set_integer() for each field
+- ❌ **Field access (read)**: `Let x_val be the x of p`
+  - Parser: Recognize `the FIELD of OBJECT` pattern
+  - Codegen: Look up struct type, calculate field offset, generate memory_get_integer()
+- ❌ **Field access (write)**: `Set the width of rect to 15`
+  - Parser: Recognize `Set the FIELD of OBJECT to VALUE` pattern
+  - Codegen: Look up struct type, calculate field offset, generate memory_set_integer()
+- ❌ **Developer mode dot notation**: `Let x_val be p.x` and `Set p.x to 15`
+  - Parser: Recognize dot notation as alternative syntax
+  - Codegen: Same as natural language form
+
+### TYPE SYSTEM (New):
+- ❌ **Type registry**: Store struct definitions (field names, types, offsets)
+- ❌ **Field offset calculation**: Given struct type and field name, return byte offset
+- ❌ **Type validation**: Ensure field exists in struct before accessing
+
+## Implementation Notes:
+
+**Struct construction creates:**
+```runa
+# User writes:
+Let point be a value of type Point with x as 10 and y as 20
+
+# Compiler generates:
+Let point be allocate(16)        # sizeof(Point) = 2 fields * 8 bytes
+memory_set_integer(point, 0, 10)  # x at offset 0
+memory_set_integer(point, 8, 20)  # y at offset 8
+```
+
+**Field access creates:**
+```runa
+# User writes:
+Let x_val be the x of p
+
+# Compiler generates:
+Let x_val be memory_get_integer(p, 0)  # x is at offset 0
+```
+
+## Success Criteria:
+- ✅ Struct construction with `a value of type` works
+- ✅ Field access with `the FIELD of OBJECT` works
+- ✅ Field assignment with `Set the FIELD of OBJECT to VALUE` works
+- ✅ Developer mode dot notation works: `p.x` and `p.x = value`
+- ✅ Type checking: compiler errors on non-existent fields
+- ✅ Multi-field structs work (3+ fields)
+- ✅ Nested struct access works: `the x of the position of player`
+- ✅ All existing tests still pass
+- ✅ New tests for struct syntax pass
+
+## Timeline: TBD
+
+---
+
+# 🔹 v0.0.8.2: Collections & For Each Loops
+
+**Goal:** Implement essential collection types (Lists, Dictionaries, Sets) and natural iteration syntax.
+
+**Priority:** HIGH - Required for stdlib and natural data structure usage.
+
+## What Belongs Where:
+
+### COMPILER (Parser/Codegen):
+- ❌ **List literals (canonical)**: `Let numbers be list containing 1, 2, 3, 4, 5`
+  - Parser: Recognize `list containing EXPR, EXPR, ...`
+  - Codegen: Generate list_create() + list_append() for each element
+- ❌ **Set literals (canonical)**: `Let unique be set containing 1, 2, 3`
+  - Parser: Recognize `set containing EXPR, EXPR, ...`
+  - Codegen: Generate set_create() + set_add() for each element
+- ❌ **Dictionary literals (canonical)**:
+  ```runa
+  Let config be dictionary with:
+      "width" as 800
+      "height" as 600
+  ```
+  - Parser: Recognize `dictionary with: KEY as VALUE` (indented pairs)
+  - Codegen: Generate dict_create() + dict_set() for each pair
+- ❌ **For each loops**: `For each item in items: ... End For`
+  - Parser: Recognize `For each IDENTIFIER in EXPRESSION:`
+  - Codegen: Generate iterator pattern with list_length/list_get
+- ❌ **Developer mode array literals**: `Let arr be [1, 2, 3]` (optional, for developer mode)
+- ❌ **Slicing syntax** (optional): `Let subset be list from index 1 to 5`
 
 ### RUNTIME (Implemented in Runa, compiled with runtime):
 - ❌ List operations: `list_create`, `list_append`, `list_insert`, `list_remove`, `list_get`, `list_set`, `list_length`
@@ -203,63 +301,189 @@ End For
 - ❌ Set operations: `set_create`, `set_add`, `set_contains`, `set_remove`, `set_union`, `set_intersection`
 
 ## Success Criteria:
-- ✅ List literals work
-- ✅ Dictionary literals work
-- ✅ Set literals work
-- ✅ All collection operations implemented
-- ✅ Collection types work with For Each loops
+- ✅ Canonical list syntax works: `list containing 1, 2, 3`
+- ✅ Canonical set syntax works: `set containing 1, 2, 3`
+- ✅ Canonical dictionary syntax works (indented key-value pairs)
+- ✅ For each loops work with lists, sets, and dictionaries
+- ✅ All collection operations implemented and tested
 - ✅ Memory management (no leaks)
+- ✅ Nested collections work: `list containing list containing 1, 2`
 - ✅ Tests for all collection types
+- ✅ Developer mode `[1, 2, 3]` syntax works (optional)
 
 ## Timeline: TBD
 
 ---
 
-# 🔹 v0.0.8.2: Match/Pattern Matching & Lambda Expressions
+# 🔹 v0.0.8.3: Match/Pattern Matching & ADT/Variant Construction
 
-**Goal:** Implement pattern matching and first-class functions
+**Goal:** Implement pattern matching and algebraic data types (sum types/variants) - enables proper type-safe data modeling.
+
+**Priority:** HIGH - ADTs are core to the type system and useless without pattern matching.
 
 ## What Belongs Where:
 
 ### COMPILER (Parser/Codegen):
-- ❌ Match statement: `Match value: When pattern: ... End Match`
-- ❌ Pattern matching with types: `When value of type Integer`
-- ❌ Pattern matching with destructuring: `When [first, rest...]`
-- ❌ Lambda expressions: `lambda x: x multiplied by 2`
-- ❌ Function types: `Function[Integer, String, Boolean]`
+- ❌ **Variant/ADT type definitions**:
+  ```runa
+  Type Shape is:
+      | Circle with radius as Float
+      | Rectangle with width as Float and height as Float
+      | Triangle with base as Float and height as Float
+  End Type
+  ```
+  - Parser: Recognize `Type NAME is: | Variant | Variant ...`
+  - Type system: Store variant names and their fields
+- ❌ **Variant construction**: `Let circle be Shape.Circle with radius as 5.0`
+  - Parser: Recognize `TypeName.VariantName with field as value`
+  - Codegen: Generate tagged union with discriminator + field storage
+- ❌ **Match statement**: `Match value: When pattern: ... End Match`
+  - Parser: Recognize `Match EXPR: When PATTERN: BLOCK ...`
+  - Codegen: Generate switch/if-chain on discriminator
+- ❌ **Pattern matching with variants**:
+  ```runa
+  Match shape:
+      When Circle with radius as r:
+          Return 3.14159 multiplied by r multiplied by r
+      When Rectangle with width as w and height as h:
+          Return w multiplied by h
+  ```
+  - Parser: Recognize `When VariantName with field as binding`
+  - Codegen: Extract discriminator, extract fields from tagged union
+- ❌ **Pattern matching with literals**: `When 0:`, `When "hello":`
+- ❌ **Pattern matching with types**: `When value of type Integer:`
+- ❌ **Wildcard pattern**: `When _:` (catch-all)
+- ❌ **Exhaustiveness checking**: Compiler warns on missing variant cases
 
-### RUNTIME:
-- ❌ Function closures (capture environment)
-- ❌ Higher-order function utilities: `map`, `filter`, `reduce`
+### TYPE SYSTEM (Enhanced):
+- ❌ **Tagged union representation**: Discriminator (int) + max-sized field storage
+- ❌ **Variant registry**: Store all variants for a type
+- ❌ **Exhaustiveness analysis**: Verify all variants are handled
+
+## Implementation Notes:
+
+**Tagged union layout:**
+```runa
+# Type Shape is: Circle | Rectangle | Triangle
+# Compiler generates:
+struct Shape {
+    int discriminator;  # 0=Circle, 1=Rectangle, 2=Triangle
+    union {
+        struct { float radius; } circle;
+        struct { float width; float height; } rectangle;
+        struct { float base; float height; } triangle;
+    } data;
+}
+```
 
 ## Success Criteria:
-- ✅ Match statements with multiple patterns
-- ✅ Exhaustiveness checking (compiler warns on missing cases)
-- ✅ Lambda expressions as values
-- ✅ Closures capture variables correctly
-- ✅ Higher-order functions work
+- ✅ Variant type definitions parse correctly
+- ✅ Variant construction works: `Shape.Circle with radius as 5.0`
+- ✅ Match statements with multiple patterns work
+- ✅ Pattern destructuring extracts fields correctly
+- ✅ Exhaustiveness checking warns on missing cases
+- ✅ Wildcard pattern `_` works as catch-all
+- ✅ Nested patterns work: `When Some(x):`
+- ✅ All tests pass including ADT tests
 
 ## Timeline: TBD
 
 ---
 
-# 🔹 v0.0.8.3: String Interpolation & Ternary Operator
+# 🔹 v0.0.8.4: Lambda Expressions & Type Inference
 
-**Goal:** Developer ergonomics improvements
+**Goal:** Implement first-class functions and basic type inference for improved developer experience.
+
+**Priority:** MEDIUM-HIGH - Enables functional programming patterns and reduces verbosity.
 
 ## What Belongs Where:
 
 ### COMPILER (Parser/Codegen):
-- ❌ String interpolation: `f"Value is {x}"`
-- ❌ Ternary operator: `value If condition Otherwise other_value`
-- ❌ Range expressions: `1 to 10`, `1 through 10`
+- ❌ **Lambda expressions**: `Let double be lambda x: x multiplied by 2`
+  - Parser: Recognize `lambda PARAMS: EXPRESSION`
+  - Codegen: Generate anonymous function with closure capture
+- ❌ **Multi-parameter lambdas**: `Let add be lambda x, y: x plus y`
+- ❌ **Lambda in function calls**: `Let doubled be Map over numbers using lambda x: x multiplied by 2`
+- ❌ **Function types**: `Function[Integer, Integer]` (takes Integer, returns Integer)
+- ❌ **Type inference for literals**: `Let x be 42` infers `Integer`, `Let name be "Alice"` infers `String`
+- ❌ **Type inference for collections**: `Let numbers be list containing 1, 2, 3` infers `List[Integer]`
+- ❌ **Type inference for function returns**: Infer return type from function body
+- ❌ **Type inference for lambda parameters**: Infer from usage context
 
 ### RUNTIME:
-- ❌ Format string support functions
+- ❌ **Function closures**: Capture environment (free variables)
+- ❌ **Higher-order function utilities**: `map`, `filter`, `reduce`, `fold`
+- ❌ **Closure memory management**: Allocate/deallocate closure environment
+
+### TYPE SYSTEM (Enhanced):
+- ❌ **Type inference engine**: Hindley-Milner-style inference (simplified)
+- ❌ **Type unification**: Resolve type variables to concrete types
+- ❌ **Type constraint solving**: Ensure consistent types across expressions
+
+## Implementation Notes:
+
+**Lambda closures capture environment:**
+```runa
+Let x be 10
+Let add_x be lambda y: y plus x  # Captures 'x' from environment
+
+# Compiler generates:
+struct Closure {
+    void* function_ptr;
+    void* environment;  # Stores captured variables
+}
+```
+
+**Type inference:**
+```runa
+# User writes:
+Let x be 42
+
+# Compiler infers:
+Let x as Integer be 42
+```
 
 ## Success Criteria:
-- ✅ String interpolation with expressions
-- ✅ Ternary operator precedence correct
+- ✅ Lambda expressions parse and compile correctly
+- ✅ Lambdas can be assigned to variables
+- ✅ Lambdas can be passed to functions
+- ✅ Closures capture free variables correctly
+- ✅ Higher-order functions (map, filter, reduce) work
+- ✅ Type inference works for literals, collections, and functions
+- ✅ Type errors are reported when inference fails
+- ✅ All tests pass including lambda and inference tests
+
+## Timeline: TBD
+
+---
+
+# 🔹 v0.0.8.5: String Interpolation & Ternary Operator
+
+**Goal:** Developer ergonomics improvements - syntactic sugar for common patterns.
+
+**Priority:** MEDIUM - Nice to have, but not critical for core functionality.
+
+## What Belongs Where:
+
+### COMPILER (Parser/Codegen):
+- ❌ **String interpolation**: `Display f"Value is {x}"`
+  - Parser: Recognize `f"text {expr} text"` format strings
+  - Codegen: Generate string concatenation calls
+- ❌ **Ternary operator**: `Let result be value If condition Otherwise other_value`
+  - Parser: Recognize `EXPR If COND Otherwise EXPR`
+  - Codegen: Generate conditional expression (inline if)
+- ❌ **Range expressions**: `1 to 10`, `1 through 10`
+  - Parser: Recognize range syntax
+  - Codegen: Generate range iterator for For loops
+
+### RUNTIME:
+- ❌ **Format string support**: Convert expressions to strings for interpolation
+- ❌ **String concatenation**: Efficient string building for interpolation
+
+## Success Criteria:
+- ✅ String interpolation with expressions works
+- ✅ Nested expressions in interpolation work: `f"Result: {x plus y}"`
+- ✅ Ternary operator precedence is correct
 - ✅ Range expressions work in For loops
 - ✅ All features tested
 
@@ -2702,6 +2926,91 @@ runaprof program.profile
 
 ---
 
-# 🎯 Priority Adjustments
+# 🎯 Priority Adjustments & Feature Dependencies
+
+## Language Completeness Analysis
+
+**Current Status (v0.0.7.6):** ~30% of language specification implemented
+
+### Core Features Present ✅
+- Variables, functions, control flow
+- Basic types, structs, arrays
+- Imports, inline assembly
+- Bitwise operators, compound assignment
+- Comments, string literals
+
+### Critical Missing Features ❌ (Blocks Natural Code)
+1. **Struct construction & field access** (`Let p be a value of type Point with x as 10`, `the x of p`)
+2. **Collection literals** (`list containing 1, 2, 3`, `dictionary with "key" as value`)
+3. **For each loops** (`For each item in items`)
+4. **Pattern matching** (`Match value: When pattern: ...`)
+5. **ADT/Variant construction** (`Shape.Circle with radius as 5.0`)
+6. **Lambda expressions** (`lambda x: x multiplied by 2`)
+7. **Type inference** (`Let x be 42` auto-infers Integer)
+
+### High Priority Features ⚠️ (Needed for Stdlib)
+8. **Error handling** (`Try/Catch/Finally`)
+9. **Generics** (`Process[T]`, `List[T]`)
+10. **Result types** (`Result[T, E]`)
+
+### Lower Priority Features 📋 (Nice to Have)
+- String interpolation, ternary operator
+- Async/await, concurrency
+- Advanced control structures
+- Operator overloading
+- Property accessors
+
+## Recommended Timeline Adjustment
+
+**Original plan had Error Handling in v0.3.0 and Generics in v0.6.0.**
+**Problem:** Can't write idiomatic stdlib without these features.
+
+**Proposed adjustment:**
+- **v0.0.8.1-8.5**: Implement features #1-7 (critical missing features)
+- **v0.0.9**: Native toolchain (as planned)
+- **v0.1.0-0.2.0**: Basic stdlib WITHOUT generics/error handling (functional but limited)
+- **v0.3.0**: Error Handling (Try/Catch, Result types) - MOVED UP IN PRIORITY
+- **v0.4.0**: Memory Management (as planned)
+- **v0.5.0**: Optimization (as planned)
+- **v0.6.0**: Generics + Advanced Types - CRITICAL FOR STDLIB MATURITY
+- **v0.6.1**: Type Inference improvements (as planned)
+- **v0.7.0+**: Concurrency, advanced features
+
+**Key insight:** Stdlib development will happen in two phases:
+1. **v0.1.0-0.2.0**: Basic stdlib with manual types (before generics)
+2. **v0.6.0+**: Mature stdlib with generic collections (after generics)
+
+## Feature Dependency Graph
+
+```
+v0.0.8 (Base Language)
+    ↓
+v0.0.8.1 (Struct Syntax) ← CRITICAL - Everything depends on this
+    ↓
+v0.0.8.2 (Collections + For Each) ← HIGH - Stdlib needs collections
+    ↓
+v0.0.8.3 (Pattern Matching + ADTs) ← HIGH - Type system completeness
+    ↓
+v0.0.8.4 (Lambdas + Inference) ← MEDIUM - Functional patterns
+    ↓
+v0.1.0 (Basic Stdlib) ← Can start here, but limited without generics
+    ↓
+v0.3.0 (Error Handling) ← Stdlib needs this for production use
+    ↓
+v0.6.0 (Generics) ← Stdlib becomes mature here
+    ↓
+v1.0.0 (Production Release)
+```
+
+## Summary
+
+**To reach v0.1.0 (Minimum Viable Stdlib):**
+- Must complete: v0.0.8.1, v0.0.8.2, v0.0.8.3, v0.0.8.4
+- Should complete: v0.0.8.5 (nice to have)
+- Can defer: Error handling and generics (will retrofit stdlib later)
+
+**To reach v1.0.0 (Production Ready):**
+- Must complete: Everything through v0.6.0 (generics)
+- Stdlib will need significant refactoring when generics arrive
 
 
