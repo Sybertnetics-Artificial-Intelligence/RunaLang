@@ -313,11 +313,219 @@ The compiler will recognize specific machine module patterns and optimize them:
 | `Machine.rdtsc()` | `rdtsc` instruction pair |
 
 ### **Platform-Specific Compilation**
-The compiler selects platform-specific implementations at compile time:
-- x86_64: Intel/AMD specific instructions
-- ARM64: ARM specific instructions (SVC instead of SYSCALL)
-- RISC-V: RISC-V specific instructions
-- WASM: Appropriate WASI calls
+
+#### **Critical Understanding: Parser vs Content**
+
+**The Runa inline assembly PARSER does not change per platform.**
+
+**The inline assembly CONTENT must be completely rewritten per platform.**
+
+The Runa syntax for inline assembly remains identical across all platforms:
+
+```runa
+Inline Assembly volatile:
+    [assembly code here]
+    : [output operands]
+    : [input operands]
+    : [clobbered registers]
+End Assembly
+```
+
+The parser handles this universally. However, the **actual assembly instructions inside the block** must be completely rewritten for each CPU architecture because different CPUs have:
+
+1. **Different Instruction Sets**: x86-64 uses `syscall`, ARM64 uses `svc`, RISC-V uses `ecall`
+2. **Different Register Names**: x86-64 uses `rax`, ARM64 uses `x8`, RISC-V uses `a7`
+3. **Different Calling Conventions**: Parameters passed in different registers per platform
+4. **Different Assembly Syntax**: AT&T syntax vs Intel syntax vs ARM syntax
+
+#### **Multi-Platform Directory Structure**
+
+```
+runa/src/stdlib/core/machine/
+├── common.runa           # Shared type definitions and constants
+├── x86_64/
+│   ├── syscall.runa     # x86-64 Linux/Windows inline assembly
+│   ├── atomic.runa      # x86-64 atomic operations (LOCK prefix)
+│   ├── memory.runa      # x86-64 memory operations (MFENCE, etc.)
+│   └── cpu.runa         # x86-64 CPU features (CPUID, RDTSC)
+├── arm64/
+│   ├── syscall.runa     # ARM64 Linux/macOS inline assembly
+│   ├── atomic.runa      # ARM64 atomic operations (LDADD, CASA)
+│   ├── memory.runa      # ARM64 memory operations (DMB, DSB)
+│   └── cpu.runa         # ARM64 CPU features (MRS, system registers)
+├── riscv64/
+│   ├── syscall.runa     # RISC-V inline assembly
+│   ├── atomic.runa      # RISC-V atomic operations (LR/SC, AMO)
+│   ├── memory.runa      # RISC-V memory operations (FENCE)
+│   └── cpu.runa         # RISC-V CPU features
+└── wasm/
+    ├── syscall.runa     # WASI function imports
+    ├── atomic.runa      # WebAssembly atomic operations
+    ├── memory.runa      # WebAssembly memory operations
+    └── cpu.runa         # WebAssembly feature detection
+```
+
+#### **Example: Same API, Different Assembly**
+
+The same `atomic_add` function signature exists on all platforms, but with completely different implementations:
+
+**x86_64/atomic.runa (Linux/Windows):**
+```runa
+Process called "atomic_add" takes ptr as Pointer, value as Integer returns Integer:
+    @Implementation
+        x86-64 atomic fetch-and-add using LOCK XADD instruction.
+    @End Implementation
+
+    Let old_value as Integer
+
+    Inline Assembly volatile:
+        "lock xadd [%1], %2"     # x86-64: LOCK prefix + XADD instruction
+        "mov %0, %2"
+        : "=r"(old_value)
+        : "r"(ptr), "r"(value)
+        : "memory"
+    End Assembly
+
+    Return old_value
+End Process
+```
+
+**arm64/atomic.runa (Linux/macOS):**
+```runa
+Process called "atomic_add" takes ptr as Pointer, value as Integer returns Integer:
+    @Implementation
+        ARM64 atomic fetch-and-add using LDADD instruction (ARMv8.1+).
+    @End Implementation
+
+    Let old_value as Integer
+
+    Inline Assembly volatile:
+        "ldadd %2, %0, [%1]"     # ARM64: Atomic Load-Add instruction
+        : "=r"(old_value)
+        : "r"(ptr), "r"(value)
+        : "memory"
+    End Assembly
+
+    Return old_value
+End Process
+```
+
+**riscv64/atomic.runa (Linux):**
+```runa
+Process called "atomic_add" takes ptr as Pointer, value as Integer returns Integer:
+    @Implementation
+        RISC-V atomic fetch-and-add using AMOADD instruction.
+    @End Implementation
+
+    Let old_value as Integer
+
+    Inline Assembly volatile:
+        "amoadd.d.aqrl %0, %2, (%1)"  # RISC-V: Atomic Memory Operation ADD
+        : "=r"(old_value)
+        : "r"(ptr), "r"(value)
+        : "memory"
+    End Assembly
+
+    Return old_value
+End Process
+```
+
+#### **Example: System Call Differences**
+
+**x86_64/syscall.runa (Linux):**
+```runa
+Process called "raw_syscall" takes number as Integer, arg1 as Integer returns Integer:
+    Let result as Integer
+
+    Inline Assembly volatile:
+        "mov rax, %1"    Note: Syscall number in RAX
+        "mov rdi, %2"    Note: First argument in RDI
+        "syscall"        Note: x86-64 syscall instruction
+        "mov %0, rax"    Note: Return value from RAX
+        : "=r"(result)
+        : "r"(number), "r"(arg1)
+        : "rax", "rdi", "rcx", "r11", "memory"
+    End Assembly
+
+    Return result
+End Process
+```
+
+**arm64/syscall.runa (Linux):**
+```runa
+Process called "raw_syscall" takes number as Integer, arg1 as Integer returns Integer:
+    Let result as Integer
+
+    Inline Assembly volatile:
+        "mov x8, %1"     Note: Syscall number in X8 (different register!)
+        "mov x0, %2"     Note: First argument in X0 (different register!)
+        "svc #0"         Note: ARM64 supervisor call (different instruction!)
+        "mov %0, x0"     Note: Return value from X0
+        : "=r"(result)
+        : "r"(number), "r"(arg1)
+        : "x8", "x0", "memory"
+    End Assembly
+
+    Return result
+End Process
+```
+
+**arm64/syscall.runa (macOS):**
+```runa
+Process called "raw_syscall" takes number as Integer, arg1 as Integer returns Integer:
+    Let result as Integer
+
+    Inline Assembly volatile:
+        "mov x16, %1"    Note: macOS uses X16 for syscall number (OS difference!)
+        "mov x0, %2"     Note: First argument in X0
+        "svc #0x80"      Note: macOS uses different syscall number
+        "mov %0, x0"     Note: Return value from X0
+        : "=r"(result)
+        : "r"(number), "r"(arg1)
+        : "x16", "x0", "memory"
+    End Assembly
+
+    Return result
+End Process
+```
+
+#### **Compiler Platform Selection**
+
+At compile time, the compiler selects the appropriate platform directory based on:
+
+1. **Target Architecture**: x86_64, arm64, riscv64, wasm
+2. **Target OS**: Linux, Windows, macOS, WASI
+3. **Feature Availability**: CPU feature detection for optimized paths
+
+The compiler includes only the relevant platform's machine module in the build, ensuring:
+- No bloat from unused platform code
+- Compile-time platform verification
+- Zero runtime overhead for platform abstraction
+
+#### **Platform Coverage Matrix**
+
+| Platform | Architecture | OS | Status | Notes |
+|----------|-------------|-----|--------|-------|
+| Linux Desktop | x86_64 | Linux | ✅ Primary | System V ABI, syscall instruction |
+| Linux Desktop | arm64 | Linux | 🔄 Planned | System V ABI, svc instruction |
+| Linux Server | riscv64 | Linux | 🔄 Planned | System V ABI, ecall instruction |
+| macOS Desktop | arm64 | macOS | 🔄 Planned | Apple ABI, Darwin syscalls |
+| macOS Desktop | x86_64 | macOS | 🔄 Planned | Apple ABI, Darwin syscalls |
+| Windows Desktop | x86_64 | Windows | 🔄 Future | Microsoft ABI, Windows API |
+| Web Browser | wasm32 | WASI | 🔄 Future | WASI imports, no inline assembly |
+
+#### **User-Facing API Consistency**
+
+Despite platform differences, users import and use the machine module identically:
+
+```runa
+Import "core/machine/atomic" as Atomic
+
+Let counter be 0
+Atomic.atomic_add with ptr as counter and value as 1
+```
+
+The compiler automatically selects the correct platform-specific implementation. Users never see or write platform-specific code.
 
 ## Security and Safety Considerations
 

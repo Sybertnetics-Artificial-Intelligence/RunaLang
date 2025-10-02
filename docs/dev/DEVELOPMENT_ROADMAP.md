@@ -52,7 +52,7 @@
 - ✅ Variables (Let, Set)
 - ✅ Arithmetic operators (+, -, *, /, %)
 - ✅ Comparison operators (==, !=, <, >, <=, >=, "is not" variants)
-- ✅ Logical operators (and, or, not)
+- ✅ Logical operators (and, or)
 - ✅ Bitwise operators (bit_and, bit_or, bit_xor, bit_shift_left, bit_shift_right)
 - ✅ Control flow (If/Otherwise/End If, While/End While)
 - ✅ Functions (Process called ... returns ...)
