@@ -6,10 +6,10 @@ print_string:
     pushq %rbp
     movq %rsp, %rbp
 
-    # Note: Calculate string length
-    movq %rdi, %rsi  # Note: Save string pointer
-    movq %rdi, %rcx  # Note: Counter for strlen
-    xorq %rax, %rax  # Note: Length accumulator
+    # Calculate string length
+    movq %rdi, %rsi  # Save string pointer
+    movq %rdi, %rcx  # Counter for strlen
+    xorq %rax, %rax  # Length accumulator
 .strlen_loop:
     cmpb $0, (%rcx)
     je .strlen_done
@@ -18,18 +18,18 @@ print_string:
     jmp .strlen_loop
 .strlen_done:
 
-    # Note: Call write syscall (sys_write = 1)
-    movq $1, %rdi     # Note: fd = stdout
-    movq %rsi, %rsi   # Note: buf = string pointer (already in rsi)
-    movq %rax, %rdx   # Note: count = string length
-    movq $1, %rax     # Note: syscall number for write
+    # Call write syscall (sys_write = 1)
+    movq $1, %rdi     # fd = stdout
+    movq %rsi, %rsi   # buf = string pointer (already in rsi)
+    movq %rax, %rdx   # count = string length
+    movq $1, %rax     # syscall number for write
     syscall
 
-    # Note: Print newline
-    movq $1, %rdi     # Note: fd = stdout
-    leaq .newline(%rip), %rsi  # Note: newline string
-    movq $1, %rdx     # Note: count = 1
-    movq $1, %rax     # Note: syscall number for write
+    # Print newline
+    movq $1, %rdi     # fd = stdout
+    leaq .newline(%rip), %rsi  # newline string
+    movq $1, %rdx     # count = 1
+    movq $1, %rax     # syscall number for write
     syscall
 
     popq %rbp
@@ -39,19 +39,19 @@ print_string:
 print_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $32, %rsp  # Note: Space for string buffer (20 digits + null)
+    subq $32, %rsp  # Space for string buffer (20 digits + null)
 
-    # Note: Convert integer to string
-    movq %rdi, %rax  # Note: integer value
-    leaq -32(%rbp), %rsi  # Note: buffer pointer
-    addq $19, %rsi  # Note: point to end of buffer (for reverse building)
-    movb $0, (%rsi)  # Note: null terminator
+    # Convert integer to string
+    movq %rdi, %rax  # integer value
+    leaq -32(%rbp), %rsi  # buffer pointer
+    addq $19, %rsi  # point to end of buffer (for reverse building)
+    movb $0, (%rsi)  # null terminator
     decq %rsi
 
-    # Note: Handle zero case
+    # Handle zero case
     testq %rax, %rax
     jnz .convert_loop
-    movb $48, (%rsi)  # Note: '0' character
+    movb $48, (%rsi)  # '0' character
     jmp .convert_done
 
 .convert_loop:
@@ -60,18 +60,18 @@ print_integer:
     movq %rax, %rcx
     movq $10, %rbx
     xorq %rdx, %rdx
-    divq %rbx  # Note: %rax = quotient, %rdx = remainder
-    addq $48, %rdx  # Note: convert remainder to ASCII
-    movb %dl, (%rsi)  # Note: store digit
+    divq %rbx  # %rax = quotient, %rdx = remainder
+    addq $48, %rdx  # convert remainder to ASCII
+    movb %dl, (%rsi)  # store digit
     decq %rsi
     jmp .convert_loop
 
 .convert_done:
-    incq %rsi  # Note: point to first character
+    incq %rsi  # point to first character
 
-    # Note: Calculate string length
-    movq %rsi, %rcx  # Note: Counter for strlen
-    xorq %rax, %rax  # Note: Length accumulator
+    # Calculate string length
+    movq %rsi, %rcx  # Counter for strlen
+    xorq %rax, %rax  # Length accumulator
 .int_strlen_loop:
     cmpb $0, (%rcx)
     je .int_strlen_done
@@ -80,18 +80,18 @@ print_integer:
     jmp .int_strlen_loop
 .int_strlen_done:
 
-    # Note: Call write syscall (sys_write = 1)
-    movq $1, %rdi     # Note: fd = stdout
-    # Note: %rsi already points to string
-    movq %rax, %rdx   # Note: count = string length
-    movq $1, %rax     # Note: syscall number for write
+    # Call write syscall (sys_write = 1)
+    movq $1, %rdi     # fd = stdout
+    # %rsi already points to string
+    movq %rax, %rdx   # count = string length
+    movq $1, %rax     # syscall number for write
     syscall
 
-    # Note: Print newline
-    movq $1, %rdi     # Note: fd = stdout
-    leaq .newline(%rip), %rsi  # Note: newline string
-    movq $1, %rdx     # Note: count = 1
-    movq $1, %rax     # Note: syscall number for write
+    # Print newline
+    movq $1, %rdi     # fd = stdout
+    leaq .newline(%rip), %rsi  # newline string
+    movq $1, %rdx     # count = 1
+    movq $1, %rax     # syscall number for write
     syscall
 
     movq %rbp, %rsp
@@ -101,7 +101,7 @@ print_integer:
 
 .section .rodata
 .newline:
-    .byte 10  # Note: newline character
+    .byte 10  # newline character
 .text
 
 
@@ -109,7 +109,7 @@ print_integer:
 string_length:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -177,7 +177,7 @@ string_length:
 string_char_at:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -214,7 +214,7 @@ string_char_at:
 string_equals:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -339,7 +339,7 @@ string_equals:
 is_digit:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $48, %rax
     movq %rax, -16(%rbp)
@@ -383,7 +383,7 @@ is_digit:
 is_alpha:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $65, %rax
     movq %rax, -16(%rbp)
@@ -459,7 +459,7 @@ is_alpha:
 is_whitespace:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $32, %rax
     movq %rax, -16(%rbp)
@@ -543,7 +543,7 @@ is_whitespace:
 integer_to_string:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -805,7 +805,7 @@ integer_to_string:
 bit_not:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     addq $1, %rax
@@ -823,7 +823,7 @@ bit_not:
 system_write:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -853,7 +853,7 @@ system_write:
 string_to_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -999,7 +999,7 @@ string_to_integer:
 memory_reallocate:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1037,7 +1037,7 @@ memory_reallocate:
 string_builder_create_with_capacity:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $24, %rax
     pushq %rax
@@ -1135,7 +1135,7 @@ string_builder_create_with_capacity:
 string_builder_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq $256, %rax
     pushq %rax
     popq %rdi
@@ -1149,7 +1149,7 @@ string_builder_create:
 string_builder_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1189,7 +1189,7 @@ string_builder_destroy:
 string_builder_ensure_capacity:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $16, %rax
@@ -1324,7 +1324,7 @@ string_builder_ensure_capacity:
 string_builder_append:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1435,7 +1435,7 @@ string_builder_append:
 string_builder_append_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1537,7 +1537,7 @@ string_builder_append_char:
 string_builder_append_int:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -1561,7 +1561,7 @@ string_builder_append_int:
 string_builder_to_string:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1647,7 +1647,7 @@ string_builder_to_string:
 string_builder_get_string:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1686,7 +1686,7 @@ string_builder_get_string:
 string_builder_length:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1720,7 +1720,7 @@ string_builder_length:
 string_builder_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1772,7 +1772,7 @@ string_builder_clear:
 string_tokenizer_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1914,7 +1914,7 @@ string_tokenizer_create:
 string_tokenizer_next:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2210,7 +2210,7 @@ string_tokenizer_next:
 string_tokenizer_has_next:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2364,7 +2364,7 @@ string_tokenizer_has_next:
 string_tokenizer_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2436,7 +2436,7 @@ string_tokenizer_destroy:
 string_array_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq $24, %rax
     pushq %rax
     popq %rdi
@@ -2529,7 +2529,7 @@ string_array_create:
 string_array_add:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2688,7 +2688,7 @@ string_array_add:
 string_array_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2770,7 +2770,7 @@ string_array_destroy:
 string_duplicate:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2816,7 +2816,7 @@ string_duplicate:
 string_starts_with:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2885,7 +2885,7 @@ string_starts_with:
 string_ends_with:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2957,7 +2957,7 @@ string_ends_with:
 string_contains:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -2997,7 +2997,7 @@ string_contains:
 string_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3031,7 +3031,7 @@ string_is_empty:
 string_is_whitespace:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3167,7 +3167,7 @@ string_is_whitespace:
 string_is_numeric:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3288,7 +3288,7 @@ string_is_numeric:
 string_contains_char_value:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -3351,7 +3351,7 @@ string_contains_char_value:
 string_util_split:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     call string_array_create
@@ -3447,7 +3447,7 @@ string_util_split:
 memory_copy_string:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -3516,7 +3516,7 @@ memory_copy_string:
 memory_copy_string_to_buffer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -3581,7 +3581,7 @@ memory_copy_string_to_buffer:
 memory_pointer_offset:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -3595,7 +3595,7 @@ memory_pointer_offset:
 memory_allocate:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax

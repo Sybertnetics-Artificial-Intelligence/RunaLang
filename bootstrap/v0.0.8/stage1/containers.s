@@ -3,10 +3,10 @@ print_string:
     pushq %rbp
     movq %rsp, %rbp
 
-    # Note: Calculate string length
-    movq %rdi, %rsi  # Note: Save string pointer
-    movq %rdi, %rcx  # Note: Counter for strlen
-    xorq %rax, %rax  # Note: Length accumulator
+    # Calculate string length
+    movq %rdi, %rsi  # Save string pointer
+    movq %rdi, %rcx  # Counter for strlen
+    xorq %rax, %rax  # Length accumulator
 .strlen_loop:
     cmpb $0, (%rcx)
     je .strlen_done
@@ -15,18 +15,18 @@ print_string:
     jmp .strlen_loop
 .strlen_done:
 
-    # Note: Call write syscall (sys_write = 1)
-    movq $1, %rdi     # Note: fd = stdout
-    movq %rsi, %rsi   # Note: buf = string pointer (already in rsi)
-    movq %rax, %rdx   # Note: count = string length
-    movq $1, %rax     # Note: syscall number for write
+    # Call write syscall (sys_write = 1)
+    movq $1, %rdi     # fd = stdout
+    movq %rsi, %rsi   # buf = string pointer (already in rsi)
+    movq %rax, %rdx   # count = string length
+    movq $1, %rax     # syscall number for write
     syscall
 
-    # Note: Print newline
-    movq $1, %rdi     # Note: fd = stdout
-    leaq .newline(%rip), %rsi  # Note: newline string
-    movq $1, %rdx     # Note: count = 1
-    movq $1, %rax     # Note: syscall number for write
+    # Print newline
+    movq $1, %rdi     # fd = stdout
+    leaq .newline(%rip), %rsi  # newline string
+    movq $1, %rdx     # count = 1
+    movq $1, %rax     # syscall number for write
     syscall
 
     popq %rbp
@@ -36,19 +36,19 @@ print_string:
 print_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $32, %rsp  # Note: Space for string buffer (20 digits + null)
+    subq $32, %rsp  # Space for string buffer (20 digits + null)
 
-    # Note: Convert integer to string
-    movq %rdi, %rax  # Note: integer value
-    leaq -32(%rbp), %rsi  # Note: buffer pointer
-    addq $19, %rsi  # Note: point to end of buffer (for reverse building)
-    movb $0, (%rsi)  # Note: null terminator
+    # Convert integer to string
+    movq %rdi, %rax  # integer value
+    leaq -32(%rbp), %rsi  # buffer pointer
+    addq $19, %rsi  # point to end of buffer (for reverse building)
+    movb $0, (%rsi)  # null terminator
     decq %rsi
 
-    # Note: Handle zero case
+    # Handle zero case
     testq %rax, %rax
     jnz .convert_loop
-    movb $48, (%rsi)  # Note: '0' character
+    movb $48, (%rsi)  # '0' character
     jmp .convert_done
 
 .convert_loop:
@@ -57,18 +57,18 @@ print_integer:
     movq %rax, %rcx
     movq $10, %rbx
     xorq %rdx, %rdx
-    divq %rbx  # Note: %rax = quotient, %rdx = remainder
-    addq $48, %rdx  # Note: convert remainder to ASCII
-    movb %dl, (%rsi)  # Note: store digit
+    divq %rbx  # %rax = quotient, %rdx = remainder
+    addq $48, %rdx  # convert remainder to ASCII
+    movb %dl, (%rsi)  # store digit
     decq %rsi
     jmp .convert_loop
 
 .convert_done:
-    incq %rsi  # Note: point to first character
+    incq %rsi  # point to first character
 
-    # Note: Calculate string length
-    movq %rsi, %rcx  # Note: Counter for strlen
-    xorq %rax, %rax  # Note: Length accumulator
+    # Calculate string length
+    movq %rsi, %rcx  # Counter for strlen
+    xorq %rax, %rax  # Length accumulator
 .int_strlen_loop:
     cmpb $0, (%rcx)
     je .int_strlen_done
@@ -77,18 +77,18 @@ print_integer:
     jmp .int_strlen_loop
 .int_strlen_done:
 
-    # Note: Call write syscall (sys_write = 1)
-    movq $1, %rdi     # Note: fd = stdout
-    # Note: %rsi already points to string
-    movq %rax, %rdx   # Note: count = string length
-    movq $1, %rax     # Note: syscall number for write
+    # Call write syscall (sys_write = 1)
+    movq $1, %rdi     # fd = stdout
+    # %rsi already points to string
+    movq %rax, %rdx   # count = string length
+    movq $1, %rax     # syscall number for write
     syscall
 
-    # Note: Print newline
-    movq $1, %rdi     # Note: fd = stdout
-    leaq .newline(%rip), %rsi  # Note: newline string
-    movq $1, %rdx     # Note: count = 1
-    movq $1, %rax     # Note: syscall number for write
+    # Print newline
+    movq $1, %rdi     # fd = stdout
+    leaq .newline(%rip), %rsi  # newline string
+    movq $1, %rdx     # count = 1
+    movq $1, %rax     # syscall number for write
     syscall
 
     movq %rbp, %rsp
@@ -98,7 +98,7 @@ print_integer:
 
 .section .rodata
 .newline:
-    .byte 10  # Note: newline character
+    .byte 10  # newline character
 .text
 
 
@@ -106,7 +106,7 @@ print_integer:
 vector_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $16, %rax
     movq %rax, -16(%rbp)
@@ -125,7 +125,7 @@ vector_create:
 vector_create_with_capacity:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $32, %rax
     pushq %rax
@@ -229,7 +229,7 @@ vector_create_with_capacity:
 vector_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     call vector_create
     movq %rax, -16(%rbp)
@@ -265,7 +265,7 @@ vector_create_with_destructor:
 vector_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -390,7 +390,7 @@ vector_destroy:
 vector_push:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -551,7 +551,7 @@ vector_push:
 vector_pop:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -641,7 +641,7 @@ vector_pop:
 vector_get:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -716,7 +716,7 @@ vector_get:
 vector_set:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -834,7 +834,7 @@ vector_set:
 vector_insert:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1064,7 +1064,7 @@ vector_insert:
 vector_remove:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1241,7 +1241,7 @@ vector_remove:
 vector_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1360,7 +1360,7 @@ vector_clear:
 vector_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1397,7 +1397,7 @@ vector_size:
 vector_capacity:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1434,7 +1434,7 @@ vector_capacity:
 vector_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1489,7 +1489,7 @@ vector_is_empty:
 vector_reserve:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1600,7 +1600,7 @@ vector_reserve:
 vector_shrink_to_fit:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1749,7 +1749,7 @@ vector_shrink_to_fit:
 vector_begin:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1786,7 +1786,7 @@ vector_begin:
 vector_end:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1840,7 +1840,7 @@ vector_end:
 vector_foreach:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1934,7 +1934,7 @@ vector_foreach:
 stack_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -1999,7 +1999,7 @@ stack_create:
 stack_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -2067,7 +2067,7 @@ stack_create_with_destructor:
 stack_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2111,7 +2111,7 @@ stack_destroy:
 stack_push:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2159,7 +2159,7 @@ stack_push:
 stack_pop:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2203,7 +2203,7 @@ stack_pop:
 stack_peek:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2279,7 +2279,7 @@ stack_peek:
 stack_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2323,7 +2323,7 @@ stack_size:
 stack_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2364,7 +2364,7 @@ stack_is_empty:
 stack_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2400,7 +2400,7 @@ stack_clear:
 queue_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $16, %rax
     movq %rax, -16(%rbp)
@@ -2419,7 +2419,7 @@ queue_create:
 queue_create_with_capacity:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $48, %rax
     pushq %rax
@@ -2543,7 +2543,7 @@ queue_create_with_capacity:
 queue_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     call queue_create
     movq %rax, -16(%rbp)
@@ -2579,7 +2579,7 @@ queue_create_with_destructor:
 queue_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2627,7 +2627,7 @@ queue_destroy:
 queue_enqueue:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2772,7 +2772,7 @@ queue_enqueue:
 queue_dequeue:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2914,7 +2914,7 @@ queue_dequeue:
 queue_peek:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2994,7 +2994,7 @@ queue_peek:
 queue_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3031,7 +3031,7 @@ queue_size:
 queue_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3086,7 +3086,7 @@ queue_is_empty:
 queue_is_full:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3149,7 +3149,7 @@ queue_is_full:
 queue_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3282,7 +3282,7 @@ queue_clear:
 container_list_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $32, %rax
     pushq %rax
@@ -3355,7 +3355,7 @@ container_list_create:
 list_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     call container_list_create
     movq %rax, -16(%rbp)
@@ -3391,7 +3391,7 @@ list_create_with_destructor:
 container_list_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3427,7 +3427,7 @@ container_list_destroy:
 list_push_front:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -3581,7 +3581,7 @@ list_push_front:
 list_push_back:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -3735,7 +3735,7 @@ list_push_back:
 list_pop_front:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3873,7 +3873,7 @@ list_pop_front:
 list_pop_back:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4011,7 +4011,7 @@ list_pop_back:
 list_front:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4072,7 +4072,7 @@ list_front:
 list_back:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4133,7 +4133,7 @@ list_back:
 list_insert_after:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4304,7 +4304,7 @@ list_insert_after:
 list_insert_before:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4475,7 +4475,7 @@ list_insert_before:
 list_remove_node:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -4668,7 +4668,7 @@ list_remove_node:
 container_list_find:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4779,7 +4779,7 @@ container_list_find:
 list_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4816,7 +4816,7 @@ list_size:
 list_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4871,7 +4871,7 @@ list_is_empty:
 container_list_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5005,7 +5005,7 @@ container_list_clear:
 list_begin:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5042,7 +5042,7 @@ list_begin:
 list_end:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $0, %rax
     movq %rbp, %rsp
@@ -5054,7 +5054,7 @@ list_end:
 list_next:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5091,7 +5091,7 @@ list_next:
 list_prev:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5128,7 +5128,7 @@ list_prev:
 list_foreach:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -5211,7 +5211,7 @@ list_foreach:
 set_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $16, %rax
@@ -5298,7 +5298,7 @@ set_create:
 set_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -5360,7 +5360,7 @@ set_create_with_destructor:
 set_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5404,7 +5404,7 @@ set_destroy:
 set_add:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -5452,7 +5452,7 @@ set_add:
 set_remove:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -5500,7 +5500,7 @@ set_remove:
 set_contains:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -5548,7 +5548,7 @@ set_contains:
 set_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5592,7 +5592,7 @@ set_size:
 set_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5652,7 +5652,7 @@ set_is_empty:
 set_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5688,7 +5688,7 @@ set_clear:
 free_string_item:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5704,7 +5704,7 @@ free_string_item:
 free_integer_item:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
