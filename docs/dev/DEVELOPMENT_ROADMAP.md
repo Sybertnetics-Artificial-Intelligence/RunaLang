@@ -229,6 +229,14 @@ End For
 - ❌ **Field offset calculation**: Given struct type and field name, return byte offset
 - ❌ **Type validation**: Ensure field exists in struct before accessing
 
+### LEXER (Breaking Change):
+- ❌ **Remove hashtag comment support**: `# comment` is NO LONGER VALID
+  - Remove `#` comment handling from lexer (lines 697-699 in v0.0.8)
+  - Remove `lexer_skip_comment` process (lines 272-292 in v0.0.8)
+  - **ONLY `Note:` comments are supported going forward**
+  - Reason: Aligns with natural language philosophy, reduces syntax complexity
+  - **Migration**: Convert all `#` comments to `Note:` comments before v0.0.8.1
+
 ## Implementation Notes:
 
 **Struct construction creates:**
@@ -259,6 +267,9 @@ Let x_val be memory_get_integer(p, 0)  # x is at offset 0
 - ✅ Type checking: compiler errors on non-existent fields
 - ✅ Multi-field structs work (3+ fields)
 - ✅ Nested struct access works: `the x of the position of player`
+- ✅ **Hashtag comments removed**: `#` is no longer recognized, only `Note:` works
+- ✅ All source files migrated from `#` to `Note:` comments
+- ✅ Lexer rejects `#` with helpful error: "Use 'Note:' for comments"
 - ✅ All existing tests still pass
 - ✅ New tests for struct syntax pass
 
