@@ -363,7 +363,10 @@ vector_destroy:
 .L61:
 .L62:
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
@@ -538,7 +541,10 @@ vector_push:
     popq %rdx
     call memory_set_pointer@PLT
     movq -24(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -24(%rbp), %rbx
     popq %rax
@@ -609,7 +615,11 @@ vector_pop:
 .L111:
 .L112:
     movq -16(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
@@ -1006,7 +1016,11 @@ vector_insert:
     testq %rax, %rax
     jz .L222
     movq -88(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -96(%rbp)
     movq -96(%rbp), %rax
     pushq %rax
@@ -1039,7 +1053,11 @@ vector_insert:
     popq %rdx
     call memory_set_pointer@PLT
     movq -88(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     pushq %rax
     leaq -88(%rbp), %rbx
     popq %rax
@@ -1063,7 +1081,10 @@ vector_insert:
     popq %rdx
     call memory_set_pointer@PLT
     movq -32(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -32(%rbp), %rbx
     popq %rax
@@ -1189,7 +1210,11 @@ vector_remove:
 .L251:
 .L252:
     movq -24(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -64(%rbp)
     movq -16(%rbp), %rax
     movq %rax, -72(%rbp)
@@ -1203,7 +1228,10 @@ vector_remove:
     testq %rax, %rax
     jz .L272
     movq -72(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -80(%rbp)
     movq -80(%rbp), %rax
     pushq %rax
@@ -1236,7 +1264,10 @@ vector_remove:
     popq %rdx
     call memory_set_pointer@PLT
     movq -72(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
@@ -1360,7 +1391,10 @@ vector_clear:
 .L311:
 .L312:
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
@@ -1859,7 +1893,10 @@ vector_end:
     imulq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -16(%rbp), %rax
-    addq -32(%rbp), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -1956,7 +1993,10 @@ vector_foreach:
     call memory_get_pointer@PLT
     movq %rax, -56(%rbp)
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
@@ -2310,7 +2350,11 @@ stack_peek:
     call memory_get_integer@PLT
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
     pushq %rax
@@ -2783,13 +2827,17 @@ queue_enqueue:
     popq %rdx
     call memory_set_pointer@PLT
     movq -48(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_67
     cqto
@@ -2806,7 +2854,11 @@ queue_enqueue:
     imulq %rbx, %rax
     movq %rax, -80(%rbp)
     movq -64(%rbp), %rax
-    subq -80(%rbp), %rax
+    pushq %rax
+    movq -80(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rax
     pushq %rax
@@ -2819,7 +2871,10 @@ queue_enqueue:
     popq %rdx
     call memory_set_integer@PLT
     movq -24(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -24(%rbp), %rbx
     popq %rax
@@ -2920,7 +2975,10 @@ queue_dequeue:
     call memory_get_pointer@PLT
     movq %rax, -48(%rbp)
     movq -32(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -56(%rbp)
     movq $8, %rax
     pushq %rax
@@ -2933,8 +2991,9 @@ queue_dequeue:
     movq -56(%rbp), %rax
     pushq %rax
     movq -64(%rbp), %rax
+    popq %rbx
     movq %rax, %rcx
-    popq %rax
+    movq %rbx, %rax
     testq %rcx, %rcx
     jz .Ldiv_by_zero_70
     cqto
@@ -2951,7 +3010,11 @@ queue_dequeue:
     imulq %rbx, %rax
     movq %rax, -80(%rbp)
     movq -56(%rbp), %rax
-    subq -80(%rbp), %rax
+    pushq %rax
+    movq -80(%rbp), %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rax
     pushq %rax
@@ -2964,7 +3027,11 @@ queue_dequeue:
     popq %rdx
     call memory_set_integer@PLT
     movq -16(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
@@ -3649,7 +3716,10 @@ list_push_front:
     call memory_get_integer@PLT
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
@@ -3806,7 +3876,10 @@ list_push_back:
     call memory_get_integer@PLT
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
@@ -3947,7 +4020,11 @@ list_pop_front:
     call memory_get_integer@PLT
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
@@ -4088,7 +4165,11 @@ list_pop_back:
     call memory_get_integer@PLT
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
@@ -4384,7 +4465,10 @@ list_insert_after:
     call memory_get_integer@PLT
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
@@ -4558,7 +4642,10 @@ list_insert_before:
     call memory_get_integer@PLT
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
@@ -4754,7 +4841,11 @@ list_remove_node:
     call memory_get_integer@PLT
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rax
-    subq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    subq %rax, %rbx
+    movq %rbx, %rax
     pushq %rax
     leaq -56(%rbp), %rbx
     popq %rax

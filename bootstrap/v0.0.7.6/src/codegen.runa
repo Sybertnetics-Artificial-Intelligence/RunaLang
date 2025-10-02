@@ -436,11 +436,11 @@ Process called "codegen_collect_strings_from_statement" takes codegen as Integer
     Let stmt_type be memory_get_int32(stmt, 0)  # stmt->type
 
 
-    # Safety check - statement types should be reasonable (0-16 for now, including STMT_INLINE_ASSEMBLY = 16)
+    # Safety check - statement types should be reasonable (0-17 for now, including STMT_COMPOUND_ASSIGN = 17)
     If stmt_type is less than 0:
         Return 0
     End If
-    If stmt_type is greater than 16:
+    If stmt_type is greater than 17:
         Return 1
     End If
 
@@ -588,6 +588,38 @@ Process called "codegen_collect_strings_from_statement" takes codegen as Integer
                 Let j be j plus 1
             End While
             Let i be i plus 1
+        End While
+        Return 0
+    End If
+
+    # STMT_COMPOUND_ASSIGN: target at offset 8, expression at offset 24
+    If stmt_type is equal to 17:
+        Let target be memory_get_pointer(stmt, 8)
+        Let expression be memory_get_pointer(stmt, 24)
+        Let result1 be codegen_collect_strings_from_expression(codegen, target)
+        Let result2 be codegen_collect_strings_from_expression(codegen, expression)
+        Return 0
+    End If
+
+    # STMT_FOR: start at offset 16, end at offset 24, step at offset 32, body at offset 40
+    If stmt_type is equal to 11:
+        Let start_expr be memory_get_pointer(stmt, 16)
+        Let end_expr be memory_get_pointer(stmt, 24)
+        Let step_expr be memory_get_pointer(stmt, 32)
+        Let body be memory_get_pointer(stmt, 40)
+        Let body_count be memory_get_integer(stmt, 48)
+
+        Let result1 be codegen_collect_strings_from_expression(codegen, start_expr)
+        Let result2 be codegen_collect_strings_from_expression(codegen, end_expr)
+        If step_expr is not equal to 0:
+            Let result3 be codegen_collect_strings_from_expression(codegen, step_expr)
+        End If
+
+        Let i be 0
+        While i is less than body_count:
+            Let body_stmt be memory_get_pointer(body, i multiplied by 8)
+            Let result_body be codegen_collect_strings_from_statement(codegen, body_stmt)
+            Set i to i plus 1
         End While
         Return 0
     End If
@@ -1370,7 +1402,30 @@ Process called "codegen_generate_binary_op" takes codegen as Integer, expr as In
             emit_line(output_file, "    movq %rbx, %rax")
             emit_line(output_file, "    sarq %cl, %rax")
         End If
+        If operator is equal to 30:  # TOKEN_AND
+            emit_line(output_file, "    andq %rbx, %rax")
+        End If
+        If operator is equal to 31:  # TOKEN_OR
+            emit_line(output_file, "    orq %rbx, %rax")
+        End If
     End If
+    Return 0
+End Process
+
+# Generate code for unary operators (NOT)
+Process called "codegen_generate_unary_op" takes codegen as Integer, expr as Integer returns Integer:
+    Let output_file be memory_get_integer(codegen, 0)
+    Let operator be memory_get_integer(expr, 8)
+    Let operand be memory_get_pointer(expr, 16)
+
+    codegen_generate_expression(codegen, operand)
+
+    If operator is equal to 29:  # TOKEN_NOT
+        emit_line(output_file, "    testq %rax, %rax")
+        emit_line(output_file, "    setz %al")
+        emit_line(output_file, "    movzbq %al, %rax")
+    End If
+
     Return 0
 End Process
 
@@ -1738,6 +1793,11 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Return 0
     End If
 
+    If expr_type is equal to 12:  # EXPR_UNARY (NOT operator)
+        codegen_generate_unary_op(codegen, expr)
+        Return 0
+    End If
+
     If expr_type is equal to 5:  # EXPR_STRING_LITERAL
         codegen_generate_string_literal(codegen, expr)
         Return 0
@@ -1834,6 +1894,44 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
     If expr_type is equal to 16:  # EXPR_ARRAY_INDEX
         # Simplified array indexing
         file_write_buffered(output_file, "    movq $0, %rax\n", 0)
+        Return 0
+    End If
+
+    If expr_type is equal to 17:  # EXPR_LIST_LITERAL
+        # Get list elements and count
+        Let elements be memory_get_pointer(expr, 8)
+        Let element_count be memory_get_integer(expr, 16)
+
+        # Calculate size: element_count * 8 (pointer size)
+        Let list_size be element_count multiplied by 8
+
+        # Allocate memory for list
+        file_write_buffered(output_file, "    movq $", 0)
+        file_write_buffered(output_file, integer_to_string(list_size), 0)
+        file_write_buffered(output_file, ", %rdi\n", 0)
+        file_write_buffered(output_file, "    call memory_allocate\n", 0)
+        file_write_buffered(output_file, "    pushq %rax  # Save list pointer\n", 0)
+
+        # Generate code for each element and store
+        Let i be 0
+        While i is less than element_count:
+            Let elem_offset be i multiplied by 8
+            Let elem_expr be memory_get_pointer(elements, elem_offset)
+
+            # Generate element value
+            codegen_generate_expression(codegen, elem_expr)
+
+            # Store in list
+            file_write_buffered(output_file, "    movq -8(%rsp), %rbx  # Load list pointer\n", 0)
+            file_write_buffered(output_file, "    movq %rax, ", 0)
+            file_write_buffered(output_file, integer_to_string(elem_offset), 0)
+            file_write_buffered(output_file, "(%rbx)\n", 0)
+
+            Set i to i plus 1
+        End While
+
+        # Pop list pointer into %rax as result
+        file_write_buffered(output_file, "    popq %rax  # List pointer as result\n", 0)
         Return 0
     End If
 
@@ -1997,6 +2095,140 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         # Restore value and store to target address
         emit_line(output_file, "    popq %rax")
         emit_line(output_file, "    movq %rax, (%rbx)")
+        Return 0
+    End If
+
+    If stmt_type is equal to 17:  # STMT_COMPOUND_ASSIGN
+        # Generate RHS expression (result in %rax)
+        Let compound_expr be memory_get_pointer(stmt, 24)  # expression at offset 24
+        codegen_generate_expression(codegen, compound_expr)
+
+        # Save RHS value on stack
+        emit_line(output_file, "    pushq %rax")
+
+        # Generate the address of the target (result in %rbx)
+        Let compound_target be memory_get_pointer(stmt, 8)  # target at offset 8
+        codegen_generate_lvalue_address(codegen, compound_target)
+
+        # Load current value from target into %rcx
+        emit_line(output_file, "    movq (%rbx), %rcx")
+
+        # Pop RHS value into %rax
+        emit_line(output_file, "    popq %rax")
+
+        # Get operation type: 0=add, 1=sub, 2=mul, 3=div
+        Let operation be memory_get_int32(stmt, 16)  # operation at offset 16
+
+        # Perform operation: %rcx = %rcx op %rax
+        If operation is equal to 0:
+            emit_line(output_file, "    addq %rax, %rcx")
+        End If
+        If operation is equal to 1:
+            emit_line(output_file, "    subq %rax, %rcx")
+        End If
+        If operation is equal to 2:
+            emit_line(output_file, "    imulq %rax, %rcx")
+        End If
+        If operation is equal to 3:
+            # Division: %rcx / %rax
+            # Move dividend to %rax, save divisor
+            emit_line(output_file, "    pushq %rax")
+            emit_line(output_file, "    movq %rcx, %rax")
+            emit_line(output_file, "    cqto")
+            emit_line(output_file, "    popq %rcx")
+            emit_line(output_file, "    idivq %rcx")
+            emit_line(output_file, "    movq %rax, %rcx")
+        End If
+
+        # Store result back to target
+        emit_line(output_file, "    movq %rcx, (%rbx)")
+        Return 0
+    End If
+
+    If stmt_type is equal to 11:  # STMT_FOR
+        Let label_counter be memory_get_int32(codegen, 28)
+        Let label_num be label_counter
+        memory_set_int32(codegen, 28, label_counter plus 1)
+
+        Let loop_start_label be label_num multiplied by 10 plus 1
+        Let loop_end_label be label_num multiplied by 10 plus 2
+
+        # Get loop components
+        Let var_name be memory_get_pointer(stmt, 8)
+        Let start_expr be memory_get_pointer(stmt, 16)
+        Let end_expr be memory_get_pointer(stmt, 24)
+        Let step_expr be memory_get_pointer(stmt, 32)
+        Let body be memory_get_pointer(stmt, 40)
+        Let body_count be memory_get_integer(stmt, 48)
+
+        # Allocate loop variable on stack
+        codegen_add_variable(codegen, var_name)
+        Let var_index be codegen_find_variable(codegen, var_name)
+        Let variables be memory_get_pointer(codegen, 8)
+        Let var_offset be memory_get_integer(variables, var_index multiplied by 32 plus 8)
+
+        # Generate start expression and store in loop variable
+        codegen_generate_expression(codegen, start_expr)
+        file_write_buffered(output_file, "    movq %rax, -", 0)
+        file_write_buffered(output_file, integer_to_string(var_offset), 0)
+        file_write_buffered(output_file, "(%rbp)\n", 0)
+
+        # Generate end expression and save on stack
+        codegen_generate_expression(codegen, end_expr)
+        emit_line(output_file, "    pushq %rax")
+
+        # Loop start label
+        Let loop_start_str be string_concat(".L", integer_to_string(loop_start_label))
+        Let loop_start_label_line be string_concat(loop_start_str, ":")
+        emit_line(output_file, loop_start_label_line)
+
+        # Load loop variable and end value, compare
+        file_write_buffered(output_file, "    movq -", 0)
+        file_write_buffered(output_file, integer_to_string(var_offset), 0)
+        file_write_buffered(output_file, "(%rbp), %rax\n", 0)
+        emit_line(output_file, "    movq (%rsp), %rcx")
+        emit_line(output_file, "    cmpq %rcx, %rax")
+        Let jg_instruction be string_concat("    jg .L", integer_to_string(loop_end_label))
+        emit_line(output_file, jg_instruction)
+
+        # Generate loop body
+        Let i be 0
+        While i is less than body_count:
+            Let body_stmt be memory_get_pointer(body, i multiplied by 8)
+            codegen_generate_statement(codegen, body_stmt)
+            Set i to i plus 1
+        End While
+
+        # Increment loop variable by step
+        If step_expr is not equal to 0:
+            codegen_generate_expression(codegen, step_expr)
+            emit_line(output_file, "    pushq %rax")
+        End If
+        If step_expr is equal to 0:
+            emit_line(output_file, "    movq $1, %rax")
+            emit_line(output_file, "    pushq %rax")
+        End If
+        file_write_buffered(output_file, "    movq -", 0)
+        file_write_buffered(output_file, integer_to_string(var_offset), 0)
+        file_write_buffered(output_file, "(%rbp), %rax\n", 0)
+        emit_line(output_file, "    popq %rcx")
+        emit_line(output_file, "    addq %rcx, %rax")
+        file_write_buffered(output_file, "    movq %rax, -", 0)
+        file_write_buffered(output_file, integer_to_string(var_offset), 0)
+        file_write_buffered(output_file, "(%rbp)\n", 0)
+
+        # Jump back to loop start
+        Let jmp_instruction be string_concat("    jmp .L", integer_to_string(loop_start_label))
+        emit_line(output_file, jmp_instruction)
+
+        # Loop end label
+        Let loop_end_str be string_concat(".L", integer_to_string(loop_end_label))
+        Let loop_end_label_line be string_concat(loop_end_str, ":")
+        emit_line(output_file, loop_end_label_line)
+
+        # Pop end value from stack
+        emit_line(output_file, "    popq %rax")
+
         Return 0
     End If
 
@@ -2795,9 +3027,6 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
 
     # First pass: collect all string literals by analyzing the AST
     Let function_count be memory_get_int32(program, 8)   # PROGRAM_FUNCTION_COUNT - use int32
-    print_string("[DEBUG] codegen_generate: function_count from program = ")
-    print_integer(function_count)
-    print_newline()
 
     # Safety check: if function_count is negative or too large, assume no functions
     If function_count is less than 0:
@@ -2815,15 +3044,8 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
         Return 0
     End If
 
-    print_string("[DEBUG] Starting string collection, function_count = ")
-    print_integer(function_count)
-    print_newline()
     Let i be 0
     While i is less than function_count:
-        print_string("[DEBUG] String collection loop iteration i = ")
-        print_integer(i)
-        print_newline()
-
         Let func be memory_get_pointer(functions, i multiplied by 8)
 
 
@@ -2856,19 +3078,10 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
                             # Process the statement
                             Let result be 0
                             If body_statement is not equal to 0:
-                                print_string("[DEBUG] About to collect strings from statement\n")
-                                Let stmt_type_debug be memory_get_int32(body_statement, 0)
-                                print_string("[DEBUG] Statement type: ")
-                                print_integer(stmt_type_debug)
-                                print_newline()
                                 Let result be codegen_collect_strings_from_statement(codegen, body_statement)
-                                print_string("[DEBUG] collect_strings returned: ")
-                                print_integer(result)
-                                print_newline()
 
                                 # Check if function reported critical error
                                 If result is not equal to 0:
-                                    print_string("[DEBUG] ERROR: collect_strings returned non-zero, exiting\n")
                                     Return 0
                                 End If
                             End If
@@ -2881,8 +3094,6 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
         End If
         Let i be i plus 1
     End While
-
-    print_string("[DEBUG] Finished string collection loop\n")
 
     # WORKAROUND removed - string collection is now working!
 
@@ -3126,35 +3337,21 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, ".text")
 
     # Generate all functions
-    print_string("[DEBUG] Starting function generation loop, count = ")
-    print_integer(function_count)
-    print_newline()
     Let i be 0
     While i is less than function_count:
-        print_string("[DEBUG] Loop iteration i = ")
-        print_integer(i)
-        print_newline()
         Let func be memory_get_pointer(functions, i multiplied by 8)
-        print_string("[DEBUG] Got func pointer = ")
-        print_integer(func)
-        print_newline()
 
         # Safety check for function pointer - skip NULL pointers
         If func is not equal to 0:
             Let func_name be memory_get_pointer(func, 0)  # func->name
-
 
             # Make main function global
             If string_equals(func_name, "main") is equal to 1:
                 emit_line(output_file, ".globl main")
             End If
 
-            print_string("[DEBUG] About to generate function: ")
-            print_string(func_name)
-            print_newline()
             emit_line(output_file, "\n")
             codegen_generate_function(codegen, func)
-            print_string("[DEBUG] Finished generating function\n")
         End If
         Let i be i plus 1
     End While
