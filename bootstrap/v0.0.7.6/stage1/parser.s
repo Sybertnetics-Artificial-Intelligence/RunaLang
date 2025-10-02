@@ -7118,9 +7118,9 @@ parser_parse_primary:
     popq %rdi
     call expression_create_integer
     movq %rax, -480(%rbp)
-    movq $17, %rax
-    pushq %rax
     movq -472(%rbp), %rax
+    pushq %rax
+    movq $17, %rax
     pushq %rax
     movq -480(%rbp), %rax
     pushq %rax

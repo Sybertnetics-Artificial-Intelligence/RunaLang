@@ -6,7 +6,7 @@
 .STR4:    .string "Long"
 .STR5:    .string ".STR"
 .STR6:    .string "    leaq "
-.STR7:    .string "(%rip), %rbx  # Note: Address of global variable"
+.STR7:    .string "(%rip), %rbx  # Address of global variable"
 .STR8:    .string "[CODEGEN ERROR] Unknown variable '"
 .STR9:    .string "'"
 .STR10:    .string "    leaq -"
@@ -18,7 +18,7 @@
 .STR16:    .string "    addq $"
 .STR17:    .string ", %rbx"
 .STR18:    .string "    movq -"
-.STR19:    .string "(%rbp), %rbx  # Note: Load array parameter pointer"
+.STR19:    .string "(%rbp), %rbx  # Load array parameter pointer"
 .STR20:    .string "    pushq %rbx"
 .STR21:    .string "    popq %rbx"
 .STR22:    .string "    imulq $8, %rax"
@@ -26,12 +26,12 @@
 .STR24:    .string "[CODEGEN ERROR] Invalid lvalue expression type"
 .STR25:    .string "    movq $"
 .STR26:    .string ", %rax\n"
-.STR27:    .string ", %rax  # Note: Load compile-time constant "
+.STR27:    .string ", %rax  # Load compile-time constant "
 .STR28:    .string "    movq "
-.STR29:    .string "(%rip), %rax  # Note: Load global variable\n"
+.STR29:    .string "(%rip), %rax  # Load global variable\n"
 .STR30:    .string "[CODEGEN ERROR] Undefined variable: "
-.STR31:    .string "(%rip), %rax  # Note: Load function address\n"
-.STR32:    .string "(%rbp), %rax  # Note: Load array address\n"
+.STR31:    .string "(%rip), %rax  # Load function address\n"
+.STR32:    .string "(%rbp), %rax  # Load array address\n"
 .STR33:    .string "(%rbp), %rax\n"
 .STR34:    .string "[CODEGEN ERROR] Invalid string literal expression"
 .STR35:    .string "    leaq .STR"
@@ -125,35 +125,35 @@
 .STR123:    .string "    pushq %rcx\n"
 .STR124:    .string "    pushq %r8\n"
 .STR125:    .string "    pushq %r9\n"
-.STR126:    .string "    movq %rax, %r10  # Note: Save function pointer\n"
-.STR127:    .string "    call *%r10  # Note: Indirect call through function pointer\n"
+.STR126:    .string "    movq %rax, %r10  # Save function pointer\n"
+.STR127:    .string "    call *%r10  # Indirect call through function pointer\n"
 .STR128:    .string "[CODEGEN ERROR] Unknown variable"
 .STR129:    .string "    movq (%rax), %rax\n"
 .STR130:    .string "    movq %rbx, %rax\n"
 .STR131:    .string ""
-.STR132:    .string "    # Note: Unimplemented builtin type "
-.STR133:    .string "    movq $0, %rax  # Note: Placeholder return value\n"
+.STR132:    .string "    # Unimplemented builtin type "
+.STR133:    .string "    movq $0, %rax  # Placeholder return value\n"
 .STR134:    .string "[CODEGEN ERROR] NULL expression pointer"
 .STR135:    .string "unknown_builtin_"
 .STR136:    .string "    movq $0, %rax\n"
-.STR137:    .string "    pushq %rax  # Note: Save index\n"
-.STR138:    .string "    popq %rbx  # Note: Load index\n"
-.STR139:    .string "    imulq $8, %rbx  # Note: Multiply index by 8\n"
-.STR140:    .string "    addq %rbx, %rax  # Note: Add offset to array pointer\n"
-.STR141:    .string "    movq (%rax), %rax  # Note: Load value from array\n"
+.STR137:    .string "    pushq %rax  # Save index\n"
+.STR138:    .string "    popq %rbx  # Load index\n"
+.STR139:    .string "    imulq $8, %rbx  # Multiply index by 8\n"
+.STR140:    .string "    addq %rbx, %rax  # Add offset to array pointer\n"
+.STR141:    .string "    movq (%rax), %rax  # Load value from array\n"
 .STR142:    .string ", %rdi\n"
 .STR143:    .string "    call memory_allocate\n"
-.STR144:    .string "    pushq %rax  # Note: Save list pointer\n"
-.STR145:    .string "    movq (%rsp), %rbx  # Note: Load list pointer\n"
+.STR144:    .string "    pushq %rax  # Save list pointer\n"
+.STR145:    .string "    movq (%rsp), %rbx  # Load list pointer\n"
 .STR146:    .string "    movq %rax, "
 .STR147:    .string "(%rbx)\n"
-.STR148:    .string "    popq %rax  # Note: List pointer as result\n"
-.STR149:    .string "    pushq %rax  # Note: Save array pointer\n"
-.STR150:    .string "    movq (%rsp), %rbx  # Note: Load array pointer\n"
-.STR151:    .string "    popq %rax  # Note: Array pointer as result\n"
+.STR148:    .string "    popq %rax  # List pointer as result\n"
+.STR149:    .string "    pushq %rax  # Save array pointer\n"
+.STR150:    .string "    movq (%rsp), %rbx  # Load array pointer\n"
+.STR151:    .string "    popq %rax  # Array pointer as result\n"
 .STR152:    .string "[CODEGEN ERROR] Unsupported expression type"
 .STR153:    .string "    movq $0, -"
-.STR154:    .string "(%rbp)  # Note: Zero array element"
+.STR154:    .string "(%rbp)  # Zero array element"
 .STR155:    .string "(%rbp)\n"
 .STR156:    .string "String"
 .STR157:    .string "List"
@@ -182,26 +182,26 @@
 .STR180:    .string "    movq %rax, %rdi\n"
 .STR181:    .string "    call print_string\n"
 .STR182:    .string "    call print_integer\n"
-.STR183:    .string "    pushq %rax  # Note: Save match expression value"
+.STR183:    .string "    pushq %rax  # Save match expression value"
 .STR184:    .string ".match_end_"
 .STR185:    .string ".match_case_"
 .STR186:    .string "_"
-.STR187:    .string "    popq %rax  # Note: Get match expression\n"
-.STR188:    .string "    pushq %rax  # Note: Keep on stack"
-.STR189:    .string "    movq (%rax), %rdx  # Note: Load variant tag"
+.STR187:    .string "    popq %rax  # Get match expression\n"
+.STR188:    .string "    pushq %rax  # Keep on stack"
+.STR189:    .string "    movq (%rax), %rdx  # Load variant tag"
 .STR190:    .string "    cmpq $"
-.STR191:    .string ", %rdx  # Note: Check tag for "
+.STR191:    .string ", %rdx  # Check tag for "
 .STR192:    .string "    jne .match_case_"
-.STR193:    .string "  # Note: Jump to next case"
+.STR193:    .string "  # Jump to next case"
 .STR194:    .string "    jne "
-.STR195:    .string "  # Note: No match, exit"
-.STR196:    .string "    popq %rax  # Note: Get variant pointer\n"
-.STR197:    .string "(%rax), %rdx  # Note: Load field "
+.STR195:    .string "  # No match, exit"
+.STR196:    .string "    popq %rax  # Get variant pointer\n"
+.STR197:    .string "(%rax), %rdx  # Load field "
 .STR198:    .string "    movq %rdx, -"
-.STR199:    .string "(%rbp, 0)  # Note: Store "
+.STR199:    .string "(%rbp, 0)  # Store "
 .STR200:    .string " at stack offset"
 .STR201:    .string "    jmp "
-.STR202:    .string "    popq %rax  # Note: Clean up match expression\n"
+.STR202:    .string "    popq %rax  # Clean up match expression\n"
 .STR203:    .string ".globl "
 .STR204:    .string "    pushq %rbp"
 .STR205:    .string "    movq %rsp, %rbp"
@@ -212,35 +212,35 @@
 .STR210:    .string "%r8"
 .STR211:    .string "%r9"
 .STR212:    .string "main"
-.STR213:    .string "    # Note: Initialize command line arguments"
-.STR214:    .string "    pushq %rdi  # Note: Save argc"
-.STR215:    .string "    pushq %rsi  # Note: Save argv"
+.STR213:    .string "    # Initialize command line arguments"
+.STR214:    .string "    pushq %rdi  # Save argc"
+.STR215:    .string "    pushq %rsi  # Save argv"
 .STR216:    .string "    call runtime_set_command_line_args@PLT"
-.STR217:    .string "    popq %rsi   # Note: Restore argv"
-.STR218:    .string "    popq %rdi   # Note: Restore argc"
-.STR219:    .string "    subq $2048, %rsp  # Note: Pre-allocate generous stack space"
+.STR217:    .string "    popq %rsi   # Restore argv"
+.STR218:    .string "    popq %rdi   # Restore argc"
+.STR219:    .string "    subq $2048, %rsp  # Pre-allocate generous stack space"
 .STR220:    .string ", -"
 .STR221:    .string "(%rbp)"
 .STR222:    .string "    movq %rbp, %rsp"
 .STR223:    .string "    popq %rbp"
 .STR224:    .string "    ret"
-.STR225:    .string "# Note: Imports:"
-.STR226:    .string "# Note:   Import "
+.STR225:    .string "# Imports:"
+.STR226:    .string "#   Import "
 .STR227:    .string " as "
 .STR228:    .string "[ERROR] codegen_generate: functions pointer is NULL"
 .STR229:    .string ".section .rodata"
 .STR230:    .string "    .string "
 .STR231:    .string ".section .data"
 .STR232:    .string "    .quad "
-.STR233:    .string "    .quad 0  # Note: Non-constant initializer defaults to 0"
+.STR233:    .string "    .quad 0  # Non-constant initializer defaults to 0"
 .STR234:    .string ".section .bss"
-.STR235:    .string "    .zero 8  # Note: 8 bytes for Integer"
+.STR235:    .string "    .zero 8  # 8 bytes for Integer"
 .STR236:    .string ".text"
 .STR237:    .string "print_string:"
-.STR238:    .string "    # Note: Calculate string length"
-.STR239:    .string "    movq %rdi, %rsi  # Note: Save string pointer"
-.STR240:    .string "    movq %rdi, %rcx  # Note: Counter for strlen"
-.STR241:    .string "    xorq %rax, %rax  # Note: Length accumulator"
+.STR238:    .string "    # Calculate string length"
+.STR239:    .string "    movq %rdi, %rsi  # Save string pointer"
+.STR240:    .string "    movq %rdi, %rcx  # Counter for strlen"
+.STR241:    .string "    xorq %rax, %rax  # Length accumulator"
 .STR242:    .string ".strlen_loop:"
 .STR243:    .string "    cmpb $0, (%rcx)"
 .STR244:    .string "    je .strlen_done"
@@ -248,45 +248,45 @@
 .STR246:    .string "    incq %rax"
 .STR247:    .string "    jmp .strlen_loop"
 .STR248:    .string ".strlen_done:"
-.STR249:    .string "    # Note: Call write syscall (sys_write = 1)"
-.STR250:    .string "    movq $1, %rdi     # Note: fd = stdout"
-.STR251:    .string "    movq %rsi, %rsi   # Note: buf = string pointer (already in rsi)"
-.STR252:    .string "    movq %rax, %rdx   # Note: count = string length"
-.STR253:    .string "    movq $1, %rax     # Note: syscall number for write"
+.STR249:    .string "    # Call write syscall (sys_write = 1)"
+.STR250:    .string "    movq $1, %rdi     # fd = stdout"
+.STR251:    .string "    movq %rsi, %rsi   # buf = string pointer (already in rsi)"
+.STR252:    .string "    movq %rax, %rdx   # count = string length"
+.STR253:    .string "    movq $1, %rax     # syscall number for write"
 .STR254:    .string "    syscall"
-.STR255:    .string "    # Note: Print newline"
-.STR256:    .string "    leaq .newline(%rip), %rsi  # Note: newline string"
-.STR257:    .string "    movq $1, %rdx     # Note: count = 1"
+.STR255:    .string "    # Print newline"
+.STR256:    .string "    leaq .newline(%rip), %rsi  # newline string"
+.STR257:    .string "    movq $1, %rdx     # count = 1"
 .STR258:    .string "print_integer:"
-.STR259:    .string "    subq $32, %rsp  # Note: Space for string buffer (20 digits + null)"
-.STR260:    .string "    # Note: Convert integer to string"
-.STR261:    .string "    movq %rdi, %rax  # Note: integer value"
-.STR262:    .string "    leaq -32(%rbp), %rsi  # Note: buffer pointer"
-.STR263:    .string "    addq $19, %rsi  # Note: point to end of buffer (for reverse building)"
-.STR264:    .string "    movb $0, (%rsi)  # Note: null terminator"
+.STR259:    .string "    subq $32, %rsp  # Space for string buffer (20 digits + null)"
+.STR260:    .string "    # Convert integer to string"
+.STR261:    .string "    movq %rdi, %rax  # integer value"
+.STR262:    .string "    leaq -32(%rbp), %rsi  # buffer pointer"
+.STR263:    .string "    addq $19, %rsi  # point to end of buffer (for reverse building)"
+.STR264:    .string "    movb $0, (%rsi)  # null terminator"
 .STR265:    .string "    decq %rsi"
-.STR266:    .string "    # Note: Handle zero case"
+.STR266:    .string "    # Handle zero case"
 .STR267:    .string "    jnz .convert_loop"
-.STR268:    .string "    movb $48, (%rsi)  # Note: '0' character"
+.STR268:    .string "    movb $48, (%rsi)  # '0' character"
 .STR269:    .string "    jmp .convert_done"
 .STR270:    .string ".convert_loop:"
 .STR271:    .string "    jz .convert_done"
 .STR272:    .string "    movq $10, %rbx"
 .STR273:    .string "    xorq %rdx, %rdx"
-.STR274:    .string "    divq %rbx  # Note: %rax = quotient, %rdx = remainder"
-.STR275:    .string "    addq $48, %rdx  # Note: convert remainder to ASCII"
-.STR276:    .string "    movb %dl, (%rsi)  # Note: store digit"
+.STR274:    .string "    divq %rbx  # %rax = quotient, %rdx = remainder"
+.STR275:    .string "    addq $48, %rdx  # convert remainder to ASCII"
+.STR276:    .string "    movb %dl, (%rsi)  # store digit"
 .STR277:    .string "    jmp .convert_loop"
 .STR278:    .string ".convert_done:"
-.STR279:    .string "    incq %rsi  # Note: point to first character"
-.STR280:    .string "    movq %rsi, %rcx  # Note: Counter for strlen"
+.STR279:    .string "    incq %rsi  # point to first character"
+.STR280:    .string "    movq %rsi, %rcx  # Counter for strlen"
 .STR281:    .string ".int_strlen_loop:"
 .STR282:    .string "    je .int_strlen_done"
 .STR283:    .string "    jmp .int_strlen_loop"
 .STR284:    .string ".int_strlen_done:"
-.STR285:    .string "    # Note: %rsi already points to string"
+.STR285:    .string "    # %rsi already points to string"
 .STR286:    .string ".newline:"
-.STR287:    .string "    .byte 10  # Note: newline character"
+.STR287:    .string "    .byte 10  # newline character"
 .STR288:    .string ".globl main"
 .STR289:    .string ".section .note.GNU-stack"
 
@@ -295,10 +295,10 @@ print_string:
     pushq %rbp
     movq %rsp, %rbp
 
-    # Note: Calculate string length
-    movq %rdi, %rsi  # Note: Save string pointer
-    movq %rdi, %rcx  # Note: Counter for strlen
-    xorq %rax, %rax  # Note: Length accumulator
+    # Calculate string length
+    movq %rdi, %rsi  # Save string pointer
+    movq %rdi, %rcx  # Counter for strlen
+    xorq %rax, %rax  # Length accumulator
 .strlen_loop:
     cmpb $0, (%rcx)
     je .strlen_done
@@ -307,18 +307,18 @@ print_string:
     jmp .strlen_loop
 .strlen_done:
 
-    # Note: Call write syscall (sys_write = 1)
-    movq $1, %rdi     # Note: fd = stdout
-    movq %rsi, %rsi   # Note: buf = string pointer (already in rsi)
-    movq %rax, %rdx   # Note: count = string length
-    movq $1, %rax     # Note: syscall number for write
+    # Call write syscall (sys_write = 1)
+    movq $1, %rdi     # fd = stdout
+    movq %rsi, %rsi   # buf = string pointer (already in rsi)
+    movq %rax, %rdx   # count = string length
+    movq $1, %rax     # syscall number for write
     syscall
 
-    # Note: Print newline
-    movq $1, %rdi     # Note: fd = stdout
-    leaq .newline(%rip), %rsi  # Note: newline string
-    movq $1, %rdx     # Note: count = 1
-    movq $1, %rax     # Note: syscall number for write
+    # Print newline
+    movq $1, %rdi     # fd = stdout
+    leaq .newline(%rip), %rsi  # newline string
+    movq $1, %rdx     # count = 1
+    movq $1, %rax     # syscall number for write
     syscall
 
     popq %rbp
@@ -328,19 +328,19 @@ print_string:
 print_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $32, %rsp  # Note: Space for string buffer (20 digits + null)
+    subq $32, %rsp  # Space for string buffer (20 digits + null)
 
-    # Note: Convert integer to string
-    movq %rdi, %rax  # Note: integer value
-    leaq -32(%rbp), %rsi  # Note: buffer pointer
-    addq $19, %rsi  # Note: point to end of buffer (for reverse building)
-    movb $0, (%rsi)  # Note: null terminator
+    # Convert integer to string
+    movq %rdi, %rax  # integer value
+    leaq -32(%rbp), %rsi  # buffer pointer
+    addq $19, %rsi  # point to end of buffer (for reverse building)
+    movb $0, (%rsi)  # null terminator
     decq %rsi
 
-    # Note: Handle zero case
+    # Handle zero case
     testq %rax, %rax
     jnz .convert_loop
-    movb $48, (%rsi)  # Note: '0' character
+    movb $48, (%rsi)  # '0' character
     jmp .convert_done
 
 .convert_loop:
@@ -349,18 +349,18 @@ print_integer:
     movq %rax, %rcx
     movq $10, %rbx
     xorq %rdx, %rdx
-    divq %rbx  # Note: %rax = quotient, %rdx = remainder
-    addq $48, %rdx  # Note: convert remainder to ASCII
-    movb %dl, (%rsi)  # Note: store digit
+    divq %rbx  # %rax = quotient, %rdx = remainder
+    addq $48, %rdx  # convert remainder to ASCII
+    movb %dl, (%rsi)  # store digit
     decq %rsi
     jmp .convert_loop
 
 .convert_done:
-    incq %rsi  # Note: point to first character
+    incq %rsi  # point to first character
 
-    # Note: Calculate string length
-    movq %rsi, %rcx  # Note: Counter for strlen
-    xorq %rax, %rax  # Note: Length accumulator
+    # Calculate string length
+    movq %rsi, %rcx  # Counter for strlen
+    xorq %rax, %rax  # Length accumulator
 .int_strlen_loop:
     cmpb $0, (%rcx)
     je .int_strlen_done
@@ -369,18 +369,18 @@ print_integer:
     jmp .int_strlen_loop
 .int_strlen_done:
 
-    # Note: Call write syscall (sys_write = 1)
-    movq $1, %rdi     # Note: fd = stdout
-    # Note: %rsi already points to string
-    movq %rax, %rdx   # Note: count = string length
-    movq $1, %rax     # Note: syscall number for write
+    # Call write syscall (sys_write = 1)
+    movq $1, %rdi     # fd = stdout
+    # %rsi already points to string
+    movq %rax, %rdx   # count = string length
+    movq $1, %rax     # syscall number for write
     syscall
 
-    # Note: Print newline
-    movq $1, %rdi     # Note: fd = stdout
-    leaq .newline(%rip), %rsi  # Note: newline string
-    movq $1, %rdx     # Note: count = 1
-    movq $1, %rax     # Note: syscall number for write
+    # Print newline
+    movq $1, %rdi     # fd = stdout
+    leaq .newline(%rip), %rsi  # newline string
+    movq $1, %rdx     # count = 1
+    movq $1, %rax     # syscall number for write
     syscall
 
     movq %rbp, %rsp
@@ -390,7 +390,7 @@ print_integer:
 
 .section .rodata
 .newline:
-    .byte 10  # Note: newline character
+    .byte 10  # newline character
 .text
 
 
@@ -398,7 +398,7 @@ print_integer:
 emit_line:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -431,7 +431,7 @@ emit_line:
 codegen_hash_string:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     movq %rax, -16(%rbp)
@@ -503,7 +503,7 @@ codegen_hash_string:
 codegen_compare_strings:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -543,7 +543,7 @@ codegen_compare_strings:
 codegen_find_variable:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $16, %rax
@@ -645,8 +645,7 @@ codegen_find_variable:
     movq %rax, -48(%rbp)
     jmp .L21
 .L22:
-    movq $0, %rax
-    subq $1, %rax
+    movq $-1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -656,7 +655,7 @@ codegen_find_variable:
 codegen_calculate_type_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     leaq .STR1(%rip), %rax
@@ -853,7 +852,7 @@ codegen_calculate_type_size:
 codegen_add_variable_with_type_and_param_flag:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1141,7 +1140,7 @@ codegen_add_variable_with_type_and_param_flag:
 codegen_add_variable_with_type:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1167,7 +1166,7 @@ codegen_add_variable_with_type:
 codegen_add_variable:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     leaq .STR1(%rip), %rax
@@ -1189,7 +1188,7 @@ codegen_add_variable:
 codegen_add_string_literal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $40, %rax
@@ -1381,7 +1380,7 @@ codegen_add_string_literal:
 codegen_collect_strings_from_expression:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -2028,7 +2027,7 @@ codegen_collect_strings_from_expression:
 codegen_collect_strings_from_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -2945,7 +2944,7 @@ codegen_collect_strings_from_statement:
 codegen_get_expression_type:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -3422,7 +3421,7 @@ codegen_get_expression_type:
 codegen_generate_lvalue_address:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -3876,8 +3875,7 @@ codegen_generate_lvalue_address:
     jmp .L872
 .L871:
 .L872:
-    movq $0, %rax
-    subq $1, %rax
+    movq $-1, %rax
     movq %rax, -296(%rbp)
     movq $8, %rax
     pushq %rax
@@ -4290,7 +4288,7 @@ codegen_generate_lvalue_address:
 codegen_generate_integer_expr:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -4352,7 +4350,7 @@ codegen_generate_integer_expr:
 codegen_generate_variable_expr:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -5059,7 +5057,7 @@ codegen_generate_variable_expr:
 codegen_generate_integer_literal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -5121,7 +5119,7 @@ codegen_generate_integer_literal:
 codegen_generate_variable_handler:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -5149,7 +5147,7 @@ codegen_generate_variable_handler:
 codegen_generate_string_literal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -5204,8 +5202,7 @@ codegen_generate_string_literal:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -48(%rbp)
-    movq $0, %rax
-    subq $1, %rax
+    movq $-1, %rax
     movq %rax, -56(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
@@ -5322,7 +5319,7 @@ codegen_generate_string_literal:
 codegen_generate_binary_op:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -7287,7 +7284,7 @@ codegen_generate_binary_op:
 codegen_generate_unary_op:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -7364,7 +7361,7 @@ codegen_generate_unary_op:
 codegen_generate_comparison:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -7565,7 +7562,7 @@ codegen_generate_comparison:
 codegen_generate_function_call:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -8507,7 +8504,7 @@ codegen_generate_function_call:
 codegen_generate_indirect_call:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -9002,7 +8999,7 @@ codegen_generate_indirect_call:
 codegen_generate_field_access:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -9193,7 +9190,7 @@ codegen_generate_field_access:
 codegen_generate_builtin_call:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -9466,7 +9463,7 @@ codegen_generate_builtin_call:
 codegen_generate_expression:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -10873,7 +10870,7 @@ codegen_generate_expression:
 codegen_generate_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -14706,7 +14703,7 @@ codegen_generate_statement:
 codegen_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $80, %rax
     pushq %rax
@@ -14950,7 +14947,7 @@ codegen_create:
 codegen_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -15378,7 +15375,7 @@ codegen_destroy:
 codegen_push_loop_context:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -15512,7 +15509,7 @@ codegen_push_loop_context:
 codegen_pop_loop_context:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $64, %rax
     pushq %rax
@@ -15555,7 +15552,7 @@ codegen_pop_loop_context:
 codegen_current_loop_context:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $64, %rax
     pushq %rax
@@ -15609,7 +15606,7 @@ codegen_current_loop_context:
 codegen_generate_function:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -16438,7 +16435,7 @@ codegen_generate_function:
 codegen_generate:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Note: Pre-allocate generous stack space
+    subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
