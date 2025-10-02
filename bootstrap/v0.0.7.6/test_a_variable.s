@@ -1,6 +1,3 @@
-.section .rodata
-.STR0:    .string "List created!"
-
 .text
 print_string:
     pushq %rbp
@@ -119,24 +116,12 @@ main:
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
-    movq $24, %rdi
-    call memory_allocate
-    pushq %rax  # Save list pointer
-    movq $1, %rax
-    movq (%rsp), %rbx  # Load list pointer
-    movq %rax, 0(%rbx)
-    movq $2, %rax
-    movq (%rsp), %rbx  # Load list pointer
-    movq %rax, 8(%rbx)
-    movq $3, %rax
-    movq (%rsp), %rbx  # Load list pointer
-    movq %rax, 16(%rbx)
-    popq %rax  # List pointer as result
+    movq $42, %rax
     movq %rax, -24(%rbp)
-    leaq .STR0(%rip), %rax
+    movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
-    call print_string
+    call print_integer
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp

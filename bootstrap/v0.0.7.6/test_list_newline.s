@@ -123,13 +123,13 @@ main:
     call memory_allocate
     pushq %rax  # Save list pointer
     movq $1, %rax
-    movq (%rsp), %rbx  # Load list pointer
+    movq -8(%rsp), %rbx  # Load list pointer
     movq %rax, 0(%rbx)
     movq $2, %rax
-    movq (%rsp), %rbx  # Load list pointer
+    movq -8(%rsp), %rbx  # Load list pointer
     movq %rax, 8(%rbx)
     movq $3, %rax
-    movq (%rsp), %rbx  # Load list pointer
+    movq -8(%rsp), %rbx  # Load list pointer
     movq %rax, 16(%rbx)
     popq %rax  # List pointer as result
     movq %rax, -24(%rbp)
@@ -137,7 +137,11 @@ main:
     pushq %rax
     popq %rdi
     call print_string
+    call print_newline
     movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
     movq %rbp, %rsp
     popq %rbp
     ret
