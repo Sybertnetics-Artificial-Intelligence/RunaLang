@@ -468,9 +468,9 @@ Let x as Integer be 42
 
 ---
 
-# 🔹 v0.0.8.5: String Interpolation & Ternary Operator
+# 🔹 v0.0.8.5: String Interpolation, Ternary Operator, Function Pointers & Character Type
 
-**Goal:** Developer ergonomics improvements - syntactic sugar for common patterns.
+**Goal:** Developer ergonomics improvements - syntactic sugar for common patterns, plus complete function pointers and character type support.
 
 **Priority:** MEDIUM - Nice to have, but not critical for core functionality.
 
@@ -486,16 +486,32 @@ Let x as Integer be 42
 - ❌ **Range expressions**: `1 to 10`, `1 through 10`
   - Parser: Recognize range syntax
   - Codegen: Generate range iterator for For loops
+- ⚠️ **Function pointers** (Complete implementation): `Let fn_ptr be $function_name`
+  - Lexer: ✅ TOKEN_DOLLAR already implemented
+  - Parser: ✅ EXPR_FUNCTION_POINTER already created
+  - Codegen: ⚠️ Fix indirect call handling - currently incomplete
+  - Support calling through function pointers: `fn_ptr(args)`
+  - Support passing function pointers as arguments
+- ⚠️ **Character type** (Complete implementation): `Let c be 'a'`
+  - Lexer: ✅ TOKEN_CHARACTER_TYPE already exists
+  - Lexer: ❌ Add character literal tokenization ('a', '\n', etc.)
+  - Parser: ❌ Handle character literals in expressions
+  - Codegen: ❌ Generate code for character operations
+  - Runtime: ❌ Character-to-string conversion functions
 
 ### RUNTIME:
 - ❌ **Format string support**: Convert expressions to strings for interpolation
 - ❌ **String concatenation**: Efficient string building for interpolation
+- ❌ **Character conversion**: `char_to_string()`, `string_to_char()`
 
 ## Success Criteria:
 - ✅ String interpolation with expressions works
 - ✅ Nested expressions in interpolation work: `f"Result: {x plus y}"`
 - ✅ Ternary operator precedence is correct
 - ✅ Range expressions work in For loops
+- ✅ Function pointers fully working: creation with `$`, indirect calls, passing as parameters
+- ✅ Character literals work: `'a'`, `'\n'`, `'\t'`, etc.
+- ✅ Character type operations work
 - ✅ All features tested
 
 ## Timeline: TBD
