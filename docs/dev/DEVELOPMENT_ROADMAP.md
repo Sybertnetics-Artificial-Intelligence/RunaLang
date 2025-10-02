@@ -67,7 +67,7 @@
 - ✅ Compound assignment (Set x gets increased by, Increase x by)
 - ✅ **For loops** (`For var from start to end:` and `For var from start to end by step:`)
 - ✅ **Import system** (Both `Import "file" as name` and `Import { items } from "file"` with optional aliasing)
-- ✅ **Inline Assembly** (`Inline Assembly: ... End Assembly` with raw x86-64 instructions)
+- ✅ **Inline Assembly** (`Inline Assembly: ... End Assembly` with raw x86-64 instructions)1
 
 ### RUNTIME Features (runtime/*.c → will become runtime/*.runa in v0.0.9):
 - ✅ Memory allocation (malloc, free) - **Currently C, will be Runa in v0.0.9**

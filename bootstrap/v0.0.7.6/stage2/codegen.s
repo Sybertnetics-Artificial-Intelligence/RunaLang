@@ -4413,7 +4413,7 @@ codegen_generate_variable_expr:
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_integer@PLT
+    call memory_get_int32@PLT
     movq %rax, -64(%rbp)
     movq $48, %rax
     pushq %rax
@@ -4652,15 +4652,15 @@ codegen_generate_variable_expr:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1031
-    movq $16, %rax
+    movq $8, %rax
     pushq %rax
     movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_integer@PLT
+    call memory_get_int32@PLT
     movq %rax, -184(%rbp)
-    movq $8, %rax
+    movq $0, %rax
     pushq %rax
     movq -56(%rbp), %rax
     pushq %rax
@@ -4872,15 +4872,15 @@ codegen_generate_variable_expr:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1081
-    movq $32, %rax
+    movq $24, %rax
     pushq %rax
     movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_integer@PLT
+    call memory_get_int32@PLT
     movq %rax, -328(%rbp)
-    movq $24, %rax
+    movq $16, %rax
     pushq %rax
     movq -56(%rbp), %rax
     pushq %rax
@@ -10959,7 +10959,7 @@ codegen_generate_statement:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -72(%rbp)
-    movq $32, %rax
+    movq $24, %rax
     pushq %rax
     movq -72(%rbp), %rax
     pushq %rax
@@ -10967,7 +10967,7 @@ codegen_generate_statement:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -80(%rbp)
-    movq $40, %rax
+    movq $16, %rax
     pushq %rax
     movq -72(%rbp), %rax
     pushq %rax
