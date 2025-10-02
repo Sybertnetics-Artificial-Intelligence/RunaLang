@@ -1,8 +1,8 @@
 # Runa Development Roadmap
 ## From v0.0.8 to v1.0
 
-**Current Status:** v0.0.8 (Self-Hosting Achieved ✅, First Self-Hosted Compiler)
-**Previous:** v0.0.7.6 (Minimal Bootstrap in C - no longer used)
+**Current Status:** v0.0.8.1 (Self-Hosting Achieved ✅, First Self-Hosted Compiler)
+**Previous:** v0.0.8 (Core Language Complete (inline asm, imports, for loops, bitwise))
 **Target:** v1.0 (Production-Ready Language)
 
 ---
@@ -15,11 +15,13 @@ Before starting standard library development in v0.1.0, these features are **ABS
 2. ✅ **v0.0.8.2: Collections & For Each Loops** - Stdlib needs lists, dicts, sets
 3. ✅ **v0.0.8.3: Pattern Matching & ADT Construction** - Type system incomplete without it
 4. ✅ **v0.0.8.4: Lambda & Type Inference** - Functional patterns + DX improvement
-5. ⚠️ **v0.3.0: Error Handling (Try/Catch)** - Stdlib needs error handling
-6. ⚠️ **v0.6.0: Generics** - Stdlib will be severely limited without generic collections
+5. ⚠️ **v0.0.9: Error Handling (Result/Option types)** - Stdlib needs error handling
+6. ⚠️ **v0.0.9: Generics** - Stdlib will be severely limited without generic collections
 
 **Without features 1-4, stdlib code will look like C with English keywords.**
 **Without features 5-6, stdlib will be non-idiomatic and error-prone.**
+
+**Timeline Adjustment:** Error handling and generics moved to v0.0.9 to provide proper foundation for stdlib development in v0.1.0+.
 
 ---
 
@@ -28,19 +30,19 @@ Before starting standard library development in v0.1.0, these features are **ABS
 | Version | Focus Area | Status |
 |---------|-----------|--------|
 | **v0.0.7.5** | Self-hosting compiler (C bootstrap) | ✅ **COMPLETE** |
-| **v0.0.8** | Core Language Complete (inline asm, imports, for loops, bitwise) | 🔄 **IN PROGRESS** |
-| **v0.0.8.1** | Struct Construction & Field Access Syntax | 📋 Planned |
+| **v0.0.8** | Core Language Complete (inline asm, imports, for loops, bitwise) | ✅ **COMPLETE**
+| **v0.0.8.1** | Struct Construction & Field Access Syntax | 🔄 **IN PROGRESS**
 | **v0.0.8.2** | Collections (Lists, Dictionaries, Sets) + For Each Loops | 📋 Planned |
 | **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | 📋 Planned |
 | **v0.0.8.4** | Lambda Expressions + Type Inference | 📋 Planned |
 | **v0.0.8.5** | String Interpolation, Ternary Operator | 📋 Planned |
-| **v0.0.9** | Native Object Writer, Linker & Pure Runa Runtime | 📋 Planned |
-| **v0.1.0** | Beta Release - Toolchain Independence | 🎯 Milestone |
+| **v0.0.9** | Error Handling, Generics, Native Object Writer & Pure Runa Runtime | 📋 Planned |
+| **v0.1.0** | Beta Release - Toolchain Independence + Stdlib Foundation | 🎯 Milestone |
 | **v0.2.0** | Standard Library Expansion + Triple Syntax (--canon/--developer/--viewer) | 📋 Planned |
-| **v0.3.0** | Error Handling & Debugging Tools (Try/Catch, Result types) | 📋 Planned |
+| **v0.3.0** | Debugging Tools & Dev Experience Improvements | 📋 Planned |
 | **v0.4.0** | Memory Management & Safety Features (Ownership, Lifetimes) | 📋 Planned |
 | **v0.5.0** | Optimization Passes (Basic - Constant Folding, DCE, Inlining) | 📋 Planned |
-| **v0.6.0** | Advanced Type System (Generics, Traits, Union/Optional types) | 📋 Planned |
+| **v0.6.0** | Advanced Type System Features (Traits, Union types, Refinement types) | 📋 Planned |
 | **v0.6.1** | Type Inference, Refinement Types | 📋 Planned |
 | **v0.7.0** | Concurrency Primitives (Threads, Mutexes, Channels) | 📋 Planned |
 | **v0.7.1** | Async/Await, Actors | 📋 Planned |
@@ -52,153 +54,6 @@ Before starting standard library development in v0.1.0, these features are **ABS
 | **v0.9.1** | IDE Tooling (LSP, Debugger, Profiler) | 📋 Planned |
 | **v0.9.2** | AI Annotation System Implementation | 📋 Planned |
 | **v1.0.0** | Production Release | 🎯 Goal |
-
----
-
-# 🔹 v0.0.8: Core Language Complete
-
-**Goal:** First fully self-hosted compiler with essential language features for real-world programming.
-
-**Status:** Self-hosting achieved ✅. Now completing core language features.
-
-**See also:** [V0_0_8_CRITICAL_FIXES.md](../bootstrap/v0.0.8/docs/V0_0_8_CRITICAL_FIXES.md)
-
-## What Belongs in v0.0.8
-
-### COMPILER Features (Lexer/Parser/Codegen):
-- ✅ Basic types (Integer, String, Character)
-- ✅ Variables (Let, Set)
-- ✅ Arithmetic operators (+, -, *, /, %)
-- ✅ Comparison operators (==, !=, <, >, <=, >=, "is not" variants)
-- ✅ Logical operators (and, or)
-- ✅ Bitwise operators (bit_and, bit_or, bit_xor, bit_shift_left, bit_shift_right)
-- ✅ Control flow (If/Otherwise/End If, While/End While)
-- ✅ Functions (Process called ... returns ...)
-- ✅ Structs (Type with fields)
-- ✅ Field access (dot notation)
-- ✅ Array indexing (bracket notation)
-- ✅ Comments (Note: single/multi-line)
-- ✅ Break/Continue statements
-- ✅ Negative numbers (negative keyword)
-- ✅ Boolean literals (true/false)
-- ✅ Parentheses for expression grouping
-- ✅ Compound assignment (Set x gets increased by, Increase x by)
-- ✅ **For loops** (`For var from start to end:` and `For var from start to end by step:`)
-- ✅ **Import system** (Both `Import "file" as name` and `Import { items } from "file"` with optional aliasing)
-- ✅ **Inline Assembly** (`Inline Assembly: ... End Assembly` with raw x86-64 instructions)1
-
-### RUNTIME Features (runtime/*.c → will become runtime/*.runa in v0.0.9):
-- ✅ Memory allocation (malloc, free) - **Currently C, will be Runa in v0.0.9**
-- ✅ String operations (length, concat, compare, char_at) - **Currently C, will be Runa in v0.0.9**
-- ✅ File I/O (read_file, write_file) - **Currently C, will be Runa in v0.0.9**
-- ✅ Basic I/O (Print/Display) - **Currently C, will be Runa in v0.0.9**
-- ✅ Math functions (sin, cos, sqrt, pow, etc.) - **Currently C, will be Runa in v0.0.9**
-- ❌ **List operations** (append, insert, remove, etc.) - **Will be Runa in v0.0.8.1**
-- ❌ **Dictionary operations** (get, set, keys, values) - **Will be Runa in v0.0.8.1**
-- ❌ **Advanced string ops** (split, join, trim, replace) - **Will be Runa in v0.0.8.1**
-
-### EXTERNAL SYSTEMS (Not in compiler or runtime):
-- Standard library modules (collections, datetime, network, JSON) - **v0.9.0**
-- Package manager - **v0.9.0**
-- Debugger/profiler - **v0.9.0**
-- IDE tooling (LSP, syntax highlighting) - **v0.9.0**
-- AOTT execution tiers - **v0.6.0-0.8.0**
-
-## Critical Fixes (From V0_0_8_CRITICAL_FIXES.md):
-
-### 1. ✅ **Fix Imports** - COMPLETE
-Multi-file compilation with process_imports
-
-### 2. ✅ **Negative Numbers** - COMPLETE
-`negative` keyword and unary negation
-
-### 3. ✅ **"is not" Comparisons** - COMPLETE
-All variants (is not equal to, is not less than, etc.)
-
-### 4. ✅ **Parentheses for Expression Grouping** - COMPLETE
-`(2 plus 3) multiplied by 4`
-
-### 5. ✅ **Note: Comments** - COMPLETE
-Single-line, inline, and multi-line block comments
-
-### 6. ✅ **Compound Assignment** - COMPLETE
-`Set x gets increased by 5`, `Increase x by 5`
-
-### 7. ✅ **Bitwise Operations** - COMPLETE
-bit_and, bit_or, bit_xor, bit_shift_left, bit_shift_right
-
-## New Features:
-
-### 5. **Inline Assembly**
-```runa
-proc syscall_exit(code: int) -> int:
-    Inline Assembly:
-        mov $60, %rax
-        movq -8(%rbp), %rdi
-        syscall
-    End Assembly
-    ret 0
-End proc
-```
-
-### 6. **Arrays**
-```runa
-Type called "IntArray":
-    data as Pointer
-    length as Integer
-    capacity as Integer
-End Type
-
-Let numbers be IntArray with length 10
-Set numbers at 0 to 42
-Let x be numbers at 0
-```
-
-### 7. **Structs with Fields**
-```runa
-Type called "Point":
-    x as Integer
-    y as Integer
-End Type
-
-Let p be Point with x 10 and y 20
-Display p.x
-Display p.y
-```
-
-### 8. **For Loops**
-```runa
-For i from 0 to 10:
-    Display i
-End For
-```
-
-## Comprehensive Testing:
-
-### Test all operators:
-- Modulo (implemented, untested)
-- Bitwise (AND, OR, XOR, shifts - implemented, untested)
-- Logical (And, Or - minimal testing)
-
-### Test edge cases:
-- Division by zero
-- Integer overflow
-- Deep recursion
-- Large numbers
-
-## Success Criteria:
-- ✅ Imports load and compile files
-- ✅ Negative numbers work
-- ✅ All "is not" comparisons work
-- ✅ Inline assembly works
-- ✅ Arrays with indexing
-- ✅ Structs with field access
-- ✅ For loops work
-- ✅ All operators tested
-- ✅ 50+ comprehensive tests passing
-- ✅ Self-hosting still works
-
-## Timeline: TBD
 
 ---
 
@@ -220,9 +75,6 @@ End For
 - ❌ **Field access (write)**: `Set the width of rect to 15`
   - Parser: Recognize `Set the FIELD of OBJECT to VALUE` pattern
   - Codegen: Look up struct type, calculate field offset, generate memory_set_integer()
-- ❌ **Developer mode dot notation**: `Let x_val be p.x` and `Set p.x to 15`
-  - Parser: Recognize dot notation as alternative syntax
-  - Codegen: Same as natural language form
 
 ### TYPE SYSTEM (New):
 - ❌ **Type registry**: Store struct definitions (field names, types, offsets)
@@ -263,7 +115,6 @@ Let x_val be memory_get_integer(p, 0)  # x is at offset 0
 - ✅ Struct construction with `a value of type` works
 - ✅ Field access with `the FIELD of OBJECT` works
 - ✅ Field assignment with `Set the FIELD of OBJECT to VALUE` works
-- ✅ Developer mode dot notation works: `p.x` and `p.x = value`
 - ✅ Type checking: compiler errors on non-existent fields
 - ✅ Multi-field structs work (3+ fields)
 - ✅ Nested struct access works: `the x of the position of player`
@@ -272,6 +123,8 @@ Let x_val be memory_get_integer(p, 0)  # x is at offset 0
 - ✅ Lexer rejects `#` with helpful error: "Use 'Note:' for comments"
 - ✅ All existing tests still pass
 - ✅ New tests for struct syntax pass
+
+**Note:** Dot notation (`p.x`) is deferred to v0.2.0 as part of developer mode syntax.
 
 ## Timeline: TBD
 
@@ -303,8 +156,6 @@ Let x_val be memory_get_integer(p, 0)  # x is at offset 0
 - ❌ **For each loops**: `For each item in items: ... End For`
   - Parser: Recognize `For each IDENTIFIER in EXPRESSION:`
   - Codegen: Generate iterator pattern with list_length/list_get
-- ❌ **Developer mode array literals**: `Let arr be [1, 2, 3]` (optional, for developer mode)
-- ❌ **Slicing syntax** (optional): `Let subset be list from index 1 to 5`
 
 ### RUNTIME (Implemented in Runa, compiled with runtime):
 - ❌ List operations: `list_create`, `list_append`, `list_insert`, `list_remove`, `list_get`, `list_set`, `list_length`
@@ -320,7 +171,8 @@ Let x_val be memory_get_integer(p, 0)  # x is at offset 0
 - ✅ Memory management (no leaks)
 - ✅ Nested collections work: `list containing list containing 1, 2`
 - ✅ Tests for all collection types
-- ✅ Developer mode `[1, 2, 3]` syntax works (optional)
+
+**Note:** Array literal syntax (`[1, 2, 3]`) is deferred to v0.2.0 as part of developer mode syntax.
 
 ## Timeline: TBD
 
@@ -415,9 +267,8 @@ struct Shape {
   - Codegen: Generate anonymous function with closure capture
 - ❌ **Multi-parameter lambdas**: `Let add be lambda x, y: x plus y`
 - ❌ **Lambda in function calls**: `Let doubled be Map over numbers using lambda x: x multiplied by 2`
-- ❌ **Function types**: `Function[Integer, Integer]` (takes Integer, returns Integer)
 - ❌ **Type inference for literals**: `Let x be 42` infers `Integer`, `Let name be "Alice"` infers `String`
-- ❌ **Type inference for collections**: `Let numbers be list containing 1, 2, 3` infers `List[Integer]`
+- ❌ **Type inference for collections**: `Let numbers be list containing 1, 2, 3` infers `List of Integer`
 - ❌ **Type inference for function returns**: Infer return type from function body
 - ❌ **Type inference for lambda parameters**: Infer from usage context
 
@@ -518,20 +369,123 @@ Let x as Integer be 42
 
 ---
 
-# 🔹 v0.0.9: Native Object Writer, Linker & Pure Runa Runtime
+# 🔹 v0.0.9: Error Handling, Generics, Native Object Writer & Pure Runa Runtime
 
-**Goal:** Complete toolchain independence - no `as`, no `ld`, no `gcc`. Zero C dependencies.
+**Goals:**
+1. **Error Handling & Generics** - Foundation for stdlib development
+2. **Complete Toolchain Independence** - No `as`, no `ld`, no `gcc`. Zero C dependencies.
 
 ## Features to Implement:
 
-### 1. **ELF Object File Writer**
+### 1. **Error Handling (Result & Option Types)**
+
+**Motivation:** Stdlib needs proper error handling before v0.1.0. Moving from v0.3.0 to v0.0.9.
+
+**Result Type:**
+```runa
+Note: Built-in Result type for operations that can fail
+Type Result of T and E:
+    Variant Success contains value as T
+    Variant Failure contains error as E
+End Type
+
+Process called "divide" takes a as Integer, b as Integer returns Result of Integer and String:
+    If b is equal to 0:
+        Return a Failure with error as "Division by zero"
+    End If
+    Return a Success with value as a divided by b
+End Process
+
+Note: Usage
+Let result be divide(10, 0)
+Match result:
+    When Success with value:
+        display("Result: ")
+        display_integer(value)
+    When Failure with error:
+        display("Error: ")
+        display(error)
+End Match
+```
+
+**Option Type:**
+```runa
+Note: Built-in Option type for optional values
+Type Option of T:
+    Variant Some contains value as T
+    Variant None
+End Type
+
+Process called "find_user" takes id as Integer returns Option of String:
+    If id is equal to 1:
+        Return Some with value as "Alice"
+    End If
+    Return None
+End Process
+```
+
+**Implementation Requirements:**
+- Built-in `Result` and `Option` types in compiler
+- Pattern matching support (already in v0.0.8.3)
+- Type inference for generic types
+- Helper methods: `is_success()`, `is_failure()`, `unwrap()`, `unwrap_or(default)`
+
+### 2. **Generics (Parametric Polymorphism)**
+
+**Motivation:** Stdlib needs generic collections. Moving from v0.6.0 to v0.0.9.
+
+**Generic Types:**
+```runa
+Note: Generic List type
+Type List of T:
+    Field items as Integer  Note: Pointer to T array
+    Field length as Integer
+    Field capacity as Integer
+End Type
+
+Process called "list_create" of type T returns List of T:
+    Let list be allocate(24)  Note: sizeof(List)
+    memory_set_pointer(list, 0, 0)  Note: items = NULL
+    memory_set_integer(list, 8, 0)   Note: length = 0
+    memory_set_integer(list, 16, 0)  Note: capacity = 0
+    Return list
+End Process
+
+Process called "list_append" of type T takes list as List of T, item as T returns Integer:
+    Note: Implementation...
+    Return 0
+End Process
+```
+
+**Generic Functions:**
+```runa
+Process called "swap" of type T takes a as T, b as T returns Integer:
+    Let temp be a
+    Set a to b
+    Set b to temp
+    Return 0
+End Process
+
+Note: Usage with type inference
+Let x be 5
+Let y be 10
+swap(x, y)  Note: Compiler infers T = Integer
+```
+
+**Implementation Requirements:**
+- Generic type parameters: `Type Foo of T:` and `Process foo of type T:`
+- Type inference for generic instantiation
+- Monomorphization (generate separate code for each concrete type)
+- Generic constraints (later): `Process foo of type T where T has Comparable:`
+
+### 3. **ELF Object File Writer**
 - Generate `.o` files directly (no `.s` intermediate)
 - ELF64 format specification
 - Symbol table generation
 - Relocation entries
 - Section headers (.text, .data, .rodata, .bss)
 
-### 2. **Custom Linker**
+### 4. **Custom Linker**
 - Link multiple `.o` files into executable
 - Resolve symbols across modules
 - Handle relocations
@@ -541,7 +495,7 @@ Let x as Integer be 42
   - Entry point specification
   - Section merging
 
-### 3. **Pure Runa Runtime (Zero C)**
+### 5. **Pure Runa Runtime (Zero C)**
 **Replaces `runtime/runtime.c` with `runtime/runtime.runa`**
 
 Write runtime entirely in Runa using inline assembly for syscalls:
@@ -587,7 +541,7 @@ runac runtime/runtime_string.runa -o runtime/runtime_string.o --emit=obj
 runac main.runa --link runtime/*.o -o program
 ```
 
-### 4. **New Compilation Flags**
+### 6. **New Compilation Flags**
 ```bash
 # Direct object file generation:
 runac program.runa -o program.o --emit=obj
@@ -599,12 +553,12 @@ runac --link main.o utils.o runtime/*.o -o program
 runac main.runa utils.runa -o program
 ```
 
-### 5. **File Format Support**
+### 7. **File Format Support**
 - **Phase 1:** ELF64 (Linux x86-64)
 - **Phase 2:** PE (Windows) - future
 - **Phase 3:** Mach-O (macOS) - future
 
-### 6. **Build Process Changes**
+### 8. **Build Process Changes**
 **Old (v0.0.7.5):**
 ```bash
 gcc -c runtime/runtime.c -o runtime/runtime.o    # Needs GCC
@@ -620,6 +574,15 @@ runac program.runa --link runtime.o -o program        # Pure Runa
 ```
 
 ## Success Criteria:
+
+**Error Handling & Generics:**
+- ✅ Result<T,E> and Option<T> types work correctly
+- ✅ Generic types and functions compile and instantiate properly
+- ✅ Type inference works for generic parameters
+- ✅ Pattern matching works with Result/Option
+- ✅ Standard library can be written using these features
+
+**Toolchain Independence:**
 - ✅ Generate valid ELF object files
 - ✅ Link multiple objects successfully
 - ✅ Executables run without external assembler/linker
@@ -632,9 +595,11 @@ runac program.runa --link runtime.o -o program        # Pure Runa
 
 ---
 
-# 🎯 v0.1.0: Beta Release - True Toolchain Independence
+# 🎯 v0.1.0: Beta Release - Toolchain Independence + Stdlib Foundation
 
-**Goal:** First public beta - zero external dependencies. Pure Runa compiler that requires nothing but libc for syscalls.
+**Goals:**
+1. **Toolchain Independence** - Zero external dependencies (no GCC/as/ld)
+2. **Stdlib Foundation** - Basic standard library using error handling & generics from v0.0.9
 
 **What "Toolchain Independence" Means:**
 - ✅ No GCC (pure Runa runtime)
@@ -652,31 +617,42 @@ runac program.runa --link runtime.o -o program        # Pure Runa
 - `runaobj` - object file inspector (debugging tool)
 - `runadump` - disassembler / binary inspector
 
-### 2. **Documentation**
+### 2. **Standard Library Foundation**
+- `stdlib/result.runa` - Result<T,E> helper functions
+- `stdlib/option.runa` - Option<T> helper functions
+- `stdlib/list.runa` - Generic List<T> collection
+- `stdlib/dict.runa` - Generic Dict<K,V> collection
+- `stdlib/string.runa` - String utilities
+- `stdlib/io.runa` - File I/O with error handling
+- `stdlib/math.runa` - Mathematical functions
+
+### 3. **Documentation**
 - Complete language specification
 - Standard library reference
 - Compiler internals guide
 - Migration guide from C/Rust/Python
 
-### 3. **Packaging**
+### 4. **Packaging**
 - Standalone binary distribution (Linux x86-64)
 - Installation script
 - Shell completion (bash, zsh)
 
-### 4. **Testing Suite**
+### 5. **Testing Suite**
 - 100+ test programs
 - Regression test suite
 - Performance benchmarks vs C/Rust/Python/Java
 - Memory leak detection
+- Stdlib unit tests
 
-### 5. **Announcement**
+### 6. **Announcement**
 - Blog post: "Runa v0.1.0: A Self-Hosting, Toolchain-Independent Language"
 - HackerNews/Reddit launch
 - GitHub release with binaries
 
 ## Success Criteria:
 - ✅ No external dependencies (except libc for syscalls)
-- ✅ Passes all test suites
+- ✅ Basic stdlib modules working with error handling & generics
+- ✅ Passes all test suites (compiler + stdlib)
 - ✅ Documentation complete
 - ✅ Public release ready
 
@@ -731,10 +707,39 @@ These are Runa modules (.runa files) that users import
   - `runac --viewer file.runa` → compiler outputs viewer format (display only)
 
 - ❌ **Developer Mode Syntax (`--developer`)**
-  - Mathematical operators: `+`, `-`, `*`, `/`, `%`, `**`
-  - Comparison operators: `==`, `!=`, `<`, `>`, `<=`, `>=`
+
+  **Field Access:**
+  - Dot notation: `p.x` instead of `the x of p`
+  - Dot assignment: `p.x = 15` instead of `Set the x of p to 15`
+
+  **Collection Literals:**
+  - Array literals: `[1, 2, 3]` instead of `list containing 1, 2, 3`
+  - Dict literals: `{"key": value}` instead of `dictionary with: "key" as value`
+  - Set literals: `{1, 2, 3}` instead of `set containing 1, 2, 3`
+
+  **Type Syntax:**
+  - Generic types: `List[Integer]` instead of `List of Integer`
+  - Function types: `Function[Integer, Integer]` instead of function pointer syntax
+
+  **Operators:**
+  - Mathematical: `+`, `-`, `*`, `/`, `%`, `**` instead of `plus`, `minus`, etc.
+  - Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=` instead of `is equal to`, etc.
+  - Logical: `&&`, `||`, `!` instead of `and`, `or`, `not`
   - Assignment: `=` instead of `be`
+
+  **Control Flow:**
+  - If syntax: `if (condition) { ... } else { ... }` instead of `If condition: ... Otherwise: ... End If`
+  - For loops: `for item in items { ... }` instead of `For each item in items: ... End For`
+  - While loops: `while (condition) { ... }` instead of `While condition: ... End While`
+
+  **Functions:**
   - Function syntax: `proc name()` instead of `Process called "name"`
+  - Return syntax: `return value` instead of `Return value`
+
+  **Comments:**
+  - Line comments: `//` instead of `Note:`
+  - Block comments: `/* ... */` instead of multi-line `Note:`
+
   - Bidirectional conversion with --canon mode
 
 - ❌ **Viewer Mode Output (`--viewer`)**
@@ -764,10 +769,22 @@ These are Runa modules (.runa files) that users import
 
 **Triple Syntax:**
 - ✅ All three modes (--canon, --developer, --viewer) fully functional
-- ✅ Bidirectional conversion between canon and developer modes
+- ✅ Bidirectional conversion between canon and developer modes preserves semantics
+- ✅ All developer mode features work (deferred from v0.0.8.x):
+  - ✅ Dot notation for field access (`p.x` from v0.0.8.1)
+  - ✅ Array literals (`[1, 2, 3]` from v0.0.8.2)
+  - ✅ Dict/Set literals (`{...}` from v0.0.8.2)
+  - ✅ Generic type syntax (`List[Integer]` from v0.0.8.4)
+  - ✅ Mathematical operators (`+`, `-`, `*`, `/`)
+  - ✅ Comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`)
+  - ✅ Logical operators (`&&`, `||`, `!`)
+  - ✅ C-style control flow (`if`, `for`, `while` with braces)
+  - ✅ Short function syntax (`proc`, `return`)
+  - ✅ Developer comments (`//` and `/* */`)
 - ✅ `runafmt` tool can convert any Runa code between modes
 - ✅ Documentation showing all three syntax forms side-by-side
 - ✅ Example programs demonstrating all modes
+- ✅ Comprehensive test suite covering all syntax variations
 
 ## Timeline: TBD
 
