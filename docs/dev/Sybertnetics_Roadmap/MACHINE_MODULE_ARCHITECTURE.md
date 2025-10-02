@@ -58,7 +58,7 @@ After analysis, `runa/src/stdlib/core/machine/` is the optimal location because:
 runa/src/stdlib/core/machine/
 ├── syscall.runa       # Raw system call interface (the ONLY syscall assembly)
 ├── atomic.runa        # Atomic operations (lock prefix instructions)
-├── memory.runa        # Memory operations (volatile, barriers, secure zeroing)
+├── memory.runa        # Memory operations (barriers, secure zeroing)
 ├── cpu.runa          # CPU feature detection and control (CPUID, RDTSC)
 ├── simd.runa         # SIMD/vector operations (SSE, AVX, NEON)
 └── platform.runa     # Platform-specific constants and detection
@@ -90,7 +90,7 @@ returns Integer:
     
     Let result as Integer
     
-    Inline Assembly volatile:
+    Inline Assembly:
         "mov rax, %1"    Note: Syscall number
         "mov rdi, %2"    Note: First argument
         "mov rsi, %3"    Note: Second argument
@@ -123,7 +123,7 @@ returns Boolean:
     
     Let success as Boolean
     
-    Inline Assembly volatile:
+    Inline Assembly:
         "mov rax, %2"              Note: Load expected value
         "lock cmpxchg [%1], %3"    Note: Atomic CAS
         "sete %0"                  Note: Set success flag
@@ -143,7 +143,7 @@ Process called "atomic_add" that takes ptr as Pointer, value as Integer returns 
     
     Let old_value as Integer
     
-    Inline Assembly volatile:
+    Inline Assembly:
         "lock xadd [%1], %2"
         "mov %0, %2"
         : "=r"(old_value)
@@ -163,7 +163,7 @@ Process called "secure_zero_memory" that takes ptr as Pointer, size as Integer:
         Critical for cryptographic key material cleanup.
     @End Security_Scope
     
-    Inline Assembly volatile:
+    Inline Assembly:
         "mov rcx, %1"          Note: Size counter
         "mov rdi, %0"          Note: Destination pointer
         "xor al, al"           Note: Zero value
@@ -180,7 +180,7 @@ Process called "memory_fence":
         Full memory barrier. Prevents CPU and compiler reordering.
     @End Implementation
     
-    Inline Assembly volatile:
+    Inline Assembly:
         "mfence"
         :
         :
@@ -323,7 +323,7 @@ The compiler will recognize specific machine module patterns and optimize them:
 The Runa syntax for inline assembly remains identical across all platforms:
 
 ```runa
-Inline Assembly volatile:
+Inline Assembly:
     [assembly code here]
     : [output operands]
     : [input operands]
@@ -378,7 +378,7 @@ Process called "atomic_add" takes ptr as Pointer, value as Integer returns Integ
 
     Let old_value as Integer
 
-    Inline Assembly volatile:
+    Inline Assembly:
         "lock xadd [%1], %2"     # x86-64: LOCK prefix + XADD instruction
         "mov %0, %2"
         : "=r"(old_value)
@@ -399,7 +399,7 @@ Process called "atomic_add" takes ptr as Pointer, value as Integer returns Integ
 
     Let old_value as Integer
 
-    Inline Assembly volatile:
+    Inline Assembly:
         "ldadd %2, %0, [%1]"     # ARM64: Atomic Load-Add instruction
         : "=r"(old_value)
         : "r"(ptr), "r"(value)
@@ -419,7 +419,7 @@ Process called "atomic_add" takes ptr as Pointer, value as Integer returns Integ
 
     Let old_value as Integer
 
-    Inline Assembly volatile:
+    Inline Assembly:
         "amoadd.d.aqrl %0, %2, (%1)"  # RISC-V: Atomic Memory Operation ADD
         : "=r"(old_value)
         : "r"(ptr), "r"(value)
@@ -437,7 +437,7 @@ End Process
 Process called "raw_syscall" takes number as Integer, arg1 as Integer returns Integer:
     Let result as Integer
 
-    Inline Assembly volatile:
+    Inline Assembly:
         "mov rax, %1"    Note: Syscall number in RAX
         "mov rdi, %2"    Note: First argument in RDI
         "syscall"        Note: x86-64 syscall instruction
@@ -456,7 +456,7 @@ End Process
 Process called "raw_syscall" takes number as Integer, arg1 as Integer returns Integer:
     Let result as Integer
 
-    Inline Assembly volatile:
+    Inline Assembly:
         "mov x8, %1"     Note: Syscall number in X8 (different register!)
         "mov x0, %2"     Note: First argument in X0 (different register!)
         "svc #0"         Note: ARM64 supervisor call (different instruction!)
@@ -475,7 +475,7 @@ End Process
 Process called "raw_syscall" takes number as Integer, arg1 as Integer returns Integer:
     Let result as Integer
 
-    Inline Assembly volatile:
+    Inline Assembly:
         "mov x16, %1"    Note: macOS uses X16 for syscall number (OS difference!)
         "mov x0, %2"     Note: First argument in X0
         "svc #0x80"      Note: macOS uses different syscall number
@@ -610,7 +610,7 @@ This is a multi-phase plan to build out this critical module.
     *   **Content:** The `raw_syscall` process we designed previously. This will be the single, unified entry point for all operating system calls. It will be heavily documented as "unsafe and for internal use only."
 *   **1.2. Create the Atomic Operations Interface:**
     *   **File:** `runa/stdlib/core/machine/atomic.runa`
-    *   **Content:** A suite of processes for atomic operations (`atomic_add`, `atomic_compare_and_swap`, etc.). Each of these will be implemented using a small, specific, and volatile `Inline Assembly` block.
+    *   **Content:** A suite of processes for atomic operations (`atomic_add`, `atomic_compare_and_swap`, etc.). Each of these will be implemented using a small, specific `Inline Assembly` block.
 *   **1.3. Create the Memory Operations Interface:**
     *   **File:** `runa/stdlib/core/machine/memory.runa`
     *   **Content:** The `securely_zero_memory` process, as well as other primitives like `memory_copy_non_temporal` (a special, highly optimized memory copy for video or network buffers), and `cpu_cache_flush`.
@@ -668,7 +668,7 @@ This is the comprehensive list of functions that the `runa/stdlib/core/machine/`
 
 #### **`memory.runa` (Safe Wrappers)**
 *   `securely_zero_memory`: The non-optimizable memory wipe function we designed.
-*   `volatile_read` / `volatile_write`: Reads/writes from memory in a way the compiler is forbidden from re-ordering. Essential for device drivers.
+*   `memory_read_ordered` / `memory_write_ordered`: Reads/writes from memory that the compiler cannot reorder. Essential for device drivers and memory-mapped I/O.
 *   `cpu_cache_flush`: A process to manually flush a specific line from the CPU's cache.
 *   `prefetch_memory`: A hint to the CPU to start loading a piece of memory into its cache before it's actually needed.
 
@@ -753,10 +753,10 @@ The compiler effectively looks at the source code you and your team wrote for `s
 ```runa
 // Inside stdlib/core/machine/atomic.runa
 Process called "atomic_add" that takes target as Integer and value as Integer:
-    Inline Assembly volatile:
-        // This is the secret sauce. The 'lock' prefix is a special
-        // CPU command that ensures this 'add' operation is atomic.
-        // It guarantees that no other thread can interrupt it.
+    Inline Assembly:
+        # This is the secret sauce. The 'lock' prefix is a special
+        # CPU command that ensures this 'add' operation is atomic.
+        # It guarantees that no other thread can interrupt it.
         "lock add [ %0 ], %1\n"   Note: Atomically add the value to the memory location.
         :
         : "r"(target), "r"(value)
