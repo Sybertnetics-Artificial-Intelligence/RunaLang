@@ -173,6 +173,9 @@ read_file_internal:
     movq %rbp, %rsp
     popq %rbp
     ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
 
 
 .globl process_imports
@@ -233,7 +236,10 @@ process_imports:
     imulq %rbx, %rax
     movq %rax, -48(%rbp)
     movq -24(%rbp), %rax
-    addq -48(%rbp), %rax
+    pushq %rax
+    movq -48(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -56(%rbp)
     movq $0, %rax
     pushq %rax
@@ -381,7 +387,10 @@ process_imports:
     imulq %rbx, %rax
     movq %rax, -152(%rbp)
     movq -136(%rbp), %rax
-    addq -152(%rbp), %rax
+    pushq %rax
+    movq -152(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -160(%rbp)
     movq $0, %rax
     pushq %rax
@@ -399,7 +408,10 @@ process_imports:
     popq %rsi
     call program_add_function
     movq -144(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -144(%rbp), %rbx
     popq %rax
@@ -440,7 +452,10 @@ process_imports:
     imulq %rbx, %rax
     movq %rax, -200(%rbp)
     movq -184(%rbp), %rax
-    addq -200(%rbp), %rax
+    pushq %rax
+    movq -200(%rbp), %rax
+    popq %rbx
+    addq %rbx, %rax
     movq %rax, -208(%rbp)
     movq $0, %rax
     pushq %rax
@@ -458,7 +473,10 @@ process_imports:
     popq %rsi
     call program_add_type
     movq -192(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -192(%rbp), %rbx
     popq %rax
@@ -478,7 +496,10 @@ process_imports:
     popq %rdi
     call deallocate@PLT
     movq -32(%rbp), %rax
-    addq $1, %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    addq %rbx, %rax
     pushq %rax
     leaq -32(%rbp), %rbx
     popq %rax
@@ -486,6 +507,9 @@ process_imports:
     jmp .L21
 .L22:
     movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -586,14 +610,6 @@ main:
     pushq %rax
     popq %rdi
     call print_string
-    movq -48(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -56(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -638,14 +654,6 @@ main:
     popq %rdi
     call lexer_destroy
     movq -64(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -48(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -726,14 +734,6 @@ main:
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -48(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -56(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -768,14 +768,6 @@ main:
     popq %rdi
     call lexer_destroy
     movq -64(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -48(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -857,10 +849,6 @@ main:
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -120(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call codegen_destroy
     movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -877,15 +865,10 @@ main:
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -48(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -56(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
     movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
     movq %rbp, %rsp
     popq %rbp
     ret
