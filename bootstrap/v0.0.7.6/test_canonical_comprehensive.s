@@ -1,5 +1,7 @@
 .section .rodata
-.STR0:    .string "List created!"
+.STR0:    .string "List created successfully"
+.STR1:    .string "List with multiple elements created"
+.STR2:    .string "Another list created"
 
 .text
 print_string:
@@ -134,6 +136,48 @@ main:
     popq %rax  # List pointer as result
     movq %rax, -24(%rbp)
     leaq .STR0(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $32, %rdi
+    call memory_allocate
+    pushq %rax  # Save list pointer
+    movq $10, %rax
+    movq (%rsp), %rbx  # Load list pointer
+    movq %rax, 0(%rbx)
+    movq $20, %rax
+    movq (%rsp), %rbx  # Load list pointer
+    movq %rax, 8(%rbx)
+    movq $30, %rax
+    movq (%rsp), %rbx  # Load list pointer
+    movq %rax, 16(%rbx)
+    movq $40, %rax
+    movq (%rsp), %rbx  # Load list pointer
+    movq %rax, 24(%rbx)
+    popq %rax  # List pointer as result
+    movq %rax, -32(%rbp)
+    leaq .STR1(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $42, %rax
+    movq %rax, -40(%rbp)
+    movq -40(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_integer
+    movq $16, %rdi
+    call memory_allocate
+    pushq %rax  # Save list pointer
+    movq $100, %rax
+    movq (%rsp), %rbx  # Load list pointer
+    movq %rax, 0(%rbx)
+    movq $200, %rax
+    movq (%rsp), %rbx  # Load list pointer
+    movq %rax, 8(%rbx)
+    popq %rax  # List pointer as result
+    movq %rax, -48(%rbp)
+    leaq .STR2(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string

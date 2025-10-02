@@ -1,5 +1,6 @@
 .section .rodata
-.STR0:    .string "List created!"
+.STR0:    .string "First list created"
+.STR1:    .string "Second list created"
 
 .text
 print_string:
@@ -134,6 +135,21 @@ main:
     popq %rax  # List pointer as result
     movq %rax, -24(%rbp)
     leaq .STR0(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $16, %rdi
+    call memory_allocate
+    pushq %rax  # Save list pointer
+    movq $10, %rax
+    movq (%rsp), %rbx  # Load list pointer
+    movq %rax, 0(%rbx)
+    movq $20, %rax
+    movq (%rsp), %rbx  # Load list pointer
+    movq %rax, 8(%rbx)
+    popq %rax  # List pointer as result
+    movq %rax, -32(%rbp)
+    leaq .STR1(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
