@@ -121,7 +121,7 @@ echo ""
 # Check if compiler exists
 if [[ ! -f "$COMPILER" ]]; then
     echo -e "${RED}ERROR:${NC} Compiler not found at $COMPILER"
-    echo "Please build stage2 first."
+    echo "Please populate build first."
     exit 1
 fi
 
