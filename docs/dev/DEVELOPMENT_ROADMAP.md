@@ -36,6 +36,8 @@ Before starting standard library development in v0.1.0, these features are **ABS
 | **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | 📋 Planned |
 | **v0.0.8.4** | Lambda Expressions + Type Inference | 📋 Planned |
 | **v0.0.8.5** | String Interpolation, Ternary Operator | 📋 Planned |
+| **v0.0.8.6** | Advanced Types Phase 1: Range Constraints + Float/Float64 | 📋 Planned |
+| **v0.0.8.7** | Advanced Types Phase 2: Wire Format Types (Integer16/32) + FFI Types | 📋 Planned |
 | **v0.0.9** | Error Handling, Generics, Native Object Writer & Pure Runa Runtime | 📋 Planned |
 | **v0.1.0** | Beta Release - Toolchain Independence + Stdlib Foundation | 🎯 Milestone |
 | **v0.2.0** | Standard Library Expansion + Triple Syntax (--canon/--developer/--viewer) | 📋 Planned |
@@ -46,14 +48,22 @@ Before starting standard library development in v0.1.0, these features are **ABS
 | **v0.6.1** | Type Inference, Refinement Types | 📋 Planned |
 | **v0.7.0** | Concurrency Primitives (Threads, Mutexes, Channels) | 📋 Planned |
 | **v0.7.1** | Async/Await, Actors | 📋 Planned |
-| **v0.8.0** | Advanced Optimization & Profiling (PGO, LTO, SIMD) | 📋 Planned |
-| **v0.8.1** | AOTT Tier 0-1: Lightning Interpreter + Smart Bytecode | 📋 Planned |
-| **v0.8.2** | AOTT Tier 2-3: Basic + Optimized Native Compilation | 📋 Planned |
-| **v0.8.3** | AOTT Tier 4: Speculative Execution | 📋 Planned |
-| **v0.9.0** | Package Management & Distribution | 📋 Planned |
-| **v0.9.1** | IDE Tooling (LSP, Debugger, Profiler) | 📋 Planned |
-| **v0.9.2** | AI Annotation System Implementation | 📋 Planned |
-| **v1.0.0** | Production Release | 🎯 Goal |
+| **v0.8.0** | Runa HIR (Human-Readable IR) + Advanced Optimization (PGO, LTO, SIMD) | 📋 Planned |
+| **v0.8.1** | AOTT Tier 0-1: Lightning Interpreter + Smart Bytecode (uses HIR) | 📋 Planned |
+| **v0.8.2** | AOTT Tier 2-3: Basic + Optimized Native Compilation (uses HIR) | 📋 Planned |
+| **v0.8.3** | AOTT Tier 4: Speculative Execution (uses HIR) | 📋 Planned |
+| **v0.9.0** | Cross-Compilation: Target Abstraction + Multi-Backend Foundation | 📋 Planned |
+| **v0.9.1** | Cross-Compilation: Windows Support (x86-64 PE format) | 📋 Planned |
+| **v0.9.2** | Cross-Compilation: macOS Support (x86-64 + ARM64 Mach-O format) | 📋 Planned |
+| **v0.9.3** | Cross-Compilation: ARM64 Linux Support | 📋 Planned |
+| **v0.9.4** | Cross-Compilation: WebAssembly Support (WASM + WASI) | 📋 Planned |
+| **v0.9.5** | Package Management & Distribution | 📋 Planned |
+| **v0.9.6** | IDE Tooling (LSP, Debugger, Profiler) | 📋 Planned |
+| **v0.9.7** | AI Annotation System Implementation | 📋 Planned |
+| **v1.0.0** | Production Release (All Platforms, All Features Complete) | 🎯 Goal |
+| **v1.1** | Rosetta Stone Phase 1: C → Runa Translation | 📋 Planned |
+| **v1.2** | Rosetta Stone Phase 2: Runa → Python Translation | 📋 Planned |
+| **v1.3** | Rosetta Stone Phase 3: Bidirectional C ↔ Runa ↔ Python | 📋 Planned |
 
 ---
 
@@ -82,7 +92,7 @@ Before starting standard library development in v0.1.0, these features are **ABS
 - ❌ **Type validation**: Ensure field exists in struct before accessing
 
 ### LEXER (Breaking Change):
-- ❌ **Remove hashtag comment support**: `# comment` is NO LONGER VALID
+- ✅ **Remove hashtag comment support**: `# comment` is NO LONGER VALID
   - Remove `#` comment handling from lexer (lines 697-699 in v0.0.8)
   - Remove `lexer_skip_comment` process (lines 272-292 in v0.0.8)
   - **ONLY `Note:` comments are supported going forward**
@@ -374,6 +384,47 @@ Let x as Integer be 42
 **Goals:**
 1. **Error Handling & Generics** - Foundation for stdlib development
 2. **Complete Toolchain Independence** - No `as`, no `ld`, no `gcc`. Zero C dependencies.
+3. **Architectural Refactoring** - Transition from monolithic v0.0.8 to modular architecture
+
+**📝 Note:** This version includes major architectural refactoring. See [V0_0_9_REFACTORING_PLAN.md](V0_0_9_REFACTORING_PLAN.md) for detailed breakdown of v0.0.9.0 → v0.0.9.1 → v0.0.9.2 → v0.0.9.3 phased implementation and module structure.
+
+## Architecture Transition:
+
+**Current State (v0.0.8):**
+```
+src/
+├── main.runa (245 lines)
+├── lexer.runa (1,576 lines) - MONOLITHIC
+├── parser.runa (4,350 lines) - TOO LARGE
+├── codegen.runa (3,490 lines) - MONOLITHIC
+├── containers.runa (1,241 lines)
+├── hashtable.runa (667 lines)
+└── string_utils.runa (917 lines)
+```
+
+**Target State (v0.0.9.3):**
+```
+src/
+├── frontend/
+│   ├── lexer/ (lexer.runa, token.runa)
+│   └── parser/ (parser.runa, ast.runa)
+├── semantic/
+│   ├── semantic_analyzer.runa
+│   ├── type_checker.runa (with generics support)
+│   └── symbol_table.runa
+├── ir/
+│   ├── hir/ (High-level IR)
+│   └── mir/ (Mid-level IR)
+├── backend/
+│   └── x86_64/ (codegen.runa, instruction_selector.runa, object_writer.runa)
+└── runtime/ (Pure Runa runtime - replaces runtime.c)
+```
+
+**Phased Implementation:**
+- **v0.0.9.0**: Split lexer/parser, add Result/Option types, begin runtime.runa
+- **v0.0.9.1**: Add semantic analysis phase, implement generics + type inference
+- **v0.0.9.2**: Add IR layers (HIR/MIR), native ELF64 object writer, custom linker
+- **v0.0.9.3**: Complete pure Runa runtime, eliminate runtime.c, zero external dependencies
 
 ## Features to Implement:
 
@@ -1455,9 +1506,142 @@ End Process
 
 ---
 
-# 🔹 v0.8.0: Advanced Optimization & Profiling
+# 🔹 v0.8.0: Runa HIR (Human-Readable IR) + Advanced Optimization & Profiling
 
-**Goal:** Match or exceed C performance through advanced optimizations.
+**Goal:** Implement Runa's Human-Readable Intermediate Representation (HIR) as the universal translation layer, enabling cross-compilation, AOTT, and advanced optimizations.
+
+**Philosophy:** Build our own IR (Runa HIR) - NOT LLVM IR - that is human-readable, preserves high-level semantics, and can be written/edited by humans.
+
+## What Belongs Where:
+
+### COMPILER (Runa HIR Implementation):
+
+- ❌ **HIR Design & Specification**
+  - **Human-readable intermediate representation** - Valid Runa code (can be written/edited by humans)
+  - **Preserves high-level semantics** - NOT low-level SSA like LLVM IR
+  - **Triple syntax support** (--canon, --viewer, --developer)
+  - **Language-agnostic abstractions** - Universal semantic representation
+  - **Metadata system** - Preserve language-specific features
+
+  **Why Runa HIR vs LLVM IR:**
+  | Feature | LLVM IR | Runa HIR |
+  |---------|---------|----------|
+  | Human Readable | ❌ SSA, registers, basic blocks | ✅ Valid Runa code |
+  | Bidirectional | ❌ One-way only | ✅ Two-way with semantics |
+  | Preserves Semantics | ❌ Low-level only | ✅ High-level concepts |
+  | Multiple Syntax | ❌ Single form | ✅ Triple syntax |
+  | Writeable | ❌ Too complex | ✅ Yes (--canon, --developer) |
+
+  **HIR Node Types:**
+  ```runa
+  Type called "HIRNode":
+      node_id as String
+      node_type as HIRNodeType
+      source_location as SourceLocation
+      type_signature as TypeInfo
+      metadata as Dictionary
+  End Type
+
+  Type called "HIRNodeType" is one of:
+      | ProgramRoot
+      | ModuleDefinition
+      | FunctionDefinition
+      | TypeDefinition
+      | VariableDeclaration
+      | Expression
+      | Statement
+      | ControlFlow
+      | Pattern
+  End Type
+  ```
+
+- ❌ **AST → HIR Lowering**
+  ```
+  Runa Source → Parse → AST → Lower to HIR → Optimize → Codegen
+  ```
+  - Convert AST to HIR representation
+  - Preserve type information
+  - Maintain semantic meaning
+  - Keep variable names and structure
+  - Attach metadata for language features
+
+  **Example Lowering:**
+  ```runa
+  # Source (Canonical):
+  Process called "factorial" takes n as Integer returns Integer:
+      If n is less than or equal to 1:
+          Return 1
+      End If
+      Return n times factorial(n minus 1)
+  End Process
+
+  # HIR (same as source - HIR is valid Runa):
+  Process called "factorial" takes n as Integer returns Integer:
+      If n is less than or equal to 1:
+          Return 1
+      End If
+      Return n times factorial(n minus 1)
+  End Process
+  ```
+
+- ❌ **HIR → Multiple Backends**
+  - HIR → x86-64 assembly (Linux/Windows/macOS)
+  - HIR → AArch64 assembly (ARM64)
+  - HIR → WASM bytecode
+  - Foundation for cross-compilation (v0.9.0+)
+
+  **Backend Interface:**
+  ```runa
+  Process called "codegen_generate" takes program as Integer, target as Integer returns Integer:
+      Let arch be memory_get_pointer(target, 0)  # target->arch
+
+      If string_equals(arch, "x86_64") is equal to 1:
+          Return codegen_x86_64_generate(program, target)
+      Otherwise If string_equals(arch, "aarch64") is equal to 1:
+          Return codegen_aarch64_generate(program, target)
+      Otherwise If string_equals(arch, "wasm32") is equal to 1:
+          Return codegen_wasm_generate(program, target)
+      End If
+  End Process
+  ```
+
+- ❌ **HIR Optimization Passes**
+  - Constant folding on HIR
+  - Dead code elimination on HIR
+  - Inlining at HIR level
+  - Common subexpression elimination
+
+- ❌ **Triple Syntax Generators**
+  Generate three different syntax views from HIR:
+
+  **--canon (Canonical - Structured):**
+  ```runa
+  Process called "factorial" takes n as Integer returns Integer:
+      If n is less than or equal to 1:
+          Return 1
+      End If
+      Return n times factorial(n minus 1)
+  End Process
+  ```
+
+  **--viewer (Natural Language - Read-only):**
+  ```
+  Define a process called "factorial" that takes an integer n and returns an integer.
+  If n is less than or equal to 1, return 1.
+  Otherwise, return n multiplied by the factorial of n minus 1.
+  ```
+
+  **--developer (Concise - Writeable):**
+  ```runa
+  proc factorial(n: int) -> int:
+      if n <= 1:
+          ret 1
+      End if
+      ret n * factorial(n - 1)
+  End proc
+  ```
+
+### COMPILER (Advanced Optimization):
 
 ## What Belongs Where:
 
@@ -1920,9 +2104,663 @@ End Process
 
 ---
 
-# 🔹 v0.9.0: Package Management & Distribution
+# 🔹 v0.9.0: Cross-Compilation: Target Abstraction + Multi-Backend Foundation
 
-**Goal:** Complete package ecosystem for code sharing and distribution.
+**Goal:** Abstract compiler to support multiple target platforms, laying the foundation for Windows, macOS, ARM64, and WASM support.
+
+**Philosophy:** Build it entirely in Runa using Runa HIR - no external dependencies, no LLVM IR (we build our own IR).
+
+## Cross-Compilation Overview:
+
+Cross-compilation allows developers to:
+- Compile Windows binaries on Linux
+- Compile macOS binaries on Windows
+- Compile ARM binaries on x86-64
+- Compile WASM from any platform
+
+**Implementation Order (v0.9.0-v0.9.4):**
+1. x86-64 Linux (v0.0.7.5 ✅ COMPLETE)
+2. x86-64 Windows PE format (v0.9.1)
+3. x86-64 + ARM64 macOS Mach-O format (v0.9.2)
+4. ARM64 Linux (v0.9.3)
+5. WASM + WASI (v0.9.4)
+
+## What Belongs Where:
+
+### COMPILER (Target Abstraction):
+- ❌ **Target Triple System**
+  ```runa
+  # Target format: <arch>-<os>-<abi>
+  # Examples: x86_64-linux-gnu, x86_64-windows-msvc, aarch64-darwin-macho
+
+  Type called "Target":
+      arch as String        # "x86_64", "aarch64", "wasm32"
+      os as String          # "linux", "windows", "darwin", "wasi"
+      abi as String         # "gnu", "msvc", "darwin", "wasi"
+      format as String      # "elf64", "pe", "macho", "wasm"
+      endian as String      # "little", "big"
+      pointer_size as Integer  # 4 (32-bit) or 8 (64-bit)
+  End Type
+
+  Process called "target_from_triple" takes triple as String returns Integer:
+      # Parse "x86_64-linux-gnu" → Target struct
+      # Returns pointer to Target
+  End Process
+  ```
+
+- ❌ **Compiler Flag: `--target`**
+  ```bash
+  # Compile for current platform (default):
+  runac program.runa -o program
+
+  # Cross-compile for Windows:
+  runac --target=x86_64-windows program.runa -o program.exe
+
+  # Cross-compile for macOS:
+  runac --target=x86_64-darwin program.runa -o program
+
+  # Cross-compile for ARM64 Linux:
+  runac --target=aarch64-linux program.runa -o program-arm
+
+  # Compile to WebAssembly:
+  runac --target=wasm32-wasi program.runa -o program.wasm
+
+  # List available targets:
+  runac --list-targets
+  ```
+
+- ❌ **Refactor Codegen for Multi-Backend**
+  ```
+  Current (v0.0.7.5):
+  src/codegen.runa  → Generates x86-64 assembly only
+
+  Future (v0.9.0+):
+  src/codegen/
+  ├── codegen_common.runa      # Shared logic (HIR traversal, etc.)
+  ├── codegen_x86_64.runa      # x86-64 instruction generation
+  ├── codegen_aarch64.runa     # ARM64 instruction generation
+  ├── codegen_wasm.runa        # WASM bytecode generation
+  ├── target.runa              # Target abstraction
+  └── backend_interface.runa   # Backend API
+  ```
+
+  **Backend Selection:**
+  ```runa
+  Process called "codegen_generate" takes program as Integer, target as Integer returns Integer:
+      Let arch be memory_get_pointer(target, 0)  # target->arch
+
+      If string_equals(arch, "x86_64") is equal to 1:
+          Return codegen_x86_64_generate(program, target)
+      Otherwise If string_equals(arch, "aarch64") is equal to 1:
+          Return codegen_aarch64_generate(program, target)
+      Otherwise If string_equals(arch, "wasm32") is equal to 1:
+          Return codegen_wasm_generate(program, target)
+      Otherwise:
+          Print "Unsupported architecture: "
+          Print arch
+          exit_with_code(1)
+      End If
+  End Process
+  ```
+
+- ❌ **Host Target Detection**
+  - Auto-detect current platform (x86_64-linux, x86_64-windows, etc.)
+  - Use as default if `--target` not specified
+
+- ❌ **Multi-Format Object Writer Foundation**
+  ```
+  Current (v0.0.9 Plan):
+  src/object_writer.runa  → Writes ELF64 only
+
+  Future (v0.9.1+):
+  src/formats/
+  ├── elf64.runa           # ELF 64-bit format (Linux, BSD)
+  ├── pe.runa              # PE format (Windows) - v0.9.1
+  ├── macho.runa           # Mach-O format (macOS, iOS) - v0.9.2
+  ├── wasm.runa            # WebAssembly module format - v0.9.4
+  └── format_common.runa   # Shared utilities
+  ```
+
+  **Format Selection:**
+  ```runa
+  Process called "write_object_file" takes code as Integer, target as Integer, filename as String returns Integer:
+      Let format be memory_get_pointer(target, 24)  # target->format
+
+      If string_equals(format, "elf64") is equal to 1:
+          Return write_elf64(code, target, filename)
+      Otherwise If string_equals(format, "pe") is equal to 1:
+          Return write_pe(code, target, filename)
+      Otherwise If string_equals(format, "macho") is equal to 1:
+          Return write_macho(code, target, filename)
+      Otherwise If string_equals(format, "wasm") is equal to 1:
+          Return write_wasm(code, target, filename)
+      End If
+  End Process
+  ```
+
+### STANDARD LIBRARY (Cross-Platform Abstraction):
+
+**Challenge:** System calls differ across platforms.
+
+**Solution:** Platform abstraction layer.
+
+```runa
+# Public API (platform-independent):
+Process called "file_open" takes path as String, mode as Integer returns Integer:
+    Let target be get_current_target()
+    Let os be memory_get_pointer(target, 8)  # target->os
+
+    If string_equals(os, "linux") is equal to 1:
+        Return file_open_linux(path, mode)
+    Otherwise If string_equals(os, "windows") is equal to 1:
+        Return file_open_windows(path, mode)
+    Otherwise If string_equals(os, "darwin") is equal to 1:
+        Return file_open_darwin(path, mode)
+    Otherwise If string_equals(os, "wasi") is equal to 1:
+        Return file_open_wasi(path, mode)
+    End If
+End Process
+```
+
+**Standard Library Structure:**
+```
+stdlib/
+├── io/
+│   ├── io_common.runa       # Public API
+│   ├── io_linux.runa        # Linux syscalls
+│   ├── io_windows.runa      # Windows API
+│   ├── io_darwin.runa       # macOS syscalls
+│   └── io_wasi.runa         # WASI functions
+├── fs/
+│   ├── fs_common.runa
+│   ├── fs_linux.runa
+│   ├── fs_windows.runa
+│   └── fs_darwin.runa
+└── net/
+    ├── net_common.runa
+    ├── net_posix.runa       # Linux/macOS/BSD
+    └── net_windows.runa     # Winsock
+```
+
+## Format Complexity Comparison:
+
+| Format | Platform | Difficulty | Lines of Code (est.) | Target Version |
+|--------|----------|------------|---------------------|----------------|
+| **ELF64** | Linux | ⭐⭐⭐ Medium | ~1000 LOC | v0.0.9 ✅ |
+| **PE** | Windows | ⭐⭐⭐⭐ Hard | ~2000 LOC | v0.9.1 |
+| **Mach-O** | macOS | ⭐⭐⭐⭐ Hard | ~2000 LOC | v0.9.2 |
+| **WASM** | Web | ⭐⭐ Easy | ~500 LOC | v0.9.4 |
+
+**Why ELF is easiest:**
+- Well-documented specification
+- Simpler structure (sections, symbols, relocations)
+- No code signing requirements
+- Open-source tooling for reference
+
+**Why PE/Mach-O are harder:**
+- Complex import/export tables
+- Code signing (macOS)
+- Platform-specific quirks
+- Less documentation
+
+## Success Criteria:
+- ✅ Can specify `--target` flag (even if only x86-64 Linux works)
+- ✅ Codegen is target-aware (accepts Target parameter)
+- ✅ Architecture cleanly separated (ready for new backends)
+- ✅ HIR → Backend interface well-defined
+- ✅ Foundation ready for v0.9.1+ (Windows, macOS, ARM64, WASM)
+
+## Timeline: 3-4 weeks
+
+---
+
+# 🔹 v0.9.1: Cross-Compilation: Windows Support (x86-64)
+
+**Goal:** Enable cross-compilation to Windows PE format with Microsoft x64 calling convention.
+
+## Platform Details:
+
+**File Format:** PE (Portable Executable)
+**Calling Convention:** Microsoft x64 (different from System V!)
+**System API:** Win32 API (no direct syscalls)
+
+## What Belongs Where:
+
+### COMPILER:
+- ❌ **PE Object Writer** (src/formats/pe.runa)
+  - Portable Executable format for Windows
+  - Import/export tables
+  - DLL linking
+  - Resource sections
+
+- ❌ **Microsoft x64 Calling Convention** (codegen_x86_64.runa)
+
+  **Key Differences from Linux (System V):**
+  - Arguments passed in: **RCX, RDX, R8, R9** (not RDI, RSI, RDX, RCX)
+  - **Shadow space:** 32 bytes reserved on stack (even if not used)
+  - Different system calls (via kernel32.dll, not syscall instruction)
+  - No direct syscalls - must use DLLs
+
+  **Example Windows Function Call:**
+  ```runa
+  # Windows x64 function call:
+  Process called "windows_print" takes message as String:
+      Inline Assembly:
+          # Windows x64 ABI:
+          # RCX = first argument
+          # RDX = second argument
+          # R8 = third argument
+          # R9 = fourth argument
+          # Stack must have 32-byte shadow space
+
+          sub $32, %rsp           # Allocate shadow space
+          movq -8(%rbp), %rcx     # Load message into RCX (first arg)
+          call WriteConsoleA      # Windows API function
+          add $32, %rsp           # Clean up shadow space
+      End Assembly
+  End Process
+  ```
+
+- ❌ **Windows Codegen Backend**
+  - Use Win32 API (no direct syscalls)
+  - DLL imports (kernel32.dll, user32.dll, etc.)
+  - Exception handling (SEH - Structured Exception Handling)
+
+### STANDARD LIBRARY:
+- ❌ **Windows Stdlib Port** (stdlib/platform/windows/)
+
+  **Platform-specific implementations:**
+  ```runa
+  Process called "file_open_windows" takes path as String, mode as Integer returns Integer:
+      # Windows API: CreateFileA
+      # Call Win32 API (requires different calling convention)
+      # Returns: File handle or INVALID_HANDLE_VALUE (-1)
+  End Process
+
+  Process called "file_read_windows" takes fd as Integer, buffer as String, length as Integer returns Integer:
+      # Windows API: ReadFile
+  End Process
+
+  Process called "file_write_windows" takes fd as Integer, buffer as String, length as Integer returns Integer:
+      # Windows API: WriteFile
+  End Process
+  ```
+
+  **Full Windows stdlib:**
+  - file_open_windows (CreateFileA)
+  - file_read_windows (ReadFile)
+  - file_write_windows (WriteFile)
+  - file_close_windows (CloseHandle)
+  - network_windows (Winsock API - WSAStartup, socket, connect, send, recv)
+  - process_windows (CreateProcess)
+  - thread_windows (CreateThread)
+  - memory_windows (VirtualAlloc, VirtualFree)
+
+### TESTING:
+- ❌ Test on Windows (native or Wine)
+- ❌ Add Windows to CI/CD pipeline
+- ❌ Cross-compilation tests (compile on Linux, run on Windows)
+
+## Success Criteria:
+- ✅ `runac --target=x86_64-windows program.runa -o program.exe` works
+- ✅ Generated .exe runs correctly on Windows
+- ✅ Standard library functions work on Windows
+- ✅ Can cross-compile from Linux to Windows
+- ✅ Microsoft x64 calling convention implemented correctly
+- ✅ Win32 API calls work (file I/O, networking, processes)
+
+## Timeline: 4-6 weeks
+
+---
+
+# 🔹 v0.9.2: Cross-Compilation: macOS Support (x86-64 + ARM64)
+
+**Goal:** Enable cross-compilation to macOS Mach-O format for Intel and Apple Silicon.
+
+## Platform Details:
+
+**File Format:** Mach-O (Mach Object)
+**Calling Convention:** System V (same as Linux for x86-64), AAPCS64 (ARM64)
+**System API:** BSD syscalls (similar to Linux)
+**Challenge:** Code signing required on Apple Silicon
+
+## What Belongs Where:
+
+### COMPILER:
+- ❌ **Mach-O Object Writer** (src/formats/macho.runa)
+  - Mach-O format for macOS/iOS
+  - Load commands
+  - Section layout (__TEXT, __DATA, __LINKEDIT)
+  - Dynamic linking (dyld)
+  - Universal binaries (fat binaries - both x86-64 and ARM64 in one file)
+
+- ❌ **macOS Syscall Differences**
+  - **Syscall numbers:** 0x2000000 offset (macOS-specific)
+  - BSD-style syscalls (similar to Linux)
+  - Different syscall numbers (write = 0x2000004, not 1)
+  - Different dynamic linker
+  - Different section names
+
+  **Example macOS Syscall:**
+  ```runa
+  # macOS syscall (write):
+  Process called "macos_write" takes fd as Integer, buffer as String, length as Integer returns Integer:
+      Inline Assembly:
+          mov $0x2000004, %rax    # macOS syscall: write (0x2000000 + 4)
+          movq -8(%rbp), %rdi     # fd
+          movq -16(%rbp), %rsi    # buffer
+          movq -24(%rbp), %rdx    # length
+          syscall
+      End Assembly
+      Return 0
+  End Process
+  ```
+
+- ❌ **Apple Silicon (ARM64) Support**
+  - **AArch64 codegen** (src/codegen/codegen_aarch64.runa)
+  - Apple's ARM64 calling convention (AAPCS64)
+  - Code signing requirements (ad-hoc signing for development)
+
+  **ARM64 Architecture Details:**
+  - Different instruction set (ARM vs x86)
+  - Different registers (X0-X30 vs RAX-R15)
+  - Different syscall instruction (SVC vs SYSCALL)
+
+  **Example ARM64 Syscall:**
+  ```runa
+  # ARM64 syscall (exit):
+  Process called "arm64_exit" takes code as Integer:
+      Inline Assembly:
+          mov x8, #1             // syscall number: exit
+          ldr x0, [fp, #-8]      // load exit code
+          svc #0                 // invoke syscall
+      End Assembly
+  End Process
+  ```
+
+  **ARM64 Calling Convention (AAPCS64):**
+  - Arguments in: X0, X1, X2, X3, X4, X5, X6, X7
+  - Return value in: X0
+  - Callee-saved: X19-X29
+  - Stack pointer: SP (X31)
+  - Frame pointer: FP (X29)
+  - Link register: LR (X30)
+
+### STANDARD LIBRARY:
+- ❌ **macOS Stdlib Port** (stdlib/platform/darwin/)
+
+  **Platform-specific implementations:**
+  ```runa
+  Process called "file_open_darwin" takes path as String, mode as Integer returns Integer:
+      # macOS syscall: open (2) - similar to Linux but different syscall number
+      # Syscall number: 0x2000000 + 5 = 0x2000005
+  End Process
+
+  Process called "network_darwin" takes ...:
+      # BSD sockets (same as Linux, just different syscall numbers)
+  End Process
+
+  Process called "process_darwin" takes ...:
+      # BSD fork/exec
+  End Process
+  ```
+
+  **Full macOS stdlib:**
+  - file_open_darwin (BSD open syscall: 0x2000005)
+  - file_read_darwin (BSD read syscall: 0x2000003)
+  - file_write_darwin (BSD write syscall: 0x2000004)
+  - network_darwin (BSD sockets)
+  - process_darwin (BSD fork/exec)
+  - thread_darwin (pthread)
+  - memory_darwin (mmap, munmap)
+
+### TESTING:
+- ❌ Test on macOS Intel (x86-64)
+- ❌ Test on macOS Apple Silicon (ARM64)
+- ❌ Test universal binaries (fat binaries with both architectures)
+- ❌ Add macOS to CI/CD pipeline
+- ❌ Handle code signing (ad-hoc for development, proper signing for distribution)
+
+## Success Criteria:
+- ✅ `runac --target=x86_64-darwin program.runa -o program` works
+- ✅ `runac --target=aarch64-darwin program.runa -o program` works
+- ✅ Generated binaries run on Intel Macs
+- ✅ Generated binaries run on Apple Silicon
+- ✅ Standard library works on macOS
+- ✅ Can create universal binaries (both x86-64 and ARM64)
+- ✅ Code signing works (ad-hoc for development)
+
+## Timeline: 4-6 weeks
+
+---
+
+# 🔹 v0.9.3: Cross-Compilation: ARM64 Linux Support
+
+**Goal:** Enable cross-compilation to ARM64 Linux for servers, Raspberry Pi, and mobile devices.
+
+## Platform Details:
+
+**Architecture:** AArch64 (ARM64)
+**File Format:** ELF64 (same as x86-64 Linux)
+**Calling Convention:** AAPCS64 (ARM Architecture Procedure Call Standard)
+**System API:** Linux syscalls (same numbers as x86-64)
+
+## What Belongs Where:
+
+### COMPILER:
+- ❌ **ARM64 Linux Backend**
+  - Use existing codegen_aarch64.runa (from v0.9.2)
+  - ELF64 format (same as x86-64 Linux)
+  - AAPCS64 calling convention
+
+- ❌ **ARM64-Specific Codegen**
+
+  **Register Allocation:**
+  - General purpose: X0-X30 (64-bit), W0-W30 (32-bit lower halves)
+  - Special registers:
+    - SP (Stack Pointer) = X31
+    - FP (Frame Pointer) = X29
+    - LR (Link Register) = X30
+    - PC (Program Counter) - not directly accessible
+
+  **Syscall Mechanism:**
+  - Instruction: **SVC #0** (not SYSCALL like x86-64)
+  - Syscall number in: X8
+  - Arguments in: X0, X1, X2, X3, X4, X5
+  - Return value in: X0
+
+  **Example ARM64 Linux Syscall (write):**
+  ```runa
+  Process called "arm64_linux_write" takes fd as Integer, buffer as String, length as Integer returns Integer:
+      Inline Assembly:
+          mov x8, #64            // syscall number: write (same as x86-64)
+          ldr x0, [fp, #-8]      // fd
+          ldr x1, [fp, #-16]     // buffer
+          ldr x2, [fp, #-24]     // length
+          svc #0                 // invoke syscall (different from x86-64 SYSCALL)
+      End Assembly
+      Return 0
+  End Process
+  ```
+
+  **ARM64 Instructions:**
+  - Load/store: LDR (load register), STR (store register)
+  - Arithmetic: ADD, SUB, MUL, SDIV (signed divide)
+  - Logical: AND, ORR (OR), EOR (XOR)
+  - Branch: B (branch), BL (branch and link), BR (branch register), BLR (branch link register)
+  - Compare: CMP, TST
+  - Conditional: B.EQ, B.NE, B.LT, B.GT, etc.
+
+### STANDARD LIBRARY:
+- ❌ **ARM64 Linux Stdlib**
+  - **Same syscall numbers** as x86-64 Linux (write=1, read=0, open=2, etc.)
+  - **Same APIs** (reuse Linux stdlib logic)
+  - **Different implementation** (ARM64 assembly instead of x86-64)
+
+  **Key Advantage:** Most code can be shared with x86-64 Linux, just different codegen.
+
+  ```runa
+  # Platform abstraction (same for both architectures):
+  Process called "file_open_linux" takes path as String, mode as Integer returns Integer:
+      Let arch be get_current_arch()
+
+      If string_equals(arch, "x86_64") is equal to 1:
+          # Use x86-64 syscall instruction
+      Otherwise If string_equals(arch, "aarch64") is equal to 1:
+          # Use ARM64 SVC instruction
+      End If
+  End Process
+  ```
+
+### TESTING:
+- ❌ Test on Raspberry Pi 4 (ARM64)
+- ❌ Test on ARM64 servers (AWS Graviton, Oracle Cloud, etc.)
+- ❌ Add ARM64 to CI/CD pipeline (use QEMU for emulation)
+- ❌ Cross-compilation tests (compile on x86-64, run on ARM64)
+
+## Success Criteria:
+- ✅ `runac --target=aarch64-linux program.runa -o program` works
+- ✅ Generated binaries run on ARM64 Linux
+- ✅ Standard library works on ARM64 Linux
+- ✅ Can cross-compile from x86-64 to ARM64
+- ✅ Performance comparable to x86-64 (accounting for CPU differences)
+
+## Timeline: 3-4 weeks
+
+---
+
+# 🔹 v0.9.4: Cross-Compilation: WebAssembly Support
+
+**Goal:** Enable compilation to WebAssembly for browsers, Node.js, and edge computing.
+
+## Platform Details:
+
+**Architecture:** Stack-based VM (not register-based)
+**File Format:** WASM binary module (.wasm)
+**System API:** WASI (WebAssembly System Interface)
+**Challenge:** Sandboxed environment, limited system access
+
+## What Belongs Where:
+
+### COMPILER:
+- ❌ **WASM Bytecode Generator** (src/codegen/codegen_wasm.runa)
+  - HIR → WASM bytecode
+  - Stack-based VM instructions (not registers like x86/ARM)
+  - Module format (.wasm binary)
+  - Text format (.wat) for debugging
+
+  **Key Differences from Native Code:**
+  - **No registers** - stack-based (push/pop operations)
+  - **No direct memory access** - sandboxed linear memory
+  - **No syscalls** - must use WASI functions
+  - **Bytecode, not assembly** - virtual machine instructions
+
+- ❌ **WASM Instructions**
+
+  **Arithmetic:**
+  - i32.add, i32.sub, i32.mul, i32.div_s (signed), i32.div_u (unsigned)
+  - i64.add, i64.sub, i64.mul, i64.div_s, i64.div_u
+  - f32.add, f32.sub, f32.mul, f32.div
+  - f64.add, f64.sub, f64.mul, f64.div
+
+  **Control Flow:**
+  - if...else...end
+  - loop...end
+  - block...end
+  - br (branch), br_if (conditional branch)
+  - return
+
+  **Memory:**
+  - i32.load, i64.load (load from linear memory)
+  - i32.store, i64.store (store to linear memory)
+  - memory.size, memory.grow
+
+  **Functions:**
+  - call (direct function call)
+  - call_indirect (indirect call through table)
+
+  **Example WASM Code Generation:**
+  ```runa
+  # Runa source:
+  Let x be 5 plus 3
+
+  # Generated WASM (text format):
+  i32.const 5    ;; push 5 onto stack
+  i32.const 3    ;; push 3 onto stack
+  i32.add        ;; pop two values, add, push result
+  local.set 0    ;; store in local variable 0 (x)
+
+  # Note: WASM doesn't use assembly - generates bytecode directly
+  # No registers like RAX, X0 - everything on stack
+  ```
+
+- ❌ **WASI Support** (WebAssembly System Interface)
+
+  **WASI provides:**
+  - File I/O: fd_read, fd_write, fd_close, path_open
+  - Environment variables: environ_get, environ_sizes_get
+  - Command-line args: args_get, args_sizes_get
+  - Random numbers: random_get
+  - Clock: clock_time_get
+  - Process exit: proc_exit
+
+  **Example WASI Usage:**
+  ```runa
+  Process called "wasm_write" takes fd as Integer, buffer as String, length as Integer returns Integer:
+      # Call WASI fd_write function (not syscall!)
+      # WASI functions are imported from host environment
+  End Process
+  ```
+
+### STANDARD LIBRARY:
+- ❌ **WASM Stdlib Port** (stdlib/platform/wasi/)
+
+  **Platform-specific implementations:**
+  ```runa
+  Process called "file_open_wasi" takes path as String, mode as Integer returns Integer:
+      # WASI: path_open
+      # Different from syscalls - sandbox-safe API
+  End Process
+
+  Process called "file_read_wasi" takes fd as Integer, buffer as String, length as Integer returns Integer:
+      # WASI: fd_read
+  End Process
+
+  Process called "file_write_wasi" takes fd as Integer, buffer as String, length as Integer returns Integer:
+      # WASI: fd_write
+  End Process
+  ```
+
+  **Full WASI stdlib:**
+  - file_open_wasi (path_open)
+  - file_read_wasi (fd_read)
+  - file_write_wasi (fd_write)
+  - file_close_wasi (fd_close)
+  - Sandboxed environment (no raw syscalls, no direct memory access)
+  - Limited to WASI capabilities (no networking in WASI preview1)
+
+### TESTING:
+- ❌ Test in browsers (Chrome, Firefox, Safari)
+- ❌ Test in Node.js (with WASI support: `node --experimental-wasi-unstable-preview1`)
+- ❌ Test in Deno, Wasmer, Wasmtime
+- ❌ Test in edge runtimes (Cloudflare Workers, Fastly Compute@Edge)
+- ❌ Add WASM to CI/CD pipeline
+
+## Success Criteria:
+- ✅ `runac --target=wasm32-wasi program.runa -o program.wasm` works
+- ✅ Generated .wasm runs in browsers
+- ✅ Generated .wasm runs in Node.js with WASI
+- ✅ Generated .wasm runs in Deno, Wasmer, Wasmtime
+- ✅ Standard library works in WASM environment (sandboxed)
+- ✅ Can output .wat (text format) for debugging
+
+## Timeline: 4-5 weeks
+
+---
+
+# 🔹 v0.9.5: Package Management & Distribution
+
+**Goal:** Complete package ecosystem for code sharing and distribution (moved from v0.9.0).
 
 ## What Belongs Where:
 
@@ -2030,9 +2868,9 @@ myproject/
 
 ---
 
-# 🔹 v0.9.1: IDE Tooling (LSP, Debugger, Profiler)
+# 🔹 v0.9.6: IDE Tooling (LSP, Debugger, Profiler)
 
-**Goal:** Professional developer tools for productivity.
+**Goal:** Professional developer tools for productivity (moved from v0.9.1).
 
 ## What Belongs Where:
 
@@ -2126,9 +2964,9 @@ Language Server Protocol for IDE integration
 
 ---
 
-# 🔹 v0.9.2: AI Annotation System Implementation
+# 🔹 v0.9.7: AI Annotation System Implementation
 
-**Goal:** Implement AI-first annotation system from specification.
+**Goal:** Implement AI-first annotation system from specification (moved from v0.9.2).
 
 ## What Belongs Where:
 
@@ -2285,17 +3123,41 @@ Recognize and parse AI annotations
 
 # 🎯 v1.0.0: Production Release
 
-**Goal:** Stable, documented, production-ready language.
+**Goal:** Stable, documented, production-ready language with full cross-platform support.
+
+## Platform Support (ALL COMPLETE):
+- ✅ x86-64 Linux (ELF64)
+- ✅ x86-64 Windows (PE)
+- ✅ x86-64 macOS (Mach-O)
+- ✅ ARM64 Linux (ELF64)
+- ✅ ARM64 macOS / Apple Silicon (Mach-O)
+- ✅ WebAssembly (WASM + WASI)
+
+## Feature Completeness (ALL COMPLETE):
+- ✅ Advanced Type System (Range constraints, Float, Wire formats, FFI types)
+- ✅ Error Handling & Generics
+- ✅ Native Object Writer & Pure Runa Runtime
+- ✅ Standard Library (comprehensive, cross-platform)
+- ✅ Triple Syntax (--canon, --developer, --viewer)
+- ✅ Memory Management & Safety (Ownership, Lifetimes)
+- ✅ Optimization Passes (Constant folding, DCE, Inlining, PGO, LTO)
+- ✅ Runa HIR (Human-Readable IR) for cross-compilation
+- ✅ Concurrency (Threads, Mutexes, Channels, Async/Await, Actors)
+- ✅ AOTT (All-Of-The-Time optimization, Tier 0-4)
+- ✅ Package Management (`rpack`)
+- ✅ IDE Tooling (LSP, Debugger, Profiler)
+- ✅ AI Annotation System
 
 ## Final Polish:
 
 ### 1. **Stability**
 - ❌ Zero known critical bugs
-- ❌ 1000+ test programs pass
+- ❌ 1000+ test programs pass (all platforms)
 - ❌ Fuzz testing (10 million+ inputs, no crashes)
 - ❌ Memory safety verified (Valgrind clean)
 - ❌ Security audit completed
 - ❌ Stress testing (long-running programs, high concurrency)
+- ❌ Cross-platform testing (Linux, Windows, macOS, ARM64, WASM)
 
 ### 2. **Documentation (Complete)**
 - ❌ **Language Reference** - Complete specification
@@ -2497,6 +3359,286 @@ Recognize and parse AI annotations
 
 ---
 
+# 🔹 v1.1: Rosetta Stone Phase 1 - C Frontend (C → Runa Translation)
+
+**Goal:** Implement C → Runa HIR translator, enabling translation from C to Runa.
+
+**Foundation:** Builds on Runa HIR from v0.8.0 (already human-readable, triple syntax ready).
+
+## What Belongs Where:
+
+### COMPILER (Language Frontend):
+- ❌ **C Parser** (src/rosetta/frontends/c/c_parser.runa)
+  - Parse C syntax (functions, structs, pointers, control flow)
+  - Build C AST (Abstract Syntax Tree)
+  - Support subset of C initially
+
+- ❌ **C Semantic Analyzer** (src/rosetta/frontends/c/c_semantic.runa)
+  - Extract C semantics (types, scopes, lifetime)
+  - Resolve declarations and references
+  - Type checking
+
+- ❌ **C → HIR Translator** (src/rosetta/frontends/c/c_to_hir.runa)
+  - Map C AST to Runa HIR
+  - Preserve C semantics in HIR metadata
+  - Map C types to Runa types
+
+  **Example Translation:**
+  ```c
+  // C input:
+  int factorial(int n) {
+      if (n <= 1) return 1;
+      return n * factorial(n - 1);
+  }
+
+  // Runa HIR output (--canon):
+  Process called "factorial" takes n as Integer returns Integer:
+      If n is less than or equal to 1:
+          Return 1
+      End If
+      Return n times factorial(n minus 1)
+  End Process
+  ```
+
+- ❌ **Compiler Flag: `--from`**
+  ```bash
+  # Translate C to Runa canonical
+  runac --from=c legacy.c --to=canon -o legacy.runa
+
+  # Translate C to Runa viewer mode (natural language docs)
+  runac --from=c legacy.c --to=viewer -o legacy_docs.txt
+
+  # Translate C to Runa developer mode
+  runac --from=c legacy.c --to=developer -o legacy.dev.runa
+  ```
+
+### Supported C Features (Initial):
+- ✅ Functions and function calls
+- ✅ Basic types (int, float, char, void)
+- ✅ Pointers and arrays
+- ✅ Structs (map to Runa types)
+- ✅ Control flow (if, while, for)
+- ✅ Operators (arithmetic, logical, bitwise)
+- ✅ Standard library calls (printf → Display, malloc → memory management)
+
+### NOT Supported (v1.1):
+- ❌ Preprocessor macros (future)
+- ❌ Unions (future)
+- ❌ Complex pointer arithmetic (future)
+- ❌ Inline assembly (future)
+
+## Success Criteria:
+- ✅ Can translate simple C programs to Runa
+- ✅ Generated Runa code compiles and runs correctly
+- ✅ Preserves C semantics (pointers, memory management)
+- ✅ Output is idiomatic Runa
+- ✅ Can translate 80% of typical C programs
+
+## Timeline: 6-8 weeks
+
+---
+
+# 🔹 v1.2: Rosetta Stone Phase 2 - Python Backend (Runa → Python Translation)
+
+**Goal:** Implement Runa HIR → Python translator, enabling translation from Runa to Python.
+
+**Foundation:** Uses Runa HIR from v0.8.0 as source.
+
+## What Belongs Where:
+
+### COMPILER (Language Backend):
+- ❌ **HIR → Python Generator** (src/rosetta/backends/python/hir_to_python.runa)
+  - Generate idiomatic Python code from Runa HIR
+  - Add type hints (Python 3.9+)
+  - Use Pythonic patterns (list comprehensions, etc.)
+
+- ❌ **Python Type Mapper** (src/rosetta/backends/python/python_types.runa)
+  - Map Runa types to Python type hints
+  - Integer → int, String → str, List → list[T]
+
+- ❌ **Python Idioms** (src/rosetta/backends/python/python_idioms.runa)
+  - Generate idiomatic Python (not literal translations)
+  - Use list comprehensions where appropriate
+  - Use Python naming conventions (snake_case)
+
+  **Example Translation:**
+  ```runa
+  # Runa HIR input (--canon):
+  Process called "factorial" takes n as Integer returns Integer:
+      If n is less than or equal to 1:
+          Return 1
+      End If
+      Return n times factorial(n minus 1)
+  End Process
+
+  # Python output:
+  def factorial(n: int) -> int:
+      """Calculate factorial of n."""
+      if n <= 1:
+          return 1
+      return n * factorial(n - 1)
+  ```
+
+- ❌ **Compiler Flag: `--to=python`**
+  ```bash
+  # Translate Runa to Python
+  runac --from=canon program.runa --to=python -o program.py
+
+  # Translate C → Runa → Python (full pipeline)
+  runac --from=c legacy.c --to=python -o modernized.py
+  ```
+
+## Success Criteria:
+- ✅ Generates working Python code from Runa HIR
+- ✅ Python code is idiomatic (uses list comprehensions, etc.)
+- ✅ Includes type hints
+- ✅ Handles Runa types → Python types correctly
+- ✅ C → Runa → Python pipeline works end-to-end
+
+## Timeline: 4-6 weeks
+
+---
+
+# 🔹 v1.3: Rosetta Stone Phase 3 - Bidirectional Translation & Additional Languages
+
+**Goal:** Complete bidirectional C ↔ Runa ↔ Python translation, add Python frontend, begin work on additional languages.
+
+## What Belongs Where:
+
+### COMPILER (Additional Frontends):
+- ❌ **Python Parser** (src/rosetta/frontends/python/)
+  - Parse Python syntax
+  - Build Python AST
+  - Handle dynamic typing
+
+- ❌ **Python → HIR Translator** (src/rosetta/frontends/python/python_to_hir.runa)
+  - Map Python AST to Runa HIR
+  - Preserve dynamic typing semantics in metadata
+  - Handle Python-specific features (duck typing, generators, etc.)
+
+  **Example: Preserving Dynamic Typing**
+  ```python
+  # Python input:
+  def process(data):
+      if isinstance(data, int):
+          return data * 2
+      elif isinstance(data, str):
+          return data.upper()
+      return None
+
+  # Runa HIR (preserves dynamic semantics):
+  Type called "DynamicValue":
+      type_tag as String
+      value as Pointer
+  End Type
+
+  Process called "process" takes data as DynamicValue returns DynamicValue:
+      If data.type_tag is equal to "Integer":
+          Let value be cast_to_integer(data.value)
+          Return DynamicValue with type_tag "Integer" and value times 2
+      Otherwise If data.type_tag is equal to "String":
+          Return DynamicValue with type_tag "String" and string_to_upper(value)
+      Otherwise:
+          Return DynamicValue with type_tag "None"
+      End If
+  End Process
+  ```
+
+### COMPILER (Additional Backends):
+- ❌ **HIR → C Generator** (src/rosetta/backends/c/hir_to_c.runa)
+  - Generate C code from Runa HIR
+  - Handle memory management (malloc/free)
+  - Add ownership comments
+
+  **Example Translation:**
+  ```runa
+  # Runa HIR input:
+  Process called "factorial" takes n as Integer returns Integer:
+      If n is less than or equal to 1:
+          Return 1
+      End If
+      Return n times factorial(n minus 1)
+  End Process
+
+  # C output:
+  /* Generated from Runa */
+  int factorial(int n) {
+      if (n <= 1) {
+          return 1;
+      }
+      return n * factorial(n - 1);
+  }
+  ```
+
+### Cross-Language Workflows:
+
+**1. Modernize Legacy C to Python:**
+```bash
+# C → Runa HIR → Python
+runac --from=c old_system.c --to=python -o new_system.py
+```
+
+**2. Port Python to C for Performance:**
+```bash
+# Python → Runa HIR → C
+runac --from=python script.py --to=c -o optimized.c
+```
+
+**3. Understand Legacy Code:**
+```bash
+# C → Natural language documentation
+runac --from=c complex_system.c --to=viewer -o documentation.txt
+```
+
+**4. Cross-Language Refactoring:**
+```bash
+# Write once in Runa, generate for multiple languages
+runac algorithm.runa --to=python -o algorithm.py
+runac algorithm.runa --to=c -o algorithm.c
+runac algorithm.runa --to=rust -o algorithm.rs  # future
+```
+
+### Future Languages (v1.4+):
+**Priority Order:**
+1. **Rust** (v1.4) - Modern systems language, ownership model
+2. **JavaScript** (v1.5) - Web development, dynamic typing
+3. **Java** (v1.6) - Enterprise, OOP patterns
+4. **Go** (v1.7) - Cloud native, concurrency
+
+## Why Runa as Rosetta Stone Works:
+
+| Feature | LLVM IR | Runa HIR |
+|---------|---------|----------|
+| **Human Readable** | ❌ SSA, registers, basic blocks | ✅ Valid Runa code |
+| **Bidirectional** | ❌ One-way only | ✅ Two-way with semantics |
+| **Preserves Semantics** | ❌ Low-level only | ✅ High-level concepts |
+| **Multiple Views** | ❌ Single IR form | ✅ Triple syntax |
+| **Natural Language** | ❌ Not possible | ✅ --viewer mode |
+| **Writeable** | ❌ Too complex | ✅ --canon, --developer |
+
+**LLVM can't be a Rosetta Stone because:**
+- Unreadable (SSA, basic blocks, registers)
+- One-way translation only (source → LLVM → native)
+- Loses high-level semantics
+- Not human-writeable
+
+**Runa HIR is perfect because:**
+- Human-readable (valid Runa code)
+- Bidirectional (language ↔ HIR ↔ language)
+- Preserves high-level semantics
+- Triple syntax (--canon, --viewer, --developer)
+
+## Success Criteria:
+- ✅ C → Runa → Python pipeline works
+- ✅ Python → Runa → C pipeline works
+- ✅ Round-trip translation preserves behavior
+- ✅ 100+ test programs successfully translated
+- ✅ Real-world code examples working
+
+## Timeline: 6-8 weeks
+
+---
+
 # 📊 Complete Timeline Summary (Updated)
 
 | Phase | Duration | Cumulative Time | Focus |
@@ -2519,12 +3661,21 @@ Recognize and parse AI annotations
 | **v0.8.1** | 6 weeks | 80 weeks | AOTT Tier 0-1 (Interpreter, Bytecode) |
 | **v0.8.2** | 8 weeks | 88 weeks | AOTT Tier 2-3 (JIT, Optimized native) |
 | **v0.8.3** | 6 weeks | 94 weeks | AOTT Tier 4 (Speculative execution) |
-| **v0.9.0** | 6 weeks | 100 weeks | Package manager, registry |
-| **v0.9.1** | 8 weeks | 108 weeks | IDE tooling (LSP, Debugger, Profiler) |
-| **v0.9.2** | 4 weeks | 112 weeks | AI Annotation system |
-| **v1.0.0** | 12 weeks | **124 weeks** | Production polish, launch |
+| **v0.9.0** | 4 weeks | 100 weeks | Cross-compilation: Target abstraction |
+| **v0.9.1** | 6 weeks | 106 weeks | Cross-compilation: Windows support |
+| **v0.9.2** | 6 weeks | 112 weeks | Cross-compilation: macOS support (x86-64 + ARM64) |
+| **v0.9.3** | 4 weeks | 116 weeks | Cross-compilation: ARM64 Linux |
+| **v0.9.4** | 5 weeks | 121 weeks | Cross-compilation: WebAssembly |
+| **v0.9.5** | 6 weeks | 127 weeks | Package manager & distribution |
+| **v0.9.6** | 8 weeks | 135 weeks | IDE tooling (LSP, Debugger, Profiler) |
+| **v0.9.7** | 4 weeks | 139 weeks | AI Annotation system |
+| **v1.0.0** | 12 weeks | **151 weeks** | Production polish, launch |
+| **v1.1** | 8 weeks | 159 weeks | Rosetta Stone: C → Runa translation |
+| **v1.2** | 6 weeks | 165 weeks | Rosetta Stone: Runa → Python translation |
+| **v1.3** | 8 weeks | **173 weeks** | Rosetta Stone: Bidirectional C ↔ Runa ↔ Python |
 
-**Total Development Time:** ~124 weeks (2.4 years)
+**Total Development Time to v1.0:** ~151 weeks (2.9 years)
+**Total Development Time to v1.3 (Rosetta Stone):** ~173 weeks (3.3 years)
 
 ---
 
