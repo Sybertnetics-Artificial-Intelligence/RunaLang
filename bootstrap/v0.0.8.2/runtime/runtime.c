@@ -545,3 +545,454 @@ int64_t list_destroy(int64_t list_ptr) {
     free(list);
     return 0;
 }
+
+// ============================================================================
+// SET OPERATIONS
+// ============================================================================
+//
+// Set structure (hash set with linear probing):
+//   offset 0:  capacity (size of hash table)
+//   offset 8:  count (number of elements)
+//   offset 16: data pointer (hash table array)
+//   offset 24: used pointer (bitmap of used slots)
+//
+// Each element is 8 bytes (int64_t)
+
+typedef struct {
+    int64_t capacity;
+    int64_t count;
+    int64_t* data;      // Hash table
+    int8_t* used;       // Bitmap: 1 if slot is used, 0 if empty
+} RunaSet;
+
+// Create a new empty set with initial capacity of 16
+int64_t set_create() {
+    RunaSet* set = (RunaSet*)calloc(1, sizeof(RunaSet));
+    set->capacity = 16;
+    set->count = 0;
+    set->data = (int64_t*)calloc(16, sizeof(int64_t));
+    set->used = (int8_t*)calloc(16, sizeof(int8_t));
+    return (int64_t)set;
+}
+
+// Simple hash function for int64_t
+static int64_t set_hash(int64_t value, int64_t capacity) {
+    // Mix bits and modulo by capacity
+    uint64_t h = (uint64_t)value;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return (int64_t)(h % (uint64_t)capacity);
+}
+
+// Resize set's hash table (private helper)
+static void set_resize(RunaSet* set, int64_t new_capacity) {
+    int64_t* old_data = set->data;
+    int8_t* old_used = set->used;
+    int64_t old_capacity = set->capacity;
+
+    set->data = (int64_t*)calloc(new_capacity, sizeof(int64_t));
+    set->used = (int8_t*)calloc(new_capacity, sizeof(int8_t));
+    set->capacity = new_capacity;
+    set->count = 0;
+
+    // Rehash all existing elements
+    for (int64_t i = 0; i < old_capacity; i++) {
+        if (old_used[i]) {
+            // Re-insert this element
+            int64_t value = old_data[i];
+            int64_t index = set_hash(value, new_capacity);
+
+            // Linear probing to find empty slot
+            while (set->used[index]) {
+                index = (index + 1) % new_capacity;
+            }
+
+            set->data[index] = value;
+            set->used[index] = 1;
+            set->count++;
+        }
+    }
+
+    free(old_data);
+    free(old_used);
+}
+
+// Add element to set (returns 1 if added, 0 if already exists)
+int64_t set_add(int64_t set_ptr, int64_t value) {
+    RunaSet* set = (RunaSet*)set_ptr;
+
+    // Resize if load factor > 0.7
+    if (set->count * 10 > set->capacity * 7) {
+        set_resize(set, set->capacity * 2);
+    }
+
+    int64_t index = set_hash(value, set->capacity);
+
+    // Linear probing to find slot
+    while (set->used[index]) {
+        if (set->data[index] == value) {
+            return 0;  // Already exists
+        }
+        index = (index + 1) % set->capacity;
+    }
+
+    // Found empty slot
+    set->data[index] = value;
+    set->used[index] = 1;
+    set->count++;
+    return 1;
+}
+
+// Check if set contains element (returns 1 if yes, 0 if no)
+int64_t set_contains(int64_t set_ptr, int64_t value) {
+    RunaSet* set = (RunaSet*)set_ptr;
+
+    int64_t index = set_hash(value, set->capacity);
+    int64_t start = index;
+
+    // Linear probing to find element
+    while (set->used[index]) {
+        if (set->data[index] == value) {
+            return 1;  // Found
+        }
+        index = (index + 1) % set->capacity;
+        if (index == start) break;  // Wrapped around
+    }
+
+    return 0;  // Not found
+}
+
+// Remove element from set (returns 1 if removed, 0 if not found)
+int64_t set_remove(int64_t set_ptr, int64_t value) {
+    RunaSet* set = (RunaSet*)set_ptr;
+
+    int64_t index = set_hash(value, set->capacity);
+    int64_t start = index;
+
+    // Linear probing to find element
+    while (set->used[index]) {
+        if (set->data[index] == value) {
+            // Found - mark as deleted
+            set->used[index] = 0;
+            set->count--;
+
+            // Rehash subsequent elements to fix probe chains
+            int64_t next = (index + 1) % set->capacity;
+            while (set->used[next]) {
+                int64_t rehash_value = set->data[next];
+                set->used[next] = 0;
+                set->count--;
+                set_add(set_ptr, rehash_value);
+                next = (next + 1) % set->capacity;
+            }
+
+            return 1;  // Removed
+        }
+        index = (index + 1) % set->capacity;
+        if (index == start) break;
+    }
+
+    return 0;  // Not found
+}
+
+// Get number of elements in set
+int64_t set_size(int64_t set_ptr) {
+    RunaSet* set = (RunaSet*)set_ptr;
+    return set->count;
+}
+
+// Create union of two sets (returns new set)
+int64_t set_union(int64_t set1_ptr, int64_t set2_ptr) {
+    RunaSet* set1 = (RunaSet*)set1_ptr;
+    RunaSet* set2 = (RunaSet*)set2_ptr;
+
+    int64_t result = set_create();
+
+    // Add all elements from set1
+    for (int64_t i = 0; i < set1->capacity; i++) {
+        if (set1->used[i]) {
+            set_add(result, set1->data[i]);
+        }
+    }
+
+    // Add all elements from set2
+    for (int64_t i = 0; i < set2->capacity; i++) {
+        if (set2->used[i]) {
+            set_add(result, set2->data[i]);
+        }
+    }
+
+    return result;
+}
+
+// Create intersection of two sets (returns new set)
+int64_t set_intersection(int64_t set1_ptr, int64_t set2_ptr) {
+    RunaSet* set1 = (RunaSet*)set1_ptr;
+    RunaSet* set2 = (RunaSet*)set2_ptr;
+
+    int64_t result = set_create();
+
+    // Add elements that are in both sets
+    for (int64_t i = 0; i < set1->capacity; i++) {
+        if (set1->used[i]) {
+            int64_t value = set1->data[i];
+            if (set_contains(set2_ptr, value)) {
+                set_add(result, value);
+            }
+        }
+    }
+
+    return result;
+}
+
+// Convert set to list (returns new list with all elements)
+int64_t set_to_list(int64_t set_ptr) {
+    RunaSet* set = (RunaSet*)set_ptr;
+    int64_t list = list_create();
+
+    for (int64_t i = 0; i < set->capacity; i++) {
+        if (set->used[i]) {
+            list_append(list, set->data[i]);
+        }
+    }
+
+    return list;
+}
+
+// Destroy set and free memory
+int64_t set_destroy(int64_t set_ptr) {
+    RunaSet* set = (RunaSet*)set_ptr;
+    free(set->data);
+    free(set->used);
+    free(set);
+    return 0;
+}
+
+// ============================================================================
+// DICTIONARY OPERATIONS
+// ============================================================================
+//
+// Dictionary structure (hash map with linear probing):
+//   offset 0:  capacity (size of hash table)
+//   offset 8:  count (number of key-value pairs)
+//   offset 16: keys pointer (hash table for keys)
+//   offset 24: values pointer (hash table for values)
+//   offset 32: used pointer (bitmap of used slots)
+//
+// Keys and values are both int64_t (can store pointers to strings or integers)
+
+typedef struct {
+    int64_t capacity;
+    int64_t count;
+    int64_t* keys;      // Hash table for keys
+    int64_t* values;    // Hash table for values
+    int8_t* used;       // Bitmap: 1 if slot is used, 0 if empty
+} RunaDict;
+
+// Create a new empty dictionary with initial capacity of 16
+int64_t dict_create() {
+    RunaDict* dict = (RunaDict*)calloc(1, sizeof(RunaDict));
+    dict->capacity = 16;
+    dict->count = 0;
+    dict->keys = (int64_t*)calloc(16, sizeof(int64_t));
+    dict->values = (int64_t*)calloc(16, sizeof(int64_t));
+    dict->used = (int8_t*)calloc(16, sizeof(int8_t));
+    return (int64_t)dict;
+}
+
+// Hash function for dictionary keys (same as set hash)
+static int64_t dict_hash(int64_t key, int64_t capacity) {
+    uint64_t h = (uint64_t)key;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return (int64_t)(h % (uint64_t)capacity);
+}
+
+// Resize dictionary's hash tables (private helper)
+static void dict_resize(RunaDict* dict, int64_t new_capacity) {
+    int64_t* old_keys = dict->keys;
+    int64_t* old_values = dict->values;
+    int8_t* old_used = dict->used;
+    int64_t old_capacity = dict->capacity;
+
+    dict->keys = (int64_t*)calloc(new_capacity, sizeof(int64_t));
+    dict->values = (int64_t*)calloc(new_capacity, sizeof(int64_t));
+    dict->used = (int8_t*)calloc(new_capacity, sizeof(int8_t));
+    dict->capacity = new_capacity;
+    dict->count = 0;
+
+    // Rehash all existing key-value pairs
+    for (int64_t i = 0; i < old_capacity; i++) {
+        if (old_used[i]) {
+            // Re-insert this pair
+            int64_t key = old_keys[i];
+            int64_t value = old_values[i];
+            int64_t index = dict_hash(key, new_capacity);
+
+            // Linear probing to find empty slot
+            while (dict->used[index]) {
+                index = (index + 1) % new_capacity;
+            }
+
+            dict->keys[index] = key;
+            dict->values[index] = value;
+            dict->used[index] = 1;
+            dict->count++;
+        }
+    }
+
+    free(old_keys);
+    free(old_values);
+    free(old_used);
+}
+
+// Set key-value pair in dictionary (replaces existing value if key exists)
+int64_t dict_set(int64_t dict_ptr, int64_t key, int64_t value) {
+    RunaDict* dict = (RunaDict*)dict_ptr;
+
+    // Resize if load factor > 0.7
+    if (dict->count * 10 > dict->capacity * 7) {
+        dict_resize(dict, dict->capacity * 2);
+    }
+
+    int64_t index = dict_hash(key, dict->capacity);
+
+    // Linear probing to find slot
+    while (dict->used[index]) {
+        if (dict->keys[index] == key) {
+            // Key exists - update value
+            dict->values[index] = value;
+            return 0;
+        }
+        index = (index + 1) % dict->capacity;
+    }
+
+    // Found empty slot - insert new pair
+    dict->keys[index] = key;
+    dict->values[index] = value;
+    dict->used[index] = 1;
+    dict->count++;
+    return 1;
+}
+
+// Get value for key (returns 0 if key not found - caller should check dict_has first)
+int64_t dict_get(int64_t dict_ptr, int64_t key) {
+    RunaDict* dict = (RunaDict*)dict_ptr;
+
+    int64_t index = dict_hash(key, dict->capacity);
+    int64_t start = index;
+
+    // Linear probing to find key
+    while (dict->used[index]) {
+        if (dict->keys[index] == key) {
+            return dict->values[index];
+        }
+        index = (index + 1) % dict->capacity;
+        if (index == start) break;
+    }
+
+    return 0;  // Not found
+}
+
+// Check if dictionary has key (returns 1 if yes, 0 if no)
+int64_t dict_has(int64_t dict_ptr, int64_t key) {
+    RunaDict* dict = (RunaDict*)dict_ptr;
+
+    int64_t index = dict_hash(key, dict->capacity);
+    int64_t start = index;
+
+    // Linear probing to find key
+    while (dict->used[index]) {
+        if (dict->keys[index] == key) {
+            return 1;
+        }
+        index = (index + 1) % dict->capacity;
+        if (index == start) break;
+    }
+
+    return 0;
+}
+
+// Remove key-value pair from dictionary (returns 1 if removed, 0 if not found)
+int64_t dict_remove(int64_t dict_ptr, int64_t key) {
+    RunaDict* dict = (RunaDict*)dict_ptr;
+
+    int64_t index = dict_hash(key, dict->capacity);
+    int64_t start = index;
+
+    // Linear probing to find key
+    while (dict->used[index]) {
+        if (dict->keys[index] == key) {
+            // Found - mark as deleted
+            dict->used[index] = 0;
+            dict->count--;
+
+            // Rehash subsequent entries to fix probe chains
+            int64_t next = (index + 1) % dict->capacity;
+            while (dict->used[next]) {
+                int64_t rehash_key = dict->keys[next];
+                int64_t rehash_value = dict->values[next];
+                dict->used[next] = 0;
+                dict->count--;
+                dict_set(dict_ptr, rehash_key, rehash_value);
+                next = (next + 1) % dict->capacity;
+            }
+
+            return 1;
+        }
+        index = (index + 1) % dict->capacity;
+        if (index == start) break;
+    }
+
+    return 0;
+}
+
+// Get number of key-value pairs in dictionary
+int64_t dict_size(int64_t dict_ptr) {
+    RunaDict* dict = (RunaDict*)dict_ptr;
+    return dict->count;
+}
+
+// Get list of all keys in dictionary
+int64_t dict_keys(int64_t dict_ptr) {
+    RunaDict* dict = (RunaDict*)dict_ptr;
+    int64_t list = list_create();
+
+    for (int64_t i = 0; i < dict->capacity; i++) {
+        if (dict->used[i]) {
+            list_append(list, dict->keys[i]);
+        }
+    }
+
+    return list;
+}
+
+// Get list of all values in dictionary
+int64_t dict_values(int64_t dict_ptr) {
+    RunaDict* dict = (RunaDict*)dict_ptr;
+    int64_t list = list_create();
+
+    for (int64_t i = 0; i < dict->capacity; i++) {
+        if (dict->used[i]) {
+            list_append(list, dict->values[i]);
+        }
+    }
+
+    return list;
+}
+
+// Destroy dictionary and free memory
+int64_t dict_destroy(int64_t dict_ptr) {
+    RunaDict* dict = (RunaDict*)dict_ptr;
+    free(dict->keys);
+    free(dict->values);
+    free(dict->used);
+    free(dict);
+    return 0;
+}
