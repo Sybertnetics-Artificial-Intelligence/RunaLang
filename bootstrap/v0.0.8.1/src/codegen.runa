@@ -122,7 +122,7 @@ Process called "codegen_calculate_type_size" takes type_name as Integer, program
             Let type_ptr be memory_get_pointer(types, type_offset)
             Let type_name_ptr be memory_get_pointer(type_ptr, 0)  Note: type->name
             If string_equals(type_name_ptr, type_name) is equal to 1:
-                Let type_size be memory_get_int32(type_ptr, 16)  Note: type->size
+                Let type_size be memory_get_int32(type_ptr, 40)  Note: TYPEDEFINITION_SIZE_OFFSET
                 Return type_size
             End If
             Let i be i plus 1
@@ -407,6 +407,19 @@ Process called "codegen_collect_strings_from_expression" takes codegen as Intege
         Return 0
     End If
 
+    If expr_type is equal to 20:  Note: EXPR_STRUCT_CONSTRUCTION
+        Let field_values be memory_get_pointer(expr, 24)
+        Let field_count be memory_get_int32(expr, 32)
+        Let field_i be 0
+        While field_i is less than field_count:
+            Let field_ptr_offset be field_i multiplied by 8
+            Let field_value_expr be memory_get_pointer(field_values, field_ptr_offset)
+            codegen_collect_strings_from_expression(codegen, field_value_expr)
+            Let field_i be field_i plus 1
+        End While
+        Return 0
+    End If
+
     Note: Other expression types (INTEGER, VARIABLE, TYPE_NAME, FUNCTION_POINTER) have no strings to collect
     Return 0
 End Process
@@ -671,8 +684,8 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
 
         Note: Find the type definition
         Let current_program be memory_get_pointer(codegen, 48)  Note: codegen->current_program (pointer with padding)
-        Let type_count be memory_get_int32(current_program, 32)  Note: program->type_count
-        Let types be memory_get_pointer(current_program, 24)       Note: program->types
+        Let type_count be memory_get_int32(current_program, 24)  Note: PROGRAM_TYPE_COUNT
+        Let types be memory_get_pointer(current_program, 16)       Note: PROGRAM_TYPES
         Let type be 0
 
         Let i be 0
@@ -693,10 +706,11 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
 
         Note: Find the field and return its type
         Let kind be memory_get_int32(type, 8)  Note: type->kind
-        If kind is equal to 1:  Note: TYPE_KIND_STRUCT
-            Let struct_type_ptr be type plus 16  Note: &type->data.struct_type
-            Let field_count be memory_get_int32(struct_type_ptr, 0)  Note: struct_type.field_count
-            Let fields be memory_get_pointer(struct_type_ptr, 8)       Note: struct_type.fields
+        If kind is equal to 0:  Note: TYPE_KIND_STRUCT
+            Note: TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET is 24
+            Note: TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET is 16
+            Let field_count be memory_get_int32(type, 24)
+            Let fields be memory_get_pointer(type, 16)
 
             Let i be 0
             While i is less than field_count:
@@ -712,6 +726,11 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
         End If
 
         Return 0
+    End If
+
+    If expr_type is equal to 20:  Note: EXPR_STRUCT_CONSTRUCTION
+        Let struct_type_name be memory_get_pointer(expr, 8)
+        Return struct_type_name
     End If
 
     Note: Other expression types don't have determinable types in this context
@@ -780,10 +799,30 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
         Let object be memory_get_pointer(field_access_ptr, 0)     Note: field_access.object
         Let field_name be memory_get_pointer(field_access_ptr, 8) Note: field_access.field_name
 
-        Note: Generate address of object
-        codegen_generate_lvalue_address(codegen, object)
+        Note: For field access, we need the POINTER VALUE, not the address of the pointer variable
+        Note: If object is a variable, we need to load its value (the pointer)
+        Let obj_type be memory_get_int32(object, 0)
+        If obj_type is equal to 1:  Note: EXPR_VARIABLE - load the pointer value
+            Let variable_name be memory_get_pointer(object, 8)
+            Let var_index be codegen_find_variable(codegen, variable_name)
+            If var_index is less than 0:
+                print_string("[CODEGEN ERROR] Unknown variable in field access")
+                exit_with_code(1)
+            End If
+            Let variables be memory_get_pointer(codegen, 8)
+            Let var_offset be var_index multiplied by 32
+            Let var_ptr be variables plus var_offset
+            Let stack_offset be memory_get_int32(var_ptr, 8)
+            file_write_buffered(output_file, "    movq -", 0)
+            file_write_buffered(output_file, integer_to_string(stack_offset), 0)
+            file_write_buffered(output_file, "(%rbp), %rbx  # Load struct pointer\n", 0)
+        Otherwise:
+            Note: For other expressions, generate their value and use that as the pointer
+            codegen_generate_expression(codegen, object)
+            file_write_buffered(output_file, "    movq %rax, %rbx  # Use expression result as pointer\n", 0)
+        End If
 
-        Note: Now %rbx contains the address of the object
+        Note: Now %rbx contains the struct pointer value
         Note: We need to add the field offset to get the field address
 
         Note: Get the type of the object using our helper function
@@ -795,8 +834,8 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
 
         Note: Find the type definition
         Let current_program be memory_get_pointer(codegen, 48)  Note: codegen->current_program (pointer with padding)
-        Let type_count be memory_get_int32(current_program, 32)  Note: program->type_count
-        Let types be memory_get_pointer(current_program, 24)       Note: program->types
+        Let type_count be memory_get_int32(current_program, 24)  Note: PROGRAM_TYPE_COUNT
+        Let types be memory_get_pointer(current_program, 16)       Note: PROGRAM_TYPES
         Let type be 0
 
         Let i be 0
@@ -822,15 +861,16 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
         Let field_offset be -1  Note: -1 for not found
         Let kind be memory_get_int32(type, 8)  Note: type->kind
 
-        If kind is equal to 1:  Note: TYPE_KIND_STRUCT
-            Let struct_type_ptr be type plus 16  Note: &type->data.struct_type
-            Let field_count be memory_get_int32(struct_type_ptr, 0)  Note: struct_type.field_count
-            Let fields be memory_get_pointer(struct_type_ptr, 8)       Note: struct_type.fields
+        If kind is equal to 0:  Note: TYPE_KIND_STRUCT
+            Note: TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET is 24
+            Note: TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET is 16
+            Let field_count be memory_get_int32(type, 24)
+            Let fields be memory_get_pointer(type, 16)
 
             Let i be 0
             While i is less than field_count:
-                Let field_offset be i multiplied by 24
-                Let field_ptr be fields plus field_offset  Note: sizeof(FieldDefinition)
+                Let field_idx_offset be i multiplied by 24
+                Let field_ptr be fields plus field_idx_offset  Note: sizeof(FieldDefinition)
                 Let field_name_ptr be memory_get_pointer(field_ptr, 0)  Note: field.name
                 If string_equals(field_name_ptr, field_name) is equal to 1:
                     Let field_offset be memory_get_int32(field_ptr, 16)  Note: field.offset
@@ -852,7 +892,7 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
         Note: Add field offset to object address
         file_write_buffered(output_file, "    addq $", 0)
         file_write_buffered(output_file, integer_to_string(field_offset), 0)
-        file_write_buffered(output_file, ", %rbx", 0)
+        file_write_buffered(output_file, ", %rbx\n", 0)
         Return 0
     End If
 
@@ -1645,12 +1685,77 @@ End Process
 Note: Generate code for field access expressions
 Process called "codegen_generate_field_access" takes codegen as Integer, expr as Integer returns Integer:
     Let output_file be memory_get_integer(codegen, 0)
-    Let field_access_ptr be expr plus 8  Note: Union at offset 4
+    Let field_access_ptr be expr plus 8  Note: Union at offset 8
     Let obj be memory_get_pointer(field_access_ptr, 0)
     Let field_name be memory_get_pointer(field_access_ptr, 8)
 
-    Note: For simplicity in Stage 1, generate basic field access
-    Let obj_type be memory_get_integer(obj, 0)
+    Note: Get the type of the object
+    Let object_type be codegen_get_expression_type(codegen, obj)
+    If object_type is equal to 0:
+        print_string("[CODEGEN ERROR] Cannot determine type of object in field access")
+        exit_with_code(1)
+    End If
+
+    Note: Find the type definition
+    Let current_program be memory_get_pointer(codegen, 48)  Note: codegen->current_program
+    Let type_count be memory_get_int32(current_program, 24)  Note: PROGRAM_TYPE_COUNT
+    Let types be memory_get_pointer(current_program, 16)     Note: PROGRAM_TYPES
+    Let type be 0
+
+    Let i be 0
+    While i is less than type_count:
+        Let type_offset be i multiplied by 8
+        Let type_ptr be memory_get_pointer(types, type_offset)
+        Let type_name_ptr be memory_get_pointer(type_ptr, 0)  Note: type->name
+        If string_equals(type_name_ptr, object_type) is equal to 1:
+            Let type be type_ptr
+            Let i be type_count  Note: break loop
+        End If
+        Let i be i plus 1
+    End While
+
+    If type is equal to 0:
+        print_string("[CODEGEN ERROR] Unknown type '")
+        print_string(object_type)
+        print_string("'")
+        exit_with_code(1)
+    End If
+
+
+    Note: Find field offset
+    Let field_offset be -1  Note: -1 for not found
+    Let kind be memory_get_int32(type, 8)  Note: type->kind
+
+    If kind is equal to 0:  Note: TYPE_KIND_STRUCT
+        Note: TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET is 24
+        Note: TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET is 16
+        Let field_count be memory_get_int32(type, 24)
+        Let fields be memory_get_pointer(type, 16)
+
+        Let j be 0
+        While j is less than field_count:
+            Let field_idx_offset be j multiplied by 24
+            Let field_ptr be fields plus field_idx_offset  Note: sizeof(FieldDefinition)
+            Let field_name_ptr be memory_get_pointer(field_ptr, 0)  Note: field.name
+            If string_equals(field_name_ptr, field_name) is equal to 1:
+                Let field_offset be memory_get_int32(field_ptr, 16)  Note: field.offset
+                Let j be field_count  Note: break loop
+            End If
+            Let j be j plus 1
+        End While
+    End If
+
+    If field_offset is less than 0:  Note: -1 for not found
+        print_string("[CODEGEN ERROR] Type '")
+        print_string(object_type)
+        print_string("' has no field '")
+        print_string(field_name)
+        print_string("'")
+        exit_with_code(1)
+    End If
+
+    Note: Generate code to load object address and access field
+    Let obj_type be memory_get_int32(obj, 0)
 
     If obj_type is equal to 1:  Note: EXPR_VARIABLE
         Let obj_variable_name be memory_get_pointer(obj, 8)
@@ -1660,23 +1765,25 @@ Process called "codegen_generate_field_access" takes codegen as Integer, expr as
             exit_with_code(1)
         End If
 
-        Note: Generate simplified field access
         Let variables be memory_get_pointer(codegen, 8)
         Let var_offset be var_index multiplied by 32
         Let var_ptr be variables plus var_offset
-        Let offset be memory_get_integer(var_ptr, 8)
+        Let stack_offset be memory_get_int32(var_ptr, 8)
 
         file_write_buffered(output_file, "    movq -", 0)
-        file_write_buffered(output_file, integer_to_string(offset), 0)
+        file_write_buffered(output_file, integer_to_string(stack_offset), 0)
         file_write_buffered(output_file, "(%rbp), %rax\n", 0)
 
-        Note: Default field offset to 0 for simplicity
-        file_write_buffered(output_file, "    movq (%rax), %rax\n", 0)
+        Note: Add field offset and dereference
+        file_write_buffered(output_file, "    movq ", 0)
+        file_write_buffered(output_file, integer_to_string(field_offset), 0)
+        file_write_buffered(output_file, "(%rax), %rax\n", 0)
     Otherwise:
-        Note: For complex field access, use lvalue addressing
-        codegen_generate_lvalue_address(codegen, obj)
-        file_write_buffered(output_file, "    movq %rbx, %rax\n", 0)
-        file_write_buffered(output_file, "    movq (%rax), %rax\n", 0)
+        Note: For complex expressions, generate the expression first
+        codegen_generate_expression(codegen, obj)
+        file_write_buffered(output_file, "    movq ", 0)
+        file_write_buffered(output_file, integer_to_string(field_offset), 0)
+        file_write_buffered(output_file, "(%rax), %rax\n", 0)
     End If
 
     Return 0
@@ -1998,6 +2105,101 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Return 0
     End If
 
+    If expr_type is equal to 20:  Note: EXPR_STRUCT_CONSTRUCTION
+        Note: Get struct construction data
+        Let struct_type_name be memory_get_pointer(expr, 8)
+        Let field_names be memory_get_pointer(expr, 16)
+        Let field_values be memory_get_pointer(expr, 24)
+        Let field_count be memory_get_int32(expr, 32)
+
+        Note: Find the struct type definition to get size and field offsets
+        Let current_program be memory_get_pointer(codegen, 48)
+        Let type_count be memory_get_int32(current_program, 24)  Note: PROGRAM_TYPE_COUNT
+        Let types be memory_get_pointer(current_program, 16)      Note: PROGRAM_TYPES
+        Let type be 0
+
+        Let type_i be 0
+        While type_i is less than type_count:
+            Let type_offset be type_i multiplied by 8
+            Let type_ptr be memory_get_pointer(types, type_offset)
+            Let type_name be memory_get_pointer(type_ptr, 0)
+            If string_equals(type_name, struct_type_name) is equal to 1:
+                Let type be type_ptr
+                Let type_i be type_count  Note: break
+            End If
+            Let type_i be type_i plus 1
+        End While
+
+        If type is equal to 0:
+            print_string("[CODEGEN ERROR] Unknown struct type '")
+            print_string(struct_type_name)
+            print_string("'")
+            exit_with_code(1)
+        End If
+
+        Note: Calculate struct size from type definition
+        Note: TYPEDEFINITION_SIZE_OFFSET is 40
+        Let struct_size be memory_get_int32(type, 40)  Note: TYPEDEFINITION_SIZE_OFFSET
+
+        Note: Allocate memory for struct
+        file_write_buffered(output_file, "    movq $", 0)
+        file_write_buffered(output_file, integer_to_string(struct_size), 0)
+        file_write_buffered(output_file, ", %rdi\n", 0)
+        file_write_buffered(output_file, "    call allocate@PLT\n", 0)
+        file_write_buffered(output_file, "    pushq %rax  # Save struct pointer\n", 0)
+
+        Note: Set each field value
+        Let field_i be 0
+        While field_i is less than field_count:
+            Let field_ptr_offset be field_i multiplied by 8
+            Let field_name be memory_get_pointer(field_names, field_ptr_offset)
+            Let field_value_expr be memory_get_pointer(field_values, field_ptr_offset)
+
+            Note: Find field offset in type definition
+            Note: TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET is 24
+            Note: TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET is 16
+            Let struct_field_count be memory_get_int32(type, 24)
+            Let fields be memory_get_pointer(type, 16)
+            Let field_offset be -1
+
+            Let field_j be 0
+            While field_j is less than struct_field_count:
+                Let field_def_offset be field_j multiplied by 24
+                Let field_def_ptr be fields plus field_def_offset
+                Let field_def_name be memory_get_pointer(field_def_ptr, 0)
+                If string_equals(field_def_name, field_name) is equal to 1:
+                    Let field_offset be memory_get_int32(field_def_ptr, 16)
+                    Let field_j be struct_field_count  Note: break
+                End If
+                Let field_j be field_j plus 1
+            End While
+
+            If field_offset is less than 0:
+                print_string("[CODEGEN ERROR] Unknown field '")
+                print_string(field_name)
+                print_string("' in struct '")
+                print_string(struct_type_name)
+                print_string("'")
+                exit_with_code(1)
+            End If
+
+            Note: Generate field value expression
+            codegen_generate_expression(codegen, field_value_expr)
+
+            Note: Store value in struct field
+            file_write_buffered(output_file, "    movq (%rsp), %rbx  # Load struct pointer\n", 0)
+            file_write_buffered(output_file, "    movq %rax, ", 0)
+            file_write_buffered(output_file, integer_to_string(field_offset), 0)
+            file_write_buffered(output_file, "(%rbx)  # Store field value\n", 0)
+
+            Let field_i be field_i plus 1
+        End While
+
+        Note: Pop struct pointer into %rax as result
+        file_write_buffered(output_file, "    popq %rax  # Struct pointer as result\n", 0)
+        Return 0
+    End If
+
     Note: Default case
     print_string("[CODEGEN ERROR] Unsupported expression type")
     exit_with_code(1)
@@ -2047,13 +2249,13 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                 Note: Get variable info
                 Let var_index be codegen_find_variable(codegen, variable_name)
                 Let variables be memory_get_pointer(codegen, 8)  Note: codegen->variables
-                Let offset be memory_get_integer(variables, var_index multiplied by 32 plus 8)  Note: variables[var_index].stack_offset
+                Let offset be memory_get_int32(variables, var_index multiplied by 32 plus 8)  Note: variables[var_index].stack_offset
 
                 Note: Handle different type kinds
                 Let type_kind be memory_get_int32(type_def, 8)  Note: type->kind
                 Let type_size be memory_get_int32(type_def, 16)  Note: type->size
 
-                If type_kind is equal to 2:  Note: TYPE_KIND_ARRAY
+                If type_kind is equal to 3:  Note: TYPE_KIND_ARRAY
                     Note: For arrays, allocate space for all elements and zero out memory
                     Let i be 0
                     While i is less than type_size:
@@ -2120,12 +2322,23 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                             codegen_add_variable_with_type(codegen, variable_name, "List")
                         Otherwise:
                             Note: Regular integer/other builtin expression
-                            codegen_add_variable(codegen, variable_name)
+                            Note: Try to infer type from expression
+                            Let inferred_type be codegen_get_expression_type(codegen, let_expr)
+                            If inferred_type is equal to 0:
+                                codegen_add_variable(codegen, variable_name)
+                            Otherwise:
+                                codegen_add_variable_with_type(codegen, variable_name, inferred_type)
+                            End If
                         End If
                     End If
                 Otherwise:
-                    Note: Regular integer/other expression (non-builtin)
-                    codegen_add_variable(codegen, variable_name)
+                    Note: Regular integer/other expression (non-builtin) - infer type
+                    Let inferred_type be codegen_get_expression_type(codegen, let_expr)
+                    If inferred_type is equal to 0:
+                        codegen_add_variable(codegen, variable_name)
+                    Otherwise:
+                        codegen_add_variable_with_type(codegen, variable_name, inferred_type)
+                    End If
                 End If
 
                 Note: Generate expression (result in %rax)
@@ -2134,7 +2347,7 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                 Note: Store value in variable's stack slot
                 Let var_index be codegen_find_variable(codegen, variable_name)
                 Let variables be memory_get_pointer(codegen, 8)  Note: codegen->variables
-                Let offset be memory_get_integer(variables, var_index multiplied by 32 plus 8)  Note: variables[var_index].stack_offset
+                Let offset be memory_get_int32(variables, var_index multiplied by 32 plus 8)  Note: variables[var_index].stack_offset
                 file_write_buffered(output_file, "    movq %rax, -", 0)
                 file_write_buffered(output_file, integer_to_string(offset), 0)
                 file_write_buffered(output_file, "(%rbp)\n", 0)
@@ -2228,7 +2441,7 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         codegen_add_variable(codegen, var_name)
         Let var_index be codegen_find_variable(codegen, var_name)
         Let variables be memory_get_pointer(codegen, 8)
-        Let var_offset be memory_get_integer(variables, var_index multiplied by 32 plus 8)
+        Let var_offset be memory_get_int32(variables, var_index multiplied by 32 plus 8)
 
         Note: Generate start expression and store in loop variable
         codegen_generate_expression(codegen, start_expr)
