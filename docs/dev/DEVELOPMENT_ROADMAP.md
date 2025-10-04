@@ -76,20 +76,20 @@ Before starting standard library development in v0.1.0, these features are **ABS
 ## What Belongs Where:
 
 ### COMPILER (Parser/Codegen):
-- ❌ **Struct construction syntax**: `Let point be a value of type Point with x as 10 and y as 20`
+- ✅ **Struct construction syntax**: `Let point be a value of type Point with x as 10 and y as 20`
   - Parser: Recognize `a value of type TypeName with field as value and field as value`
   - Codegen: Generate allocate() + memory_set_integer() for each field
-- ❌ **Field access (read)**: `Let x_val be the x of p`
+- ✅ **Field access (read)**: `Let x_val be the x of p`
   - Parser: Recognize `the FIELD of OBJECT` pattern
   - Codegen: Look up struct type, calculate field offset, generate memory_get_integer()
-- ❌ **Field access (write)**: `Set the width of rect to 15`
+- ✅ **Field access (write)**: `Set the width of rect to 15`
   - Parser: Recognize `Set the FIELD of OBJECT to VALUE` pattern
   - Codegen: Look up struct type, calculate field offset, generate memory_set_integer()
 
 ### TYPE SYSTEM (New):
-- ❌ **Type registry**: Store struct definitions (field names, types, offsets)
-- ❌ **Field offset calculation**: Given struct type and field name, return byte offset
-- ❌ **Type validation**: Ensure field exists in struct before accessing
+- ✅ **Type registry**: Store struct definitions (field names, types, offsets)
+- ✅ **Field offset calculation**: Given struct type and field name, return byte offset
+- ✅ **Type validation**: Ensure field exists in struct before accessing
 
 ### LEXER (Breaking Change):
 - ✅ **Remove hashtag comment support**: `# comment` is NO LONGER VALID
