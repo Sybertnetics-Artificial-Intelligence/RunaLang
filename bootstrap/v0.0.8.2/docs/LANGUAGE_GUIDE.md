@@ -11,7 +11,10 @@ This guide documents the Runa programming language syntax and features as implem
 6. [Control Flow](#control-flow)
 7. [Functions](#functions)
 8. [Structs](#structs)
-9. [Lists](#lists)
+9. [Collections](#collections)
+   - [Lists](#lists)
+   - [Sets](#sets)
+   - [Dictionaries](#dictionaries)
 10. [Inline Assembly](#inline-assembly)
 11. [Imports](#imports)
 
@@ -96,9 +99,9 @@ Let is_false be false
 
 See [Structs](#structs) section below.
 
-### Lists
+### Collections
 
-See [Lists](#lists) section below.
+See [Collections](#collections) section below for Lists, Sets, and Dictionaries.
 
 ---
 
@@ -306,60 +309,256 @@ Set the y of the bottom_right of rect to 50
 
 ---
 
-## Lists
+## Collections
 
-### List Literals
+Runa provides three built-in collection types: **Lists**, **Sets**, and **Dictionaries**. All collection keywords (`list`, `set`, `dictionary`) are **context-aware** - they only act as keywords when followed by `containing` or `with:`, allowing you to use them as variable names elsewhere in your code.
+
+### Lists
+
+Lists are ordered, mutable sequences that can contain duplicate values.
+
+#### List Literal Syntax
 
 ```runa
-Note: Create list with values
-Let numbers be a list containing 10, 20, 30
+Note: Two equivalent syntaxes for list literals
 
-Note: Create list with expressions
+Note: Syntax 1: "list containing"
+Let numbers be list containing 10, 20, 30
+
+Note: Syntax 2: "a list containing" (more natural English)
+Let values be a list containing 1, 2, 3, 4, 5
+
+Note: Lists with expressions
 Let x be 5
 Let y be 10
 Let computed be a list containing x, y, x plus y
+
+Note: Empty list (use runtime function)
+Let empty be list_create()
+
+Note: "list" can be used as a variable name
+Let list be 42  Note: This works! "list" is context-aware
 ```
 
-### List Operations
+#### List Runtime Operations
 
 ```runa
 Note: Create empty list
-Let list be list_create()
+Let my_list be list_create()
 
 Note: Append elements
-list_append(list, 10)
-list_append(list, 20)
+list_append(my_list, 10)
+list_append(my_list, 20)
+list_append(my_list, 30)
 
-Note: Get element
-Let val be list_get(list, 0)
+Note: Get element by index (0-based)
+Let first be list_get(my_list, 0)  Note: Returns 10
 
-Note: Set element
-list_set(list, 0, 100)
+Note: Set element at index
+list_set(my_list, 1, 100)  Note: Changes 20 to 100
 
-Note: Insert element
-list_insert(list, 1, 15)
+Note: Insert element at index
+list_insert(my_list, 1, 15)  Note: Insert 15 at position 1
 
-Note: Remove element
-Let removed be list_remove(list, 1)
+Note: Remove element at index (returns removed value)
+Let removed be list_remove(my_list, 0)
 
-Note: Get length
-Let len be list_length(list)
+Note: Get list length
+Let len be list_length(my_list)
 
-Note: Clear list
-list_clear(list)
+Note: Clear all elements
+list_clear(my_list)
 
-Note: Destroy list
-list_destroy(list)
+Note: Destroy list and free memory
+list_destroy(my_list)
 ```
 
-### Iterating Over Lists
+#### Iterating Over Lists
 
 ```runa
-Let fruits be a list containing 100, 200, 300
-For each item in fruits:
-    Display(integer_to_string(item))
+Note: For-each loop over list
+Let numbers be a list containing 1, 2, 3, 4, 5
+Let sum be 0
+
+For each num in numbers:
+    Set sum to sum plus num
+End For
+
+Note: Nested for-each loops
+Let list1 be a list containing 10, 20
+Let list2 be a list containing 1, 2, 3
+
+For each x in list1:
+    For each y in list2:
+        Display(integer_to_string(x plus y))
+    End For
 End For
 ```
+
+---
+
+### Sets
+
+Sets are unordered collections of unique values. Duplicate values are automatically removed.
+
+#### Set Literal Syntax
+
+```runa
+Note: Two equivalent syntaxes for set literals
+
+Note: Syntax 1: "set containing"
+Let unique be set containing 1, 2, 3, 4, 5
+
+Note: Syntax 2: "a set containing" (more natural English)
+Let numbers be a set containing 10, 20, 30
+
+Note: Sets automatically deduplicate
+Let deduped be set containing 1, 2, 2, 3, 3, 3
+Note: deduped contains only {1, 2, 3}
+
+Note: "set" can be used as a variable name
+Let set be 100  Note: This works! "set" is context-aware
+```
+
+#### Set Runtime Operations
+
+```runa
+Note: Create empty set
+Let my_set be set_create()
+
+Note: Add elements (duplicates ignored)
+set_add(my_set, 10)
+set_add(my_set, 20)
+set_add(my_set, 10)  Note: Ignored, already in set
+
+Note: Check if set contains element
+Let has_ten be set_contains(my_set, 10)  Note: Returns 1 (true)
+Let has_fifty be set_contains(my_set, 50)  Note: Returns 0 (false)
+
+Note: Remove element (returns 1 if removed, 0 if not found)
+Let removed be set_remove(my_set, 10)
+
+Note: Get set size
+Let size be set_size(my_set)
+
+Note: Set union (combine two sets)
+Let set1 be set containing 1, 2, 3
+Let set2 be set containing 3, 4, 5
+Let union_set be set_union(set1, set2)  Note: {1, 2, 3, 4, 5}
+
+Note: Set intersection (common elements)
+Let intersection be set_intersection(set1, set2)  Note: {3}
+```
+
+#### Iterating Over Sets
+
+```runa
+Note: Sets can be iterated with for-each loops
+Let my_set be set containing 100, 200, 300
+
+For each value in my_set:
+    Display(integer_to_string(value))
+End For
+```
+
+---
+
+### Dictionaries
+
+Dictionaries are key-value mappings (also called hash maps or associative arrays).
+
+#### Dictionary Literal Syntax
+
+```runa
+Note: Dictionary syntax: "dictionary with: key as value and key as value ..."
+
+Note: Simple dictionary
+Let ages be dictionary with: 1 as 25 and 2 as 30 and 3 as 35
+
+Note: Dictionary with expressions
+Let x be 10
+Let y be 20
+Let mapping be dictionary with: x as y and 100 as x plus y
+
+Note: "dictionary" can be used as a variable name
+Let dictionary be 777  Note: This works! "dictionary" is context-aware
+```
+
+#### Dictionary Runtime Operations
+
+```runa
+Note: Create empty dictionary
+Let my_dict be dict_create()
+
+Note: Set key-value pairs
+dict_set(my_dict, 1, 100)
+dict_set(my_dict, 2, 200)
+dict_set(my_dict, 3, 300)
+
+Note: Get value by key (returns value, or 0 if key not found)
+Let value be dict_get(my_dict, 1)  Note: Returns 100
+
+Note: Check if dictionary has key
+Let has_key be dict_has(my_dict, 1)  Note: Returns 1 (true)
+Let missing be dict_has(my_dict, 99)  Note: Returns 0 (false)
+
+Note: Remove key-value pair (returns 1 if removed, 0 if not found)
+Let removed be dict_remove(my_dict, 2)
+
+Note: Get dictionary size (number of key-value pairs)
+Let size be dict_size(my_dict)
+
+Note: Get all keys as a list
+Let keys be dict_keys(my_dict)
+
+Note: Get all values as a list
+Let values be dict_values(my_dict)
+```
+
+#### Iterating Over Dictionaries
+
+```runa
+Note: Iterate over dictionary keys
+Let ages be dictionary with: 1 as 25 and 2 as 30 and 3 as 35
+Let keys be dict_keys(ages)
+
+For each key in keys:
+    Let value be dict_get(ages, key)
+    Display(integer_to_string(key))
+    Display(integer_to_string(value))
+End For
+
+Note: Iterate over dictionary values
+Let values be dict_values(ages)
+For each val in values:
+    Display(integer_to_string(val))
+End For
+```
+
+---
+
+### Context-Aware Collection Keywords
+
+The keywords `list`, `set`, and `dictionary` are **context-aware** - they only act as keywords in specific contexts:
+
+```runa
+Note: As keywords (followed by "containing" or "with:")
+Let my_list be list containing 1, 2, 3
+Let my_set be set containing 1, 2, 3
+Let my_dict be dictionary with: 1 as 100
+
+Note: As variable names (anywhere else)
+Let list be 42
+Let set be 100
+Let dictionary be 200
+Set list to list plus set  Note: Works perfectly!
+
+Note: Real example from compiler source code
+Let list be list_create()  Note: "list" is a variable, not a keyword
+list_append(list, value)
+```
+
+This design allows natural English-like syntax for collection literals while maintaining full backward compatibility with existing code that uses these words as identifiers.
 
 ---
 
@@ -447,8 +646,8 @@ Display(integer_to_string(42))
 Let str be integer_to_string(42)
 ```
 
-### List Functions
-See [Lists](#lists) section for complete list operations.
+### Collection Functions
+See [Collections](#collections) section for complete list, set, and dictionary operations.
 
 ---
 
@@ -461,8 +660,12 @@ See [Lists](#lists) section for complete list operations.
 - Control flow (If/Otherwise If/Otherwise, While, For, For-Each)
 - Functions (Processes) with multiple parameters
 - Structs with nested field access
-- Lists with runtime operations
-- List literals and for-each loops
+- **Collections:**
+  - **Lists** with literals (`list containing`) and runtime operations
+  - **Sets** with literals (`set containing`) and runtime operations
+  - **Dictionaries** with literals (`dictionary with:`) and runtime operations
+- For-each loops over collections
+- Context-aware collection keywords
 - Inline assembly
 - Multi-file imports
 - Break/Continue statements
@@ -470,12 +673,11 @@ See [Lists](#lists) section for complete list operations.
 - Compound assignments
 
 ❌ **Not Yet Implemented:**
-- Sets
-- Dictionaries
 - String type (planned)
 - Floating-point numbers
 - Generic types
 - Error handling
+- Pattern matching
 
 ---
 
@@ -519,7 +721,87 @@ Process called "main" returns Integer:
     End For
 
     Display("Sum is:")
-    Display(integer_to_string(sum))
+    Display(integer_to_string(sum))  Note: Prints 15
+    Return 0
+End Process
+```
+
+### Working with Sets
+```runa
+Process called "main" returns Integer:
+    Note: Sets automatically deduplicate
+    Let unique_nums be set containing 1, 2, 2, 3, 3, 3, 4, 5
+
+    Let size be set_size(unique_nums)
+    Display("Set size:")
+    Display(integer_to_string(size))  Note: Prints 5, not 8
+
+    Note: Set operations
+    Let set1 be set containing 1, 2, 3
+    Let set2 be set containing 3, 4, 5
+
+    Let union be set_union(set1, set2)
+    Display("Union size:")
+    Display(integer_to_string(set_size(union)))  Note: Prints 5
+
+    Let intersection be set_intersection(set1, set2)
+    Display("Intersection size:")
+    Display(integer_to_string(set_size(intersection)))  Note: Prints 1
+
+    Return 0
+End Process
+```
+
+### Working with Dictionaries
+```runa
+Process called "main" returns Integer:
+    Note: Create a dictionary mapping IDs to scores
+    Let scores be dictionary with: 1 as 95 and 2 as 87 and 3 as 92
+
+    Note: Get values
+    Let score1 be dict_get(scores, 1)
+    Display("Score for ID 1:")
+    Display(integer_to_string(score1))  Note: Prints 95
+
+    Note: Add new entry
+    dict_set(scores, 4, 88)
+
+    Note: Iterate over all entries
+    Let keys be dict_keys(scores)
+    For each key in keys:
+        Let value be dict_get(scores, key)
+        Display(integer_to_string(key))
+        Display(integer_to_string(value))
+    End For
+
+    Return 0
+End Process
+```
+
+### Nested Collections
+```runa
+Process called "main" returns Integer:
+    Note: Lists of lists (nested collections)
+    Let list1 be list containing 1, 2, 3
+    Let list2 be list containing 4, 5, 6
+    Let matrix be list_create()
+    list_append(matrix, list1)
+    list_append(matrix, list2)
+
+    Note: Access nested elements
+    Let row0 be list_get(matrix, 0)
+    Let element be list_get(row0, 1)
+    Display(integer_to_string(element))  Note: Prints 2
+
+    Note: Dictionary with list values
+    Let data be dict_create()
+    dict_set(data, 100, list1)
+    dict_set(data, 200, list2)
+
+    Let retrieved be dict_get(data, 100)
+    Let first be list_get(retrieved, 0)
+    Display(integer_to_string(first))  Note: Prints 1
+
     Return 0
 End Process
 ```
