@@ -1,8 +1,8 @@
 # Runa Development Roadmap
 ## From v0.0.8 to v1.0
 
-**Current Status:** v0.0.8.1 (Self-Hosting Achieved ✅, First Self-Hosted Compiler)
-**Previous:** v0.0.8 (Core Language Complete (inline asm, imports, for loops, bitwise))
+**Current Status:** v0.0.8.2 (Struct Construction & Field Access Syntax)
+**Previous:** v0.0.8.1 (Self-Hosting Achieved ✅, First Self-Hosted Compiler)
 **Target:** v1.0 (Production-Ready Language)
 
 ---
@@ -31,8 +31,8 @@ Before starting standard library development in v0.1.0, these features are **ABS
 |---------|-----------|--------|
 | **v0.0.7.5** | Self-hosting compiler (C bootstrap) | ✅ **COMPLETE** |
 | **v0.0.8** | Core Language Complete (inline asm, imports, for loops, bitwise) | ✅ **COMPLETE**
-| **v0.0.8.1** | Struct Construction & Field Access Syntax | 🔄 **IN PROGRESS**
-| **v0.0.8.2** | Collections (Lists, Dictionaries, Sets) + For Each Loops | 📋 Planned |
+| **v0.0.8.1** | Struct Construction & Field Access Syntax | ✅ **IN PROGRESS**
+| **v0.0.8.2** | Collections (Lists, Dictionaries, Sets) + For Each Loops | 🔄 Planned |
 | **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | 📋 Planned |
 | **v0.0.8.4** | Lambda Expressions + Type Inference | 📋 Planned |
 | **v0.0.8.5** | String Interpolation, Ternary Operator | 📋 Planned |
@@ -64,79 +64,6 @@ Before starting standard library development in v0.1.0, these features are **ABS
 | **v1.1** | Rosetta Stone Phase 1: C → Runa Translation | 📋 Planned |
 | **v1.2** | Rosetta Stone Phase 2: Runa → Python Translation | 📋 Planned |
 | **v1.3** | Rosetta Stone Phase 3: Bidirectional C ↔ Runa ↔ Python | 📋 Planned |
-
----
-
-# 🔹 v0.0.8.1: Struct Construction & Field Access Syntax
-
-**Goal:** Implement natural language syntax for creating and accessing structs - the #1 blocker for writing natural Runa code.
-
-**Priority:** CRITICAL - Without this, all code looks like C with manual memory management.
-
-## What Belongs Where:
-
-### COMPILER (Parser/Codegen):
-- ✅ **Struct construction syntax**: `Let point be a value of type Point with x as 10 and y as 20`
-  - Parser: Recognize `a value of type TypeName with field as value and field as value`
-  - Codegen: Generate allocate() + memory_set_integer() for each field
-- ✅ **Field access (read)**: `Let x_val be the x of p`
-  - Parser: Recognize `the FIELD of OBJECT` pattern
-  - Codegen: Look up struct type, calculate field offset, generate memory_get_integer()
-- ✅ **Field access (write)**: `Set the width of rect to 15`
-  - Parser: Recognize `Set the FIELD of OBJECT to VALUE` pattern
-  - Codegen: Look up struct type, calculate field offset, generate memory_set_integer()
-
-### TYPE SYSTEM (New):
-- ✅ **Type registry**: Store struct definitions (field names, types, offsets)
-- ✅ **Field offset calculation**: Given struct type and field name, return byte offset
-- ✅ **Type validation**: Ensure field exists in struct before accessing
-
-### LEXER (Breaking Change):
-- ✅ **Remove hashtag comment support**: `# comment` is NO LONGER VALID
-  - Remove `#` comment handling from lexer (lines 697-699 in v0.0.8)
-  - Remove `lexer_skip_comment` process (lines 272-292 in v0.0.8)
-  - **ONLY `Note:` comments are supported going forward**
-  - Reason: Aligns with natural language philosophy, reduces syntax complexity
-  - **Migration**: Convert all `#` comments to `Note:` comments before v0.0.8.1
-
-## Implementation Notes:
-
-**Struct construction creates:**
-```runa
-# User writes:
-Let point be a value of type Point with x as 10 and y as 20
-
-# Compiler generates:
-Let point be allocate(16)        # sizeof(Point) = 2 fields * 8 bytes
-memory_set_integer(point, 0, 10)  # x at offset 0
-memory_set_integer(point, 8, 20)  # y at offset 8
-```
-
-**Field access creates:**
-```runa
-# User writes:
-Let x_val be the x of p
-
-# Compiler generates:
-Let x_val be memory_get_integer(p, 0)  # x is at offset 0
-```
-
-## Success Criteria:
-- ✅ Struct construction with `a value of type` works
-- ✅ Field access with `the FIELD of OBJECT` works
-- ✅ Field assignment with `Set the FIELD of OBJECT to VALUE` works
-- ✅ Type checking: compiler errors on non-existent fields
-- ✅ Multi-field structs work (3+ fields)
-- ✅ Nested struct access works: `the x of the position of player`
-- ✅ **Hashtag comments removed**: `#` is no longer recognized, only `Note:` works
-- ✅ All source files migrated from `#` to `Note:` comments
-- ✅ Lexer rejects `#` with helpful error: "Use 'Note:' for comments"
-- ✅ All existing tests still pass
-- ✅ New tests for struct syntax pass
-
-**Note:** Dot notation (`p.x`) is deferred to v0.2.0 as part of developer mode syntax.
-
-## Timeline: TBD
 
 ---
 
