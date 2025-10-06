@@ -93,8 +93,9 @@
 .STR91:    .string ","
 .STR92:    .string "|"
 .STR93:    .string "$"
-.STR94:    .string "{"
-.STR95:    .string "}"
+.STR94:    .string "_"
+.STR95:    .string "{"
+.STR96:    .string "}"
 
 .section .data
 .globl LEXER_POSITION
@@ -423,6 +424,8 @@ TOKEN_THE:    .quad 158
 TOKEN_LIST:    .quad 159
 .globl TOKEN_DICTIONARY
 TOKEN_DICTIONARY:    .quad 160
+.globl TOKEN_UNDERSCORE
+TOKEN_UNDERSCORE:    .quad 161
 
 .text
 print_string:
@@ -6677,7 +6680,7 @@ check_single_char_token:
 .L2001:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $123, %rax
+    movq $95, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -6697,7 +6700,7 @@ check_single_char_token:
     pushq %rax
     movq -296(%rbp), %rax
     pushq %rax
-    movq $146, %rax  # Load compile-time constant TOKEN_LBRACE
+    movq $161, %rax  # Load compile-time constant TOKEN_UNDERSCORE
     pushq %rax
     popq %rdi
     popq %rsi
@@ -6713,7 +6716,7 @@ check_single_char_token:
 .L2011:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $125, %rax
+    movq $123, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -6733,7 +6736,7 @@ check_single_char_token:
     pushq %rax
     movq -320(%rbp), %rax
     pushq %rax
-    movq $147, %rax  # Load compile-time constant TOKEN_RBRACE
+    movq $146, %rax  # Load compile-time constant TOKEN_LBRACE
     pushq %rax
     popq %rdi
     popq %rsi
@@ -6747,6 +6750,43 @@ check_single_char_token:
     ret
     jmp .L2022
 .L2021:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $125, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2031
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call lexer_advance
+    movq %rax, -48(%rbp)
+    leaq .STR96(%rip), %rax
+    movq %rax, -344(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq -344(%rbp), %rax
+    pushq %rax
+    movq $147, %rax  # Load compile-time constant TOKEN_RBRACE
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    call token_create
+    movq %rax, -64(%rbp)
+    movq -64(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L2032
+.L2031:
+.L2032:
 .L2022:
 .L2012:
 .L2002:
@@ -6779,7 +6819,7 @@ token_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2031
+    jz .L2041
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6796,21 +6836,21 @@ token_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2041
+    jz .L2051
     movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    jmp .L2052
+.L2051:
+.L2052:
+    movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     jmp .L2042
 .L2041:
 .L2042:
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    jmp .L2032
-.L2031:
-.L2032:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -6836,14 +6876,14 @@ is_alnum_char:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2051
+    jz .L2061
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2052
-.L2051:
-.L2052:
+    jmp .L2062
+.L2061:
+.L2062:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
