@@ -121,10 +121,6 @@ main:
     cmpq %rbx, %rax  # Compare
     jne .match_0_case_1  # Try next case
     popq %rax  # Matched, clean up stack
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
     jmp .match_0_end
 .match_0_case_1:
     popq %rax  # Get match value
@@ -133,16 +129,60 @@ main:
     movq %rax, %rbx  # Pattern value to %rbx
     movq (%rsp), %rax  # Match value to %rax
     cmpq %rbx, %rax  # Compare
-    jne .match_0_end  # No match
+    jne .match_0_case_2  # Try next case
     popq %rax  # Matched, clean up stack
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .match_0_end
+.match_0_case_2:
+    popq %rax  # Matched, clean up stack
+    movq $2, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .match_0_end
 .match_0_end:
     addq $8, %rsp  # Clean up match value if still on stack
-    movq $2, %rax
+    movq $99, %rax
+    movq %rax, -16(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax  # Save match value
+.match_1_case_0:
+    popq %rax  # Get match value
+    pushq %rax  # Keep for next comparison
+    movq $5, %rax
+    movq %rax, %rbx  # Pattern value to %rbx
+    movq (%rsp), %rax  # Match value to %rax
+    cmpq %rbx, %rax  # Compare
+    jne .match_1_case_1  # Try next case
+    popq %rax  # Matched, clean up stack
+    movq $3, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .match_1_end
+.match_1_case_1:
+    popq %rax  # Get match value
+    pushq %rax  # Keep for next comparison
+    movq $10, %rax
+    movq %rax, %rbx  # Pattern value to %rbx
+    movq (%rsp), %rax  # Match value to %rax
+    cmpq %rbx, %rax  # Compare
+    jne .match_1_case_2  # Try next case
+    popq %rax  # Matched, clean up stack
+    movq $4, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .match_1_end
+.match_1_case_2:
+    popq %rax  # Matched, clean up stack
+    jmp .match_1_end
+.match_1_end:
+    addq $8, %rsp  # Clean up match value if still on stack
+    movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
