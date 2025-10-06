@@ -1,11 +1,3 @@
-.section .rodata
-.STR0:    .string "FAIL: basic for-each"
-.STR1:    .string "FAIL: for-each empty"
-.STR2:    .string "FAIL: nested for-each"
-.STR3:    .string "FAIL: for-each with created list"
-.STR4:    .string "FAIL: for-each external variable"
-.STR5:    .string "PASS: All for-each tests"
-
 .text
 print_string:
     pushq %rbp
@@ -107,6 +99,12 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
+.STR0:    .string "FAIL: basic for-each"
+.STR1:    .string "FAIL: for-each empty"
+.STR2:    .string "FAIL: nested for-each"
+.STR3:    .string "FAIL: for-each with created list"
+.STR4:    .string "FAIL: for-each external variable"
+.STR5:    .string "PASS: All for-each tests"
 .text
 .globl main
 

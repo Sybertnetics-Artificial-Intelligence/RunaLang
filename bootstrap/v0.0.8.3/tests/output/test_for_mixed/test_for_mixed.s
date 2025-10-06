@@ -180,6 +180,25 @@ main:
 .L2:
     addq $24, %rsp
     movq -16(%rbp), %rax
+    pushq %rax
+    movq $90, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L21
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L22
+.L21:
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L22:
     movq %rbp, %rsp
     popq %rbp
     ret

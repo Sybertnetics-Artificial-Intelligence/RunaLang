@@ -29,7 +29,7 @@ Every Runa program starts with a `main` function (called a "Process"):
 
 ```runa
 Process called "main" returns Integer:
-    Display("Hello, World!")
+    Display "Hello, World!"
     Return 0
 End Process
 ```
@@ -137,11 +137,11 @@ If x is not greater than y:
 
 ```runa
 If x is equal to 5 and y is greater than 3:
-    Display("Both conditions true")
+    Display "Both conditions true"
 End If
 
 If x is equal to 5 or y is equal to 10:
-    Display("At least one condition true")
+    Display "At least one condition true"
 End If
 ```
 
@@ -163,9 +163,9 @@ Let result be a right shifted by 2
 
 ```runa
 If x is equal to 10:
-    Display("x is 10")
+    Display "x is 10"
 Otherwise:
-    Display("x is not 10")
+    Display "x is not 10"
 End If
 ```
 
@@ -216,7 +216,7 @@ End For
 Note: Iterate over a list
 Let numbers be a list containing 1, 2, 3, 4, 5
 For each num in numbers:
-    Display(integer_to_string(num))
+    Display integer_to_string(num)
 End For
 ```
 
@@ -232,7 +232,7 @@ While i is less than 10:
     If i is equal to 8:
         Break      Note: Exit loop
     End If
-    Display(integer_to_string(i))
+    Display integer_to_string(i)
 End While
 ```
 
@@ -255,7 +255,7 @@ End Process
 
 ```runa
 Let sum be add(5, 3)
-Display(integer_to_string(sum))
+Display integer_to_string(sum)
 ```
 
 ### Multiple Parameters
@@ -460,7 +460,7 @@ Note: Sets can be iterated with for-each loops
 Let my_set be set containing 100, 200, 300
 
 For each value in my_set:
-    Display(integer_to_string(value))
+    Display integer_to_string(value)
 End For
 ```
 
@@ -528,7 +528,7 @@ Let keys be dict_keys(ages)
 For each key in keys:
     Let value be dict_get(ages, key)
     Display(integer_to_string(key))
-    Display(integer_to_string(value))
+    Display integer_to_string(value)
 End For
 
 Note: Iterate over dictionary values
@@ -640,8 +640,8 @@ End Process
 
 ### Display
 ```runa
-Display("Hello")
-Display(integer_to_string(42))
+Display "Hello"
+Display integer_to_string(42)
 ```
 
 ### String Conversion
@@ -695,7 +695,7 @@ See [Collections](#collections) section for complete list, set, and dictionary o
 ### Hello World
 ```runa
 Process called "main" returns Integer:
-    Display("Hello, World!")
+    Display "Hello, World!"
     Return 0
 End Process
 ```
@@ -713,7 +713,7 @@ End Process
 
 Process called "main" returns Integer:
     Let result be fibonacci(10)
-    Display(integer_to_string(result))
+    Display integer_to_string(result)
     Return 0
 End Process
 ```
@@ -729,8 +729,8 @@ Process called "main" returns Integer:
         Set sum to sum plus num
     End For
 
-    Display("Sum is:")
-    Display(integer_to_string(sum))  Note: Prints 15
+    Display "Sum is:"
+    Display integer_to_string(sum)  Note: Prints 15
     Return 0
 End Process
 ```
@@ -742,20 +742,20 @@ Process called "main" returns Integer:
     Let unique_nums be set containing 1, 2, 2, 3, 3, 3, 4, 5
 
     Let size be set_size(unique_nums)
-    Display("Set size:")
-    Display(integer_to_string(size))  Note: Prints 5, not 8
+    Display "Set size:"
+    Display integer_to_string(size)  Note: Prints 5, not 8
 
     Note: Set operations
     Let set1 be set containing 1, 2, 3
     Let set2 be set containing 3, 4, 5
 
     Let union be set_union(set1, set2)
-    Display("Union size:")
-    Display(integer_to_string(set_size(union)))  Note: Prints 5
+    Display "Union size:"
+    Display integer_to_string(set_size(union))  Note: Prints 5
 
     Let intersection be set_intersection(set1, set2)
-    Display("Intersection size:")
-    Display(integer_to_string(set_size(intersection)))  Note: Prints 1
+    Display "Intersection size:"
+    Display integer_to_string(set_size(intersection))  Note: Prints 1
 
     Return 0
 End Process
@@ -769,8 +769,8 @@ Process called "main" returns Integer:
 
     Note: Get values
     Let score1 be dict_get(scores, 1)
-    Display("Score for ID 1:")
-    Display(integer_to_string(score1))  Note: Prints 95
+    Display "Score for ID 1:"
+    Display integer_to_string(score1)  Note: Prints 95
 
     Note: Add new entry
     dict_set(scores, 4, 88)
@@ -780,7 +780,7 @@ Process called "main" returns Integer:
     For each key in keys:
         Let value be dict_get(scores, key)
         Display(integer_to_string(key))
-        Display(integer_to_string(value))
+        Display integer_to_string(value)
     End For
 
     Return 0
@@ -800,7 +800,7 @@ Process called "main" returns Integer:
     Note: Access nested elements
     Let row0 be list_get(matrix, 0)
     Let element be list_get(row0, 1)
-    Display(integer_to_string(element))  Note: Prints 2
+    Display integer_to_string(element)  Note: Prints 2
 
     Note: Dictionary with list values
     Let data be dict_create()
@@ -809,7 +809,7 @@ Process called "main" returns Integer:
 
     Let retrieved be dict_get(data, 100)
     Let first be list_get(retrieved, 0)
-    Display(integer_to_string(first))  Note: Prints 1
+    Display integer_to_string(first)  Note: Prints 1
 
     Return 0
 End Process
@@ -833,7 +833,7 @@ Process called "main" returns Integer:
     Let p1 be a Point with x 0 and y 0
     Let p2 be a Point with x 3 and y 4
     Let dist_squared be distance(p1, p2)
-    Display(integer_to_string(dist_squared))
+    Display integer_to_string(dist_squared)
     Return 0
 End Process
 ```
@@ -925,11 +925,11 @@ End Process
 Process called "main" returns Integer:
     Let x be a Some with value as 42
     Let value be get_or_default(x, 0)
-    Display(integer_to_string(value))  Note: Prints 42
+    Display integer_to_string(value)  Note: Prints 42
 
     Let y be a None with
     Let default_value be get_or_default(y, 100)
-    Display(integer_to_string(default_value))  Note: Prints 100
+    Display integer_to_string(default_value)  Note: Prints 100
 
     Return 0
 End Process
@@ -955,11 +955,11 @@ End Process
 Process called "main" returns Integer:
     Let circle be a Circle with radius as 5
     Let circle_area be area(circle)
-    Display(integer_to_string(circle_area))  Note: Prints 75
+    Display integer_to_string(circle_area)  Note: Prints 75
 
     Let rect be a Rectangle with width as 10 and height as 20
     Let rect_area be area(rect)
-    Display(integer_to_string(rect_area))  Note: Prints 200
+    Display integer_to_string(rect_area)  Note: Prints 200
 
     Return 0
 End Process
@@ -1018,7 +1018,7 @@ Process called "main" returns Integer:
     Let list1 be a Cons with head as 1 and tail as list2
 
     Let total be sum_list(list1)
-    Display(integer_to_string(total))  Note: Prints 6
+    Display integer_to_string(total)  Note: Prints 6
 
     Return 0
 End Process
@@ -1057,7 +1057,7 @@ Process called "main" returns Integer:
     Let root be a Node with value as 1 and left as node1 and right as leaf3
 
     Let total be tree_sum(root)
-    Display(integer_to_string(total))  Note: Prints 66 (1+5+10+20+30)
+    Display integer_to_string(total)  Note: Prints 66 (1+5+10+20+30)
 
     Return 0
 End Process
@@ -1102,7 +1102,7 @@ Process called "main" returns Integer:
     Let result_expr be a Multiply with left as add2_3 and right as num4
 
     Let result be eval_expr(result_expr)
-    Display(integer_to_string(result))  Note: Prints 20
+    Display integer_to_string(result)  Note: Prints 20
 
     Return 0
 End Process

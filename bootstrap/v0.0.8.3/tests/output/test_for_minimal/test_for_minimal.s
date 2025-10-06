@@ -99,6 +99,7 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
+.STR0:    .string "ok"
 .text
 .globl main
 

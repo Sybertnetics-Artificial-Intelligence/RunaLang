@@ -1,19 +1,3 @@
-.section .rodata
-.STR0:    .string "PASS: and (both true)"
-.STR1:    .string "FAIL: and (both true)"
-.STR2:    .string "FAIL: and (first false)"
-.STR3:    .string "PASS: and (first false)"
-.STR4:    .string "FAIL: and (second false)"
-.STR5:    .string "PASS: and (second false)"
-.STR6:    .string "PASS: or (both true)"
-.STR7:    .string "FAIL: or (both true)"
-.STR8:    .string "PASS: or (first true)"
-.STR9:    .string "FAIL: or (first true)"
-.STR10:    .string "PASS: or (second true)"
-.STR11:    .string "FAIL: or (second true)"
-.STR12:    .string "FAIL: or (both false)"
-.STR13:    .string "PASS: or (both false)"
-
 .text
 print_string:
     pushq %rbp
@@ -115,6 +99,20 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
+.STR0:    .string "PASS: and (both true)"
+.STR1:    .string "FAIL: and (both true)"
+.STR2:    .string "FAIL: and (first false)"
+.STR3:    .string "PASS: and (first false)"
+.STR4:    .string "FAIL: and (second false)"
+.STR5:    .string "PASS: and (second false)"
+.STR6:    .string "PASS: or (both true)"
+.STR7:    .string "FAIL: or (both true)"
+.STR8:    .string "PASS: or (first true)"
+.STR9:    .string "FAIL: or (first true)"
+.STR10:    .string "PASS: or (second true)"
+.STR11:    .string "FAIL: or (second true)"
+.STR12:    .string "FAIL: or (both false)"
+.STR13:    .string "PASS: or (both false)"
 .text
 .globl main
 

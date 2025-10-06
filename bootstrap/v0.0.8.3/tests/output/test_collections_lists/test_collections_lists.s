@@ -1,14 +1,3 @@
-.section .rodata
-.STR0:    .string "FAIL: list_length"
-.STR1:    .string "FAIL: a list containing"
-.STR2:    .string "FAIL: list_get"
-.STR3:    .string "FAIL: list_set"
-.STR4:    .string "FAIL: list_append"
-.STR5:    .string "FAIL: list_insert"
-.STR6:    .string "FAIL: list_remove"
-.STR7:    .string "FAIL: list as variable"
-.STR8:    .string "PASS: All list tests"
-
 .text
 print_string:
     pushq %rbp
@@ -110,6 +99,15 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
+.STR0:    .string "FAIL: list_length"
+.STR1:    .string "FAIL: a list containing"
+.STR2:    .string "FAIL: list_get"
+.STR3:    .string "FAIL: list_set"
+.STR4:    .string "FAIL: list_append"
+.STR5:    .string "FAIL: list_insert"
+.STR6:    .string "FAIL: list_remove"
+.STR7:    .string "FAIL: list as variable"
+.STR8:    .string "PASS: All list tests"
 .text
 .globl main
 

@@ -1,21 +1,3 @@
-.section .rodata
-.STR0:    .string "PASS: is equal to"
-.STR1:    .string "FAIL: is equal to"
-.STR2:    .string "PASS: is not equal to"
-.STR3:    .string "FAIL: is not equal to"
-.STR4:    .string "PASS: is less than"
-.STR5:    .string "FAIL: is less than"
-.STR6:    .string "PASS: is greater than"
-.STR7:    .string "FAIL: is greater than"
-.STR8:    .string "PASS: is less than or equal to"
-.STR9:    .string "FAIL: is less than or equal to"
-.STR10:    .string "PASS: is greater than or equal to"
-.STR11:    .string "FAIL: is greater than or equal to"
-.STR12:    .string "PASS: is not less than"
-.STR13:    .string "FAIL: is not less than"
-.STR14:    .string "PASS: is not greater than"
-.STR15:    .string "FAIL: is not greater than"
-
 .text
 print_string:
     pushq %rbp
@@ -117,6 +99,22 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
+.STR0:    .string "PASS: is equal to"
+.STR1:    .string "FAIL: is equal to"
+.STR2:    .string "PASS: is not equal to"
+.STR3:    .string "FAIL: is not equal to"
+.STR4:    .string "PASS: is less than"
+.STR5:    .string "FAIL: is less than"
+.STR6:    .string "PASS: is greater than"
+.STR7:    .string "FAIL: is greater than"
+.STR8:    .string "PASS: is less than or equal to"
+.STR9:    .string "FAIL: is less than or equal to"
+.STR10:    .string "PASS: is greater than or equal to"
+.STR11:    .string "FAIL: is greater than or equal to"
+.STR12:    .string "PASS: is not less than"
+.STR13:    .string "FAIL: is not less than"
+.STR14:    .string "PASS: is not greater than"
+.STR15:    .string "FAIL: is not greater than"
 .text
 .globl main
 
