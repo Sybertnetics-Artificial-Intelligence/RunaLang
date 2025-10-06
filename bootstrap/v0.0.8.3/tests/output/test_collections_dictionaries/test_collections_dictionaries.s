@@ -1,16 +1,3 @@
-.section .rodata
-.STR0:    .string "FAIL: dict_size"
-.STR1:    .string "FAIL: dict_get"
-.STR2:    .string "FAIL: dict_has true"
-.STR3:    .string "FAIL: dict_has false"
-.STR4:    .string "FAIL: dict_set new"
-.STR5:    .string "FAIL: dict_set update"
-.STR6:    .string "FAIL: dict_remove"
-.STR7:    .string "FAIL: dict_keys"
-.STR8:    .string "FAIL: dict_values"
-.STR9:    .string "FAIL: dictionary as variable"
-.STR10:    .string "PASS: All dictionary tests"
-
 .text
 print_string:
     pushq %rbp
@@ -112,6 +99,17 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
+.STR0:    .string "FAIL: dict_size"
+.STR1:    .string "FAIL: dict_get"
+.STR2:    .string "FAIL: dict_has true"
+.STR3:    .string "FAIL: dict_has false"
+.STR4:    .string "FAIL: dict_set new"
+.STR5:    .string "FAIL: dict_set update"
+.STR6:    .string "FAIL: dict_remove"
+.STR7:    .string "FAIL: dict_keys"
+.STR8:    .string "FAIL: dict_values"
+.STR9:    .string "FAIL: dictionary as variable"
+.STR10:    .string "PASS: All dictionary tests"
 .text
 .globl main
 

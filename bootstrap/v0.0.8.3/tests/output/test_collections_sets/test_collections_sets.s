@@ -1,15 +1,3 @@
-.section .rodata
-.STR0:    .string "FAIL: set duplicate removal"
-.STR1:    .string "FAIL: a set containing"
-.STR2:    .string "FAIL: set_contains true"
-.STR3:    .string "FAIL: set_contains false"
-.STR4:    .string "FAIL: set_add"
-.STR5:    .string "FAIL: set_remove"
-.STR6:    .string "FAIL: set_union"
-.STR7:    .string "FAIL: set_intersection"
-.STR8:    .string "FAIL: set as variable"
-.STR9:    .string "PASS: All set tests"
-
 .text
 print_string:
     pushq %rbp
@@ -111,6 +99,16 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
+.STR0:    .string "FAIL: set duplicate removal"
+.STR1:    .string "FAIL: a set containing"
+.STR2:    .string "FAIL: set_contains true"
+.STR3:    .string "FAIL: set_contains false"
+.STR4:    .string "FAIL: set_add"
+.STR5:    .string "FAIL: set_remove"
+.STR6:    .string "FAIL: set_union"
+.STR7:    .string "FAIL: set_intersection"
+.STR8:    .string "FAIL: set as variable"
+.STR9:    .string "PASS: All set tests"
 .text
 .globl main
 
