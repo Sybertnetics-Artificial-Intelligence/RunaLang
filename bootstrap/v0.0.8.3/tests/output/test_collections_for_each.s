@@ -1,0 +1,521 @@
+.text
+print_string:
+    pushq %rbp
+    movq %rsp, %rbp
+
+    # Calculate string length
+    movq %rdi, %rsi  # Save string pointer
+    movq %rdi, %rcx  # Counter for strlen
+    xorq %rax, %rax  # Length accumulator
+.strlen_loop:
+    cmpb $0, (%rcx)
+    je .strlen_done
+    incq %rcx
+    incq %rax
+    jmp .strlen_loop
+.strlen_done:
+
+    # Call write syscall (sys_write = 1)
+    movq $1, %rdi     # fd = stdout
+    movq %rsi, %rsi   # buf = string pointer (already in rsi)
+    movq %rax, %rdx   # count = string length
+    movq $1, %rax     # syscall number for write
+    syscall
+
+    # Print newline
+    movq $1, %rdi     # fd = stdout
+    leaq .newline(%rip), %rsi  # newline string
+    movq $1, %rdx     # count = 1
+    movq $1, %rax     # syscall number for write
+    syscall
+
+    popq %rbp
+    ret
+
+
+print_integer:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $32, %rsp  # Space for string buffer (20 digits + null)
+
+    # Convert integer to string
+    movq %rdi, %rax  # integer value
+    leaq -32(%rbp), %rsi  # buffer pointer
+    addq $19, %rsi  # point to end of buffer (for reverse building)
+    movb $0, (%rsi)  # null terminator
+    decq %rsi
+
+    # Handle zero case
+    testq %rax, %rax
+    jnz .convert_loop
+    movb $48, (%rsi)  # '0' character
+    jmp .convert_done
+
+.convert_loop:
+    testq %rax, %rax
+    jz .convert_done
+    movq %rax, %rcx
+    movq $10, %rbx
+    xorq %rdx, %rdx
+    divq %rbx  # %rax = quotient, %rdx = remainder
+    addq $48, %rdx  # convert remainder to ASCII
+    movb %dl, (%rsi)  # store digit
+    decq %rsi
+    jmp .convert_loop
+
+.convert_done:
+    incq %rsi  # point to first character
+
+    # Calculate string length
+    movq %rsi, %rcx  # Counter for strlen
+    xorq %rax, %rax  # Length accumulator
+.int_strlen_loop:
+    cmpb $0, (%rcx)
+    je .int_strlen_done
+    incq %rcx
+    incq %rax
+    jmp .int_strlen_loop
+.int_strlen_done:
+
+    # Call write syscall (sys_write = 1)
+    movq $1, %rdi     # fd = stdout
+    # %rsi already points to string
+    movq %rax, %rdx   # count = string length
+    movq $1, %rax     # syscall number for write
+    syscall
+
+    # Print newline
+    movq $1, %rdi     # fd = stdout
+    leaq .newline(%rip), %rsi  # newline string
+    movq $1, %rdx     # count = 1
+    movq $1, %rax     # syscall number for write
+    syscall
+
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.section .rodata
+.newline:
+    .byte 10  # newline character
+.STR0:    .string "FAIL: basic for-each"
+.STR1:    .string "FAIL: for-each empty"
+.STR2:    .string "FAIL: nested for-each"
+.STR3:    .string "FAIL: for-each with created list"
+.STR4:    .string "FAIL: for-each external variable"
+.STR5:    .string "PASS: All for-each tests"
+.text
+.globl main
+
+
+.globl main
+main:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    call list_create
+    pushq %rax  # Save list pointer
+    movq $1, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    movq $2, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    movq $3, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    movq $4, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    movq $5, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    popq %rax  # List pointer as result
+    movq %rax, -8(%rbp)
+    movq $0, %rax
+    movq %rax, -16(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq %rax, %rdi
+    call list_length
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+.L1:
+    movq (%rsp), %rax
+    movq 8(%rsp), %rcx
+    cmpq %rcx, %rax
+    jge .L2
+    movq 16(%rsp), %rdi
+    movq (%rsp), %rsi
+    call list_get
+    movq %rax, -24(%rbp)
+    movq -16(%rbp), %rax
+    addq -24(%rbp), %rax
+    pushq %rax
+    leaq -16(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq (%rsp), %rax
+    addq $1, %rax
+    movq %rax, (%rsp)
+    jmp .L1
+.L2:
+    addq $24, %rsp
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $15, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L11
+    leaq .STR0(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L12
+.L11:
+.L12:
+    call list_create
+    movq %rax, -32(%rbp)
+    movq $0, %rax
+    movq %rax, -40(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq %rax, %rdi
+    call list_length
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+.L21:
+    movq (%rsp), %rax
+    movq 8(%rsp), %rcx
+    cmpq %rcx, %rax
+    jge .L22
+    movq 16(%rsp), %rdi
+    movq (%rsp), %rsi
+    call list_get
+    movq %rax, -48(%rbp)
+    movq -40(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq (%rsp), %rax
+    addq $1, %rax
+    movq %rax, (%rsp)
+    jmp .L21
+.L22:
+    addq $24, %rsp
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L31
+    leaq .STR1(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L32
+.L31:
+.L32:
+    call list_create
+    pushq %rax  # Save list pointer
+    movq $2, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    movq $3, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    popq %rax  # List pointer as result
+    movq %rax, -56(%rbp)
+    call list_create
+    pushq %rax  # Save list pointer
+    movq $10, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    movq $20, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    popq %rax  # List pointer as result
+    movq %rax, -64(%rbp)
+    movq $0, %rax
+    movq %rax, -72(%rbp)
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq %rax, %rdi
+    call list_length
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+.L41:
+    movq (%rsp), %rax
+    movq 8(%rsp), %rcx
+    cmpq %rcx, %rax
+    jge .L42
+    movq 16(%rsp), %rdi
+    movq (%rsp), %rsi
+    call list_get
+    movq %rax, -80(%rbp)
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq %rax, %rdi
+    call list_length
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+.L51:
+    movq (%rsp), %rax
+    movq 8(%rsp), %rcx
+    cmpq %rcx, %rax
+    jge .L52
+    movq 16(%rsp), %rdi
+    movq (%rsp), %rsi
+    call list_get
+    movq %rax, -88(%rbp)
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq -88(%rbp), %rax
+    popq %rbx
+    imulq %rbx, %rax
+    popq %rbx
+    addq %rbx, %rax
+    pushq %rax
+    leaq -72(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq (%rsp), %rax
+    addq $1, %rax
+    movq %rax, (%rsp)
+    jmp .L51
+.L52:
+    addq $24, %rsp
+    movq (%rsp), %rax
+    addq $1, %rax
+    movq %rax, (%rsp)
+    jmp .L41
+.L42:
+    addq $24, %rsp
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq $150, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L61
+    leaq .STR2(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L62
+.L61:
+.L62:
+    call list_create
+    movq %rax, -96(%rbp)
+    movq $7, %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call list_append
+    movq $8, %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call list_append
+    movq $9, %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call list_append
+    movq $0, %rax
+    movq %rax, -104(%rbp)
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq %rax, %rdi
+    call list_length
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+.L71:
+    movq (%rsp), %rax
+    movq 8(%rsp), %rcx
+    cmpq %rcx, %rax
+    jge .L72
+    movq 16(%rsp), %rdi
+    movq (%rsp), %rsi
+    call list_get
+    movq %rax, -112(%rbp)
+    movq -104(%rbp), %rax
+    addq -112(%rbp), %rax
+    pushq %rax
+    leaq -104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq (%rsp), %rax
+    addq $1, %rax
+    movq %rax, (%rsp)
+    jmp .L71
+.L72:
+    addq $24, %rsp
+    movq -104(%rbp), %rax
+    pushq %rax
+    movq $24, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L81
+    leaq .STR3(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L82
+.L81:
+.L82:
+    movq $1, %rax
+    movq %rax, -120(%rbp)
+    call list_create
+    pushq %rax  # Save list pointer
+    movq $2, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    movq $3, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    movq $4, %rax
+    pushq %rax  # Save element value
+    movq 8(%rsp), %rdi  # Load list pointer
+    movq (%rsp), %rsi   # Load element value
+    call list_append
+    popq %rax  # Clean up element value
+    popq %rax  # List pointer as result
+    movq %rax, -128(%rbp)
+    movq -128(%rbp), %rax
+    pushq %rax
+    movq %rax, %rdi
+    call list_length
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+.L91:
+    movq (%rsp), %rax
+    movq 8(%rsp), %rcx
+    cmpq %rcx, %rax
+    jge .L92
+    movq 16(%rsp), %rdi
+    movq (%rsp), %rsi
+    call list_get
+    movq %rax, -136(%rbp)
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq -136(%rbp), %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -120(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq (%rsp), %rax
+    addq $1, %rax
+    movq %rax, (%rsp)
+    jmp .L91
+.L92:
+    addq $24, %rsp
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $24, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L101
+    leaq .STR4(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L102
+.L101:
+.L102:
+    leaq .STR5(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+.section .note.GNU-stack
