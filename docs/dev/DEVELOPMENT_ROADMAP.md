@@ -32,15 +32,19 @@ Before starting standard library development in v0.1.0, these features are **ABS
 | **v0.0.7.5** | Self-hosting compiler (C bootstrap) | ✅ **COMPLETE** |
 | **v0.0.8** | Core Language Complete (inline asm, imports, for loops, bitwise) | ✅ **COMPLETE**
 | **v0.0.8.1** | Struct Construction & Field Access Syntax | ✅ **IN PROGRESS**
-| **v0.0.8.2** | Collections (Lists, Dictionaries, Sets) + For Each Loops | 🔄 Planned |
-| **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | 📋 Planned |
+| **v0.0.8.2** | Collections (Lists, Dictionaries, Sets) + For Each Loops | ✅ Planned |
+| **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | 🔄 Planned |
 | **v0.0.8.4** | Lambda Expressions + Type Inference | 📋 Planned |
 | **v0.0.8.5** | String Interpolation, Ternary Operator | 📋 Planned |
 | **v0.0.8.6** | Advanced Types Phase 1: Range Constraints + Float/Float64 | 📋 Planned |
 | **v0.0.8.7** | Advanced Types Phase 2: Wire Format Types (Integer16/32) + FFI Types | 📋 Planned |
+| **v0.0.8.8** | FFI & C Interop - External Library Bindings | 📋 Planned |
 | **v0.0.9** | Error Handling, Generics, Native Object Writer & Pure Runa Runtime | 📋 Planned |
 | **v0.1.0** | Beta Release - Toolchain Independence + Stdlib Foundation | 🎯 Milestone |
 | **v0.2.0** | Standard Library Expansion + Triple Syntax (--canon/--developer/--viewer) | 📋 Planned |
+| **v0.2.1** | HTTP/Network Library & REST API Support | 📋 Planned |
+| **v0.2.2** | JSON/XML Parsing & Serialization | 📋 Planned |
+| **v0.2.3** | Web Framework Foundation (HTTP Server, Routing, Middleware) | 📋 Planned |
 | **v0.3.0** | Debugging Tools & Dev Experience Improvements | 📋 Planned |
 | **v0.4.0** | Memory Management & Safety Features (Ownership, Lifetimes) | 📋 Planned |
 | **v0.5.0** | Optimization Passes (Basic - Constant Folding, DCE, Inlining) | 📋 Planned |
@@ -67,54 +71,6 @@ Before starting standard library development in v0.1.0, these features are **ABS
 
 ---
 
-# 🔹 v0.0.8.2: Collections & For Each Loops
-
-**Goal:** Implement essential collection types (Lists, Dictionaries, Sets) and natural iteration syntax.
-
-**Priority:** HIGH - Required for stdlib and natural data structure usage.
-
-## What Belongs Where:
-
-### COMPILER (Parser/Codegen):
-- ❌ **List literals (canonical)**: `Let numbers be list containing 1, 2, 3, 4, 5`
-  - Parser: Recognize `list containing EXPR, EXPR, ...`
-  - Codegen: Generate list_create() + list_append() for each element
-- ❌ **Set literals (canonical)**: `Let unique be set containing 1, 2, 3`
-  - Parser: Recognize `set containing EXPR, EXPR, ...`
-  - Codegen: Generate set_create() + set_add() for each element
-- ❌ **Dictionary literals (canonical)**:
-  ```runa
-  Let config be dictionary with:
-      "width" as 800
-      "height" as 600
-  ```
-  - Parser: Recognize `dictionary with: KEY as VALUE` (indented pairs)
-  - Codegen: Generate dict_create() + dict_set() for each pair
-- ❌ **For each loops**: `For each item in items: ... End For`
-  - Parser: Recognize `For each IDENTIFIER in EXPRESSION:`
-  - Codegen: Generate iterator pattern with list_length/list_get
-
-### RUNTIME (Implemented in Runa, compiled with runtime):
-- ❌ List operations: `list_create`, `list_append`, `list_insert`, `list_remove`, `list_get`, `list_set`, `list_length`
-- ❌ Dictionary operations: `dict_create`, `dict_set`, `dict_get`, `dict_has`, `dict_keys`, `dict_values`
-- ❌ Set operations: `set_create`, `set_add`, `set_contains`, `set_remove`, `set_union`, `set_intersection`
-
-## Success Criteria:
-- ✅ Canonical list syntax works: `list containing 1, 2, 3`
-- ✅ Canonical set syntax works: `set containing 1, 2, 3`
-- ✅ Canonical dictionary syntax works (indented key-value pairs)
-- ✅ For each loops work with lists, sets, and dictionaries
-- ✅ All collection operations implemented and tested
-- ✅ Memory management (no leaks)
-- ✅ Nested collections work: `list containing list containing 1, 2`
-- ✅ Tests for all collection types
-
-**Note:** Array literal syntax (`[1, 2, 3]`) is deferred to v0.2.0 as part of developer mode syntax.
-
-## Timeline: TBD
-
----
-
 # 🔹 v0.0.8.3: Match/Pattern Matching & ADT/Variant Construction
 
 **Goal:** Implement pattern matching and algebraic data types (sum types/variants) - enables proper type-safe data modeling.
@@ -134,8 +90,8 @@ Before starting standard library development in v0.1.0, these features are **ABS
   ```
   - Parser: Recognize `Type NAME is: | Variant | Variant ...`
   - Type system: Store variant names and their fields
-- ❌ **Variant construction**: `Let circle be Shape.Circle with radius as 5.0`
-  - Parser: Recognize `TypeName.VariantName with field as value`
+- ❌ **Variant construction**: `Let circle be Shape of Circle with radius as 5.0`
+  - Parser: Recognize `TypeName of VariantName with field as value`
   - Codegen: Generate tagged union with discriminator + field storage
 - ❌ **Match statement**: `Match value: When pattern: ... End Match`
   - Parser: Recognize `Match EXPR: When PATTERN: BLOCK ...`
@@ -301,6 +257,128 @@ Let x as Integer be 42
 - ✅ Character literals work: `'a'`, `'\n'`, `'\t'`, etc.
 - ✅ Character type operations work
 - ✅ All features tested
+
+## Timeline: TBD
+
+---
+
+# 🔹 v0.0.8.8: FFI & C Interop - External Library Bindings
+
+**Goal:** Enable Runa programs to call C libraries and external functions, allowing integration with existing ecosystems.
+
+**Priority:** HIGH - Required for real-world applications that need system libraries, graphics, databases, etc.
+
+## What Belongs Where:
+
+### COMPILER (Parser/Codegen):
+- ❌ **External function declarations**:
+  ```runa
+  External Process called "printf" takes format as Pointer returns Integer
+  External Process called "malloc" takes size as Integer returns Pointer
+  ```
+  - Parser: Recognize `External Process` declarations (no body)
+  - Codegen: Generate external symbol references (no definition)
+
+- ❌ **Calling convention support**:
+  - System V AMD64 ABI (Linux/macOS)
+  - Proper stack alignment (16-byte boundary)
+  - Register usage (rdi, rsi, rdx, rcx, r8, r9)
+
+- ❌ **Library linking directives**:
+  ```runa
+  Link Library "libm.so"
+  Link Library "libpthread.so"
+  ```
+  - Parser: Recognize `Link Library` directives
+  - Codegen: Generate appropriate linker flags
+
+- ❌ **Structure packing/alignment control**:
+  ```runa
+  Type called "CStruct" with alignment 8:
+      field1 as Integer
+      field2 as Pointer
+  End Type
+  ```
+  - Required for ABI compatibility with C structs
+
+### RUNTIME:
+- ❌ **Dynamic library loading**: `dlopen()`, `dlsym()`, `dlclose()` wrappers
+- ❌ **FFI type conversions**: Runa types ↔ C types
+- ❌ **Error handling for FFI calls**: Capture errno, handle NULL returns
+
+### TYPE SYSTEM:
+- ❌ **C-compatible types** (from v0.0.8.7):
+  - `Integer8`, `Integer16`, `Integer32`, `Integer64`
+  - `UnsignedInteger8`, `UnsignedInteger16`, `UnsignedInteger32`, `UnsignedInteger64`
+  - `Pointer` (void*)
+  - `CString` (char*)
+
+## Implementation Examples:
+
+**Calling libc functions:**
+```runa
+Note: Declare external C functions
+External Process called "printf" takes format as CString returns Integer
+External Process called "strlen" takes str as CString returns Integer
+
+Process called "main" returns Integer:
+    Let message be "Hello from Runa!"
+    printf("Message length: %d\n", strlen(message))
+    Return 0
+End Process
+```
+
+**Using external libraries (e.g., SQLite):**
+```runa
+Link Library "libsqlite3.so"
+
+External Process called "sqlite3_open" takes filename as CString, db as Pointer returns Integer
+External Process called "sqlite3_close" takes db as Pointer returns Integer
+External Process called "sqlite3_exec" takes db as Pointer, sql as CString, callback as Pointer, data as Pointer, errmsg as Pointer returns Integer
+
+Process called "main" returns Integer:
+    Let db be 0 as Pointer
+    Let result be sqlite3_open("test.db", $db)
+
+    If result is equal to 0:
+        Display("Database opened successfully")
+        sqlite3_close(db)
+    Otherwise:
+        Display("Failed to open database")
+    End If
+
+    Return 0
+End Process
+```
+
+**Using SDL2 for graphics:**
+```runa
+Link Library "libSDL2.so"
+
+External Process called "SDL_Init" takes flags as Integer32 returns Integer
+External Process called "SDL_CreateWindow" takes title as CString, x as Integer, y as Integer, w as Integer, h as Integer, flags as Integer32 returns Pointer
+External Process called "SDL_Quit" returns Nothing
+
+Process called "main" returns Integer:
+    SDL_Init(32)  Note: SDL_INIT_VIDEO
+    Let window be SDL_CreateWindow("Runa SDL", 100, 100, 800, 600, 0)
+    Note: Game loop would go here
+    SDL_Quit()
+    Return 0
+End Process
+```
+
+## Success Criteria:
+- ✅ Can declare and call external C functions
+- ✅ Proper calling convention (System V AMD64 ABI)
+- ✅ Can link against system libraries (libc, libm, libpthread)
+- ✅ Can link against third-party libraries (SDL2, SQLite, curl, etc.)
+- ✅ C struct layout compatibility (padding, alignment)
+- ✅ Pointer types work correctly with external functions
+- ✅ String conversion between Runa and C strings
+- ✅ No memory corruption when calling C code
+- ✅ Example programs work: SQLite database, SDL2 window, curl HTTP request
+- ✅ All tests pass including FFI integration tests
 
 ## Timeline: TBD
 
@@ -763,6 +841,423 @@ These are Runa modules (.runa files) that users import
 - ✅ Documentation showing all three syntax forms side-by-side
 - ✅ Example programs demonstrating all modes
 - ✅ Comprehensive test suite covering all syntax variations
+
+## Timeline: TBD
+
+---
+
+# 🔹 v0.2.1: HTTP/Network Library & REST API Support
+
+**Goal:** Enable Runa programs to make HTTP requests and build REST API clients.
+
+**Priority:** HIGH - Essential for modern applications that interact with web services.
+
+## What Belongs Where:
+
+### STANDARD LIBRARY MODULES:
+- ❌ **HTTP Client Module** (`stdlib/http/client.runa`)
+  - HTTP methods: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS
+  - Request builder with headers, query parameters, body
+  - Response handling (status code, headers, body)
+  - Timeout and retry configuration
+  - Connection pooling for performance
+
+- ❌ **URL Module** (`stdlib/http/url.runa`)
+  - URL parsing and building
+  - Query string encoding/decoding
+  - Path joining and normalization
+  - URL validation
+
+- ❌ **TCP/UDP Sockets Module** (`stdlib/net/socket.runa`)
+  - Low-level socket operations (wrapping syscalls)
+  - TCP client/server sockets
+  - UDP datagrams
+  - Socket options (timeout, keepalive, etc.)
+
+### RUNTIME (Low-level networking):
+- ❌ **Socket syscall wrappers**:
+  - `socket()`, `connect()`, `bind()`, `listen()`, `accept()`
+  - `send()`, `recv()`, `sendto()`, `recvfrom()`
+  - `setsockopt()`, `getsockopt()`
+  - `getaddrinfo()`, `getnameinfo()`
+
+## Implementation Examples:
+
+**Simple HTTP GET request:**
+```runa
+Import "stdlib/http/client.runa" as HTTP
+
+Process called "main" returns Integer:
+    Let response be HTTP.get("https://api.github.com/users/octocat")
+
+    Match response:
+        Success with data:
+            Display("Status: ")
+            Display(integer_to_string(data.status_code))
+            Display("Body: ")
+            Display(data.body)
+        Error with err:
+            Display("Request failed: ")
+            Display(err.message)
+    End Match
+
+    Return 0
+End Process
+```
+
+**POST request with JSON:**
+```runa
+Import "stdlib/http/client.runa" as HTTP
+Import "stdlib/json.runa" as JSON
+
+Process called "main" returns Integer:
+    Let payload be JSON.object()
+    JSON.set(payload, "name", "Alice")
+    JSON.set(payload, "email", "alice@example.com")
+
+    Let request be HTTP.request()
+    HTTP.set_url(request, "https://api.example.com/users")
+    HTTP.set_method(request, "POST")
+    HTTP.add_header(request, "Content-Type", "application/json")
+    HTTP.set_body(request, JSON.stringify(payload))
+
+    Let response be HTTP.send(request)
+
+    Match response:
+        Success with data:
+            Display("User created successfully")
+        Error with err:
+            Display("Failed to create user")
+    End Match
+
+    Return 0
+End Process
+```
+
+**TCP socket server:**
+```runa
+Import "stdlib/net/socket.runa" as Net
+
+Process called "main" returns Integer:
+    Let server be Net.tcp_server("127.0.0.1", 8080)
+
+    Match server:
+        Success with sock:
+            Display("Server listening on port 8080")
+
+            While true:
+                Let client be Net.accept(sock)
+                Match client:
+                    Success with conn:
+                        Let data be Net.recv(conn, 1024)
+                        Net.send(conn, "Hello from Runa!\n")
+                        Net.close(conn)
+                    Error with err:
+                        Display("Accept failed")
+                End Match
+            End While
+        Error with err:
+            Display("Failed to start server")
+    End Match
+
+    Return 0
+End Process
+```
+
+## Success Criteria:
+- ✅ Can make HTTP GET/POST/PUT/DELETE requests
+- ✅ Support for HTTPS (TLS/SSL via OpenSSL FFI)
+- ✅ Request/response headers work correctly
+- ✅ Query parameters and URL encoding
+- ✅ Timeout and error handling
+- ✅ TCP/UDP socket support
+- ✅ Example programs: REST API client, simple HTTP server
+- ✅ All tests pass including network integration tests
+
+## Timeline: TBD
+
+---
+
+# 🔹 v0.2.2: JSON/XML Parsing & Serialization
+
+**Goal:** Enable Runa programs to parse and generate JSON and XML data formats.
+
+**Priority:** HIGH - Required for API integration and data exchange.
+
+## What Belongs Where:
+
+### STANDARD LIBRARY MODULES:
+- ❌ **JSON Module** (`stdlib/json.runa`)
+  - JSON parsing: string → Runa data structures
+  - JSON generation: Runa data structures → string
+  - Support for objects, arrays, strings, numbers, booleans, null
+  - Pretty-printing with indentation
+  - Streaming parser for large files
+
+- ❌ **XML Module** (`stdlib/xml.runa`)
+  - XML parsing: string → DOM tree
+  - XML generation: DOM tree → string
+  - XPath-like queries
+  - Namespace support
+  - Streaming parser for large documents
+
+### TYPE SYSTEM:
+- ❌ **JSON Value Type** (Sum type):
+  ```runa
+  Type called "JsonValue":
+      Either:
+          JsonObject with fields as Dictionary of String to JsonValue
+          Or JsonArray with items as List of JsonValue
+          Or JsonString with value as String
+          Or JsonNumber with value as Float64
+          Or JsonBool with value as Boolean
+          Or JsonNull
+      End Either
+  End Type
+  ```
+
+## Implementation Examples:
+
+**Parsing JSON:**
+```runa
+Import "stdlib/json.runa" as JSON
+
+Process called "main" returns Integer:
+    Let json_text be "{\"name\":\"Alice\",\"age\":30,\"active\":true}"
+    Let parsed be JSON.parse(json_text)
+
+    Match parsed:
+        Success with json:
+            Match json:
+                JsonObject with fields:
+                    Let name be JSON.get_string(fields, "name")
+                    Let age be JSON.get_number(fields, "age")
+                    Display(name)
+                    Display(integer_to_string(age))
+            End Match
+        Error with err:
+            Display("JSON parse error")
+    End Match
+
+    Return 0
+End Process
+```
+
+**Generating JSON:**
+```runa
+Import "stdlib/json.runa" as JSON
+
+Process called "main" returns Integer:
+    Let obj be JSON.object()
+    JSON.set(obj, "name", JSON.string("Bob"))
+    JSON.set(obj, "age", JSON.number(25))
+    JSON.set(obj, "hobbies", JSON.array(
+        JSON.string("coding"),
+        JSON.string("music")
+    ))
+
+    Let json_text be JSON.stringify(obj)
+    Display(json_text)
+    Note: Output: {"name":"Bob","age":25,"hobbies":["coding","music"]}
+
+    Return 0
+End Process
+```
+
+**Parsing XML:**
+```runa
+Import "stdlib/xml.runa" as XML
+
+Process called "main" returns Integer:
+    Let xml_text be "<user><name>Alice</name><email>alice@example.com</email></user>"
+    Let parsed be XML.parse(xml_text)
+
+    Match parsed:
+        Success with doc:
+            Let root be XML.root(doc)
+            Let name be XML.find_text(root, "name")
+            Let email be XML.find_text(root, "email")
+            Display(name)
+            Display(email)
+        Error with err:
+            Display("XML parse error")
+    End Match
+
+    Return 0
+End Process
+```
+
+## Success Criteria:
+- ✅ JSON parsing handles all JSON types correctly
+- ✅ JSON generation produces valid JSON
+- ✅ Pretty-printing with configurable indentation
+- ✅ Error handling for malformed JSON
+- ✅ XML parsing handles elements, attributes, text, CDATA
+- ✅ XML generation produces valid XML
+- ✅ Streaming parsers for large files (memory efficient)
+- ✅ Example programs: API response parsing, config file reading
+- ✅ All tests pass including edge cases
+
+## Timeline: TBD
+
+---
+
+# 🔹 v0.2.3: Web Framework Foundation (HTTP Server, Routing, Middleware)
+
+**Goal:** Enable Runa programs to build web servers and REST APIs.
+
+**Priority:** MEDIUM - Useful for building web services and APIs in Runa.
+
+## What Belongs Where:
+
+### STANDARD LIBRARY MODULES:
+- ❌ **HTTP Server Module** (`stdlib/http/server.runa`)
+  - HTTP server implementation (using socket module from v0.2.1)
+  - Request parsing (method, path, headers, query, body)
+  - Response building (status, headers, body)
+  - Keep-alive connection handling
+  - Chunked transfer encoding
+
+- ❌ **Router Module** (`stdlib/http/router.runa`)
+  - Route matching (exact, prefix, regex patterns)
+  - Path parameters: `/users/:id` → `{id: "123"}`
+  - HTTP method routing (GET, POST, PUT, DELETE)
+  - Route groups and nesting
+  - Middleware chaining
+
+- ❌ **Middleware Module** (`stdlib/http/middleware.runa`)
+  - CORS headers
+  - Request logging
+  - Static file serving
+  - Request/response compression (gzip)
+  - Authentication helpers
+  - Rate limiting
+
+### FRAMEWORK DESIGN:
+```runa
+Import "stdlib/http/server.runa" as Server
+Import "stdlib/http/router.runa" as Router
+
+Process called "main" returns Integer:
+    Let router be Router.create()
+
+    Note: Define routes
+    Router.get(router, "/", handler_home)
+    Router.get(router, "/users/:id", handler_get_user)
+    Router.post(router, "/users", handler_create_user)
+
+    Note: Add middleware
+    Router.use(router, middleware_logger)
+    Router.use(router, middleware_cors)
+
+    Note: Start server
+    Let server be Server.create("0.0.0.0", 8080, router)
+    Server.start(server)
+
+    Return 0
+End Process
+
+Process called "handler_home" takes req as Request, res as Response:
+    Response.send(res, 200, "Welcome to Runa Web!")
+End Process
+
+Process called "handler_get_user" takes req as Request, res as Response:
+    Let user_id be Request.param(req, "id")
+    Note: Fetch user from database...
+    Response.json(res, 200, user_data)
+End Process
+
+Process called "middleware_logger" takes req as Request, res as Response, next as Function:
+    Display("Request: ")
+    Display(Request.method(req))
+    Display(" ")
+    Display(Request.path(req))
+    next(req, res)  Note: Continue to next middleware
+End Process
+```
+
+## Implementation Examples:
+
+**Simple REST API:**
+```runa
+Import "stdlib/http/server.runa" as Server
+Import "stdlib/http/router.runa" as Router
+Import "stdlib/json.runa" as JSON
+
+Process called "main" returns Integer:
+    Let router be Router.create()
+
+    Router.get(router, "/api/status", $handler_status)
+    Router.get(router, "/api/users", $handler_list_users)
+    Router.post(router, "/api/users", $handler_create_user)
+
+    Let server be Server.create("0.0.0.0", 3000, router)
+    Display("Server listening on http://localhost:3000")
+    Server.start(server)
+
+    Return 0
+End Process
+
+Process called "handler_status" takes req as Request, res as Response:
+    Let status be JSON.object()
+    JSON.set(status, "status", JSON.string("ok"))
+    JSON.set(status, "version", JSON.string("1.0.0"))
+    Response.json(res, 200, status)
+End Process
+
+Process called "handler_list_users" takes req as Request, res as Response:
+    Let users be JSON.array(
+        JSON.object_with("id", 1, "name", "Alice"),
+        JSON.object_with("id", 2, "name", "Bob")
+    )
+    Response.json(res, 200, users)
+End Process
+
+Process called "handler_create_user" takes req as Request, res as Response:
+    Let body be Request.json(req)
+    Match body:
+        Success with data:
+            Note: Validate and save user...
+            Response.json(res, 201, data)
+        Error with err:
+            Response.json(res, 400, JSON.object_with("error", "Invalid JSON"))
+    End Match
+End Process
+```
+
+**Static file server:**
+```runa
+Import "stdlib/http/server.runa" as Server
+Import "stdlib/http/router.runa" as Router
+Import "stdlib/http/middleware.runa" as Middleware
+
+Process called "main" returns Integer:
+    Let router be Router.create()
+
+    Note: Serve static files from ./public directory
+    Router.use(router, Middleware.static_files("./public"))
+
+    Note: API routes
+    Router.get(router, "/api/hello", $handler_hello)
+
+    Let server be Server.create("0.0.0.0", 8080, router)
+    Server.start(server)
+
+    Return 0
+End Process
+```
+
+## Success Criteria:
+- ✅ HTTP server can handle concurrent connections
+- ✅ Request parsing works for all HTTP methods
+- ✅ Response building with status codes and headers
+- ✅ Route matching with path parameters
+- ✅ Middleware chain execution
+- ✅ Static file serving with MIME types
+- ✅ JSON request/response handling
+- ✅ Example programs: REST API, static site server, webhook receiver
+- ✅ Performance: Handle 1000+ requests/second
+- ✅ All tests pass including stress tests
 
 ## Timeline: TBD
 

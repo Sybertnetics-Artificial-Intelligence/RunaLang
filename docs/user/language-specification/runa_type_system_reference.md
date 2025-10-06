@@ -322,6 +322,33 @@ Type ConnectionState is:
     | Error with code as Integer and message as String
 ```
 
+#### Variant Construction
+
+Variants are constructed by calling the variant name directly as a constructor:
+
+```runa
+Note: Variant with fields
+Let circle be Circle with radius as 5.0
+Let rect be Rectangle with width as 10.0 and height as 20.0
+
+Note: Variant without fields
+Let disconnected be Disconnected
+
+Note: Generic variant construction
+Let success be Success with value as 42
+Let failure be Failure with error as "Invalid input"
+
+Note: Nested variant construction
+Let connection be Connected with session_id as "abc123" and start_time as 1234567890
+```
+
+The construction syntax follows the same pattern as the variant definition:
+- Variant name acts as the constructor
+- `with` keyword introduces field assignments (if fields exist)
+- Field names use `as` for value assignment
+- Multiple fields are separated by `and`
+- Fieldless variants are constructed by name alone
+
 ### Enumeration Types
 
 ```runa
@@ -595,7 +622,9 @@ Note:   Set name to (42 to string)
 Pattern matching integrates deeply with the type system:
 
 ```runa
-Type Result[T] is Success with value as T OR Failure with error as String
+Type Result[T] is:
+    | Success with value as T
+    | Failure with error as String
 
 Process called "handle_result"[T] that takes result as Result[T] returns String:
     Match result:
@@ -605,6 +634,13 @@ Process called "handle_result"[T] that takes result as Result[T] returns String:
         When Failure with error as e:
             Note: e has type String here
             Return "Error: " joined with e
+
+Note: Construction and matching example
+Let my_result be Success with value as 42
+Let message be handle_result with result as my_result  Note: Returns "Success: 42"
+
+Let error_result be Failure with error as "Connection timeout"
+Let error_message be handle_result with result as error_result  Note: Returns "Error: Connection timeout"
 ```
 
 ### Exhaustiveness Checking

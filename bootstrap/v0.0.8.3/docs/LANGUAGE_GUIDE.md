@@ -1,6 +1,6 @@
-# Runa Language Guide (v0.0.8.2)
+# Runa Language Guide (v0.0.8.3)
 
-This guide documents the Runa programming language syntax and features as implemented in v0.0.8.2. All examples are taken from actual working test files.
+This guide documents the Runa programming language syntax and features as implemented in v0.0.8.3. All examples are taken from actual working test files.
 
 ## Table of Contents
 1. [Program Structure](#program-structure)
@@ -15,8 +15,11 @@ This guide documents the Runa programming language syntax and features as implem
    - [Lists](#lists)
    - [Sets](#sets)
    - [Dictionaries](#dictionaries)
-10. [Inline Assembly](#inline-assembly)
-11. [Imports](#imports)
+10. [Algebraic Data Types (ADTs)](#algebraic-data-types-adts)
+   - [Variant Types](#variant-types)
+   - [Pattern Matching](#pattern-matching)
+11. [Inline Assembly](#inline-assembly)
+12. [Imports](#imports)
 
 ---
 
@@ -653,7 +656,7 @@ See [Collections](#collections) section for complete list, set, and dictionary o
 
 ## Language Features Summary
 
-✅ **Implemented in v0.0.8.2:**
+✅ **Implemented in v0.0.8.3:**
 - Variables with type inference
 - Integers and booleans
 - Arithmetic, comparison, logical, and bitwise operators
@@ -666,6 +669,12 @@ See [Collections](#collections) section for complete list, set, and dictionary o
   - **Dictionaries** with literals (`dictionary with:`) and runtime operations
 - For-each loops over collections
 - Context-aware collection keywords
+- **Algebraic Data Types (ADTs):**
+  - **Variant types** with multiple constructors
+  - **Pattern matching** with `Match`/`When` statements
+  - **Field extraction** from variant patterns
+  - **Wildcard patterns** (`_`) for catch-all cases
+  - **Recursive ADTs** (lists, trees, etc.)
 - Inline assembly
 - Multi-file imports
 - Break/Continue statements
@@ -677,7 +686,7 @@ See [Collections](#collections) section for complete list, set, and dictionary o
 - Floating-point numbers
 - Generic types
 - Error handling
-- Pattern matching
+- Advanced pattern matching (literals, guards)
 
 ---
 
@@ -829,6 +838,278 @@ Process called "main" returns Integer:
 End Process
 ```
 
+## 10. Algebraic Data Types (ADTs)
+
+### Variant Types
+
+ADTs (also known as sum types or tagged unions) allow you to define types that can be one of several variants. Each variant can have its own set of fields.
+
+**Basic Syntax:**
+```runa
+Type TypeName is:
+    | Variant1
+    | Variant2 with field1 as Integer
+    | Variant3 with field1 as Integer and field2 as Integer
+End Type
+```
+
+**Example - Option Type:**
+```runa
+Type Option is:
+    | Some with value as Integer
+    | None
+End Type
+```
+
+**Example - Shape Type:**
+```runa
+Type Shape is:
+    | Circle with radius as Integer
+    | Rectangle with width as Integer and height as Integer
+    | Triangle with base as Integer and height as Integer
+End Type
+```
+
+**Constructing Variants:**
+
+Variants without fields:
+```runa
+Let x be a None with
+```
+
+Variants with a single field:
+```runa
+Let x be a Some with value as 42
+Let circle be a Circle with radius as 5
+```
+
+Variants with multiple fields:
+```runa
+Let rect be a Rectangle with width as 10 and height as 20
+Let tri be a Triangle with base as 8 and height as 6
+```
+
+### Pattern Matching
+
+Use `Match` statements to discriminate between variants and extract their fields.
+
+**Basic Syntax:**
+```runa
+Match value:
+    When Variant1:
+        Note: Handle variant without fields
+    When Variant2 with field1 as x:
+        Note: Extract and use field
+    When Variant3 with field1 as a and field2 as b:
+        Note: Extract multiple fields
+    When _:
+        Note: Wildcard catches all other cases
+End Match
+```
+
+**Example - Option Type:**
+```runa
+Process called "get_or_default" takes opt as Integer, default as Integer returns Integer:
+    Let result be 0
+
+    Match opt:
+        When Some with value as v:
+            Set result to v
+        When None:
+            Set result to default
+    End Match
+
+    Return result
+End Process
+
+Process called "main" returns Integer:
+    Let x be a Some with value as 42
+    Let value be get_or_default(x, 0)
+    Display(integer_to_string(value))  Note: Prints 42
+
+    Let y be a None with
+    Let default_value be get_or_default(y, 100)
+    Display(integer_to_string(default_value))  Note: Prints 100
+
+    Return 0
+End Process
+```
+
+**Example - Shape Area Calculation:**
+```runa
+Process called "area" takes shape as Integer returns Integer:
+    Let result be 0
+
+    Match shape:
+        When Circle with radius as r:
+            Set result to r multiplied by r multiplied by 3
+        When Rectangle with width as w and height as h:
+            Set result to w multiplied by h
+        When Triangle with base as b and height as h:
+            Set result to b multiplied by h divided by 2
+    End Match
+
+    Return result
+End Process
+
+Process called "main" returns Integer:
+    Let circle be a Circle with radius as 5
+    Let circle_area be area(circle)
+    Display(integer_to_string(circle_area))  Note: Prints 75
+
+    Let rect be a Rectangle with width as 10 and height as 20
+    Let rect_area be area(rect)
+    Display(integer_to_string(rect_area))  Note: Prints 200
+
+    Return 0
+End Process
+```
+
+**Wildcard Patterns:**
+
+The wildcard pattern `_` matches any variant and is useful for default cases:
+
+```runa
+Process called "is_some" takes opt as Integer returns Integer:
+    Let result be 0
+
+    Match opt:
+        When Some with value as v:
+            Set result to 1
+        When _:
+            Set result to 0
+    End Match
+
+    Return result
+End Process
+```
+
+**Recursive ADTs:**
+
+ADTs can reference themselves, enabling recursive data structures:
+
+```runa
+Type List is:
+    | Cons with head as Integer and tail as Integer
+    | Nil
+End Type
+
+Process called "sum_list" takes list as Integer returns Integer:
+    Let result be 0
+
+    Match list:
+        When Cons with head as h and tail as t:
+            Let tail_sum be sum_list(t)
+            Set result to h plus tail_sum
+        When Nil:
+            Set result to 0
+        When _:
+            Set result to 0
+    End Match
+
+    Return result
+End Process
+
+Process called "main" returns Integer:
+    Note: Build list [1, 2, 3]
+    Let nil be a Nil with
+    Let list3 be a Cons with head as 3 and tail as nil
+    Let list2 be a Cons with head as 2 and tail as list3
+    Let list1 be a Cons with head as 1 and tail as list2
+
+    Let total be sum_list(list1)
+    Display(integer_to_string(total))  Note: Prints 6
+
+    Return 0
+End Process
+```
+
+**Binary Tree Example:**
+```runa
+Type BinaryTree is:
+    | Leaf with value as Integer
+    | Node with value as Integer and left as Integer and right as Integer
+End Type
+
+Process called "tree_sum" takes tree as Integer returns Integer:
+    Let result be 0
+
+    Match tree:
+        When Leaf with value as v:
+            Set result to v
+        When Node with value as v and left as l and right as r:
+            Let left_sum be tree_sum(l)
+            Let right_sum be tree_sum(r)
+            Set result to v plus left_sum plus right_sum
+        When _:
+            Set result to 0
+    End Match
+
+    Return result
+End Process
+
+Process called "main" returns Integer:
+    Note: Build tree with root=1, left=Node(5, Leaf(10), Leaf(20)), right=Leaf(30)
+    Let leaf1 be a Leaf with value as 10
+    Let leaf2 be a Leaf with value as 20
+    Let leaf3 be a Leaf with value as 30
+    Let node1 be a Node with value as 5 and left as leaf1 and right as leaf2
+    Let root be a Node with value as 1 and left as node1 and right as leaf3
+
+    Let total be tree_sum(root)
+    Display(integer_to_string(total))  Note: Prints 66 (1+5+10+20+30)
+
+    Return 0
+End Process
+```
+
+**Expression Evaluator Example:**
+```runa
+Type Expression is:
+    | Number with value as Integer
+    | Add with left as Integer and right as Integer
+    | Multiply with left as Integer and right as Integer
+End Type
+
+Process called "eval_expr" takes expr as Integer returns Integer:
+    Let result be 0
+
+    Match expr:
+        When Number with value as v:
+            Set result to v
+        When Add with left as l and right as r:
+            Let left_val be eval_expr(l)
+            Let right_val be eval_expr(r)
+            Set result to left_val plus right_val
+        When Multiply with left as l and right as r:
+            Let left_val be eval_expr(l)
+            Let right_val be eval_expr(r)
+            Set result to left_val multiplied by right_val
+        When _:
+            Set result to 0
+    End Match
+
+    Return result
+End Process
+
+Process called "main" returns Integer:
+    Note: Evaluate (2 + 3) * 4 = 20
+    Let num2 be a Number with value as 2
+    Let num3 be a Number with value as 3
+    Let num4 be a Number with value as 4
+
+    Let add2_3 be a Add with left as num2 and right as num3
+    Let result_expr be a Multiply with left as add2_3 and right as num4
+
+    Let result be eval_expr(result_expr)
+    Display(integer_to_string(result))  Note: Prints 20
+
+    Return 0
+End Process
+```
+
+## 11. Inline Assembly
+
 ---
 
-This guide covers all implemented features in v0.0.8.2. For compiler usage instructions, see [GETTING_STARTED.md](GETTING_STARTED.md).
+This guide covers all implemented features in v0.0.8.3. For compiler usage instructions, see [GETTING_STARTED.md](GETTING_STARTED.md).
