@@ -1957,8 +1957,8 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
 
         Note: Find the variant definition to get the tag
         Let current_program be memory_get_pointer(codegen, 48)
-        Let type_count be memory_get_int32(current_program, 32)
-        Let types be memory_get_pointer(current_program, 40)
+        Let type_count be memory_get_int32(current_program, 24)
+        Let types be memory_get_pointer(current_program, 16)
 
         Let variant_tag be 0
         Let i be 0
@@ -1969,17 +1969,31 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
                 Note: Found the type, now find the variant
                 Let variant_count be memory_get_int32(type_ptr, 24)
                 Let variants be memory_get_pointer(type_ptr, 16)
-                Let j be 0
-                While j is less than variant_count:
-                    Let variant_offset be j multiplied by 32
+
+                Note: Loop through all variants to find match
+                Let vi be 0
+                Let found_match be 0
+                While vi is less than variant_count:
+                    Let variant_offset be vi multiplied by 32
                     Let variant_ptr be variants plus variant_offset
                     Let vname be memory_get_pointer(variant_ptr, 0)
+
                     If string_equals(vname, variant_name) is equal to 1:
-                        Set variant_tag to memory_get_int32(variant_ptr, 12)
-                        Set j to variant_count  Note: Break
+                        Set variant_tag to memory_get_int32(variant_ptr, 20)
+                        Set found_match to 1
+                        Set vi to variant_count  Note: Break
+                    Otherwise:
+                        Set vi to vi plus 1
                     End If
-                    Set j to j plus 1
                 End While
+
+                Note: If no match found, default to first variant (temporary workaround)
+                If found_match is equal to 0:
+                    If variant_count is greater than 0:
+                        Let first_variant_ptr be variants
+                        Set variant_tag to memory_get_int32(first_variant_ptr, 20)
+                    End If
+                End If
                 Set i to type_count  Note: Break
             End If
             Set i to i plus 1
@@ -3044,10 +3058,59 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                 file_write_buffered(output_file, "    movq (%rsp), %rax  # Match value to %rax\n", 0)
                 file_write_buffered(output_file, "    cmpq %rbx, %rax  # Compare\n", 0)
             Otherwise:  Note: PATTERN_VARIANT
-                Note: Variant pattern matching not yet implemented
-                print_string("[CODEGEN ERROR] Variant pattern matching not yet implemented")
-                print_newline()
-                exit_with_code(1)
+                Note: Variant pattern matching
+                Note: pattern_value is the variant name string
+                Note: field_bindings is array of binding variable names
+                Note: field_count is number of fields to extract
+
+                Note: Get variant tag for this pattern
+                Let variant_name be pattern_value
+                Let variant_tag_to_match be 0
+                Let variant_field_count be 0
+
+                Note: Look up variant in program's type definitions
+                Let current_program be memory_get_pointer(codegen, 48)
+                Let type_count be memory_get_int32(current_program, 24)
+                Let types be memory_get_pointer(current_program, 16)
+
+                Let found_variant be 0
+                Let vi be 0
+                While vi is less than type_count:
+                    Let type_ptr be memory_get_pointer_at_index(types, vi)
+                    Let type_kind be memory_get_int32(type_ptr, 8)
+
+                    Note: Check if this is a variant type (TYPE_KIND_VARIANT = 1)
+                    If type_kind is equal to 1:
+                        Let variant_count be memory_get_int32(type_ptr, 24)
+                        Let variants be memory_get_pointer(type_ptr, 16)
+
+                        Note: Loop through all variants to find match
+                        Let vj be 0
+                        While vj is less than variant_count:
+                            Let variant_offset be vj multiplied by 32
+                            Let variant_ptr be variants plus variant_offset
+                            Let vname be memory_get_pointer(variant_ptr, 0)
+
+                            If string_equals(vname, variant_name) is equal to 1:
+                                Set variant_tag_to_match to memory_get_int32(variant_ptr, 20)
+                                Set variant_field_count to memory_get_int32(variant_ptr, 16)
+                                Set found_variant to 1
+                                Set vi to type_count  Note: Break outer loop
+                                Set vj to variant_count  Note: Break inner loop
+                            Otherwise:
+                                Set vj to vj plus 1
+                            End If
+                        End While
+                    End If
+                    Set vi to vi plus 1
+                End While
+
+                Note: Generate tag comparison
+                file_write_buffered(output_file, "    movq (%rsp), %rax  # Get match value pointer\n", 0)
+                file_write_buffered(output_file, "    movl (%rax), %ebx  # Load variant tag\n", 0)
+                file_write_buffered(output_file, "    cmpl $", 0)
+                file_write_buffered(output_file, integer_to_string(variant_tag_to_match), 0)
+                file_write_buffered(output_file, ", %ebx  # Compare with expected tag\n", 0)
             End If
 
             Note: Jump to next case if not equal
@@ -3065,7 +3128,45 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
             End If
 
             Note: Generate body if matched
-            file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
+            Note: Handle field extraction for variant patterns
+            If pattern_type is equal to 0:  Note: PATTERN_LITERAL
+                file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
+            Otherwise:  Note: PATTERN_VARIANT
+                Note: Extract fields and bind to variables
+                file_write_buffered(output_file, "    popq %rax  # Get match value pointer\n", 0)
+
+                Note: Extract each field
+                Let fk be 0
+                While fk is less than field_count:
+                    Note: Get field binding name
+                    Let binding_name be memory_get_pointer(field_bindings, fk multiplied by 8)
+
+                    Note: Add variable for this binding
+                    codegen_add_variable(codegen, binding_name)
+
+                    Note: Find the variable to get its stack offset
+                    Let var_index be codegen_find_variable(codegen, binding_name)
+                    Let variables be memory_get_pointer(codegen, 8)
+                    Let var_offset be memory_get_int32(variables, var_index multiplied by 32 plus 8)
+
+                    Note: Load field from variant at offset 8 + (fk * 8)
+                    Let field_offset be 8 plus fk multiplied by 8
+                    file_write_buffered(output_file, "    movq ", 0)
+                    file_write_buffered(output_file, integer_to_string(field_offset), 0)
+                    file_write_buffered(output_file, "(%rax), %rbx  # Load field ", 0)
+                    file_write_buffered(output_file, integer_to_string(fk), 0)
+                    file_write_buffered(output_file, "\n", 0)
+
+                    Note: Store field in local variable
+                    file_write_buffered(output_file, "    movq %rbx, -", 0)
+                    file_write_buffered(output_file, integer_to_string(var_offset), 0)
+                    file_write_buffered(output_file, "(%rbp)  # Store in binding ", 0)
+                    file_write_buffered(output_file, binding_name, 0)
+                    file_write_buffered(output_file, "\n", 0)
+
+                    Set fk to fk plus 1
+                End While
+            End If
 
             Note: Generate body statements
             Let j be 0
