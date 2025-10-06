@@ -5897,20 +5897,29 @@ program_add_function:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -56(%rbp)
-    movq -16(%rbp), %rax
-    pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -80(%rbp)
     movq -56(%rbp), %rax
+    addq -80(%rbp), %rax
+    movq %rax, -88(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
-    call memory_set_pointer_at_index@PLT
+    call memory_set_pointer@PLT
     movq -24(%rbp), %rax
     addq $1, %rax
-    movq %rax, -80(%rbp)
-    movq -80(%rbp), %rax
+    movq %rax, -96(%rbp)
+    movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
@@ -6039,20 +6048,29 @@ program_add_global:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -56(%rbp)
-    movq -16(%rbp), %rax
-    pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -80(%rbp)
     movq -56(%rbp), %rax
+    addq -80(%rbp), %rax
+    movq %rax, -88(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
-    call memory_set_pointer_at_index@PLT
+    call memory_set_pointer@PLT
     movq -24(%rbp), %rax
     addq $1, %rax
-    movq %rax, -80(%rbp)
-    movq -80(%rbp), %rax
+    movq %rax, -96(%rbp)
+    movq -96(%rbp), %rax
     pushq %rax
     movq $56, %rax
     pushq %rax
@@ -6181,20 +6199,29 @@ program_add_type:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -56(%rbp)
-    movq -16(%rbp), %rax
-    pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -80(%rbp)
     movq -56(%rbp), %rax
+    addq -80(%rbp), %rax
+    movq %rax, -88(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
-    call memory_set_pointer_at_index@PLT
+    call memory_set_pointer@PLT
     movq -24(%rbp), %rax
     addq $1, %rax
-    movq %rax, -80(%rbp)
-    movq -80(%rbp), %rax
+    movq %rax, -96(%rbp)
+    movq -96(%rbp), %rax
     pushq %rax
     movq $24, %rax
     pushq %rax
@@ -6323,20 +6350,29 @@ program_add_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -56(%rbp)
-    movq -16(%rbp), %rax
-    pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -80(%rbp)
     movq -56(%rbp), %rax
+    addq -80(%rbp), %rax
+    movq %rax, -88(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
-    call memory_set_pointer_at_index@PLT
+    call memory_set_pointer@PLT
     movq -24(%rbp), %rax
     addq $1, %rax
-    movq %rax, -80(%rbp)
-    movq -80(%rbp), %rax
+    movq %rax, -96(%rbp)
+    movq -96(%rbp), %rax
     pushq %rax
     movq $40, %rax
     pushq %rax
@@ -10846,7 +10882,7 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_integer@PLT
+    call memory_get_int32@PLT
     movq %rax, -1880(%rbp)
     movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
     pushq %rax
@@ -10885,13 +10921,13 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -1912(%rbp)
-    movq $8, %rax
+    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
     pushq %rax
     movq -1912(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_integer@PLT
+    call memory_get_int32@PLT
     movq %rax, -1920(%rbp)
     movq -1920(%rbp), %rax
     pushq %rax
@@ -10908,7 +10944,7 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_integer@PLT
+    call memory_get_int32@PLT
     movq %rax, -1928(%rbp)
     movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
     pushq %rax
