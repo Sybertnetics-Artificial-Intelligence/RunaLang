@@ -1,3 +1,15 @@
+.section .rodata
+.STR0:    .string "[MAIN ERROR] Could not open input file '"
+.STR1:    .string "'"
+.STR2:    .string "[IMPORT ERROR] Failed to read import file: "
+.STR3:    .string "[IMPORT ERROR] Failed to parse import file: "
+.STR4:    .string "Usage: "
+.STR5:    .string " <input.runa> <output.s>"
+.STR6:    .string "[ERROR] Failed to read source file"
+.STR7:    .string "[ERROR] main: Parsing failed - program is NULL"
+.STR8:    .string "Successfully compiled '"
+.STR9:    .string "' to '"
+
 .text
 print_string:
     pushq %rbp
@@ -99,16 +111,6 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
-.STR0:    .string "[MAIN ERROR] Could not open input file '"
-.STR1:    .string "'"
-.STR2:    .string "[IMPORT ERROR] Failed to read import file: "
-.STR3:    .string "[IMPORT ERROR] Failed to parse import file: "
-.STR4:    .string "Usage: "
-.STR5:    .string " <input.runa> <output.s>"
-.STR6:    .string "[ERROR] Failed to read source file"
-.STR7:    .string "[ERROR] main: Parsing failed - program is NULL"
-.STR8:    .string "Successfully compiled '"
-.STR9:    .string "' to '"
 .text
 
 

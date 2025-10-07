@@ -116,7 +116,7 @@ print_integer:
 read_file_internal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -177,7 +177,7 @@ read_file_internal:
 process_imports:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $40, %rax
     pushq %rax
@@ -500,7 +500,7 @@ main:
     call runtime_set_command_line_args@PLT
     popq %rsi   # Restore argv
     popq %rdi   # Restore argc
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax

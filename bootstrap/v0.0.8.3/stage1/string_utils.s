@@ -1,3 +1,6 @@
+.section .rodata
+.STR0:    .string ""
+
 .text
 print_string:
     pushq %rbp
@@ -99,7 +102,6 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
-.STR0:    .string ""
 .text
 
 

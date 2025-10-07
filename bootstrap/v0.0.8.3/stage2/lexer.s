@@ -533,7 +533,7 @@ print_integer:
 string_copy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -602,7 +602,7 @@ string_copy:
 string_copy_n:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -657,7 +657,7 @@ string_copy_n:
 string_set_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -681,7 +681,7 @@ string_set_char:
 lexer_advance:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $20, %rax
     pushq %rax
@@ -853,7 +853,7 @@ lexer_advance:
 lexer_skip_whitespace:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $1, %rax
     movq %rax, -16(%rbp)
@@ -930,7 +930,7 @@ lexer_skip_whitespace:
 lexer_skip_note_comment:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $20, %rax
     pushq %rax
@@ -1795,7 +1795,7 @@ lexer_skip_note_comment:
 token_create_owned:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1857,7 +1857,7 @@ token_create_owned:
 token_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1946,7 +1946,7 @@ token_create:
 lexer_read_string_literal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2118,7 +2118,7 @@ lexer_read_string_literal:
 lexer_read_word:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -2276,7 +2276,7 @@ lexer_read_word:
 lexer_read_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -2415,7 +2415,7 @@ lexer_read_integer:
 lexer_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $32, %rax
     movq %rax, -16(%rbp)
@@ -2510,7 +2510,7 @@ lexer_create:
 lexer_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2550,7 +2550,7 @@ lexer_destroy:
 lexer_next_token:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $1, %rax
     movq %rax, -16(%rbp)
@@ -3137,7 +3137,7 @@ lexer_next_token:
 determine_token_type:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $0, %rax
     pushq %rax
@@ -3808,7 +3808,7 @@ determine_token_type:
 check_keywords_P:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR8(%rip), %rax
     pushq %rax
@@ -3864,7 +3864,7 @@ check_keywords_P:
 check_keywords_c:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR10(%rip), %rax
     pushq %rax
@@ -3920,7 +3920,7 @@ check_keywords_c:
 check_keywords_r:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR12(%rip), %rax
     pushq %rax
@@ -3954,7 +3954,7 @@ check_keywords_r:
 check_keywords_I:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR13(%rip), %rax
     pushq %rax
@@ -4076,7 +4076,7 @@ check_keywords_I:
 check_keywords_A:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR18(%rip), %rax
     pushq %rax
@@ -4110,7 +4110,7 @@ check_keywords_A:
 check_keywords_S:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR19(%rip), %rax
     pushq %rax
@@ -4166,7 +4166,7 @@ check_keywords_S:
 check_keywords_C:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR21(%rip), %rax
     pushq %rax
@@ -4222,7 +4222,7 @@ check_keywords_C:
 check_keywords_R:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR23(%rip), %rax
     pushq %rax
@@ -4256,7 +4256,7 @@ check_keywords_R:
 check_keywords_E:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR0(%rip), %rax
     pushq %rax
@@ -4290,7 +4290,7 @@ check_keywords_E:
 check_keywords_L:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR24(%rip), %rax
     pushq %rax
@@ -4324,7 +4324,7 @@ check_keywords_L:
 check_keywords_b:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR25(%rip), %rax
     pushq %rax
@@ -4490,7 +4490,7 @@ check_keywords_b:
 check_keywords_s:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
     movq %rbp, %rsp
@@ -4502,7 +4502,7 @@ check_keywords_s:
 check_keywords_t:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR32(%rip), %rax
     pushq %rax
@@ -4646,7 +4646,7 @@ check_keywords_t:
 check_keywords_p:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR38(%rip), %rax
     pushq %rax
@@ -4680,7 +4680,7 @@ check_keywords_p:
 check_keywords_m:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR39(%rip), %rax
     pushq %rax
@@ -4758,7 +4758,7 @@ check_keywords_m:
 check_keywords_i:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR42(%rip), %rax
     pushq %rax
@@ -4858,7 +4858,7 @@ check_keywords_i:
 check_keywords_e:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR46(%rip), %rax
     pushq %rax
@@ -4914,7 +4914,7 @@ check_keywords_e:
 check_keywords_l:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR48(%rip), %rax
     pushq %rax
@@ -4970,7 +4970,7 @@ check_keywords_l:
 check_keywords_g:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR50(%rip), %rax
     pushq %rax
@@ -5026,7 +5026,7 @@ check_keywords_g:
 check_keywords_n:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR52(%rip), %rax
     pushq %rax
@@ -5082,7 +5082,7 @@ check_keywords_n:
 check_keywords_N:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR1(%rip), %rax
     pushq %rax
@@ -5116,7 +5116,7 @@ check_keywords_N:
 check_keywords_a:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR54(%rip), %rax
     pushq %rax
@@ -5238,7 +5238,7 @@ check_keywords_a:
 check_keywords_o:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR59(%rip), %rax
     pushq %rax
@@ -5294,7 +5294,7 @@ check_keywords_o:
 check_keywords_O:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR61(%rip), %rax
     pushq %rax
@@ -5328,7 +5328,7 @@ check_keywords_O:
 check_keywords_W:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR62(%rip), %rax
     pushq %rax
@@ -5384,7 +5384,7 @@ check_keywords_W:
 check_keywords_T:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR64(%rip), %rax
     pushq %rax
@@ -5418,7 +5418,7 @@ check_keywords_T:
 check_keywords_B:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR65(%rip), %rax
     pushq %rax
@@ -5452,7 +5452,7 @@ check_keywords_B:
 check_keywords_f:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR66(%rip), %rax
     pushq %rax
@@ -5508,7 +5508,7 @@ check_keywords_f:
 check_keywords_d:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR68(%rip), %rax
     pushq %rax
@@ -5564,7 +5564,7 @@ check_keywords_d:
 check_keywords_D:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR70(%rip), %rax
     pushq %rax
@@ -5642,7 +5642,7 @@ check_keywords_D:
 check_keywords_M:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR73(%rip), %rax
     pushq %rax
@@ -5698,7 +5698,7 @@ check_keywords_M:
 check_keywords_F:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR75(%rip), %rax
     pushq %rax
@@ -5732,7 +5732,7 @@ check_keywords_F:
 check_keywords_w:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR76(%rip), %rax
     pushq %rax
@@ -5788,7 +5788,7 @@ check_keywords_w:
 check_keywords_k:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR78(%rip), %rax
     pushq %rax
@@ -5822,7 +5822,7 @@ check_keywords_k:
 check_builtin_functions:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR65(%rip), %rax
     movq %rax, -16(%rbp)
@@ -6039,7 +6039,7 @@ check_builtin_functions:
 check_more_builtins:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR80(%rip), %rax
     movq %rax, -16(%rbp)
@@ -6309,7 +6309,7 @@ check_more_builtins:
 check_single_char_token:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -6807,7 +6807,7 @@ check_single_char_token:
 token_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -6859,7 +6859,7 @@ token_destroy:
 is_alnum_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -6897,7 +6897,7 @@ is_alnum_char:
 print_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $2, %rax
     pushq %rax
@@ -6942,7 +6942,7 @@ print_char:
 print_newline:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $10, %rax
     movq %rax, -16(%rbp)
