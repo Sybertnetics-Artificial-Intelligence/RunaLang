@@ -397,8 +397,8 @@ Process called "codegen_collect_strings_from_expression" takes codegen as Intege
 
     If expr_type is equal to 16:  Note: EXPR_ARRAY_INDEX
         Let array_index_ptr be expr plus 8  Note: &expr->data.array_index
-        Let arr be memory_get_integer(array_index_ptr, 0)  Note: array_index.array
-        Let index be memory_get_integer(array_index_ptr, 8)  Note: array_index.index
+        Let arr be memory_get_pointer(array_index_ptr, 0)  Note: array_index.array (FIX: use memory_get_pointer, not _integer)
+        Let index be memory_get_pointer(array_index_ptr, 8)  Note: array_index.index (FIX: use memory_get_pointer, not _integer)
         codegen_collect_strings_from_expression(codegen, arr)
         codegen_collect_strings_from_expression(codegen, index)
         Return 0
@@ -920,8 +920,8 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
 
     If expr_type is equal to 16:  Note: EXPR_ARRAY_INDEX
         Let array_index_ptr be expr plus 8  Note: &expr->data.array_index
-        Let arr be memory_get_integer(array_index_ptr, 0)  Note: array_index.array
-        Let index be memory_get_integer(array_index_ptr, 8)  Note: array_index.index
+        Let arr be memory_get_pointer(array_index_ptr, 0)  Note: array_index.array (FIX: use memory_get_pointer, not _integer)
+        Let index be memory_get_pointer(array_index_ptr, 8)  Note: array_index.index (FIX: use memory_get_pointer, not _integer)
 
         Note: Check if the array is a parameter or local variable
         Let array_type be memory_get_int32(arr, 0)  Note: array->type
@@ -2056,6 +2056,40 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Let array_expr be memory_get_pointer(expr, 8)
         Let index_expr be memory_get_pointer(expr, 16)
 
+        Note: COMPILE-TIME BOUNDS CHECKING
+        Note: If index is a constant integer literal, check bounds at compile time
+        Let index_type be memory_get_int32(index_expr, 0)
+        If index_type is equal to 0:  Note: EXPR_INTEGER_LITERAL
+            Let constant_index be memory_get_int32(index_expr, 8)
+
+            Note: Check if index is negative (always invalid)
+            If constant_index is less than 0:
+                print_string("[SAFETY ERROR] Array index ")
+                print_integer(constant_index)
+                print_string(" is negative - arrays cannot have negative indices\n")
+                exit(1)
+            End If
+
+            Note: Check if array is an array literal (we know the size at compile time)
+            Let array_type be memory_get_int32(array_expr, 0)
+            If array_type is equal to 18:  Note: EXPR_ARRAY_LITERAL
+                Let array_size be memory_get_int32(array_expr, 16)
+                If constant_index is greater than or equal to array_size:
+                    print_string("[SAFETY ERROR] Array index ")
+                    print_integer(constant_index)
+                    print_string(" is out of bounds (array size is ")
+                    print_integer(array_size)
+                    print_string(")\n")
+                    exit(1)
+                End If
+                print_string("[SAFETY] Compile-time bounds check PASSED: index ")
+                print_integer(constant_index)
+                print_string(" is within array bounds [0..")
+                print_integer(array_size)
+                print_string(")\n")
+            End If
+        End If
+
         Note: Generate code for index (result in %rax)
         codegen_generate_expression(codegen, index_expr)
         file_write_buffered(output_file, "    pushq %rax  # Save index\n", 0)
@@ -2065,6 +2099,19 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
 
         Note: Pop index into %rbx, array pointer is in %rax
         file_write_buffered(output_file, "    popq %rbx  # Load index\n", 0)
+
+        Note: RUNTIME BOUNDS CHECKING (always enabled for safety)
+        Note: Runa arrays store their size in the first 8 bytes (at offset -8 from data pointer)
+        Note: Check if index is negative
+        file_write_buffered(output_file, "    # Runtime bounds check: ensure index >= 0\n", 0)
+        file_write_buffered(output_file, "    cmpq $0, %rbx\n", 0)
+        file_write_buffered(output_file, "    jl .bounds_error_negative\n", 0)
+
+        Note: Load array size from metadata (stored at offset -8 from data pointer)
+        file_write_buffered(output_file, "    # Runtime bounds check: ensure index < size\n", 0)
+        file_write_buffered(output_file, "    movq -8(%rax), %rcx  # Load array size from metadata\n", 0)
+        file_write_buffered(output_file, "    cmpq %rcx, %rbx  # Compare index with size\n", 0)
+        file_write_buffered(output_file, "    jge .bounds_error_overflow\n", 0)
 
         Note: Calculate offset: index * 8 (pointer size)
         file_write_buffered(output_file, "    imulq $8, %rbx  # Multiply index by 8\n", 0)
@@ -2119,12 +2166,21 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Note: Calculate size: array_size * 8 (assuming pointer-sized elements for now)
         Let total_size be array_size multiplied by 8
 
-        Note: Allocate memory for array
+        Note: Allocate memory for array + 8 bytes for size metadata
+        Let allocation_size be total_size plus 8
         file_write_buffered(output_file, "    movq $", 0)
-        file_write_buffered(output_file, integer_to_string(total_size), 0)
+        file_write_buffered(output_file, integer_to_string(allocation_size), 0)
         file_write_buffered(output_file, ", %rdi\n", 0)
         file_write_buffered(output_file, "    call memory_allocate\n", 0)
-        file_write_buffered(output_file, "    pushq %rax  # Save array pointer\n", 0)
+
+        Note: Store array size in metadata at offset 0
+        file_write_buffered(output_file, "    movq $", 0)
+        file_write_buffered(output_file, integer_to_string(array_size), 0)
+        file_write_buffered(output_file, ", (%rax)  # Store array size in metadata\n", 0)
+
+        Note: Adjust pointer to point to data (after metadata)
+        file_write_buffered(output_file, "    addq $8, %rax  # Move pointer past metadata\n", 0)
+        file_write_buffered(output_file, "    pushq %rax  # Save array data pointer\n", 0)
 
         Note: Generate code for each element and store
         Let i be 0
@@ -2136,7 +2192,7 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
             codegen_generate_expression(codegen, elem_expr)
 
             Note: Store in array
-            file_write_buffered(output_file, "    movq (%rsp), %rbx  # Load array pointer\n", 0)
+            file_write_buffered(output_file, "    movq (%rsp), %rbx  # Load array data pointer\n", 0)
             file_write_buffered(output_file, "    movq %rax, ", 0)
             file_write_buffered(output_file, integer_to_string(elem_offset), 0)
             file_write_buffered(output_file, "(%rbx)\n", 0)
@@ -2144,8 +2200,8 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
             Set i to i plus 1
         End While
 
-        Note: Pop array pointer into %rax as result
-        file_write_buffered(output_file, "    popq %rax  # Array pointer as result\n", 0)
+        Note: Pop array data pointer into %rax as result
+        file_write_buffered(output_file, "    popq %rax  # Array data pointer as result\n", 0)
         Return 0
     End If
 
@@ -2156,11 +2212,20 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Note: Calculate size: array_size * 8
         Let total_size be array_size multiplied by 8
 
-        Note: Allocate zeroed memory
+        Note: Allocate zeroed memory + 8 bytes for size metadata
+        Let allocation_size be total_size plus 8
         file_write_buffered(output_file, "    movq $", 0)
-        file_write_buffered(output_file, integer_to_string(total_size), 0)
+        file_write_buffered(output_file, integer_to_string(allocation_size), 0)
         file_write_buffered(output_file, ", %rdi\n", 0)
         file_write_buffered(output_file, "    call memory_allocate\n", 0)
+
+        Note: Store array size in metadata at offset 0
+        file_write_buffered(output_file, "    movq $", 0)
+        file_write_buffered(output_file, integer_to_string(array_size), 0)
+        file_write_buffered(output_file, ", (%rax)  # Store array size in metadata\n", 0)
+
+        Note: Adjust pointer to point to data (after metadata)
+        file_write_buffered(output_file, "    addq $8, %rax  # Move pointer past metadata\n", 0)
         Return 0
     End If
 
@@ -3608,7 +3673,7 @@ End Process
 
 Note: Create a new code generator - equivalent to codegen_create
 Process called "codegen_create" takes output_filename as Integer returns Integer:
-    Let codegen be allocate(80)  Note: sizeof(CodeGenerator) - includes var_hashtable at offset 72
+    Let codegen be allocate(88)  Note: sizeof(CodeGenerator) - expanded for call_graph at offset 80
 
     Note: Note: allocate() uses calloc() which already zeros the memory,
     Note: so no explicit initialization loop is needed
@@ -3736,6 +3801,11 @@ Process called "codegen_destroy" takes codegen as Integer returns Integer:
         If var_hashtable is not equal to 0:
             hashtable_destroy(var_hashtable)
         End If
+        Note: Destroy call graph (at offset 80)
+        Let call_graph be memory_get_pointer(codegen, 80)
+        If call_graph is not equal to 0:
+            callgraph_destroy(call_graph)
+        End If
         deallocate(codegen)
     End If
     Return 0
@@ -3810,7 +3880,7 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     Note: ========================================================================
     Note: STACK SAFETY: Inject stack probe for recursive functions
     Note: ========================================================================
-    Let call_graph be memory_get_pointer(codegen, 72)  Note: codegen->call_graph
+    Let call_graph be memory_get_pointer(codegen, 80)  Note: codegen->call_graph (offset 80, NOT 72)
     If call_graph is not equal to 0:
         Let node be callgraph_find_node(call_graph, func_name)
         If node is not equal to 0:
@@ -4308,7 +4378,7 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     callgraph_print_warnings(call_graph)
 
     Note: Store call graph pointer in codegen for function generation
-    memory_set_pointer(codegen, 72, call_graph)  Note: codegen->call_graph (using offset 72)
+    memory_set_pointer(codegen, 80, call_graph)  Note: codegen->call_graph (using offset 80, NOT 72 which is var_hashtable)
 
     print_string("[CODEGEN] Stack safety analysis complete.\n")
     Note: ========================================================================
@@ -4376,9 +4446,87 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     Note:     Note: Wrapper generation disabled for library modules
     Note: End If
 
+    Note: Add memory safety error handlers BEFORE .note.GNU-stack
+    file_write_buffered(output_file, "\n", 0)
+
+    Note: Null pointer dereference handler
+    emit_line(output_file, ".null_pointer_error:")
+    emit_line(output_file, "    # Print error message for null pointer")
+    emit_line(output_file, "    leaq .null_pointer_msg(%rip), %rdi")
+    emit_line(output_file, "    call print_string@PLT")
+    emit_line(output_file, "    # Exit with error code")
+    emit_line(output_file, "    movq $1, %rdi")
+    emit_line(output_file, "    call exit_with_code@PLT")
+    file_write_buffered(output_file, "\n", 0)
+
+    emit_line(output_file, ".bounds_error_negative:")
+    emit_line(output_file, "    # Print error message for negative index")
+    emit_line(output_file, "    leaq .bounds_error_negative_msg(%rip), %rdi")
+    emit_line(output_file, "    call print_string@PLT")
+    emit_line(output_file, "    # Print the negative index value")
+    emit_line(output_file, "    movq %rbx, %rdi  # Index value")
+    emit_line(output_file, "    call print_integer@PLT")
+    emit_line(output_file, "    # Exit with error code")
+    emit_line(output_file, "    movq $1, %rdi")
+    emit_line(output_file, "    call exit_with_code@PLT")
+    file_write_buffered(output_file, "\n", 0)
+
+    emit_line(output_file, ".bounds_error_overflow:")
+    emit_line(output_file, "    # Save registers that will be clobbered")
+    emit_line(output_file, "    pushq %rcx  # Save array size")
+    emit_line(output_file, "    pushq %rbx  # Save index")
+    emit_line(output_file, "    # Print error message for out-of-bounds index")
+    emit_line(output_file, "    leaq .bounds_error_overflow_msg(%rip), %rdi")
+    emit_line(output_file, "    call print_string@PLT")
+    emit_line(output_file, "    # Print the index value")
+    emit_line(output_file, "    popq %rdi  # Restore and use index")
+    emit_line(output_file, "    pushq %rdi  # Save again for later")
+    emit_line(output_file, "    call print_integer@PLT")
+    emit_line(output_file, "    # Print size message")
+    emit_line(output_file, "    leaq .bounds_error_size_msg(%rip), %rdi")
+    emit_line(output_file, "    call print_string@PLT")
+    emit_line(output_file, "    # Print the array size")
+    emit_line(output_file, "    movq 8(%rsp), %rdi  # Get saved array size from stack")
+    emit_line(output_file, "    call print_integer@PLT")
+    emit_line(output_file, "    # Clean up stack")
+    emit_line(output_file, "    addq $16, %rsp")
+    emit_line(output_file, "    # Exit with error code")
+    emit_line(output_file, "    movq $1, %rdi")
+    emit_line(output_file, "    call exit_with_code@PLT")
+    file_write_buffered(output_file, "\n", 0)
+
+    Note: Add error message strings to .rodata
+    emit_line(output_file, ".section .rodata")
+
+    emit_line(output_file, ".null_pointer_msg:")
+    emit_line(output_file, "    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32")  Note: "FATAL ERROR: "
+    emit_line(output_file, "    .byte 78,117,108,108,32,112,111,105,110,116,101,114,32")  Note: "Null pointer "
+    emit_line(output_file, "    .byte 100,101,114,101,102,101,114,101,110,99,101")  Note: "dereference"
+    emit_line(output_file, "    .byte 10,0")  Note: "\n"
+    file_write_buffered(output_file, "\n", 0)
+
+    emit_line(output_file, ".bounds_error_negative_msg:")
+    emit_line(output_file, "    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32")  Note: "FATAL ERROR: "
+    emit_line(output_file, "    .byte 65,114,114,97,121,32,105,110,100,101,120,32")  Note: "Array index "
+    emit_line(output_file, "    .byte 105,115,32,110,101,103,97,116,105,118,101,58,32")  Note: "is negative: "
+    emit_line(output_file, "    .byte 0")
+    file_write_buffered(output_file, "\n", 0)
+
+    emit_line(output_file, ".bounds_error_overflow_msg:")
+    emit_line(output_file, "    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32")  Note: "FATAL ERROR: "
+    emit_line(output_file, "    .byte 65,114,114,97,121,32,105,110,100,101,120,32")  Note: "Array index "
+    emit_line(output_file, "    .byte 111,117,116,32,111,102,32,98,111,117,110,100,115,58,32")  Note: "out of bounds: "
+    emit_line(output_file, "    .byte 0")
+    file_write_buffered(output_file, "\n", 0)
+
+    emit_line(output_file, ".bounds_error_size_msg:")
+    emit_line(output_file, "    .byte 32,40,97,114,114,97,121,32,115,105,122,101,32,105,115,32")  Note: " (array size is "
+    emit_line(output_file, "    .byte 41,10,0")  Note: ")\n"
+    file_write_buffered(output_file, "\n", 0)
+
     Note: Add GNU stack note to prevent executable stack warning
     file_write_buffered(output_file, "\n", 0)
-    Note: Output the GNU stack section
+    Note: Output the GNU stack section (MUST BE LAST)
     emit_line(output_file, ".section .note.GNU-stack")
 
     Return 0
@@ -4422,6 +4570,49 @@ Process called "callgraph_create" takes program as Integer, codegen as Integer r
     memory_set_pointer(graph, 24, codegen)
 
     Return graph
+End Process
+
+Note: Destroy a call graph and free all resources
+Process called "callgraph_destroy" takes graph as Integer returns Integer:
+    If graph is equal to 0:
+        Return 0
+    End If
+
+    Note: Get nodes array and count
+    Let nodes be memory_get_pointer(graph, 0)
+    Let node_count be memory_get_int32(graph, 8)
+
+    Note: Free each node
+    If nodes is not equal to 0:
+        Let i be 0
+        While i is less than node_count:
+            Let node be memory_get_pointer(nodes, i multiplied by 8)
+            If node is not equal to 0:
+                Note: Free node's function name
+                Let func_name be memory_get_pointer(node, 0)
+                If func_name is not equal to 0:
+                    deallocate(func_name)
+                End If
+
+                Note: Free node's callees array
+                Let callees be memory_get_pointer(node, 16)
+                If callees is not equal to 0:
+                    deallocate(callees)
+                End If
+
+                Note: Free the node itself
+                deallocate(node)
+            End If
+            Let i be i plus 1
+        End While
+
+        Note: Free the nodes array
+        deallocate(nodes)
+    End If
+
+    Note: Free the graph itself
+    deallocate(graph)
+    Return 0
 End Process
 
 Note: Create a new call graph node for a function
