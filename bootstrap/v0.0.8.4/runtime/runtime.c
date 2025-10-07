@@ -289,11 +289,14 @@ int64_t call_function_pointer_2args(void* fn, void* arg1, void* arg2) {
 // int64_t string_length(char* str) - in string_utils.o
 
 // OVERRIDE: C implementation of string_equals to fix bootstrap bug
+// DISABLED: Now provided by string_utils.runa
+#if 0
 int64_t string_equals(const char* str1, const char* str2) {
     if (!str1 && !str2) return 1;
     if (!str1 || !str2) return 0;
     return strcmp(str1, str2) == 0 ? 1 : 0;
 }
+#endif
 
 void print(char* str) {
     printf("%s\n", str);
@@ -565,6 +568,9 @@ typedef struct {
     int8_t* used;       // Bitmap: 1 if slot is used, 0 if empty
 } RunaSet;
 
+// DISABLED: These set functions are now provided by containers.runa
+#if 0
+
 // Create a new empty set with initial capacity of 16
 int64_t set_create() {
     RunaSet* set = (RunaSet*)calloc(1, sizeof(RunaSet));
@@ -770,6 +776,8 @@ int64_t set_destroy(int64_t set_ptr) {
     free(set);
     return 0;
 }
+
+#endif // End of disabled set functions
 
 // ============================================================================
 // DICTIONARY OPERATIONS
