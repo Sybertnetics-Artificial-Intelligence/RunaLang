@@ -1,12 +1,3 @@
-.section .rodata
-.STR0:    .string "Hash Table Statistics:"
-.STR1:    .string "  Bucket count: "
-.STR2:    .string "  Entry count: "
-.STR3:    .string "  Empty buckets: "
-.STR4:    .string "  Max chain length: "
-.STR5:    .string "  Average chain length: "
-.STR6:    .string "  Load factor: "
-
 .text
 print_string:
     pushq %rbp
@@ -108,6 +99,13 @@ print_integer:
 .section .rodata
 .newline:
     .byte 10  # newline character
+.STR0:    .string "Hash Table Statistics:"
+.STR1:    .string "  Bucket count: "
+.STR2:    .string "  Entry count: "
+.STR3:    .string "  Empty buckets: "
+.STR4:    .string "  Max chain length: "
+.STR5:    .string "  Average chain length: "
+.STR6:    .string "  Load factor: "
 .text
 
 
