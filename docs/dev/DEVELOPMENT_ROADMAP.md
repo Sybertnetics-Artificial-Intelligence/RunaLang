@@ -33,8 +33,8 @@ Before starting standard library development in v0.1.0, these features are **ABS
 | **v0.0.8** | Core Language Complete (inline asm, imports, for loops, bitwise) | ✅ **COMPLETE**
 | **v0.0.8.1** | Struct Construction & Field Access Syntax | ✅ **IN PROGRESS**
 | **v0.0.8.2** | Collections (Lists, Dictionaries, Sets) + For Each Loops | ✅ Planned |
-| **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | 🔄 Planned |
-| **v0.0.8.4** | Lambda Expressions + Type Inference | 📋 Planned |
+| **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | ✅ Planned |
+| **v0.0.8.4** | Lambda Expressions + Type Inference | 🔄 Planned |
 | **v0.0.8.5** | String Interpolation, Ternary Operator | 📋 Planned |
 | **v0.0.8.6** | Advanced Types Phase 1: Range Constraints + Float/Float64 | 📋 Planned |
 | **v0.0.8.7** | Advanced Types Phase 2: Wire Format Types (Integer16/32) + FFI Types | 📋 Planned |
@@ -68,81 +68,6 @@ Before starting standard library development in v0.1.0, these features are **ABS
 | **v1.1** | Rosetta Stone Phase 1: C → Runa Translation | 📋 Planned |
 | **v1.2** | Rosetta Stone Phase 2: Runa → Python Translation | 📋 Planned |
 | **v1.3** | Rosetta Stone Phase 3: Bidirectional C ↔ Runa ↔ Python | 📋 Planned |
-
----
-
-# 🔹 v0.0.8.3: Match/Pattern Matching & ADT/Variant Construction
-
-**Goal:** Implement pattern matching and algebraic data types (sum types/variants) - enables proper type-safe data modeling.
-
-**Priority:** HIGH - ADTs are core to the type system and useless without pattern matching.
-
-## What Belongs Where:
-
-### COMPILER (Parser/Codegen):
-- ❌ **Variant/ADT type definitions**:
-  ```runa
-  Type Shape is:
-      | Circle with radius as Float
-      | Rectangle with width as Float and height as Float
-      | Triangle with base as Float and height as Float
-  End Type
-  ```
-  - Parser: Recognize `Type NAME is: | Variant | Variant ...`
-  - Type system: Store variant names and their fields
-- ❌ **Variant construction**: `Let circle be Shape of Circle with radius as 5.0`
-  - Parser: Recognize `TypeName of VariantName with field as value`
-  - Codegen: Generate tagged union with discriminator + field storage
-- ❌ **Match statement**: `Match value: When pattern: ... End Match`
-  - Parser: Recognize `Match EXPR: When PATTERN: BLOCK ...`
-  - Codegen: Generate switch/if-chain on discriminator
-- ❌ **Pattern matching with variants**:
-  ```runa
-  Match shape:
-      When Circle with radius as r:
-          Return 3.14159 multiplied by r multiplied by r
-      When Rectangle with width as w and height as h:
-          Return w multiplied by h
-  ```
-  - Parser: Recognize `When VariantName with field as binding`
-  - Codegen: Extract discriminator, extract fields from tagged union
-- ❌ **Pattern matching with literals**: `When 0:`, `When "hello":`
-- ❌ **Pattern matching with types**: `When value of type Integer:`
-- ❌ **Wildcard pattern**: `When _:` (catch-all)
-- ❌ **Exhaustiveness checking**: Compiler warns on missing variant cases
-
-### TYPE SYSTEM (Enhanced):
-- ❌ **Tagged union representation**: Discriminator (int) + max-sized field storage
-- ❌ **Variant registry**: Store all variants for a type
-- ❌ **Exhaustiveness analysis**: Verify all variants are handled
-
-## Implementation Notes:
-
-**Tagged union layout:**
-```runa
-# Type Shape is: Circle | Rectangle | Triangle
-# Compiler generates:
-struct Shape {
-    int discriminator;  # 0=Circle, 1=Rectangle, 2=Triangle
-    union {
-        struct { float radius; } circle;
-        struct { float width; float height; } rectangle;
-        struct { float base; float height; } triangle;
-    } data;
-}
-```
-
-## Success Criteria:
-- ✅ Variant type definitions parse correctly
-- ✅ Variant construction works: `Shape.Circle with radius as 5.0`
-- ✅ Match statements with multiple patterns work
-- ✅ Pattern destructuring extracts fields correctly
-- ✅ Exhaustiveness checking warns on missing cases
-- ✅ Wildcard pattern `_` works as catch-all
-- ✅ Nested patterns work: `When Some(x):`
-- ✅ All tests pass including ADT tests
-
-## Timeline: TBD
 
 ---
 
