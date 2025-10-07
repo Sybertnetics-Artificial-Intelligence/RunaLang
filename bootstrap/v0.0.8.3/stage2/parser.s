@@ -483,7 +483,7 @@ print_integer:
 token_can_be_identifier:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -767,7 +767,7 @@ token_can_be_identifier:
 parser_parse_expression:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -782,7 +782,7 @@ parser_parse_expression:
 parser_parse_logical_or:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -871,7 +871,7 @@ parser_parse_logical_or:
 parser_parse_logical_and:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -960,7 +960,7 @@ parser_parse_logical_and:
 parser_parse_comparison_level:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -975,7 +975,7 @@ parser_parse_comparison_level:
 parser_parse_additive:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1106,7 +1106,7 @@ parser_parse_additive:
 parser_parse_multiplicative:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1498,7 +1498,7 @@ parser_parse_multiplicative:
 parser_parse_primary_with_postfix:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2052,7 +2052,7 @@ parser_parse_primary_with_postfix:
 parser_parse_comparison:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2629,7 +2629,7 @@ parser_parse_comparison:
 parser_parse_let_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2784,7 +2784,7 @@ parser_parse_let_statement:
 parser_parse_implicit_compound_assign:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $8, %rax
@@ -2848,7 +2848,7 @@ parser_parse_implicit_compound_assign:
 parser_parse_set_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $14, %rax
     pushq %rax
@@ -3163,7 +3163,7 @@ parser_parse_set_statement:
 string_duplicate_parser:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3213,7 +3213,7 @@ string_duplicate_parser:
 parser_advance:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -3260,7 +3260,7 @@ parser_advance:
 parser_eat:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $8, %rax
@@ -3349,7 +3349,7 @@ parser_eat:
 parser_is_builtin_function_token:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4385,7 +4385,7 @@ parser_is_builtin_function_token:
 expression_create_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $32, %rax
     movq %rax, -16(%rbp)
@@ -4424,7 +4424,7 @@ expression_create_integer:
 expression_create_variable:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $32, %rax
     movq %rax, -16(%rbp)
@@ -4468,7 +4468,7 @@ expression_create_variable:
 expression_create_binary_op:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4529,7 +4529,7 @@ expression_create_binary_op:
 expression_create_comparison:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4590,7 +4590,7 @@ expression_create_comparison:
 expression_create_unary_op:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $32, %rax
@@ -4640,7 +4640,7 @@ expression_create_unary_op:
 expression_create_function_call:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4706,7 +4706,7 @@ expression_create_function_call:
 expression_create_string_literal_owned:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $32, %rax
     movq %rax, -16(%rbp)
@@ -4745,7 +4745,7 @@ expression_create_string_literal_owned:
 statement_create_let:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $24, %rax
@@ -4800,7 +4800,7 @@ statement_create_let:
 statement_create_set:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $24, %rax
@@ -4850,7 +4850,7 @@ statement_create_set:
 statement_create_compound_assign:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4911,7 +4911,7 @@ statement_create_compound_assign:
 statement_create_for_range:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -5005,7 +5005,7 @@ statement_create_for_range:
 statement_create_for_each:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -5077,7 +5077,7 @@ statement_create_for_each:
 statement_create_return:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $24, %rax
     movq %rax, -16(%rbp)
@@ -5116,7 +5116,7 @@ statement_create_return:
 statement_create_print:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $24, %rax
     movq %rax, -16(%rbp)
@@ -5155,7 +5155,7 @@ statement_create_print:
 statement_create_expression:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $24, %rax
     movq %rax, -16(%rbp)
@@ -5194,7 +5194,7 @@ statement_create_expression:
 statement_create_if:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -5277,7 +5277,7 @@ statement_create_if:
 statement_create_while:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -5338,7 +5338,7 @@ statement_create_while:
 statement_create_break:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $8, %rax
     movq %rax, -16(%rbp)
@@ -5367,7 +5367,7 @@ statement_create_break:
 statement_create_continue:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $8, %rax
     movq %rax, -16(%rbp)
@@ -5396,7 +5396,7 @@ statement_create_continue:
 function_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $48, %rax
@@ -5486,7 +5486,7 @@ function_create:
 function_add_parameter:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -5594,7 +5594,7 @@ function_add_parameter:
 function_add_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $40, %rax
@@ -5681,7 +5681,7 @@ function_add_statement:
 program_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $64, %rax
     movq %rax, -16(%rbp)
@@ -5820,7 +5820,7 @@ program_create:
 program_add_function:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $8, %rax
@@ -5971,7 +5971,7 @@ program_add_function:
 program_add_global:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $56, %rax
@@ -6122,7 +6122,7 @@ program_add_global:
 program_add_type:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $24, %rax
@@ -6273,7 +6273,7 @@ program_add_type:
 program_add_import:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $40, %rax
@@ -6424,7 +6424,7 @@ program_add_import:
 parser_parse_primary:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -13360,7 +13360,7 @@ parser_parse_primary:
 parser_parse_return_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $7, %rax
     pushq %rax
@@ -13390,7 +13390,7 @@ parser_parse_return_statement:
 parser_parse_break_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $44, %rax
     pushq %rax
@@ -13413,7 +13413,7 @@ parser_parse_break_statement:
 parser_parse_continue_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $45, %rax
     pushq %rax
@@ -13436,7 +13436,7 @@ parser_parse_continue_statement:
 parser_parse_print_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $47, %rax
     pushq %rax
@@ -13513,7 +13513,7 @@ parser_parse_print_statement:
 parser_parse_statement_block:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -14272,7 +14272,7 @@ parser_parse_statement_block:
 parser_parse_while_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $20, %rax
     pushq %rax
@@ -14357,7 +14357,7 @@ parser_parse_while_statement:
 parser_parse_for_range_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $143, %rax
     pushq %rax
@@ -14694,7 +14694,7 @@ parser_parse_for_range_statement:
 parser_parse_if_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $18, %rax
     pushq %rax
@@ -15242,7 +15242,7 @@ parser_parse_if_statement:
 parser_parse_match_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $112, %rax
     pushq %rax
@@ -16744,7 +16744,7 @@ parser_parse_match_statement:
 parser_parse_inline_assembly_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $121, %rax
     pushq %rax
@@ -16848,7 +16848,7 @@ parser_parse_inline_assembly_statement:
 parser_read_raw_assembly_until_end:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $8192, %rax
@@ -17026,7 +17026,7 @@ parser_read_raw_assembly_until_end:
 parser_try_match_end_assembly:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $0, %rax
     pushq %rax
@@ -17147,7 +17147,7 @@ parser_try_match_end_assembly:
 lexer_try_match_word:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -17221,7 +17221,7 @@ lexer_try_match_word:
 calculate_type_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     leaq .STR56(%rip), %rax
@@ -17494,7 +17494,7 @@ calculate_type_size:
 parser_parse_type_definition:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $50, %rax
     pushq %rax
@@ -20211,7 +20211,7 @@ parser_parse_type_definition:
 parser_parse_function:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $1, %rax
     pushq %rax
@@ -21697,7 +21697,7 @@ parser_parse_function:
 parser_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $24, %rax  # Load compile-time constant SIZEOF_PARSER
     pushq %rax
@@ -21755,7 +21755,7 @@ parser_create:
 parser_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -21771,7 +21771,7 @@ parser_destroy:
 parser_parse_program:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $64, %rax  # Load compile-time constant SIZEOF_PROGRAM
     pushq %rax
@@ -22489,7 +22489,7 @@ parser_parse_program:
 expression_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -22733,7 +22733,7 @@ expression_destroy:
 statement_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -23061,7 +23061,7 @@ statement_destroy:
 function_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -23103,7 +23103,7 @@ function_destroy:
 type_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -23227,7 +23227,7 @@ type_destroy:
 program_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -23549,7 +23549,7 @@ program_destroy:
 string_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -23577,7 +23577,7 @@ string_destroy:
 param_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -23629,7 +23629,7 @@ param_destroy:
 field_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -23681,7 +23681,7 @@ field_destroy:
 import_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -23733,7 +23733,7 @@ import_destroy:
 parser_parse_import:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax

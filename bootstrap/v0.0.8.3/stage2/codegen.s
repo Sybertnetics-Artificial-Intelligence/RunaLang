@@ -399,7 +399,7 @@ print_integer:
 .STR297:    .string "    call runtime_set_command_line_args@PLT"
 .STR298:    .string "    popq %rsi   # Restore argv"
 .STR299:    .string "    popq %rdi   # Restore argc"
-.STR300:    .string "    subq $2048, %rsp  # Pre-allocate generous stack space"
+.STR300:    .string "    subq $16384, %rsp  # Pre-allocate stack space for variables"
 .STR301:    .string ", -"
 .STR302:    .string "(%rbp)"
 .STR303:    .string "    movq %rbp, %rsp"
@@ -477,7 +477,7 @@ print_integer:
 emit_line:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -510,7 +510,7 @@ emit_line:
 codegen_hash_string:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     movq %rax, -16(%rbp)
@@ -582,7 +582,7 @@ codegen_hash_string:
 codegen_compare_strings:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -622,7 +622,7 @@ codegen_compare_strings:
 codegen_find_variable:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $16, %rax
@@ -734,7 +734,7 @@ codegen_find_variable:
 codegen_calculate_type_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     leaq .STR1(%rip), %rax
@@ -931,7 +931,7 @@ codegen_calculate_type_size:
 codegen_add_variable_with_type_and_param_flag:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1219,7 +1219,7 @@ codegen_add_variable_with_type_and_param_flag:
 codegen_add_variable_with_type:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1245,7 +1245,7 @@ codegen_add_variable_with_type:
 codegen_add_variable:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     leaq .STR1(%rip), %rax
@@ -1267,7 +1267,7 @@ codegen_add_variable:
 codegen_add_string_literal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $40, %rax
@@ -1459,7 +1459,7 @@ codegen_add_string_literal:
 codegen_collect_strings_from_expression:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -2175,7 +2175,7 @@ codegen_collect_strings_from_expression:
 codegen_collect_strings_from_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -3217,7 +3217,7 @@ codegen_collect_strings_from_statement:
 codegen_get_expression_type:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -3715,7 +3715,7 @@ codegen_get_expression_type:
 codegen_generate_lvalue_address:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -4703,7 +4703,7 @@ codegen_generate_lvalue_address:
 codegen_generate_integer_expr:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -4765,7 +4765,7 @@ codegen_generate_integer_expr:
 codegen_generate_variable_expr:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -5472,7 +5472,7 @@ codegen_generate_variable_expr:
 codegen_generate_integer_literal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -5534,7 +5534,7 @@ codegen_generate_integer_literal:
 codegen_generate_variable_handler:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -5562,7 +5562,7 @@ codegen_generate_variable_handler:
 codegen_generate_string_literal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -5734,7 +5734,7 @@ codegen_generate_string_literal:
 codegen_generate_binary_op:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -7699,7 +7699,7 @@ codegen_generate_binary_op:
 codegen_generate_unary_op:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -7776,7 +7776,7 @@ codegen_generate_unary_op:
 codegen_generate_comparison:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -7977,7 +7977,7 @@ codegen_generate_comparison:
 codegen_generate_function_call:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -8919,7 +8919,7 @@ codegen_generate_function_call:
 codegen_generate_indirect_call:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -9414,7 +9414,7 @@ codegen_generate_indirect_call:
 codegen_generate_field_access:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -9918,7 +9918,7 @@ codegen_generate_field_access:
 codegen_generate_builtin_call:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -10191,7 +10191,7 @@ codegen_generate_builtin_call:
 codegen_generate_expression:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -12759,7 +12759,7 @@ codegen_generate_expression:
 codegen_generate_statement:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -18385,7 +18385,7 @@ codegen_generate_statement:
 codegen_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $80, %rax
     pushq %rax
@@ -18629,7 +18629,7 @@ codegen_create:
 codegen_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -19057,7 +19057,7 @@ codegen_destroy:
 codegen_push_loop_context:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -19191,7 +19191,7 @@ codegen_push_loop_context:
 codegen_pop_loop_context:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $64, %rax
     pushq %rax
@@ -19234,7 +19234,7 @@ codegen_pop_loop_context:
 codegen_current_loop_context:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $64, %rax
     pushq %rax
@@ -19288,7 +19288,7 @@ codegen_current_loop_context:
 codegen_generate_function:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -20117,7 +20117,7 @@ codegen_generate_function:
 codegen_generate:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $8192, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
