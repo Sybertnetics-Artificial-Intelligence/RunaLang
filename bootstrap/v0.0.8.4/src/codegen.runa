@@ -1085,6 +1085,18 @@ Process called "codegen_generate_variable_expr" takes codegen as Integer, expr a
     Let offset be memory_get_integer(var_ptr, 8)
     Let var_type be memory_get_pointer(var_ptr, 16)
 
+    Note: Check if this is a closure variable (offset == -1, appears as 4294967295 unsigned)
+    If offset is equal to 4294967295:
+        Note: This is a captured variable from closure environment
+        Note: Environment pointer is at -8(%rbp), get actual offset from is_parameter field
+        Let env_offset be memory_get_int32(var_ptr, 24)  Note: is_parameter field stores env offset
+        emit_line(output_file, "    movq -8(%rbp), %rbx  # Load environment pointer")
+        file_write_buffered(output_file, "    movq ", 0)
+        file_write_buffered(output_file, integer_to_string(env_offset), 0)
+        emit_line(output_file, "(%rbx), %rax  # Load captured variable from environment")
+        Return 0
+    End If
+
     Note: Check if array type
     Let is_array be 0
     Let current_program be memory_get_pointer(codegen, 48)
@@ -1220,9 +1232,18 @@ Process called "codegen_generate_binary_op" takes codegen as Integer, expr as In
                     Let var_offset be var_index multiplied by 32
                     Let var_ptr be variables plus var_offset
                     Let stack_offset be memory_get_integer(var_ptr, 8)
-                    file_write_buffered(output_file, "    addq -", 0)
-                    file_write_buffered(output_file, integer_to_string(stack_offset), 0)
-                    file_write_buffered(output_file, "(%rbp), %rax\n", 0)
+                    Note: Check if this is a closure variable (offset == -1, appears as 4294967295 unsigned)
+                    If stack_offset is equal to 4294967295:
+                        Note: Closure variable, use general expression path
+                        emit_line(output_file, "    pushq %rax")
+                        codegen_generate_expression(codegen, right)
+                        emit_line(output_file, "    popq %rbx")
+                        emit_line(output_file, "    addq %rbx, %rax")
+                    Otherwise:
+                        file_write_buffered(output_file, "    addq -", 0)
+                        file_write_buffered(output_file, integer_to_string(stack_offset), 0)
+                        file_write_buffered(output_file, "(%rbp), %rax\n", 0)
+                    End If
                 Otherwise:
                     Note: Fallback to stack-based for complex cases
                     emit_line(output_file, "    pushq %rax")
@@ -1245,9 +1266,19 @@ Process called "codegen_generate_binary_op" takes codegen as Integer, expr as In
                     Let var_offset be var_index multiplied by 32
                     Let var_ptr be variables plus var_offset
                     Let stack_offset be memory_get_integer(var_ptr, 8)
-                    file_write_buffered(output_file, "    subq -", 0)
-                    file_write_buffered(output_file, integer_to_string(stack_offset), 0)
-                    file_write_buffered(output_file, "(%rbp), %rax\n", 0)
+                    Note: Check if this is a closure variable (offset == -1, appears as 4294967295 unsigned)
+                    If stack_offset is equal to 4294967295:
+                        Note: Closure variable, use general expression path
+                        emit_line(output_file, "    pushq %rax")
+                        codegen_generate_expression(codegen, right)
+                        emit_line(output_file, "    popq %rbx")
+                        emit_line(output_file, "    subq %rax, %rbx")
+                        emit_line(output_file, "    movq %rbx, %rax")
+                    Otherwise:
+                        file_write_buffered(output_file, "    subq -", 0)
+                        file_write_buffered(output_file, integer_to_string(stack_offset), 0)
+                        file_write_buffered(output_file, "(%rbp), %rax\n", 0)
+                    End If
                 Otherwise:
                     Note: Fallback to stack-based for complex cases
                     emit_line(output_file, "    pushq %rax")
@@ -2428,6 +2459,33 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         memory_set_int32(codegen, 20, 16)
         memory_set_int32(codegen, 24, 0)
 
+        Note: Get free variables for closure support
+        Let free_vars be memory_get_pointer(expr, 32)
+        Let free_var_count be memory_get_int32(expr, 40)
+
+        Note: Add free variables FIRST (mark them as closure variables)
+        Note: Store the environment array index directly (0, 8, 16, etc.)
+        Let i be 0
+        While i is less than free_var_count:
+            Let var_offset be i multiplied by 8
+            Let free_var_name be memory_get_pointer(free_vars, var_offset)
+            codegen_add_variable(codegen, free_var_name)
+            Note: Mark this variable as a closure variable
+            Let var_index be memory_get_int32(codegen, 16) minus 1
+            Let variables be memory_get_pointer(codegen, 8)
+            Let var_struct_offset be var_index multiplied by 32
+            Let var_ptr be variables plus var_struct_offset
+            Note: Store -1 as stack offset to mark as closure variable
+            Note: Store actual environment offset in is_parameter field (reusing it)
+            memory_set_int32(var_ptr, 8, -1)
+            memory_set_int32(var_ptr, 24, var_offset)  Note: Environment offset in is_parameter field
+            Let i be i plus 1
+        End While
+
+        Note: Reset stack offset before adding parameters
+        Note: Free variables don't use stack space, so reset to base offset
+        memory_set_int32(codegen, 24, 8)
+
         Note: Add parameters as local variables
         If param_count is equal to 0:
             Note: Single parameter (old format) - param_names is a string pointer
@@ -2458,32 +2516,36 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         emit_line(output_file, "    pushq %rbp")
         emit_line(output_file, "    movq %rsp, %rbp")
 
-        Note: Calculate stack space needed for parameters
-        Let stack_space be param_count multiplied by 8
+        Note: Calculate stack space needed for parameters + environment pointer
+        Let stack_space be param_count multiplied by 8 plus 8
         Let stack_space_aligned be stack_space plus 8
         file_write_buffered(output_file, "    subq $", 0)
         file_write_buffered(output_file, integer_to_string(stack_space_aligned), 0)
-        emit_line(output_file, ", %rsp  # Allocate space for parameters")
+        emit_line(output_file, ", %rsp  # Allocate space for environment + parameters")
 
-        Note: Store parameters on stack from registers
-        Note: x86-64 calling convention: %rdi, %rsi, %rdx, %rcx, %r8, %r9
+        Note: CRITICAL: First parameter in %rdi is the environment pointer (from closure)
+        Note: Store environment pointer at a fixed location we can reference
+        emit_line(output_file, "    movq %rdi, -8(%rbp)  # Store environment pointer")
+
+        Note: Store parameters on stack from registers (shifted by one)
+        Note: Real parameters start at %rsi, %rdx, %rcx, %r8, %r9, stack
         If param_count is greater than 0:
-            emit_line(output_file, "    movq %rdi, -8(%rbp)  # Store parameter 1")
+            emit_line(output_file, "    movq %rsi, -16(%rbp)  # Store parameter 1")
         End If
         If param_count is greater than 1:
-            emit_line(output_file, "    movq %rsi, -16(%rbp)  # Store parameter 2")
+            emit_line(output_file, "    movq %rdx, -24(%rbp)  # Store parameter 2")
         End If
         If param_count is greater than 2:
-            emit_line(output_file, "    movq %rdx, -24(%rbp)  # Store parameter 3")
+            emit_line(output_file, "    movq %rcx, -32(%rbp)  # Store parameter 3")
         End If
         If param_count is greater than 3:
-            emit_line(output_file, "    movq %rcx, -32(%rbp)  # Store parameter 4")
+            emit_line(output_file, "    movq %r8, -40(%rbp)  # Store parameter 4")
         End If
         If param_count is greater than 4:
-            emit_line(output_file, "    movq %r8, -40(%rbp)  # Store parameter 5")
+            emit_line(output_file, "    movq %r9, -48(%rbp)  # Store parameter 5")
         End If
         If param_count is greater than 5:
-            emit_line(output_file, "    movq %r9, -48(%rbp)  # Store parameter 6")
+            emit_line(output_file, "    movq 16(%rbp), -56(%rbp)  # Store parameter 6 (from stack)")
         End If
 
         Note: Generate body expression
@@ -2505,8 +2567,72 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         memory_set_int32(codegen, 20, saved_var_capacity)
         memory_set_int32(codegen, 24, saved_stack_offset)
 
+        Note: Get free variables for closure environment
+        Let free_vars be memory_get_pointer(expr, 32)
+        Let free_var_count be memory_get_int32(expr, 40)
+
+        Note: Allocate environment struct if there are free variables
+        Let env_ptr be 0
+        If free_var_count is greater than 0:
+            Note: Environment struct: array of pointers to captured values
+            Let env_size be free_var_count multiplied by 8
+            file_write_buffered(output_file, "    # Allocate environment for ", 0)
+            file_write_buffered(output_file, integer_to_string(free_var_count), 0)
+            emit_line(output_file, " captured variables")
+            file_write_buffered(output_file, "    movq $", 0)
+            file_write_buffered(output_file, integer_to_string(env_size), 0)
+            emit_line(output_file, ", %rdi")
+            emit_line(output_file, "    call allocate")
+            emit_line(output_file, "    pushq %rax  # Save environment pointer")
+
+            Note: Populate environment with current values of free variables
+            Let i be 0
+            While i is less than free_var_count:
+                Let var_offset be i multiplied by 8
+                Let var_name be memory_get_pointer(free_vars, var_offset)
+
+                Note: Find variable in current scope
+                Let var_index be codegen_find_variable(codegen, var_name)
+                If var_index is less than 0:
+                    print_string("[CODEGEN ERROR] Free variable not found in scope: ")
+                    print_string(var_name)
+                    print_newline()
+                    exit(1)
+                End If
+
+                Note: Load variable value into %rbx
+                Let variables be memory_get_pointer(codegen, 8)
+                Let var_struct_offset be var_index multiplied by 32
+                Let var_ptr be variables plus var_struct_offset
+                Let stack_offset_u be memory_get_integer(var_ptr, 8)
+                Note: Check if this variable is itself a closure variable (shouldn't happen in normal cases)
+                If stack_offset_u is equal to 4294967295:
+                    print_string("[CODEGEN ERROR] Attempting to capture a closure variable - this indicates a compiler bug")
+                    exit(1)
+                End If
+                file_write_buffered(output_file, "    movq -", 0)
+                file_write_buffered(output_file, integer_to_string(stack_offset_u), 0)
+                emit_line(output_file, "(%rbp), %rbx  # Load captured variable")
+
+                Note: Store in environment at correct offset
+                emit_line(output_file, "    popq %rax  # Get environment pointer")
+                file_write_buffered(output_file, "    movq %rbx, ", 0)
+                file_write_buffered(output_file, integer_to_string(var_offset), 0)
+                emit_line(output_file, "(%rax)  # Store in environment")
+                emit_line(output_file, "    pushq %rax  # Save environment pointer again")
+
+                Let i be i plus 1
+            End While
+
+            emit_line(output_file, "    popq %rcx  # Final environment pointer in %rcx")
+        End If
+
         Note: Now allocate closure struct (16 bytes: function_ptr + environment)
         emit_line(output_file, "    # Allocate closure struct")
+        Note: Save %rcx across allocate call (it's caller-saved and will be clobbered)
+        If free_var_count is greater than 0:
+            emit_line(output_file, "    pushq %rcx  # Save environment pointer across call")
+        End If
         emit_line(output_file, "    movq $16, %rdi")
         emit_line(output_file, "    call allocate")
         emit_line(output_file, "    pushq %rax  # Save closure pointer")
@@ -2518,8 +2644,13 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         emit_line(output_file, "    popq %rax  # Restore closure pointer")
         emit_line(output_file, "    movq %rbx, 0(%rax)  # Store function_ptr")
 
-        Note: Store NULL environment at offset 8
-        emit_line(output_file, "    movq $0, 8(%rax)  # NULL environment")
+        Note: Store environment pointer at offset 8
+        If free_var_count is greater than 0:
+            emit_line(output_file, "    popq %rcx  # Restore environment pointer")
+            emit_line(output_file, "    movq %rcx, 8(%rax)  # Store environment pointer")
+        Otherwise:
+            emit_line(output_file, "    movq $0, 8(%rax)  # NULL environment")
+        End If
 
         Note: Closure pointer is now in %rax as result
         Return 0
@@ -2552,42 +2683,39 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Note: Save closure pointer in non-argument register
         emit_line(output_file, "    movq %rax, %r10  # Save closure pointer in r10")
 
-        Note: Pop arguments from stack into argument registers (reverse order)
-        Note: x86-64 calling convention: %rdi, %rsi, %rdx, %rcx, %r8, %r9
-        If arg_count is greater than 6:
-            print_string("[CODEGEN ERROR] Lambda calls support max 6 arguments")
+        Note: Load environment pointer from closure (offset 8) - this goes in %rdi
+        emit_line(output_file, "    movq 8(%r10), %rdi  # Load environment pointer (first param)")
+
+        Note: Pop arguments from stack into argument registers (reverse order, SHIFTED BY ONE)
+        Note: x86-64 calling convention: %rdi=env, %rsi=arg1, %rdx=arg2, %rcx=arg3, %r8=arg4, %r9=arg5
+        If arg_count is greater than 5:
+            print_string("[CODEGEN ERROR] Lambda calls support max 5 arguments (6th register used for environment)")
             print_newline()
             exit_with_code(1)
         End If
 
         Note: Arguments are on stack in order arg1, arg2, ..., argN (argN on top)
-        Note: Pop in reverse to get them into registers in correct order
-        If arg_count is greater than 5:
-            emit_line(output_file, "    popq %r9  # Pop argument 6")
-        End If
+        Note: Pop in reverse to get them into registers (shifted: %rsi, %rdx, %rcx, %r8, %r9)
         If arg_count is greater than 4:
-            emit_line(output_file, "    popq %r8  # Pop argument 5")
+            emit_line(output_file, "    popq %r9  # Pop argument 5")
         End If
         If arg_count is greater than 3:
-            emit_line(output_file, "    popq %rcx  # Pop argument 4")
+            emit_line(output_file, "    popq %r8  # Pop argument 4")
         End If
         If arg_count is greater than 2:
-            emit_line(output_file, "    popq %rdx  # Pop argument 3")
+            emit_line(output_file, "    popq %rcx  # Pop argument 3")
         End If
         If arg_count is greater than 1:
-            emit_line(output_file, "    popq %rsi  # Pop argument 2")
+            emit_line(output_file, "    popq %rdx  # Pop argument 2")
         End If
         If arg_count is greater than 0:
-            emit_line(output_file, "    popq %rdi  # Pop argument 1")
+            emit_line(output_file, "    popq %rsi  # Pop argument 1")
         End If
 
-        Note: Restore closure pointer to %rax
-        emit_line(output_file, "    movq %r10, %rax  # Restore closure pointer")
-
         Note: Load function pointer from closure (offset 0)
-        emit_line(output_file, "    movq 0(%rax), %rbx  # Load function pointer from closure")
+        emit_line(output_file, "    movq 0(%r10), %rbx  # Load function pointer from closure")
 
-        Note: Call the lambda function
+        Note: Call the lambda function (environment already in %rdi)
         emit_line(output_file, "    call *%rbx  # Invoke lambda")
 
         Note: Result is in %rax
@@ -4809,12 +4937,17 @@ Process called "callgraph_collect_calls_from_expr" takes graph as Integer, node 
 
     Note: EXPR_VARIANT_CONSTRUCTOR = 9
     If expr_type is equal to 9:
-        Let variant_ptr be expr plus 8
-        Let value_expr be memory_get_pointer(variant_ptr, 16)
+        Let field_values be memory_get_pointer(expr, 24)
+        Let field_count be memory_get_int32(expr, 32)
 
-        Note: Variant may have a value expression
-        If value_expr is not equal to 0:
-            callgraph_collect_calls_from_expr(graph, node, value_expr)
+        Note: Variant may have field value expressions
+        If field_values is not equal to 0:
+            Let i be 0
+            While i is less than field_count:
+                Let field_expr be memory_get_pointer(field_values, i multiplied by 8)
+                callgraph_collect_calls_from_expr(graph, node, field_expr)
+                Let i be i plus 1
+            End While
         End If
     End If
 
@@ -4864,14 +4997,26 @@ Process called "callgraph_collect_calls_from_stmt" takes graph as Integer, node 
 
     Let stmt_type be memory_get_int32(stmt, 0)
 
-    Note: STMT_EXPRESSION = 1
-    If stmt_type is equal to 1:
+    Note: STMT_EXPRESSION = 7
+    If stmt_type is equal to 7:
         Let expr be memory_get_pointer(stmt, 8)
         callgraph_collect_calls_from_expr(graph, node, expr)
     End If
 
-    Note: STMT_IF = 2
-    If stmt_type is equal to 2:
+    Note: STMT_RETURN = 3
+    If stmt_type is equal to 3:
+        Let return_expr be memory_get_pointer(stmt, 8)
+        callgraph_collect_calls_from_expr(graph, node, return_expr)
+    End If
+
+    Note: STMT_PRINT = 4
+    If stmt_type is equal to 4:
+        Let expr be memory_get_pointer(stmt, 8)
+        callgraph_collect_calls_from_expr(graph, node, expr)
+    End If
+
+    Note: STMT_IF = 5
+    If stmt_type is equal to 5:
         Let if_ptr be stmt plus 8
         Let condition be memory_get_pointer(if_ptr, 0)
         Let then_stmts be memory_get_pointer(if_ptr, 8)
@@ -4896,14 +5041,8 @@ Process called "callgraph_collect_calls_from_stmt" takes graph as Integer, node 
         End While
     End If
 
-    Note: STMT_RETURN = 3
-    If stmt_type is equal to 3:
-        Let return_expr be memory_get_pointer(stmt, 8)
-        callgraph_collect_calls_from_expr(graph, node, return_expr)
-    End If
-
-    Note: STMT_WHILE = 4
-    If stmt_type is equal to 4:
+    Note: STMT_WHILE = 6
+    If stmt_type is equal to 6:
         Let while_ptr be stmt plus 8
         Let condition be memory_get_pointer(while_ptr, 0)
         Let body_stmts be memory_get_pointer(while_ptr, 8)
@@ -4919,18 +5058,21 @@ Process called "callgraph_collect_calls_from_stmt" takes graph as Integer, node 
         End While
     End If
 
-    Note: STMT_FOR = 5
-    If stmt_type is equal to 5:
-        Let for_ptr be stmt plus 8
-        Let init be memory_get_pointer(for_ptr, 0)
-        Let condition be memory_get_pointer(for_ptr, 8)
-        Let increment be memory_get_pointer(for_ptr, 16)
-        Let body_stmts be memory_get_pointer(for_ptr, 24)
-        Let body_count be memory_get_int32(for_ptr, 32)
+    Note: STMT_FOR = 11 (For-range: For var from start to end by step)
+    If stmt_type is equal to 11:
+        Let start_expr be memory_get_pointer(stmt, 16)
+        Let end_expr be memory_get_pointer(stmt, 24)
+        Let step_expr be memory_get_pointer(stmt, 32)
+        Let body_stmts be memory_get_pointer(stmt, 40)
+        Let body_count be memory_get_int32(stmt, 48)
 
-        callgraph_collect_calls_from_expr(graph, node, init)
-        callgraph_collect_calls_from_expr(graph, node, condition)
-        callgraph_collect_calls_from_expr(graph, node, increment)
+        callgraph_collect_calls_from_expr(graph, node, start_expr)
+        callgraph_collect_calls_from_expr(graph, node, end_expr)
+
+        Note: step_expr can be 0 if no step specified
+        If step_expr is not equal to 0:
+            callgraph_collect_calls_from_expr(graph, node, step_expr)
+        End If
 
         Let i be 0
         While i is less than body_count:
@@ -4951,10 +5093,10 @@ Process called "callgraph_collect_calls_from_stmt" takes graph as Integer, node 
 
         Let i be 0
         While i is less than arm_count:
-            Let arm_offset be i multiplied by 32  Note: sizeof(MatchArm)
+            Let arm_offset be i multiplied by 48  Note: sizeof(WhenClause) = 48 bytes
             Let arm be arms plus arm_offset
-            Let body_stmts be memory_get_pointer(arm, 16)
-            Let body_count be memory_get_int32(arm, 24)
+            Let body_stmts be memory_get_pointer(arm, 32)  Note: WHEN_BODY_STMTS = 32
+            Let body_count be memory_get_int32(arm, 40)    Note: WHEN_BODY_COUNT = 40
 
             Let j be 0
             While j is less than body_count:
@@ -4966,6 +5108,43 @@ Process called "callgraph_collect_calls_from_stmt" takes graph as Integer, node 
             Let i be i plus 1
         End While
     End If
+
+    Note: STMT_FOR_EACH = 12
+    If stmt_type is equal to 12:
+        Let for_each_ptr be stmt plus 8
+        Let collection_expr be memory_get_pointer(for_each_ptr, 8)
+        Let body_stmts be memory_get_pointer(for_each_ptr, 16)
+        Let body_count be memory_get_int32(for_each_ptr, 24)
+
+        callgraph_collect_calls_from_expr(graph, node, collection_expr)
+
+        Let i be 0
+        While i is less than body_count:
+            Let body_stmt be memory_get_pointer(body_stmts, i multiplied by 8)
+            callgraph_collect_calls_from_stmt(graph, node, body_stmt)
+            Let i be i plus 1
+        End While
+    End If
+
+    Note: STMT_LET = 1
+    If stmt_type is equal to 1:
+        Let let_expr be memory_get_pointer(stmt, 16)
+        callgraph_collect_calls_from_expr(graph, node, let_expr)
+    End If
+
+    Note: STMT_SET = 2
+    If stmt_type is equal to 2:
+        Let set_expr be memory_get_pointer(stmt, 16)
+        callgraph_collect_calls_from_expr(graph, node, set_expr)
+    End If
+
+    Note: STMT_COMPOUND_ASSIGN = 17
+    If stmt_type is equal to 17:
+        Let compound_expr be memory_get_pointer(stmt, 24)
+        callgraph_collect_calls_from_expr(graph, node, compound_expr)
+    End If
+
+    Note: STMT_BREAK = 9 and STMT_CONTINUE = 10 have no expressions to traverse
 
     Return 0
 End Process

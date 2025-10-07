@@ -1,6 +1,6 @@
 # Runa Programming Language
 
-**Version:** v0.0.8.3
+**Version:** v0.0.8.4
 **Status:** Bootstrap Phase - Self-Hosting Achieved ✅
 **Target:** Linux x86-64
 
@@ -20,6 +20,8 @@ Runa is a **human-readable programming language** that compiles to native machin
 - ✅ **Collections Support** - Lists, Sets, and Dictionaries with natural syntax
 - ✅ **Algebraic Data Types** - Variant types with pattern matching
 - ✅ **Pattern Matching** - Wildcard, literal, type, and exhaustiveness checking
+- ✅ **Lambda Expressions** - Anonymous functions with closure support (v0.0.8.4)
+- ✅ **Type Inference** - Automatic type deduction for literals and collections (v0.0.8.4)
 - ✅ **Inline Assembly** - Direct access to x86-64 instructions
 - ✅ **Struct Types** - Custom data structures
 - ✅ **For-Each Loops** - Iterate over collections naturally
@@ -111,7 +113,7 @@ Linker (executable binary)
 
 ---
 
-## Current Capabilities (v0.0.8.3)
+## Current Capabilities (v0.0.8.4)
 
 ### Language Features
 
@@ -156,7 +158,10 @@ Linker (executable binary)
 
 ✅ **Advanced Features:**
 - **ADT variant types** with multiple constructors and fields
+- **Implicit variant construction** (v0.0.8.4) - fieldless variants without type prefix
 - **Pattern matching** with exhaustiveness checking
+- **Lambda expressions** (v0.0.8.4) - anonymous functions with closure capture
+- **Type inference** (v0.0.8.4) - automatic type deduction for literals and collections
 - Struct field access with natural syntax
 - Import system for multi-file projects
 - Inline assembly for low-level operations
@@ -167,7 +172,7 @@ Linker (executable binary)
 ## Project Structure
 
 ```
-v0.0.8.3/
+v0.0.8.4/
 ├── docs/
 │   ├── README.md               # This file
 │   ├── GETTING_STARTED.md     # Compilation and usage guide
@@ -175,9 +180,9 @@ v0.0.8.3/
 │
 ├── src/                        # Compiler source code (written in Runa)
 │   ├── main.runa               # Entry point
-│   ├── lexer.runa              # Tokenization (with TOKEN_UNDERSCORE, TOKEN_DOLLAR)
-│   ├── parser.runa             # AST construction (ADTs, pattern matching)
-│   ├── codegen.runa            # x86-64 code generation (variant tags, match)
+│   ├── lexer.runa              # Tokenization (with TOKEN_LAMBDA, TOKEN_UNDERSCORE)
+│   ├── parser.runa             # AST construction (ADTs, lambdas, type inference)
+│   ├── codegen.runa            # x86-64 code generation (closures, variant tags)
 │   ├── containers.runa         # Dynamic arrays/lists/sets
 │   ├── hashtable.runa          # Hash tables (for dictionaries)
 │   └── string_utils.runa       # String operations
@@ -189,6 +194,9 @@ v0.0.8.3/
 │   └── runac                   # Compiled Runa compiler (executable)
 │
 ├── tests/unit/                 # Comprehensive unit tests (40 tests)
+│   ├── test_lambda.runa        # Lambda and closure tests
+│   ├── test_adt_explicit.runa  # Implicit variant syntax tests
+│   └── ...
 └── benchmarks/                 # Performance benchmarks
     ├── runa/                   # Runa implementations
     ├── c/                      # C comparison
@@ -220,24 +228,34 @@ v0.0.8.3/
 
 ## Roadmap
 
-### Completed (v0.0.8.3) ✅
+### Completed (v0.0.8.4) ✅
 - ✅ Self-hosting compiler
 - ✅ Struct construction and field access
 - ✅ **Collections:** Lists, Sets, Dictionaries with literals and full runtime
 - ✅ **Algebraic Data Types (ADTs)** with variant constructors
+- ✅ **Implicit Variant Syntax (v0.0.8.4):** Fieldless variants without type prefix
 - ✅ **Pattern Matching:**
   - Variant patterns with field extraction
   - Wildcard patterns (`_`)
   - Literal patterns (integers)
   - Type patterns (`of Type`)
   - Exhaustiveness checking with warnings
+- ✅ **Lambda Expressions (v0.0.8.4):**
+  - Anonymous functions with `lambda` syntax
+  - Multi-parameter lambdas
+  - Closure capture (by value)
+  - Lambda invocation with `with` keyword
+- ✅ **Type Inference (v0.0.8.4):**
+  - Literal type inference (integers, floats, strings, booleans)
+  - Collection type inference (lists, dictionaries)
+  - Lambda type inference
+  - Expression type propagation
 - ✅ Inline assembly with hash comments
 - ✅ Multi-file imports
 - ✅ For-each loops over collections
 - ✅ Context-aware collection keywords
 
 ### Coming Soon
-- **v0.0.8.4** - Implicit variant construction, string interpolation, lambda expressions
 - **v0.0.9** - Error handling (Result/Option as stdlib ADTs), generics, native object writer
 - **v0.1.0** - Beta release, standard library foundation
 - **v1.0.0** - Production release
