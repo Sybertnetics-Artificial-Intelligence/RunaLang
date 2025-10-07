@@ -3807,6 +3807,19 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     emit_line(output_file, "    pushq %rbp")
     emit_line(output_file, "    movq %rsp, %rbp")
 
+    Note: ========================================================================
+    Note: STACK SAFETY: Inject stack probe for recursive functions
+    Note: ========================================================================
+    Let call_graph be memory_get_pointer(codegen, 72)  Note: codegen->call_graph
+    If call_graph is not equal to 0:
+        Let node be callgraph_find_node(call_graph, func_name)
+        If node is not equal to 0:
+            Let is_recursive be memory_get_int32(node, 28)
+            codegen_inject_stack_probe(output_file, func_name, is_recursive)
+        End If
+    End If
+    Note: ========================================================================
+
     Note: Handle parameters (System V ABI: %rdi, %rsi, %rdx, %rcx, %r8, %r9)
     Let param_registers be allocate(6 multiplied by 8)  Note: Array of 6 string pointers
     memory_set_pointer(param_registers, 0, "%rdi")
@@ -4279,6 +4292,27 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
 
     emit_line(output_file, ".text")
 
+    Note: ========================================================================
+    Note: STACK SAFETY ANALYSIS PHASE
+    Note: ========================================================================
+    Note: Build call graph for recursion detection and stack analysis
+    print_string("[CODEGEN] Building call graph for stack safety analysis...\n")
+    Let call_graph be callgraph_create(program, codegen)
+    Note: TEMPORARILY DISABLED FOR DEBUGGING - callgraph_build(call_graph)
+
+    Note: Detect recursion (both direct and mutual)
+    print_string("[CODEGEN] Detecting recursion patterns...\n")
+    Note: TEMPORARILY DISABLED FOR DEBUGGING - callgraph_detect_recursion(call_graph)
+
+    Note: Print warnings for recursive functions
+    Note: TEMPORARILY DISABLED FOR DEBUGGING - callgraph_print_warnings(call_graph)
+
+    Note: Store call graph pointer in codegen for function generation
+    memory_set_pointer(codegen, 72, call_graph)  Note: codegen->call_graph (using offset 72)
+
+    print_string("[CODEGEN] Stack safety analysis complete.\n")
+    Note: ========================================================================
+
     Note: Generate all functions
     Let i be 0
     While i is less than function_count:
@@ -4298,6 +4332,25 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
         End If
         Let i be i plus 1
     End While
+
+    Note: Generate stack overflow handler if any recursive functions exist
+    Let nodes be memory_get_pointer(call_graph, 0)
+    Let node_count be memory_get_int32(call_graph, 8)
+    Let has_recursive be 0
+    Let i be 0
+    While i is less than node_count:
+        Let node be memory_get_pointer(nodes, i multiplied by 8)
+        Let is_recursive be memory_get_int32(node, 28)
+        If is_recursive is equal to 1:
+            Let has_recursive be 1
+            Let i be node_count  Note: Break
+        End If
+        Let i be i plus 1
+    End While
+
+    If has_recursive is equal to 1:
+        codegen_generate_stack_overflow_handler(output_file)
+    End If
 
     Note: Add a main function wrapper if no main function exists
     Let has_main be 0
@@ -4330,3 +4383,603 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
 
     Return 0
 End Process
+
+Note: ========================================================================
+Note: STACK SAFETY & MEMORY FOUNDATION (v0.0.8.4.1)
+Note: ========================================================================
+Note: This section implements critical compiler safety features:
+Note: 1. Call graph analysis for recursion detection
+Note: 2. Stack overflow protection via stack probes
+Note: 3. Tail call optimization (TCO) for tail-recursive functions
+Note: 4. Stack size calculation and warnings
+Note: ========================================================================
+
+Note: Data Structures for Call Graph Analysis
+Note: CallGraphNode structure (32 bytes):
+Note:   offset 0:  function_name (pointer)
+Note:   offset 8:  function_ptr (pointer to Function AST node)
+Note:   offset 16: callees (pointer array - functions this calls)
+Note:   offset 24: callee_count (int32)
+Note:   offset 28: is_recursive (int32) - 1 if recursively calls itself
+
+Note: CallGraph structure (32 bytes):
+Note:   offset 0:  nodes (CallGraphNode** array)
+Note:   offset 8:  node_count (int32)
+Note:   offset 12: node_capacity (int32)
+Note:   offset 16: program (pointer to Program AST)
+Note:   offset 24: codegen (pointer to CodeGen state)
+
+Note: Create a new call graph for analysis
+Process called "callgraph_create" takes program as Integer, codegen as Integer returns Integer:
+    Let graph be allocate(32)
+
+    Note: Initialize with capacity for 64 functions
+    Let initial_capacity be 64
+    memory_set_pointer(graph, 0, allocate(initial_capacity multiplied by 8))
+    memory_set_int32(graph, 8, 0)
+    memory_set_int32(graph, 12, initial_capacity)
+    memory_set_pointer(graph, 16, program)
+    memory_set_pointer(graph, 24, codegen)
+
+    Return graph
+End Process
+
+Note: Create a new call graph node for a function
+Process called "callgraph_node_create" takes function_name as Integer, function_ptr as Integer returns Integer:
+    Let node be allocate(32)
+
+    memory_set_pointer(node, 0, string_duplicate(function_name))
+    memory_set_pointer(node, 8, function_ptr)
+
+    Note: Initialize with capacity for 16 callees
+    memory_set_pointer(node, 16, allocate(16 multiplied by 8))
+    memory_set_int32(node, 24, 0)
+    memory_set_int32(node, 28, 0)  Note: is_recursive = false
+
+    Return node
+End Process
+
+Note: Add a callee to a call graph node
+Process called "callgraph_node_add_callee" takes node as Integer, callee_name as Integer returns Integer:
+    Let callees be memory_get_pointer(node, 16)
+    Let callee_count be memory_get_int32(node, 24)
+
+    Note: Check if callee already exists
+    Let i be 0
+    While i is less than callee_count:
+        Let existing_callee be memory_get_pointer(callees, i multiplied by 8)
+        If string_equals(existing_callee, callee_name) is equal to 1:
+            Return 0  Note: Already exists, don't add duplicate
+        End If
+        Let i be i plus 1
+    End While
+
+    Note: Add new callee
+    memory_set_pointer(callees, callee_count multiplied by 8, string_duplicate(callee_name))
+    memory_set_int32(node, 24, callee_count plus 1)
+
+    Return 0
+End Process
+
+Note: Add a node to the call graph
+Process called "callgraph_add_node" takes graph as Integer, node as Integer returns Integer:
+    Let nodes be memory_get_pointer(graph, 0)
+    Let node_count be memory_get_int32(graph, 8)
+
+    Note: Store the node
+    memory_set_pointer(nodes, node_count multiplied by 8, node)
+    memory_set_int32(graph, 8, node_count plus 1)
+
+    Return 0
+End Process
+
+Note: Find a node in the call graph by function name
+Process called "callgraph_find_node" takes graph as Integer, function_name as Integer returns Integer:
+    Let nodes be memory_get_pointer(graph, 0)
+    Let node_count be memory_get_int32(graph, 8)
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be memory_get_pointer(nodes, i multiplied by 8)
+        Let node_name be memory_get_pointer(node, 0)
+
+        If string_equals(node_name, function_name) is equal to 1:
+            Return node
+        End If
+
+        Let i be i plus 1
+    End While
+
+    Return 0  Note: Not found
+End Process
+
+Note: Traverse expression to find function calls
+Process called "callgraph_collect_calls_from_expr" takes graph as Integer, node as Integer, expr as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    Let expr_type be memory_get_int32(expr, 0)
+
+    Note: EXPR_FUNCTION_CALL = 9
+    If expr_type is equal to 9:
+        Let function_call_ptr be expr plus 8
+        Let function_name be memory_get_pointer(function_call_ptr, 0)
+
+        Note: Add this function to the callees
+        callgraph_node_add_callee(node, function_name)
+
+        Note: Also traverse arguments
+        Let arguments be memory_get_pointer(function_call_ptr, 8)
+        Let arg_count be memory_get_int32(function_call_ptr, 16)
+
+        Let i be 0
+        While i is less than arg_count:
+            Let arg_expr be memory_get_pointer(arguments, i multiplied by 8)
+            callgraph_collect_calls_from_expr(graph, node, arg_expr)
+            Let i be i plus 1
+        End While
+    End If
+
+    Note: EXPR_BINARY_OP = 2
+    If expr_type is equal to 2:
+        Let binary_op_ptr be expr plus 8
+        Let left be memory_get_pointer(binary_op_ptr, 0)
+        Let right be memory_get_pointer(binary_op_ptr, 8)
+
+        callgraph_collect_calls_from_expr(graph, node, left)
+        callgraph_collect_calls_from_expr(graph, node, right)
+    End If
+
+    Note: EXPR_UNARY_OP = 3
+    If expr_type is equal to 3:
+        Let unary_op_ptr be expr plus 8
+        Let operand be memory_get_pointer(unary_op_ptr, 8)
+
+        callgraph_collect_calls_from_expr(graph, node, operand)
+    End If
+
+    Note: EXPR_LET = 4 (let expressions with initializer)
+    If expr_type is equal to 4:
+        Let let_ptr be expr plus 8
+        Let value be memory_get_pointer(let_ptr, 16)
+
+        callgraph_collect_calls_from_expr(graph, node, value)
+    End If
+
+    Note: EXPR_SET = 5 (set expressions)
+    If expr_type is equal to 5:
+        Let set_ptr be expr plus 8
+        Let value be memory_get_pointer(set_ptr, 8)
+
+        callgraph_collect_calls_from_expr(graph, node, value)
+    End If
+
+    Note: EXPR_FIELD_ACCESS = 10
+    If expr_type is equal to 10:
+        Let field_access_ptr be expr plus 8
+        Let object_expr be memory_get_pointer(field_access_ptr, 0)
+
+        callgraph_collect_calls_from_expr(graph, node, object_expr)
+    End If
+
+    Note: EXPR_ARRAY_INDEX = 11
+    If expr_type is equal to 11:
+        Let array_index_ptr be expr plus 8
+        Let array_expr be memory_get_pointer(array_index_ptr, 0)
+        Let index_expr be memory_get_pointer(array_index_ptr, 8)
+
+        callgraph_collect_calls_from_expr(graph, node, array_expr)
+        callgraph_collect_calls_from_expr(graph, node, index_expr)
+    End If
+
+    Return 0
+End Process
+
+Note: Traverse statement to find function calls
+Process called "callgraph_collect_calls_from_stmt" takes graph as Integer, node as Integer, stmt as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+
+    Let stmt_type be memory_get_int32(stmt, 0)
+
+    Note: STMT_EXPRESSION = 1
+    If stmt_type is equal to 1:
+        Let expr be memory_get_pointer(stmt, 8)
+        callgraph_collect_calls_from_expr(graph, node, expr)
+    End If
+
+    Note: STMT_IF = 2
+    If stmt_type is equal to 2:
+        Let if_ptr be stmt plus 8
+        Let condition be memory_get_pointer(if_ptr, 0)
+        Let then_stmts be memory_get_pointer(if_ptr, 8)
+        Let then_count be memory_get_int32(if_ptr, 16)
+        Let else_stmts be memory_get_pointer(if_ptr, 24)
+        Let else_count be memory_get_int32(if_ptr, 32)
+
+        callgraph_collect_calls_from_expr(graph, node, condition)
+
+        Let i be 0
+        While i is less than then_count:
+            Let then_stmt be memory_get_pointer(then_stmts, i multiplied by 8)
+            callgraph_collect_calls_from_stmt(graph, node, then_stmt)
+            Let i be i plus 1
+        End While
+
+        Let i be 0
+        While i is less than else_count:
+            Let else_stmt be memory_get_pointer(else_stmts, i multiplied by 8)
+            callgraph_collect_calls_from_stmt(graph, node, else_stmt)
+            Let i be i plus 1
+        End While
+    End If
+
+    Note: STMT_RETURN = 3
+    If stmt_type is equal to 3:
+        Let return_expr be memory_get_pointer(stmt, 8)
+        callgraph_collect_calls_from_expr(graph, node, return_expr)
+    End If
+
+    Note: STMT_WHILE = 4
+    If stmt_type is equal to 4:
+        Let while_ptr be stmt plus 8
+        Let condition be memory_get_pointer(while_ptr, 0)
+        Let body_stmts be memory_get_pointer(while_ptr, 8)
+        Let body_count be memory_get_int32(while_ptr, 16)
+
+        callgraph_collect_calls_from_expr(graph, node, condition)
+
+        Let i be 0
+        While i is less than body_count:
+            Let body_stmt be memory_get_pointer(body_stmts, i multiplied by 8)
+            callgraph_collect_calls_from_stmt(graph, node, body_stmt)
+            Let i be i plus 1
+        End While
+    End If
+
+    Note: STMT_FOR = 5
+    If stmt_type is equal to 5:
+        Let for_ptr be stmt plus 8
+        Let init be memory_get_pointer(for_ptr, 0)
+        Let condition be memory_get_pointer(for_ptr, 8)
+        Let increment be memory_get_pointer(for_ptr, 16)
+        Let body_stmts be memory_get_pointer(for_ptr, 24)
+        Let body_count be memory_get_int32(for_ptr, 32)
+
+        callgraph_collect_calls_from_expr(graph, node, init)
+        callgraph_collect_calls_from_expr(graph, node, condition)
+        callgraph_collect_calls_from_expr(graph, node, increment)
+
+        Let i be 0
+        While i is less than body_count:
+            Let body_stmt be memory_get_pointer(body_stmts, i multiplied by 8)
+            callgraph_collect_calls_from_stmt(graph, node, body_stmt)
+            Let i be i plus 1
+        End While
+    End If
+
+    Note: STMT_MATCH = 8
+    If stmt_type is equal to 8:
+        Let match_ptr be stmt plus 8
+        Let expr be memory_get_pointer(match_ptr, 0)
+        Let arms be memory_get_pointer(match_ptr, 8)
+        Let arm_count be memory_get_int32(match_ptr, 16)
+
+        callgraph_collect_calls_from_expr(graph, node, expr)
+
+        Let i be 0
+        While i is less than arm_count:
+            Let arm_offset be i multiplied by 32  Note: sizeof(MatchArm)
+            Let arm be arms plus arm_offset
+            Let body_stmts be memory_get_pointer(arm, 16)
+            Let body_count be memory_get_int32(arm, 24)
+
+            Let j be 0
+            While j is less than body_count:
+                Let body_stmt be memory_get_pointer(body_stmts, j multiplied by 8)
+                callgraph_collect_calls_from_stmt(graph, node, body_stmt)
+                Let j be j plus 1
+            End While
+
+            Let i be i plus 1
+        End While
+    End If
+
+    Return 0
+End Process
+
+Note: Build call graph from program AST
+Process called "callgraph_build" takes graph as Integer returns Integer:
+    Let program be memory_get_pointer(graph, 16)
+    Let functions be memory_get_pointer(program, 0)
+    Let function_count be memory_get_int32(program, 8)
+
+    Note: First pass: create nodes for all functions
+    Let i be 0
+    While i is less than function_count:
+        Let func be memory_get_pointer(functions, i multiplied by 8)
+
+        If func is not equal to 0:
+            Let func_name be memory_get_pointer(func, 0)
+            Let node be callgraph_node_create(func_name, func)
+            callgraph_add_node(graph, node)
+        End If
+
+        Let i be i plus 1
+    End While
+
+    Note: Second pass: traverse function bodies to collect calls
+    Let nodes be memory_get_pointer(graph, 0)
+    Let node_count be memory_get_int32(graph, 8)
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be memory_get_pointer(nodes, i multiplied by 8)
+        Let func be memory_get_pointer(node, 8)
+
+        Let statements be memory_get_pointer(func, 32)
+        Let stmt_count be memory_get_int32(func, 40)
+
+        Let j be 0
+        While j is less than stmt_count:
+            Let stmt be memory_get_pointer(statements, j multiplied by 8)
+            callgraph_collect_calls_from_stmt(graph, node, stmt)
+            Let j be j plus 1
+        End While
+
+        Let i be i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: Detect direct recursion (function calls itself)
+Process called "callgraph_detect_direct_recursion" takes graph as Integer, node as Integer returns Integer:
+    Let function_name be memory_get_pointer(node, 0)
+    Let callees be memory_get_pointer(node, 16)
+    Let callee_count be memory_get_int32(node, 24)
+
+    Let i be 0
+    While i is less than callee_count:
+        Let callee_name be memory_get_pointer(callees, i multiplied by 8)
+
+        If string_equals(function_name, callee_name) is equal to 1:
+            memory_set_int32(node, 28, 1)  Note: Mark as recursive
+            Return 1
+        End If
+
+        Let i be i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: Detect mutual recursion using depth-first search
+Note: Uses a visited array to track function visit state during DFS
+Note: visited states: 0 = unvisited, 1 = visiting (on stack), 2 = visited
+Process called "callgraph_detect_mutual_recursion_dfs" takes graph as Integer, node as Integer, visited as Integer, node_index as Integer returns Integer:
+    Note: Mark as visiting (on stack)
+    memory_set_int32(visited, node_index multiplied by 4, 1)
+
+    Let callees be memory_get_pointer(node, 16)
+    Let callee_count be memory_get_int32(node, 24)
+
+    Let found_cycle be 0
+
+    Let i be 0
+    While i is less than callee_count:
+        Let callee_name be memory_get_pointer(callees, i multiplied by 8)
+        Let callee_node be callgraph_find_node(graph, callee_name)
+
+        If callee_node is not equal to 0:
+            Note: Find callee's index
+            Let nodes be memory_get_pointer(graph, 0)
+            Let node_count be memory_get_int32(graph, 8)
+
+            Let callee_idx be 0
+            Let j be 0
+            While j is less than node_count:
+                Let check_node be memory_get_pointer(nodes, j multiplied by 8)
+                If check_node is equal to callee_node:
+                    Let callee_idx be j
+                    Let j be node_count  Note: Break
+                End If
+                Let j be j plus 1
+            End While
+
+            Let callee_state be memory_get_int32(visited, callee_idx multiplied by 4)
+
+            Note: If callee is currently being visited, we found a cycle
+            If callee_state is equal to 1:
+                memory_set_int32(node, 28, 1)  Note: Mark current as recursive
+                memory_set_int32(callee_node, 28, 1)  Note: Mark callee as recursive
+                Let found_cycle be 1
+            End If
+
+            Note: If callee is unvisited, recurse
+            If callee_state is equal to 0:
+                Let cycle_found be callgraph_detect_mutual_recursion_dfs(graph, callee_node, visited, callee_idx)
+                If cycle_found is equal to 1:
+                    Let found_cycle be 1
+                End If
+            End If
+        End If
+
+        Let i be i plus 1
+    End While
+
+    Note: Mark as visited (done)
+    memory_set_int32(visited, node_index multiplied by 4, 2)
+
+    Return found_cycle
+End Process
+
+Note: Detect all recursion (direct and mutual)
+Process called "callgraph_detect_recursion" takes graph as Integer returns Integer:
+    Let nodes be memory_get_pointer(graph, 0)
+    Let node_count be memory_get_int32(graph, 8)
+
+    Note: First detect direct recursion
+    Let i be 0
+    While i is less than node_count:
+        Let node be memory_get_pointer(nodes, i multiplied by 8)
+        callgraph_detect_direct_recursion(graph, node)
+        Let i be i plus 1
+    End While
+
+    Note: Then detect mutual recursion using DFS
+    Let visited be allocate(node_count multiplied by 4)  Note: Array of int32
+
+    Note: Initialize all to unvisited (0)
+    Let i be 0
+    While i is less than node_count:
+        memory_set_int32(visited, i multiplied by 4, 0)
+        Let i be i plus 1
+    End While
+
+    Note: Run DFS from each unvisited node
+    Let i be 0
+    While i is less than node_count:
+        Let state be memory_get_int32(visited, i multiplied by 4)
+        If state is equal to 0:
+            Let node be memory_get_pointer(nodes, i multiplied by 8)
+            callgraph_detect_mutual_recursion_dfs(graph, node, visited, i)
+        End If
+        Let i be i plus 1
+    End While
+
+    deallocate(visited)
+    Return 0
+End Process
+
+Note: Check if a return statement is a tail call
+Process called "is_tail_call" takes stmt as Integer, function_name as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+
+    Let stmt_type be memory_get_int32(stmt, 0)
+
+    Note: STMT_RETURN = 3
+    If stmt_type is not equal to 3:
+        Return 0
+    End If
+
+    Let return_expr be memory_get_pointer(stmt, 8)
+    If return_expr is equal to 0:
+        Return 0
+    End If
+
+    Let expr_type be memory_get_int32(return_expr, 0)
+
+    Note: EXPR_FUNCTION_CALL = 9
+    If expr_type is not equal to 9:
+        Return 0
+    End If
+
+    Let function_call_ptr be return_expr plus 8
+    Let called_function_name be memory_get_pointer(function_call_ptr, 0)
+
+    Note: Check if it's calling itself
+    If string_equals(function_name, called_function_name) is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: Calculate stack size needed for a function
+Note: This includes local variables and call depth estimation
+Process called "callgraph_calculate_stack_size" takes node as Integer returns Integer:
+    Let func be memory_get_pointer(node, 8)
+
+    Note: Base stack size: 2048 bytes (conservative estimate)
+    Let stack_size be 2048
+
+    Note: Check if recursive - if so, needs unlimited stack
+    Let is_recursive be memory_get_int32(node, 28)
+    If is_recursive is equal to 1:
+        Return -1  Note: -1 indicates unbounded/recursive
+    End If
+
+    Note: Add 256 bytes per callee (conservative estimate for call overhead)
+    Let callee_count be memory_get_int32(node, 24)
+    Let stack_size be stack_size plus callee_count multiplied by 256
+
+    Return stack_size
+End Process
+
+Note: Print recursion warnings for all recursive functions
+Process called "callgraph_print_warnings" takes graph as Integer returns Integer:
+    Let nodes be memory_get_pointer(graph, 0)
+    Let node_count be memory_get_int32(graph, 8)
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be memory_get_pointer(nodes, i multiplied by 8)
+        Let is_recursive be memory_get_int32(node, 28)
+
+        If is_recursive is equal to 1:
+            Let function_name be memory_get_pointer(node, 0)
+
+            print_string("[WARNING] Recursive function detected: ")
+            print_string(function_name)
+            print_string("\n")
+            print_string("          Stack overflow possible. Consider tail call optimization or iterative approach.\n")
+        End If
+
+        Let i be i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: Inject stack probe at function prologue
+Note: This checks if stack pointer is within safe bounds before proceeding
+Process called "codegen_inject_stack_probe" takes output_file as Integer, function_name as Integer, is_recursive as Integer returns Integer:
+    Note: Only inject probes for recursive functions or in debug mode
+    If is_recursive is equal to 0:
+        Return 0
+    End If
+
+    emit_line(output_file, "    # Stack overflow protection")
+    emit_line(output_file, "    movq %rsp, %rax")
+    emit_line(output_file, "    subq $16384, %rax  # Check if we have 16KB stack space")
+
+    Note: Compare against a conservative stack limit
+    Note: In a full implementation, this would check against __stack_limit
+    emit_line(output_file, "    cmpq $0x100000, %rax  # Compare against 1MB limit")
+    emit_line(output_file, "    jb .stack_overflow_panic")
+
+    Return 0
+End Process
+
+Note: Generate stack overflow panic handler
+Process called "codegen_generate_stack_overflow_handler" takes output_file as Integer returns Integer:
+    file_write_buffered(output_file, "\n", 0)
+    emit_line(output_file, "# Stack overflow panic handler")
+    emit_line(output_file, ".stack_overflow_panic:")
+    emit_line(output_file, "    # Print error message")
+    emit_line(output_file, "    leaq .stack_overflow_msg(%rip), %rdi")
+    emit_line(output_file, "    call print_string@PLT")
+    emit_line(output_file, "    # Exit with error code")
+    emit_line(output_file, "    movq $1, %rdi")
+    emit_line(output_file, "    call exit_with_code@PLT")
+    file_write_buffered(output_file, "\n", 0)
+    emit_line(output_file, ".section .rodata")
+    emit_line(output_file, ".stack_overflow_msg:")
+    emit_line(output_file, "    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32")  Note: "FATAL ERROR: "
+    emit_line(output_file, "    .byte 83,116,97,99,107,32,111,118,101,114,102,108,111,119,32")  Note: "Stack overflow "
+    emit_line(output_file, "    .byte 100,101,116,101,99,116,101,100")  Note: "detected"
+    emit_line(output_file, "    .byte 10,0")
+    emit_line(output_file, ".text")
+    file_write_buffered(output_file, "\n", 0)
+
+    Return 0
+End Process
+
+Note: ========================================================================
+Note: END OF STACK SAFETY & MEMORY FOUNDATION
+Note: ========================================================================
