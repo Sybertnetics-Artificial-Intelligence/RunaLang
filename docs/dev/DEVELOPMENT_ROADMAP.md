@@ -88,8 +88,9 @@ Codegen → Assembly → Binary
 | **v0.0.8.4** | Lambda Expressions + Type Inference | 🔄 **In Progress** |
 | **v0.0.8.5** | String Interpolation, Ternary Operator | 📋 Planned |
 | **v0.0.8.6** | Advanced Types Phase 1: Range Constraints + Float/Float64 | 📋 Planned |
-| **v0.0.8.7** | Advanced Types Phase 2: Wire Format Types (Integer16/32) + FFI Types | 📋 Planned |
+| **v0.0.8.7** | Advanced Types Phase 2: Wire Format Types (Integer8/16/32/64) + FFI Types | 📋 Planned |
 | **v0.0.8.8** | FFI & C Interop - External Library Bindings | 📋 Planned |
+| **v0.0.8.9** | Advanced Type System Features (Traits, Union Types, Refinement Types) | 📋 Planned |
 | **v0.0.9** | Error Handling, Generics, Native Object Writer & Pure Runa Runtime | 📋 Planned |
 | **v0.1.0** | Beta Release - Toolchain Independence + Stdlib Foundation | 🎯 Milestone |
 | **v0.2.0** | Standard Library Expansion + Triple Syntax (--canon/--developer/--viewer) | 📋 Planned |
@@ -115,6 +116,7 @@ Codegen → Assembly → Binary
 | **v0.9.2** | Cross-Compilation: macOS Support (x86-64 + ARM64 Mach-O format) | 📋 Planned |
 | **v0.9.3** | Cross-Compilation: ARM64 Linux Support | 📋 Planned |
 | **v0.9.4** | Cross-Compilation: WebAssembly Support (WASM + WASI) | 📋 Planned |
+| **v0.9.4.5** | GPU Acceleration Backends (CUDA, OpenCL, Metal) | 📋 Planned |
 | **v0.9.5** | Package Management & Distribution | 📋 Planned |
 | **v0.9.6** | IDE Tooling (LSP, Debugger, Profiler) | 📋 Planned |
 | **v0.9.7** | AI Annotation System Implementation | 📋 Planned |
@@ -187,7 +189,6 @@ Let x as Integer be 42
 - ✅ Type errors are reported when inference fails
 - ✅ All tests pass including lambda and inference tests
 
-## Timeline: TBD
 
 ---
 
@@ -237,7 +238,223 @@ Let x as Integer be 42
 - ✅ Character type operations work
 - ✅ All features tested
 
-## Timeline: TBD
+
+---
+
+# 🔹 v0.0.8.6: Advanced Types Phase 1 - Range Constraints, Float & Float64
+
+**Goal:** Implement refinement-style range constraints and floating-point numeric types for better domain modeling and numerical computing.
+
+**Priority:** MEDIUM - Required for scientific computing, domain validation, and type safety improvements.
+
+## What Belongs Where:
+
+### COMPILER (Type System):
+
+- ❌ **Range-constrained integer types**:
+  ```runa
+  Type called "Percentage" is Integer where value is greater than or equal to 0 and value is less than or equal to 100
+  Type called "PositiveInteger" is Integer where value is greater than 0
+  Type called "Port" is Integer where value is greater than 0 and value is less than 65536
+  Type called "ValidAge" is Integer where value is greater than or equal to 0 and value is less than 150
+  ```
+  - Parser: Recognize `Type X is BaseType where CONSTRAINT` syntax
+  - Type Checker: Verify constraints at compile-time when possible
+  - Codegen: Insert runtime checks when compile-time verification impossible
+
+- ❌ **Compile-time constraint verification**:
+  ```runa
+  Let percent as Percentage be 50      # OK - compile-time verified
+  Let invalid as Percentage be 150     # ERROR - compile-time violation detected
+  ```
+  - Simple constant constraints checked during parsing/type-checking
+  - Complex constraints deferred to runtime
+
+- ❌ **Runtime constraint verification**:
+  ```runa
+  Process called "set_volume" takes vol as Percentage returns Nothing:
+      Note: Constraint checked at runtime if 'vol' is dynamic
+      # Compiler inserts: if (vol < 0 || vol > 100) panic("Constraint violation")
+  End Process
+  ```
+  - Insert boundary checks at function entry
+  - Panic with clear error message on violation
+
+- ❌ **Float (32-bit) and Float64 (64-bit) types**:
+  ```runa
+  Let pi as Float be 3.14159
+  Let precise_pi as Float64 be 3.141592653589793
+
+  Process called "calculate_area" takes radius as Float64 returns Float64:
+      Return 3.141592653589793 times radius times radius
+  End Process
+  ```
+  - Parser: Recognize Float and Float64 type annotations
+  - Lexer: Distinguish integer vs floating-point literals (presence of decimal point)
+  - Codegen: Use SSE/AVX instructions for floating-point operations
+
+- ❌ **Floating-point literal syntax**:
+  ```runa
+  Let x be 3.14          # Inferred as Float64
+  Let y be 2.5e10        # Scientific notation: 2.5 × 10^10
+  Let z be 1.0e-5        # 0.00001
+  ```
+
+- ❌ **Floating-point operations**:
+  - Arithmetic: `plus`, `minus`, `times`, `divided by`
+  - Comparisons: `is equal to`, `is less than`, etc. (with epsilon tolerance handling)
+  - Math functions: `sqrt`, `pow`, `sin`, `cos`, `tan` (via runtime/FFI)
+
+### RUNTIME:
+- ❌ **Range check helpers**:
+  ```runa
+  Process called "check_range" takes value as Integer, min as Integer, max as Integer, type_name as String returns Nothing:
+      If value is less than min or value is greater than max:
+          Display("Range constraint violation for ")
+          Display(type_name)
+          Display(": expected ")
+          Display(integer_to_string(min))
+          Display(" to ")
+          Display(integer_to_string(max))
+          Display(", got ")
+          Display(integer_to_string(value))
+          exit_with_code(1)
+      End If
+  End Process
+  ```
+
+- ❌ **Floating-point math library**:
+  - `sqrt(x)`, `pow(x, y)`, `abs(x)`, `floor(x)`, `ceil(x)`, `round(x)`
+  - Trigonometric: `sin(x)`, `cos(x)`, `tan(x)`, `asin(x)`, `acos(x)`, `atan(x)`
+  - Logarithmic: `log(x)`, `log10(x)`, `exp(x)`
+  - Initially use libm via FFI, later implement in pure Runa with inline assembly
+
+### CODEGEN:
+- ❌ **SSE/AVX floating-point instructions**:
+  - `movsd` (move scalar double)
+  - `addsd`, `subsd`, `mulsd`, `divsd` (scalar double arithmetic)
+  - `movss`, `addss`, `subss`, `mulss`, `divss` (scalar single arithmetic)
+  - `ucomisd`, `ucomiss` (floating-point comparison)
+
+## Success Criteria:
+- ✅ Range-constrained types compile and enforce constraints
+- ✅ Compile-time constraint violations are detected (constants)
+- ✅ Runtime constraint violations panic with clear error messages
+- ✅ Float and Float64 types parse correctly
+- ✅ Floating-point arithmetic works (add, sub, mul, div)
+- ✅ Floating-point comparisons work (with proper epsilon handling)
+- ✅ SSE/AVX instructions used for floating-point operations
+- ✅ Math library functions available (sqrt, sin, cos, etc.)
+- ✅ All tests pass including range and float tests
+
+
+---
+
+# 🔹 v0.0.8.7: Advanced Types Phase 2 - Wire Format Types & FFI Type Foundation
+
+**Goal:** Implement fixed-size integer types for network protocols, binary formats, and FFI compatibility with C/C++.
+
+**Priority:** HIGH - Required for v0.0.8.8 (FFI), binary I/O, network programming, and low-level system programming.
+
+## What Belongs Where:
+
+### COMPILER (Type System):
+
+- ❌ **Fixed-size signed integer types**:
+  ```runa
+  Type Integer8   # 8-bit signed: -128 to 127
+  Type Integer16  # 16-bit signed: -32,768 to 32,767
+  Type Integer32  # 32-bit signed: -2,147,483,648 to 2,147,483,647
+  Type Integer64  # 64-bit signed (alias for Integer)
+  ```
+  - Parser: Recognize Integer8/16/32/64 type names
+  - Type Checker: Track size for operations and conversions
+  - Codegen: Use appropriate load/store instructions (movb, movw, movl, movq)
+
+- ❌ **Fixed-size unsigned integer types**:
+  ```runa
+  Type UnsignedInteger8   # uint8_t: 0 to 255
+  Type UnsignedInteger16  # uint16_t: 0 to 65,535
+  Type UnsignedInteger32  # uint32_t: 0 to 4,294,967,295
+  Type UnsignedInteger64  # uint64_t: 0 to 18,446,744,073,709,551,615
+  ```
+  - Required for bit manipulation, binary protocols, graphics (RGBA colors)
+  - Codegen: Use unsigned comparison instructions (ja, jb vs jg, jl)
+
+- ❌ **Type conversions and casts**:
+  ```runa
+  Let x as Integer32 be 1000
+  Let y as Integer64 be x as Integer64           # Sign-extend 32→64
+  Let z as UnsignedInteger8 be 255
+  Let overflow as Integer8 be z as Integer8      # Truncate/reinterpret
+  ```
+  - Explicit casting required for safety
+  - Sign-extension for signed types
+  - Zero-extension for unsigned types
+  - Truncation warnings for narrowing conversions
+
+- ❌ **Byte order operations (Endianness)**:
+  ```runa
+  Process called "to_big_endian" takes value as Integer32 returns Integer32:
+      # Convert to network byte order (big-endian)
+      Inline Assembly:
+          movl %value, %eax
+          bswap %eax        # Byte swap
+          movl %eax, %result
+      End Assembly
+  End Process
+
+  Process called "to_little_endian" takes value as Integer32 returns Integer32:
+      # x86-64 is little-endian, so this is a no-op
+      Return value
+  End Process
+  ```
+
+- ❌ **Binary literal syntax**:
+  ```runa
+  Let flags as UnsignedInteger8 be 0b10110101    # Binary literal
+  Let mask as UnsignedInteger16 be 0x1F3A        # Hex literal (already supported)
+  ```
+  - Parser: Recognize `0b` prefix for binary literals
+
+### RUNTIME:
+- ❌ **Binary I/O functions**:
+  ```runa
+  Process called "read_integer32" takes fd as Integer returns Integer32
+  Process called "write_integer32" takes fd as Integer, value as Integer32 returns Integer
+  Process called "read_bytes" takes fd as Integer, buffer as Pointer, count as Integer returns Integer
+  Process called "write_bytes" takes fd as Integer, buffer as Pointer, count as Integer returns Integer
+  ```
+
+- ❌ **Endianness conversion helpers**:
+  ```runa
+  Process called "htobe16" takes value as Integer16 returns Integer16  # Host to big-endian 16-bit
+  Process called "htobe32" takes value as Integer32 returns Integer32
+  Process called "htobe64" takes value as Integer64 returns Integer64
+  Process called "htole16" takes value as Integer16 returns Integer16  # Host to little-endian
+  Process called "be16toh" takes value as Integer16 returns Integer16  # Big-endian to host
+  Process called "le16toh" takes value as Integer16 returns Integer16  # Little-endian to host
+  ```
+
+### CODEGEN:
+- ❌ **Size-specific load/store instructions**:
+  - `movb` - 8-bit (1 byte)
+  - `movw` - 16-bit (2 bytes)
+  - `movl` - 32-bit (4 bytes)
+  - `movq` - 64-bit (8 bytes)
+  - Sign-extension: `movsbq` (byte to quad), `movswq` (word to quad), `movslq` (long to quad)
+  - Zero-extension: `movzbq`, `movzwq`, `movzlq`
+
+## Success Criteria:
+- ✅ All fixed-size integer types (8/16/32/64, signed/unsigned) parse correctly
+- ✅ Type conversions work with proper sign/zero extension
+- ✅ Binary literals parse correctly (0b prefix)
+- ✅ Endianness conversion functions work
+- ✅ Binary I/O functions read/write correct byte counts
+- ✅ Size-specific assembly instructions generated (movb/w/l/q)
+- ✅ Overflow/truncation warnings for narrowing conversions
+- ✅ All tests pass including wire format and binary I/O tests
+
 
 ---
 
@@ -359,7 +576,214 @@ End Process
 - ✅ Example programs work: SQLite database, SDL2 window, curl HTTP request
 - ✅ All tests pass including FFI integration tests
 
-## Timeline: TBD
+
+---
+
+# 🔹 v0.0.8.9: Traits, Union Types & Advanced Type System Features
+
+**Goal:** Complete the advanced type system with traits (interfaces/protocols), union types, and refinement types moved from v0.6.0/v0.6.1.
+
+**Priority:** MEDIUM-HIGH - Enables polymorphism, flexible type modeling, and enhanced type safety before v0.0.9 stdlib work.
+
+## What Belongs Where:
+
+### COMPILER (Type System):
+
+#### 1. **Traits/Protocols** (from v0.6.0)
+
+- ❌ **Trait definitions**:
+  ```runa
+  Trait called "Comparable":
+      Process called "compare" takes self as This, other as This returns Integer
+  End Trait
+
+  Trait called "Printable":
+      Process called "to_string" takes self as This returns String
+  End Trait
+
+  Trait called "Iterator" with type parameter T:
+      Process called "next" takes self as This returns Option of T
+      Process called "has_next" takes self as This returns Boolean
+  End Trait
+  ```
+  - Parser: Recognize `Trait called NAME` declarations
+  - Type Checker: Track trait requirements (method signatures)
+  - Codegen: Generate vtables for dynamic dispatch
+
+- ❌ **Trait implementation**:
+  ```runa
+  Type called "Point" implements Comparable and Printable:
+      x as Integer
+      y as Integer
+
+      Process called "compare" takes self as Point, other as Point returns Integer:
+          If self.x is equal to other.x:
+              Return self.y minus other.y
+          Otherwise:
+              Return self.x minus other.x
+          End If
+      End Process
+
+      Process called "to_string" takes self as Point returns String:
+          Return "Point(" plus integer_to_string(self.x) plus ", " plus integer_to_string(self.y) plus ")"
+      End Process
+  End Type
+  ```
+  - Parser: Recognize `implements TRAIT` clause
+  - Type Checker: Verify all trait methods are implemented
+  - Verify method signatures match trait requirements
+
+- ❌ **Generic constraints with traits**:
+  ```runa
+  Process called "max" with type parameter T where T implements Comparable takes a as T, b as T returns T:
+      If a.compare(b) is greater than 0:
+          Return a
+      Otherwise:
+          Return b
+      End If
+  End Process
+
+  # Usage:
+  Let p1 be Point with x as 1 and y as 2
+  Let p2 be Point with x as 3 and y as 4
+  Let bigger be max(p1, p2)  # Type checker verifies Point implements Comparable
+  ```
+
+- ❌ **Trait objects (dynamic dispatch)**:
+  ```runa
+  Process called "print_all" takes items as List of Printable returns Nothing:
+      For each item in items:
+          Display(item.to_string())  # Dynamic dispatch via vtable
+      End For
+  End Process
+  ```
+  - Codegen: Generate vtable pointers and dispatch code
+  - Runtime cost: One level of indirection per call
+
+#### 2. **Union Types** (from v0.6.0)
+
+- ❌ **Union type definitions**:
+  ```runa
+  Type called "IntOrString" is:
+      Union:
+          Integer
+          Or
+          String
+      End Union
+  End Type
+
+  Type called "NumberOrError" is:
+      Union:
+          Integer
+          Or
+          Float64
+          Or
+          String   # Error message
+      End Union
+  End Type
+  ```
+  - Parser: Recognize `Union: ... Or ... End Union` syntax
+  - Type Checker: Track which type variant is active (runtime tag)
+  - Different from ADTs: No field names, just type alternatives
+
+- ❌ **Union value creation**:
+  ```runa
+  Let value as IntOrString be 42 as IntOrString           # Store Integer variant
+  Set value to "hello" as IntOrString                     # Now store String variant
+
+  Let result as NumberOrError be 3.14 as NumberOrError    # Float64 variant
+  Set result to "division by zero" as NumberOrError       # Error variant
+  ```
+  - Explicit cast required to disambiguate type
+  - Runtime tag updated on assignment
+
+- ❌ **Union type checking (pattern matching)**:
+  ```runa
+  Match value:
+      When Integer as i:
+          Display("Got integer: ")
+          Display(integer_to_string(i))
+      When String as s:
+          Display("Got string: ")
+          Display(s)
+  End Match
+  ```
+  - Type-based pattern matching (different from variant-based)
+  - Extract value with correct type
+
+- ❌ **Type guards**:
+  ```runa
+  If value is of type Integer:
+      Let i as Integer be value as Integer
+      Display("Integer: ")
+      Display(integer_to_string(i))
+  Otherwise If value is of type String:
+      Let s as String be value as String
+      Display("String: ")
+      Display(s)
+  End If
+  ```
+
+#### 3. **Refinement Types** (from v0.6.1 - extends v0.0.8.6 range constraints)
+
+- ❌ **Advanced refinement predicates**:
+  ```runa
+  Type called "NonEmptyString" is String where string_length(value) is greater than 0
+  Type called "EvenInteger" is Integer where value modulo 2 is equal to 0
+  Type called "PrimeNumber" is Integer where is_prime(value) is equal to 1
+  Type called "ValidEmail" is String where contains(value, "@") and contains(value, ".")
+  ```
+  - Extends v0.0.8.6 range constraints with arbitrary predicates
+  - Compile-time verification when possible (constants, simple expressions)
+  - Runtime verification via predicate function calls
+
+- ❌ **Dependent typing (limited)**:
+  ```runa
+  Process called "safe_divide" takes a as Integer, b as NonZeroInteger returns Integer:
+      Return a divided by b  # Compiler knows b cannot be zero
+  End Process
+
+  Type called "NonZeroInteger" is Integer where value is not equal to 0
+  ```
+
+- ❌ **Refinement type inference**:
+  ```runa
+  Let x be 5  # Inferred as Integer
+  If x is greater than 0:
+      # Within this scope, x is known to be PositiveInteger
+      pass_to_positive_function(x)
+  End If
+  ```
+
+### CODEGEN:
+
+- ❌ **Vtable generation for traits**:
+  - Generate vtable structs with function pointers
+  - Store vtable pointer in trait objects
+  - Indirect call through vtable for dynamic dispatch
+
+- ❌ **Union type tags**:
+  - Store type discriminator (similar to ADT tags)
+  - Layout: `[tag: int32][value: largest_variant_size]`
+  - Runtime checks on access
+
+- ❌ **Refinement check insertion**:
+  - Insert predicate calls at type boundaries
+  - Panic on refinement violation with clear message
+
+## Success Criteria:
+- ✅ Traits parse and type-check correctly
+- ✅ Trait implementations verified (all methods present, correct signatures)
+- ✅ Generic constraints with traits work
+- ✅ Trait objects support dynamic dispatch (vtables)
+- ✅ Union types store and retrieve values correctly
+- ✅ Union type tags updated on assignment
+- ✅ Pattern matching on union types works
+- ✅ Type guards (is of type) work
+- ✅ Refinement types enforce predicates at compile-time when possible
+- ✅ Refinement types enforce predicates at runtime when necessary
+- ✅ All tests pass including traits, unions, and refinement tests
+
 
 ---
 
@@ -626,7 +1050,6 @@ runac program.runa --link runtime.o -o program        # Pure Runa
 - ✅ Self-hosting with native object generation
 - ✅ Bootstrap produces identical binaries
 
-## Timeline: TBD
 
 ---
 
@@ -691,7 +1114,6 @@ runac program.runa --link runtime.o -o program        # Pure Runa
 - ✅ Documentation complete
 - ✅ Public release ready
 
-## Timeline: TBD
 
 ---
 
@@ -821,7 +1243,6 @@ These are Runa modules (.runa files) that users import
 - ✅ Example programs demonstrating all modes
 - ✅ Comprehensive test suite covering all syntax variations
 
-## Timeline: TBD
 
 ---
 
@@ -953,7 +1374,6 @@ End Process
 - ✅ Example programs: REST API client, simple HTTP server
 - ✅ All tests pass including network integration tests
 
-## Timeline: TBD
 
 ---
 
@@ -1077,7 +1497,6 @@ End Process
 - ✅ Example programs: API response parsing, config file reading
 - ✅ All tests pass including edge cases
 
-## Timeline: TBD
 
 ---
 
@@ -1238,7 +1657,6 @@ End Process
 - ✅ Performance: Handle 1000+ requests/second
 - ✅ All tests pass including stress tests
 
-## Timeline: TBD
 
 ---
 
@@ -1319,7 +1737,6 @@ End Process
 - ✅ GDB can debug Runa programs
 - ✅ Panic shows full stack trace before exit
 
-## Timeline: TBD
 
 ---
 
@@ -1416,7 +1833,6 @@ End Process
 - ✅ Rc<T> works for shared ownership cases
 - ✅ Arena allocators provide zero-cost bulk deallocation
 
-## Timeline: TBD
 
 ---
 
@@ -1524,7 +1940,6 @@ All optimizations happen between parsing and codegen
 - ✅ All tests still pass with optimizations enabled
 - ✅ Debug builds (-O0) compile fast for development
 
-## Timeline: TBD
 
 ---
 
@@ -1679,7 +2094,6 @@ End Process
 - ✅ Generic code is as fast as hand-written specialized code
 - ✅ Union types safely handle multiple type cases
 
-## Timeline: TBD
 
 ---
 
@@ -1751,7 +2165,6 @@ End Process
 - ✅ Runtime checks are minimal and optimized
 - ✅ Error messages show inferred types clearly
 
-## Timeline: TBD
 
 ---
 
@@ -1838,7 +2251,6 @@ End Process
 - ✅ Compiler catches common concurrency bugs
 - ✅ Documentation includes concurrency guide
 
-## Timeline: TBD
 
 ---
 
@@ -1903,7 +2315,6 @@ End Process
 - ✅ Documentation includes async programming guide
 - ✅ Benchmarks show performance comparable to Tokio/async-std
 
-## Timeline: TBD
 
 ---
 
@@ -2048,7 +2459,6 @@ src/compiler/ir/
 - ✅ Foundation for Rosetta Stone (C → HIR, HIR → Python in v1.1+)
 - ✅ All existing tests pass with HIR pipeline enabled
 
-## Timeline: 4-6 weeks
 
 ---
 
@@ -2217,7 +2627,6 @@ src/compiler/ir/
 - ✅ All optimizations preserve program semantics (tests still pass)
 - ✅ Performance improvement: 10-20% on benchmarks vs unoptimized
 
-## Timeline: 6-8 weeks
 
 ---
 
@@ -2357,7 +2766,6 @@ src/compiler/ir/
 - ✅ Performance matches current direct-to-assembly codegen
 - ✅ Foundation for multi-backend support (x86-64, ARM64, WASM)
 
-## Timeline: 6-8 weeks
 
 ---
 
@@ -2443,7 +2851,6 @@ src/compiler/ir/
 - ✅ Performance matches or beats C on benchmarks (-O3)
 - ✅ Compilation time still reasonable (< 2x slower than C at -O3)
 
-## Timeline: 8-10 weeks
 
 ---
 
@@ -2611,7 +3018,6 @@ src/compiler/ir/
 - ✅ Bytecode format is stable and documented
 - ✅ Interpreter supports all language features
 
-## Timeline: TBD
 
 ---
 
@@ -2701,7 +3107,6 @@ src/compiler/ir/
 - ✅ OSR allows long-running functions to be optimized mid-execution
 - ✅ Compilation happens in background without blocking
 
-## Timeline: TBD
 
 ---
 
@@ -2809,7 +3214,6 @@ src/compiler/ir/
 - ✅ Adaptive optimization prevents repeated speculation failures
 - ✅ Benchmarks show competitive performance with V8, PyPy, LuaJIT
 
-## Timeline: TBD
 
 ---
 
@@ -3019,7 +3423,6 @@ stdlib/
 - ✅ HIR → Backend interface well-defined
 - ✅ Foundation ready for v0.9.1+ (Windows, macOS, ARM64, WASM)
 
-## Timeline: 3-4 weeks
 
 ---
 
@@ -3118,7 +3521,6 @@ stdlib/
 - ✅ Microsoft x64 calling convention implemented correctly
 - ✅ Win32 API calls work (file I/O, networking, processes)
 
-## Timeline: 4-6 weeks
 
 ---
 
@@ -3239,7 +3641,6 @@ stdlib/
 - ✅ Can create universal binaries (both x86-64 and ARM64)
 - ✅ Code signing works (ad-hoc for development)
 
-## Timeline: 4-6 weeks
 
 ---
 
@@ -3334,7 +3735,6 @@ stdlib/
 - ✅ Can cross-compile from x86-64 to ARM64
 - ✅ Performance comparable to x86-64 (accounting for CPU differences)
 
-## Timeline: 3-4 weeks
 
 ---
 
@@ -3463,7 +3863,278 @@ stdlib/
 - ✅ Standard library works in WASM environment (sandboxed)
 - ✅ Can output .wat (text format) for debugging
 
-## Timeline: 4-5 weeks
+
+---
+
+# 🔹 v0.9.4.5: GPU Acceleration Backends (CUDA, OpenCL, Metal)
+
+**Goal:** Enable GPU-accelerated computation with automatic parallelization and multi-backend support.
+
+## Platform Details:
+
+**Supported Backends:**
+- **CUDA** - NVIDIA GPUs (AI/ML training, tensor cores)
+- **OpenCL** - Universal GPU support (cross-platform scientific computing)
+- **Metal** - Apple GPUs (macOS/iOS optimal performance)
+
+**Architecture:** LIR → GPU Kernel Compilation
+**Capabilities:** Automatic parallelization, kernel fusion, memory optimization
+
+## What Belongs Where:
+
+### COMPILER (GPU Backend Infrastructure):
+
+- ❌ **GPU Backend Type System** (src/backends/gpu/gpu_backend.runa)
+  ```runa
+  Type GpuBackendType is:
+      | Cuda
+      | OpenCL
+      | Metal
+      | Auto  # Automatically detect best backend
+
+  Type GpuDevice is Dictionary with:
+      device_id as Integer
+      name as String
+      backend_type as GpuBackendType
+      capabilities as GpuCapabilities
+      memory_total as Integer
+      memory_available as Integer
+      is_available as Boolean
+
+  Type GpuCapabilities is Dictionary with:
+      compute_capability as String
+      max_threads_per_block as Integer
+      max_shared_memory as Integer
+      max_registers_per_thread as Integer
+      supports_double_precision as Boolean
+      supports_tensor_cores as Boolean
+      warp_size as Integer
+  ```
+
+- ❌ **Automatic Parallelization Analyzer** (src/backends/gpu/parallelization_analyzer.runa)
+  - Analyze Runa AST for parallelizable loops
+  - Detect data dependencies and access patterns
+  - Identify reduction patterns (sum, product, min, max)
+  - Suggest optimal thread block sizes
+  - Generate parallelization hints for kernel generation
+
+  **Parallelization Detection:**
+  ```runa
+  # Runa source code:
+  Let sum be 0
+  For i from 0 to 1000000:
+      Set sum to sum plus array[i]
+  End For
+
+  # Parallelization analyzer detects:
+  # - Pattern: Reduction (sum)
+  # - Memory access: Sequential
+  # - Dependencies: None (embarrassingly parallel)
+  # - Suggested strategy: Parallel reduction with shared memory
+  ```
+
+- ❌ **CUDA Backend** (src/backends/gpu/cuda_backend.runa)
+  - Generate CUDA C++ kernel code
+  - PTX (Parallel Thread Execution) assembly generation
+  - Support for tensor cores on modern GPUs
+  - CUDA-specific optimizations
+
+  **Example CUDA Codegen:**
+  ```cuda
+  // Generated CUDA kernel
+  __global__ void vector_add(float* a, float* b, float* c, int n) {
+      int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      if (idx < n) {
+          c[idx] = a[idx] + b[idx];
+      }
+  }
+  ```
+
+- ❌ **OpenCL Backend** (src/backends/gpu/opencl_backend.runa)
+  - Generate OpenCL C kernel code
+  - SPIR-V intermediate representation support
+  - Cross-platform compatibility (NVIDIA, AMD, Intel GPUs)
+  - Runtime kernel compilation
+
+  **Example OpenCL Codegen:**
+  ```c
+  // Generated OpenCL kernel
+  __kernel void vector_add(__global float* a, __global float* b,
+                          __global float* c, int n) {
+      int idx = get_global_id(0);
+      if (idx < n) {
+          c[idx] = a[idx] + b[idx];
+      }
+  }
+  ```
+
+- ❌ **Metal Backend** (src/backends/gpu/metal_backend.runa)
+  - Generate Metal Shading Language (MSL) code
+  - Apple GPU optimization (unified memory, tile-based rendering)
+  - Integration with Metal Performance Shaders
+  - macOS/iOS native performance
+
+  **Example Metal Codegen:**
+  ```metal
+  // Generated Metal kernel
+  kernel void vector_add(device float* a [[buffer(0)]],
+                        device float* b [[buffer(1)]],
+                        device float* c [[buffer(2)]],
+                        uint id [[thread_position_in_grid]]) {
+      c[id] = a[id] + b[id];
+  }
+  ```
+
+- ❌ **GPU Memory Manager** (src/backends/gpu/gpu_memory.runa)
+  - Automatic host ↔ device memory transfers
+  - Memory pooling and reuse
+  - Pinned memory allocation for faster transfers
+  - Unified memory support (where available)
+
+- ❌ **Kernel Optimizer** (src/backends/gpu/kernel_optimizer.runa)
+  - Kernel fusion (combine multiple kernels into one)
+  - Shared memory optimization
+  - Register pressure analysis
+  - Occupancy optimization
+  - Auto-tuning for block/grid dimensions
+
+### COMPILER (Integration):
+
+- ❌ **GPU Compilation Pipeline**
+  ```
+  Runa Source → Parser → AST → Semantic Analysis
+      ↓
+  Parallelization Analysis (detect GPU opportunities)
+      ↓
+  LIR Generation (Low-level IR)
+      ↓
+  GPU Backend Selection (CUDA/OpenCL/Metal)
+      ↓
+  Kernel Code Generation
+      ↓
+  Backend-specific Compilation (nvcc/clang/metalc)
+      ↓
+  GPU Binary Module (.cubin, .spv, .metallib)
+  ```
+
+- ❌ **Runtime GPU Dispatch**
+  - Detect available GPU devices at runtime
+  - Select optimal backend based on hardware
+  - Fallback to CPU execution if GPU unavailable
+  - Performance profiling and auto-switching
+
+### STDLIB (GPU Library):
+
+- ❌ **GPU Array Operations** (stdlib/gpu/arrays.runa)
+  ```runa
+  Process called "gpu_vector_add" takes a as List[Float], b as List[Float] returns List[Float]:
+      # Automatically dispatched to GPU
+      Let c be create_list(length(a))
+      GPU Parallel For i from 0 to length(a):
+          Set c[i] to a[i] plus b[i]
+      End GPU
+      Return c
+  End Process
+  ```
+
+- ❌ **GPU Matrix Operations** (stdlib/gpu/matrix.runa)
+  - Matrix multiplication (optimized for tensor cores)
+  - Matrix transpose
+  - Element-wise operations
+  - Reduction operations (sum, max, min)
+
+- ❌ **GPU Syntax Extensions**
+  ```runa
+  # Explicit GPU kernel annotation
+  GPU Kernel called "my_kernel" with block_size 256:
+      # Kernel code automatically parallelized
+      Let idx be gpu_thread_index()
+      Set output[idx] to input[idx] multiplied by 2
+  End Kernel
+
+  # Launch kernel
+  Launch my_kernel with 1000000 threads on Auto backend
+  ```
+
+### TOOLING:
+
+- ❌ **runac GPU Flags**
+  ```bash
+  runac --gpu=cuda file.runa        # Force CUDA backend
+  runac --gpu=opencl file.runa      # Force OpenCL backend
+  runac --gpu=metal file.runa       # Force Metal backend
+  runac --gpu=auto file.runa        # Auto-select best backend
+  runac --gpu-optimize=3 file.runa  # Aggressive GPU optimizations
+  ```
+
+- ❌ **GPU Performance Profiler**
+  ```bash
+  runaprof --gpu file.runa
+  # Shows:
+  # - Kernel execution time
+  # - Memory transfer overhead
+  # - GPU occupancy
+  # - Suggested optimizations
+  ```
+
+## Use Cases:
+
+**AI/ML Training:**
+```runa
+# Neural network training with automatic GPU acceleration
+Type NeuralLayer is Dictionary with:
+    weights as List[List[Float]]
+    biases as List[Float]
+End Type
+
+Process called "forward_pass" takes layer as NeuralLayer, input as List[Float] returns List[Float]:
+    # Automatically parallelized on GPU
+    Let output be create_list(length(layer.biases))
+
+    GPU Parallel For i from 0 to length(output):
+        Let sum be 0.0
+        For j from 0 to length(input):
+            Set sum to sum plus (layer.weights[i][j] multiplied by input[j])
+        End For
+        Set output[i] to relu(sum plus layer.biases[i])
+    End GPU
+
+    Return output
+End Process
+```
+
+**Scientific Computing:**
+```runa
+# N-body simulation with GPU acceleration
+Process called "compute_forces" takes particles as List[Particle] returns List[Vector3]:
+    Let forces be create_list(length(particles))
+
+    GPU Parallel For i from 0 to length(particles):
+        Let force be Vector3(0, 0, 0)
+        For j from 0 to length(particles):
+            If i is not equal to j:
+                Let r be distance(particles[i], particles[j])
+                Let f be gravitational_force(particles[i], particles[j], r)
+                Set force to vector_add(force, f)
+            End If
+        End For
+        Set forces[i] to force
+    End GPU
+
+    Return forces
+End Process
+```
+
+## Success Criteria:
+- ✅ CUDA, OpenCL, and Metal backends all functional
+- ✅ Automatic parallelization detects 90%+ of parallelizable loops
+- ✅ GPU execution 10-100x faster than CPU for parallel workloads
+- ✅ Automatic fallback to CPU if GPU unavailable
+- ✅ Memory transfers optimized (minimal host ↔ device copies)
+- ✅ Kernel fusion reduces kernel launch overhead by 50%+
+- ✅ Auto-tuning finds optimal block sizes within 5% of manual tuning
+- ✅ Comprehensive documentation with AI/ML and scientific computing examples
+
 
 ---
 
@@ -3573,7 +4244,6 @@ myproject/
 - ✅ Web interface for browsing packages
 - ✅ Documentation is auto-generated and hosted
 
-## Timeline: TBD
 
 ---
 
@@ -3669,7 +4339,6 @@ Language Server Protocol for IDE integration
 - ✅ Tools are documented with examples
 - ✅ VS Code extension has 1000+ installs
 
-## Timeline: TBD
 
 ---
 
@@ -3826,7 +4495,6 @@ Recognize and parse AI annotations
 - ✅ AI assistance tools provide useful suggestions
 - ✅ Annotations improve code understandability by 40%+
 
-## Timeline: TBD
 
 ---
 
@@ -4063,9 +4731,6 @@ Recognize and parse AI annotations
 - ✅ Positive reception on HackerNews/Reddit (top 3 posts)
 - ✅ Weekly active users: 1000+ developers
 
-## Timeline:
-**Target Date:** TBD (approximately 118 weeks from v0.0.8 start)
-
 ---
 
 # 🔹 v1.1: Rosetta Stone Phase 1 - C Frontend (C → Runa Translation)
@@ -4143,7 +4808,6 @@ Recognize and parse AI annotations
 - ✅ Output is idiomatic Runa
 - ✅ Can translate 80% of typical C programs
 
-## Timeline: 6-8 weeks
 
 ---
 
@@ -4204,7 +4868,6 @@ Recognize and parse AI annotations
 - ✅ Handles Runa types → Python types correctly
 - ✅ C → Runa → Python pipeline works end-to-end
 
-## Timeline: 4-6 weeks
 
 ---
 
@@ -4344,50 +5007,6 @@ runac algorithm.runa --to=rust -o algorithm.rs  # future
 - ✅ 100+ test programs successfully translated
 - ✅ Real-world code examples working
 
-## Timeline: 6-8 weeks
-
----
-
-# 📊 Complete Timeline Summary (Updated)
-
-| Phase | Duration | Cumulative Time | Focus |
-|-------|----------|-----------------|-------|
-| **v0.0.8** | 4 weeks | 4 weeks | Core language features, bitwise ops, inline asm |
-| **v0.0.8.1** | 3 weeks | 7 weeks | Collections (Lists, Dicts, Sets) |
-| **v0.0.8.2** | 3 weeks | 10 weeks | Match/Pattern matching, Lambdas |
-| **v0.0.8.3** | 2 weeks | 12 weeks | String interpolation, Ternary |
-| **v0.0.9** | 6 weeks | 18 weeks | Native object writer, linker, Pure Runa runtime |
-| **v0.1.0** | 2 weeks | 20 weeks | Beta release polish, packaging |
-| **v0.2.0** | 6 weeks | 26 weeks | Standard library modules |
-| **v0.3.0** | 6 weeks | 32 weeks | Error handling (Try/Catch, Result) |
-| **v0.4.0** | 6 weeks | 38 weeks | Memory safety (Ownership, Lifetimes) |
-| **v0.5.0** | 6 weeks | 44 weeks | Basic optimizations (Constant folding, DCE, Inlining) |
-| **v0.6.0** | 8 weeks | 52 weeks | Advanced type system (Generics, Traits, ADTs) |
-| **v0.6.1** | 4 weeks | 56 weeks | Type inference, Refinement types |
-| **v0.7.0** | 6 weeks | 62 weeks | Concurrency (Threads, Mutexes, Channels) |
-| **v0.7.1** | 4 weeks | 66 weeks | Async/Await, Actors |
-| **v0.8.0** | 4-6 weeks | 72 weeks | HIR - Triple Syntax & Rosetta Stone Foundation |
-| **v0.8.1** | 6-8 weeks | 80 weeks | MIR - SSA Form, CFG & Classic Optimizations |
-| **v0.8.2** | 6-8 weeks | 88 weeks | LIR - Virtual Registers & Register Allocation |
-| **v0.8.3** | 8-10 weeks | 98 weeks | Advanced Optimizations (PGO, LTO, SIMD, Loop Opts) |
-| **v0.8.4** | 6 weeks | 104 weeks | AOTT Tier 0-1 (Interpreter, Bytecode) |
-| **v0.8.5** | 8 weeks | 112 weeks | AOTT Tier 2-3 (JIT, Optimized native) |
-| **v0.8.6** | 6 weeks | 118 weeks | AOTT Tier 4 (Speculative execution) |
-| **v0.9.0** | 4 weeks | 100 weeks | Cross-compilation: Target abstraction |
-| **v0.9.1** | 6 weeks | 106 weeks | Cross-compilation: Windows support |
-| **v0.9.2** | 6 weeks | 112 weeks | Cross-compilation: macOS support (x86-64 + ARM64) |
-| **v0.9.3** | 4 weeks | 116 weeks | Cross-compilation: ARM64 Linux |
-| **v0.9.4** | 5 weeks | 121 weeks | Cross-compilation: WebAssembly |
-| **v0.9.5** | 6 weeks | 127 weeks | Package manager & distribution |
-| **v0.9.6** | 8 weeks | 135 weeks | IDE tooling (LSP, Debugger, Profiler) |
-| **v0.9.7** | 4 weeks | 139 weeks | AI Annotation system |
-| **v1.0.0** | 12 weeks | **151 weeks** | Production polish, launch |
-| **v1.1** | 8 weeks | 159 weeks | Rosetta Stone: C → Runa translation |
-| **v1.2** | 6 weeks | 165 weeks | Rosetta Stone: Runa → Python translation |
-| **v1.3** | 8 weeks | **173 weeks** | Rosetta Stone: Bidirectional C ↔ Runa ↔ Python |
-
-**Total Development Time to v1.0:** ~151 weeks (2.9 years)
-**Total Development Time to v1.3 (Rosetta Stone):** ~173 weeks (3.3 years)
 
 ---
 
@@ -4495,7 +5114,6 @@ End Process
 - ✅ GDB can debug Runa programs
 - ✅ Compiler errors guide users to fixes
 
-## Timeline: TBD
 
 ---
 
@@ -4552,7 +5170,6 @@ arena_destroy(arena)  # Frees all allocations at once
 - ✅ Performance impact < 5% vs manual management
 - ✅ Clear error messages for ownership violations
 
-## Timeline: TBD
 
 ---
 
@@ -4621,7 +5238,6 @@ Let result be 5 plus 3  # Function call eliminated
 - ✅ Compilation time increase < 20%
 - ✅ All tests still pass
 
-## Timeline: TBD
 
 ---
 
@@ -4688,7 +5304,6 @@ Let value be atomic_load(counter)
 - ✅ Performance scales with core count
 - ✅ Documentation includes concurrency guide
 
-## Timeline: TBD
 
 ---
 
@@ -4748,7 +5363,6 @@ runaprof program.profile
 - ✅ Profiler identifies bottlenecks accurately
 - ✅ Compilation time still reasonable (<2x slower than C)
 
-## Timeline: TBD
 
 ---
 
@@ -4809,27 +5423,8 @@ runaprof program.profile
 - ✅ Used in production by early adopters
 - ✅ Performance competitive with established languages
 
-## Timeline: TBD
 
 ---
-
-# 📊 Complete Timeline Summary
-
-| Phase | Duration | Total Time |
-|-------|----------|------------|
-| **v0.0.8** Inline Assembly | 2-3 weeks | 3 weeks |
-| **v0.0.9** Native Object/Linker | 4-6 weeks | 9 weeks |
-| **v0.1.0** Beta Release | 2-3 weeks | 12 weeks |
-| **v0.2.0** Standard Library | 6-8 weeks | 20 weeks |
-| **v0.3.0** Type System | 8-10 weeks | 30 weeks |
-| **v0.4.0** Modules & Packages | 10-12 weeks | 42 weeks |
-| **v0.5.0** Error Handling | 6-8 weeks | 50 weeks |
-| **v0.6.0** Memory Safety | 10-12 weeks | 62 weeks |
-| **v0.7.0** Optimization L1 | 8-10 weeks | 72 weeks |
-| **v0.8.0** Concurrency | 10-12 weeks | 84 weeks |
-| **v0.9.0** Advanced Optimization | 12-14 weeks | 98 weeks |
-| **v1.0.0** Production Polish | 16-20 weeks | **118 weeks** |
-
 
 ---
 

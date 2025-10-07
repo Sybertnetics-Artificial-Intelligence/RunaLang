@@ -2335,9 +2335,11 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
     If expr_type is equal to 23:  Note: EXPR_LAMBDA
         Note: Generate lambda closure (no free variables yet)
 
-        Note: Get lambda parameter name and body
-        Let param_name be memory_get_pointer(expr, 8)
+        Note: Get lambda parameters and body
+        Note: Check if multi-parameter (param_count at offset 24) or single parameter
+        Let param_count be memory_get_int32(expr, 24)
         Let body_expr be memory_get_pointer(expr, 16)
+        Let param_names be memory_get_pointer(expr, 8)
 
         Note: Generate unique lambda function name
         Let lambda_counter be memory_get_int32(codegen, 28)  Note: label_counter
@@ -2361,8 +2363,21 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         memory_set_int32(codegen, 20, 16)
         memory_set_int32(codegen, 24, 0)
 
-        Note: Add parameter as local variable
-        codegen_add_variable(codegen, param_name)
+        Note: Add parameters as local variables
+        If param_count is equal to 0:
+            Note: Single parameter (old format) - param_names is a string pointer
+            codegen_add_variable(codegen, param_names)
+            Let param_count be 1
+        Otherwise:
+            Note: Multiple parameters - param_names is an array of string pointers
+            Let i be 0
+            While i is less than param_count:
+                Let param_offset be i multiplied by 8
+                Let param_name be memory_get_pointer(param_names, param_offset)
+                codegen_add_variable(codegen, param_name)
+                Let i be i plus 1
+            End While
+        End If
 
         Note: Generate lambda function in assembly
         Note: First, emit a jump to skip over the lambda function code
@@ -2378,10 +2393,33 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         emit_line(output_file, "    pushq %rbp")
         emit_line(output_file, "    movq %rsp, %rbp")
 
-        Note: Parameter is in %rdi (first argument)
-        Note: Store parameter on stack
-        emit_line(output_file, "    subq $16, %rsp  # Allocate space for parameter")
-        emit_line(output_file, "    movq %rdi, -8(%rbp)  # Store parameter")
+        Note: Calculate stack space needed for parameters
+        Let stack_space be param_count multiplied by 8
+        Let stack_space_aligned be stack_space plus 8
+        file_write_buffered(output_file, "    subq $", 0)
+        file_write_buffered(output_file, integer_to_string(stack_space_aligned), 0)
+        emit_line(output_file, ", %rsp  # Allocate space for parameters")
+
+        Note: Store parameters on stack from registers
+        Note: x86-64 calling convention: %rdi, %rsi, %rdx, %rcx, %r8, %r9
+        If param_count is greater than 0:
+            emit_line(output_file, "    movq %rdi, -8(%rbp)  # Store parameter 1")
+        End If
+        If param_count is greater than 1:
+            emit_line(output_file, "    movq %rsi, -16(%rbp)  # Store parameter 2")
+        End If
+        If param_count is greater than 2:
+            emit_line(output_file, "    movq %rdx, -24(%rbp)  # Store parameter 3")
+        End If
+        If param_count is greater than 3:
+            emit_line(output_file, "    movq %rcx, -32(%rbp)  # Store parameter 4")
+        End If
+        If param_count is greater than 4:
+            emit_line(output_file, "    movq %r8, -40(%rbp)  # Store parameter 5")
+        End If
+        If param_count is greater than 5:
+            emit_line(output_file, "    movq %r9, -48(%rbp)  # Store parameter 6")
+        End If
 
         Note: Generate body expression
         codegen_generate_expression(codegen, body_expr)
@@ -2423,7 +2461,7 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
     End If
 
     If expr_type is equal to 24:  Note: EXPR_LAMBDA_CALL
-        Note: Phase 3: Invoke lambda with arguments
+        Note: Phase 4: Invoke lambda with multiple arguments
         Note: Structure: lambda_expr at offset 8, arguments at offset 16, arg_count at offset 24
 
         Note: Get lambda expression (should evaluate to closure pointer)
@@ -2431,39 +2469,64 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Let arguments be memory_get_pointer(expr, 16)
         Let arg_count be memory_get_int32(expr, 24)
 
+        Note: Evaluate all arguments and save on stack
+        Note: Must evaluate in reverse order to push correctly
+        Let i be 0
+        While i is less than arg_count:
+            Let arg_offset be i multiplied by 8
+            Let arg_expr be memory_get_pointer(arguments, arg_offset)
+            codegen_generate_expression(codegen, arg_expr)
+            emit_line(output_file, "    pushq %rax  # Save argument on stack")
+            Let i be i plus 1
+        End While
+
         Note: Generate code to evaluate lambda expression to get closure pointer
         codegen_generate_expression(codegen, lambda_expr)
         Note: Result is closure pointer in %rax
 
-        Note: Save closure pointer
-        emit_line(output_file, "    pushq %rax  # Save closure pointer")
+        Note: Save closure pointer in non-argument register
+        emit_line(output_file, "    movq %rax, %r10  # Save closure pointer in r10")
 
-        Note: For Phase 3, we only support single argument
-        If arg_count is equal to 1:
-            Note: Evaluate the argument
-            Let arg_expr be memory_get_pointer(arguments, 0)
-            codegen_generate_expression(codegen, arg_expr)
-            Note: Argument value is now in %rax
-
-            Note: Move argument to %rdi (first parameter register)
-            emit_line(output_file, "    movq %rax, %rdi  # Move argument to parameter register")
-
-            Note: Restore closure pointer
-            emit_line(output_file, "    popq %rax  # Restore closure pointer")
-
-            Note: Load function pointer from closure (offset 0)
-            emit_line(output_file, "    movq 0(%rax), %rbx  # Load function pointer from closure")
-
-            Note: Call the lambda function
-            emit_line(output_file, "    call *%rbx  # Invoke lambda")
-
-            Note: Result is in %rax
-            Return 0
-        Otherwise:
-            print_string("[CODEGEN ERROR] Lambda calls only support 1 argument in Phase 3")
+        Note: Pop arguments from stack into argument registers (reverse order)
+        Note: x86-64 calling convention: %rdi, %rsi, %rdx, %rcx, %r8, %r9
+        If arg_count is greater than 6:
+            print_string("[CODEGEN ERROR] Lambda calls support max 6 arguments")
             print_newline()
             exit_with_code(1)
         End If
+
+        Note: Arguments are on stack in order arg1, arg2, ..., argN (argN on top)
+        Note: Pop in reverse to get them into registers in correct order
+        If arg_count is greater than 5:
+            emit_line(output_file, "    popq %r9  # Pop argument 6")
+        End If
+        If arg_count is greater than 4:
+            emit_line(output_file, "    popq %r8  # Pop argument 5")
+        End If
+        If arg_count is greater than 3:
+            emit_line(output_file, "    popq %rcx  # Pop argument 4")
+        End If
+        If arg_count is greater than 2:
+            emit_line(output_file, "    popq %rdx  # Pop argument 3")
+        End If
+        If arg_count is greater than 1:
+            emit_line(output_file, "    popq %rsi  # Pop argument 2")
+        End If
+        If arg_count is greater than 0:
+            emit_line(output_file, "    popq %rdi  # Pop argument 1")
+        End If
+
+        Note: Restore closure pointer to %rax
+        emit_line(output_file, "    movq %r10, %rax  # Restore closure pointer")
+
+        Note: Load function pointer from closure (offset 0)
+        emit_line(output_file, "    movq 0(%rax), %rbx  # Load function pointer from closure")
+
+        Note: Call the lambda function
+        emit_line(output_file, "    call *%rbx  # Invoke lambda")
+
+        Note: Result is in %rax
+        Return 0
     End If
 
     Note: Default case
