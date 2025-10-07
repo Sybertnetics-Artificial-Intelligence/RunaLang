@@ -25,16 +25,67 @@ Before starting standard library development in v0.1.0, these features are **ABS
 
 ---
 
+## 🏗️ Compiler Architecture: 3-Level IR Pipeline (v0.8.0-v0.8.3)
+
+**Philosophy:** We use a **3-level Intermediate Representation (IR) pipeline** instead of compiling directly from AST to assembly. This enables powerful optimizations, cross-platform compilation, and human-readable intermediate forms.
+
+**IR Pipeline:**
+```
+Runa Source Code
+    ↓
+Parser → AST
+    ↓
+v0.8.0: HIR (High-Level IR)     ← Human-readable, triple syntax, Rosetta Stone
+    ↓
+v0.8.1: MIR (Mid-Level IR)      ← SSA form, CFG, classic optimizations
+    ↓
+v0.8.2: LIR (Low-Level IR)      ← Virtual registers, register allocation
+    ↓
+Codegen → Assembly → Binary
+```
+
+**Why 3 Levels?**
+
+1. **HIR (Human-Readable IR)** - v0.8.0
+   - **Purpose:** Triple syntax generation (--canon/--viewer/--developer), Rosetta Stone translation
+   - **Form:** Structured, named variables, high-level semantics
+   - **Examples:** Type checking, source-to-source transforms, language interop
+   - **Based on:** `_legacy/src/compiler/ir/hir/`
+
+2. **MIR (Mid-Level IR)** - v0.8.1
+   - **Purpose:** Platform-independent optimizations
+   - **Form:** SSA form, control flow graph, basic blocks, phi nodes
+   - **Examples:** DCE, CSE, LICM, constant propagation, inlining
+   - **Based on:** `_legacy/src/compiler/ir/mir/`
+
+3. **LIR (Low-Level IR)** - v0.8.2
+   - **Purpose:** Register allocation, instruction selection, peephole opts
+   - **Form:** Virtual registers, machine-like instructions, memory addressing
+   - **Examples:** Graph coloring, spilling, target-specific lowering
+   - **Based on:** `_legacy/src/compiler/ir/lir/`
+
+**Benefits:**
+- ✅ Each IR level optimized for different concerns (separation of concerns)
+- ✅ Human-readable HIR for tooling and cross-language translation
+- ✅ Powerful SSA-based opts on MIR (impossible on AST/HIR)
+- ✅ Proper register allocation on LIR (impossible on SSA form)
+- ✅ Multi-backend support (x86-64, ARM64, WASM) shares MIR/LIR logic
+- ✅ Industry-standard approach (LLVM, GCC, Rust, Swift all use multi-level IRs)
+
+**Note:** This replaces the original "HIR-only" approach in earlier drafts. The `_legacy/` implementation already has all three IRs - we're bringing them into the main codebase properly.
+
+---
+
 ## 📋 Milestone Overview
 
 | Version | Focus Area | Status |
 |---------|-----------|--------|
 | **v0.0.7.5** | Self-hosting compiler (C bootstrap) | ✅ **COMPLETE** |
-| **v0.0.8** | Core Language Complete (inline asm, imports, for loops, bitwise) | ✅ **COMPLETE**
-| **v0.0.8.1** | Struct Construction & Field Access Syntax | ✅ **IN PROGRESS**
-| **v0.0.8.2** | Collections (Lists, Dictionaries, Sets) + For Each Loops | ✅ Planned |
-| **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | ✅ Planned |
-| **v0.0.8.4** | Lambda Expressions + Type Inference | 🔄 Planned |
+| **v0.0.8** | Core Language Complete (inline asm, imports, for loops, bitwise) | ✅ **COMPLETE** |
+| **v0.0.8.1** | Struct Construction & Field Access Syntax | ✅ **COMPLETE** |
+| **v0.0.8.2** | Collections (Lists, Dictionaries, Sets) + For Each Loops | ✅ **COMPLETE** |
+| **v0.0.8.3** | Match/Pattern Matching + ADT/Variant Construction | ✅ **COMPLETE** |
+| **v0.0.8.4** | Lambda Expressions + Type Inference | 🔄 **In Progress** |
 | **v0.0.8.5** | String Interpolation, Ternary Operator | 📋 Planned |
 | **v0.0.8.6** | Advanced Types Phase 1: Range Constraints + Float/Float64 | 📋 Planned |
 | **v0.0.8.7** | Advanced Types Phase 2: Wire Format Types (Integer16/32) + FFI Types | 📋 Planned |
@@ -52,10 +103,13 @@ Before starting standard library development in v0.1.0, these features are **ABS
 | **v0.6.1** | Type Inference, Refinement Types | 📋 Planned |
 | **v0.7.0** | Concurrency Primitives (Threads, Mutexes, Channels) | 📋 Planned |
 | **v0.7.1** | Async/Await, Actors | 📋 Planned |
-| **v0.8.0** | Runa HIR (Human-Readable IR) + Advanced Optimization (PGO, LTO, SIMD) | 📋 Planned |
-| **v0.8.1** | AOTT Tier 0-1: Lightning Interpreter + Smart Bytecode (uses HIR) | 📋 Planned |
-| **v0.8.2** | AOTT Tier 2-3: Basic + Optimized Native Compilation (uses HIR) | 📋 Planned |
-| **v0.8.3** | AOTT Tier 4: Speculative Execution (uses HIR) | 📋 Planned |
+| **v0.8.0** | Runa HIR (Human-Readable IR) - Triple Syntax & Rosetta Stone Foundation | 📋 Planned |
+| **v0.8.1** | Runa MIR (Mid-Level IR) - SSA Form, CFG & Classic Optimizations | 📋 Planned |
+| **v0.8.2** | Runa LIR (Low-Level IR) - Virtual Registers & Register Allocation | 📋 Planned |
+| **v0.8.3** | Advanced Optimizations - PGO, LTO, SIMD, Loop Opts (HIR→MIR→LIR pipeline) | 📋 Planned |
+| **v0.8.4** | AOTT Tier 0-1: Lightning Interpreter + Smart Bytecode (uses MIR) | 📋 Planned |
+| **v0.8.5** | AOTT Tier 2-3: Basic + Optimized Native Compilation (uses MIR→LIR) | 📋 Planned |
+| **v0.8.6** | AOTT Tier 4: Speculative Execution (uses full IR pipeline) | 📋 Planned |
 | **v0.9.0** | Cross-Compilation: Target Abstraction + Multi-Backend Foundation | 📋 Planned |
 | **v0.9.1** | Cross-Compilation: Windows Support (x86-64 PE format) | 📋 Planned |
 | **v0.9.2** | Cross-Compilation: macOS Support (x86-64 + ARM64 Mach-O format) | 📋 Planned |
@@ -1853,110 +1907,93 @@ End Process
 
 ---
 
-# 🔹 v0.8.0: Runa HIR (Human-Readable IR) + Advanced Optimization & Profiling
+# 🔹 v0.8.0: Runa HIR (Human-Readable IR) - Triple Syntax & Rosetta Stone Foundation
 
-**Goal:** Implement Runa's Human-Readable Intermediate Representation (HIR) as the universal translation layer, enabling cross-compilation, AOTT, and advanced optimizations.
+**Goal:** Implement Runa's High-Level Intermediate Representation (HIR) as the human-readable, semantic-preserving layer for triple syntax generation and cross-language translation.
 
-**Philosophy:** Build our own IR (Runa HIR) - NOT LLVM IR - that is human-readable, preserves high-level semantics, and can be written/edited by humans.
+**Philosophy:** HIR is the **first layer** of our 3-level IR pipeline (HIR → MIR → LIR). It preserves high-level Runa semantics, enables triple syntax (--canon/--viewer/--developer), and serves as the universal translation layer for Rosetta Stone.
+
+**Pipeline Overview:**
+```
+Runa Source → Parser → AST → HIR (v0.8.0) → MIR (v0.8.1) → LIR (v0.8.2) → Codegen → Assembly
+                                ↓              ↓              ↓
+                         Triple Syntax    SSA Opts      Register Alloc
+                         Rosetta Stone   (DCE, LICM)   (Graph Coloring)
+```
 
 ## What Belongs Where:
 
 ### COMPILER (Runa HIR Implementation):
 
-- ❌ **HIR Design & Specification**
-  - **Human-readable intermediate representation** - Valid Runa code (can be written/edited by humans)
-  - **Preserves high-level semantics** - NOT low-level SSA like LLVM IR
-  - **Triple syntax support** (--canon, --viewer, --developer)
-  - **Language-agnostic abstractions** - Universal semantic representation
-  - **Metadata system** - Preserve language-specific features
+- ❌ **HIR Design & Specification** (Based on `_legacy/src/compiler/ir/hir/hir.runa`)
+  - **Human-readable intermediate representation** - Close to AST, preserves Runa semantics
+  - **NOT SSA form** - Named variables, structured control flow (If/For/While)
+  - **Triple syntax support** (--canon, --viewer, --developer) - Primary use case
+  - **Rosetta Stone foundation** - Universal semantic representation for C ↔ Runa ↔ Python
+  - **Metadata system** - Preserve language-specific features, source locations, type annotations
 
-  **Why Runa HIR vs LLVM IR:**
-  | Feature | LLVM IR | Runa HIR |
-  |---------|---------|----------|
-  | Human Readable | ❌ SSA, registers, basic blocks | ✅ Valid Runa code |
-  | Bidirectional | ❌ One-way only | ✅ Two-way with semantics |
-  | Preserves Semantics | ❌ Low-level only | ✅ High-level concepts |
-  | Multiple Syntax | ❌ Single form | ✅ Triple syntax |
-  | Writeable | ❌ Too complex | ✅ Yes (--canon, --developer) |
+  **HIR Responsibilities:**
+  - ✅ Triple syntax generation (HIR → --canon/--viewer/--developer)
+  - ✅ Rosetta Stone translation (C → HIR, HIR → Python)
+  - ✅ High-level semantic analysis (type checking, scope resolution)
+  - ✅ Source-to-source transforms (macro expansion, desugaring)
+  - ❌ NOT for optimization (use MIR for that)
+  - ❌ NOT for register allocation (use LIR for that)
 
-  **HIR Node Types:**
+  **HIR Node Types (from _legacy/):**
   ```runa
-  Type called "HIRNode":
-      node_id as String
-      node_type as HIRNodeType
-      source_location as SourceLocation
-      type_signature as TypeInfo
-      metadata as Dictionary
-  End Type
+  Type HIRExpression is:
+      | HIRLiteral with value as Any and literal_type as String and inferred_type as IRType
+      | HIRIdentifier with name as String and resolved_symbol as Optional[String] and inferred_type as IRType
+      | HIRBinaryOperation with left as HIRExpression and operator as String and right as HIRExpression and inferred_type as IRType
+      | HIRUnaryOperation with operator as String and operand as HIRExpression and inferred_type as IRType
+      | HIRFunctionCall with function as HIRExpression and arguments as List[HIRExpression] and inferred_type as IRType
+      | HIRFieldAccess with object as HIRExpression and field as String and inferred_type as IRType
+      | HIRMatchExpression with value as HIRExpression and cases as List[HIRMatchCase] and inferred_type as IRType
 
-  Type called "HIRNodeType" is one of:
-      | ProgramRoot
-      | ModuleDefinition
-      | FunctionDefinition
-      | TypeDefinition
-      | VariableDeclaration
-      | Expression
-      | Statement
-      | ControlFlow
-      | Pattern
+  Type HIRStatement is:
+      | HIRVariableDeclaration with name as String and type_annotation as Optional[IRType] and initializer as Optional[HIRExpression] and is_mutable as Boolean
+      | HIRAssignment with target as HIRExpression and value as HIRExpression
+      | HIRIfStatement with condition as HIRExpression and then_block as List[HIRStatement] and else_block as Optional[List[HIRStatement]]
+      | HIRForLoop with iterator as String and collection as HIRExpression and body as List[HIRStatement]
+      | HIRWhileLoop with condition as HIRExpression and body as List[HIRStatement]
+      | HIRReturnStatement with value as Optional[HIRExpression]
+      | HIRMatchStatement with value as HIRExpression and cases as List[HIRMatchCase]
+
+  Type HIRDeclaration is:
+      | HIRProcessDeclaration with name as String and parameters as List[HIRParameter] and return_type as Optional[IRType] and body as List[HIRStatement]
+      | HIRTypeDeclaration with name as String and fields as List[HIRTypeField]
   End Type
   ```
 
-- ❌ **AST → HIR Lowering**
+- ❌ **AST → HIR Lowering** (src/compiler/ir/hir/builder.runa)
   ```
-  Runa Source → Parse → AST → Lower to HIR → Optimize → Codegen
+  Runa Source → Parser → AST → HIR Lowering → HIR
   ```
-  - Convert AST to HIR representation
-  - Preserve type information
-  - Maintain semantic meaning
-  - Keep variable names and structure
-  - Attach metadata for language features
+  - Convert AST nodes to HIR representation
+  - Resolve identifiers to symbols (scope resolution)
+  - Infer types where not explicitly annotated
+  - Preserve source locations for error messages
+  - Attach metadata (language-specific features, pragmas)
 
   **Example Lowering:**
   ```runa
-  # Source (Canonical):
-  Process called "factorial" takes n as Integer returns Integer:
-      If n is less than or equal to 1:
-          Return 1
-      End If
-      Return n times factorial(n minus 1)
-  End Process
+  # AST (from parser):
+  EXPR_BINARY_OP(left=EXPR_IDENTIFIER("x"), op=TOKEN_PLUS, right=EXPR_LITERAL(42))
 
-  # HIR (same as source - HIR is valid Runa):
-  Process called "factorial" takes n as Integer returns Integer:
-      If n is less than or equal to 1:
-          Return 1
-      End If
-      Return n times factorial(n minus 1)
-  End Process
+  # HIR (high-level, typed):
+  HIRBinaryOperation with:
+      left as HIRIdentifier with name as "x" and resolved_symbol as "local_var_x" and inferred_type as IRType.Integer
+      operator as "plus"
+      right as HIRLiteral with value as 42 and literal_type as "Integer" and inferred_type as IRType.Integer
+      inferred_type as IRType.Integer
   ```
 
-- ❌ **HIR → Multiple Backends**
-  - HIR → x86-64 assembly (Linux/Windows/macOS)
-  - HIR → AArch64 assembly (ARM64)
-  - HIR → WASM bytecode
-  - Foundation for cross-compilation (v0.9.0+)
-
-  **Backend Interface:**
-  ```runa
-  Process called "codegen_generate" takes program as Integer, target as Integer returns Integer:
-      Let arch be memory_get_pointer(target, 0)  # target->arch
-
-      If string_equals(arch, "x86_64") is equal to 1:
-          Return codegen_x86_64_generate(program, target)
-      Otherwise If string_equals(arch, "aarch64") is equal to 1:
-          Return codegen_aarch64_generate(program, target)
-      Otherwise If string_equals(arch, "wasm32") is equal to 1:
-          Return codegen_wasm_generate(program, target)
-      End If
-  End Process
-  ```
-
-- ❌ **HIR Optimization Passes**
-  - Constant folding on HIR
-  - Dead code elimination on HIR
-  - Inlining at HIR level
-  - Common subexpression elimination
+- ❌ **HIR → MIR Lowering** (Deferred to v0.8.1)
+  - Convert structured control flow (If/For/While) → Basic blocks + jumps
+  - Convert named variables → SSA form with phi nodes
+  - Flatten nested expressions → Temporary variables
+  - Foundation for optimization passes in MIR layer
 
 - ❌ **Triple Syntax Generators**
   Generate three different syntax views from HIR:
@@ -1988,12 +2025,353 @@ End Process
   End proc
   ```
 
-### COMPILER (Advanced Optimization):
+### PROJECT STRUCTURE:
+```
+src/compiler/ir/
+├── hir/
+│   ├── hir.runa              # HIR type definitions (from _legacy/)
+│   ├── builder.runa          # AST → HIR lowering
+│   ├── triple_syntax.runa    # HIR → --canon/--viewer/--developer
+│   └── rosetta.runa          # HIR ↔ C/Python translation helpers
+├── types/
+│   └── types.runa            # IRType definitions (shared across HIR/MIR/LIR)
+└── ir_context.runa           # Shared IR context (symbol tables, type info)
+```
+
+## Success Criteria:
+- ✅ HIR represents all Runa language features (ADTs, pattern matching, collections, etc.)
+- ✅ AST → HIR lowering preserves all semantic information
+- ✅ HIR → --canon generates valid, compilable Runa code
+- ✅ HIR → --viewer generates readable natural language description
+- ✅ HIR → --developer generates concise, writeable syntax
+- ✅ HIR metadata system preserves source locations for error messages
+- ✅ Foundation for Rosetta Stone (C → HIR, HIR → Python in v1.1+)
+- ✅ All existing tests pass with HIR pipeline enabled
+
+## Timeline: 4-6 weeks
+
+---
+
+# 🔹 v0.8.1: Runa MIR (Mid-Level IR) - SSA Form, CFG & Classic Optimizations
+
+**Goal:** Implement Runa's Mid-Level Intermediate Representation (MIR) with SSA form and control flow graph for platform-independent optimizations.
+
+**Philosophy:** MIR is the **second layer** of our 3-level IR pipeline. It converts structured control flow to basic blocks, uses SSA form for precise data flow analysis, and enables classic compiler optimizations (DCE, CSE, LICM, inlining, etc.).
+
+**Why MIR is Essential:**
+- ✅ SSA form enables powerful data flow optimizations (impossible on AST/HIR)
+- ✅ Control Flow Graph (CFG) makes loop optimizations tractable
+- ✅ Platform-independent optimizations (run once, benefit all backends)
+- ✅ Foundation for advanced opts in v0.8.3 (PGO, LTO, loop fusion)
+
+## What Belongs Where:
+
+### COMPILER (Runa MIR Implementation):
+
+- ❌ **MIR Design & Specification** (Based on `_legacy/src/compiler/ir/mir/mir.runa`)
+  - **SSA form** - Static Single Assignment with phi nodes
+  - **Control Flow Graph** - Basic blocks with predecessors/successors
+  - **Dominance analysis** - Dominance tree and dominance frontier
+  - **Temporary names** - Variables replaced with SSA temporaries (%0, %1, ...)
+  - **Explicit jumps** - No structured control flow (converted to jumps/branches)
+
+  **MIR Node Types (from _legacy/):**
+  ```runa
+  Type MIRInstruction is:
+      | MIRLoad with destination as String and source as String and type as IRType
+      | MIRStore with destination as String and source as String and type as IRType
+      | MIRBinaryOp with destination as String and left as String and operator as String and right as String and type as IRType
+      | MIRCall with destination as String and function as String and arguments as List[String] and return_type as IRType
+      | MIRReturn with value as Optional[String]
+      | MIRJump with target as String
+      | MIRBranch with condition as String and true_target as String and false_target as String
+      | MIRPhi with destination as String and operands as List[PhiOperand] and type as IRType
+  End Type
+
+  Type MIRBasicBlock is Dictionary with:
+      name as String
+      instructions as List[MIRInstruction]
+      terminator as MIRTerminator
+      predecessors as List[String]       # For CFG analysis
+      successors as List[String]         # For CFG analysis
+      dominance_frontier as List[String] # For SSA construction
+  End Type
+  ```
+
+- ❌ **HIR → MIR Lowering** (src/compiler/ir/mir/builder.runa)
+  ```
+  HIR → MIR Lowering → MIR in SSA form
+  ```
+  - **Structured → Unstructured control flow:**
+    - `If cond: ... Otherwise: ...` → Branch to BB_then/BB_else, merge at BB_end
+    - `While cond: ...` → BB_header, Branch to BB_body/BB_exit, Jump back to BB_header
+    - `For each x in list: ...` → Desugar to While loop, then convert to basic blocks
+
+  - **Named variables → SSA form:**
+    - Insert phi nodes at merge points (dominance frontier)
+    - Rename variables to SSA temporaries (%x_0, %x_1, %x_2)
+    - Track versions of variables across basic blocks
+
+  - **Flatten expressions → Temp variables:**
+    - `Let y be (x plus 1) times 2` →
+      ```
+      %tmp1 = add %x, 1
+      %y = mul %tmp1, 2
+      ```
+
+  **Example Lowering:**
+  ```runa
+  # HIR (structured):
+  Let x be 0
+  While x is less than 10:
+      Set x to x plus 1
+  End While
+
+  # MIR (SSA, CFG):
+  BB_entry:
+      %x_0 = constant 0
+      jump BB_header
+
+  BB_header:
+      %x_1 = phi [%x_0, BB_entry], [%x_2, BB_body]
+      %cond = lt %x_1, 10
+      branch %cond, BB_body, BB_exit
+
+  BB_body:
+      %x_2 = add %x_1, 1
+      jump BB_header
+
+  BB_exit:
+      ret
+  ```
+
+- ❌ **SSA Construction Algorithm** (Cytron et al.)
+  - Compute dominance tree
+  - Compute dominance frontiers
+  - Insert phi nodes at merge points
+  - Rename variables to SSA form
+  - Standard textbook algorithm (used by LLVM, GCC, etc.)
+
+- ❌ **Classic Optimization Passes on MIR:**
+
+  **1. Dead Code Elimination (DCE)**
+  - Remove unused SSA temporaries
+  - Remove unreachable basic blocks
+  - Trivial on SSA form (check use count == 0)
+
+  **2. Constant Propagation**
+  - Track constant values through SSA graph
+  - Replace uses with constants
+  - Enable further optimizations
+
+  **3. Copy Propagation**
+  - Replace `%y = %x` with direct uses of `%x`
+  - Simplify SSA graph
+
+  **4. Common Subexpression Elimination (CSE)**
+  - Detect redundant computations
+  - Reuse previous results
+  - Enabled by SSA form (value numbering)
+
+  **5. Loop-Invariant Code Motion (LICM)**
+  - Identify expressions that don't change in loop
+  - Hoist them out of loop header
+  - Reduce iterations × computation
+
+  **6. Sparse Conditional Constant Propagation (SCCP)**
+  - Interprocedural constant propagation
+  - More powerful than local constant prop
+
+- ❌ **MIR → LIR Lowering** (Deferred to v0.8.2)
+  - Convert SSA temporaries → Virtual registers
+  - Prepare for register allocation
+  - Lower high-level operations to machine-like instructions
+
+### PROJECT STRUCTURE:
+```
+src/compiler/ir/
+├── mir/
+│   ├── mir.runa              # MIR type definitions (from _legacy/)
+│   ├── builder.runa          # HIR → MIR lowering
+│   ├── ssa.runa              # SSA construction (phi insertion, renaming)
+│   ├── cfg.runa              # Control flow graph analysis
+│   ├── dominance.runa        # Dominance tree & frontier computation
+│   ├── optimizations/
+│   │   ├── dce.runa          # Dead code elimination
+│   │   ├── constant_prop.runa# Constant propagation
+│   │   ├── copy_prop.runa    # Copy propagation
+│   │   ├── cse.runa          # Common subexpression elimination
+│   │   ├── licm.runa         # Loop-invariant code motion
+│   │   └── sccp.runa         # Sparse conditional constant propagation
+│   └── verifier.runa         # MIR verification (SSA form correct, etc.)
+```
+
+## Success Criteria:
+- ✅ HIR → MIR lowering converts all structured control flow to CFG
+- ✅ SSA construction produces valid SSA form (verified by verifier)
+- ✅ Phi nodes inserted correctly at merge points
+- ✅ DCE removes all dead code
+- ✅ Constant propagation folds compile-time constants
+- ✅ CSE eliminates redundant computations
+- ✅ LICM hoists loop-invariant code
+- ✅ All optimizations preserve program semantics (tests still pass)
+- ✅ Performance improvement: 10-20% on benchmarks vs unoptimized
+
+## Timeline: 6-8 weeks
+
+---
+
+# 🔹 v0.8.2: Runa LIR (Low-Level IR) - Virtual Registers & Register Allocation
+
+**Goal:** Implement Runa's Low-Level Intermediate Representation (LIR) with virtual registers and graph-coloring register allocation.
+
+**Philosophy:** LIR is the **third layer** of our 3-level IR pipeline. It bridges the gap between platform-independent MIR and machine-specific assembly, handling register allocation, instruction selection, and peephole optimization.
+
+**Why LIR is Essential:**
+- ✅ Virtual registers enable register allocation (can't do this on MIR SSA names)
+- ✅ Platform-specific but machine-independent (prepares for x86/ARM/WASM backends)
+- ✅ Instruction selection can target different architectures
+- ✅ Peephole optimization works on instruction sequences
+
+## What Belongs Where:
+
+### COMPILER (Runa LIR Implementation):
+
+- ❌ **LIR Design & Specification** (Based on `_legacy/src/compiler/ir/lir/lir.runa`)
+  - **Virtual registers** - Unlimited register space with types
+  - **Physical register allocation** - Map virtual → physical registers
+  - **Spilling** - Handle register pressure by spilling to stack
+  - **Memory addressing modes** - Direct, indirect, indexed, scaled
+  - **Machine-like instructions** - Load, Store, Move, BinaryOp, Call, Return
+
+  **LIR Node Types (from _legacy/):**
+  ```runa
+  Type VirtualRegister is Dictionary with:
+      name as String                    # %r0, %r1, %r2, ...
+      type as IRType                    # Integer, Pointer, Float, etc.
+      is_spilled as Boolean             # True if spilled to stack
+      physical_register as Optional[String]  # RAX, RBX, etc. (after allocation)
+      spill_slot as Optional[Integer]   # Stack offset if spilled
+  End Type
+
+  Type LIRInstruction is:
+      | LIRLoad with destination as VirtualRegister and source as MemoryAddress and type as IRType
+      | LIRStore with destination as MemoryAddress and source as VirtualRegister and type as IRType
+      | LIRMove with destination as VirtualRegister and source as VirtualRegister or Immediate
+      | LIRBinaryOp with destination as VirtualRegister and left as VirtualRegister and operator as String and right as VirtualRegister or Immediate
+      | LIRCall with destination as Optional[VirtualRegister] and function as String and arguments as List[VirtualRegister]
+      | LIRReturn with value as Optional[VirtualRegister]
+  End Type
+
+  Type MemoryAddress is:
+      | LIRDirectAddress with offset as Integer and base as Optional[VirtualRegister]
+      | LIRIndirectAddress with base as VirtualRegister and offset as Integer
+      | LIRIndexedAddress with base as VirtualRegister and index as VirtualRegister and scale as Integer
+  End Type
+  ```
+
+- ❌ **MIR → LIR Lowering** (src/compiler/ir/lir/builder.runa)
+  ```
+  MIR (SSA temporaries) → LIR (Virtual registers)
+  ```
+  - Convert SSA temporaries → Virtual registers
+  - Lower phi nodes → Parallel copies at predecessors
+  - Introduce explicit memory operations (load/store)
+  - Handle calling conventions (argument passing, return values)
+
+  **Example Lowering:**
+  ```runa
+  # MIR (SSA):
+  BB_header:
+      %x_1 = phi [%x_0, BB_entry], [%x_2, BB_body]
+      %cond = lt %x_1, 10
+      branch %cond, BB_body, BB_exit
+
+  # LIR (Virtual registers):
+  BB_entry_to_header:
+      move %r0, %x_0              # Copy for phi
+      jump BB_header
+
+  BB_body_to_header:
+      move %r0, %x_2              # Copy for phi
+      jump BB_header
+
+  BB_header:
+      %r1 = move %r0              # x_1 = phi result (now in %r0)
+      %r2 = lt %r1, 10
+      branch %r2, BB_body, BB_exit
+  ```
+
+- ❌ **Register Allocation (Graph Coloring)**
+  - Build interference graph (which virtual regs are live simultaneously)
+  - Color graph with K colors (K = number of physical registers)
+  - Spill virtual registers that can't be colored
+  - Insert spill code (load/store to stack)
+  - Iterative algorithm until all registers allocated
+
+  **Algorithm:**
+  1. Liveness analysis (compute live ranges)
+  2. Build interference graph
+  3. Graph coloring (Chaitin's algorithm or linear scan)
+  4. Spill if needed, insert spill code
+  5. Repeat until all registers allocated
+  6. Assign physical registers (RAX, RBX, RCX, ...)
+
+- ❌ **Instruction Selection**
+  - Map LIR instructions → Target-specific assembly
+  - x86-64: `LIRBinaryOp(add)` → `addq %rax, %rbx`
+  - ARM64: `LIRBinaryOp(add)` → `add x0, x1, x2`
+  - WASM: `LIRBinaryOp(add)` → `i64.add`
+
+- ❌ **Peephole Optimization**
+  - Local instruction-level optimizations
+  - Strength reduction: `mul %rax, 2` → `shl %rax, 1`
+  - Constant folding: `add %rax, 0` → `nop` (eliminate)
+  - Instruction combining: `mov %rax, %rbx; add %rbx, 1` → `lea 1(%rax), %rbx`
+
+- ❌ **LIR → Assembly** (Deferred to existing codegen)
+  - Emit assembly from LIR with physical registers
+  - Handle calling conventions (System V ABI for Linux)
+  - Prologue/epilogue generation
+  - Platform-specific quirks
+
+### PROJECT STRUCTURE:
+```
+src/compiler/ir/
+├── lir/
+│   ├── lir.runa              # LIR type definitions (from _legacy/)
+│   ├── builder.runa          # MIR → LIR lowering
+│   ├── register_alloc.runa   # Graph coloring register allocation
+│   ├── liveness.runa         # Liveness analysis
+│   ├── interference.runa     # Interference graph construction
+│   ├── spilling.runa         # Spill code insertion
+│   ├── instruction_select.runa # LIR → Target instructions
+│   └── peephole.runa         # Peephole optimizations
+```
+
+## Success Criteria:
+- ✅ MIR → LIR lowering converts all SSA form to virtual registers
+- ✅ Register allocator produces valid allocation (no conflicts)
+- ✅ Spilling works correctly when register pressure high
+- ✅ All tests pass with LIR-based codegen
+- ✅ Performance matches current direct-to-assembly codegen
+- ✅ Foundation for multi-backend support (x86-64, ARM64, WASM)
+
+## Timeline: 6-8 weeks
+
+---
+
+# 🔹 v0.8.3: Advanced Optimizations - PGO, LTO, SIMD, Loop Opts
+
+**Goal:** Implement advanced compiler optimizations using the full HIR→MIR→LIR pipeline.
+
+**Philosophy:** With all three IR layers in place, we can now implement sophisticated optimizations that span multiple levels: profile-guided optimization, link-time optimization, auto-vectorization, and advanced loop transformations.
 
 ## What Belongs Where:
 
 ### COMPILER (Advanced Optimization Passes):
-- ❌ **Profile-Guided Optimization (PGO)**
+
+- ❌ **Profile-Guided Optimization (PGO)** (Works on MIR)
   ```bash
   # Step 1: Build with instrumentation
   runac --profile-gen program.runa -o program_instrumented
@@ -2005,17 +2383,17 @@ End Process
   # Step 3: Build with profile data
   runac --profile-use=program.profdata program.runa -o program_optimized
   ```
-  - Inline hot functions
+  - Inline hot functions (MIR level)
   - Optimize branch prediction
-  - Reorder code for better cache locality
+  - Reorder basic blocks for better cache locality
 
-- ❌ **Link-Time Optimization (LTO)**
+- ❌ **Link-Time Optimization (LTO)** (Works on HIR/MIR)
   - Optimize across compilation units
-  - Inline across modules
-  - Global dead code elimination
+  - Inline across modules (HIR → HIR or MIR → MIR)
+  - Global dead code elimination (MIR level)
   - Whole-program analysis
 
-- ❌ **SIMD Auto-Vectorization**
+- ❌ **SIMD Auto-Vectorization** (Works on MIR loop bodies)
   ```runa
   # Compiler automatically uses AVX/SSE:
   For i from 0 to 1000:
@@ -2023,32 +2401,21 @@ End Process
   End For
   # → Vectorized to process 8 elements at once (AVX2)
   ```
+  - Detect vectorizable loops (MIR CFG analysis)
+  - Generate SIMD instructions (LIR level)
+  - Handle alignment, aliasing, dependencies
 
-- ❌ **Loop Optimizations (Advanced)**
+- ❌ **Loop Optimizations (Advanced)** (Works on MIR CFG)
   - Loop fusion (combine adjacent loops)
   - Loop interchange (reorder nested loops for cache)
   - Loop blocking/tiling (improve cache reuse)
-  - Software pipelining
+  - Loop unrolling (reduce loop overhead)
+  - Software pipelining (overlap iterations)
 
-- ❌ **Escape Analysis** - Stack allocate when possible
-  ```runa
-  Process called "use_list":
-      Let list be List of Integer  # Doesn't escape
-      # → Allocated on stack instead of heap
-  End Process
-  ```
-
-- ❌ **Branch Prediction Hints**
-  ```runa
-  If Likely x is greater than 0:  # Hint: likely true
-      # Hot path
-  End If
-  ```
-
-- ❌ **Instruction Selection** - Use best CPU instructions
-  - Multiply by power-of-2 → shift
-  - Small constants → lea instruction
-  - Conditional moves instead of branches
+- ❌ **Escape Analysis** (Works on MIR data flow)
+  - Determine if objects escape function scope
+  - Stack allocate non-escaping objects
+  - Reduce heap pressure and GC overhead
 
 ### EXTERNAL TOOL (runaprof - NEW):
 - ❌ **Sampling Profiler**
@@ -2068,26 +2435,21 @@ End Process
   - Peak memory usage
   - Allocation hotspots
 
-- ❌ **Cache Profiler**
-  - Cache miss rates
-  - Identify cache-unfriendly code
-  - Suggest optimizations
-
 ## Success Criteria:
-- ✅ Performance matches or beats C on benchmarks (-O3)
 - ✅ PGO provides 10-30% speedup on real workloads
+- ✅ LTO reduces binary size and improves cross-module optimization
 - ✅ SIMD vectorization works automatically for simple loops
-- ✅ Profiler identifies bottlenecks accurately
-- ✅ LTO reduces binary size and improves performance
+- ✅ Loop optimizations improve cache performance measurably
+- ✅ Performance matches or beats C on benchmarks (-O3)
 - ✅ Compilation time still reasonable (< 2x slower than C at -O3)
 
-## Timeline: TBD
+## Timeline: 8-10 weeks
 
 ---
 
-# 🔹 v0.8.1: AOTT Tier 0-1 (Lightning Interpreter + Smart Bytecode)
+# 🔹 v0.8.4: AOTT Tier 0-1 (Lightning Interpreter + Smart Bytecode)
 
-**Goal:** Implement first two tiers of AOTT execution architecture.
+**Goal:** Implement first two tiers of AOTT execution architecture using MIR as bytecode IR.
 
 **What is AOTT?** All-Of-The-Time execution architecture with 5 tiers:
 - Tier 0: Lightning Interpreter (fast startup, profiling hooks)
@@ -4004,10 +4366,13 @@ runac algorithm.runa --to=rust -o algorithm.rs  # future
 | **v0.6.1** | 4 weeks | 56 weeks | Type inference, Refinement types |
 | **v0.7.0** | 6 weeks | 62 weeks | Concurrency (Threads, Mutexes, Channels) |
 | **v0.7.1** | 4 weeks | 66 weeks | Async/Await, Actors |
-| **v0.8.0** | 8 weeks | 74 weeks | Advanced optimization (PGO, LTO, SIMD) |
-| **v0.8.1** | 6 weeks | 80 weeks | AOTT Tier 0-1 (Interpreter, Bytecode) |
-| **v0.8.2** | 8 weeks | 88 weeks | AOTT Tier 2-3 (JIT, Optimized native) |
-| **v0.8.3** | 6 weeks | 94 weeks | AOTT Tier 4 (Speculative execution) |
+| **v0.8.0** | 4-6 weeks | 72 weeks | HIR - Triple Syntax & Rosetta Stone Foundation |
+| **v0.8.1** | 6-8 weeks | 80 weeks | MIR - SSA Form, CFG & Classic Optimizations |
+| **v0.8.2** | 6-8 weeks | 88 weeks | LIR - Virtual Registers & Register Allocation |
+| **v0.8.3** | 8-10 weeks | 98 weeks | Advanced Optimizations (PGO, LTO, SIMD, Loop Opts) |
+| **v0.8.4** | 6 weeks | 104 weeks | AOTT Tier 0-1 (Interpreter, Bytecode) |
+| **v0.8.5** | 8 weeks | 112 weeks | AOTT Tier 2-3 (JIT, Optimized native) |
+| **v0.8.6** | 6 weeks | 118 weeks | AOTT Tier 4 (Speculative execution) |
 | **v0.9.0** | 4 weeks | 100 weeks | Cross-compilation: Target abstraction |
 | **v0.9.1** | 6 weeks | 106 weeks | Cross-compilation: Windows support |
 | **v0.9.2** | 6 weeks | 112 weeks | Cross-compilation: macOS support (x86-64 + ARM64) |
