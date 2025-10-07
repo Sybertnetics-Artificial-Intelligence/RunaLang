@@ -12925,6 +12925,11 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -2880(%rbp)
+    movq -2880(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    movq %rax, -2888(%rbp)
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -12939,16 +12944,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2888(%rbp)
+    movq %rax, -2896(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -2888(%rbp), %rax
+    movq -2896(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -2896(%rbp)
-    movq -2896(%rbp), %rax
+    movq %rax, -2904(%rbp)
+    movq -2904(%rbp), %rax
     pushq %rax
     movq $9, %rax
     popq %rbx
@@ -12980,16 +12985,16 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_expression
-    movq %rax, -2904(%rbp)
-    movq -2904(%rbp), %rax
+    movq %rax, -2912(%rbp)
+    movq -2912(%rbp), %rax
     pushq %rax
-    movq -2880(%rbp), %rax
+    movq -2888(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call expression_create_lambda
-    movq %rax, -2912(%rbp)
-    movq -2912(%rbp), %rax
+    movq %rax, -2920(%rbp)
+    movq -2920(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret

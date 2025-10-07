@@ -237,7 +237,6 @@ v0.0.8.3/
 - ✅ Context-aware collection keywords
 
 ### Coming Soon
-- **v0.0.8.4** - Implicit variant construction, string interpolation, lambda expressions
 - **v0.0.9** - Error handling (Result/Option as stdlib ADTs), generics, native object writer
 - **v0.1.0** - Beta release, standard library foundation
 - **v1.0.0** - Production release
