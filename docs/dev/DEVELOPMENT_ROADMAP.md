@@ -97,6 +97,8 @@ Codegen → Assembly → Binary
 | **v0.2.1** | HTTP/Network Library & REST API Support | 📋 Planned |
 | **v0.2.2** | JSON/XML Parsing & Serialization | 📋 Planned |
 | **v0.2.3** | Web Framework Foundation (HTTP Server, Routing, Middleware) | 📋 Planned |
+| **v0.2.4** | Garbage Collection & Memory Management (Mark-Sweep, Generational, Concurrent GC) | 📋 Planned |
+| **v0.2.5** | Advanced I/O & Serialization (Filesystem, WebSockets, Binary/XML) | 📋 Planned |
 | **v0.3.0** | Debugging Tools & Dev Experience Improvements | 📋 Planned |
 | **v0.4.0** | Memory Management & Safety Features (Ownership, Lifetimes) | 📋 Planned |
 | **v0.5.0** | Optimization Passes (Basic - Constant Folding, DCE, Inlining) | 📋 Planned |
@@ -111,14 +113,16 @@ Codegen → Assembly → Binary
 | **v0.8.4** | AOTT Tier 0-1: Lightning Interpreter + Smart Bytecode (uses MIR) | 📋 Planned |
 | **v0.8.5** | AOTT Tier 2-3: Basic + Optimized Native Compilation (uses MIR→LIR) | 📋 Planned |
 | **v0.8.6** | AOTT Tier 4: Speculative Execution (uses full IR pipeline) | 📋 Planned |
+| **v0.8.7** | Runtime Services (AOTT Interface, Debugging, Monitoring, Profiling, Security) | 📋 Planned |
 | **v0.9.0** | Cross-Compilation: Target Abstraction + Multi-Backend Foundation | 📋 Planned |
 | **v0.9.1** | Cross-Compilation: Windows Support (x86-64 PE format) | 📋 Planned |
 | **v0.9.2** | Cross-Compilation: macOS Support (x86-64 + ARM64 Mach-O format) | 📋 Planned |
 | **v0.9.3** | Cross-Compilation: ARM64 Linux Support | 📋 Planned |
+| **v0.9.3.5** | Cross-Compilation: RISC-V Support (RV64GC) | 📋 Planned |
 | **v0.9.4** | Cross-Compilation: WebAssembly Support (WASM + WASI) | 📋 Planned |
 | **v0.9.4.5** | GPU Acceleration Backends (CUDA, OpenCL, Metal) | 📋 Planned |
 | **v0.9.5** | Package Management & Distribution | 📋 Planned |
-| **v0.9.6** | IDE Tooling (LSP, Debugger, Profiler) | 📋 Planned |
+| **v0.9.6** | IDE Tooling (HermodIDE, LSP, Debugger, Profiler) | 📋 Planned |
 | **v0.9.7** | AI Annotation System Implementation | 📋 Planned |
 | **v1.0.0** | Production Release (All Platforms, All Features Complete) | 🎯 Goal |
 | **v1.1** | Rosetta Stone Phase 1: C → Runa Translation | 📋 Planned |
@@ -445,6 +449,39 @@ Let x as Integer be 42
   - Sign-extension: `movsbq` (byte to quad), `movswq` (word to quad), `movslq` (long to quad)
   - Zero-extension: `movzbq`, `movzwq`, `movzlq`
 
+### RUNATIME (Advanced FFI & Platform Abstraction):
+
+- ❌ **FFI Type Marshaling** (`runatime/integration/ffi/type_marshaling.runa`)
+  - Complex type conversions (structs, arrays, pointers)
+  - Nested struct handling
+  - Union type marshaling
+  - Opaque pointer types
+  - Callback function pointers
+
+- ❌ **Callback Manager** (`runatime/integration/ffi/callback_manager.runa`)
+  - Register Runa functions as C callbacks
+  - Trampoline generation for calling conventions
+  - Thread-safe callback handling
+  - Re-entrant call support
+
+- ❌ **Native Library Loader** (`runatime/integration/ffi/native_library_loader.runa`)
+  - Dynamic library loading (dlopen on Unix, LoadLibrary on Windows)
+  - Symbol resolution and caching
+  - Library dependency tracking
+  - Graceful handling of missing libraries
+
+- ❌ **Platform Detector** (`runatime/integration/system_interface/platform_detector.runa`)
+  - Runtime OS detection (Linux, Windows, macOS, FreeBSD)
+  - Architecture detection (x86_64, ARM64, RISC-V)
+  - ABI detection (System V vs Windows x64 calling convention)
+  - Feature detection (SSE, AVX, NEON availability)
+
+- ❌ **Platform-Specific System Interfaces** (`runatime/integration/system_interface/platform_implementations/`)
+  - **Linux** (`linux/`): Standard POSIX syscalls
+  - **Windows** (`windows/`): Win32 API syscalls
+  - **macOS** (`darwin/`): BSD + macOS-specific syscalls
+  - **FreeBSD** (`bsd/freebsd/`): BSD syscalls + Capsicum security, kqueue, jails
+
 ## Success Criteria:
 - ✅ All fixed-size integer types (8/16/32/64, signed/unsigned) parse correctly
 - ✅ Type conversions work with proper sign/zero extension
@@ -453,7 +490,12 @@ Let x as Integer be 42
 - ✅ Binary I/O functions read/write correct byte counts
 - ✅ Size-specific assembly instructions generated (movb/w/l/q)
 - ✅ Overflow/truncation warnings for narrowing conversions
-- ✅ All tests pass including wire format and binary I/O tests
+- ✅ FFI type marshaling handles complex types (structs, unions, callbacks)
+- ✅ Callback manager supports re-entrant calls
+- ✅ Native library loader works on all platforms
+- ✅ Platform detector correctly identifies OS, architecture, ABI
+- ✅ Platform-specific syscalls work on Linux, Windows, macOS, FreeBSD
+- ✅ All tests pass including wire format, binary I/O, FFI, and platform tests
 
 
 ---
@@ -813,26 +855,53 @@ src/
 **Target State (v0.0.9.3):**
 ```
 src/
-├── frontend/
-│   ├── lexer/ (lexer.runa, token.runa)
-│   └── parser/ (parser.runa, ast.runa)
-├── semantic/
-│   ├── semantic_analyzer.runa
-│   ├── type_checker.runa (with generics support)
-│   └── symbol_table.runa
-├── ir/
-│   ├── hir/ (High-level IR)
-│   └── mir/ (Mid-level IR)
-├── backend/
-│   └── x86_64/ (codegen.runa, instruction_selector.runa, object_writer.runa)
-└── runtime/ (Pure Runa runtime - replaces runtime.c)
+├── compiler/
+│   ├── driver/
+│   │   ├── compiler_driver.runa (Pipeline orchestration)
+│   │   ├── build_system.runa (Build coordination)
+│   │   ├── cache_manager.runa (Compilation caching)
+│   │   ├── dependency_manager.runa (Module dependencies)
+│   │   ├── incremental_build.runa (Rebuild only changed files)
+│   │   └── parallel_compilation.runa (Multi-threaded builds)
+│   ├── frontend/
+│   │   ├── diagnostics/ (Error reporting, suggestions)
+│   │   ├── lexical/
+│   │   │   ├── lexer.runa, token.runa
+│   │   │   ├── keywords.runa, operators.runa, literals.runa
+│   │   │   ├── import_resolver.runa
+│   │   │   └── intentional_recovery/ (AI-first error recovery)
+│   │   └── parser/ (parser.runa, ast.runa)
+│   ├── middle/
+│   │   ├── ir/ (hir/, mir/, lir/)
+│   │   ├── analysis/ (control flow, data flow, alias analysis)
+│   │   └── transformations/
+│   │       ├── lowering.runa (HIR→MIR→LIR)
+│   │       ├── monomorphization.runa (Generic instantiation)
+│   │       ├── specialization.runa (Type-specific opts)
+│   │       └── optimization.runa (Middle-end passes)
+│   ├── backend/
+│   │   ├── machine_code/
+│   │   │   ├── x86_64/ (asm_generator, register_allocator)
+│   │   │   ├── common/ (linker, loader, executable_format)
+│   │   └── bytecode_gen/ (AOTT bytecode - future)
+│   ├── services/
+│   │   ├── language_server/ (LSP - future)
+│   │   └── ide_integration/ (Debugger, syntax highlighting - future)
+│   └── tools/
+│       ├── formatter.runa, linter.runa (future)
+│       ├── test_runner.runa, benchmark_runner.runa (future)
+│       └── documentation_generator.runa (future)
+├── stdlib/ (Standard library modules)
+├── runatime/ (Pure Runa runatime - replaces runtime.c)
+└── scripts/ (Build and utility scripts)
 ```
 
 **Phased Implementation:**
-- **v0.0.9.0**: Split lexer/parser, add Result/Option types, begin runtime.runa
-- **v0.0.9.1**: Add semantic analysis phase, implement generics + type inference
-- **v0.0.9.2**: Add IR layers (HIR/MIR), native ELF64 object writer, custom linker
-- **v0.0.9.3**: Complete pure Runa runtime, eliminate runtime.c, zero external dependencies
+- **v0.0.9.0**: Compiler driver, build system, split lexer/parser, Result/Option types
+- **v0.0.9.1**: Semantic analysis, generics, type inference, monomorphization
+- **v0.0.9.2**: Middle-end (HIR/MIR/LIR), transformations, native ELF64 object writer
+- **v0.0.9.3**: Pure Runa runatime, incremental/parallel builds, intentional recovery
+- **v0.0.9.4**: Complete toolchain independence (zero C dependencies)
 
 ## Features to Implement:
 
@@ -934,10 +1003,164 @@ swap(x, y)  Note: Compiler infers T = Integer
 **Implementation Requirements:**
 - Generic type parameters: `Type Foo of T:` and `Process foo of type T:`
 - Type inference for generic instantiation
-- Monomorphization (generate separate code for each concrete type)
+- **Monomorphization** (generate separate code for each concrete type)
+- **Specialization** (type-specific optimizations for hot paths)
 - Generic constraints (later): `Process foo of type T where T has Comparable:`
 
-### 3. **ELF Object File Writer**
+### 3. **Compiler Driver & Build System**
+
+**Motivation:** Professional build orchestration for large projects with fast incremental builds.
+
+**Compiler Driver** (src/driver/compiler_driver.runa):
+```runa
+Type CompilerConfiguration is Dictionary with:
+    source_files as List[String]
+    output_path as String
+    target_platform as String
+    optimization_level as Integer
+    debug_info as Boolean
+    syntax_mode as String          # Canon or Developer
+    feature_flags as Dictionary[String, Boolean]
+End Type
+
+Type CompilationPipeline is Dictionary with:
+    phases as List[CompilationPhase]
+    current_phase as Integer
+    units as List[CompilationUnit]
+    error_count as Integer
+End Type
+
+Process called "compile_project" takes config as CompilerConfiguration returns CompilationResult:
+    # Multi-phase pipeline coordination:
+    # 1. Dependency analysis
+    # 2. Parallel compilation of independent modules
+    # 3. Link-time optimization
+    # 4. Final linking
+End Process
+```
+
+**Incremental Build System** (src/driver/incremental_build.runa):
+- File change detection (mtime, content hash)
+- Dependency graph tracking
+- Rebuild only affected modules
+- Cache intermediate artifacts (.o files, IR)
+
+**Parallel Compilation** (src/driver/parallel_compilation.runa):
+- Multi-threaded compilation of independent modules
+- Work-stealing scheduler
+- CPU core utilization optimization
+- Progress reporting
+
+**Build Cache** (src/driver/cache_manager.runa):
+- Cache compilation artifacts by content hash
+- Shared cache across projects
+- Cache invalidation strategies
+- Compression for storage efficiency
+
+**Dependency Manager** (src/driver/dependency_manager.runa):
+- Module dependency graph construction
+- Circular dependency detection
+- Topological sort for compilation order
+- Cross-module incremental analysis
+
+### 4. **Monomorphization & Specialization**
+
+**Monomorphization** (middle/transformations/monomorphization.runa):
+
+Generate specialized code for each concrete type instantiation:
+
+```runa
+# Generic definition:
+Type List of T:
+    items as Pointer
+    count as Integer
+End Type
+
+Process called "list_get" of type T takes list as List of T, index as Integer returns T:
+    # Generic implementation
+End Process
+
+# After monomorphization:
+# - list_get__Integer (for List of Integer)
+# - list_get__String (for List of String)
+# - list_get__Point (for List of Point)
+```
+
+**Specialization** (middle/transformations/specialization.runa):
+
+Type-specific optimizations for hot paths:
+
+```runa
+# Generic swap can be specialized for integers:
+Process called "swap" of type Integer takes a as Integer, b as Integer:
+    # Specialized: use XOR trick for integers (no temp variable)
+    Set a to a xor b
+    Set b to a xor b
+    Set a to a xor b
+End Process
+```
+
+**Monomorphization Cache:**
+- Avoid redundant instantiations
+- Cross-module instantiation sharing
+- Code size optimization (only instantiate used types)
+
+### 5. **Intentional Recovery System (AI-First Innovation)**
+
+**Motivation:** Revolutionary 3-stage error recovery treats errors as moments of ambiguity where high-level intent needs reconciliation with low-level code.
+
+**Stage 1: Traditional Syntactic Recovery** (frontend/lexical/intentional_recovery/syntactic_recovery.runa):
+```runa
+# Missing semicolon, closing brace, etc.
+# Standard error recovery techniques
+```
+
+**Stage 2: Semantic Context Analysis** (frontend/lexical/intentional_recovery/semantic_analysis.runa):
+```runa
+Type ErrorContext is Dictionary with:
+    error_location as SourceLocation
+    surrounding_code as String
+    symbol_table_snapshot as SymbolTable
+    type_environment as Dictionary[String, Type]
+    partial_ast as ASTNode
+End Type
+
+Process called "analyze_semantic_context" takes error as SyntaxError returns ErrorContext:
+    # Analyze:
+    # - Available variables in scope
+    # - Expected types from context
+    # - Function signatures in scope
+    # - Common patterns in codebase
+    Return context
+End Process
+```
+
+**Stage 3: Generative Intervention** (future AI integration):
+```runa
+# Use error context to suggest corrections:
+# "Did you mean: variable_name instead of varaible_name?"
+# "Expected type Integer, found String. Did you mean to call parse_int()?"
+```
+
+**Recovery Engine** (frontend/lexical/intentional_recovery/recovery_engine.runa):
+```runa
+Type RecoveryResult is Dictionary with:
+    success as Boolean
+    confidence as Float
+    stage_reached as Integer        # 1, 2, or 3
+    correction as Optional[String]
+    explanation as Optional[String]
+    alternatives as List[String]
+End Type
+
+Process called "attempt_recovery" takes error as SyntaxError returns RecoveryResult:
+    # Try Stage 1 (syntactic)
+    # If fails, try Stage 2 (semantic)
+    # If fails, try Stage 3 (generative)
+End Process
+```
+
+### 6. **ELF Object File Writer**
 - Generate `.o` files directly (no `.s` intermediate)
 - ELF64 format specification
 - Symbol table generation
@@ -955,12 +1178,12 @@ swap(x, y)  Note: Compiler infers T = Integer
   - Section merging
 
 ### 5. **Pure Runa Runtime (Zero C)**
-**Replaces `runtime/runtime.c` with `runtime/runtime.runa`**
+**Replaces `runatime/runatime.c` with `runtime/runtime.runa`**
 
 Write runtime entirely in Runa using inline assembly for syscalls:
 
 ```runa
-# runtime/runtime_io.runa
+# runatime/runatime_io.runa
 proc write_syscall(fd: int, buf: ptr, len: int) -> int:
     Inline Assembly:
         mov $1, %rax           # syscall: write
@@ -983,21 +1206,21 @@ End proc
 ```
 
 **Runtime modules to implement:**
-- `runtime/runtime_io.runa` - read, write, open, close
-- `runtime/runtime_memory.runa` - malloc, free, memcpy, memset
-- `runtime/runtime_string.runa` - string operations
-- `runtime/runtime_file.runa` - file operations
-- `runtime/runtime_math.runa` - basic math (if needed)
+- `runatime/runatime_io.runa` - read, write, open, close
+- `runatime/runatime_memory.runa` - malloc, free, memcpy, memset
+- `runatime/runatime_string.runa` - string operations
+- `runatime/runatime_file.runa` - file operations
+- `runatime/runatime_math.runa` - basic math (if needed)
 
 **Compilation:**
 ```bash
 # Compile runtime modules to .o files
-runac runtime/runtime_io.runa -o runtime/runtime_io.o --emit=obj
-runac runtime/runtime_memory.runa -o runtime/runtime_memory.o --emit=obj
-runac runtime/runtime_string.runa -o runtime/runtime_string.o --emit=obj
+runac runatime/runatime_io.runa -o runatime/runatime_io.o --emit=obj
+runac runatime/runatime_memory.runa -o runatime/runatime_memory.o --emit=obj
+runac runatime/runatime_string.runa -o runatime/runatime_string.o --emit=obj
 
 # Link with user program
-runac main.runa --link runtime/*.o -o program
+runac main.runa --link runatime/*.o -o program
 ```
 
 ### 6. **New Compilation Flags**
@@ -1020,15 +1243,15 @@ runac main.runa utils.runa -o program
 ### 8. **Build Process Changes**
 **Old (v0.0.7.5):**
 ```bash
-gcc -c runtime/runtime.c -o runtime/runtime.o    # Needs GCC
+gcc -c runatime/runatime.c -o runtime/runatime.o    # Needs GCC
 as --64 program.s -o program.o                   # Needs as
-ld program.o runtime/runtime.o -o program        # Needs ld
+ld program.o runtime/runatime.o -o program        # Needs ld
 ```
 
 **New (v0.0.9):**
 ```bash
-runac runtime/runtime.runa -o runtime.o --emit=obj    # Pure Runa
-runac program.runa --link runtime.o -o program        # Pure Runa
+runac runatime/runtime.runa -o runatime.o --emit=obj    # Pure Runa
+runac program.runa --link runatime.o -o program        # Pure Runa
 # Zero external dependencies!
 ```
 
@@ -1045,7 +1268,7 @@ runac program.runa --link runtime.o -o program        # Pure Runa
 - ✅ Generate valid ELF object files
 - ✅ Link multiple objects successfully
 - ✅ Executables run without external assembler/linker
-- ✅ **Pure Runa runtime (zero C code)**
+- ✅ **Pure Runa runatime (zero C code)**
 - ✅ **Zero dependency on GCC, as, or ld**
 - ✅ Self-hosting with native object generation
 - ✅ Bootstrap produces identical binaries
@@ -1656,6 +1879,361 @@ End Process
 - ✅ Example programs: REST API, static site server, webhook receiver
 - ✅ Performance: Handle 1000+ requests/second
 - ✅ All tests pass including stress tests
+
+
+---
+
+# 🔹 v0.2.4: Garbage Collection & Memory Management
+
+**Goal:** Implement production-grade garbage collection system with multiple GC algorithms and advanced memory management.
+
+**Priority:** HIGH - Essential for automatic memory management and production workloads.
+
+## What Belongs Where:
+
+### RUNATIME (Core Memory Management):
+- ❌ **Garbage Collector** (`runatime/core/memory/garbage_collector.runa`)
+  - Multiple GC algorithms:
+    - **Mark-Sweep**: Simple, predictable pause times
+    - **Generational GC**: Optimized for short-lived objects
+    - **Incremental GC**: Reduced pause times for interactive applications
+    - **Concurrent GC**: Background collection for low-latency workloads
+  - Reference tracking and cycle detection
+  - Weak reference support
+  - Finalization queues
+  - GC tuning and configuration
+
+- ❌ **Heap Manager** (`runatime/core/memory/heap_manager.runa`)
+  - Heap allocation strategies
+  - Heap compaction and defragmentation
+  - Large object handling (separate large object heap)
+  - Memory pressure detection and triggers
+  - Heap sizing and growth policies
+
+- ❌ **Object Model** (`runatime/core/object_model/`)
+  - **Object Layout** (`object_layout.runa`)
+    - Object header design (type ID, size, GC flags, generation)
+    - Field layout and alignment
+    - Padding and cache line optimization
+  - **VTable Manager** (`vtable_manager.runa`)
+    - Virtual method table generation
+    - Dynamic dispatch optimization
+  - **Weak References** (`weak_references.runa`)
+    - Weak reference tracking
+    - Phantom references for cleanup
+  - **Finalizers** (`finalizers.runa`)
+    - Finalization queue management
+    - Safe finalization ordering
+  - **Reference Counting** (`reference_counting.runa`)
+    - Optional reference counting for deterministic cleanup
+    - Hybrid RC + GC approach
+
+- ❌ **Memory Profiler** (`runatime/core/memory/memory_profiler.runa`)
+  - Heap allocation tracking
+  - Memory leak detection
+  - Object lifetime analysis
+  - Allocation hotspot identification
+
+### RUNATIME (Type System Support):
+- ❌ **Runtime Type Information** (`runatime/core/type_system/type_info.runa`)
+  - Type metadata storage
+  - Type ID assignment
+  - Type hierarchy information
+- ❌ **Reflection** (`runatime/core/type_system/reflection.runa`)
+  - Runtime type introspection
+  - Field enumeration
+  - Method discovery
+- ❌ **Dynamic Dispatch** (`runatime/core/type_system/dynamic_dispatch.runa`)
+  - Virtual method dispatch
+  - Interface method resolution
+
+## GC Algorithm Examples:
+
+**Mark-Sweep GC:**
+```runa
+Type GCConfiguration:
+    algorithm as String                # "mark-sweep", "generational", etc.
+    heap_size as Integer              # Total heap size in bytes
+    collection_threshold as Float     # Trigger GC at X% heap usage
+    pause_target_ms as Integer        # Target pause time
+    concurrent_enabled as Boolean     # Enable concurrent collection
+End Type
+
+Process called "gc_mark_and_sweep" returns Integer:
+    @Reasoning:
+        Classic mark-and-sweep algorithm:
+        1. Mark phase: Traverse object graph from roots
+        2. Sweep phase: Reclaim unmarked objects
+    End Reasoning
+
+    Note: Mark phase - traverse from root set
+    Let roots be gc_enumerate_roots()
+    For Each root in roots:
+        gc_mark_object(root)
+    End For
+
+    Note: Sweep phase - reclaim unmarked objects
+    Let reclaimed be gc_sweep_heap()
+
+    Return reclaimed
+End Process
+```
+
+**Generational GC:**
+```runa
+Type Generation:
+    id as Integer                     # Generation number (0=young, 1=old)
+    start_address as Integer          # Start of generation
+    size as Integer                   # Generation size
+    used as Integer                   # Bytes used
+    collection_count as Integer       # Collections performed
+    promotion_threshold as Integer    # Age for promotion
+End Type
+
+Process called "gc_generational_collect" returns Integer:
+    @Reasoning:
+        Generational hypothesis: Most objects die young.
+        - Minor GC: Collect young generation (frequent, fast)
+        - Major GC: Collect all generations (infrequent, slower)
+    End Reasoning
+
+    Note: Minor collection - young generation only
+    Let young_gen be gc_get_generation(0)
+    Let reclaimed be gc_collect_generation(young_gen)
+
+    Note: Promote survivors to old generation
+    gc_promote_survivors(young_gen)
+
+    Return reclaimed
+End Process
+```
+
+**Object Header Design:**
+```runa
+Type ObjectHeader:
+    type_id as Integer                # Type identifier
+    size as Integer                   # Object size in bytes
+    gc_flags as Integer               # GC state flags
+    generation as Integer             # Which generation object is in
+    forwarding_pointer as Integer     # For compacting GC
+    mark_bit as Boolean               # Marked during GC trace
+    pinned as Boolean                 # Prevent moving/collection
+    has_finalizer as Boolean          # Object has finalizer
+End Type
+```
+
+## Configuration Examples:
+
+**Interactive Application (Low Latency):**
+```runa
+Let gc_config be GCConfiguration with
+    algorithm as "incremental",
+    heap_size as 512_000_000,         # 512 MB
+    collection_threshold as 0.75,      # Collect at 75% full
+    pause_target_ms as 10,             # Target 10ms pauses
+    concurrent_enabled as True         # Enable background GC
+End GCConfiguration
+```
+
+**Batch Processing (High Throughput):**
+```runa
+Let gc_config be GCConfiguration with
+    algorithm as "mark-sweep",
+    heap_size as 4_000_000_000,       # 4 GB
+    collection_threshold as 0.9,       # Collect at 90% full
+    pause_target_ms as 100,            # Accept longer pauses
+    concurrent_enabled as False        # Disable concurrent GC
+End GCConfiguration
+```
+
+## Success Criteria:
+- ✅ Mark-sweep GC implemented and working
+- ✅ Generational GC reduces pause times for typical workloads
+- ✅ Incremental GC provides sub-10ms pauses
+- ✅ Concurrent GC reduces application pause time by 50%+
+- ✅ Object headers use minimal memory (8-16 bytes)
+- ✅ Weak references work correctly
+- ✅ Finalizers execute in correct order
+- ✅ Memory profiler identifies leaks and hotspots
+- ✅ GC tuning options allow optimization for different workloads
+- ✅ Heap compaction reduces fragmentation
+- ✅ Large objects handled efficiently (separate LOH)
+- ✅ GC statistics and monitoring available
+- ✅ All tests pass including stress tests
+
+
+---
+
+# 🔹 v0.2.5: Advanced I/O & Serialization
+
+**Goal:** Comprehensive I/O system with filesystem operations, advanced networking, and serialization.
+
+**Priority:** MEDIUM-HIGH - Essential for real-world applications.
+
+## What Belongs Where:
+
+### RUNATIME (Filesystem):
+- ❌ **File Operations** (`runatime/io/filesystem/file_operations.runa`)
+  - File reading/writing (beyond basic I/O)
+  - File metadata (size, permissions, timestamps)
+  - File copying and moving
+  - Atomic file operations
+  - File locking mechanisms
+
+- ❌ **Directory Operations** (`runatime/io/filesystem/directory_operations.runa`)
+  - Directory creation and deletion
+  - Directory traversal and listing
+  - Recursive operations
+  - Directory watching for changes
+
+- ❌ **Path Manipulation** (`runatime/io/filesystem/path_manipulation.runa`)
+  - Path normalization and canonicalization
+  - Path joining and splitting
+  - Relative path resolution
+  - Cross-platform path handling
+
+- ❌ **File Watching** (`runatime/io/filesystem/file_watching.runa`)
+  - Monitor file/directory changes
+  - Event notification (created, modified, deleted)
+  - Recursive watching
+  - Platform-specific implementations (inotify, FSEvents, ReadDirectoryChangesW)
+
+- ❌ **Temporary Files** (`runatime/io/filesystem/temp_files.runa`)
+  - Secure temporary file creation
+  - Automatic cleanup
+  - Temporary directory management
+
+### RUNATIME (Advanced Networking):
+- ❌ **DNS Resolver** (`runatime/io/networking/dns_resolver.runa`)
+  - DNS queries (A, AAAA, MX, TXT records)
+  - Asynchronous resolution
+  - DNS caching
+  - Custom DNS servers
+
+- ❌ **TCP Sockets** (`runatime/io/networking/tcp_sockets.runa`)
+  - Low-level TCP socket operations
+  - Non-blocking I/O
+  - Socket options (keepalive, nodelay, buffer sizes)
+  - Connection pooling
+
+- ❌ **UDP Sockets** (`runatime/io/networking/udp_sockets.runa`)
+  - UDP datagram send/receive
+  - Multicast support
+  - Broadcast support
+
+- ❌ **WebSockets** (`runatime/io/networking/websockets.runa`)
+  - WebSocket client and server
+  - Frame parsing and generation
+  - Ping/pong heartbeat
+  - Binary and text messages
+
+### RUNATIME (Serialization):
+- ❌ **JSON Serializer** (`runatime/io/serialization/json_serializer.runa`)
+  - JSON encoding/decoding
+  - Streaming JSON parser
+  - Pretty printing
+  - Custom type serialization
+
+- ❌ **XML Serializer** (`runatime/io/serialization/xml_serializer.runa`)
+  - XML parsing and generation
+  - DOM and SAX-style APIs
+  - XML schema validation
+  - Namespace support
+
+- ❌ **Binary Serializer** (`runatime/io/serialization/binary_serializer.runa`)
+  - Efficient binary encoding
+  - Versioning support
+  - Schema evolution
+  - Cross-platform compatibility
+
+- ❌ **Custom Serializer** (`runatime/io/serialization/custom_serializer.runa`)
+  - Define custom serialization formats
+  - Serialization hooks
+  - Type registration
+
+- ❌ **Schema Validator** (`runatime/io/serialization/schema_validator.runa`)
+  - JSON Schema validation
+  - XML Schema validation
+  - Custom schema formats
+
+## Implementation Examples:
+
+**File Watching:**
+```runa
+Import "runatime/io/filesystem/file_watching.runa" as FileWatch
+
+Process called "watch_config_changes" returns Integer:
+    Let watcher be FileWatch.create_watcher("./config")
+
+    FileWatch.on_change(watcher, $handle_config_change)
+    FileWatch.on_create(watcher, $handle_config_create)
+    FileWatch.on_delete(watcher, $handle_config_delete)
+
+    FileWatch.start(watcher)  # Start watching
+
+    Return 0
+End Process
+
+Process called "handle_config_change" takes path as String:
+    Display("Config file changed: ")
+    Display(path)
+    Note: Reload configuration...
+End Process
+```
+
+**WebSocket Client:**
+```runa
+Import "runatime/io/networking/websockets.runa" as WS
+
+Process called "connect_to_server" returns Integer:
+    Let socket be WS.connect("wss://api.example.com/stream")
+
+    WS.on_message(socket, $handle_message)
+    WS.on_close(socket, $handle_close)
+
+    WS.send(socket, "Hello Server!")
+
+    Return 0
+End Process
+```
+
+**Binary Serialization:**
+```runa
+Import "runatime/io/serialization/binary_serializer.runa" as Binary
+
+Type User:
+    id as Integer
+    name as String
+    email as String
+    created_at as Integer
+End Type
+
+Process called "serialize_user" takes user as User returns List[Integer]:
+    Let serializer be Binary.create()
+
+    Binary.write_int(serializer, user.id)
+    Binary.write_string(serializer, user.name)
+    Binary.write_string(serializer, user.email)
+    Binary.write_int(serializer, user.created_at)
+
+    Return Binary.to_bytes(serializer)
+End Process
+```
+
+## Success Criteria:
+- ✅ File watching works on Linux, macOS, Windows
+- ✅ Directory operations handle recursive operations correctly
+- ✅ Path manipulation works cross-platform
+- ✅ Temporary files are cleaned up automatically
+- ✅ DNS resolver handles all common record types
+- ✅ TCP sockets support non-blocking I/O
+- ✅ UDP multicast works correctly
+- ✅ WebSocket client and server interoperate with standard implementations
+- ✅ JSON serialization handles all Runa types
+- ✅ XML parser handles complex documents
+- ✅ Binary serialization is efficient and versioned
+- ✅ Schema validation catches invalid data
+- ✅ All tests pass including platform-specific tests
 
 
 ---
@@ -3217,6 +3795,238 @@ src/compiler/ir/
 
 ---
 
+# 🔹 v0.8.7: Runtime Services (AOTT Interface, Debugging, Monitoring, Security)
+
+**Goal:** Comprehensive runtime services for production deployments including debugging, monitoring, profiling, and security.
+
+**Priority:** HIGH - Essential for production-grade applications and enterprise deployments.
+
+## What Belongs Where:
+
+### RUNATIME (AOTT Interface Services):
+- ❌ **Code Cache Interface** (`runatime/services/aott_interface/code_cache_interface.runa`)
+  - Manage compiled code cache
+  - Code eviction policies (LRU, size-based)
+  - Cache persistence across restarts
+  - Cache warming strategies
+
+- ❌ **Deoptimization Handler** (`runatime/services/aott_interface/deopt_handler.runa`)
+  - Handle failed speculative optimizations
+  - Stack reconstruction from optimized to interpreted frames
+  - Metadata for deoptimization points
+  - Performance tracking of deopt events
+
+- ❌ **Execution Bridge** (`runatime/services/aott_interface/execution_bridge.runa`)
+  - Seamless transition between interpreter and compiled code
+  - OSR (On-Stack Replacement) for hot loops
+  - Frame layout compatibility
+  - Register allocation coordination
+
+- ❌ **Profile Collector** (`runatime/services/aott_interface/profile_collector.runa`)
+  - Collect runtime profiling data
+  - Type feedback collection
+  - Branch prediction data
+  - Call site profiling
+
+- ❌ **Tier Coordinator** (`runatime/services/aott_interface/tier_coordinator.runa`)
+  - Manage compilation tier transitions
+  - Decide when to promote to higher tiers
+  - Background compilation scheduling
+  - Resource-aware tier selection
+
+### RUNATIME (Debugging Services):
+- ❌ **Breakpoint Manager** (`runatime/services/debugging/breakpoint_manager.runa`)
+  - Set/remove breakpoints at source locations
+  - Conditional breakpoints
+  - Watchpoints for data changes
+  - Breakpoint persistence
+
+- ❌ **Call Stack Tracer** (`runatime/services/debugging/call_stack_tracer.runa`)
+  - Stack unwinding and trace generation
+  - Source location mapping
+  - Inlined function handling
+  - Async stack traces
+
+- ❌ **Debugger Support** (`runatime/services/debugging/debugger_support.runa`)
+  - DAP (Debug Adapter Protocol) implementation
+  - Step-over, step-in, step-out
+  - Variable inspection
+  - Expression evaluation in context
+
+- ❌ **Variable Inspector** (`runatime/services/debugging/variable_inspector.runa`)
+  - Inspect local and global variables
+  - Heap object inspection
+  - Type-aware pretty printing
+  - Memory address display
+
+### RUNATIME (Monitoring Services):
+- ❌ **Health Monitor** (`runatime/services/monitoring/health_monitor.runa`)
+  - Application health checks
+  - Resource usage monitoring
+  - Error rate tracking
+  - SLA compliance monitoring
+
+- ❌ **Log Manager** (`runatime/services/monitoring/log_manager.runa`)
+  - Structured logging
+  - Log levels (DEBUG, INFO, WARN, ERROR, FATAL)
+  - Log rotation and retention
+  - Async logging for performance
+
+- ❌ **Performance Monitor** (`runatime/services/monitoring/performance_monitor.runa`)
+  - Real-time performance metrics
+  - Request/response time tracking
+  - Throughput measurement
+  - Latency percentiles (p50, p95, p99)
+
+- ❌ **Resource Monitor** (`runatime/services/monitoring/resource_monitor.runa`)
+  - CPU usage tracking
+  - Memory usage and GC statistics
+  - Thread pool utilization
+  - I/O bandwidth monitoring
+
+### RUNATIME (Profiling Services):
+- ❌ **Allocation Tracker** (`runatime/services/profiling/allocation_tracker.runa`)
+  - Track memory allocations
+  - Allocation site profiling
+  - Object lifetime analysis
+  - Memory leak detection
+
+- ❌ **CPU Profiler** (`runatime/services/profiling/cpu_profiler.runa`)
+  - Sampling-based CPU profiling
+  - Call graph generation
+  - Hotspot identification
+  - Flame graph generation
+
+- ❌ **Memory Profiler** (`runatime/services/profiling/memory_profiler.runa`)
+  - Heap snapshots
+  - Retention analysis
+  - Memory usage by type
+  - Allocation/deallocation patterns
+
+- ❌ **Performance Counter** (`runatime/services/profiling/performance_counter.runa`)
+  - Hardware performance counters (cache misses, branch mispredicts)
+  - Custom metric tracking
+  - Counter aggregation
+  - Time-series data collection
+
+### RUNATIME (Security Services):
+- ❌ **Audit Logger** (`runatime/services/security/audit_logger.runa`)
+  - Security event logging
+  - Access control logging
+  - Tamper-evident logs
+  - Compliance reporting
+
+- ❌ **Crypto Services** (`runatime/services/security/crypto_services.runa`)
+  - Cryptographic primitives (AES, SHA, RSA)
+  - Secure random number generation
+  - Key management
+  - Certificate validation
+
+- ❌ **Permission System** (`runatime/services/security/permission_system.runa`)
+  - Role-Based Access Control (RBAC)
+  - Capability-based security
+  - Fine-grained permissions
+  - Permission inheritance and delegation
+
+## Implementation Examples:
+
+**Debugging with Breakpoints:**
+```runa
+Import "runatime/services/debugging/breakpoint_manager.runa" as Debug
+
+Process called "debug_function" returns Integer:
+    Let bp be Debug.set_breakpoint("myfile.runa", 42)
+    Debug.on_breakpoint_hit(bp, $inspect_state)
+
+    Note: Code continues execution...
+    Return 0
+End Process
+
+Process called "inspect_state" takes context as DebugContext:
+    Display("Breakpoint hit at line: ")
+    Display(context.line_number)
+
+    Let locals be Debug.inspect_locals(context)
+    Display("Local variables: ")
+    Display(locals)
+End Process
+```
+
+**Performance Monitoring:**
+```runa
+Import "runatime/services/monitoring/performance_monitor.runa" as PerfMon
+
+Process called "handle_request" takes request as Request returns Response:
+    Let timer be PerfMon.start_timer("request_handler")
+
+    Note: Process request...
+    Let response be process(request)
+
+    PerfMon.stop_timer(timer)
+    PerfMon.record_metric("requests_processed", 1)
+
+    Return response
+End Process
+```
+
+**Security Permissions:**
+```runa
+Import "runatime/services/security/permission_system.runa" as Perms
+
+Process called "access_file" takes user as User, path as String returns Result:
+    Let permission be Perms.check_permission(user, "file:read", path)
+
+    If permission is Denied:
+        Return Error("Access denied")
+    End If
+
+    Note: Proceed with file access...
+    Return Ok(file_contents)
+End Process
+```
+
+**CPU Profiling:**
+```runa
+Import "runatime/services/profiling/cpu_profiler.runa" as Profiler
+
+Process called "run_workload" returns Integer:
+    Profiler.start()
+
+    Note: Run CPU-intensive workload...
+    expensive_computation()
+
+    Let profile be Profiler.stop()
+    Profiler.generate_flamegraph(profile, "output.svg")
+
+    Return 0
+End Process
+```
+
+## Success Criteria:
+- ✅ AOTT interface services coordinate tier transitions smoothly
+- ✅ Code cache reduces recompilation overhead by 90%+
+- ✅ Deoptimization completes in < 1ms
+- ✅ Breakpoints work with all compilation tiers
+- ✅ Call stack traces accurately show source locations
+- ✅ Debugger supports step-in/over/out operations
+- ✅ Variable inspector shows accurate values for all types
+- ✅ Health monitor detects application issues
+- ✅ Log manager handles high-throughput logging (100k+ logs/sec)
+- ✅ Performance monitor tracks metrics with < 1% overhead
+- ✅ Resource monitor provides real-time CPU/memory stats
+- ✅ Allocation tracker identifies memory leaks
+- ✅ CPU profiler generates accurate flame graphs
+- ✅ Memory profiler produces heap snapshots
+- ✅ Performance counters work on x86_64, ARM64
+- ✅ Audit logger creates tamper-evident logs
+- ✅ Crypto services use secure implementations
+- ✅ Permission system enforces RBAC correctly
+- ✅ All services work across platforms (Linux, Windows, macOS, FreeBSD)
+- ✅ All tests pass including security and performance tests
+
+
+---
+
 # 🔹 v0.9.0: Cross-Compilation: Target Abstraction + Multi-Backend Foundation
 
 **Goal:** Abstract compiler to support multiple target platforms, laying the foundation for Windows, macOS, ARM64, and WASM support.
@@ -3738,6 +4548,104 @@ stdlib/
 
 ---
 
+# 🔹 v0.9.3.5: Cross-Compilation: RISC-V Support (RV64GC)
+
+**Goal:** Enable cross-compilation to RISC-V for embedded systems, servers, and emerging RISC-V hardware.
+
+## Platform Details:
+
+**Architecture:** RISC-V 64-bit (RV64GC = Base + MAFDCV extensions)
+**File Format:** ELF64
+**Calling Convention:** RISC-V calling convention
+**System API:** Linux syscalls (same numbers as x86-64/ARM64)
+
+**Why RISC-V?**
+- Open-source ISA (no licensing fees)
+- Growing ecosystem (SiFive, StarFive, RISC-V International)
+- Embedded systems (microcontrollers, IoT)
+- Future server market (competitive with ARM64)
+
+## What Belongs Where:
+
+### COMPILER (backend/machine_code/riscv/):
+
+- ❌ **RISC-V Assembly Generator** (riscv/asm_generator.runa)
+
+**Register Allocation:**
+- General purpose: x0-x31
+  - x0 = zero (always 0)
+  - x1 = ra (return address)
+  - x2 = sp (stack pointer)
+  - x8 = fp (frame pointer)
+  - x10-x17 = a0-a7 (function arguments/return values)
+  - x18-x27 = s2-s11 (saved registers)
+  - x28-x31 = t3-t6 (temporary registers)
+
+**Syscall Mechanism:**
+- Instruction: **ECALL** (environment call)
+- Syscall number in: a7 (x17)
+- Arguments in: a0-a5 (x10-x15)
+- Return value in: a0 (x10)
+
+**Example RISC-V Linux Syscall (write):**
+```runa
+Process called "riscv_linux_write" takes fd as Integer, buffer as String, length as Integer returns Integer:
+    Inline Assembly:
+        li a7, 64          # syscall number: write
+        ld a0, -8(fp)      # fd
+        ld a1, -16(fp)     # buffer
+        ld a2, -24(fp)     # length
+        ecall              # invoke syscall
+    End Assembly
+    Return 0
+End Process
+```
+
+**RISC-V Instructions:**
+- Load/store: LD (load doubleword), SD (store doubleword), LW (load word), SW (store word)
+- Arithmetic: ADD, SUB, MUL, DIV, REM
+- Logical: AND, OR, XOR, SLL (shift left logical), SRL (shift right logical)
+- Branch: BEQ (branch equal), BNE (branch not equal), BLT (branch less than), BGE (branch greater/equal)
+- Unconditional: JAL (jump and link), JALR (jump and link register)
+- Compare: No separate CMP (use SUB and check zero flag)
+
+**Key Differences from x86-64/ARM64:**
+- **Simple, regular instruction format** (easier to decode)
+- **No complex addressing modes** (RISC philosophy)
+- **Explicit zero register** (x0 always reads as 0)
+- **No status flags** (compare instructions set destination register, not flags)
+
+- ❌ **RISC-V Instruction Encoder** (riscv/instruction_encoder.runa)
+  - Encode RISC-V instructions to binary
+  - R-type, I-type, S-type, B-type, U-type, J-type formats
+  - Immediate encoding (sign extension)
+
+- ❌ **RISC-V Register Allocator** (riscv/register_allocator.runa)
+  - Graph coloring algorithm
+  - Respect calling convention (caller-saved vs callee-saved)
+  - Spill/reload handling
+
+### STANDARD LIBRARY:
+- ❌ **RISC-V Linux Stdlib**
+  - Same syscall numbers as x86-64/ARM64 Linux
+  - Same APIs (reuse Linux stdlib logic)
+  - Different implementation (RISC-V ECALL instruction)
+
+### TESTING:
+- ❌ Test on RISC-V hardware (SiFive Unmatched, StarFive VisionFive 2)
+- ❌ Test on RISC-V QEMU emulation
+- ❌ Add RISC-V to CI/CD pipeline
+- ❌ Cross-compilation tests (compile on x86-64, run on RISC-V)
+
+## Success Criteria:
+- ✅ `runac --target=riscv64-linux program.runa -o program` works
+- ✅ Generated binaries run on RISC-V Linux hardware/emulation
+- ✅ Standard library works on RISC-V
+- ✅ Can cross-compile from x86-64 to RISC-V
+- ✅ Performance competitive with ARM64 for embedded workloads
+
+---
+
 # 🔹 v0.9.4: Cross-Compilation: WebAssembly Support
 
 **Goal:** Enable compilation to WebAssembly for browsers, Node.js, and edge computing.
@@ -4247,14 +5155,80 @@ myproject/
 
 ---
 
-# 🔹 v0.9.6: IDE Tooling (LSP, Debugger, Profiler)
+# 🔹 v0.9.6: IDE Tooling (HermodIDE, LSP, Debugger, Profiler)
 
-**Goal:** Professional developer tools for productivity (moved from v0.9.1).
+**Goal:** Professional developer tools for productivity, including the official HermodIDE with integrated Hermod AI agent.
 
 ## What Belongs Where:
 
-### NEW TOOL: `runa-language-server` (LSP Implementation)
-Language Server Protocol for IDE integration
+### PRIMARY TOOL: **HermodIDE** (Official Sybertnetics IDE)
+
+**The official integrated development environment for Runa with built-in Hermod AI agent.**
+
+**Core Features:**
+- ❌ **Hermod AI Agent Integration**
+  - Real-time AI coding assistance
+  - Transparent reasoning visualization
+  - Context-aware code suggestions
+  - Natural language project generation
+  - Automatic error correction and refactoring
+  - Knowledge graph visualization
+
+- ❌ **Multi-Language Support**
+  - **Runa** - First-class support (native language)
+  - Python, JavaScript/TypeScript, Java, C/C++, Go, Rust
+  - Syntax highlighting, code completion, refactoring for all languages
+  - Language Server Protocol integration
+
+- ❌ **AI-Enhanced Features**
+  - Complete function/class generation
+  - Code translation between languages
+  - Test case generation
+  - Documentation generation
+  - Security vulnerability scanning
+  - Performance optimization suggestions
+
+- ❌ **Administrative Capabilities**
+  - Knowledge graph management
+  - Agent reasoning transparency panels
+  - Task manager for Hermod operations
+  - Performance analytics
+  - Role-based access control (Administrator/Developer/End-user tiers)
+
+- ❌ **Development Tools**
+  - Integrated debugger with AI assistance
+  - Git workflow management (commit message generation, PR descriptions)
+  - Project templates and scaffolding
+  - Multi-root workspace support
+  - Built-in terminal with shell integration
+
+- ❌ **Internet-Connected Development**
+  - Real-time access to latest documentation
+  - Package discovery and installation
+  - Code snippet search across repositories
+  - Stack Overflow integration
+  - API documentation lookup
+
+- ❌ **Extensibility**
+  - Plugin architecture
+  - Extension marketplace
+  - Custom integrations and hooks
+  - API for third-party tools
+
+**Platform Support:**
+- Windows, macOS, Linux
+- Cross-platform consistency
+- Performance optimized for large projects
+
+**UI/UX:**
+- Modern, intuitive interface
+- Customizable layouts and themes
+- Command palette
+- Distraction-free coding mode
+- Accessibility features
+
+### SECONDARY: `runa-language-server` (LSP Implementation)
+Language Server Protocol for **third-party IDE** integration (VS Code, IntelliJ, Vim)
 
 - ❌ **Features**:
   - Syntax highlighting
@@ -4267,12 +5241,14 @@ Language Server Protocol for IDE integration
   - Code actions (quick fixes)
   - Format document
 
-- ❌ **IDE Integration**:
+- ❌ **Third-Party IDE Integration** (via LSP):
   - VS Code extension
   - IntelliJ plugin
   - Vim/Neovim plugin
   - Emacs mode
   - Sublime Text package
+
+  **Note:** HermodIDE is the **official primary IDE**. Third-party IDE support provided for developers who prefer their existing tools.
 
 ### NEW TOOL: `runadbg` (Interactive Debugger)
 - ❌ **Debugger Features**:
@@ -4330,14 +5306,283 @@ Language Server Protocol for IDE integration
   - `.runalint.toml` for custom rules
   - Disable specific rules per-line or per-file
 
+### NEW TOOL: `runatest` (Test Runner)
+- ❌ **Test Discovery**:
+  - Auto-discover test files (`test_*.runa`, `*_test.runa`)
+  - Test functions (start with `test_`)
+  - Test fixtures (setup/teardown)
+
+- ❌ **Test Execution**:
+  ```runa
+  # tests/test_math.runa
+  Process called "test_addition" returns Integer:
+      Let result be add(2, 3)
+      assert_equals(result, 5, "2 + 3 should equal 5")
+      Return 0
+  End Process
+
+  Process called "test_division_by_zero" returns Integer:
+      # Expect this to fail gracefully
+      assert_throws("Division by zero", divide(10, 0))
+      Return 0
+  End Process
+  ```
+
+- ❌ **Test Reporting**:
+  ```bash
+  $ runatest
+  Running 15 tests...
+  ✓ test_addition (0.001s)
+  ✓ test_subtraction (0.001s)
+  ✗ test_division (0.002s)
+    Expected: 5, Got: 4
+    At: tests/test_math.runa:23
+
+  13/15 tests passed (86.7%)
+  ```
+
+- ❌ **Coverage Analysis**:
+  ```bash
+  $ runatest --coverage
+  Code coverage: 87.3%
+  src/math.runa: 95.2%
+  src/string.runa: 78.4%
+  ```
+
+### NEW TOOL: `runabench` (Benchmark Runner)
+- ❌ **Benchmark Functions** (tools/benchmark_runner.runa):
+  ```runa
+  # benchmarks/bench_sorting.runa
+  Process called "bench_quicksort" returns Integer:
+      Let data be generate_random_list(10000)
+
+      Benchmark:
+          quicksort(data)
+      End Benchmark
+
+      Return 0
+  End Process
+  ```
+
+- ❌ **Statistical Analysis**:
+  ```bash
+  $ runabench
+  Running benchmarks...
+
+  bench_quicksort
+    Time: 2.34ms ± 0.12ms (100 iterations)
+    Min: 2.21ms, Max: 2.58ms
+    Throughput: 427 ops/sec
+
+  bench_mergesort
+    Time: 2.89ms ± 0.15ms (100 iterations)
+    Min: 2.67ms, Max: 3.12ms
+    Throughput: 346 ops/sec
+
+  quicksort is 23.5% faster than mergesort
+  ```
+
+- ❌ **Comparison Mode**:
+  ```bash
+  $ runabench --compare baseline.json
+  bench_quicksort: 2.34ms (was 2.56ms) -8.6% ✓ FASTER
+  bench_mergesort: 2.89ms (was 2.78ms) +4.0% ✗ SLOWER
+  ```
+
+- ❌ **Profiling Integration**:
+  ```bash
+  $ runabench --profile
+  # Automatically runs runaprof on slow benchmarks
+  # Shows flamegraphs for hot spots
+  ```
+
+### NEW TOOL: `runadoc` (Documentation Generator)
+- ❌ **Documentation Extraction** (tools/documentation_generator.runa):
+  ```runa
+  # Extract documentation from:
+  # - Note: blocks
+  # - Type definitions
+  # - Process signatures
+  # - @Reasoning, @Implementation annotations
+  ```
+
+- ❌ **Output Formats**:
+  ```bash
+  $ runadoc --format html
+  # Generates docs/ folder with HTML documentation
+
+  $ runadoc --format markdown
+  # Generates API.md reference
+
+  $ runadoc --format json
+  # Generates docs.json for IDE integration
+  ```
+
+- ❌ **Documentation Comments**:
+  ```runa
+  Note:
+  Sorts a list of integers in ascending order using quicksort.
+
+  Time complexity: O(n log n) average case, O(n²) worst case
+  Space complexity: O(log n) due to recursion
+
+  Parameters:
+  - list: List of integers to sort
+
+  Returns: Sorted list
+
+  Example:
+      Let numbers be [5, 2, 8, 1, 9]
+      Let sorted be quicksort(numbers)
+      # sorted = [1, 2, 5, 8, 9]
+  :End Note
+  Process called "quicksort" takes list as List[Integer] returns List[Integer]:
+      # Implementation...
+  End Process
+  ```
+
+- ❌ **Cross-References**:
+  - Automatic linking to referenced types/functions
+  - Dependency graphs
+  - Call graphs
+
+- ❌ **Examples**:
+  - Extract examples from @TestCases annotations
+  - Runnable code samples
+  - Interactive playground links
+
+### RUNATIME TOOLS:
+
+- ❌ **GC Tuner** (`runatime/tools/gc_tuner.runa`)
+  - Interactive GC configuration tuning
+  - Heap size recommendations based on workload
+  - Pause time optimization
+  - GC algorithm selection guidance
+  - Real-time tuning parameter adjustment
+  - Performance impact visualization
+
+- ❌ **Memory Analyzer** (`runatime/tools/memory_analyzer.runa`)
+  - Heap dump analysis
+  - Memory leak detection and reporting
+  - Object retention path visualization
+  - Dominated tree analysis
+  - Memory usage trends over time
+  - Allocation hotspot identification
+
+- ❌ **Performance Tester** (`runatime/tools/performance_tester.runa`)
+  - Automated performance testing framework
+  - Benchmark execution and comparison
+  - Regression detection
+  - Performance baseline management
+  - Multi-version comparison
+  - Statistical significance testing
+
+- ❌ **Runtime Profiler** (`runatime/tools/runtime_profiler.runa`)
+  - Comprehensive runtime profiling
+  - CPU, memory, I/O profiling integrated view
+  - Thread activity visualization
+  - Lock contention analysis
+  - GC activity tracking
+  - Export to standard profiling formats (FlameGraph, Chrome DevTools)
+
+- ❌ **Diagnostic Tools** (`runatime/tools/diagnostic_tools.runa`)
+  - Runtime health checks
+  - Configuration validation
+  - Performance diagnostics
+  - Crash dump analysis
+  - Core dump investigation
+  - System resource monitoring
+
+## Runtime Tools Examples:
+
+**GC Tuning:**
+```bash
+$ runa-gc-tuner --analyze myapp.runa
+Analyzing workload patterns...
+
+Recommendations:
+  - Current heap: 512MB, suggested: 1GB (reduces collection frequency)
+  - Algorithm: mark-sweep → generational (95% objects die young)
+  - Pause target: 50ms → 20ms (workload is latency-sensitive)
+
+Apply recommendations? [y/N]: y
+Writing optimized GC configuration to .runaconfig
+```
+
+**Memory Analysis:**
+```bash
+$ runa-memanalyze heap_dump.bin
+Loading heap dump (2.4 GB)...
+
+Memory Leaks Detected:
+  1. UserSession objects (12,450 instances, 45 MB)
+     - Retained by: CacheManager.sessionMap
+     - Root path: GC Root → CacheManager → HashMap → UserSession[]
+     - Recommendation: Implement cache eviction policy
+
+  2. String objects (8,923 instances, 18 MB)
+     - Retained by: LogBuffer.messages
+     - Recommendation: Use bounded circular buffer
+```
+
+**Performance Testing:**
+```bash
+$ runa-perftest --compare v1.0.0 v1.1.0
+Running performance comparison...
+
+Results:
+  Startup time:  245ms → 198ms  (19% faster) ✓
+  Request time:  12ms  → 14ms   (16% slower) ⚠
+  Throughput:    8500  → 7200   (15% lower)  ✗
+  Memory usage:  450MB → 380MB  (16% less)   ✓
+
+Regression detected in request handling.
+View detailed report: perf_report_2025_10_06.html
+```
+
+**Runtime Profiling:**
+```bash
+$ runa-profile myapp.runa
+Profiling for 30 seconds...
+
+Top CPU Hotspots:
+  1. process_request()          42.3%
+  2. json_parser.parse()        18.7%
+  3. database_query()           12.4%
+  4. gc_mark_and_sweep()         8.1%
+  5. string_concat()             5.2%
+
+GC Activity:
+  - Collections: 145 (4.8/sec)
+  - Avg pause: 8.2ms
+  - Max pause: 23.1ms
+  - Total GC time: 1.2s (4% of runtime)
+
+Flamegraph saved to: profile_flamegraph.svg
+```
+
 ## Success Criteria:
-- ✅ LSP provides smooth IDE experience (autocomplete < 100ms)
-- ✅ Debugger works in VS Code, terminal
+- ✅ **HermodIDE is production-ready** with AI agent integration
+- ✅ HermodIDE provides smooth experience (autocomplete < 100ms)
+- ✅ Hermod AI agent successfully assists with code generation and debugging
+- ✅ Knowledge graph visualization works in HermodIDE
+- ✅ LSP provides smooth third-party IDE experience (autocomplete < 100ms)
+- ✅ Debugger works in HermodIDE, VS Code, terminal
 - ✅ Profiler identifies bottlenecks accurately
 - ✅ Formatter produces consistent, readable code
 - ✅ Linter catches common mistakes
+- ✅ Test runner executes tests < 100ms per test
+- ✅ Benchmark runner provides statistical analysis with confidence intervals
+- ✅ Documentation generator produces comprehensive API docs
+- ✅ All tools integrate with HermodIDE and third-party IDEs (VS Code, IntelliJ, Vim)
 - ✅ Tools are documented with examples
-- ✅ VS Code extension has 1000+ installs
+- ✅ HermodIDE has 5000+ active users
+- ✅ VS Code extension has 1000+ installs (for those preferring third-party IDEs)
+- ✅ GC tuner provides accurate recommendations for different workloads
+- ✅ Memory analyzer identifies leaks with retention paths
+- ✅ Performance tester detects regressions automatically
+- ✅ Runtime profiler generates flamegraphs with < 5% overhead
+- ✅ Diagnostic tools catch common configuration issues
 
 
 ---
@@ -5033,7 +6278,7 @@ runac algorithm.runa --to=rust -o algorithm.rs  # future
 - v0.0.8: Existing C runtime continues
 - v0.0.8.1: Collection operations
 - v0.0.8.2: Closures, higher-order functions
-- v0.0.9: **Pure Runa runtime** (replaces C)
+- v0.0.9: **Pure Runa runatime** (replaces C)
 - v0.3.0: Exception handling, stack traces
 - v0.4.0: Rc<T>, arena allocators
 - v0.7.0: Threads, mutexes, channels, atomics
