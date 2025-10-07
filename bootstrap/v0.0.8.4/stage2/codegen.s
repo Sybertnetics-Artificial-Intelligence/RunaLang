@@ -22919,10 +22919,22 @@ codegen_generate:
     popq %rsi
     call callgraph_create
     movq %rax, -568(%rbp)
+    movq -568(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call callgraph_build
     leaq .STR400(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
+    movq -568(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call callgraph_detect_recursion
+    movq -568(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call callgraph_print_warnings
     movq -568(%rbp), %rax
     pushq %rax
     movq $72, %rax
@@ -23632,6 +23644,22 @@ callgraph_collect_calls_from_expr:
     jmp .L4942
 .L4941:
 .L4942:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $4096, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4951
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L4952
+.L4951:
+.L4952:
     movq $0, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -23642,13 +23670,45 @@ callgraph_collect_calls_from_expr:
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
-    movq $9, %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4961
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L4962
+.L4961:
+.L4962:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $30, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4971
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L4972
+.L4971:
+.L4972:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $4, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4951
+    jz .L4981
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -40(%rbp)
@@ -23683,9 +23743,18 @@ callgraph_collect_calls_from_expr:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -64(%rbp)
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4991
     movq $0, %rax
     movq %rax, -72(%rbp)
-.L4961:    movq -72(%rbp), %rax
+.L5001:    movq -72(%rbp), %rax
     pushq %rax
     movq -64(%rbp), %rax
     popq %rbx
@@ -23693,7 +23762,7 @@ callgraph_collect_calls_from_expr:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4962
+    jz .L5002
     movq -72(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -23719,11 +23788,14 @@ callgraph_collect_calls_from_expr:
     movq -72(%rbp), %rax
     addq $1, %rax
     movq %rax, -72(%rbp)
-    jmp .L4961
-.L4962:
-    jmp .L4952
-.L4951:
-.L4952:
+    jmp .L5001
+.L5002:
+    jmp .L4992
+.L4991:
+.L4992:
+    jmp .L4982
+.L4981:
+.L4982:
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -23732,7 +23804,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4971
+    jz .L5011
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -96(%rbp)
@@ -23772,9 +23844,9 @@ callgraph_collect_calls_from_expr:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L4972
-.L4971:
-.L4972:
+    jmp .L5012
+.L5011:
+.L5012:
     movq -32(%rbp), %rax
     pushq %rax
     movq $3, %rax
@@ -23783,10 +23855,18 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4981
+    jz .L5021
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -120(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -104(%rbp)
     movq $8, %rax
     pushq %rax
     movq -120(%rbp), %rax
@@ -23794,8 +23874,8 @@ callgraph_collect_calls_from_expr:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -128(%rbp)
-    movq -128(%rbp), %rax
+    movq %rax, -112(%rbp)
+    movq -104(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -23805,147 +23885,7 @@ callgraph_collect_calls_from_expr:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L4982
-.L4981:
-.L4982:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $4, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4991
-    movq -24(%rbp), %rax
-    addq $8, %rax
-    movq %rax, -136(%rbp)
-    movq $16, %rax
-    pushq %rax
-    movq -136(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -144(%rbp)
-    movq -144(%rbp), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call callgraph_collect_calls_from_expr
-    jmp .L4992
-.L4991:
-.L4992:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $5, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5001
-    movq -24(%rbp), %rax
-    addq $8, %rax
-    movq %rax, -152(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -152(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -144(%rbp)
-    movq -144(%rbp), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call callgraph_collect_calls_from_expr
-    jmp .L5002
-.L5001:
-.L5002:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $10, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5011
-    movq -24(%rbp), %rax
-    addq $8, %rax
-    movq %rax, -168(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -168(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -176(%rbp)
-    movq -176(%rbp), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call callgraph_collect_calls_from_expr
-    jmp .L5012
-.L5011:
-.L5012:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $11, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5021
-    movq -24(%rbp), %rax
-    addq $8, %rax
-    movq %rax, -184(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -184(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -192(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -184(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -200(%rbp)
-    movq -192(%rbp), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call callgraph_collect_calls_from_expr
-    movq -200(%rbp), %rax
+    movq -112(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -23958,6 +23898,462 @@ callgraph_collect_calls_from_expr:
     jmp .L5022
 .L5021:
 .L5022:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $12, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5031
+    movq -24(%rbp), %rax
+    addq $8, %rax
+    movq %rax, -144(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -144(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -152(%rbp)
+    movq -152(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    jmp .L5032
+.L5031:
+.L5032:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5041
+    movq -24(%rbp), %rax
+    addq $8, %rax
+    movq %rax, -160(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -160(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -56(%rbp)
+    movq $16, %rax
+    pushq %rax
+    movq -160(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -64(%rbp)
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5051
+    movq $0, %rax
+    movq %rax, -72(%rbp)
+.L5061:    movq -72(%rbp), %rax
+    pushq %rax
+    movq -64(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5062
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -80(%rbp)
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    movq -72(%rbp), %rax
+    addq $1, %rax
+    movq %rax, -72(%rbp)
+    jmp .L5061
+.L5062:
+    jmp .L5052
+.L5051:
+.L5052:
+    jmp .L5042
+.L5041:
+.L5042:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $11, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5071
+    movq -24(%rbp), %rax
+    addq $8, %rax
+    movq %rax, -208(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -208(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -216(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -208(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -56(%rbp)
+    movq $16, %rax
+    pushq %rax
+    movq -208(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -64(%rbp)
+    movq -216(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5081
+    movq $0, %rax
+    movq %rax, -72(%rbp)
+.L5091:    movq -72(%rbp), %rax
+    pushq %rax
+    movq -64(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5092
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -80(%rbp)
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    movq -72(%rbp), %rax
+    addq $1, %rax
+    movq %rax, -72(%rbp)
+    jmp .L5091
+.L5092:
+    jmp .L5082
+.L5081:
+.L5082:
+    jmp .L5072
+.L5071:
+.L5072:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $6, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5101
+    movq -24(%rbp), %rax
+    addq $8, %rax
+    movq %rax, -264(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -264(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -272(%rbp)
+    movq -272(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    jmp .L5102
+.L5101:
+.L5102:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $9, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5111
+    movq -24(%rbp), %rax
+    addq $8, %rax
+    movq %rax, -280(%rbp)
+    movq $16, %rax
+    pushq %rax
+    movq -280(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -288(%rbp)
+    movq -288(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5121
+    movq -288(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    jmp .L5122
+.L5121:
+.L5122:
+    jmp .L5112
+.L5111:
+.L5112:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $20, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5131
+    movq -24(%rbp), %rax
+    addq $8, %rax
+    movq %rax, -296(%rbp)
+    movq $16, %rax
+    pushq %rax
+    movq -296(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -304(%rbp)
+    movq $24, %rax
+    pushq %rax
+    movq -296(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -312(%rbp)
+    movq -304(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5141
+    movq $0, %rax
+    movq %rax, -72(%rbp)
+.L5151:    movq -72(%rbp), %rax
+    pushq %rax
+    movq -312(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5152
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    movq -304(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -328(%rbp)
+    movq -328(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    movq -72(%rbp), %rax
+    addq $1, %rax
+    movq %rax, -72(%rbp)
+    jmp .L5151
+.L5152:
+    jmp .L5142
+.L5141:
+.L5142:
+    jmp .L5132
+.L5131:
+.L5132:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $7, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5161
+    movq -24(%rbp), %rax
+    addq $8, %rax
+    movq %rax, -344(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -344(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -288(%rbp)
+    movq -288(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    jmp .L5162
+.L5161:
+.L5162:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $16, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5171
+    movq -24(%rbp), %rax
+    addq $8, %rax
+    movq %rax, -360(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -360(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -368(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -360(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -376(%rbp)
+    movq -368(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    movq -376(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call callgraph_collect_calls_from_expr
+    jmp .L5172
+.L5171:
+.L5172:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -23980,14 +24376,14 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5031
+    jz .L5181
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5032
-.L5031:
-.L5032:
+    jmp .L5182
+.L5181:
+.L5182:
     movq $0, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -24004,7 +24400,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5041
+    jz .L5191
     movq $8, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -24023,9 +24419,9 @@ callgraph_collect_calls_from_stmt:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5042
-.L5041:
-.L5042:
+    jmp .L5192
+.L5191:
+.L5192:
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -24034,7 +24430,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5051
+    jz .L5201
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -48(%rbp)
@@ -24090,7 +24486,7 @@ callgraph_collect_calls_from_stmt:
     call callgraph_collect_calls_from_expr
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L5061:    movq -96(%rbp), %rax
+.L5211:    movq -96(%rbp), %rax
     pushq %rax
     movq -72(%rbp), %rax
     popq %rbx
@@ -24098,7 +24494,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5062
+    jz .L5212
     movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24124,11 +24520,11 @@ callgraph_collect_calls_from_stmt:
     movq -96(%rbp), %rax
     addq $1, %rax
     movq %rax, -96(%rbp)
-    jmp .L5061
-.L5062:
+    jmp .L5211
+.L5212:
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L5071:    movq -96(%rbp), %rax
+.L5221:    movq -96(%rbp), %rax
     pushq %rax
     movq -88(%rbp), %rax
     popq %rbx
@@ -24136,7 +24532,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5072
+    jz .L5222
     movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24162,11 +24558,11 @@ callgraph_collect_calls_from_stmt:
     movq -96(%rbp), %rax
     addq $1, %rax
     movq %rax, -96(%rbp)
-    jmp .L5071
-.L5072:
-    jmp .L5052
-.L5051:
-.L5052:
+    jmp .L5221
+.L5222:
+    jmp .L5202
+.L5201:
+.L5202:
     movq -32(%rbp), %rax
     pushq %rax
     movq $3, %rax
@@ -24175,7 +24571,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5081
+    jz .L5231
     movq $8, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -24194,9 +24590,9 @@ callgraph_collect_calls_from_stmt:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5082
-.L5081:
-.L5082:
+    jmp .L5232
+.L5231:
+.L5232:
     movq -32(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -24205,7 +24601,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5091
+    jz .L5241
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -152(%rbp)
@@ -24245,7 +24641,7 @@ callgraph_collect_calls_from_stmt:
     call callgraph_collect_calls_from_expr
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L5101:    movq -96(%rbp), %rax
+.L5251:    movq -96(%rbp), %rax
     pushq %rax
     movq -176(%rbp), %rax
     popq %rbx
@@ -24253,7 +24649,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5102
+    jz .L5252
     movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24279,11 +24675,11 @@ callgraph_collect_calls_from_stmt:
     movq -96(%rbp), %rax
     addq $1, %rax
     movq %rax, -96(%rbp)
-    jmp .L5101
-.L5102:
-    jmp .L5092
-.L5091:
-.L5092:
+    jmp .L5251
+.L5252:
+    jmp .L5242
+.L5241:
+.L5242:
     movq -32(%rbp), %rax
     pushq %rax
     movq $5, %rax
@@ -24292,7 +24688,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5111
+    jz .L5261
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -208(%rbp)
@@ -24368,7 +24764,7 @@ callgraph_collect_calls_from_stmt:
     call callgraph_collect_calls_from_expr
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L5121:    movq -96(%rbp), %rax
+.L5271:    movq -96(%rbp), %rax
     pushq %rax
     movq -176(%rbp), %rax
     popq %rbx
@@ -24376,7 +24772,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5122
+    jz .L5272
     movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24402,11 +24798,11 @@ callgraph_collect_calls_from_stmt:
     movq -96(%rbp), %rax
     addq $1, %rax
     movq %rax, -96(%rbp)
-    jmp .L5121
-.L5122:
-    jmp .L5112
-.L5111:
-.L5112:
+    jmp .L5271
+.L5272:
+    jmp .L5262
+.L5261:
+.L5262:
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24415,7 +24811,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5131
+    jz .L5281
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -280(%rbp)
@@ -24455,7 +24851,7 @@ callgraph_collect_calls_from_stmt:
     call callgraph_collect_calls_from_expr
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L5141:    movq -96(%rbp), %rax
+.L5291:    movq -96(%rbp), %rax
     pushq %rax
     movq -304(%rbp), %rax
     popq %rbx
@@ -24463,7 +24859,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5142
+    jz .L5292
     movq -96(%rbp), %rax
     pushq %rax
     movq $32, %rax
@@ -24491,7 +24887,7 @@ callgraph_collect_calls_from_stmt:
     movq %rax, -176(%rbp)
     movq $0, %rax
     movq %rax, -352(%rbp)
-.L5151:    movq -352(%rbp), %rax
+.L5301:    movq -352(%rbp), %rax
     pushq %rax
     movq -176(%rbp), %rax
     popq %rbx
@@ -24499,7 +24895,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5152
+    jz .L5302
     movq -352(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24525,16 +24921,16 @@ callgraph_collect_calls_from_stmt:
     movq -352(%rbp), %rax
     addq $1, %rax
     movq %rax, -352(%rbp)
-    jmp .L5151
-.L5152:
+    jmp .L5301
+.L5302:
     movq -96(%rbp), %rax
     addq $1, %rax
     movq %rax, -96(%rbp)
-    jmp .L5141
-.L5142:
-    jmp .L5132
-.L5131:
-.L5132:
+    jmp .L5291
+.L5292:
+    jmp .L5282
+.L5281:
+.L5282:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -24573,7 +24969,7 @@ callgraph_build:
     movq %rax, -32(%rbp)
     movq $0, %rax
     movq %rax, -40(%rbp)
-.L5161:    movq -40(%rbp), %rax
+.L5311:    movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -24581,7 +24977,7 @@ callgraph_build:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5162
+    jz .L5312
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24602,7 +24998,7 @@ callgraph_build:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5171
+    jz .L5321
     movq $0, %rax
     pushq %rax
     movq -48(%rbp), %rax
@@ -24626,14 +25022,14 @@ callgraph_build:
     popq %rdi
     popq %rsi
     call callgraph_add_node
-    jmp .L5172
-.L5171:
-.L5172:
+    jmp .L5322
+.L5321:
+.L5322:
     movq -40(%rbp), %rax
     addq $1, %rax
     movq %rax, -40(%rbp)
-    jmp .L5161
-.L5162:
+    jmp .L5311
+.L5312:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24652,7 +25048,7 @@ callgraph_build:
     movq %rax, -88(%rbp)
     movq $0, %rax
     movq %rax, -40(%rbp)
-.L5181:    movq -40(%rbp), %rax
+.L5331:    movq -40(%rbp), %rax
     pushq %rax
     movq -88(%rbp), %rax
     popq %rbx
@@ -24660,7 +25056,7 @@ callgraph_build:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5182
+    jz .L5332
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24699,7 +25095,7 @@ callgraph_build:
     movq %rax, -128(%rbp)
     movq $0, %rax
     movq %rax, -136(%rbp)
-.L5191:    movq -136(%rbp), %rax
+.L5341:    movq -136(%rbp), %rax
     pushq %rax
     movq -128(%rbp), %rax
     popq %rbx
@@ -24707,7 +25103,7 @@ callgraph_build:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5192
+    jz .L5342
     movq -136(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24733,13 +25129,13 @@ callgraph_build:
     movq -136(%rbp), %rax
     addq $1, %rax
     movq %rax, -136(%rbp)
-    jmp .L5191
-.L5192:
+    jmp .L5341
+.L5342:
     movq -40(%rbp), %rax
     addq $1, %rax
     movq %rax, -40(%rbp)
-    jmp .L5181
-.L5182:
+    jmp .L5331
+.L5332:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -24779,7 +25175,7 @@ callgraph_detect_direct_recursion:
     movq %rax, -40(%rbp)
     movq $0, %rax
     movq %rax, -48(%rbp)
-.L5201:    movq -48(%rbp), %rax
+.L5351:    movq -48(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
     popq %rbx
@@ -24787,7 +25183,7 @@ callgraph_detect_direct_recursion:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5202
+    jz .L5352
     movq -48(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24814,7 +25210,7 @@ callgraph_detect_direct_recursion:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5211
+    jz .L5361
     movq $1, %rax
     pushq %rax
     movq $28, %rax
@@ -24829,14 +25225,14 @@ callgraph_detect_direct_recursion:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5212
-.L5211:
-.L5212:
+    jmp .L5362
+.L5361:
+.L5362:
     movq -48(%rbp), %rax
     addq $1, %rax
     movq %rax, -48(%rbp)
-    jmp .L5201
-.L5202:
+    jmp .L5351
+.L5352:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -24886,7 +25282,7 @@ callgraph_detect_mutual_recursion_dfs:
     movq %rax, -56(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L5221:    movq -64(%rbp), %rax
+.L5371:    movq -64(%rbp), %rax
     pushq %rax
     movq -48(%rbp), %rax
     popq %rbx
@@ -24894,7 +25290,7 @@ callgraph_detect_mutual_recursion_dfs:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5222
+    jz .L5372
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24923,7 +25319,7 @@ callgraph_detect_mutual_recursion_dfs:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5231
+    jz .L5381
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24944,7 +25340,7 @@ callgraph_detect_mutual_recursion_dfs:
     movq %rax, -104(%rbp)
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L5241:    movq -112(%rbp), %rax
+.L5391:    movq -112(%rbp), %rax
     pushq %rax
     movq -96(%rbp), %rax
     popq %rbx
@@ -24952,7 +25348,7 @@ callgraph_detect_mutual_recursion_dfs:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5242
+    jz .L5392
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24973,19 +25369,19 @@ callgraph_detect_mutual_recursion_dfs:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5251
+    jz .L5401
     movq -112(%rbp), %rax
     movq %rax, -104(%rbp)
     movq -96(%rbp), %rax
     movq %rax, -112(%rbp)
-    jmp .L5252
-.L5251:
-.L5252:
+    jmp .L5402
+.L5401:
+.L5402:
     movq -112(%rbp), %rax
     addq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L5241
-.L5242:
+    jmp .L5391
+.L5392:
     movq -104(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -25006,7 +25402,7 @@ callgraph_detect_mutual_recursion_dfs:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5261
+    jz .L5411
     movq $1, %rax
     pushq %rax
     movq $28, %rax
@@ -25029,9 +25425,9 @@ callgraph_detect_mutual_recursion_dfs:
     call memory_set_int32@PLT
     movq $1, %rax
     movq %rax, -56(%rbp)
-    jmp .L5262
-.L5261:
-.L5262:
+    jmp .L5412
+.L5411:
+.L5412:
     movq -152(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -25040,7 +25436,7 @@ callgraph_detect_mutual_recursion_dfs:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5271
+    jz .L5421
     movq -104(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -25063,23 +25459,23 @@ callgraph_detect_mutual_recursion_dfs:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5281
+    jz .L5431
     movq $1, %rax
     movq %rax, -56(%rbp)
-    jmp .L5282
-.L5281:
-.L5282:
-    jmp .L5272
-.L5271:
-.L5272:
-    jmp .L5232
-.L5231:
-.L5232:
+    jmp .L5432
+.L5431:
+.L5432:
+    jmp .L5422
+.L5421:
+.L5422:
+    jmp .L5382
+.L5381:
+.L5382:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L5221
-.L5222:
+    jmp .L5371
+.L5372:
     movq $2, %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -25124,7 +25520,7 @@ callgraph_detect_recursion:
     movq %rax, -24(%rbp)
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L5291:    movq -32(%rbp), %rax
+.L5441:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -25132,7 +25528,7 @@ callgraph_detect_recursion:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5292
+    jz .L5442
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25155,8 +25551,8 @@ callgraph_detect_recursion:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L5291
-.L5292:
+    jmp .L5441
+.L5442:
     movq -24(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -25168,7 +25564,7 @@ callgraph_detect_recursion:
     movq %rax, -56(%rbp)
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L5301:    movq -32(%rbp), %rax
+.L5451:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -25176,7 +25572,7 @@ callgraph_detect_recursion:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5302
+    jz .L5452
     movq $0, %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -25194,11 +25590,11 @@ callgraph_detect_recursion:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L5301
-.L5302:
+    jmp .L5451
+.L5452:
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L5311:    movq -32(%rbp), %rax
+.L5461:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -25206,7 +25602,7 @@ callgraph_detect_recursion:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5312
+    jz .L5462
     movq -32(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -25227,7 +25623,7 @@ callgraph_detect_recursion:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5321
+    jz .L5471
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25253,14 +25649,14 @@ callgraph_detect_recursion:
     popq %rdx
     popq %rcx
     call callgraph_detect_mutual_recursion_dfs
-    jmp .L5322
-.L5321:
-.L5322:
+    jmp .L5472
+.L5471:
+.L5472:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L5311
-.L5312:
+    jmp .L5461
+.L5462:
     movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -25286,14 +25682,14 @@ is_tail_call:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5331
+    jz .L5481
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5332
-.L5331:
-.L5332:
+    jmp .L5482
+.L5481:
+.L5482:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -25310,14 +25706,14 @@ is_tail_call:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5341
+    jz .L5491
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5342
-.L5341:
-.L5342:
+    jmp .L5492
+.L5491:
+.L5492:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -25334,14 +25730,14 @@ is_tail_call:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5351
+    jz .L5501
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5352
-.L5351:
-.L5352:
+    jmp .L5502
+.L5501:
+.L5502:
     movq $0, %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -25358,14 +25754,14 @@ is_tail_call:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5361
+    jz .L5511
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5362
-.L5361:
-.L5362:
+    jmp .L5512
+.L5511:
+.L5512:
     movq -32(%rbp), %rax
     addq $8, %rax
     movq %rax, -48(%rbp)
@@ -25391,14 +25787,14 @@ is_tail_call:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5371
+    jz .L5521
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5372
-.L5371:
-.L5372:
+    jmp .L5522
+.L5521:
+.L5522:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -25437,14 +25833,14 @@ callgraph_calculate_stack_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5381
+    jz .L5531
     movq $-1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5382
-.L5381:
-.L5382:
+    jmp .L5532
+.L5531:
+.L5532:
     movq $24, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -25493,7 +25889,7 @@ callgraph_print_warnings:
     movq %rax, -24(%rbp)
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L5391:    movq -32(%rbp), %rax
+.L5541:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -25501,7 +25897,7 @@ callgraph_print_warnings:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5392
+    jz .L5542
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25530,7 +25926,7 @@ callgraph_print_warnings:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5401
+    jz .L5551
     movq $0, %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -25555,14 +25951,14 @@ callgraph_print_warnings:
     pushq %rax
     popq %rdi
     call print_string
-    jmp .L5402
-.L5401:
-.L5402:
+    jmp .L5552
+.L5551:
+.L5552:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L5391
-.L5392:
+    jmp .L5541
+.L5542:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -25585,14 +25981,14 @@ codegen_inject_stack_probe:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5411
+    jz .L5561
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5412
-.L5411:
-.L5412:
+    jmp .L5562
+.L5561:
+.L5562:
     leaq .STR406(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
