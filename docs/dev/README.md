@@ -100,21 +100,21 @@ runa/docs/dev/
 
 ## 🎯 Milestone Quick Reference
 
-| Version | Goal | Timeline | Status |
-|---------|------|----------|--------|
-| v0.0.7.5 | Self-hosting | - | ✅ Complete |
-| v0.0.8 | Inline Assembly | 2-3 weeks | 🔄 Next |
-| v0.0.9 | Native Object/Linker | 4-6 weeks | 📋 Planned |
-| v0.1.0 | Beta Release | 2-3 weeks | 🎯 Milestone |
-| v0.2.0 | Standard Library | 6-8 weeks | 📋 Planned |
-| v0.3.0 | Type System | 8-10 weeks | 📋 Planned |
-| v0.4.0 | Modules & Packages | 10-12 weeks | 📋 Planned |
-| v0.5.0 | Error Handling | 6-8 weeks | 📋 Planned |
-| v0.6.0 | Memory Safety | 10-12 weeks | 📋 Planned |
-| v0.7.0 | Optimization L1 | 8-10 weeks | 📋 Planned |
-| v0.8.0 | Concurrency | 10-12 weeks | 📋 Planned |
-| v0.9.0 | Advanced Optimization | 12-14 weeks | 📋 Planned |
-| v1.0.0 | Production Release | 16-20 weeks | 🎯 Goal |
+| Version | Goal |  Status |
+|---------|------|--------|
+| v0.0.7.5 | Self-hosting | ✅ Complete |
+| v0.0.8 | Inline Assembly | ✅ Next |
+| v0.0.9 | Native Object/Linker | 📋 Planned |
+| v0.1.0 | Beta Release | 🎯 Milestone |
+| v0.2.0 | Standard Library | 📋 Planned |
+| v0.3.0 | Type System | 📋 Planned |
+| v0.4.0 | Modules & Packages | 📋 Planned |
+| v0.5.0 | Error Handling | 📋 Planned |
+| v0.6.0 | Memory Safety | 📋 Planned |
+| v0.7.0 | Optimization L1 | 📋 Planned |
+| v0.8.0 | Concurrency | 📋 Planned |
+| v0.9.0 | Advanced Optimization | 📋 Planned |
+| v1.0.0 | Production Release | 🎯 Goal |
 
 ---
 
