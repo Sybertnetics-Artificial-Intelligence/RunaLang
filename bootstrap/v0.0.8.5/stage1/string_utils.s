@@ -2807,29 +2807,18 @@ string_duplicate:
     ret
 
 
-.globl string_starts_with
-string_starts_with:
+.globl string_duplicate_ptr
+string_duplicate_ptr:
     pushq %rbp
     movq %rsp, %rbp
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
-    popq %rdi
-    call string_length@PLT
-    movq %rax, -24(%rbp)
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_length@PLT
-    movq %rax, -32(%rbp)
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq -24(%rbp), %rax
+    movq $0, %rax
     popq %rbx
     cmpq %rax, %rbx
-    setg %al
+    sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L841
@@ -2840,41 +2829,48 @@ string_starts_with:
     jmp .L842
 .L841:
 .L842:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    popq %rsi
-    popq %rdx
-    call string_substring@PLT
-    movq %rax, -40(%rbp)
+    call string_length@PLT
+    movq %rax, -16(%rbp)
     movq -16(%rbp), %rax
-    pushq %rax
-    movq -40(%rbp), %rax
+    addq $1, %rax
     pushq %rax
     popq %rdi
-    popq %rsi
-    call string_equals@PLT
+    call allocate@PLT
+    movq %rax, -24(%rbp)
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
     testq %rax, %rax
     jz .L851
-    movq $1, %rax
+    movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L852
 .L851:
 .L852:
-    movq $0, %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_copy_string_to_buffer
+    movq -24(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
 
 
-.globl string_ends_with
-string_ends_with:
+.globl string_starts_with
+string_starts_with:
     pushq %rbp
     movq %rsp, %rbp
     subq $2048, %rsp  # Pre-allocate generous stack space
@@ -2906,6 +2902,72 @@ string_ends_with:
     jmp .L862
 .L861:
 .L862:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call string_substring@PLT
+    movq %rax, -40(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -40(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    testq %rax, %rax
+    jz .L871
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L872
+.L871:
+.L872:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl string_ends_with
+string_ends_with:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq %rsi, -16(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_length@PLT
+    movq %rax, -24(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_length@PLT
+    movq %rax, -32(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L881
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L882
+.L881:
+.L882:
     movq -24(%rbp), %rax
     subq -32(%rbp), %rax
     movq %rax, -40(%rbp)
@@ -2928,14 +2990,14 @@ string_ends_with:
     popq %rsi
     call string_equals@PLT
     testq %rax, %rax
-    jz .L871
+    jz .L891
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L872
-.L871:
-.L872:
+    jmp .L892
+.L891:
+.L892:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2965,14 +3027,14 @@ string_contains:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L881
+    jz .L901
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L882
-.L881:
-.L882:
+    jmp .L902
+.L901:
+.L902:
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2996,14 +3058,14 @@ string_is_empty:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L891
+    jz .L911
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L892
-.L891:
-.L892:
+    jmp .L912
+.L911:
+.L912:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -3029,17 +3091,17 @@ string_is_whitespace:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L901
+    jz .L921
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L902
-.L901:
-.L902:
+    jmp .L922
+.L921:
+.L922:
     movq $0, %rax
     movq %rax, -24(%rbp)
-.L911:    movq -24(%rbp), %rax
+.L931:    movq -24(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
     popq %rbx
@@ -3047,7 +3109,7 @@ string_is_whitespace:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L912
+    jz .L932
     movq -24(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3071,32 +3133,6 @@ string_is_whitespace:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L921
-    movq $1, %rax
-    movq %rax, -48(%rbp)
-    jmp .L922
-.L921:
-    movq -40(%rbp), %rax
-    pushq %rax
-    movq $9, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L931
-    movq $1, %rax
-    movq %rax, -48(%rbp)
-    jmp .L932
-.L931:
-    movq -40(%rbp), %rax
-    pushq %rax
-    movq $10, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L941
     movq $1, %rax
     movq %rax, -48(%rbp)
@@ -3104,7 +3140,7 @@ string_is_whitespace:
 .L941:
     movq -40(%rbp), %rax
     pushq %rax
-    movq $13, %rax
+    movq $9, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -3115,10 +3151,36 @@ string_is_whitespace:
     movq %rax, -48(%rbp)
     jmp .L952
 .L951:
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $10, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L961
+    movq $1, %rax
+    movq %rax, -48(%rbp)
+    jmp .L962
+.L961:
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $13, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L971
+    movq $1, %rax
+    movq %rax, -48(%rbp)
+    jmp .L972
+.L971:
+.L972:
+.L962:
 .L952:
 .L942:
-.L932:
-.L922:
     movq -48(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -3127,19 +3189,19 @@ string_is_whitespace:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L961
+    jz .L981
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L962
-.L961:
-.L962:
+    jmp .L982
+.L981:
+.L982:
     movq -24(%rbp), %rax
     addq $1, %rax
     movq %rax, -24(%rbp)
-    jmp .L911
-.L912:
+    jmp .L931
+.L932:
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -3165,14 +3227,14 @@ string_is_numeric:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L971
+    jz .L991
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L972
-.L971:
-.L972:
+    jmp .L992
+.L991:
+.L992:
     movq $0, %rax
     movq %rax, -24(%rbp)
     movq $0, %rax
@@ -3196,7 +3258,7 @@ string_is_numeric:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L981
+    jz .L1001
     movq $1, %rax
     movq %rax, -24(%rbp)
     movq -16(%rbp), %rax
@@ -3207,18 +3269,18 @@ string_is_numeric:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L991
+    jz .L1011
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L992
-.L991:
-.L992:
-    jmp .L982
-.L981:
-.L982:
-.L1001:    movq -24(%rbp), %rax
+    jmp .L1012
+.L1011:
+.L1012:
+    jmp .L1002
+.L1001:
+.L1002:
+.L1021:    movq -24(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
     popq %rbx
@@ -3226,7 +3288,7 @@ string_is_numeric:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1002
+    jz .L1022
     movq -24(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3248,19 +3310,19 @@ string_is_numeric:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1011
+    jz .L1031
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1012
-.L1011:
-.L1012:
+    jmp .L1032
+.L1031:
+.L1032:
     movq -24(%rbp), %rax
     addq $1, %rax
     movq %rax, -24(%rbp)
-    jmp .L1001
-.L1002:
+    jmp .L1021
+.L1022:
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -3281,7 +3343,7 @@ string_contains_char_value:
     movq %rax, -24(%rbp)
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L1021:    movq -32(%rbp), %rax
+.L1041:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -3289,7 +3351,7 @@ string_contains_char_value:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1022
+    jz .L1042
     movq -32(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3311,19 +3373,19 @@ string_contains_char_value:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1031
+    jz .L1051
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1032
-.L1031:
-.L1032:
+    jmp .L1052
+.L1051:
+.L1052:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L1021
-.L1022:
+    jmp .L1041
+.L1042:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -3347,14 +3409,14 @@ string_util_split:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1041
+    jz .L1061
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1042
-.L1041:
-.L1042:
+    jmp .L1062
+.L1061:
+.L1062:
     movq -16(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3371,7 +3433,7 @@ string_util_split:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1051
+    jz .L1071
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -3380,15 +3442,15 @@ string_util_split:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1052
-.L1051:
-.L1052:
+    jmp .L1072
+.L1071:
+.L1072:
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_tokenizer_has_next
     movq %rax, -40(%rbp)
-.L1061:    movq -40(%rbp), %rax
+.L1081:    movq -40(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3396,7 +3458,7 @@ string_util_split:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1062
+    jz .L1082
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -3414,8 +3476,8 @@ string_util_split:
     popq %rdi
     call string_tokenizer_has_next
     movq %rax, -40(%rbp)
-    jmp .L1061
-.L1062:
+    jmp .L1081
+.L1082:
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -3443,7 +3505,7 @@ memory_copy_string:
     movq %rax, -48(%rbp)
     movq $1, %rax
     movq %rax, -56(%rbp)
-.L1071:    movq -56(%rbp), %rax
+.L1091:    movq -56(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3451,7 +3513,7 @@ memory_copy_string:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1072
+    jz .L1092
     movq -48(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -3478,17 +3540,17 @@ memory_copy_string:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1081
+    jz .L1101
     movq $0, %rax
     movq %rax, -56(%rbp)
-    jmp .L1082
-.L1081:
+    jmp .L1102
+.L1101:
     movq -48(%rbp), %rax
     addq $1, %rax
     movq %rax, -48(%rbp)
-.L1082:
-    jmp .L1071
-.L1072:
+.L1102:
+    jmp .L1091
+.L1092:
     movq -48(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -3508,7 +3570,7 @@ memory_copy_string_to_buffer:
     movq %rax, -32(%rbp)
     movq $1, %rax
     movq %rax, -40(%rbp)
-.L1091:    movq -40(%rbp), %rax
+.L1111:    movq -40(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3516,7 +3578,7 @@ memory_copy_string_to_buffer:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1092
+    jz .L1112
     movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -3543,17 +3605,17 @@ memory_copy_string_to_buffer:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1101
+    jz .L1121
     movq $0, %rax
     movq %rax, -40(%rbp)
-    jmp .L1102
-.L1101:
+    jmp .L1122
+.L1121:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-.L1102:
-    jmp .L1091
-.L1092:
+.L1122:
+    jmp .L1111
+.L1112:
     movq -32(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp

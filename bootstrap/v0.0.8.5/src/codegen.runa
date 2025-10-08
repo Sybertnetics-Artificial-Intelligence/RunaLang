@@ -248,8 +248,8 @@ Process called "codegen_add_string_literal" takes codegen as Integer, value as I
     Let str_offset be str_index multiplied by 16
     Let str_ptr be strings plus str_offset
 
-    Note: Set string value
-    memory_set_pointer(str_ptr, 0, string_duplicate(value))  Note: value
+    Note: Set string value (use _ptr version for Integer type)
+    memory_set_pointer(str_ptr, 0, string_duplicate_ptr(value))  Note: value
 
     Note: Generate unique label for this string
     Let label be string_concat(".STR", integer_to_string(str_index))
@@ -414,6 +414,35 @@ Process called "codegen_collect_strings_from_expression" takes codegen as Intege
             codegen_collect_strings_from_expression(codegen, field_value_expr)
             Let field_i be field_i plus 1
         End While
+        Return 0
+    End If
+
+    If expr_type is equal to 28:  Note: EXPR_STRING_INTERPOLATION
+        Note: Collect string parts from interpolation
+        Note: Structure: type(4), part_count(4), expr_count(4), parts_ptr(8), exprs_ptr(8)
+        Let part_count be memory_get_int32(expr, 4)
+        Let expr_count be memory_get_int32(expr, 8)
+        Let parts_ptr be memory_get_pointer(expr, 16)
+        Let exprs_ptr be memory_get_pointer(expr, 24)
+
+        Note: Collect all string parts
+        Let i be 0
+        While i is less than part_count:
+            Let part_str be memory_get_pointer(parts_ptr plus (i multiplied by 8), 0)
+            If part_str is not equal to 0:
+                codegen_add_string_literal(codegen, part_str)
+            End If
+            Set i to i plus 1
+        End While
+
+        Note: Recursively collect strings from embedded expressions
+        Set i to 0
+        While i is less than expr_count:
+            Let embedded_expr be memory_get_pointer(exprs_ptr plus (i multiplied by 8), 0)
+            codegen_collect_strings_from_expression(codegen, embedded_expr)
+            Set i to i plus 1
+        End While
+
         Return 0
     End If
 
@@ -1535,6 +1564,35 @@ Process called "codegen_generate_function_call" takes codegen as Integer, expr a
     Note: Safety check for function_name
     If function_name is equal to 0:  Note: NULL pointer check
         exit_with_code(1)
+    End If
+
+    Note: Check if this is actually a variable holding a function pointer
+    Let var_index be codegen_find_variable(codegen, function_name)
+    If var_index is not equal to -1:
+        Note: This is a variable, not a function - generate indirect call
+        Let variables be memory_get_pointer(codegen, 8)
+        Let var_offset be var_index multiplied by 32
+        Let var_ptr be variables plus var_offset
+
+        Note: Generate the indirect call by creating a temporary EXPR_INDIRECT_CALL structure
+        Let indirect_expr be memory_allocate(32)
+
+        Note: Create EXPR_VARIABLE for the function pointer
+        Let var_expr be memory_allocate(16)
+        memory_set_int32(var_expr, 0, 1)  Note: EXPR_VARIABLE
+        memory_set_pointer(var_expr, 8, function_name)
+
+        Note: Set up EXPR_INDIRECT_CALL structure
+        memory_set_int32(indirect_expr, 0, 11)  Note: EXPR_INDIRECT_CALL
+        memory_set_pointer(indirect_expr, 8, var_expr)
+        memory_set_pointer(indirect_expr, 16, arguments)
+        memory_set_int32(indirect_expr, 24, arg_count)
+
+        Note: Generate indirect call and clean up
+        codegen_generate_indirect_call(codegen, indirect_expr)
+        deallocate(var_expr)
+        deallocate(indirect_expr)
+        Return 0
     End If
 
     Note: Generate argument values in reverse order (right-to-left evaluation)
@@ -2797,6 +2855,84 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         file_write_buffered(output_file, ":\n", 0)
         emit_line(output_file, "    # Ternary result in %rax")
 
+        Return 0
+    End If
+
+    If expr_type is equal to 28:  Note: EXPR_STRING_INTERPOLATION
+        Note: String interpolation: f"text {expr} more text"
+        Note: Structure: type(4), part_count(4), expr_count(4), parts_ptr(8), exprs_ptr(8)
+        Let part_count be memory_get_int32(expr, 4)
+        Let expr_count be memory_get_int32(expr, 8)
+        Let parts_ptr be memory_get_pointer(expr, 16)
+        Let exprs_ptr be memory_get_pointer(expr, 24)
+
+        Note: Start with empty string
+        emit_line(output_file, "    # String interpolation")
+        emit_line(output_file, "    movq $0, %rax  # Start with null (will concat)")
+
+        Note: Interleave string parts and expressions
+        Let i be 0
+        While i is less than or equal to expr_count:
+            Note: Add string part if it exists
+            If i is less than part_count:
+                Let part_str be memory_get_pointer(parts_ptr plus (i multiplied by 8), 0)
+                If part_str is not equal to 0:
+                    emit_line(output_file, "    pushq %rax  # Save current result")
+
+                    Note: Find string literal in collected strings
+                    Let strings be memory_get_pointer(codegen, 32)
+                    Let string_count be memory_get_int32(codegen, 40)
+                    Let str_index be -1
+                    Let j be 0
+                    While j is less than string_count:
+                        Let str_offset be j multiplied by 16
+                        Let str_ptr be strings plus str_offset
+                        Let existing_value be memory_get_pointer(str_ptr, 0)
+                        If existing_value is not equal to 0:
+                            If string_equals(existing_value, part_str) is equal to 1:
+                                Set str_index to j
+                                Set j to string_count  Note: Break
+                            End If
+                        End If
+                        Set j to j plus 1
+                    End While
+
+                    If str_index is not equal to -1:
+                        Let str_offset be str_index multiplied by 16
+                        Let str_ptr be strings plus str_offset
+                        Let str_label be memory_get_pointer(str_ptr, 8)
+
+                        file_write_buffered(output_file, "    leaq ", 0)
+                        file_write_buffered(output_file, str_label, 0)
+                        file_write_buffered(output_file, "(%rip), %rsi\n", 0)
+
+                        emit_line(output_file, "    popq %rdi  # Previous result")
+                        emit_line(output_file, "    call string_concat@PLT")
+                    End If
+                End If
+            End If
+
+            Note: Add expression value if it exists
+            If i is less than expr_count:
+                Let expr_to_eval be memory_get_pointer(exprs_ptr plus (i multiplied by 8), 0)
+                emit_line(output_file, "    pushq %rax  # Save current result")
+
+                Note: Evaluate expression
+                codegen_generate_expression(codegen, expr_to_eval)
+
+                Note: Convert to string (assuming integer for now)
+                emit_line(output_file, "    movq %rax, %rdi")
+                emit_line(output_file, "    call integer_to_string@PLT")
+                emit_line(output_file, "    movq %rax, %rsi")
+
+                emit_line(output_file, "    popq %rdi  # Previous result")
+                emit_line(output_file, "    call string_concat@PLT")
+            End If
+
+            Set i to i plus 1
+        End While
+
+        emit_line(output_file, "    # String interpolation result in %rax")
         Return 0
     End If
 
