@@ -373,15 +373,15 @@ print_integer:
 .STR271:    .string ".L"
 .STR272:    .string "    movq (%rsp), %rcx"
 .STR273:    .string "    cmpq %rcx, %rax"
-.STR274:    .string "    jg .L"
-.STR275:    .string "    movq $1, %rax"
-.STR276:    .string "    addq %rcx, %rax"
-.STR277:    .string "    jmp .L"
-.STR278:    .string "    movq %rax, %rdi"
-.STR279:    .string "    call list_length"
-.STR280:    .string "    movq (%rsp), %rax"
-.STR281:    .string "    movq 8(%rsp), %rcx"
-.STR282:    .string "    jge .L"
+.STR274:    .string "    jge .L"
+.STR275:    .string "    jg .L"
+.STR276:    .string "    movq $1, %rax"
+.STR277:    .string "    addq %rcx, %rax"
+.STR278:    .string "    jmp .L"
+.STR279:    .string "    movq %rax, %rdi"
+.STR280:    .string "    call list_length"
+.STR281:    .string "    movq (%rsp), %rax"
+.STR282:    .string "    movq 8(%rsp), %rcx"
 .STR283:    .string "    movq 16(%rsp), %rdi"
 .STR284:    .string "    movq (%rsp), %rsi"
 .STR285:    .string "    call list_get"
@@ -15825,6 +15825,14 @@ codegen_generate_statement:
     popq %rsi
     call memory_get_integer@PLT
     movq %rax, -504(%rbp)
+    movq $56, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -512(%rbp)
     movq -464(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15860,7 +15868,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -528(%rbp)
+    movq %rax, -536(%rbp)
     movq -472(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15880,7 +15888,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -528(%rbp), %rax
+    movq -536(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -15925,16 +15933,16 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -536(%rbp)
+    movq %rax, -544(%rbp)
     leaq .STR210(%rip), %rax
     pushq %rax
-    movq -536(%rbp), %rax
+    movq -544(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -544(%rbp)
-    movq -544(%rbp), %rax
+    movq %rax, -552(%rbp)
+    movq -552(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -15953,7 +15961,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -528(%rbp), %rax
+    movq -536(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -15988,6 +15996,17 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
+    leaq .STR135(%rip), %rax
+    movq %rax, -560(%rbp)
+    movq -512(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L3631
     movq -456(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -15998,8 +16017,28 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -552(%rbp)
-    movq -552(%rbp), %rax
+    pushq %rax
+    leaq -560(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L3632
+.L3631:
+    movq -456(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call integer_to_string@PLT
+    pushq %rax
+    leaq .STR275(%rip), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    pushq %rax
+    leaq -560(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L3632:
+    movq -560(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16008,7 +16047,7 @@ codegen_generate_statement:
     call emit_line
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L3631:    movq -112(%rbp), %rax
+.L3641:    movq -112(%rbp), %rax
     pushq %rax
     movq -504(%rbp), %rax
     popq %rbx
@@ -16016,7 +16055,7 @@ codegen_generate_statement:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3632
+    jz .L3642
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -16028,8 +16067,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -568(%rbp)
-    movq -568(%rbp), %rax
+    movq %rax, -576(%rbp)
+    movq -576(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16042,8 +16081,8 @@ codegen_generate_statement:
     leaq -112(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3631
-.L3632:
+    jmp .L3641
+.L3642:
     movq -488(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -16052,7 +16091,7 @@ codegen_generate_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3641
+    jz .L3651
     movq -488(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16067,9 +16106,9 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
-    jmp .L3642
-.L3641:
-.L3642:
+    jmp .L3652
+.L3651:
+.L3652:
     movq -488(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -16078,8 +16117,8 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3651
-    leaq .STR275(%rip), %rax
+    jz .L3661
+    leaq .STR276(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16093,9 +16132,9 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
-    jmp .L3652
-.L3651:
-.L3652:
+    jmp .L3662
+.L3661:
+.L3662:
     movq $0, %rax
     pushq %rax
     leaq .STR13(%rip), %rax
@@ -16108,7 +16147,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -528(%rbp), %rax
+    movq -536(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -16136,7 +16175,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
-    leaq .STR276(%rip), %rax
+    leaq .STR277(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16155,7 +16194,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -528(%rbp), %rax
+    movq -536(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -16181,13 +16220,13 @@ codegen_generate_statement:
     popq %rdi
     call integer_to_string@PLT
     pushq %rax
-    leaq .STR277(%rip), %rax
+    leaq .STR278(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -576(%rbp)
-    movq -576(%rbp), %rax
+    movq %rax, -584(%rbp)
+    movq -584(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16204,16 +16243,16 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -584(%rbp)
+    movq %rax, -592(%rbp)
     leaq .STR210(%rip), %rax
     pushq %rax
-    movq -584(%rbp), %rax
+    movq -592(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -592(%rbp)
-    movq -592(%rbp), %rax
+    movq %rax, -600(%rbp)
+    movq -600(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16242,7 +16281,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3661
+    jz .L3671
     movq $28, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16293,7 +16332,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -640(%rbp)
+    movq %rax, -648(%rbp)
     movq $24, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -16310,7 +16349,7 @@ codegen_generate_statement:
     popq %rsi
     call memory_get_integer@PLT
     movq %rax, -504(%rbp)
-    movq -640(%rbp), %rax
+    movq -648(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16324,14 +16363,14 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
-    leaq .STR278(%rip), %rax
+    leaq .STR279(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call emit_line
-    leaq .STR279(%rip), %rax
+    leaq .STR280(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16394,7 +16433,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -528(%rbp)
+    movq %rax, -536(%rbp)
     movq -448(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -16405,23 +16444,16 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -536(%rbp)
+    movq %rax, -544(%rbp)
     leaq .STR210(%rip), %rax
     pushq %rax
-    movq -536(%rbp), %rax
+    movq -544(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -544(%rbp)
-    movq -544(%rbp), %rax
-    pushq %rax
-    movq -32(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call emit_line
-    leaq .STR280(%rip), %rax
+    movq %rax, -552(%rbp)
+    movq -552(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16429,6 +16461,13 @@ codegen_generate_statement:
     popq %rsi
     call emit_line
     leaq .STR281(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call emit_line
+    leaq .STR282(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16447,13 +16486,13 @@ codegen_generate_statement:
     popq %rdi
     call integer_to_string@PLT
     pushq %rax
-    leaq .STR282(%rip), %rax
+    leaq .STR274(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -704(%rbp)
-    movq -704(%rbp), %rax
+    movq %rax, -712(%rbp)
+    movq -712(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16493,7 +16532,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -528(%rbp), %rax
+    movq -536(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -16516,7 +16555,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L3671:    movq -112(%rbp), %rax
+.L3681:    movq -112(%rbp), %rax
     pushq %rax
     movq -504(%rbp), %rax
     popq %rbx
@@ -16524,7 +16563,7 @@ codegen_generate_statement:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3672
+    jz .L3682
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -16536,8 +16575,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -568(%rbp)
-    movq -568(%rbp), %rax
+    movq %rax, -576(%rbp)
+    movq -576(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16550,9 +16589,9 @@ codegen_generate_statement:
     leaq -112(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3671
-.L3672:
-    leaq .STR280(%rip), %rax
+    jmp .L3681
+.L3682:
+    leaq .STR281(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16578,13 +16617,13 @@ codegen_generate_statement:
     popq %rdi
     call integer_to_string@PLT
     pushq %rax
-    leaq .STR277(%rip), %rax
+    leaq .STR278(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -576(%rbp)
-    movq -576(%rbp), %rax
+    movq %rax, -584(%rbp)
+    movq -584(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16601,16 +16640,16 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -584(%rbp)
+    movq %rax, -592(%rbp)
     leaq .STR210(%rip), %rax
     pushq %rax
-    movq -584(%rbp), %rax
+    movq -592(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -592(%rbp)
-    movq -592(%rbp), %rax
+    movq %rax, -600(%rbp)
+    movq -600(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16628,9 +16667,9 @@ codegen_generate_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3662
-.L3661:
-.L3662:
+    jmp .L3672
+.L3671:
+.L3672:
     movq -24(%rbp), %rax
     pushq %rax
     movq $3, %rax
@@ -16639,7 +16678,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3681
+    jz .L3691
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -16647,8 +16686,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -752(%rbp)
-    movq -752(%rbp), %rax
+    movq %rax, -760(%rbp)
+    movq -760(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16689,9 +16728,9 @@ codegen_generate_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3682
-.L3681:
-.L3682:
+    jmp .L3692
+.L3691:
+.L3692:
     movq -24(%rbp), %rax
     pushq %rax
     movq $5, %rax
@@ -16700,7 +16739,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3691
+    jz .L3701
     movq $28, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16728,14 +16767,14 @@ codegen_generate_statement:
     popq %rbx
     imulq %rbx, %rax
     addq $1, %rax
-    movq %rax, -776(%rbp)
+    movq %rax, -784(%rbp)
     movq -440(%rbp), %rax
     pushq %rax
     movq $10, %rax
     popq %rbx
     imulq %rbx, %rax
     addq $2, %rax
-    movq %rax, -784(%rbp)
+    movq %rax, -792(%rbp)
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -16743,8 +16782,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -792(%rbp)
-    movq -792(%rbp), %rax
+    movq %rax, -800(%rbp)
+    movq -800(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16758,7 +16797,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
-    movq -776(%rbp), %rax
+    movq -784(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -16768,8 +16807,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -800(%rbp)
-    movq -800(%rbp), %rax
+    movq %rax, -808(%rbp)
+    movq -808(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16783,7 +16822,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -808(%rbp)
+    movq %rax, -816(%rbp)
     movq $24, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -16791,45 +16830,45 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -816(%rbp)
-    movq $0, %rax
     movq %rax, -824(%rbp)
-.L3701:    movq -824(%rbp), %rax
+    movq $0, %rax
+    movq %rax, -832(%rbp)
+.L3711:    movq -832(%rbp), %rax
     pushq %rax
-    movq -816(%rbp), %rax
+    movq -824(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3702
-    movq -824(%rbp), %rax
+    jz .L3712
+    movq -832(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -808(%rbp), %rax
+    movq -816(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -832(%rbp)
-    movq -832(%rbp), %rax
+    movq %rax, -840(%rbp)
+    movq -840(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call codegen_generate_statement
-    movq -824(%rbp), %rax
+    movq -832(%rbp), %rax
     addq $1, %rax
-    movq %rax, -824(%rbp)
-    jmp .L3701
-.L3702:
+    movq %rax, -832(%rbp)
+    jmp .L3711
+.L3712:
     movq $0, %rax
     pushq %rax
-    leaq .STR277(%rip), %rax
+    leaq .STR278(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -16839,7 +16878,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -784(%rbp), %rax
+    movq -792(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -16860,91 +16899,6 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    movq -776(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call integer_to_string@PLT
-    pushq %rax
-    leaq .STR271(%rip), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_concat@PLT
-    movq %rax, -848(%rbp)
-    leaq .STR210(%rip), %rax
-    pushq %rax
-    movq -848(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_concat@PLT
-    movq %rax, -856(%rbp)
-    movq -856(%rbp), %rax
-    pushq %rax
-    movq -32(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call emit_line
-    movq -848(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -856(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq $32, %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -864(%rbp)
-    movq $40, %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -872(%rbp)
-    movq $0, %rax
-    movq %rax, -880(%rbp)
-.L3711:    movq -880(%rbp), %rax
-    pushq %rax
-    movq -872(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3712
-    movq -880(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    movq -864(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -888(%rbp)
-    movq -888(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call codegen_generate_statement
-    movq -880(%rbp), %rax
-    addq $1, %rax
-    movq %rax, -880(%rbp)
-    jmp .L3711
-.L3712:
     movq -784(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -16955,27 +16909,112 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -904(%rbp)
+    movq %rax, -856(%rbp)
     leaq .STR210(%rip), %rax
     pushq %rax
-    movq -904(%rbp), %rax
+    movq -856(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -912(%rbp)
-    movq -912(%rbp), %rax
+    movq %rax, -864(%rbp)
+    movq -864(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call emit_line
-    movq -904(%rbp), %rax
+    movq -856(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
+    movq -864(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq $32, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -872(%rbp)
+    movq $40, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -880(%rbp)
+    movq $0, %rax
+    movq %rax, -888(%rbp)
+.L3721:    movq -888(%rbp), %rax
+    pushq %rax
+    movq -880(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L3722
+    movq -888(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    movq -872(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -896(%rbp)
+    movq -896(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call codegen_generate_statement
+    movq -888(%rbp), %rax
+    addq $1, %rax
+    movq %rax, -888(%rbp)
+    jmp .L3721
+.L3722:
+    movq -792(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call integer_to_string@PLT
+    pushq %rax
+    leaq .STR271(%rip), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -912(%rbp)
+    leaq .STR210(%rip), %rax
+    pushq %rax
     movq -912(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -920(%rbp)
+    movq -920(%rbp), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call emit_line
+    movq -912(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -920(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -16983,9 +17022,9 @@ codegen_generate_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3692
-.L3691:
-.L3692:
+    jmp .L3702
+.L3701:
+.L3702:
     movq -24(%rbp), %rax
     pushq %rax
     movq $6, %rax
@@ -16994,7 +17033,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3721
+    jz .L3731
     movq $28, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17011,10 +17050,10 @@ codegen_generate_statement:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3731
-    jmp .L3732
-.L3731:
-.L3732:
+    jz .L3741
+    jmp .L3742
+.L3741:
+.L3742:
     movq -432(%rbp), %rax
     movq %rax, -440(%rbp)
     movq -432(%rbp), %rax
@@ -17034,17 +17073,17 @@ codegen_generate_statement:
     popq %rbx
     imulq %rbx, %rax
     addq $1, %rax
-    movq %rax, -936(%rbp)
+    movq %rax, -944(%rbp)
     movq -440(%rbp), %rax
     pushq %rax
     movq $10, %rax
     popq %rbx
     imulq %rbx, %rax
     addq $2, %rax
-    movq %rax, -944(%rbp)
-    movq -944(%rbp), %rax
+    movq %rax, -952(%rbp)
+    movq -952(%rbp), %rax
     pushq %rax
-    movq -936(%rbp), %rax
+    movq -944(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -17062,14 +17101,14 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    movq -936(%rbp), %rax
+    movq -944(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
-    movq %rax, -536(%rbp)
+    movq %rax, -544(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -536(%rbp), %rax
+    movq -544(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -17094,8 +17133,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -792(%rbp)
-    movq -792(%rbp), %rax
+    movq %rax, -800(%rbp)
+    movq -800(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -17109,7 +17148,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
-    movq -944(%rbp), %rax
+    movq -952(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -17119,8 +17158,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -800(%rbp)
-    movq -800(%rbp), %rax
+    movq %rax, -808(%rbp)
+    movq -808(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -17134,7 +17173,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -976(%rbp)
+    movq %rax, -984(%rbp)
     movq $24, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -17142,45 +17181,45 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -984(%rbp)
-    movq $0, %rax
     movq %rax, -992(%rbp)
-.L3741:    movq -992(%rbp), %rax
+    movq $0, %rax
+    movq %rax, -1000(%rbp)
+.L3751:    movq -1000(%rbp), %rax
     pushq %rax
-    movq -984(%rbp), %rax
+    movq -992(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3742
-    movq -992(%rbp), %rax
+    jz .L3752
+    movq -1000(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -976(%rbp), %rax
+    movq -984(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1000(%rbp)
-    movq -1000(%rbp), %rax
+    movq %rax, -1008(%rbp)
+    movq -1008(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call codegen_generate_statement
-    movq -992(%rbp), %rax
+    movq -1000(%rbp), %rax
     addq $1, %rax
-    movq %rax, -992(%rbp)
-    jmp .L3741
-.L3742:
+    movq %rax, -1000(%rbp)
+    jmp .L3751
+.L3752:
     movq $0, %rax
     pushq %rax
-    leaq .STR277(%rip), %rax
+    leaq .STR278(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -17190,7 +17229,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -936(%rbp), %rax
+    movq -944(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -17211,7 +17250,7 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    movq -944(%rbp), %rax
+    movq -952(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -17221,27 +17260,27 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -584(%rbp)
+    movq %rax, -592(%rbp)
     leaq .STR210(%rip), %rax
     pushq %rax
-    movq -584(%rbp), %rax
+    movq -592(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -1024(%rbp)
-    movq -1024(%rbp), %rax
+    movq %rax, -1032(%rbp)
+    movq -1032(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call emit_line
-    movq -584(%rbp), %rax
+    movq -592(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -1024(%rbp), %rax
+    movq -1032(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -17253,9 +17292,9 @@ codegen_generate_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3722
-.L3721:
-.L3722:
+    jmp .L3732
+.L3731:
+.L3732:
     movq -24(%rbp), %rax
     pushq %rax
     movq $9, %rax
@@ -17264,13 +17303,13 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3751
+    jz .L3761
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call codegen_current_loop_context
-    movq %rax, -1032(%rbp)
-    movq -1032(%rbp), %rax
+    movq %rax, -1040(%rbp)
+    movq -1040(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -17278,18 +17317,18 @@ codegen_generate_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3761
+    jz .L3771
     movq $8, %rax
     pushq %rax
-    movq -1032(%rbp), %rax
+    movq -1040(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1040(%rbp)
+    movq %rax, -1048(%rbp)
     movq $0, %rax
     pushq %rax
-    leaq .STR277(%rip), %rax
+    leaq .STR278(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -17299,7 +17338,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1040(%rbp), %rax
+    movq -1048(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -17320,20 +17359,20 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L3762
-.L3761:
+    jmp .L3772
+.L3771:
     movq $1, %rax
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-.L3762:
+.L3772:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3752
-.L3751:
-.L3752:
+    jmp .L3762
+.L3761:
+.L3762:
     movq -24(%rbp), %rax
     pushq %rax
     movq $10, %rax
@@ -17342,13 +17381,13 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3771
+    jz .L3781
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call codegen_current_loop_context
-    movq %rax, -1032(%rbp)
-    movq -1032(%rbp), %rax
+    movq %rax, -1040(%rbp)
+    movq -1040(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -17356,18 +17395,18 @@ codegen_generate_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3781
+    jz .L3791
     movq $0, %rax
     pushq %rax
-    movq -1032(%rbp), %rax
+    movq -1040(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1056(%rbp)
+    movq %rax, -1064(%rbp)
     movq $0, %rax
     pushq %rax
-    leaq .STR277(%rip), %rax
+    leaq .STR278(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -17377,7 +17416,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1056(%rbp), %rax
+    movq -1064(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -17398,20 +17437,20 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L3782
-.L3781:
+    jmp .L3792
+.L3791:
     movq $1, %rax
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-.L3782:
+.L3792:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3772
-.L3771:
-.L3772:
+    jmp .L3782
+.L3781:
+.L3782:
     movq -24(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -17420,7 +17459,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3791
+    jz .L3801
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -17428,7 +17467,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1064(%rbp)
+    movq %rax, -1072(%rbp)
     movq $16, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -17436,31 +17475,31 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1072(%rbp)
-    movq $0, %rax
     movq %rax, -1080(%rbp)
-    movq $1, %rax
+    movq $0, %rax
     movq %rax, -1088(%rbp)
-.L3801:    movq -1080(%rbp), %rax
+    movq $1, %rax
+    movq %rax, -1096(%rbp)
+.L3811:    movq -1088(%rbp), %rax
     pushq %rax
-    movq -1072(%rbp), %rax
+    movq -1080(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3802
-    movq -1080(%rbp), %rax
+    jz .L3812
+    movq -1088(%rbp), %rax
     pushq %rax
-    movq -1064(%rbp), %rax
+    movq -1072(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_char_at@PLT
-    movq %rax, -1096(%rbp)
-    movq $10, %rax
     movq %rax, -1104(%rbp)
-    movq -1088(%rbp), %rax
+    movq $10, %rax
+    movq %rax, -1112(%rbp)
+    movq -1096(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -17468,16 +17507,16 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3811
-    movq -1096(%rbp), %rax
-    pushq %rax
+    jz .L3821
     movq -1104(%rbp), %rax
+    pushq %rax
+    movq -1112(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3821
+    jz .L3831
     movq $0, %rax
     pushq %rax
     leaq .STR293(%rip), %rax
@@ -17488,29 +17527,29 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
+    jmp .L3832
+.L3831:
+.L3832:
+    movq $0, %rax
+    pushq %rax
+    leaq -1096(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
     jmp .L3822
 .L3821:
 .L3822:
-    movq $0, %rax
-    pushq %rax
-    leaq -1088(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3812
-.L3811:
-.L3812:
     movq $2, %rax
-    movq %rax, -1112(%rbp)
-    movq -1112(%rbp), %rax
+    movq %rax, -1120(%rbp)
+    movq -1120(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1120(%rbp)
-    movq -1096(%rbp), %rax
+    movq %rax, -1128(%rbp)
+    movq -1104(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1120(%rbp), %rax
+    movq -1128(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -17520,7 +17559,7 @@ codegen_generate_statement:
     pushq %rax
     movq $1, %rax
     pushq %rax
-    movq -1120(%rbp), %rax
+    movq -1128(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -17528,7 +17567,7 @@ codegen_generate_statement:
     call memory_set_byte@PLT
     movq $0, %rax
     pushq %rax
-    movq -1120(%rbp), %rax
+    movq -1128(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -17536,36 +17575,36 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    movq -1120(%rbp), %rax
+    movq -1128(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -1096(%rbp), %rax
-    pushq %rax
     movq -1104(%rbp), %rax
+    pushq %rax
+    movq -1112(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3831
+    jz .L3841
     movq $1, %rax
+    pushq %rax
+    leaq -1096(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L3842
+.L3841:
+.L3842:
+    movq -1088(%rbp), %rax
+    addq $1, %rax
     pushq %rax
     leaq -1088(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3832
-.L3831:
-.L3832:
-    movq -1080(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -1080(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3801
-.L3802:
-    movq -1088(%rbp), %rax
+    jmp .L3811
+.L3812:
+    movq -1096(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -17573,7 +17612,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3841
+    jz .L3851
     movq $0, %rax
     pushq %rax
     leaq .STR0(%rip), %rax
@@ -17584,16 +17623,16 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L3842
-.L3841:
-.L3842:
+    jmp .L3852
+.L3851:
+.L3852:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3792
-.L3791:
-.L3792:
+    jmp .L3802
+.L3801:
+.L3802:
     movq -24(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -17602,7 +17641,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3851
+    jz .L3861
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -17610,8 +17649,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1128(%rbp)
-    movq -1128(%rbp), %rax
+    movq %rax, -1136(%rbp)
+    movq -1136(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -17620,7 +17659,7 @@ codegen_generate_statement:
     call codegen_generate_expression
     movq $0, %rax
     pushq %rax
-    movq -1128(%rbp), %rax
+    movq -1136(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -17634,7 +17673,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3861
+    jz .L3871
     movq $0, %rax
     pushq %rax
     leaq .STR294(%rip), %rax
@@ -17655,8 +17694,8 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L3862
-.L3861:
+    jmp .L3872
+.L3871:
     movq -56(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -17665,8 +17704,8 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3871
-    movq -1128(%rbp), %rax
+    jz .L3881
+    movq -1136(%rbp), %rax
     addq $8, %rax
     movq %rax, -248(%rbp)
     movq $0, %rax
@@ -17687,19 +17726,6 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3881
-    movq $1, %rax
-    movq %rax, -264(%rbp)
-    jmp .L3882
-.L3881:
-    movq -256(%rbp), %rax
-    pushq %rax
-    movq $42, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L3891
     movq $1, %rax
     movq %rax, -264(%rbp)
@@ -17707,7 +17733,7 @@ codegen_generate_statement:
 .L3891:
     movq -256(%rbp), %rax
     pushq %rax
-    movq $48, %rax
+    movq $42, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -17720,7 +17746,7 @@ codegen_generate_statement:
 .L3901:
     movq -256(%rbp), %rax
     pushq %rax
-    movq $49, %rax
+    movq $48, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -17733,7 +17759,7 @@ codegen_generate_statement:
 .L3911:
     movq -256(%rbp), %rax
     pushq %rax
-    movq $52, %rax
+    movq $49, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -17746,7 +17772,7 @@ codegen_generate_statement:
 .L3921:
     movq -256(%rbp), %rax
     pushq %rax
-    movq $54, %rax
+    movq $52, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -17757,12 +17783,25 @@ codegen_generate_statement:
     movq %rax, -264(%rbp)
     jmp .L3932
 .L3931:
+    movq -256(%rbp), %rax
+    pushq %rax
+    movq $54, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L3941
+    movq $1, %rax
+    movq %rax, -264(%rbp)
+    jmp .L3942
+.L3941:
+.L3942:
 .L3932:
 .L3922:
 .L3912:
 .L3902:
 .L3892:
-.L3882:
     movq -264(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -17771,7 +17810,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3941
+    jz .L3951
     movq $0, %rax
     pushq %rax
     leaq .STR294(%rip), %rax
@@ -17792,8 +17831,8 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L3942
-.L3941:
+    jmp .L3952
+.L3951:
     movq $0, %rax
     pushq %rax
     leaq .STR294(%rip), %rax
@@ -17814,9 +17853,9 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-.L3942:
-    jmp .L3872
-.L3871:
+.L3952:
+    jmp .L3882
+.L3881:
     movq -56(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -17825,10 +17864,10 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3951
+    jz .L3961
     movq $8, %rax
     pushq %rax
-    movq -1128(%rbp), %rax
+    movq -1136(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -17850,7 +17889,7 @@ codegen_generate_statement:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3961
+    jz .L3971
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17880,45 +17919,8 @@ codegen_generate_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3971
-    leaq .STR260(%rip), %rax
-    pushq %rax
-    movq -64(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L3981
-    movq $0, %rax
-    pushq %rax
-    leaq .STR294(%rip), %rax
-    pushq %rax
-    movq -32(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call file_write_buffered@PLT
-    movq $0, %rax
-    pushq %rax
-    leaq .STR295(%rip), %rax
-    pushq %rax
-    movq -32(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call file_write_buffered@PLT
-    jmp .L3982
-.L3981:
-    leaq .STR261(%rip), %rax
+    leaq .STR260(%rip), %rax
     pushq %rax
     movq -64(%rbp), %rax
     pushq %rax
@@ -17945,7 +17947,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    leaq .STR296(%rip), %rax
+    leaq .STR295(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -17955,6 +17957,21 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     jmp .L3992
 .L3991:
+    leaq .STR261(%rip), %rax
+    pushq %rax
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4001
     movq $0, %rax
     pushq %rax
     leaq .STR294(%rip), %rax
@@ -17975,7 +17992,52 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
+    jmp .L4002
+.L4001:
+    movq $0, %rax
+    pushq %rax
+    leaq .STR294(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call file_write_buffered@PLT
+    movq $0, %rax
+    pushq %rax
+    leaq .STR296(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call file_write_buffered@PLT
+.L4002:
 .L3992:
+    jmp .L3982
+.L3981:
+    movq $0, %rax
+    pushq %rax
+    leaq .STR294(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call file_write_buffered@PLT
+    movq $0, %rax
+    pushq %rax
+    leaq .STR296(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call file_write_buffered@PLT
 .L3982:
     jmp .L3972
 .L3971:
@@ -18023,38 +18085,15 @@ codegen_generate_statement:
     popq %rdx
     call file_write_buffered@PLT
 .L3962:
-    jmp .L3952
-.L3951:
-    movq $0, %rax
-    pushq %rax
-    leaq .STR294(%rip), %rax
-    pushq %rax
-    movq -32(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call file_write_buffered@PLT
-    movq $0, %rax
-    pushq %rax
-    leaq .STR296(%rip), %rax
-    pushq %rax
-    movq -32(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call file_write_buffered@PLT
-.L3952:
+.L3882:
 .L3872:
-.L3862:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3852
-.L3851:
-.L3852:
+    jmp .L3862
+.L3861:
+.L3862:
     movq -24(%rbp), %rax
     pushq %rax
     movq $7, %rax
@@ -18063,7 +18102,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4001
+    jz .L4011
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -18071,8 +18110,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1248(%rbp)
-    movq -1248(%rbp), %rax
+    movq %rax, -1256(%rbp)
+    movq -1256(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -18083,9 +18122,9 @@ codegen_generate_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4002
-.L4001:
-.L4002:
+    jmp .L4012
+.L4011:
+.L4012:
     movq -24(%rbp), %rax
     pushq %rax
     movq $13, %rax
@@ -18094,14 +18133,14 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4011
+    jz .L4021
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4012
-.L4011:
-.L4012:
+    jmp .L4022
+.L4021:
+.L4022:
     movq -24(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -18110,7 +18149,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4021
+    jz .L4031
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -18118,8 +18157,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1256(%rbp)
-    movq -1256(%rbp), %rax
+    movq %rax, -1264(%rbp)
+    movq -1264(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -18145,7 +18184,7 @@ codegen_generate_statement:
     call memory_get_int32@PLT
     movq %rax, -432(%rbp)
     movq -432(%rbp), %rax
-    movq %rax, -1272(%rbp)
+    movq %rax, -1280(%rbp)
     movq -432(%rbp), %rax
     addq $1, %rax
     pushq %rax
@@ -18164,7 +18203,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1280(%rbp)
+    movq %rax, -1288(%rbp)
     movq $24, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -18172,70 +18211,70 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1288(%rbp)
+    movq %rax, -1296(%rbp)
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L4031:    movq -112(%rbp), %rax
+.L4041:    movq -112(%rbp), %rax
     pushq %rax
-    movq -1288(%rbp), %rax
+    movq -1296(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4032
+    jz .L4042
     movq -112(%rbp), %rax
     pushq %rax
     movq $48, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1304(%rbp)
-    movq -1280(%rbp), %rax
-    addq -1304(%rbp), %rax
     movq %rax, -1312(%rbp)
+    movq -1288(%rbp), %rax
+    addq -1312(%rbp), %rax
+    movq %rax, -1320(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1312(%rbp), %rax
+    movq -1320(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1320(%rbp)
+    movq %rax, -1328(%rbp)
     movq $8, %rax
     pushq %rax
-    movq -1312(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -1328(%rbp)
-    movq $16, %rax
-    pushq %rax
-    movq -1312(%rbp), %rax
+    movq -1320(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -1336(%rbp)
-    movq $24, %rax
+    movq $16, %rax
     pushq %rax
-    movq -1312(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -1344(%rbp)
-    movq $32, %rax
-    pushq %rax
-    movq -1312(%rbp), %rax
+    movq -1320(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
+    movq %rax, -1344(%rbp)
+    movq $24, %rax
+    pushq %rax
+    movq -1320(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
     movq %rax, -1352(%rbp)
+    movq $32, %rax
+    pushq %rax
+    movq -1320(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1360(%rbp)
     movq $40, %rax
     pushq %rax
-    movq -1312(%rbp), %rax
+    movq -1320(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -18253,7 +18292,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -18297,7 +18336,7 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    movq -1320(%rbp), %rax
+    movq -1328(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
@@ -18305,10 +18344,10 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4041
-    jmp .L4042
-.L4041:
-    movq -1320(%rbp), %rax
+    jz .L4051
+    jmp .L4052
+.L4051:
+    movq -1328(%rbp), %rax
     pushq %rax
     movq $3, %rax
     popq %rbx
@@ -18316,9 +18355,9 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4051
-    movq -1328(%rbp), %rax
-    movq %rax, -1368(%rbp)
+    jz .L4061
+    movq -1336(%rbp), %rax
+    movq %rax, -1376(%rbp)
     movq $0, %rax
     pushq %rax
     leaq .STR300(%rip), %rax
@@ -18341,7 +18380,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     leaq .STR1(%rip), %rax
     pushq %rax
-    movq -1368(%rbp), %rax
+    movq -1376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -18353,7 +18392,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4061
+    jz .L4071
     movq $0, %rax
     pushq %rax
     leaq .STR302(%rip), %rax
@@ -18376,16 +18415,16 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq -112(%rbp), %rax
     addq $1, %rax
-    movq %rax, -1376(%rbp)
-    movq -1376(%rbp), %rax
+    movq %rax, -1384(%rbp)
+    movq -1384(%rbp), %rax
     pushq %rax
-    movq -1288(%rbp), %rax
+    movq -1296(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4071
+    jz .L4081
     movq $0, %rax
     pushq %rax
     leaq .STR304(%rip), %rax
@@ -18398,7 +18437,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -18421,7 +18460,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1376(%rbp), %rax
+    movq -1384(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -18442,8 +18481,8 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4072
-.L4071:
+    jmp .L4082
+.L4081:
     movq $0, %rax
     pushq %rax
     leaq .STR304(%rip), %rax
@@ -18456,7 +18495,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -18477,9 +18516,9 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-.L4072:
-    jmp .L4062
-.L4061:
+.L4082:
+    jmp .L4072
+.L4071:
     movq $0, %rax
     pushq %rax
     leaq .STR302(%rip), %rax
@@ -18502,16 +18541,16 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq -112(%rbp), %rax
     addq $1, %rax
-    movq %rax, -1376(%rbp)
-    movq -1376(%rbp), %rax
+    movq %rax, -1384(%rbp)
+    movq -1384(%rbp), %rax
     pushq %rax
-    movq -1288(%rbp), %rax
+    movq -1296(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4081
+    jz .L4091
     movq $0, %rax
     pushq %rax
     leaq .STR308(%rip), %rax
@@ -18524,7 +18563,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -18547,7 +18586,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1376(%rbp), %rax
+    movq -1384(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -18568,8 +18607,8 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4082
-.L4081:
+    jmp .L4092
+.L4091:
     movq $0, %rax
     pushq %rax
     leaq .STR308(%rip), %rax
@@ -18582,7 +18621,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -18603,11 +18642,11 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-.L4082:
-.L4062:
-    jmp .L4052
-.L4051:
-    movq -1320(%rbp), %rax
+.L4092:
+.L4072:
+    jmp .L4062
+.L4061:
+    movq -1328(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -18615,7 +18654,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4091
+    jz .L4101
     movq $0, %rax
     pushq %rax
     leaq .STR300(%rip), %rax
@@ -18636,7 +18675,7 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    movq -1328(%rbp), %rax
+    movq -1336(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -18673,14 +18712,14 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4092
-.L4091:
-    movq -1328(%rbp), %rax
-    movq %rax, -1392(%rbp)
-    movq $0, %rax
+    jmp .L4102
+.L4101:
+    movq -1336(%rbp), %rax
     movq %rax, -1400(%rbp)
     movq $0, %rax
     movq %rax, -1408(%rbp)
+    movq $0, %rax
+    movq %rax, -1416(%rbp)
     movq $48, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -18706,10 +18745,10 @@ codegen_generate_statement:
     call memory_get_pointer@PLT
     movq %rax, -88(%rbp)
     movq $0, %rax
-    movq %rax, -1440(%rbp)
-    movq $0, %rax
     movq %rax, -1448(%rbp)
-.L4101:    movq -1448(%rbp), %rax
+    movq $0, %rax
+    movq %rax, -1456(%rbp)
+.L4111:    movq -1456(%rbp), %rax
     pushq %rax
     movq -80(%rbp), %rax
     popq %rbx
@@ -18717,18 +18756,18 @@ codegen_generate_statement:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4102
-    movq -1448(%rbp), %rax
+    jz .L4112
+    movq -1456(%rbp), %rax
     pushq %rax
     movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer_at_index
-    movq %rax, -1456(%rbp)
+    movq %rax, -1464(%rbp)
     movq $8, %rax
     pushq %rax
-    movq -1456(%rbp), %rax
+    movq -1464(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -18742,54 +18781,54 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4111
+    jz .L4121
     movq $24, %rax
     pushq %rax
-    movq -1456(%rbp), %rax
+    movq -1464(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1472(%rbp)
+    movq %rax, -1480(%rbp)
     movq $16, %rax
     pushq %rax
-    movq -1456(%rbp), %rax
+    movq -1464(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1480(%rbp)
-    movq $0, %rax
     movq %rax, -1488(%rbp)
-.L4121:    movq -1488(%rbp), %rax
+    movq $0, %rax
+    movq %rax, -1496(%rbp)
+.L4131:    movq -1496(%rbp), %rax
     pushq %rax
-    movq -1472(%rbp), %rax
+    movq -1480(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4122
-    movq -1488(%rbp), %rax
+    jz .L4132
+    movq -1496(%rbp), %rax
     pushq %rax
     movq $32, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1496(%rbp)
-    movq -1480(%rbp), %rax
-    addq -1496(%rbp), %rax
     movq %rax, -1504(%rbp)
+    movq -1488(%rbp), %rax
+    addq -1504(%rbp), %rax
+    movq %rax, -1512(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1504(%rbp), %rax
+    movq -1512(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1512(%rbp)
-    movq -1392(%rbp), %rax
+    movq %rax, -1520(%rbp)
+    movq -1400(%rbp), %rax
     pushq %rax
-    movq -1512(%rbp), %rax
+    movq -1520(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -18801,21 +18840,10 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4131
+    jz .L4141
     movq $20, %rax
     pushq %rax
-    movq -1504(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    pushq %rax
-    leaq -1400(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $16, %rax
-    pushq %rax
-    movq -1504(%rbp), %rax
+    movq -1512(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -18824,43 +18852,54 @@ codegen_generate_statement:
     leaq -1408(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+    movq $16, %rax
+    pushq %rax
+    movq -1512(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    pushq %rax
+    leaq -1416(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
     movq $1, %rax
     pushq %rax
-    leaq -1440(%rbp), %rbx
+    leaq -1448(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -80(%rbp), %rax
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -1456(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1472(%rbp), %rax
+    movq -1480(%rbp), %rax
     pushq %rax
-    leaq -1488(%rbp), %rbx
+    leaq -1496(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4132
-.L4131:
-    movq -1488(%rbp), %rax
+    jmp .L4142
+.L4141:
+    movq -1496(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1488(%rbp), %rbx
+    leaq -1496(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L4142:
+    jmp .L4131
 .L4132:
-    jmp .L4121
+    jmp .L4122
+.L4121:
 .L4122:
-    jmp .L4112
-.L4111:
-.L4112:
-    movq -1448(%rbp), %rax
+    movq -1456(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -1456(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4101
-.L4102:
+    jmp .L4111
+.L4112:
     movq $0, %rax
     pushq %rax
     leaq .STR314(%rip), %rax
@@ -18893,7 +18932,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1400(%rbp), %rax
+    movq -1408(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -18914,10 +18953,10 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-.L4092:
+.L4102:
+.L4062:
 .L4052:
-.L4042:
-    movq -1320(%rbp), %rax
+    movq -1328(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
@@ -18925,8 +18964,8 @@ codegen_generate_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4141
-    movq -1320(%rbp), %rax
+    jz .L4151
+    movq -1328(%rbp), %rax
     pushq %rax
     movq $3, %rax
     popq %rbx
@@ -18934,19 +18973,19 @@ codegen_generate_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4151
+    jz .L4161
     movq -112(%rbp), %rax
     addq $1, %rax
-    movq %rax, -1376(%rbp)
-    movq -1376(%rbp), %rax
+    movq %rax, -1384(%rbp)
+    movq -1384(%rbp), %rax
     pushq %rax
-    movq -1288(%rbp), %rax
+    movq -1296(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4161
+    jz .L4171
     movq $0, %rax
     pushq %rax
     leaq .STR318(%rip), %rax
@@ -18959,7 +18998,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -18982,7 +19021,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1376(%rbp), %rax
+    movq -1384(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19003,8 +19042,8 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4162
-.L4161:
+    jmp .L4172
+.L4171:
     movq $0, %rax
     pushq %rax
     leaq .STR318(%rip), %rax
@@ -19017,7 +19056,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19038,37 +19077,16 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
+.L4172:
+    jmp .L4162
+.L4161:
 .L4162:
     jmp .L4152
 .L4151:
 .L4152:
-    jmp .L4142
-.L4141:
-.L4142:
-    movq -1320(%rbp), %rax
+    movq -1328(%rbp), %rax
     pushq %rax
     movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4171
-    movq $0, %rax
-    pushq %rax
-    leaq .STR321(%rip), %rax
-    pushq %rax
-    movq -32(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call file_write_buffered@PLT
-    jmp .L4172
-.L4171:
-    movq -1320(%rbp), %rax
-    pushq %rax
-    movq $2, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -19087,9 +19105,9 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     jmp .L4182
 .L4181:
-    movq -1320(%rbp), %rax
+    movq -1328(%rbp), %rax
     pushq %rax
-    movq $3, %rax
+    movq $2, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -19108,6 +19126,27 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     jmp .L4192
 .L4191:
+    movq -1328(%rbp), %rax
+    pushq %rax
+    movq $3, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4201
+    movq $0, %rax
+    pushq %rax
+    leaq .STR321(%rip), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call file_write_buffered@PLT
+    jmp .L4202
+.L4201:
     movq $0, %rax
     pushq %rax
     leaq .STR322(%rip), %rax
@@ -19119,36 +19158,36 @@ codegen_generate_statement:
     popq %rdx
     call file_write_buffered@PLT
     movq $0, %rax
-    movq %rax, -1528(%rbp)
-.L4201:    movq -1528(%rbp), %rax
+    movq %rax, -1536(%rbp)
+.L4211:    movq -1536(%rbp), %rax
     pushq %rax
-    movq -1344(%rbp), %rax
+    movq -1352(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4202
-    movq -1528(%rbp), %rax
+    jz .L4212
+    movq -1536(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -1336(%rbp), %rax
+    movq -1344(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1536(%rbp)
-    movq -1536(%rbp), %rax
+    movq %rax, -1544(%rbp)
+    movq -1544(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call codegen_add_variable
-    movq -1536(%rbp), %rax
+    movq -1544(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -19176,17 +19215,17 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -528(%rbp)
+    movq %rax, -536(%rbp)
     movq $8, %rax
     pushq %rax
-    movq -1528(%rbp), %rax
+    movq -1536(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     popq %rbx
     addq %rbx, %rax
-    movq %rax, -1568(%rbp)
+    movq %rax, -1576(%rbp)
     movq $0, %rax
     pushq %rax
     leaq .STR31(%rip), %rax
@@ -19199,7 +19238,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1568(%rbp), %rax
+    movq -1576(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19222,7 +19261,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1528(%rbp), %rax
+    movq -1536(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19255,7 +19294,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -528(%rbp), %rax
+    movq -536(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19278,7 +19317,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1536(%rbp), %rax
+    movq -1544(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -19296,20 +19335,20 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    movq -1528(%rbp), %rax
+    movq -1536(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1528(%rbp), %rbx
+    leaq -1536(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4201
+    jmp .L4211
+.L4212:
 .L4202:
 .L4192:
 .L4182:
-.L4172:
     movq $0, %rax
-    movq %rax, -1576(%rbp)
-.L4211:    movq -1576(%rbp), %rax
+    movq %rax, -1584(%rbp)
+.L4221:    movq -1584(%rbp), %rax
     pushq %rax
     movq -504(%rbp), %rax
     popq %rbx
@@ -19317,36 +19356,36 @@ codegen_generate_statement:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4212
-    movq -1576(%rbp), %rax
+    jz .L4222
+    movq -1584(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1584(%rbp)
-    movq -1584(%rbp), %rax
+    movq %rax, -1592(%rbp)
+    movq -1592(%rbp), %rax
     pushq %rax
-    movq -1352(%rbp), %rax
+    movq -1360(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -568(%rbp)
-    movq -568(%rbp), %rax
+    movq %rax, -576(%rbp)
+    movq -576(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call codegen_generate_statement
-    movq -1576(%rbp), %rax
+    movq -1584(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1576(%rbp), %rbx
+    leaq -1584(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4211
-.L4212:
+    jmp .L4221
+.L4222:
     movq $0, %rax
     pushq %rax
     leaq .STR326(%rip), %rax
@@ -19359,7 +19398,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19386,8 +19425,8 @@ codegen_generate_statement:
     leaq -112(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4031
-.L4032:
+    jmp .L4041
+.L4042:
     movq $0, %rax
     pushq %rax
     leaq .STR298(%rip), %rax
@@ -19400,7 +19439,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19435,9 +19474,9 @@ codegen_generate_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4022
-.L4021:
-.L4022:
+    jmp .L4032
+.L4031:
+.L4032:
     movq -24(%rbp), %rax
     pushq %rax
     movq $7, %rax
@@ -19446,7 +19485,7 @@ codegen_generate_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4221
+    jz .L4231
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -19454,8 +19493,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1256(%rbp)
-    movq -1256(%rbp), %rax
+    movq %rax, -1264(%rbp)
+    movq -1264(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -19481,7 +19520,7 @@ codegen_generate_statement:
     call memory_get_int32@PLT
     movq %rax, -432(%rbp)
     movq -432(%rbp), %rax
-    movq %rax, -1272(%rbp)
+    movq %rax, -1280(%rbp)
     movq -432(%rbp), %rax
     addq $1, %rax
     pushq %rax
@@ -19493,7 +19532,7 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19503,7 +19542,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -784(%rbp)
+    movq %rax, -792(%rbp)
     movq $16, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -19511,7 +19550,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1632(%rbp)
+    movq %rax, -1640(%rbp)
     movq $24, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -19519,54 +19558,54 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1640(%rbp)
+    movq %rax, -1648(%rbp)
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L4231:    movq -112(%rbp), %rax
+.L4241:    movq -112(%rbp), %rax
     pushq %rax
-    movq -1632(%rbp), %rax
+    movq -1640(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4232
+    jz .L4242
     movq -112(%rbp), %rax
     pushq %rax
     movq $64, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1656(%rbp)
-    movq -1640(%rbp), %rax
-    addq -1656(%rbp), %rax
     movq %rax, -1664(%rbp)
+    movq -1648(%rbp), %rax
+    addq -1664(%rbp), %rax
+    movq %rax, -1672(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1664(%rbp), %rax
+    movq -1672(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1392(%rbp)
+    movq %rax, -1400(%rbp)
     movq $8, %rax
     pushq %rax
-    movq -1664(%rbp), %rax
+    movq -1672(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1344(%rbp)
+    movq %rax, -1352(%rbp)
     movq $16, %rax
     pushq %rax
-    movq -1664(%rbp), %rax
+    movq -1672(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1688(%rbp)
+    movq %rax, -1696(%rbp)
     movq $24, %rax
     pushq %rax
-    movq -1664(%rbp), %rax
+    movq -1672(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -19574,7 +19613,7 @@ codegen_generate_statement:
     movq %rax, -504(%rbp)
     movq $32, %rax
     pushq %rax
-    movq -1664(%rbp), %rax
+    movq -1672(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -19582,7 +19621,7 @@ codegen_generate_statement:
     movq %rax, -496(%rbp)
     movq -112(%rbp), %rax
     addq $1, %rax
-    movq %rax, -1712(%rbp)
+    movq %rax, -1720(%rbp)
     movq $0, %rax
     pushq %rax
     leaq .STR332(%rip), %rax
@@ -19595,7 +19634,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19704,7 +19743,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1392(%rbp), %rax
+    movq -1400(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -19724,14 +19763,14 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq -112(%rbp), %rax
     pushq %rax
-    movq -1632(%rbp), %rax
+    movq -1640(%rbp), %rax
     subq $1, %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4241
+    jz .L4251
     movq $0, %rax
     pushq %rax
     leaq .STR339(%rip), %rax
@@ -19744,7 +19783,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1272(%rbp), %rax
+    movq -1280(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19767,7 +19806,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1712(%rbp), %rax
+    movq -1720(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19788,8 +19827,8 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4242
-.L4241:
+    jmp .L4252
+.L4251:
     movq $0, %rax
     pushq %rax
     leaq .STR341(%rip), %rax
@@ -19802,7 +19841,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -784(%rbp), %rax
+    movq -792(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -19820,8 +19859,8 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-.L4242:
-    movq -1344(%rbp), %rax
+.L4252:
+    movq -1352(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -19829,7 +19868,7 @@ codegen_generate_statement:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4251
+    jz .L4261
     movq $0, %rax
     pushq %rax
     leaq .STR343(%rip), %rax
@@ -19851,25 +19890,25 @@ codegen_generate_statement:
     popq %rdx
     call file_write_buffered@PLT
     movq $0, %rax
-    movq %rax, -1576(%rbp)
-.L4261:    movq -1576(%rbp), %rax
+    movq %rax, -1584(%rbp)
+.L4271:    movq -1584(%rbp), %rax
     pushq %rax
-    movq -1344(%rbp), %rax
+    movq -1352(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4262
-    movq -1576(%rbp), %rax
+    jz .L4272
+    movq -1584(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1728(%rbp)
+    movq %rax, -1736(%rbp)
     movq $8, %rax
-    addq -1728(%rbp), %rax
-    movq %rax, -1568(%rbp)
+    addq -1736(%rbp), %rax
+    movq %rax, -1576(%rbp)
     movq $0, %rax
     pushq %rax
     leaq .STR31(%rip), %rax
@@ -19882,7 +19921,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1568(%rbp), %rax
+    movq -1576(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19905,7 +19944,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1576(%rbp), %rax
+    movq -1584(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19936,8 +19975,8 @@ codegen_generate_statement:
     movq %rax, -224(%rbp)
     movq -224(%rbp), %rax
     addq $8, %rax
-    movq %rax, -1752(%rbp)
-    movq -1752(%rbp), %rax
+    movq %rax, -1760(%rbp)
+    movq -1760(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
@@ -19959,7 +19998,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1752(%rbp), %rax
+    movq -1760(%rbp), %rax
     pushq %rax
     popq %rdi
     call integer_to_string@PLT
@@ -19970,18 +20009,18 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    movq -1576(%rbp), %rax
+    movq -1584(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -1688(%rbp), %rax
+    movq -1696(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1760(%rbp)
+    movq %rax, -1768(%rbp)
     movq $0, %rax
     pushq %rax
     leaq .STR346(%rip), %rax
@@ -19994,7 +20033,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -1760(%rbp), %rax
+    movq -1768(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -20019,7 +20058,7 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1768(%rbp)
+    movq %rax, -1776(%rbp)
     movq $24, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20027,23 +20066,23 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1776(%rbp)
-    movq -1768(%rbp), %rax
-    pushq %rax
+    movq %rax, -1784(%rbp)
     movq -1776(%rbp), %rax
+    pushq %rax
+    movq -1784(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4271
-    movq -1776(%rbp), %rax
+    jz .L4281
+    movq -1784(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1784(%rbp)
-    movq -1784(%rbp), %rax
+    movq %rax, -1792(%rbp)
+    movq -1792(%rbp), %rax
     pushq %rax
     movq $24, %rax
     pushq %rax
@@ -20061,7 +20100,7 @@ codegen_generate_statement:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -176(%rbp)
-    movq -1784(%rbp), %rax
+    movq -1792(%rbp), %rax
     pushq %rax
     movq $32, %rax
     popq %rbx
@@ -20072,8 +20111,8 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call reallocate
-    movq %rax, -1800(%rbp)
-    movq -1800(%rbp), %rax
+    movq %rax, -1808(%rbp)
+    movq -1808(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
@@ -20083,9 +20122,9 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    jmp .L4272
-.L4271:
-.L4272:
+    jmp .L4282
+.L4281:
+.L4282:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20094,18 +20133,18 @@ codegen_generate_statement:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -176(%rbp)
-    movq -1768(%rbp), %rax
+    movq -1776(%rbp), %rax
     pushq %rax
     movq $32, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1816(%rbp)
-    movq -1760(%rbp), %rax
+    movq %rax, -1824(%rbp)
+    movq -1768(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate@PLT
     pushq %rax
-    movq -1816(%rbp), %rax
+    movq -1824(%rbp), %rax
     pushq %rax
     movq -176(%rbp), %rax
     pushq %rax
@@ -20113,9 +20152,9 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1752(%rbp), %rax
+    movq -1760(%rbp), %rax
     pushq %rax
-    movq -1816(%rbp), %rax
+    movq -1824(%rbp), %rax
     addq $8, %rax
     pushq %rax
     movq -176(%rbp), %rax
@@ -20129,7 +20168,7 @@ codegen_generate_statement:
     popq %rdi
     call string_duplicate@PLT
     pushq %rax
-    movq -1816(%rbp), %rax
+    movq -1824(%rbp), %rax
     addq $16, %rax
     pushq %rax
     movq -176(%rbp), %rax
@@ -20138,7 +20177,7 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1768(%rbp), %rax
+    movq -1776(%rbp), %rax
     addq $1, %rax
     pushq %rax
     movq $12, %rax
@@ -20149,17 +20188,17 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1576(%rbp), %rax
+    movq -1584(%rbp), %rax
     addq $1, %rax
-    movq %rax, -1576(%rbp)
-    jmp .L4261
+    movq %rax, -1584(%rbp)
+    jmp .L4271
+.L4272:
+    jmp .L4262
+.L4261:
 .L4262:
-    jmp .L4252
-.L4251:
-.L4252:
     movq $0, %rax
-    movq %rax, -1832(%rbp)
-.L4281:    movq -1832(%rbp), %rax
+    movq %rax, -1840(%rbp)
+.L4291:    movq -1840(%rbp), %rax
     pushq %rax
     movq -504(%rbp), %rax
     popq %rbx
@@ -20167,8 +20206,8 @@ codegen_generate_statement:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4282
-    movq -1832(%rbp), %rax
+    jz .L4292
+    movq -1840(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
@@ -20179,20 +20218,20 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1840(%rbp)
-    movq -1840(%rbp), %rax
+    movq %rax, -1848(%rbp)
+    movq -1848(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call codegen_generate_statement
-    movq -1832(%rbp), %rax
+    movq -1840(%rbp), %rax
     addq $1, %rax
-    movq %rax, -1832(%rbp)
-    jmp .L4281
-.L4282:
-    movq -1344(%rbp), %rax
+    movq %rax, -1840(%rbp)
+    jmp .L4291
+.L4292:
+    movq -1352(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -20200,18 +20239,18 @@ codegen_generate_statement:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4291
+    jz .L4301
     movq $0, %rax
-    movq %rax, -1576(%rbp)
-.L4301:    movq -1576(%rbp), %rax
+    movq %rax, -1584(%rbp)
+.L4311:    movq -1584(%rbp), %rax
     pushq %rax
-    movq -1344(%rbp), %rax
+    movq -1352(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4302
+    jz .L4312
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20219,11 +20258,11 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1768(%rbp)
-    movq -1768(%rbp), %rax
-    subq -1344(%rbp), %rax
-    addq -1576(%rbp), %rax
-    movq %rax, -1872(%rbp)
+    movq %rax, -1776(%rbp)
+    movq -1776(%rbp), %rax
+    subq -1352(%rbp), %rax
+    addq -1584(%rbp), %rax
+    movq %rax, -1880(%rbp)
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20232,7 +20271,7 @@ codegen_generate_statement:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -176(%rbp)
-    movq -1872(%rbp), %rax
+    movq -1880(%rbp), %rax
     pushq %rax
     movq $24, %rax
     popq %rbx
@@ -20244,7 +20283,7 @@ codegen_generate_statement:
     popq %rsi
     call memory_get_integer@PLT
     movq %rax, -464(%rbp)
-    movq -1872(%rbp), %rax
+    movq -1880(%rbp), %rax
     pushq %rax
     movq $24, %rax
     popq %rbx
@@ -20256,20 +20295,20 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -1896(%rbp)
+    movq %rax, -1904(%rbp)
     movq -464(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -1896(%rbp), %rax
+    movq -1904(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -1576(%rbp), %rax
+    movq -1584(%rbp), %rax
     addq $1, %rax
-    movq %rax, -1576(%rbp)
-    jmp .L4301
-.L4302:
+    movq %rax, -1584(%rbp)
+    jmp .L4311
+.L4312:
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20277,9 +20316,9 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1768(%rbp)
-    movq -1768(%rbp), %rax
-    subq -1344(%rbp), %rax
+    movq %rax, -1776(%rbp)
+    movq -1776(%rbp), %rax
+    subq -1352(%rbp), %rax
     pushq %rax
     movq $12, %rax
     pushq %rax
@@ -20289,9 +20328,9 @@ codegen_generate_statement:
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    jmp .L4292
-.L4291:
-.L4292:
+    jmp .L4302
+.L4301:
+.L4302:
     movq $0, %rax
     pushq %rax
     leaq .STR208(%rip), %rax
@@ -20304,7 +20343,7 @@ codegen_generate_statement:
     call file_write_buffered@PLT
     movq $0, %rax
     pushq %rax
-    movq -784(%rbp), %rax
+    movq -792(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -20325,11 +20364,11 @@ codegen_generate_statement:
     movq -112(%rbp), %rax
     addq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L4231
-.L4232:
+    jmp .L4241
+.L4242:
     movq $0, %rax
     pushq %rax
-    movq -784(%rbp), %rax
+    movq -792(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -20361,9 +20400,9 @@ codegen_generate_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4222
-.L4221:
-.L4222:
+    jmp .L4232
+.L4231:
+.L4232:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -20397,7 +20436,7 @@ codegen_create:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4311
+    jz .L4321
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -20406,9 +20445,9 @@ codegen_create:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4312
-.L4311:
-.L4312:
+    jmp .L4322
+.L4321:
+.L4322:
     movq -24(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -20584,7 +20623,7 @@ codegen_create:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4321
+    jz .L4331
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -20605,9 +20644,9 @@ codegen_create:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4322
-.L4321:
-.L4322:
+    jmp .L4332
+.L4331:
+.L4332:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -20628,7 +20667,7 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4331
+    jz .L4341
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20645,14 +20684,14 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4341
+    jz .L4351
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
     call file_close_fd
-    jmp .L4342
-.L4341:
-.L4342:
+    jmp .L4352
+.L4351:
+.L4352:
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20724,10 +20763,10 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4351
+    jz .L4361
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L4361:    movq -96(%rbp), %rax
+.L4371:    movq -96(%rbp), %rax
     pushq %rax
     movq -80(%rbp), %rax
     popq %rbx
@@ -20735,7 +20774,7 @@ codegen_destroy:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4362
+    jz .L4372
     movq -96(%rbp), %rax
     pushq %rax
     movq $32, %rax
@@ -20769,14 +20808,14 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4371
+    jz .L4381
     movq -120(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L4372
-.L4371:
-.L4372:
+    jmp .L4382
+.L4381:
+.L4382:
     movq -128(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -20785,22 +20824,22 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4381
+    jz .L4391
     movq -128(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L4382
-.L4381:
-.L4382:
+    jmp .L4392
+.L4391:
+.L4392:
     movq -96(%rbp), %rax
     addq $1, %rax
     movq %rax, -96(%rbp)
-    jmp .L4361
+    jmp .L4371
+.L4372:
+    jmp .L4362
+.L4361:
 .L4362:
-    jmp .L4352
-.L4351:
-.L4352:
     movq $40, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20872,10 +20911,10 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4391
+    jz .L4401
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L4401:    movq -96(%rbp), %rax
+.L4411:    movq -96(%rbp), %rax
     pushq %rax
     movq -200(%rbp), %rax
     popq %rbx
@@ -20883,7 +20922,7 @@ codegen_destroy:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4402
+    jz .L4412
     movq -96(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -20917,39 +20956,15 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4411
-    movq -240(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    jmp .L4412
-.L4411:
-.L4412:
-    movq -248(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L4421
-    movq -248(%rbp), %rax
+    movq -240(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     jmp .L4422
 .L4421:
 .L4422:
-    movq -96(%rbp), %rax
-    addq $1, %rax
-    movq %rax, -96(%rbp)
-    jmp .L4401
-.L4402:
-    jmp .L4392
-.L4391:
-.L4392:
-    movq -88(%rbp), %rax
+    movq -248(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -20958,14 +20973,22 @@ codegen_destroy:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4431
-    movq -88(%rbp), %rax
+    movq -248(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     jmp .L4432
 .L4431:
 .L4432:
-    movq -208(%rbp), %rax
+    movq -96(%rbp), %rax
+    addq $1, %rax
+    movq %rax, -96(%rbp)
+    jmp .L4411
+.L4412:
+    jmp .L4402
+.L4401:
+.L4402:
+    movq -88(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -20974,13 +20997,29 @@ codegen_destroy:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4441
-    movq -208(%rbp), %rax
+    movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     jmp .L4442
 .L4441:
 .L4442:
+    movq -208(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4451
+    movq -208(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    jmp .L4452
+.L4451:
+.L4452:
     movq $56, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20997,14 +21036,14 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4451
+    jz .L4461
     movq -264(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L4452
-.L4451:
-.L4452:
+    jmp .L4462
+.L4461:
+.L4462:
     movq $72, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21021,14 +21060,14 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4461
+    jz .L4471
     movq -272(%rbp), %rax
     pushq %rax
     popq %rdi
     call hashtable_destroy
-    jmp .L4462
-.L4461:
-.L4462:
+    jmp .L4472
+.L4471:
+.L4472:
     movq $80, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21045,21 +21084,21 @@ codegen_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4471
+    jz .L4481
     movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
     call callgraph_destroy
-    jmp .L4472
-.L4471:
-.L4472:
+    jmp .L4482
+.L4481:
+.L4482:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L4332
-.L4331:
-.L4332:
+    jmp .L4342
+.L4341:
+.L4342:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -21098,7 +21137,7 @@ codegen_push_loop_context:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4481
+    jz .L4491
     movq -40(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -21145,9 +21184,9 @@ codegen_push_loop_context:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    jmp .L4482
-.L4481:
-.L4482:
+    jmp .L4492
+.L4491:
+.L4492:
     movq $56, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21222,7 +21261,7 @@ codegen_pop_loop_context:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4491
+    jz .L4501
     movq -16(%rbp), %rax
     subq $1, %rax
     pushq %rax
@@ -21234,9 +21273,9 @@ codegen_pop_loop_context:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L4492
-.L4491:
-.L4492:
+    jmp .L4502
+.L4501:
+.L4502:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -21265,7 +21304,7 @@ codegen_current_loop_context:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4501
+    jz .L4511
     movq $56, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21288,9 +21327,9 @@ codegen_current_loop_context:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4502
-.L4501:
-.L4502:
+    jmp .L4512
+.L4511:
+.L4512:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -21430,7 +21469,7 @@ codegen_generate_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4511
+    jz .L4521
     movq -32(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -21447,7 +21486,7 @@ codegen_generate_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4521
+    jz .L4531
     movq $28, %rax
     pushq %rax
     movq -48(%rbp), %rax
@@ -21466,12 +21505,12 @@ codegen_generate_function:
     popq %rsi
     popq %rdx
     call codegen_inject_stack_probe
+    jmp .L4532
+.L4531:
+.L4532:
     jmp .L4522
 .L4521:
 .L4522:
-    jmp .L4512
-.L4511:
-.L4512:
     movq $6, %rax
     pushq %rax
     movq $8, %rax
@@ -21565,7 +21604,7 @@ codegen_generate_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4531
+    jz .L4541
     movq -80(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -21574,7 +21613,7 @@ codegen_generate_function:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4541
+    jz .L4551
     leaq .STR357(%rip), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -21617,12 +21656,12 @@ codegen_generate_function:
     popq %rdi
     popq %rsi
     call emit_line
+    jmp .L4552
+.L4551:
+.L4552:
     jmp .L4542
 .L4541:
 .L4542:
-    jmp .L4532
-.L4531:
-.L4532:
     leaq .STR363(%rip), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -21642,7 +21681,7 @@ codegen_generate_function:
     movq %rax, -96(%rbp)
     movq $1, %rax
     movq %rax, -104(%rbp)
-.L4551:    movq -104(%rbp), %rax
+.L4561:    movq -104(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -21650,24 +21689,10 @@ codegen_generate_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4552
+    jz .L4562
     movq -96(%rbp), %rax
     pushq %rax
     movq -80(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4561
-    movq $0, %rax
-    movq %rax, -104(%rbp)
-    jmp .L4562
-.L4561:
-.L4562:
-    movq -96(%rbp), %rax
-    pushq %rax
-    movq -72(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
@@ -21679,6 +21704,20 @@ codegen_generate_function:
     jmp .L4572
 .L4571:
 .L4572:
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq -72(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setge %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4581
+    movq $0, %rax
+    movq %rax, -104(%rbp)
+    jmp .L4582
+.L4581:
+.L4582:
     movq -104(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -21687,7 +21726,7 @@ codegen_generate_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4581
+    jz .L4591
     movq -96(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -21719,12 +21758,12 @@ codegen_generate_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4591
+    jz .L4601
     leaq .STR1(%rip), %rax
     movq %rax, -144(%rbp)
-    jmp .L4592
-.L4591:
-.L4592:
+    jmp .L4602
+.L4601:
+.L4602:
     movq $1, %rax
     pushq %rax
     movq -144(%rbp), %rax
@@ -21832,14 +21871,14 @@ codegen_generate_function:
     movq -96(%rbp), %rax
     addq $1, %rax
     movq %rax, -96(%rbp)
-    jmp .L4582
-.L4581:
-.L4582:
-    jmp .L4551
-.L4552:
+    jmp .L4592
+.L4591:
+.L4592:
+    jmp .L4561
+.L4562:
     movq -72(%rbp), %rax
     movq %rax, -96(%rbp)
-.L4601:    movq -96(%rbp), %rax
+.L4611:    movq -96(%rbp), %rax
     pushq %rax
     movq -80(%rbp), %rax
     popq %rbx
@@ -21847,7 +21886,7 @@ codegen_generate_function:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4602
+    jz .L4612
     movq -96(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -21991,8 +22030,8 @@ codegen_generate_function:
     movq -96(%rbp), %rax
     addq $1, %rax
     movq %rax, -96(%rbp)
-    jmp .L4601
-.L4602:
+    jmp .L4611
+.L4612:
     movq $40, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -22017,10 +22056,10 @@ codegen_generate_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4611
+    jz .L4621
     movq $0, %rax
     movq %rax, -336(%rbp)
-.L4621:    movq -336(%rbp), %rax
+.L4631:    movq -336(%rbp), %rax
     pushq %rax
     movq -320(%rbp), %rax
     popq %rbx
@@ -22028,7 +22067,7 @@ codegen_generate_function:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4622
+    jz .L4632
     movq -336(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -22051,7 +22090,7 @@ codegen_generate_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4631
+    jz .L4641
     movq -352(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22059,17 +22098,17 @@ codegen_generate_function:
     popq %rdi
     popq %rsi
     call codegen_generate_statement
-    jmp .L4632
-.L4631:
-.L4632:
+    jmp .L4642
+.L4641:
+.L4642:
     movq -336(%rbp), %rax
     addq $1, %rax
     movq %rax, -336(%rbp)
-    jmp .L4621
+    jmp .L4631
+.L4632:
+    jmp .L4622
+.L4621:
 .L4622:
-    jmp .L4612
-.L4611:
-.L4612:
     movq $1, %rax
     movq %rax, -368(%rbp)
     movq -320(%rbp), %rax
@@ -22080,7 +22119,7 @@ codegen_generate_function:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4641
+    jz .L4651
     movq -320(%rbp), %rax
     subq $1, %rax
     movq %rax, -376(%rbp)
@@ -22109,7 +22148,7 @@ codegen_generate_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4651
+    jz .L4661
     movq $0, %rax
     pushq %rax
     movq -384(%rbp), %rax
@@ -22126,21 +22165,21 @@ codegen_generate_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4661
+    jz .L4671
     movq $0, %rax
     pushq %rax
     leaq -368(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+    jmp .L4672
+.L4671:
+.L4672:
     jmp .L4662
 .L4661:
 .L4662:
     jmp .L4652
 .L4651:
 .L4652:
-    jmp .L4642
-.L4641:
-.L4642:
     movq -368(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -22149,7 +22188,7 @@ codegen_generate_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4671
+    jz .L4681
     leaq .STR366(%rip), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -22171,9 +22210,9 @@ codegen_generate_function:
     popq %rdi
     popq %rsi
     call emit_line
-    jmp .L4672
-.L4671:
-.L4672:
+    jmp .L4682
+.L4681:
+.L4682:
     movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22225,30 +22264,16 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4681
-    jmp .L4682
-.L4681:
-.L4682:
+    jz .L4691
+    jmp .L4692
+.L4691:
+.L4692:
     movq -32(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4691
-    movq $0, %rax
-    movq %rax, -32(%rbp)
-    jmp .L4692
-.L4691:
-.L4692:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $1000, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setg %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4701
@@ -22259,13 +22284,27 @@ codegen_generate:
 .L4702:
     movq -32(%rbp), %rax
     pushq %rax
-    movq $0, %rax
+    movq $1000, %rax
     popq %rbx
     cmpq %rax, %rbx
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4711
+    movq $0, %rax
+    movq %rax, -32(%rbp)
+    jmp .L4712
+.L4711:
+.L4712:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4721
     movq $0, %rax
     pushq %rax
     leaq .STR368(%rip), %rax
@@ -22286,7 +22325,7 @@ codegen_generate:
     movq %rax, -56(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L4721:    movq -64(%rbp), %rax
+.L4731:    movq -64(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -22294,7 +22333,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4722
+    jz .L4732
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -22376,8 +22415,8 @@ codegen_generate:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L4721
-.L4722:
+    jmp .L4731
+.L4732:
     movq $0, %rax
     pushq %rax
     leaq .STR0(%rip), %rax
@@ -22388,9 +22427,9 @@ codegen_generate:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4712
-.L4711:
-.L4712:
+    jmp .L4722
+.L4721:
+.L4722:
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -22407,12 +22446,12 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4731
+    jz .L4741
     movq $0, %rax
     movq %rax, -104(%rbp)
-    jmp .L4732
-.L4731:
-.L4732:
+    jmp .L4742
+.L4741:
+.L4742:
     movq -104(%rbp), %rax
     pushq %rax
     movq $10000, %rax
@@ -22421,12 +22460,12 @@ codegen_generate:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4741
+    jz .L4751
     movq $0, %rax
     movq %rax, -104(%rbp)
-    jmp .L4742
-.L4741:
-.L4742:
+    jmp .L4752
+.L4751:
+.L4752:
     movq $0, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -22443,7 +22482,7 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4751
+    jz .L4761
     leaq .STR371(%rip), %rax
     pushq %rax
     popq %rdi
@@ -22452,12 +22491,12 @@ codegen_generate:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4752
-.L4751:
-.L4752:
+    jmp .L4762
+.L4761:
+.L4762:
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L4761:    movq -64(%rbp), %rax
+.L4771:    movq -64(%rbp), %rax
     pushq %rax
     movq -104(%rbp), %rax
     popq %rbx
@@ -22465,7 +22504,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4762
+    jz .L4772
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -22486,7 +22525,7 @@ codegen_generate:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4771
+    jz .L4781
     movq $0, %rax
     pushq %rax
     movq -144(%rbp), %rax
@@ -22519,7 +22558,7 @@ codegen_generate:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4781
+    jz .L4791
     movq -168(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -22528,10 +22567,10 @@ codegen_generate:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4791
+    jz .L4801
     movq $0, %rax
     movq %rax, -176(%rbp)
-.L4801:    movq -176(%rbp), %rax
+.L4811:    movq -176(%rbp), %rax
     pushq %rax
     movq -168(%rbp), %rax
     popq %rbx
@@ -22539,7 +22578,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4802
+    jz .L4812
     movq -176(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -22564,7 +22603,7 @@ codegen_generate:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4811
+    jz .L4821
     movq -192(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22581,21 +22620,24 @@ codegen_generate:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4821
+    jz .L4831
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
+    jmp .L4832
+.L4831:
+.L4832:
     jmp .L4822
 .L4821:
 .L4822:
-    jmp .L4812
-.L4811:
-.L4812:
     movq -176(%rbp), %rax
     addq $1, %rax
     movq %rax, -176(%rbp)
-    jmp .L4801
+    jmp .L4811
+.L4812:
+    jmp .L4802
+.L4801:
 .L4802:
     jmp .L4792
 .L4791:
@@ -22603,14 +22645,11 @@ codegen_generate:
     jmp .L4782
 .L4781:
 .L4782:
-    jmp .L4772
-.L4771:
-.L4772:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L4761
-.L4762:
+    jmp .L4771
+.L4772:
     movq $56, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -22631,7 +22670,7 @@ codegen_generate:
     movq %rax, -248(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L4831:    movq -64(%rbp), %rax
+.L4841:    movq -64(%rbp), %rax
     pushq %rax
     movq -232(%rbp), %rax
     popq %rbx
@@ -22639,7 +22678,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4832
+    jz .L4842
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -22668,19 +22707,19 @@ codegen_generate:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4841
+    jz .L4851
     movq $1, %rax
     movq %rax, -248(%rbp)
     movq -232(%rbp), %rax
     movq %rax, -64(%rbp)
-    jmp .L4842
-.L4841:
-.L4842:
+    jmp .L4852
+.L4851:
+.L4852:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L4831
-.L4832:
+    jmp .L4841
+.L4842:
     movq -248(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -22689,7 +22728,7 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4851
+    jz .L4861
     leaq .STR372(%rip), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -22699,7 +22738,7 @@ codegen_generate:
     call emit_line
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L4861:    movq -64(%rbp), %rax
+.L4871:    movq -64(%rbp), %rax
     pushq %rax
     movq -232(%rbp), %rax
     popq %rbx
@@ -22707,7 +22746,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4862
+    jz .L4872
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -22744,7 +22783,7 @@ codegen_generate:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4871
+    jz .L4881
     movq $0, %rax
     pushq %rax
     leaq .STR349(%rip), %rax
@@ -22811,7 +22850,7 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4881
+    jz .L4891
     movq $8, %rax
     pushq %rax
     movq -272(%rbp), %rax
@@ -22853,8 +22892,8 @@ codegen_generate:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4882
-.L4881:
+    jmp .L4892
+.L4891:
     movq $0, %rax
     pushq %rax
     leaq .STR374(%rip), %rax
@@ -22865,15 +22904,15 @@ codegen_generate:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
+.L4892:
+    jmp .L4882
+.L4881:
 .L4882:
-    jmp .L4872
-.L4871:
-.L4872:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L4861
-.L4862:
+    jmp .L4871
+.L4872:
     movq $0, %rax
     pushq %rax
     leaq .STR0(%rip), %rax
@@ -22884,14 +22923,14 @@ codegen_generate:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4852
-.L4851:
-.L4852:
+    jmp .L4862
+.L4861:
+.L4862:
     movq $0, %rax
     movq %rax, -360(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L4891:    movq -64(%rbp), %rax
+.L4901:    movq -64(%rbp), %rax
     pushq %rax
     movq -232(%rbp), %rax
     popq %rbx
@@ -22899,7 +22938,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4892
+    jz .L4902
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -22928,19 +22967,19 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4901
+    jz .L4911
     movq $1, %rax
     movq %rax, -360(%rbp)
     movq -232(%rbp), %rax
     movq %rax, -64(%rbp)
-    jmp .L4902
-.L4901:
-.L4902:
+    jmp .L4912
+.L4911:
+.L4912:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L4891
-.L4892:
+    jmp .L4901
+.L4902:
     movq -360(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -22949,7 +22988,7 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4911
+    jz .L4921
     leaq .STR375(%rip), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -22959,7 +22998,7 @@ codegen_generate:
     call emit_line
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L4921:    movq -64(%rbp), %rax
+.L4931:    movq -64(%rbp), %rax
     pushq %rax
     movq -232(%rbp), %rax
     popq %rbx
@@ -22967,7 +23006,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4922
+    jz .L4932
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -23004,7 +23043,7 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4931
+    jz .L4941
     movq $0, %rax
     pushq %rax
     leaq .STR349(%rip), %rax
@@ -23065,14 +23104,14 @@ codegen_generate:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4932
-.L4931:
-.L4932:
+    jmp .L4942
+.L4941:
+.L4942:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L4921
-.L4922:
+    jmp .L4931
+.L4932:
     movq $0, %rax
     pushq %rax
     leaq .STR0(%rip), %rax
@@ -23083,9 +23122,9 @@ codegen_generate:
     popq %rsi
     popq %rdx
     call file_write_buffered@PLT
-    jmp .L4912
-.L4911:
-.L4912:
+    jmp .L4922
+.L4921:
+.L4922:
     leaq .STR377(%rip), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -23846,7 +23885,7 @@ codegen_generate:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4941
+    jz .L4951
     movq $32, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -23857,7 +23896,7 @@ codegen_generate:
     movq %rax, -520(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L4951:    movq -64(%rbp), %rax
+.L4961:    movq -64(%rbp), %rax
     pushq %rax
     movq -512(%rbp), %rax
     popq %rbx
@@ -23865,7 +23904,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4952
+    jz .L4962
     movq -64(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -23993,11 +24032,11 @@ codegen_generate:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L4951
+    jmp .L4961
+.L4962:
+    jmp .L4952
+.L4951:
 .L4952:
-    jmp .L4942
-.L4941:
-.L4942:
     leaq .STR377(%rip), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -24037,7 +24076,7 @@ codegen_generate:
     call callgraph_print_warnings
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L4961:    movq -64(%rbp), %rax
+.L4971:    movq -64(%rbp), %rax
     pushq %rax
     movq -104(%rbp), %rax
     popq %rbx
@@ -24045,7 +24084,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4962
+    jz .L4972
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24066,7 +24105,7 @@ codegen_generate:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4971
+    jz .L4981
     movq $0, %rax
     pushq %rax
     movq -144(%rbp), %rax
@@ -24089,7 +24128,7 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4981
+    jz .L4991
     leaq .STR431(%rip), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -24097,9 +24136,9 @@ codegen_generate:
     popq %rdi
     popq %rsi
     call emit_line
-    jmp .L4982
-.L4981:
-.L4982:
+    jmp .L4992
+.L4991:
+.L4992:
     leaq .STR0(%rip), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -24114,14 +24153,14 @@ codegen_generate:
     popq %rdi
     popq %rsi
     call codegen_generate_function
-    jmp .L4972
-.L4971:
-.L4972:
+    jmp .L4982
+.L4981:
+.L4982:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L4961
-.L4962:
+    jmp .L4971
+.L4972:
     movq -568(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -24130,7 +24169,7 @@ codegen_generate:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4991
+    jz .L5001
     movq $0, %rax
     pushq %rax
     movq -568(%rbp), %rax
@@ -24151,7 +24190,7 @@ codegen_generate:
     movq %rax, -624(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L5001:    movq -64(%rbp), %rax
+.L5011:    movq -64(%rbp), %rax
     pushq %rax
     movq -616(%rbp), %rax
     popq %rbx
@@ -24159,7 +24198,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5002
+    jz .L5012
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24188,19 +24227,19 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5011
+    jz .L5021
     movq $1, %rax
     movq %rax, -624(%rbp)
     movq -616(%rbp), %rax
     movq %rax, -64(%rbp)
-    jmp .L5012
-.L5011:
-.L5012:
+    jmp .L5022
+.L5021:
+.L5022:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L5001
-.L5002:
+    jmp .L5011
+.L5012:
     movq -624(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -24209,22 +24248,22 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5021
+    jz .L5031
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
     call codegen_generate_stack_overflow_handler
-    jmp .L5022
-.L5021:
-.L5022:
-    jmp .L4992
-.L4991:
-.L4992:
+    jmp .L5032
+.L5031:
+.L5032:
+    jmp .L5002
+.L5001:
+.L5002:
     movq $0, %rax
     movq %rax, -680(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L5031:    movq -64(%rbp), %rax
+.L5041:    movq -64(%rbp), %rax
     pushq %rax
     movq -104(%rbp), %rax
     popq %rbx
@@ -24232,7 +24271,7 @@ codegen_generate:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5032
+    jz .L5042
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24253,7 +24292,7 @@ codegen_generate:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5041
+    jz .L5051
     movq $0, %rax
     pushq %rax
     movq -144(%rbp), %rax
@@ -24276,22 +24315,22 @@ codegen_generate:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5051
+    jz .L5061
     movq $1, %rax
     movq %rax, -680(%rbp)
     movq -104(%rbp), %rax
     movq %rax, -64(%rbp)
+    jmp .L5062
+.L5061:
+.L5062:
     jmp .L5052
 .L5051:
 .L5052:
-    jmp .L5042
-.L5041:
-.L5042:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L5031
-.L5032:
+    jmp .L5041
+.L5042:
     movq $0, %rax
     pushq %rax
     leaq .STR0(%rip), %rax
@@ -24892,14 +24931,14 @@ callgraph_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5061
+    jz .L5071
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5062
-.L5061:
-.L5062:
+    jmp .L5072
+.L5071:
+.L5072:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24924,10 +24963,10 @@ callgraph_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5071
+    jz .L5081
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L5081:    movq -32(%rbp), %rax
+.L5091:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -24935,7 +24974,7 @@ callgraph_destroy:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5082
+    jz .L5092
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -24956,7 +24995,7 @@ callgraph_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5091
+    jz .L5101
     movq $0, %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -24973,14 +25012,14 @@ callgraph_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5101
+    jz .L5111
     movq -48(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L5102
-.L5101:
-.L5102:
+    jmp .L5112
+.L5111:
+.L5112:
     movq $16, %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -24997,33 +25036,33 @@ callgraph_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5111
+    jz .L5121
     movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L5112
-.L5111:
-.L5112:
+    jmp .L5122
+.L5121:
+.L5122:
     movq -40(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L5092
-.L5091:
-.L5092:
+    jmp .L5102
+.L5101:
+.L5102:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L5081
-.L5082:
+    jmp .L5091
+.L5092:
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L5072
-.L5071:
-.L5072:
+    jmp .L5082
+.L5081:
+.L5082:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -25157,7 +25196,7 @@ callgraph_node_add_callee:
     movq %rax, -40(%rbp)
     movq $0, %rax
     movq %rax, -48(%rbp)
-.L5121:    movq -48(%rbp), %rax
+.L5131:    movq -48(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -25165,7 +25204,7 @@ callgraph_node_add_callee:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5122
+    jz .L5132
     movq -48(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25192,19 +25231,19 @@ callgraph_node_add_callee:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5131
+    jz .L5141
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5132
-.L5131:
-.L5132:
+    jmp .L5142
+.L5141:
+.L5142:
     movq -48(%rbp), %rax
     addq $1, %rax
     movq %rax, -48(%rbp)
-    jmp .L5121
-.L5122:
+    jmp .L5131
+.L5132:
     movq -32(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -25213,7 +25252,7 @@ callgraph_node_add_callee:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5141
+    jz .L5151
     movq -40(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -25231,7 +25270,7 @@ callgraph_node_add_callee:
     movq %rax, -80(%rbp)
     movq $0, %rax
     movq %rax, -48(%rbp)
-.L5151:    movq -48(%rbp), %rax
+.L5161:    movq -48(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -25239,7 +25278,7 @@ callgraph_node_add_callee:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5152
+    jz .L5162
     movq -48(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25269,8 +25308,8 @@ callgraph_node_add_callee:
     movq -48(%rbp), %rax
     addq $1, %rax
     movq %rax, -48(%rbp)
-    jmp .L5151
-.L5152:
+    jmp .L5161
+.L5162:
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -25300,9 +25339,9 @@ callgraph_node_add_callee:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L5142
-.L5141:
-.L5142:
+    jmp .L5152
+.L5151:
+.L5152:
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -25376,7 +25415,7 @@ callgraph_add_node:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5161
+    jz .L5171
     movq -40(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -25394,7 +25433,7 @@ callgraph_add_node:
     movq %rax, -56(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L5171:    movq -64(%rbp), %rax
+.L5181:    movq -64(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -25402,7 +25441,7 @@ callgraph_add_node:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5172
+    jz .L5182
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25432,8 +25471,8 @@ callgraph_add_node:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L5171
-.L5172:
+    jmp .L5181
+.L5182:
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -25463,9 +25502,9 @@ callgraph_add_node:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L5162
-.L5161:
-.L5162:
+    jmp .L5172
+.L5171:
+.L5172:
     movq -16(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -25522,7 +25561,7 @@ callgraph_find_node:
     movq %rax, -32(%rbp)
     movq $0, %rax
     movq %rax, -40(%rbp)
-.L5181:    movq -40(%rbp), %rax
+.L5191:    movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -25530,7 +25569,7 @@ callgraph_find_node:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5182
+    jz .L5192
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25565,19 +25604,19 @@ callgraph_find_node:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5191
+    jz .L5201
     movq -48(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5192
-.L5191:
-.L5192:
+    jmp .L5202
+.L5201:
+.L5202:
     movq -40(%rbp), %rax
     addq $1, %rax
     movq %rax, -40(%rbp)
-    jmp .L5181
-.L5182:
+    jmp .L5191
+.L5192:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -25605,22 +25644,6 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5201
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L5202
-.L5201:
-.L5202:
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq $4096, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L5211
     movq $0, %rax
     movq %rbp, %rsp
@@ -25629,6 +25652,22 @@ callgraph_collect_calls_from_expr:
     jmp .L5212
 .L5211:
 .L5212:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $4096, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5221
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L5222
+.L5221:
+.L5222:
     movq $0, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -25645,22 +25684,6 @@ callgraph_collect_calls_from_expr:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5221
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L5222
-.L5221:
-.L5222:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $30, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setg %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L5231
     movq $0, %rax
     movq %rbp, %rsp
@@ -25671,13 +25694,29 @@ callgraph_collect_calls_from_expr:
 .L5232:
     movq -32(%rbp), %rax
     pushq %rax
+    movq $30, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5241
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L5242
+.L5241:
+.L5242:
+    movq -32(%rbp), %rax
+    pushq %rax
     movq $4, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5241
+    jz .L5251
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -40(%rbp)
@@ -25720,10 +25759,10 @@ callgraph_collect_calls_from_expr:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5251
+    jz .L5261
     movq $0, %rax
     movq %rax, -72(%rbp)
-.L5261:    movq -72(%rbp), %rax
+.L5271:    movq -72(%rbp), %rax
     pushq %rax
     movq -64(%rbp), %rax
     popq %rbx
@@ -25731,7 +25770,7 @@ callgraph_collect_calls_from_expr:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5262
+    jz .L5272
     movq -72(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25757,14 +25796,14 @@ callgraph_collect_calls_from_expr:
     movq -72(%rbp), %rax
     addq $1, %rax
     movq %rax, -72(%rbp)
-    jmp .L5261
+    jmp .L5271
+.L5272:
+    jmp .L5262
+.L5261:
 .L5262:
     jmp .L5252
 .L5251:
 .L5252:
-    jmp .L5242
-.L5241:
-.L5242:
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -25773,7 +25812,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5271
+    jz .L5281
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -96(%rbp)
@@ -25813,9 +25852,9 @@ callgraph_collect_calls_from_expr:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5272
-.L5271:
-.L5272:
+    jmp .L5282
+.L5281:
+.L5282:
     movq -32(%rbp), %rax
     pushq %rax
     movq $3, %rax
@@ -25824,7 +25863,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5281
+    jz .L5291
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -120(%rbp)
@@ -25864,9 +25903,9 @@ callgraph_collect_calls_from_expr:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5282
-.L5281:
-.L5282:
+    jmp .L5292
+.L5291:
+.L5292:
     movq -32(%rbp), %rax
     pushq %rax
     movq $12, %rax
@@ -25875,7 +25914,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5291
+    jz .L5301
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -144(%rbp)
@@ -25897,9 +25936,9 @@ callgraph_collect_calls_from_expr:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5292
-.L5291:
-.L5292:
+    jmp .L5302
+.L5301:
+.L5302:
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25908,7 +25947,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5301
+    jz .L5311
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -160(%rbp)
@@ -25936,10 +25975,10 @@ callgraph_collect_calls_from_expr:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5311
+    jz .L5321
     movq $0, %rax
     movq %rax, -72(%rbp)
-.L5321:    movq -72(%rbp), %rax
+.L5331:    movq -72(%rbp), %rax
     pushq %rax
     movq -64(%rbp), %rax
     popq %rbx
@@ -25947,7 +25986,7 @@ callgraph_collect_calls_from_expr:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5322
+    jz .L5332
     movq -72(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25973,14 +26012,14 @@ callgraph_collect_calls_from_expr:
     movq -72(%rbp), %rax
     addq $1, %rax
     movq %rax, -72(%rbp)
-    jmp .L5321
+    jmp .L5331
+.L5332:
+    jmp .L5322
+.L5321:
 .L5322:
     jmp .L5312
 .L5311:
 .L5312:
-    jmp .L5302
-.L5301:
-.L5302:
     movq -32(%rbp), %rax
     pushq %rax
     movq $11, %rax
@@ -25989,7 +26028,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5331
+    jz .L5341
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -208(%rbp)
@@ -26035,10 +26074,10 @@ callgraph_collect_calls_from_expr:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5341
+    jz .L5351
     movq $0, %rax
     movq %rax, -72(%rbp)
-.L5351:    movq -72(%rbp), %rax
+.L5361:    movq -72(%rbp), %rax
     pushq %rax
     movq -64(%rbp), %rax
     popq %rbx
@@ -26046,7 +26085,7 @@ callgraph_collect_calls_from_expr:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5352
+    jz .L5362
     movq -72(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -26072,14 +26111,14 @@ callgraph_collect_calls_from_expr:
     movq -72(%rbp), %rax
     addq $1, %rax
     movq %rax, -72(%rbp)
-    jmp .L5351
+    jmp .L5361
+.L5362:
+    jmp .L5352
+.L5351:
 .L5352:
     jmp .L5342
 .L5341:
 .L5342:
-    jmp .L5332
-.L5331:
-.L5332:
     movq -32(%rbp), %rax
     pushq %rax
     movq $6, %rax
@@ -26088,7 +26127,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5361
+    jz .L5371
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -264(%rbp)
@@ -26110,9 +26149,9 @@ callgraph_collect_calls_from_expr:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5362
-.L5361:
-.L5362:
+    jmp .L5372
+.L5371:
+.L5372:
     movq -32(%rbp), %rax
     pushq %rax
     movq $9, %rax
@@ -26121,7 +26160,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5371
+    jz .L5381
     movq $24, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -26146,10 +26185,10 @@ callgraph_collect_calls_from_expr:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5381
+    jz .L5391
     movq $0, %rax
     movq %rax, -72(%rbp)
-.L5391:    movq -72(%rbp), %rax
+.L5401:    movq -72(%rbp), %rax
     pushq %rax
     movq -288(%rbp), %rax
     popq %rbx
@@ -26157,7 +26196,7 @@ callgraph_collect_calls_from_expr:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5392
+    jz .L5402
     movq -72(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -26183,14 +26222,14 @@ callgraph_collect_calls_from_expr:
     movq -72(%rbp), %rax
     addq $1, %rax
     movq %rax, -72(%rbp)
-    jmp .L5391
+    jmp .L5401
+.L5402:
+    jmp .L5392
+.L5391:
 .L5392:
     jmp .L5382
 .L5381:
 .L5382:
-    jmp .L5372
-.L5371:
-.L5372:
     movq -32(%rbp), %rax
     pushq %rax
     movq $20, %rax
@@ -26199,7 +26238,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5401
+    jz .L5411
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -320(%rbp)
@@ -26227,10 +26266,10 @@ callgraph_collect_calls_from_expr:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5411
+    jz .L5421
     movq $0, %rax
     movq %rax, -72(%rbp)
-.L5421:    movq -72(%rbp), %rax
+.L5431:    movq -72(%rbp), %rax
     pushq %rax
     movq -288(%rbp), %rax
     popq %rbx
@@ -26238,7 +26277,7 @@ callgraph_collect_calls_from_expr:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5422
+    jz .L5432
     movq -72(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -26264,14 +26303,14 @@ callgraph_collect_calls_from_expr:
     movq -72(%rbp), %rax
     addq $1, %rax
     movq %rax, -72(%rbp)
-    jmp .L5421
+    jmp .L5431
+.L5432:
+    jmp .L5422
+.L5421:
 .L5422:
     jmp .L5412
 .L5411:
 .L5412:
-    jmp .L5402
-.L5401:
-.L5402:
     movq -32(%rbp), %rax
     pushq %rax
     movq $7, %rax
@@ -26280,7 +26319,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5431
+    jz .L5441
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -368(%rbp)
@@ -26302,9 +26341,9 @@ callgraph_collect_calls_from_expr:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5432
-.L5431:
-.L5432:
+    jmp .L5442
+.L5441:
+.L5442:
     movq -32(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -26313,7 +26352,7 @@ callgraph_collect_calls_from_expr:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5441
+    jz .L5451
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -384(%rbp)
@@ -26353,9 +26392,9 @@ callgraph_collect_calls_from_expr:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5442
-.L5441:
-.L5442:
+    jmp .L5452
+.L5451:
+.L5452:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -26383,14 +26422,14 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5451
+    jz .L5461
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5452
-.L5451:
-.L5452:
+    jmp .L5462
+.L5461:
+.L5462:
     movq $0, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -26407,7 +26446,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5461
+    jz .L5471
     movq $8, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -26426,9 +26465,9 @@ callgraph_collect_calls_from_stmt:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5462
-.L5461:
-.L5462:
+    jmp .L5472
+.L5471:
+.L5472:
     movq -32(%rbp), %rax
     pushq %rax
     movq $3, %rax
@@ -26437,7 +26476,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5471
+    jz .L5481
     movq $8, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -26456,9 +26495,9 @@ callgraph_collect_calls_from_stmt:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5472
-.L5471:
-.L5472:
+    jmp .L5482
+.L5481:
+.L5482:
     movq -32(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -26467,7 +26506,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5481
+    jz .L5491
     movq $8, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -26486,9 +26525,9 @@ callgraph_collect_calls_from_stmt:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5482
-.L5481:
-.L5482:
+    jmp .L5492
+.L5491:
+.L5492:
     movq -32(%rbp), %rax
     pushq %rax
     movq $5, %rax
@@ -26497,7 +26536,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5491
+    jz .L5501
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -64(%rbp)
@@ -26553,7 +26592,7 @@ callgraph_collect_calls_from_stmt:
     call callgraph_collect_calls_from_expr
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L5501:    movq -112(%rbp), %rax
+.L5511:    movq -112(%rbp), %rax
     pushq %rax
     movq -88(%rbp), %rax
     popq %rbx
@@ -26561,7 +26600,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5502
+    jz .L5512
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -26587,11 +26626,11 @@ callgraph_collect_calls_from_stmt:
     movq -112(%rbp), %rax
     addq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L5501
-.L5502:
+    jmp .L5511
+.L5512:
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L5511:    movq -112(%rbp), %rax
+.L5521:    movq -112(%rbp), %rax
     pushq %rax
     movq -104(%rbp), %rax
     popq %rbx
@@ -26599,7 +26638,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5512
+    jz .L5522
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -26625,11 +26664,11 @@ callgraph_collect_calls_from_stmt:
     movq -112(%rbp), %rax
     addq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L5511
-.L5512:
-    jmp .L5492
-.L5491:
-.L5492:
+    jmp .L5521
+.L5522:
+    jmp .L5502
+.L5501:
+.L5502:
     movq -32(%rbp), %rax
     pushq %rax
     movq $6, %rax
@@ -26638,7 +26677,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5521
+    jz .L5531
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -160(%rbp)
@@ -26678,7 +26717,7 @@ callgraph_collect_calls_from_stmt:
     call callgraph_collect_calls_from_expr
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L5531:    movq -112(%rbp), %rax
+.L5541:    movq -112(%rbp), %rax
     pushq %rax
     movq -184(%rbp), %rax
     popq %rbx
@@ -26686,7 +26725,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5532
+    jz .L5542
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -26712,11 +26751,11 @@ callgraph_collect_calls_from_stmt:
     movq -112(%rbp), %rax
     addq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L5531
+    jmp .L5541
+.L5542:
+    jmp .L5532
+.L5531:
 .L5532:
-    jmp .L5522
-.L5521:
-.L5522:
     movq -32(%rbp), %rax
     pushq %rax
     movq $11, %rax
@@ -26725,7 +26764,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5541
+    jz .L5551
     movq $16, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -26794,7 +26833,7 @@ callgraph_collect_calls_from_stmt:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5551
+    jz .L5561
     movq -232(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -26805,12 +26844,12 @@ callgraph_collect_calls_from_stmt:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5552
-.L5551:
-.L5552:
+    jmp .L5562
+.L5561:
+.L5562:
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L5561:    movq -112(%rbp), %rax
+.L5571:    movq -112(%rbp), %rax
     pushq %rax
     movq -184(%rbp), %rax
     popq %rbx
@@ -26818,7 +26857,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5562
+    jz .L5572
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -26844,11 +26883,11 @@ callgraph_collect_calls_from_stmt:
     movq -112(%rbp), %rax
     addq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L5561
-.L5562:
-    jmp .L5542
-.L5541:
-.L5542:
+    jmp .L5571
+.L5572:
+    jmp .L5552
+.L5551:
+.L5552:
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -26857,7 +26896,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5571
+    jz .L5581
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -280(%rbp)
@@ -26897,7 +26936,7 @@ callgraph_collect_calls_from_stmt:
     call callgraph_collect_calls_from_expr
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L5581:    movq -112(%rbp), %rax
+.L5591:    movq -112(%rbp), %rax
     pushq %rax
     movq -304(%rbp), %rax
     popq %rbx
@@ -26905,7 +26944,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5582
+    jz .L5592
     movq -112(%rbp), %rax
     pushq %rax
     movq $48, %rax
@@ -26933,7 +26972,7 @@ callgraph_collect_calls_from_stmt:
     movq %rax, -184(%rbp)
     movq $0, %rax
     movq %rax, -352(%rbp)
-.L5591:    movq -352(%rbp), %rax
+.L5601:    movq -352(%rbp), %rax
     pushq %rax
     movq -184(%rbp), %rax
     popq %rbx
@@ -26941,7 +26980,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5592
+    jz .L5602
     movq -352(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -26967,16 +27006,16 @@ callgraph_collect_calls_from_stmt:
     movq -352(%rbp), %rax
     addq $1, %rax
     movq %rax, -352(%rbp)
-    jmp .L5591
-.L5592:
+    jmp .L5601
+.L5602:
     movq -112(%rbp), %rax
     addq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L5581
+    jmp .L5591
+.L5592:
+    jmp .L5582
+.L5581:
 .L5582:
-    jmp .L5572
-.L5571:
-.L5572:
     movq -32(%rbp), %rax
     pushq %rax
     movq $12, %rax
@@ -26985,7 +27024,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5601
+    jz .L5611
     movq -24(%rbp), %rax
     addq $8, %rax
     movq %rax, -384(%rbp)
@@ -27025,7 +27064,7 @@ callgraph_collect_calls_from_stmt:
     call callgraph_collect_calls_from_expr
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L5611:    movq -112(%rbp), %rax
+.L5621:    movq -112(%rbp), %rax
     pushq %rax
     movq -184(%rbp), %rax
     popq %rbx
@@ -27033,7 +27072,7 @@ callgraph_collect_calls_from_stmt:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5612
+    jz .L5622
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -27059,11 +27098,11 @@ callgraph_collect_calls_from_stmt:
     movq -112(%rbp), %rax
     addq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L5611
+    jmp .L5621
+.L5622:
+    jmp .L5612
+.L5611:
 .L5612:
-    jmp .L5602
-.L5601:
-.L5602:
     movq -32(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -27072,7 +27111,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5621
+    jz .L5631
     movq $16, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -27091,9 +27130,9 @@ callgraph_collect_calls_from_stmt:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5622
-.L5621:
-.L5622:
+    jmp .L5632
+.L5631:
+.L5632:
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -27102,7 +27141,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5631
+    jz .L5641
     movq $16, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -27121,9 +27160,9 @@ callgraph_collect_calls_from_stmt:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5632
-.L5631:
-.L5632:
+    jmp .L5642
+.L5641:
+.L5642:
     movq -32(%rbp), %rax
     pushq %rax
     movq $17, %rax
@@ -27132,7 +27171,7 @@ callgraph_collect_calls_from_stmt:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5641
+    jz .L5651
     movq $24, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -27151,9 +27190,9 @@ callgraph_collect_calls_from_stmt:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_expr
-    jmp .L5642
-.L5641:
-.L5642:
+    jmp .L5652
+.L5651:
+.L5652:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -27192,7 +27231,7 @@ callgraph_build:
     movq %rax, -32(%rbp)
     movq $0, %rax
     movq %rax, -40(%rbp)
-.L5651:    movq -40(%rbp), %rax
+.L5661:    movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -27200,7 +27239,7 @@ callgraph_build:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5652
+    jz .L5662
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -27221,7 +27260,7 @@ callgraph_build:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5661
+    jz .L5671
     movq $0, %rax
     pushq %rax
     movq -48(%rbp), %rax
@@ -27245,14 +27284,14 @@ callgraph_build:
     popq %rdi
     popq %rsi
     call callgraph_add_node
-    jmp .L5662
-.L5661:
-.L5662:
+    jmp .L5672
+.L5671:
+.L5672:
     movq -40(%rbp), %rax
     addq $1, %rax
     movq %rax, -40(%rbp)
-    jmp .L5651
-.L5652:
+    jmp .L5661
+.L5662:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -27277,17 +27316,17 @@ callgraph_build:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5671
+    jz .L5681
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5672
-.L5671:
-.L5672:
+    jmp .L5682
+.L5681:
+.L5682:
     movq $0, %rax
     movq %rax, -40(%rbp)
-.L5681:    movq -40(%rbp), %rax
+.L5691:    movq -40(%rbp), %rax
     pushq %rax
     movq -88(%rbp), %rax
     popq %rbx
@@ -27295,7 +27334,7 @@ callgraph_build:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5682
+    jz .L5692
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -27318,12 +27357,12 @@ callgraph_build:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5691
+    jz .L5701
     movq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L5692
-.L5691:
-.L5692:
+    jmp .L5702
+.L5701:
+.L5702:
     movq $0, %rax
     movq %rax, -48(%rbp)
     movq -112(%rbp), %rax
@@ -27334,7 +27373,7 @@ callgraph_build:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5701
+    jz .L5711
     movq $8, %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -27354,15 +27393,15 @@ callgraph_build:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5711
+    jz .L5721
     movq $1, %rax
     movq %rax, -112(%rbp)
+    jmp .L5722
+.L5721:
+.L5722:
     jmp .L5712
 .L5711:
 .L5712:
-    jmp .L5702
-.L5701:
-.L5702:
     movq -112(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -27371,7 +27410,7 @@ callgraph_build:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5721
+    jz .L5731
     movq $32, %rax
     pushq %rax
     movq -48(%rbp), %rax
@@ -27390,7 +27429,7 @@ callgraph_build:
     movq %rax, -152(%rbp)
     movq $0, %rax
     movq %rax, -160(%rbp)
-.L5731:    movq -160(%rbp), %rax
+.L5741:    movq -160(%rbp), %rax
     pushq %rax
     movq -152(%rbp), %rax
     popq %rbx
@@ -27398,7 +27437,7 @@ callgraph_build:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5732
+    jz .L5742
     movq -160(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -27419,7 +27458,7 @@ callgraph_build:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5741
+    jz .L5751
     movq -168(%rbp), %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -27430,22 +27469,22 @@ callgraph_build:
     popq %rsi
     popq %rdx
     call callgraph_collect_calls_from_stmt
-    jmp .L5742
-.L5741:
-.L5742:
+    jmp .L5752
+.L5751:
+.L5752:
     movq -160(%rbp), %rax
     addq $1, %rax
     movq %rax, -160(%rbp)
-    jmp .L5731
+    jmp .L5741
+.L5742:
+    jmp .L5732
+.L5731:
 .L5732:
-    jmp .L5722
-.L5721:
-.L5722:
     movq -40(%rbp), %rax
     addq $1, %rax
     movq %rax, -40(%rbp)
-    jmp .L5681
-.L5682:
+    jmp .L5691
+.L5692:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -27485,7 +27524,7 @@ callgraph_detect_direct_recursion:
     movq %rax, -40(%rbp)
     movq $0, %rax
     movq %rax, -48(%rbp)
-.L5751:    movq -48(%rbp), %rax
+.L5761:    movq -48(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
     popq %rbx
@@ -27493,7 +27532,7 @@ callgraph_detect_direct_recursion:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5752
+    jz .L5762
     movq -48(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -27520,7 +27559,7 @@ callgraph_detect_direct_recursion:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5761
+    jz .L5771
     movq $1, %rax
     pushq %rax
     movq $28, %rax
@@ -27535,14 +27574,14 @@ callgraph_detect_direct_recursion:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5762
-.L5761:
-.L5762:
+    jmp .L5772
+.L5771:
+.L5772:
     movq -48(%rbp), %rax
     addq $1, %rax
     movq %rax, -48(%rbp)
-    jmp .L5751
-.L5752:
+    jmp .L5761
+.L5762:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -27597,7 +27636,7 @@ callgraph_detect_mutual_recursion_dfs:
     movq %rax, -56(%rbp)
     movq $0, %rax
     movq %rax, -64(%rbp)
-.L5771:    movq -64(%rbp), %rax
+.L5781:    movq -64(%rbp), %rax
     pushq %rax
     movq -48(%rbp), %rax
     popq %rbx
@@ -27605,7 +27644,7 @@ callgraph_detect_mutual_recursion_dfs:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5772
+    jz .L5782
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -27634,7 +27673,7 @@ callgraph_detect_mutual_recursion_dfs:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5781
+    jz .L5791
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -27655,7 +27694,7 @@ callgraph_detect_mutual_recursion_dfs:
     movq %rax, -104(%rbp)
     movq $0, %rax
     movq %rax, -112(%rbp)
-.L5791:    movq -112(%rbp), %rax
+.L5801:    movq -112(%rbp), %rax
     pushq %rax
     movq -96(%rbp), %rax
     popq %rbx
@@ -27663,7 +27702,7 @@ callgraph_detect_mutual_recursion_dfs:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5792
+    jz .L5802
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -27684,19 +27723,19 @@ callgraph_detect_mutual_recursion_dfs:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5801
+    jz .L5811
     movq -112(%rbp), %rax
     movq %rax, -104(%rbp)
     movq -96(%rbp), %rax
     movq %rax, -112(%rbp)
-    jmp .L5802
-.L5801:
-.L5802:
+    jmp .L5812
+.L5811:
+.L5812:
     movq -112(%rbp), %rax
     addq $1, %rax
     movq %rax, -112(%rbp)
-    jmp .L5791
-.L5792:
+    jmp .L5801
+.L5802:
     movq -104(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -27717,7 +27756,7 @@ callgraph_detect_mutual_recursion_dfs:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5811
+    jz .L5821
     movq $1, %rax
     pushq %rax
     movq $28, %rax
@@ -27740,9 +27779,9 @@ callgraph_detect_mutual_recursion_dfs:
     call memory_set_int32@PLT
     movq $1, %rax
     movq %rax, -56(%rbp)
-    jmp .L5812
-.L5811:
-.L5812:
+    jmp .L5822
+.L5821:
+.L5822:
     movq -152(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -27751,7 +27790,7 @@ callgraph_detect_mutual_recursion_dfs:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5821
+    jz .L5831
     movq -104(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -27774,23 +27813,23 @@ callgraph_detect_mutual_recursion_dfs:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5831
+    jz .L5841
     movq $1, %rax
     movq %rax, -56(%rbp)
+    jmp .L5842
+.L5841:
+.L5842:
     jmp .L5832
 .L5831:
 .L5832:
-    jmp .L5822
-.L5821:
-.L5822:
-    jmp .L5782
-.L5781:
-.L5782:
+    jmp .L5792
+.L5791:
+.L5792:
     movq -64(%rbp), %rax
     addq $1, %rax
     movq %rax, -64(%rbp)
-    jmp .L5771
-.L5772:
+    jmp .L5781
+.L5782:
     movq $2, %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -27835,7 +27874,7 @@ callgraph_detect_recursion:
     movq %rax, -24(%rbp)
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L5841:    movq -32(%rbp), %rax
+.L5851:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -27843,7 +27882,7 @@ callgraph_detect_recursion:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5842
+    jz .L5852
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -27866,8 +27905,8 @@ callgraph_detect_recursion:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L5841
-.L5842:
+    jmp .L5851
+.L5852:
     movq -24(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -27879,7 +27918,7 @@ callgraph_detect_recursion:
     movq %rax, -56(%rbp)
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L5851:    movq -32(%rbp), %rax
+.L5861:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -27887,7 +27926,7 @@ callgraph_detect_recursion:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5852
+    jz .L5862
     movq $0, %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -27905,11 +27944,11 @@ callgraph_detect_recursion:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L5851
-.L5852:
+    jmp .L5861
+.L5862:
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L5861:    movq -32(%rbp), %rax
+.L5871:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -27917,7 +27956,7 @@ callgraph_detect_recursion:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5862
+    jz .L5872
     movq -32(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -27938,7 +27977,7 @@ callgraph_detect_recursion:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5871
+    jz .L5881
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -27964,14 +28003,14 @@ callgraph_detect_recursion:
     popq %rdx
     popq %rcx
     call callgraph_detect_mutual_recursion_dfs
-    jmp .L5872
-.L5871:
-.L5872:
+    jmp .L5882
+.L5881:
+.L5882:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L5861
-.L5862:
+    jmp .L5871
+.L5872:
     movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -27997,14 +28036,14 @@ is_tail_call:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5881
+    jz .L5891
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5882
-.L5881:
-.L5882:
+    jmp .L5892
+.L5891:
+.L5892:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28021,14 +28060,14 @@ is_tail_call:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5891
+    jz .L5901
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5892
-.L5891:
-.L5892:
+    jmp .L5902
+.L5901:
+.L5902:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28045,14 +28084,14 @@ is_tail_call:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5901
+    jz .L5911
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5902
-.L5901:
-.L5902:
+    jmp .L5912
+.L5911:
+.L5912:
     movq $0, %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -28069,14 +28108,14 @@ is_tail_call:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5911
+    jz .L5921
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5912
-.L5911:
-.L5912:
+    jmp .L5922
+.L5921:
+.L5922:
     movq -32(%rbp), %rax
     addq $8, %rax
     movq %rax, -48(%rbp)
@@ -28102,14 +28141,14 @@ is_tail_call:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5921
+    jz .L5931
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5922
-.L5921:
-.L5922:
+    jmp .L5932
+.L5931:
+.L5932:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -28148,14 +28187,14 @@ callgraph_calculate_stack_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5931
+    jz .L5941
     movq $-1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5932
-.L5931:
-.L5932:
+    jmp .L5942
+.L5941:
+.L5942:
     movq $24, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28204,7 +28243,7 @@ callgraph_print_warnings:
     movq %rax, -24(%rbp)
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L5941:    movq -32(%rbp), %rax
+.L5951:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -28212,7 +28251,7 @@ callgraph_print_warnings:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5942
+    jz .L5952
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -28241,7 +28280,7 @@ callgraph_print_warnings:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5951
+    jz .L5961
     movq $0, %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -28266,14 +28305,14 @@ callgraph_print_warnings:
     pushq %rax
     popq %rdi
     call print_string
-    jmp .L5952
-.L5951:
-.L5952:
+    jmp .L5962
+.L5961:
+.L5962:
     movq -32(%rbp), %rax
     addq $1, %rax
     movq %rax, -32(%rbp)
-    jmp .L5941
-.L5942:
+    jmp .L5951
+.L5952:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -28296,14 +28335,14 @@ codegen_inject_stack_probe:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5961
+    jz .L5971
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5962
-.L5961:
-.L5962:
+    jmp .L5972
+.L5971:
+.L5972:
     leaq .STR477(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
