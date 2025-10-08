@@ -1004,3 +1004,37 @@ int64_t dict_destroy(int64_t dict_ptr) {
     free(dict);
     return 0;
 }
+
+// Create a range as a list (for range expressions like "1 to 10" or "1 through 10")
+// Parameters: start (inclusive), end, is_inclusive (1 for through, 0 for to)
+// Returns: pointer to array with size metadata at offset -8
+int64_t runtime_create_range(int64_t start, int64_t end, int64_t is_inclusive) {
+    int64_t count;
+
+    // Calculate size
+    if (is_inclusive) {
+        count = end - start + 1;
+    } else {
+        count = end - start;
+    }
+
+    // Handle invalid ranges
+    if (count <= 0) {
+        count = 0;
+    }
+
+    // Allocate memory: 8 bytes for size + (count * 8) bytes for elements
+    int64_t total_size = 8 + (count * 8);
+    int64_t* array = (int64_t*)allocate(total_size);
+
+    // Store size in metadata at offset 0
+    array[0] = count;
+
+    // Fill array with range values starting at offset 1
+    for (int64_t i = 0; i < count; i++) {
+        array[i + 1] = start + i;
+    }
+
+    // Return pointer to data (after metadata)
+    return (int64_t)(&array[1]);
+}
