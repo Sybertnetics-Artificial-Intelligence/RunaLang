@@ -812,6 +812,7 @@ Let EXPR_LAMBDA_CALL be 24
 Let EXPR_CHARACTER_LITERAL be 25
 Let EXPR_RANGE be 26
 Let EXPR_TERNARY be 27
+Let EXPR_STRING_INTERPOLATION be 28
 
 Note: Statement type constants - synchronized with codegen.runa
 Let STMT_LET be 1
@@ -1964,6 +1965,18 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
         Let char_value be string_to_integer(value_str)
         Let dummy7 be parser_eat(parser, 163)
         Let expr be expression_create_character_literal(char_value)
+        Return expr
+    End If
+
+    Note: Handle f-string (string interpolation)
+    If token_type is equal to 165:  Note: TOKEN_F_STRING
+        Let fstring_content be memory_get_pointer(current_token, 8)
+        Note: CRITICAL: Duplicate BEFORE parser_eat destroys the token!
+        Let fstring_copy be string_duplicate_parser(fstring_content)
+        Let dummy_fstring be parser_eat(parser, 165)
+
+        Note: DEBUG: Bypass parsing, use as regular string
+        Let expr be expression_create_string_literal_owned(fstring_copy)
         Return expr
     End If
 
@@ -5783,4 +5796,144 @@ Process called "parser_parse_import" takes parser as Integer returns Integer:
     memory_set_pointer(import_stmt, 8, module_name) Note: module_name at offset 8
 
     Return import_stmt
+End Process
+
+Process called "parser_parse_fstring" takes parser as Integer, fstring_content as Integer returns Integer:
+    Note: Parse f-string and create EXPR_STRING_INTERPOLATION
+    Note: f-string format: f"text {expr} more text {expr2}"
+    Note: We need to split into parts and expressions
+
+    Note: Safety check for null or empty fstring_content
+    If fstring_content is equal to 0:
+        Note: Return empty string literal for null f-string
+        Let empty_str be string_duplicate_parser("")
+        Let expr be expression_create_string_literal_owned(empty_str)
+        Return expr
+    End If
+
+    Note: Allocate arrays for string parts and expressions
+    Let capacity be 8
+    Let parts be memory_allocate(capacity multiplied by 8)
+    Let expressions be memory_allocate(capacity multiplied by 8)
+
+    Note: Initialize arrays to NULL
+    Let init_j be 0
+    While init_j is less than capacity:
+        memory_set_pointer(parts plus (init_j multiplied by 8), 0, 0)
+        memory_set_pointer(expressions plus (init_j multiplied by 8), 0, 0)
+        Set init_j to init_j plus 1
+    End While
+
+    Let part_count be 0
+    Let expr_count be 0
+
+    Let i be 0
+    Let len be string_length(fstring_content)
+
+    Note: Check if content is empty - if so, return single empty string part
+    If len is equal to 0:
+        Let empty_str be string_duplicate_parser("")
+        memory_set_pointer(parts plus 0, 0, empty_str)
+        Set part_count to 1
+
+        Let expr be memory_allocate(32)
+        memory_set_int32(expr, 0, 28)
+        memory_set_int32(expr, 4, part_count)
+        memory_set_int32(expr, 8, 0)
+        memory_set_pointer(expr, 16, parts)
+        memory_set_pointer(expr, 24, expressions)
+        Return expr
+    End If
+
+    Let current_part be memory_allocate(256)
+
+    Note: Initialize buffer to zeros
+    Let init_i be 0
+    While init_i is less than 256:
+        memory_set_byte(current_part plus init_i, 0, 0)
+        Set init_i to init_i plus 1
+    End While
+
+    Let part_len be 0
+
+    While i is less than len:
+        Let ch be memory_get_byte(fstring_content plus i, 0)
+
+        Note: Check for opening brace
+        If ch is equal to 123:  Note: ASCII for '{'
+            Note: Save current text part if any
+            If part_len is greater than 0:
+                memory_set_byte(current_part plus part_len, 0, 0)  Note: Null terminate
+                memory_set_pointer(parts plus (part_count multiplied by 8), 0, string_duplicate_parser(current_part))
+                Set part_count to part_count plus 1
+                Set part_len to 0
+            End If
+
+            Note: Find closing brace
+            Set i to i plus 1
+            Let expr_start be i
+            Let brace_depth be 1
+            While i is less than len:
+                Let expr_ch be memory_get_byte(fstring_content plus i, 0)
+                If expr_ch is equal to 123:
+                    Set brace_depth to brace_depth plus 1
+                End If
+                If expr_ch is equal to 125:  Note: ASCII for '}'
+                    Set brace_depth to brace_depth minus 1
+                    If brace_depth is equal to 0:
+                        Note: Found matching closing brace
+                        Let expr_len be i minus expr_start
+                        Let expr_str be memory_allocate(expr_len plus 1)
+                        memory_copy(expr_str, fstring_content plus expr_start, expr_len)
+                        memory_set_byte(expr_str plus expr_len, 0, 0)
+
+                        Note: Create mini-lexer and parser for this expression
+                        Let expr_lexer be lexer_create_from_string(expr_str)
+                        Let expr_token_list be lexer_tokenize(expr_lexer)
+
+                        Note: Extract tokens array from token_list structure
+                        Let expr_tokens be memory_get_pointer(expr_token_list, 0)
+                        Let expr_token_count be memory_get_integer(expr_token_list, 8)
+
+                        Note: Create parser with tokens
+                        Let expr_parser be parser_create(expr_tokens)
+                        Let parsed_expr be parser_parse_additive(expr_parser)
+
+                        memory_set_pointer(expressions plus (expr_count multiplied by 8), 0, parsed_expr)
+                        Set expr_count to expr_count plus 1
+
+                        deallocate(expr_str)
+                        Set i to i plus 1
+                        Set brace_depth to -1  Note: Signal to break
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        Otherwise:
+            Note: Regular character, add to current part
+            memory_set_byte(current_part plus part_len, 0, ch)
+            Set part_len to part_len plus 1
+            Set i to i plus 1
+        End If
+    End While
+
+    Note: Save final text part if any
+    If part_len is greater than 0:
+        memory_set_byte(current_part plus part_len, 0, 0)
+        memory_set_pointer(parts plus (part_count multiplied by 8), 0, string_duplicate_parser(current_part))
+        Set part_count to part_count plus 1
+    End If
+
+    deallocate(current_part)
+
+    Note: Create EXPR_STRING_INTERPOLATION structure
+    Note: Layout: type(4), part_count(4), expr_count(4), parts_ptr(8), exprs_ptr(8)
+    Let expr be memory_allocate(32)
+    memory_set_int32(expr, 0, 28)  Note: EXPR_STRING_INTERPOLATION
+    memory_set_int32(expr, 4, part_count)
+    memory_set_int32(expr, 8, expr_count)
+    memory_set_pointer(expr, 16, parts)
+    memory_set_pointer(expr, 24, expressions)
+
+    Return expr
 End Process
