@@ -113,7 +113,7 @@ print_integer:
 hashtable_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -142,7 +142,7 @@ hashtable_create:
 hashtable_create_with_destructors:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -357,7 +357,7 @@ hashtable_create_with_destructors:
 hashtable_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -405,7 +405,7 @@ hashtable_destroy:
 hashtable_put:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -764,7 +764,7 @@ hashtable_put:
 hashtable_get:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -943,7 +943,7 @@ hashtable_get:
 hashtable_remove:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1272,7 +1272,7 @@ hashtable_remove:
 hashtable_contains:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -1309,7 +1309,7 @@ hashtable_contains:
 hashtable_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1343,7 +1343,7 @@ hashtable_size:
 hashtable_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1556,7 +1556,7 @@ hashtable_clear:
 hashtable_iterator_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1714,7 +1714,7 @@ hashtable_iterator_create:
 hashtable_iterator_has_next:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1766,7 +1766,7 @@ hashtable_iterator_has_next:
 hashtable_iterator_next:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -2094,7 +2094,7 @@ hashtable_iterator_next:
 hashtable_iterator_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2110,7 +2110,7 @@ hashtable_iterator_destroy:
 hash_string:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     movq %rax, -16(%rbp)
@@ -2182,7 +2182,7 @@ hash_string:
 compare_strings:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -16(%rbp), %rax
@@ -2219,7 +2219,7 @@ compare_strings:
 hash_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $0, %rax
     pushq %rax
@@ -2319,7 +2319,7 @@ hash_integer:
 compare_integers:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -2364,7 +2364,7 @@ compare_integers:
 hash_pointer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     movq %rax, -16(%rbp)
@@ -2447,7 +2447,7 @@ hash_pointer:
 compare_pointers:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2476,7 +2476,7 @@ compare_pointers:
 hashtable_get_stats:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2819,7 +2819,7 @@ hashtable_get_stats:
 hashtable_print_stats:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $48, %rax
     pushq %rax
@@ -2935,7 +2935,7 @@ hashtable_print_stats:
 call_function_1:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -2948,7 +2948,7 @@ call_function_1:
 call_function_2:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -2956,71 +2956,5 @@ call_function_2:
     movq %rbp, %rsp
     popq %rbp
     ret
-
-.null_pointer_error:
-    # Print error message for null pointer
-    leaq .null_pointer_msg(%rip), %rdi
-    call print_string@PLT
-    # Exit with error code
-    movq $1, %rdi
-    call exit_with_code@PLT
-
-.bounds_error_negative:
-    # Print error message for negative index
-    leaq .bounds_error_negative_msg(%rip), %rdi
-    call print_string@PLT
-    # Print the negative index value
-    movq %rbx, %rdi  # Index value
-    call print_integer@PLT
-    # Exit with error code
-    movq $1, %rdi
-    call exit_with_code@PLT
-
-.bounds_error_overflow:
-    # Save registers that will be clobbered
-    pushq %rcx  # Save array size
-    pushq %rbx  # Save index
-    # Print error message for out-of-bounds index
-    leaq .bounds_error_overflow_msg(%rip), %rdi
-    call print_string@PLT
-    # Print the index value
-    popq %rdi  # Restore and use index
-    pushq %rdi  # Save again for later
-    call print_integer@PLT
-    # Print size message
-    leaq .bounds_error_size_msg(%rip), %rdi
-    call print_string@PLT
-    # Print the array size
-    movq 8(%rsp), %rdi  # Get saved array size from stack
-    call print_integer@PLT
-    # Clean up stack
-    addq $16, %rsp
-    # Exit with error code
-    movq $1, %rdi
-    call exit_with_code@PLT
-
-.section .rodata
-.null_pointer_msg:
-    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
-    .byte 78,117,108,108,32,112,111,105,110,116,101,114,32
-    .byte 100,101,114,101,102,101,114,101,110,99,101
-    .byte 10,0
-
-.bounds_error_negative_msg:
-    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
-    .byte 65,114,114,97,121,32,105,110,100,101,120,32
-    .byte 105,115,32,110,101,103,97,116,105,118,101,58,32
-    .byte 0
-
-.bounds_error_overflow_msg:
-    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
-    .byte 65,114,114,97,121,32,105,110,100,101,120,32
-    .byte 111,117,116,32,111,102,32,98,111,117,110,100,115,58,32
-    .byte 0
-
-.bounds_error_size_msg:
-    .byte 32,40,97,114,114,97,121,32,115,105,122,101,32,105,115,32
-    .byte 41,10,0
-
 
 .section .note.GNU-stack
