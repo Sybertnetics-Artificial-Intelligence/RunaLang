@@ -4491,24 +4491,14 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, ".text")
 
     Note: ========================================================================
-    Note: STACK SAFETY ANALYSIS PHASE
+    Note: STACK SAFETY ANALYSIS PHASE - RE-ENABLED
     Note: ========================================================================
-    Note: Build call graph for recursion detection and stack analysis
-    print_string("[CODEGEN] Building call graph for stack safety analysis...\n")
+    Note: Build call graph for recursion detection and stack safety
     Let call_graph be callgraph_create(program, codegen)
+    memory_set_pointer(codegen, 80, call_graph)
     callgraph_build(call_graph)
-
-    Note: Detect recursion (both direct and mutual)
-    print_string("[CODEGEN] Detecting recursion patterns...\n")
     callgraph_detect_recursion(call_graph)
-
-    Note: Print warnings for recursive functions
     callgraph_print_warnings(call_graph)
-
-    Note: Store call graph pointer in codegen for function generation
-    memory_set_pointer(codegen, 80, call_graph)  Note: codegen->call_graph (using offset 80, NOT 72 which is var_hashtable)
-
-    print_string("[CODEGEN] Stack safety analysis complete.\n")
     Note: ========================================================================
 
     Note: Generate all functions
@@ -4532,22 +4522,24 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     End While
 
     Note: Generate stack overflow handler if any recursive functions exist
-    Let nodes be memory_get_pointer(call_graph, 0)
-    Let node_count be memory_get_int32(call_graph, 8)
-    Let has_recursive be 0
-    Let i be 0
-    While i is less than node_count:
-        Let node be memory_get_pointer(nodes, i multiplied by 8)
-        Let is_recursive be memory_get_int32(node, 28)
-        If is_recursive is equal to 1:
-            Let has_recursive be 1
-            Let i be node_count  Note: Break
-        End If
-        Let i be i plus 1
-    End While
+    If call_graph is not equal to 0:
+        Let nodes be memory_get_pointer(call_graph, 0)
+        Let node_count be memory_get_int32(call_graph, 8)
+        Let has_recursive be 0
+        Let i be 0
+        While i is less than node_count:
+            Let node be memory_get_pointer(nodes, i multiplied by 8)
+            Let is_recursive be memory_get_int32(node, 28)
+            If is_recursive is equal to 1:
+                Let has_recursive be 1
+                Let i be node_count  Note: Break
+            End If
+            Let i be i plus 1
+        End While
 
-    If has_recursive is equal to 1:
-        codegen_generate_stack_overflow_handler(output_file)
+        If has_recursive is equal to 1:
+            codegen_generate_stack_overflow_handler(output_file)
+        End If
     End If
 
     Note: Add a main function wrapper if no main function exists
@@ -4661,7 +4653,7 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
 End Process
 
 Note: ========================================================================
-Note: STACK SAFETY & MEMORY FOUNDATION (v0.0.8.4.1)
+Note: STACK SAFETY & MEMORY FOUNDATION
 Note: ========================================================================
 Note: This section implements critical compiler safety features:
 Note: 1. Call graph analysis for recursion detection
@@ -4671,12 +4663,13 @@ Note: 4. Stack size calculation and warnings
 Note: ========================================================================
 
 Note: Data Structures for Call Graph Analysis
-Note: CallGraphNode structure (32 bytes):
+Note: CallGraphNode structure (40 bytes):
 Note:   offset 0:  function_name (pointer)
 Note:   offset 8:  function_ptr (pointer to Function AST node)
 Note:   offset 16: callees (pointer array - functions this calls)
 Note:   offset 24: callee_count (int32)
 Note:   offset 28: is_recursive (int32) - 1 if recursively calls itself
+Note:   offset 32: callee_capacity (int32) - allocated capacity for callees array
 
 Note: CallGraph structure (32 bytes):
 Note:   offset 0:  nodes (CallGraphNode** array)
@@ -4745,15 +4738,17 @@ End Process
 
 Note: Create a new call graph node for a function
 Process called "callgraph_node_create" takes function_name as Integer, function_ptr as Integer returns Integer:
-    Let node be allocate(32)
+    Let node be allocate(40)
 
     memory_set_pointer(node, 0, string_duplicate(function_name))
     memory_set_pointer(node, 8, function_ptr)
 
     Note: Initialize with capacity for 16 callees
-    memory_set_pointer(node, 16, allocate(16 multiplied by 8))
-    memory_set_int32(node, 24, 0)
+    Let initial_callees_capacity be 16
+    memory_set_pointer(node, 16, allocate(initial_callees_capacity multiplied by 8))
+    memory_set_int32(node, 24, 0)  Note: callee_count
     memory_set_int32(node, 28, 0)  Note: is_recursive = false
+    memory_set_int32(node, 32, initial_callees_capacity)  Note: callee_capacity
 
     Return node
 End Process
@@ -4762,6 +4757,7 @@ Note: Add a callee to a call graph node
 Process called "callgraph_node_add_callee" takes node as Integer, callee_name as Integer returns Integer:
     Let callees be memory_get_pointer(node, 16)
     Let callee_count be memory_get_int32(node, 24)
+    Let callee_capacity be memory_get_int32(node, 32)
 
     Note: Check if callee already exists
     Let i be 0
@@ -4772,6 +4768,25 @@ Process called "callgraph_node_add_callee" takes node as Integer, callee_name as
         End If
         Let i be i plus 1
     End While
+
+    Note: Resize array if full
+    If callee_count is greater than or equal to callee_capacity:
+        Let new_capacity be callee_capacity multiplied by 2
+        Let new_callees be allocate(new_capacity multiplied by 8)
+
+        Note: Copy existing callees
+        Let i be 0
+        While i is less than callee_count:
+            Let old_callee be memory_get_pointer(callees, i multiplied by 8)
+            memory_set_pointer(new_callees, i multiplied by 8, old_callee)
+            Let i be i plus 1
+        End While
+
+        deallocate(callees)
+        Set callees to new_callees
+        memory_set_pointer(node, 16, new_callees)
+        memory_set_int32(node, 32, new_capacity)
+    End If
 
     Note: Add new callee
     memory_set_pointer(callees, callee_count multiplied by 8, string_duplicate(callee_name))
@@ -4784,6 +4799,26 @@ Note: Add a node to the call graph
 Process called "callgraph_add_node" takes graph as Integer, node as Integer returns Integer:
     Let nodes be memory_get_pointer(graph, 0)
     Let node_count be memory_get_int32(graph, 8)
+    Let capacity be memory_get_int32(graph, 12)
+
+    Note: Resize array if full
+    If node_count is greater than or equal to capacity:
+        Let new_capacity be capacity multiplied by 2
+        Let new_nodes be allocate(new_capacity multiplied by 8)
+
+        Note: Copy existing nodes
+        Let i be 0
+        While i is less than node_count:
+            Let old_node be memory_get_pointer(nodes, i multiplied by 8)
+            memory_set_pointer(new_nodes, i multiplied by 8, old_node)
+            Let i be i plus 1
+        End While
+
+        deallocate(nodes)
+        Set nodes to new_nodes
+        memory_set_pointer(graph, 0, new_nodes)
+        memory_set_int32(graph, 12, new_capacity)
+    End If
 
     Note: Store the node
     memory_set_pointer(nodes, node_count multiplied by 8, node)
@@ -5173,20 +5208,44 @@ Process called "callgraph_build" takes graph as Integer returns Integer:
     Let nodes be memory_get_pointer(graph, 0)
     Let node_count be memory_get_int32(graph, 8)
 
+    Note: Safety check for null nodes array
+    If nodes is equal to 0:
+        Return 0
+    End If
+
     Let i be 0
     While i is less than node_count:
         Let node be memory_get_pointer(nodes, i multiplied by 8)
-        Let func be memory_get_pointer(node, 8)
+        Let should_skip be 0
 
-        Let statements be memory_get_pointer(func, 32)
-        Let stmt_count be memory_get_int32(func, 40)
+        Note: Check if node is null
+        If node is equal to 0:
+            Let should_skip be 1
+        End If
 
-        Let j be 0
-        While j is less than stmt_count:
-            Let stmt be memory_get_pointer(statements, j multiplied by 8)
-            callgraph_collect_calls_from_stmt(graph, node, stmt)
-            Let j be j plus 1
-        End While
+        Note: Check if func is null
+        Let func be 0
+        If should_skip is equal to 0:
+            Set func to memory_get_pointer(node, 8)
+            If func is equal to 0:
+                Let should_skip be 1
+            End If
+        End If
+
+        Note: Process node if not skipped
+        If should_skip is equal to 0:
+            Let statements be memory_get_pointer(func, 32)
+            Let stmt_count be memory_get_int32(func, 40)
+
+            Let j be 0
+            While j is less than stmt_count:
+                Let stmt be memory_get_pointer(statements, j multiplied by 8)
+                If stmt is not equal to 0:
+                    callgraph_collect_calls_from_stmt(graph, node, stmt)
+                End If
+                Let j be j plus 1
+            End While
+        End If
 
         Let i be i plus 1
     End While
