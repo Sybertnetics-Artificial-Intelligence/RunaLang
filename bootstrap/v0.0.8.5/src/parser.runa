@@ -79,7 +79,37 @@ End Process
 
 Note: Parser parse expression - entry point for expression parsing with PEMDAS precedence
 Process called "parser_parse_expression" takes parser as Integer returns Integer:
-    Return parser_parse_logical_or(parser)
+    Return parser_parse_ternary(parser)
+End Process
+
+Note: Parse ternary conditional expressions (value If condition Otherwise other_value)
+Process called "parser_parse_ternary" takes parser as Integer returns Integer:
+    Let expr be parser_parse_logical_or(parser)
+
+    Note: Check for "If" to start ternary
+    Let current_token be memory_get_pointer(parser, 8)
+    Let token_type be memory_get_integer(current_token, 0)
+
+    If token_type is equal to 18:  Note: TOKEN_IF
+        Note: This is a ternary: expr If condition Otherwise other_value
+        Let true_expr be expr
+        parser_eat(parser, 18)  Note: Eat "If"
+
+        Note: Parse condition
+        Let condition be parser_parse_logical_or(parser)
+
+        Note: Expect "Otherwise"
+        parser_eat(parser, 19)  Note: TOKEN_OTHERWISE
+
+        Note: Parse false branch
+        Let false_expr be parser_parse_logical_or(parser)
+
+        Note: Create ternary expression
+        Let ternary_expr be expression_create_ternary(true_expr, condition, false_expr)
+        Return ternary_expr
+    End If
+
+    Return expr
 End Process
 
 Note: Parse logical OR expressions
@@ -105,7 +135,7 @@ End Process
 
 Note: Parse logical AND expressions
 Process called "parser_parse_logical_and" takes parser as Integer returns Integer:
-    Let left be parser_parse_comparison_level(parser)
+    Let left be parser_parse_range(parser)
 
     Let loop_and be 1
     While loop_and is equal to 1:
@@ -114,12 +144,38 @@ Process called "parser_parse_logical_and" takes parser as Integer returns Intege
 
         If token_type is equal to 30:  Note: TOKEN_AND
             parser_eat(parser, 30)
-            Let right be parser_parse_comparison_level(parser)
+            Let right be parser_parse_range(parser)
             Set left to expression_create_binary_op(left, 30, right)
         Otherwise:
             Set loop_and to 0
         End If
     End While
+
+    Return left
+End Process
+
+Note: Parse range expressions (start to/through end)
+Process called "parser_parse_range" takes parser as Integer returns Integer:
+    Let left be parser_parse_comparison_level(parser)
+
+    Let current_token be memory_get_pointer(parser, 8)
+    Let token_type be memory_get_integer(current_token, 0)
+
+    Note: Check for "to" (exclusive range)
+    If token_type is equal to 15:  Note: TOKEN_TO
+        parser_eat(parser, 15)
+        Let right be parser_parse_comparison_level(parser)
+        Let range_expr be expression_create_range(left, right, 0)  Note: 0 = exclusive
+        Return range_expr
+    End If
+
+    Note: Check for "through" (inclusive range)
+    If token_type is equal to 164:  Note: TOKEN_THROUGH
+        parser_eat(parser, 164)
+        Let right be parser_parse_comparison_level(parser)
+        Let range_expr be expression_create_range(left, right, 1)  Note: 1 = inclusive
+        Return range_expr
+    End If
 
     Return left
 End Process
@@ -240,7 +296,7 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
     Let current_token_fc be memory_get_pointer(parser, 8)
     Let token_type_fc be memory_get_integer(current_token_fc, 0)
     If token_type_fc is equal to 48:  Note: TOKEN_LPAREN (48)
-        Note: Convert variable expression to function call
+        Note: Convert variable expression to function call or create indirect call for function pointer
         Let expr_type be memory_get_integer(left, 0)
         If expr_type is equal to EXPR_VARIABLE:
             Note: Get the variable name from the EXPR_VARIABLE
@@ -290,6 +346,55 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
             Let func_call be expression_create_function_call(var_name, arguments, argument_count)
             deallocate(left)  Note: Free the old EXPR_VARIABLE
             Set left to func_call
+        Otherwise If expr_type is equal to 10:  Note: EXPR_FUNCTION_POINTER
+            Note: This is an indirect call through a function pointer
+            parser_eat(parser, 48)
+
+            Note: Allocate space for arguments
+            Let arguments be 0
+            Let argument_count be 0
+            Let argument_capacity be 4
+            Let arg_ptr_size be 8
+            Let arg_size be argument_capacity multiplied by arg_ptr_size
+            Set arguments to memory_allocate(arg_size)
+
+            Note: Parse arguments until we hit ')'
+            Let continue_args be 1
+            While continue_args is equal to 1:
+                Let current_token_arg be memory_get_pointer(parser, 8)
+                Let token_type_arg be memory_get_integer(current_token_arg, 0)
+
+                If token_type_arg is equal to 49:  Note: TOKEN_RPAREN (49)
+                    Set continue_args to 0
+                Otherwise:
+                    Note: Parse the argument expression
+                    Let arg_expr be parser_parse_additive(parser)
+
+                    Note: Store argument
+                    Let arg_offset be argument_count multiplied by arg_ptr_size
+                    Let arg_ptr be arguments plus arg_offset
+                    memory_set_pointer(arg_ptr, 0, arg_expr)
+                    Set argument_count to argument_count plus 1
+
+                    Note: Check for comma
+                    Let current_token_comma be memory_get_pointer(parser, 8)
+                    Let token_type_comma be memory_get_integer(current_token_comma, 0)
+                    If token_type_comma is equal to 52:  Note: TOKEN_COMMA (52)
+                        parser_eat(parser, 52)
+                    End If
+                End If
+            End While
+
+            parser_eat(parser, 49)
+
+            Note: Create EXPR_INDIRECT_CALL expression
+            Note: Structure: type(int32), func_ptr_expr(ptr at 8), arguments(ptr at 16), arg_count(int32 at 24)
+            Let indirect_call be memory_allocate(32)
+            memory_set_int32(indirect_call, 0, 11)  Note: EXPR_INDIRECT_CALL
+            memory_set_pointer(indirect_call, 8, left)  Note: The function pointer expression
+            memory_set_pointer(indirect_call, 16, arguments)
+            memory_set_int32(indirect_call, 24, argument_count)
+            Set left to indirect_call
         End If
     End If
 
@@ -609,7 +714,8 @@ Process called "parser_parse_set_statement" takes parser as Integer returns Inte
     parser_eat(parser, 14)
 
     Note: Parse the target expression (could be variable or nested field access)
-    Let target be parser_parse_expression(parser)
+    Note: Use comparison_level to avoid parsing "to" as range operator
+    Let target be parser_parse_comparison_level(parser)
 
     Note: Check for compound assignment: gets [increased|decreased|multiplied|divided] by
     Let current_token be memory_get_pointer(parser, 8)
@@ -702,6 +808,9 @@ Let EXPR_DICT_LITERAL be 22
 Let EXPR_STRUCT_CONSTRUCTION be 20
 Let EXPR_LAMBDA be 23
 Let EXPR_LAMBDA_CALL be 24
+Let EXPR_CHARACTER_LITERAL be 25
+Let EXPR_RANGE be 26
+Let EXPR_TERNARY be 27
 
 Note: Statement type constants - synchronized with codegen.runa
 Let STMT_LET be 1
@@ -1176,6 +1285,40 @@ Process called "expression_create_string_literal_owned" takes string_value as In
     Let expr be memory_allocate(expr_size)
     memory_set_int32(expr, 0, EXPR_STRING_LITERAL)
     memory_set_pointer(expr, 8, string_value)  Note: Takes ownership
+
+    Return expr
+End Process
+
+Note: Create character literal expression
+Process called "expression_create_character_literal" takes char_value as Integer returns Integer:
+    Let expr_size be 32  Note: Match other expression types for safety
+    Let expr be memory_allocate(expr_size)
+    memory_set_int32(expr, 0, EXPR_CHARACTER_LITERAL)
+    memory_set_int32(expr, 8, char_value)  Note: Store character as int32
+
+    Return expr
+End Process
+
+Note: Create range expression (start to/through end)
+Process called "expression_create_range" takes start_expr as Integer, end_expr as Integer, is_inclusive as Integer returns Integer:
+    Let expr_size be 32  Note: Match other expression types for safety
+    Let expr be memory_allocate(expr_size)
+    memory_set_int32(expr, 0, EXPR_RANGE)
+    memory_set_pointer(expr, 8, start_expr)   Note: Start expression
+    memory_set_pointer(expr, 16, end_expr)    Note: End expression
+    memory_set_int32(expr, 24, is_inclusive)  Note: 1 for through, 0 for to
+
+    Return expr
+End Process
+
+Note: Create ternary expression (value If condition Otherwise other_value)
+Process called "expression_create_ternary" takes true_expr as Integer, condition as Integer, false_expr as Integer returns Integer:
+    Let expr_size be 32  Note: Match other expression types for safety
+    Let expr be memory_allocate(expr_size)
+    memory_set_int32(expr, 0, EXPR_TERNARY)
+    memory_set_pointer(expr, 8, condition)    Note: Condition expression
+    memory_set_pointer(expr, 16, true_expr)   Note: True branch expression
+    memory_set_pointer(expr, 24, false_expr)  Note: False branch expression
 
     Return expr
 End Process
@@ -1812,6 +1955,15 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
             Let expr be expression_create_string_literal_owned(string_value)
             Return expr
         End If
+    End If
+
+    Note: Handle character literal
+    If token_type is equal to 163:  Note: TOKEN_CHARACTER_LITERAL
+        Let value_str be memory_get_pointer(current_token, 8)
+        Let char_value be string_to_integer(value_str)
+        Let dummy7 be parser_eat(parser, 163)
+        Let expr be expression_create_character_literal(char_value)
+        Return expr
     End If
 
     Note: Handle function pointer ($identifier)
