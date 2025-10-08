@@ -1023,18 +1023,35 @@ int64_t runtime_create_range(int64_t start, int64_t end, int64_t is_inclusive) {
         count = 0;
     }
 
-    // Allocate memory: 8 bytes for size + (count * 8) bytes for elements
-    int64_t total_size = 8 + (count * 8);
-    int64_t* array = (int64_t*)allocate(total_size);
+    // Create a proper RunaList structure
+    RunaList* list = (RunaList*)calloc(1, sizeof(RunaList));
+    list->capacity = count;
+    list->length = count;
+    list->data = (int64_t*)calloc(count, sizeof(int64_t));
 
-    // Store size in metadata at offset 0
-    array[0] = count;
-
-    // Fill array with range values starting at offset 1
+    // Fill array with range values
     for (int64_t i = 0; i < count; i++) {
-        array[i + 1] = start + i;
+        list->data[i] = start + i;
     }
 
-    // Return pointer to data (after metadata)
-    return (int64_t)(&array[1]);
+    // Return pointer to RunaList structure
+    return (int64_t)list;
+}
+
+// Character conversion functions
+// Convert character (int64_t ASCII value) to single-character string
+int64_t char_to_string(int64_t char_val) {
+    char* str = (char*)malloc(2);
+    str[0] = (char)char_val;
+    str[1] = '\0';
+    return (int64_t)str;
+}
+
+// Convert single-character string to character (ASCII value)
+int64_t string_to_char(int64_t str_ptr) {
+    char* str = (char*)str_ptr;
+    if (str == NULL || str[0] == '\0') {
+        return 0;  // Return null character for empty string
+    }
+    return (int64_t)str[0];
 }
