@@ -79,7 +79,38 @@ End Process
 
 Note: Parser parse expression - entry point for expression parsing with PEMDAS precedence
 Process called "parser_parse_expression" takes parser as Integer returns Integer:
-    Return parser_parse_logical_or(parser)
+    Return parser_parse_ternary(parser)
+End Process
+
+Note: Parse ternary conditional expressions using ? : syntax (like C/Java)
+Note: Syntax: condition ? true_value : false_value
+Process called "parser_parse_ternary" takes parser as Integer returns Integer:
+    Let expr be parser_parse_logical_or(parser)
+
+    Note: Check for '?' to start ternary
+    Let current_token be memory_get_pointer(parser, 8)
+    Let token_type be memory_get_integer(current_token, 0)
+
+    If token_type is equal to 166:  Note: TOKEN_QUESTION
+        Note: This is a ternary: condition ? true_value : false_value
+        Let condition be expr
+        parser_eat(parser, 166)  Note: Eat '?'
+
+        Note: Parse true branch (no ternary to avoid ambiguity)
+        Let true_expr be parser_parse_logical_or(parser)
+
+        Note: Expect ':'
+        parser_eat(parser, 9)  Note: TOKEN_COLON
+
+        Note: Parse false branch (allow right-associative nesting)
+        Let false_expr be parser_parse_ternary(parser)
+
+        Note: Create ternary expression
+        Let ternary_expr be expression_create_ternary(true_expr, condition, false_expr)
+        Return ternary_expr
+    End If
+
+    Return expr
 End Process
 
 Note: Parse logical OR expressions
@@ -105,7 +136,7 @@ End Process
 
 Note: Parse logical AND expressions
 Process called "parser_parse_logical_and" takes parser as Integer returns Integer:
-    Let left be parser_parse_comparison_level(parser)
+    Let left be parser_parse_range(parser)
 
     Let loop_and be 1
     While loop_and is equal to 1:
@@ -114,12 +145,38 @@ Process called "parser_parse_logical_and" takes parser as Integer returns Intege
 
         If token_type is equal to 30:  Note: TOKEN_AND
             parser_eat(parser, 30)
-            Let right be parser_parse_comparison_level(parser)
+            Let right be parser_parse_range(parser)
             Set left to expression_create_binary_op(left, 30, right)
         Otherwise:
             Set loop_and to 0
         End If
     End While
+
+    Return left
+End Process
+
+Note: Parse range expressions (start to/through end)
+Process called "parser_parse_range" takes parser as Integer returns Integer:
+    Let left be parser_parse_comparison_level(parser)
+
+    Let current_token be memory_get_pointer(parser, 8)
+    Let token_type be memory_get_integer(current_token, 0)
+
+    Note: Check for "to" (exclusive range)
+    If token_type is equal to 15:  Note: TOKEN_TO
+        parser_eat(parser, 15)
+        Let right be parser_parse_comparison_level(parser)
+        Let range_expr be expression_create_range(left, right, 0)  Note: 0 = exclusive
+        Return range_expr
+    End If
+
+    Note: Check for "through" (inclusive range)
+    If token_type is equal to 164:  Note: TOKEN_THROUGH
+        parser_eat(parser, 164)
+        Let right be parser_parse_comparison_level(parser)
+        Let range_expr be expression_create_range(left, right, 1)  Note: 1 = inclusive
+        Return range_expr
+    End If
 
     Return left
 End Process
@@ -240,7 +297,7 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
     Let current_token_fc be memory_get_pointer(parser, 8)
     Let token_type_fc be memory_get_integer(current_token_fc, 0)
     If token_type_fc is equal to 48:  Note: TOKEN_LPAREN (48)
-        Note: Convert variable expression to function call
+        Note: Convert variable expression to function call or create indirect call for function pointer
         Let expr_type be memory_get_integer(left, 0)
         If expr_type is equal to EXPR_VARIABLE:
             Note: Get the variable name from the EXPR_VARIABLE
@@ -290,6 +347,55 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
             Let func_call be expression_create_function_call(var_name, arguments, argument_count)
             deallocate(left)  Note: Free the old EXPR_VARIABLE
             Set left to func_call
+        Otherwise If expr_type is equal to 10:  Note: EXPR_FUNCTION_POINTER
+            Note: This is an indirect call through a function pointer
+            parser_eat(parser, 48)
+
+            Note: Allocate space for arguments
+            Let arguments be 0
+            Let argument_count be 0
+            Let argument_capacity be 4
+            Let arg_ptr_size be 8
+            Let arg_size be argument_capacity multiplied by arg_ptr_size
+            Set arguments to memory_allocate(arg_size)
+
+            Note: Parse arguments until we hit ')'
+            Let continue_args be 1
+            While continue_args is equal to 1:
+                Let current_token_arg be memory_get_pointer(parser, 8)
+                Let token_type_arg be memory_get_integer(current_token_arg, 0)
+
+                If token_type_arg is equal to 49:  Note: TOKEN_RPAREN (49)
+                    Set continue_args to 0
+                Otherwise:
+                    Note: Parse the argument expression
+                    Let arg_expr be parser_parse_additive(parser)
+
+                    Note: Store argument
+                    Let arg_offset be argument_count multiplied by arg_ptr_size
+                    Let arg_ptr be arguments plus arg_offset
+                    memory_set_pointer(arg_ptr, 0, arg_expr)
+                    Set argument_count to argument_count plus 1
+
+                    Note: Check for comma
+                    Let current_token_comma be memory_get_pointer(parser, 8)
+                    Let token_type_comma be memory_get_integer(current_token_comma, 0)
+                    If token_type_comma is equal to 52:  Note: TOKEN_COMMA (52)
+                        parser_eat(parser, 52)
+                    End If
+                End If
+            End While
+
+            parser_eat(parser, 49)
+
+            Note: Create EXPR_INDIRECT_CALL expression
+            Note: Structure: type(int32), func_ptr_expr(ptr at 8), arguments(ptr at 16), arg_count(int32 at 24)
+            Let indirect_call be memory_allocate(32)
+            memory_set_int32(indirect_call, 0, 11)  Note: EXPR_INDIRECT_CALL
+            memory_set_pointer(indirect_call, 8, left)  Note: The function pointer expression
+            memory_set_pointer(indirect_call, 16, arguments)
+            memory_set_int32(indirect_call, 24, argument_count)
+            Set left to indirect_call
         End If
     End If
 
@@ -609,7 +715,8 @@ Process called "parser_parse_set_statement" takes parser as Integer returns Inte
     parser_eat(parser, 14)
 
     Note: Parse the target expression (could be variable or nested field access)
-    Let target be parser_parse_expression(parser)
+    Note: Use comparison_level to avoid parsing "to" as range operator
+    Let target be parser_parse_comparison_level(parser)
 
     Note: Check for compound assignment: gets [increased|decreased|multiplied|divided] by
     Let current_token be memory_get_pointer(parser, 8)
@@ -703,6 +810,9 @@ Let EXPR_STRUCT_CONSTRUCTION be 20
 Let EXPR_LAMBDA be 23
 Let EXPR_LAMBDA_CALL be 24
 Let EXPR_CHARACTER_LITERAL be 25
+Let EXPR_RANGE be 26
+Let EXPR_TERNARY be 27
+Let EXPR_STRING_INTERPOLATION be 28
 
 Note: Statement type constants - synchronized with codegen.runa
 Let STMT_LET be 1
@@ -1117,15 +1227,6 @@ Process called "expression_create_integer" takes value as Integer returns Intege
     Return expr
 End Process
 
-Note: Create character literal expression
-Process called "expression_create_character_literal" takes char_value as Integer returns Integer:
-    Let expr_size be 32  Note: Match other expression types for safety
-    Let expr be memory_allocate(expr_size)
-    memory_set_int32(expr, 0, EXPR_CHARACTER_LITERAL)
-    memory_set_integer(expr, 8, char_value)
-    Return expr
-End Process
-
 Note: Create variable expression
 Process called "expression_create_variable" takes name as Integer returns Integer:
     Let expr_size be 32  Note: Ensure sufficient space: type(8) + name_pointer(8) + padding
@@ -1186,6 +1287,40 @@ Process called "expression_create_string_literal_owned" takes string_value as In
     Let expr be memory_allocate(expr_size)
     memory_set_int32(expr, 0, EXPR_STRING_LITERAL)
     memory_set_pointer(expr, 8, string_value)  Note: Takes ownership
+
+    Return expr
+End Process
+
+Note: Create character literal expression
+Process called "expression_create_character_literal" takes char_value as Integer returns Integer:
+    Let expr_size be 32  Note: Match other expression types for safety
+    Let expr be memory_allocate(expr_size)
+    memory_set_int32(expr, 0, EXPR_CHARACTER_LITERAL)
+    memory_set_int32(expr, 8, char_value)  Note: Store character as int32
+
+    Return expr
+End Process
+
+Note: Create range expression (start to/through end)
+Process called "expression_create_range" takes start_expr as Integer, end_expr as Integer, is_inclusive as Integer returns Integer:
+    Let expr_size be 32  Note: Match other expression types for safety
+    Let expr be memory_allocate(expr_size)
+    memory_set_int32(expr, 0, EXPR_RANGE)
+    memory_set_pointer(expr, 8, start_expr)   Note: Start expression
+    memory_set_pointer(expr, 16, end_expr)    Note: End expression
+    memory_set_int32(expr, 24, is_inclusive)  Note: 1 for through, 0 for to
+
+    Return expr
+End Process
+
+Note: Create ternary expression (value If condition Otherwise other_value)
+Process called "expression_create_ternary" takes true_expr as Integer, condition as Integer, false_expr as Integer returns Integer:
+    Let expr_size be 32  Note: Match other expression types for safety
+    Let expr be memory_allocate(expr_size)
+    memory_set_int32(expr, 0, EXPR_TERNARY)
+    memory_set_pointer(expr, 8, condition)    Note: Condition expression
+    memory_set_pointer(expr, 16, true_expr)   Note: True branch expression
+    memory_set_pointer(expr, 24, false_expr)  Note: False branch expression
 
     Return expr
 End Process
@@ -1780,15 +1915,6 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
         Return expr
     End If
 
-    Note: Handle character literal
-    If token_type is equal to 163:  Note: TOKEN_CHARACTER_LITERAL
-        Let value_str be memory_get_pointer(current_token, 8)
-        Let char_value be string_to_integer(value_str)
-        Let dummy_char be parser_eat(parser, 163)
-        Let expr be expression_create_character_literal(char_value)
-        Return expr
-    End If
-
     Note: Handle string literal
     If token_type is equal to 10:
         Let value_str be memory_get_pointer(current_token, 8)
@@ -1831,6 +1957,27 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
             Let expr be expression_create_string_literal_owned(string_value)
             Return expr
         End If
+    End If
+
+    Note: Handle character literal
+    If token_type is equal to 163:  Note: TOKEN_CHARACTER_LITERAL
+        Let value_str be memory_get_pointer(current_token, 8)
+        Let char_value be string_to_integer(value_str)
+        Let dummy7 be parser_eat(parser, 163)
+        Let expr be expression_create_character_literal(char_value)
+        Return expr
+    End If
+
+    Note: Handle f-string (string interpolation)
+    If token_type is equal to 165:  Note: TOKEN_F_STRING
+        Let fstring_content be memory_get_pointer(current_token, 8)
+        Note: CRITICAL: Duplicate BEFORE parser_eat destroys the token!
+        Let fstring_copy be string_duplicate_parser(fstring_content)
+        Let dummy_fstring be parser_eat(parser, 165)
+
+        Note: DEBUG: Bypass parsing, use as regular string
+        Let expr be expression_create_string_literal_owned(fstring_copy)
+        Return expr
     End If
 
     Note: Handle function pointer ($identifier)
@@ -5649,4 +5796,144 @@ Process called "parser_parse_import" takes parser as Integer returns Integer:
     memory_set_pointer(import_stmt, 8, module_name) Note: module_name at offset 8
 
     Return import_stmt
+End Process
+
+Process called "parser_parse_fstring" takes parser as Integer, fstring_content as Integer returns Integer:
+    Note: Parse f-string and create EXPR_STRING_INTERPOLATION
+    Note: f-string format: f"text {expr} more text {expr2}"
+    Note: We need to split into parts and expressions
+
+    Note: Safety check for null or empty fstring_content
+    If fstring_content is equal to 0:
+        Note: Return empty string literal for null f-string
+        Let empty_str be string_duplicate_parser("")
+        Let expr be expression_create_string_literal_owned(empty_str)
+        Return expr
+    End If
+
+    Note: Allocate arrays for string parts and expressions
+    Let capacity be 8
+    Let parts be memory_allocate(capacity multiplied by 8)
+    Let expressions be memory_allocate(capacity multiplied by 8)
+
+    Note: Initialize arrays to NULL
+    Let init_j be 0
+    While init_j is less than capacity:
+        memory_set_pointer(parts plus (init_j multiplied by 8), 0, 0)
+        memory_set_pointer(expressions plus (init_j multiplied by 8), 0, 0)
+        Set init_j to init_j plus 1
+    End While
+
+    Let part_count be 0
+    Let expr_count be 0
+
+    Let i be 0
+    Let len be string_length(fstring_content)
+
+    Note: Check if content is empty - if so, return single empty string part
+    If len is equal to 0:
+        Let empty_str be string_duplicate_parser("")
+        memory_set_pointer(parts plus 0, 0, empty_str)
+        Set part_count to 1
+
+        Let expr be memory_allocate(32)
+        memory_set_int32(expr, 0, 28)
+        memory_set_int32(expr, 4, part_count)
+        memory_set_int32(expr, 8, 0)
+        memory_set_pointer(expr, 16, parts)
+        memory_set_pointer(expr, 24, expressions)
+        Return expr
+    End If
+
+    Let current_part be memory_allocate(256)
+
+    Note: Initialize buffer to zeros
+    Let init_i be 0
+    While init_i is less than 256:
+        memory_set_byte(current_part plus init_i, 0, 0)
+        Set init_i to init_i plus 1
+    End While
+
+    Let part_len be 0
+
+    While i is less than len:
+        Let ch be memory_get_byte(fstring_content plus i, 0)
+
+        Note: Check for opening brace
+        If ch is equal to 123:  Note: ASCII for '{'
+            Note: Save current text part if any
+            If part_len is greater than 0:
+                memory_set_byte(current_part plus part_len, 0, 0)  Note: Null terminate
+                memory_set_pointer(parts plus (part_count multiplied by 8), 0, string_duplicate_parser(current_part))
+                Set part_count to part_count plus 1
+                Set part_len to 0
+            End If
+
+            Note: Find closing brace
+            Set i to i plus 1
+            Let expr_start be i
+            Let brace_depth be 1
+            While i is less than len:
+                Let expr_ch be memory_get_byte(fstring_content plus i, 0)
+                If expr_ch is equal to 123:
+                    Set brace_depth to brace_depth plus 1
+                End If
+                If expr_ch is equal to 125:  Note: ASCII for '}'
+                    Set brace_depth to brace_depth minus 1
+                    If brace_depth is equal to 0:
+                        Note: Found matching closing brace
+                        Let expr_len be i minus expr_start
+                        Let expr_str be memory_allocate(expr_len plus 1)
+                        memory_copy(expr_str, fstring_content plus expr_start, expr_len)
+                        memory_set_byte(expr_str plus expr_len, 0, 0)
+
+                        Note: Create mini-lexer and parser for this expression
+                        Let expr_lexer be lexer_create_from_string(expr_str)
+                        Let expr_token_list be lexer_tokenize(expr_lexer)
+
+                        Note: Extract tokens array from token_list structure
+                        Let expr_tokens be memory_get_pointer(expr_token_list, 0)
+                        Let expr_token_count be memory_get_integer(expr_token_list, 8)
+
+                        Note: Create parser with tokens
+                        Let expr_parser be parser_create(expr_tokens)
+                        Let parsed_expr be parser_parse_additive(expr_parser)
+
+                        memory_set_pointer(expressions plus (expr_count multiplied by 8), 0, parsed_expr)
+                        Set expr_count to expr_count plus 1
+
+                        deallocate(expr_str)
+                        Set i to i plus 1
+                        Set brace_depth to -1  Note: Signal to break
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        Otherwise:
+            Note: Regular character, add to current part
+            memory_set_byte(current_part plus part_len, 0, ch)
+            Set part_len to part_len plus 1
+            Set i to i plus 1
+        End If
+    End While
+
+    Note: Save final text part if any
+    If part_len is greater than 0:
+        memory_set_byte(current_part plus part_len, 0, 0)
+        memory_set_pointer(parts plus (part_count multiplied by 8), 0, string_duplicate_parser(current_part))
+        Set part_count to part_count plus 1
+    End If
+
+    deallocate(current_part)
+
+    Note: Create EXPR_STRING_INTERPOLATION structure
+    Note: Layout: type(4), part_count(4), expr_count(4), parts_ptr(8), exprs_ptr(8)
+    Let expr be memory_allocate(32)
+    memory_set_int32(expr, 0, 28)  Note: EXPR_STRING_INTERPOLATION
+    memory_set_int32(expr, 4, part_count)
+    memory_set_int32(expr, 8, expr_count)
+    memory_set_pointer(expr, 16, parts)
+    memory_set_pointer(expr, 24, expressions)
+
+    Return expr
 End Process
