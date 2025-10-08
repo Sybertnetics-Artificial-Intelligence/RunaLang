@@ -327,8 +327,6 @@ TOKEN_LIST:    .quad 159
 TOKEN_DICTIONARY:    .quad 160
 .globl TOKEN_UNDERSCORE
 TOKEN_UNDERSCORE:    .quad 161
-.globl TOKEN_LAMBDA
-TOKEN_LAMBDA:    .quad 162
 
 .text
 print_string:
@@ -481,54 +479,53 @@ print_integer:
 .STR47:    .string "each"
 .STR48:    .string "less"
 .STR49:    .string "length"
-.STR50:    .string "lambda"
-.STR51:    .string "greater"
-.STR52:    .string "gets"
-.STR53:    .string "not"
-.STR54:    .string "negative"
-.STR55:    .string "and"
-.STR56:    .string "as"
-.STR57:    .string "at"
-.STR58:    .string "an"
-.STR59:    .string "array"
-.STR60:    .string "or"
-.STR61:    .string "of"
-.STR62:    .string "Otherwise"
-.STR63:    .string "While"
-.STR64:    .string "When"
-.STR65:    .string "Type"
-.STR66:    .string "Break"
-.STR67:    .string "false"
-.STR68:    .string "from"
-.STR69:    .string "divided"
-.STR70:    .string "decreased"
-.STR71:    .string "Display"
-.STR72:    .string "Decrease"
-.STR73:    .string "Divide"
-.STR74:    .string "Multiply"
-.STR75:    .string "Match"
-.STR76:    .string "For"
-.STR77:    .string "where"
-.STR78:    .string "with"
-.STR79:    .string "key"
-.STR80:    .string "string_length"
-.STR81:    .string "read_file"
-.STR82:    .string "write_file"
-.STR83:    .string "memory_get_byte"
-.STR84:    .string "memory_set_byte"
-.STR85:    .string "-"
-.STR86:    .string ":"
-.STR87:    .string "("
-.STR88:    .string ")"
-.STR89:    .string "["
-.STR90:    .string "]"
-.STR91:    .string "."
-.STR92:    .string ","
-.STR93:    .string "|"
-.STR94:    .string "$"
-.STR95:    .string "_"
-.STR96:    .string "{"
-.STR97:    .string "}"
+.STR50:    .string "greater"
+.STR51:    .string "gets"
+.STR52:    .string "not"
+.STR53:    .string "negative"
+.STR54:    .string "and"
+.STR55:    .string "as"
+.STR56:    .string "at"
+.STR57:    .string "an"
+.STR58:    .string "array"
+.STR59:    .string "or"
+.STR60:    .string "of"
+.STR61:    .string "Otherwise"
+.STR62:    .string "While"
+.STR63:    .string "When"
+.STR64:    .string "Type"
+.STR65:    .string "Break"
+.STR66:    .string "false"
+.STR67:    .string "from"
+.STR68:    .string "divided"
+.STR69:    .string "decreased"
+.STR70:    .string "Display"
+.STR71:    .string "Decrease"
+.STR72:    .string "Divide"
+.STR73:    .string "Multiply"
+.STR74:    .string "Match"
+.STR75:    .string "For"
+.STR76:    .string "where"
+.STR77:    .string "with"
+.STR78:    .string "key"
+.STR79:    .string "string_length"
+.STR80:    .string "read_file"
+.STR81:    .string "write_file"
+.STR82:    .string "memory_get_byte"
+.STR83:    .string "memory_set_byte"
+.STR84:    .string "-"
+.STR85:    .string ":"
+.STR86:    .string "("
+.STR87:    .string ")"
+.STR88:    .string "["
+.STR89:    .string "]"
+.STR90:    .string "."
+.STR91:    .string ","
+.STR92:    .string "|"
+.STR93:    .string "$"
+.STR94:    .string "_"
+.STR95:    .string "{"
+.STR96:    .string "}"
 .text
 
 
@@ -536,7 +533,7 @@ print_integer:
 string_copy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -605,7 +602,7 @@ string_copy:
 string_copy_n:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -660,7 +657,7 @@ string_copy_n:
 string_set_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -684,7 +681,7 @@ string_set_char:
 lexer_advance:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $20, %rax
     pushq %rax
@@ -856,7 +853,7 @@ lexer_advance:
 lexer_skip_whitespace:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $1, %rax
     movq %rax, -16(%rbp)
@@ -933,7 +930,7 @@ lexer_skip_whitespace:
 lexer_skip_note_comment:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $20, %rax
     pushq %rax
@@ -1798,7 +1795,7 @@ lexer_skip_note_comment:
 token_create_owned:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1860,7 +1857,7 @@ token_create_owned:
 token_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1949,7 +1946,7 @@ token_create:
 lexer_read_string_literal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2121,7 +2118,7 @@ lexer_read_string_literal:
 lexer_read_word:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -2279,7 +2276,7 @@ lexer_read_word:
 lexer_read_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -2418,7 +2415,7 @@ lexer_read_integer:
 lexer_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $32, %rax
     movq %rax, -16(%rbp)
@@ -2513,7 +2510,7 @@ lexer_create:
 lexer_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2553,7 +2550,7 @@ lexer_destroy:
 lexer_next_token:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $1, %rax
     movq %rax, -16(%rbp)
@@ -3140,7 +3137,7 @@ lexer_next_token:
 determine_token_type:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $0, %rax
     pushq %rax
@@ -3811,7 +3808,7 @@ determine_token_type:
 check_keywords_P:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR8(%rip), %rax
     pushq %rax
@@ -3867,7 +3864,7 @@ check_keywords_P:
 check_keywords_c:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR10(%rip), %rax
     pushq %rax
@@ -3923,7 +3920,7 @@ check_keywords_c:
 check_keywords_r:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR12(%rip), %rax
     pushq %rax
@@ -3957,7 +3954,7 @@ check_keywords_r:
 check_keywords_I:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR13(%rip), %rax
     pushq %rax
@@ -4079,7 +4076,7 @@ check_keywords_I:
 check_keywords_A:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR18(%rip), %rax
     pushq %rax
@@ -4113,7 +4110,7 @@ check_keywords_A:
 check_keywords_S:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR19(%rip), %rax
     pushq %rax
@@ -4169,7 +4166,7 @@ check_keywords_S:
 check_keywords_C:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR21(%rip), %rax
     pushq %rax
@@ -4225,7 +4222,7 @@ check_keywords_C:
 check_keywords_R:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR23(%rip), %rax
     pushq %rax
@@ -4259,7 +4256,7 @@ check_keywords_R:
 check_keywords_E:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR0(%rip), %rax
     pushq %rax
@@ -4293,7 +4290,7 @@ check_keywords_E:
 check_keywords_L:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR24(%rip), %rax
     pushq %rax
@@ -4327,7 +4324,7 @@ check_keywords_L:
 check_keywords_b:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR25(%rip), %rax
     pushq %rax
@@ -4493,7 +4490,7 @@ check_keywords_b:
 check_keywords_s:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
     movq %rbp, %rsp
@@ -4505,7 +4502,7 @@ check_keywords_s:
 check_keywords_t:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR32(%rip), %rax
     pushq %rax
@@ -4649,7 +4646,7 @@ check_keywords_t:
 check_keywords_p:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR38(%rip), %rax
     pushq %rax
@@ -4683,7 +4680,7 @@ check_keywords_p:
 check_keywords_m:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR39(%rip), %rax
     pushq %rax
@@ -4761,7 +4758,7 @@ check_keywords_m:
 check_keywords_i:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR42(%rip), %rax
     pushq %rax
@@ -4861,7 +4858,7 @@ check_keywords_i:
 check_keywords_e:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR46(%rip), %rax
     pushq %rax
@@ -4917,7 +4914,7 @@ check_keywords_e:
 check_keywords_l:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR48(%rip), %rax
     pushq %rax
@@ -4961,6 +4958,20 @@ check_keywords_l:
     ret
     jmp .L1442
 .L1441:
+.L1442:
+.L1432:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_g
+check_keywords_g:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR50(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4976,27 +4987,12 @@ check_keywords_l:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1451
-    movq $162, %rax  # Load compile-time constant TOKEN_LAMBDA
+    movq $25, %rax  # Load compile-time constant TOKEN_GREATER
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1452
 .L1451:
-.L1452:
-.L1442:
-.L1432:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_g
-check_keywords_g:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
     leaq .STR51(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5012,12 +5008,26 @@ check_keywords_g:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1461
-    movq $25, %rax  # Load compile-time constant TOKEN_GREATER
+    movq $136, %rax  # Load compile-time constant TOKEN_GETS
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1462
 .L1461:
+.L1462:
+.L1452:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_n
+check_keywords_n:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR52(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5033,26 +5043,12 @@ check_keywords_g:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1471
-    movq $136, %rax  # Load compile-time constant TOKEN_GETS
+    movq $29, %rax  # Load compile-time constant TOKEN_NOT
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1472
 .L1471:
-.L1472:
-.L1462:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_n
-check_keywords_n:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
     leaq .STR53(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5068,35 +5064,14 @@ check_keywords_n:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1481
-    movq $29, %rax  # Load compile-time constant TOKEN_NOT
+    movq $133, %rax  # Load compile-time constant TOKEN_NEGATIVE
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1482
 .L1481:
-    leaq .STR54(%rip), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1491
-    movq $133, %rax  # Load compile-time constant TOKEN_NEGATIVE
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L1492
-.L1491:
-.L1492:
 .L1482:
+.L1472:
     movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
     movq %rbp, %rsp
     popq %rbp
@@ -5107,7 +5082,7 @@ check_keywords_n:
 check_keywords_N:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR1(%rip), %rax
     pushq %rax
@@ -5123,14 +5098,14 @@ check_keywords_N:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1501
+    jz .L1491
     movq $123, %rax  # Load compile-time constant TOKEN_NOTE
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1502
-.L1501:
-.L1502:
+    jmp .L1492
+.L1491:
+.L1492:
     movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
     movq %rbp, %rsp
     popq %rbp
@@ -5141,8 +5116,29 @@ check_keywords_N:
 check_keywords_a:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
+    leaq .STR54(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1501
+    movq $30, %rax  # Load compile-time constant TOKEN_AND
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1502
+.L1501:
     leaq .STR55(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5158,7 +5154,7 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1511
-    movq $30, %rax  # Load compile-time constant TOKEN_AND
+    movq $34, %rax  # Load compile-time constant TOKEN_AS
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5179,7 +5175,7 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1521
-    movq $34, %rax  # Load compile-time constant TOKEN_AS
+    movq $148, %rax  # Load compile-time constant TOKEN_AT
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5200,7 +5196,7 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1531
-    movq $148, %rax  # Load compile-time constant TOKEN_AT
+    movq $154, %rax  # Load compile-time constant TOKEN_AN
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5221,12 +5217,29 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1541
-    movq $154, %rax  # Load compile-time constant TOKEN_AN
+    movq $126, %rax  # Load compile-time constant TOKEN_ARRAY
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1542
 .L1541:
+.L1542:
+.L1532:
+.L1522:
+.L1512:
+.L1502:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_o
+check_keywords_o:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR59(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5242,29 +5255,12 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1551
-    movq $126, %rax  # Load compile-time constant TOKEN_ARRAY
+    movq $31, %rax  # Load compile-time constant TOKEN_OR
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1552
 .L1551:
-.L1552:
-.L1542:
-.L1532:
-.L1522:
-.L1512:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_o
-check_keywords_o:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
     leaq .STR60(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5280,12 +5276,26 @@ check_keywords_o:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1561
-    movq $31, %rax  # Load compile-time constant TOKEN_OR
+    movq $125, %rax  # Load compile-time constant TOKEN_OF
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1562
 .L1561:
+.L1562:
+.L1552:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_O
+check_keywords_O:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR61(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5301,25 +5311,24 @@ check_keywords_o:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1571
-    movq $125, %rax  # Load compile-time constant TOKEN_OF
+    movq $19, %rax  # Load compile-time constant TOKEN_OTHERWISE
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1572
 .L1571:
 .L1572:
-.L1562:
     movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
     movq %rbp, %rsp
     popq %rbp
     ret
 
 
-.globl check_keywords_O
-check_keywords_O:
+.globl check_keywords_W
+check_keywords_W:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR62(%rip), %rax
     pushq %rax
@@ -5336,25 +5345,12 @@ check_keywords_O:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1581
-    movq $19, %rax  # Load compile-time constant TOKEN_OTHERWISE
+    movq $20, %rax  # Load compile-time constant TOKEN_WHILE
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1582
 .L1581:
-.L1582:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_W
-check_keywords_W:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
     leaq .STR63(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5370,12 +5366,26 @@ check_keywords_W:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1591
-    movq $20, %rax  # Load compile-time constant TOKEN_WHILE
+    movq $113, %rax  # Load compile-time constant TOKEN_WHEN
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1592
 .L1591:
+.L1592:
+.L1582:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_T
+check_keywords_T:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR64(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5391,25 +5401,24 @@ check_keywords_W:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1601
-    movq $113, %rax  # Load compile-time constant TOKEN_WHEN
+    movq $50, %rax  # Load compile-time constant TOKEN_TYPE
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1602
 .L1601:
 .L1602:
-.L1592:
     movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
     movq %rbp, %rsp
     popq %rbp
     ret
 
 
-.globl check_keywords_T
-check_keywords_T:
+.globl check_keywords_B
+check_keywords_B:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR65(%rip), %rax
     pushq %rax
@@ -5426,7 +5435,7 @@ check_keywords_T:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1611
-    movq $50, %rax  # Load compile-time constant TOKEN_TYPE
+    movq $44, %rax  # Load compile-time constant TOKEN_BREAK
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5439,11 +5448,11 @@ check_keywords_T:
     ret
 
 
-.globl check_keywords_B
-check_keywords_B:
+.globl check_keywords_f
+check_keywords_f:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR66(%rip), %rax
     pushq %rax
@@ -5460,25 +5469,12 @@ check_keywords_B:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1621
-    movq $44, %rax  # Load compile-time constant TOKEN_BREAK
+    movq $135, %rax  # Load compile-time constant TOKEN_FALSE
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1622
 .L1621:
-.L1622:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_f
-check_keywords_f:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
     leaq .STR67(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5494,12 +5490,26 @@ check_keywords_f:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1631
-    movq $135, %rax  # Load compile-time constant TOKEN_FALSE
+    movq $144, %rax  # Load compile-time constant TOKEN_FROM
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1632
 .L1631:
+.L1632:
+.L1622:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_d
+check_keywords_d:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR68(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5515,26 +5525,12 @@ check_keywords_f:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1641
-    movq $144, %rax  # Load compile-time constant TOKEN_FROM
+    movq $36, %rax  # Load compile-time constant TOKEN_DIVIDED
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1642
 .L1641:
-.L1642:
-.L1632:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_d
-check_keywords_d:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
     leaq .STR69(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5550,12 +5546,26 @@ check_keywords_d:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1651
-    movq $36, %rax  # Load compile-time constant TOKEN_DIVIDED
+    movq $138, %rax  # Load compile-time constant TOKEN_DECREASED
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1652
 .L1651:
+.L1652:
+.L1642:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_D
+check_keywords_D:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR70(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5571,26 +5581,12 @@ check_keywords_d:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1661
-    movq $138, %rax  # Load compile-time constant TOKEN_DECREASED
+    movq $47, %rax  # Load compile-time constant TOKEN_PRINT
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1662
 .L1661:
-.L1662:
-.L1652:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_D
-check_keywords_D:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
     leaq .STR71(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5606,7 +5602,7 @@ check_keywords_D:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1671
-    movq $47, %rax  # Load compile-time constant TOKEN_PRINT
+    movq $140, %rax  # Load compile-time constant TOKEN_DECREASE
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5627,12 +5623,27 @@ check_keywords_D:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1681
-    movq $140, %rax  # Load compile-time constant TOKEN_DECREASE
+    movq $142, %rax  # Load compile-time constant TOKEN_DIVIDE
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1682
 .L1681:
+.L1682:
+.L1672:
+.L1662:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_M
+check_keywords_M:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR73(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5648,27 +5659,12 @@ check_keywords_D:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1691
-    movq $142, %rax  # Load compile-time constant TOKEN_DIVIDE
+    movq $141, %rax  # Load compile-time constant TOKEN_MULTIPLY
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1692
 .L1691:
-.L1692:
-.L1682:
-.L1672:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_M
-check_keywords_M:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
     leaq .STR74(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5684,12 +5680,26 @@ check_keywords_M:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1701
-    movq $141, %rax  # Load compile-time constant TOKEN_MULTIPLY
+    movq $112, %rax  # Load compile-time constant TOKEN_MATCH
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1702
 .L1701:
+.L1702:
+.L1692:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_F
+check_keywords_F:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR75(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5705,25 +5715,24 @@ check_keywords_M:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1711
-    movq $112, %rax  # Load compile-time constant TOKEN_MATCH
+    movq $143, %rax  # Load compile-time constant TOKEN_FOR
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1712
 .L1711:
 .L1712:
-.L1702:
     movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
     movq %rbp, %rsp
     popq %rbp
     ret
 
 
-.globl check_keywords_F
-check_keywords_F:
+.globl check_keywords_w
+check_keywords_w:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     leaq .STR76(%rip), %rax
     pushq %rax
@@ -5740,25 +5749,12 @@ check_keywords_F:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1721
-    movq $143, %rax  # Load compile-time constant TOKEN_FOR
+    movq $153, %rax  # Load compile-time constant TOKEN_WHERE
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1722
 .L1721:
-.L1722:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_w
-check_keywords_w:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
     leaq .STR77(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5774,12 +5770,26 @@ check_keywords_w:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1731
-    movq $153, %rax  # Load compile-time constant TOKEN_WHERE
+    movq $114, %rax  # Load compile-time constant TOKEN_WITH
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1732
 .L1731:
+.L1732:
+.L1722:
+    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl check_keywords_k
+check_keywords_k:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack space for variables
+    movq %rdi, -8(%rbp)
     leaq .STR78(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5795,48 +5805,13 @@ check_keywords_w:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1741
-    movq $114, %rax  # Load compile-time constant TOKEN_WITH
+    movq $150, %rax  # Load compile-time constant TOKEN_KEY
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1742
 .L1741:
 .L1742:
-.L1732:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-
-.globl check_keywords_k
-check_keywords_k:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
-    movq %rdi, -8(%rbp)
-    leaq .STR79(%rip), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1751
-    movq $150, %rax  # Load compile-time constant TOKEN_KEY
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L1752
-.L1751:
-.L1752:
     movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
     movq %rbp, %rsp
     popq %rbp
@@ -5847,9 +5822,9 @@ check_keywords_k:
 check_builtin_functions:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
-    leaq .STR66(%rip), %rax
+    leaq .STR65(%rip), %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rax
     pushq %rax
@@ -5867,14 +5842,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1761
+    jz .L1751
     movq $44, %rax  # Load compile-time constant TOKEN_BREAK
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1762
-.L1761:
-.L1762:
+    jmp .L1752
+.L1751:
+.L1752:
     leaq .STR22(%rip), %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rax
@@ -5896,17 +5871,46 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1771
+    jz .L1761
     movq $45, %rax  # Load compile-time constant TOKEN_CONTINUE
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1762
+.L1761:
+.L1762:
+    leaq .STR9(%rip), %rax
+    movq %rax, -40(%rbp)
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    leaq -24(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1771
+    movq $47, %rax  # Load compile-time constant TOKEN_PRINT
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1772
 .L1771:
 .L1772:
-    leaq .STR9(%rip), %rax
-    movq %rax, -40(%rbp)
-    movq -40(%rbp), %rax
+    leaq .STR70(%rip), %rax
+    movq %rax, -48(%rbp)
+    movq -48(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -5933,36 +5937,7 @@ check_builtin_functions:
     jmp .L1782
 .L1781:
 .L1782:
-    leaq .STR71(%rip), %rax
-    movq %rax, -48(%rbp)
-    movq -48(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    leaq -24(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1791
-    movq $47, %rax  # Load compile-time constant TOKEN_PRINT
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L1792
-.L1791:
-.L1792:
-    leaq .STR65(%rip), %rax
+    leaq .STR64(%rip), %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rax
     pushq %rax
@@ -5983,14 +5958,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1801
+    jz .L1791
     movq $50, %rax  # Load compile-time constant TOKEN_TYPE
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1802
-.L1801:
-.L1802:
+    jmp .L1792
+.L1791:
+.L1792:
     leaq .STR17(%rip), %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %rax
@@ -6012,15 +5987,15 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1811
+    jz .L1801
     movq $56, %rax  # Load compile-time constant TOKEN_IMPORT
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1812
-.L1811:
-.L1812:
-    leaq .STR80(%rip), %rax
+    jmp .L1802
+.L1801:
+.L1802:
+    leaq .STR79(%rip), %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rax
     pushq %rax
@@ -6041,14 +6016,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1821
+    jz .L1811
     movq $57, %rax  # Load compile-time constant TOKEN_STRING_LENGTH
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1822
-.L1821:
-.L1822:
+    jmp .L1812
+.L1811:
+.L1812:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -6064,9 +6039,9 @@ check_builtin_functions:
 check_more_builtins:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
-    leaq .STR81(%rip), %rax
+    leaq .STR80(%rip), %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rax
     pushq %rax
@@ -6084,15 +6059,15 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1831
+    jz .L1821
     movq $54, %rax  # Load compile-time constant TOKEN_READ_FILE
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1832
-.L1831:
-.L1832:
-    leaq .STR82(%rip), %rax
+    jmp .L1822
+.L1821:
+.L1822:
+    leaq .STR81(%rip), %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6113,15 +6088,15 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1841
+    jz .L1831
     movq $55, %rax  # Load compile-time constant TOKEN_WRITE_FILE
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1842
-.L1841:
-.L1842:
-    leaq .STR83(%rip), %rax
+    jmp .L1832
+.L1831:
+.L1832:
+    leaq .STR82(%rip), %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
     pushq %rax
@@ -6142,15 +6117,15 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1851
+    jz .L1841
     movq $130, %rax  # Load compile-time constant TOKEN_MEMORY_GET_BYTE
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1852
-.L1851:
-.L1852:
-    leaq .STR84(%rip), %rax
+    jmp .L1842
+.L1841:
+.L1842:
+    leaq .STR83(%rip), %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rax
     pushq %rax
@@ -6171,14 +6146,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1861
+    jz .L1851
     movq $131, %rax  # Load compile-time constant TOKEN_MEMORY_SET_BYTE
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1862
-.L1861:
-.L1862:
+    jmp .L1852
+.L1851:
+.L1852:
     leaq .STR30(%rip), %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rax
@@ -6200,14 +6175,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1871
+    jz .L1861
     movq $42, %rax  # Load compile-time constant TOKEN_BIT_SHIFT_LEFT
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1872
-.L1871:
-.L1872:
+    jmp .L1862
+.L1861:
+.L1862:
     leaq .STR31(%rip), %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %rax
@@ -6229,14 +6204,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1881
+    jz .L1871
     movq $43, %rax  # Load compile-time constant TOKEN_BIT_SHIFT_RIGHT
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1882
-.L1881:
-.L1882:
+    jmp .L1872
+.L1871:
+.L1872:
     leaq .STR27(%rip), %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rax
@@ -6258,14 +6233,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1891
+    jz .L1881
     movq $39, %rax  # Load compile-time constant TOKEN_BIT_AND
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1892
-.L1891:
-.L1892:
+    jmp .L1882
+.L1881:
+.L1882:
     leaq .STR28(%rip), %rax
     movq %rax, -80(%rbp)
     movq -80(%rbp), %rax
@@ -6287,14 +6262,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1901
+    jz .L1891
     movq $40, %rax  # Load compile-time constant TOKEN_BIT_OR
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1902
-.L1901:
-.L1902:
+    jmp .L1892
+.L1891:
+.L1892:
     leaq .STR29(%rip), %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rax
@@ -6316,14 +6291,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1911
+    jz .L1901
     movq $41, %rax  # Load compile-time constant TOKEN_BIT_XOR
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1912
-.L1911:
-.L1912:
+    jmp .L1902
+.L1901:
+.L1902:
     movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
     movq %rbp, %rsp
     popq %rbp
@@ -6334,7 +6309,7 @@ check_more_builtins:
 check_single_char_token:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -6349,13 +6324,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1921
+    jz .L1911
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR85(%rip), %rax
+    leaq .STR84(%rip), %rax
     movq %rax, -56(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6375,8 +6350,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1922
-.L1921:
+    jmp .L1912
+.L1911:
     movq -16(%rbp), %rax
     pushq %rax
     movq $58, %rax
@@ -6385,13 +6360,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1931
+    jz .L1921
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR86(%rip), %rax
+    leaq .STR85(%rip), %rax
     movq %rax, -80(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6411,8 +6386,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1932
-.L1931:
+    jmp .L1922
+.L1921:
     movq -16(%rbp), %rax
     pushq %rax
     movq $40, %rax
@@ -6421,13 +6396,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1941
+    jz .L1931
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR87(%rip), %rax
+    leaq .STR86(%rip), %rax
     movq %rax, -104(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6447,8 +6422,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1942
-.L1941:
+    jmp .L1932
+.L1931:
     movq -16(%rbp), %rax
     pushq %rax
     movq $41, %rax
@@ -6457,13 +6432,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1951
+    jz .L1941
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR88(%rip), %rax
+    leaq .STR87(%rip), %rax
     movq %rax, -128(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6483,8 +6458,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1952
-.L1951:
+    jmp .L1942
+.L1941:
     movq -16(%rbp), %rax
     pushq %rax
     movq $91, %rax
@@ -6493,13 +6468,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1961
+    jz .L1951
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR89(%rip), %rax
+    leaq .STR88(%rip), %rax
     movq %rax, -152(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6519,8 +6494,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1962
-.L1961:
+    jmp .L1952
+.L1951:
     movq -16(%rbp), %rax
     pushq %rax
     movq $93, %rax
@@ -6529,13 +6504,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1971
+    jz .L1961
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR90(%rip), %rax
+    leaq .STR89(%rip), %rax
     movq %rax, -176(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6555,8 +6530,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1972
-.L1971:
+    jmp .L1962
+.L1961:
     movq -16(%rbp), %rax
     pushq %rax
     movq $46, %rax
@@ -6565,13 +6540,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1981
+    jz .L1971
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR91(%rip), %rax
+    leaq .STR90(%rip), %rax
     movq %rax, -200(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6591,8 +6566,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1982
-.L1981:
+    jmp .L1972
+.L1971:
     movq -16(%rbp), %rax
     pushq %rax
     movq $44, %rax
@@ -6601,13 +6576,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1991
+    jz .L1981
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR92(%rip), %rax
+    leaq .STR91(%rip), %rax
     movq %rax, -224(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6627,8 +6602,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1992
-.L1991:
+    jmp .L1982
+.L1981:
     movq -16(%rbp), %rax
     pushq %rax
     movq $124, %rax
@@ -6637,13 +6612,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2001
+    jz .L1991
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR93(%rip), %rax
+    leaq .STR92(%rip), %rax
     movq %rax, -248(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6663,8 +6638,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2002
-.L2001:
+    jmp .L1992
+.L1991:
     movq -16(%rbp), %rax
     pushq %rax
     movq $36, %rax
@@ -6673,13 +6648,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2011
+    jz .L2001
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR94(%rip), %rax
+    leaq .STR93(%rip), %rax
     movq %rax, -272(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6699,8 +6674,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2012
-.L2011:
+    jmp .L2002
+.L2001:
     movq -16(%rbp), %rax
     pushq %rax
     movq $95, %rax
@@ -6709,13 +6684,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2021
+    jz .L2011
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR95(%rip), %rax
+    leaq .STR94(%rip), %rax
     movq %rax, -296(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6735,8 +6710,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2022
-.L2021:
+    jmp .L2012
+.L2011:
     movq -16(%rbp), %rax
     pushq %rax
     movq $123, %rax
@@ -6745,13 +6720,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2031
+    jz .L2021
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR96(%rip), %rax
+    leaq .STR95(%rip), %rax
     movq %rax, -320(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6771,8 +6746,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2032
-.L2031:
+    jmp .L2022
+.L2021:
     movq -16(%rbp), %rax
     pushq %rax
     movq $125, %rax
@@ -6781,13 +6756,13 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2041
+    jz .L2031
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_advance
     movq %rax, -48(%rbp)
-    leaq .STR97(%rip), %rax
+    leaq .STR96(%rip), %rax
     movq %rax, -344(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
@@ -6807,9 +6782,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2042
-.L2041:
-.L2042:
+    jmp .L2032
+.L2031:
 .L2032:
 .L2022:
 .L2012:
@@ -6822,6 +6796,7 @@ check_single_char_token:
 .L1942:
 .L1932:
 .L1922:
+.L1912:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -6832,7 +6807,7 @@ check_single_char_token:
 token_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -6842,7 +6817,7 @@ token_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2051
+    jz .L2041
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6859,21 +6834,21 @@ token_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2061
+    jz .L2051
     movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    jmp .L2062
-.L2061:
-.L2062:
-    movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     jmp .L2052
 .L2051:
 .L2052:
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    jmp .L2042
+.L2041:
+.L2042:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -6884,7 +6859,7 @@ token_destroy:
 is_alnum_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -6899,14 +6874,14 @@ is_alnum_char:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2071
+    jz .L2061
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2072
-.L2071:
-.L2072:
+    jmp .L2062
+.L2061:
+.L2062:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -6922,7 +6897,7 @@ is_alnum_char:
 print_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $2, %rax
     pushq %rax
@@ -6967,7 +6942,7 @@ print_char:
 print_newline:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $10, %rax
     movq %rax, -16(%rbp)
@@ -6980,71 +6955,5 @@ print_newline:
     movq %rbp, %rsp
     popq %rbp
     ret
-
-.null_pointer_error:
-    # Print error message for null pointer
-    leaq .null_pointer_msg(%rip), %rdi
-    call print_string@PLT
-    # Exit with error code
-    movq $1, %rdi
-    call exit_with_code@PLT
-
-.bounds_error_negative:
-    # Print error message for negative index
-    leaq .bounds_error_negative_msg(%rip), %rdi
-    call print_string@PLT
-    # Print the negative index value
-    movq %rbx, %rdi  # Index value
-    call print_integer@PLT
-    # Exit with error code
-    movq $1, %rdi
-    call exit_with_code@PLT
-
-.bounds_error_overflow:
-    # Save registers that will be clobbered
-    pushq %rcx  # Save array size
-    pushq %rbx  # Save index
-    # Print error message for out-of-bounds index
-    leaq .bounds_error_overflow_msg(%rip), %rdi
-    call print_string@PLT
-    # Print the index value
-    popq %rdi  # Restore and use index
-    pushq %rdi  # Save again for later
-    call print_integer@PLT
-    # Print size message
-    leaq .bounds_error_size_msg(%rip), %rdi
-    call print_string@PLT
-    # Print the array size
-    movq 8(%rsp), %rdi  # Get saved array size from stack
-    call print_integer@PLT
-    # Clean up stack
-    addq $16, %rsp
-    # Exit with error code
-    movq $1, %rdi
-    call exit_with_code@PLT
-
-.section .rodata
-.null_pointer_msg:
-    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
-    .byte 78,117,108,108,32,112,111,105,110,116,101,114,32
-    .byte 100,101,114,101,102,101,114,101,110,99,101
-    .byte 10,0
-
-.bounds_error_negative_msg:
-    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
-    .byte 65,114,114,97,121,32,105,110,100,101,120,32
-    .byte 105,115,32,110,101,103,97,116,105,118,101,58,32
-    .byte 0
-
-.bounds_error_overflow_msg:
-    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
-    .byte 65,114,114,97,121,32,105,110,100,101,120,32
-    .byte 111,117,116,32,111,102,32,98,111,117,110,100,115,58,32
-    .byte 0
-
-.bounds_error_size_msg:
-    .byte 32,40,97,114,114,97,121,32,115,105,122,101,32,105,115,32
-    .byte 41,10,0
-
 
 .section .note.GNU-stack

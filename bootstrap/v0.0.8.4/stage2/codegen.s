@@ -1577,6 +1577,11 @@ codegen_add_string_literal:
 codegen_collect_strings_from_expression:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -2293,6 +2298,11 @@ codegen_collect_strings_from_expression:
 codegen_collect_strings_from_statement:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -3335,6 +3345,11 @@ codegen_collect_strings_from_statement:
 codegen_get_expression_type:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -3833,6 +3848,11 @@ codegen_get_expression_type:
 codegen_generate_lvalue_address:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -5913,6 +5933,11 @@ codegen_generate_string_literal:
 codegen_generate_binary_op:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -7965,6 +7990,11 @@ codegen_generate_binary_op:
 codegen_generate_unary_op:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -8042,6 +8072,11 @@ codegen_generate_unary_op:
 codegen_generate_comparison:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -8243,6 +8278,11 @@ codegen_generate_comparison:
 codegen_generate_function_call:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -9185,6 +9225,11 @@ codegen_generate_function_call:
 codegen_generate_indirect_call:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -9680,6 +9725,11 @@ codegen_generate_indirect_call:
 codegen_generate_field_access:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -10457,6 +10507,11 @@ codegen_generate_builtin_call:
 codegen_generate_expression:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -14631,6 +14686,11 @@ codegen_generate_expression:
 codegen_generate_statement:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -25471,6 +25531,11 @@ callgraph_find_node:
 callgraph_collect_calls_from_expr:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -26244,6 +26309,11 @@ callgraph_collect_calls_from_expr:
 callgraph_collect_calls_from_stmt:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -27426,6 +27496,11 @@ callgraph_detect_direct_recursion:
 callgraph_detect_mutual_recursion_dfs:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -28358,6 +28433,24 @@ codegen_generate_stack_overflow_handler:
     movq %rbp, %rsp
     popq %rbp
     ret
+
+# Stack overflow panic handler
+.stack_overflow_panic:
+    # Print error message
+    leaq .stack_overflow_msg(%rip), %rdi
+    call print_string@PLT
+    # Exit with error code
+    movq $1, %rdi
+    call exit_with_code@PLT
+
+.section .rodata
+.stack_overflow_msg:
+    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
+    .byte 83,116,97,99,107,32,111,118,101,114,102,108,111,119,32
+    .byte 100,101,116,101,99,116,101,100
+    .byte 10,0
+.text
+
 
 .null_pointer_error:
     # Print error message for null pointer

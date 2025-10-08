@@ -116,7 +116,7 @@ print_integer:
 read_file_internal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -177,7 +177,7 @@ read_file_internal:
 process_imports:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq $40, %rax
     pushq %rax
@@ -500,7 +500,7 @@ main:
     call runtime_set_command_line_args@PLT
     popq %rsi   # Restore argv
     popq %rdi   # Restore argc
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack space for variables
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -847,71 +847,5 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-
-.null_pointer_error:
-    # Print error message for null pointer
-    leaq .null_pointer_msg(%rip), %rdi
-    call print_string@PLT
-    # Exit with error code
-    movq $1, %rdi
-    call exit_with_code@PLT
-
-.bounds_error_negative:
-    # Print error message for negative index
-    leaq .bounds_error_negative_msg(%rip), %rdi
-    call print_string@PLT
-    # Print the negative index value
-    movq %rbx, %rdi  # Index value
-    call print_integer@PLT
-    # Exit with error code
-    movq $1, %rdi
-    call exit_with_code@PLT
-
-.bounds_error_overflow:
-    # Save registers that will be clobbered
-    pushq %rcx  # Save array size
-    pushq %rbx  # Save index
-    # Print error message for out-of-bounds index
-    leaq .bounds_error_overflow_msg(%rip), %rdi
-    call print_string@PLT
-    # Print the index value
-    popq %rdi  # Restore and use index
-    pushq %rdi  # Save again for later
-    call print_integer@PLT
-    # Print size message
-    leaq .bounds_error_size_msg(%rip), %rdi
-    call print_string@PLT
-    # Print the array size
-    movq 8(%rsp), %rdi  # Get saved array size from stack
-    call print_integer@PLT
-    # Clean up stack
-    addq $16, %rsp
-    # Exit with error code
-    movq $1, %rdi
-    call exit_with_code@PLT
-
-.section .rodata
-.null_pointer_msg:
-    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
-    .byte 78,117,108,108,32,112,111,105,110,116,101,114,32
-    .byte 100,101,114,101,102,101,114,101,110,99,101
-    .byte 10,0
-
-.bounds_error_negative_msg:
-    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
-    .byte 65,114,114,97,121,32,105,110,100,101,120,32
-    .byte 105,115,32,110,101,103,97,116,105,118,101,58,32
-    .byte 0
-
-.bounds_error_overflow_msg:
-    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
-    .byte 65,114,114,97,121,32,105,110,100,101,120,32
-    .byte 111,117,116,32,111,102,32,98,111,117,110,100,115,58,32
-    .byte 0
-
-.bounds_error_size_msg:
-    .byte 32,40,97,114,114,97,121,32,115,105,122,101,32,105,115,32
-    .byte 41,10,0
-
 
 .section .note.GNU-stack

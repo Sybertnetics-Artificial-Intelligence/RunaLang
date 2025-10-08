@@ -774,6 +774,11 @@ token_can_be_identifier:
 parser_parse_expression:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
@@ -967,6 +972,11 @@ parser_parse_logical_and:
 parser_parse_comparison_level:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
@@ -982,6 +992,11 @@ parser_parse_comparison_level:
 parser_parse_additive:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
@@ -1505,6 +1520,11 @@ parser_parse_multiplicative:
 parser_parse_primary_with_postfix:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
@@ -5270,6 +5290,11 @@ lambda_add_free_var:
 lambda_collect_free_vars:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -7512,6 +7537,11 @@ program_add_import:
 parser_parse_primary:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
@@ -14927,6 +14957,11 @@ parser_parse_print_statement:
 parser_parse_statement_block:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -15686,6 +15721,11 @@ parser_parse_statement_block:
 parser_parse_while_statement:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $20, %rax
@@ -15771,6 +15811,11 @@ parser_parse_while_statement:
 parser_parse_for_range_statement:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $143, %rax
@@ -16108,6 +16153,11 @@ parser_parse_for_range_statement:
 parser_parse_if_statement:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $18, %rax
@@ -16656,6 +16706,11 @@ parser_parse_if_statement:
 parser_parse_match_statement:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq $112, %rax
@@ -23903,6 +23958,11 @@ parser_parse_program:
 expression_destroy:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
@@ -24517,6 +24577,11 @@ function_destroy:
 type_destroy:
     pushq %rbp
     movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
@@ -25391,6 +25456,24 @@ parser_parse_import:
     movq %rbp, %rsp
     popq %rbp
     ret
+
+# Stack overflow panic handler
+.stack_overflow_panic:
+    # Print error message
+    leaq .stack_overflow_msg(%rip), %rdi
+    call print_string@PLT
+    # Exit with error code
+    movq $1, %rdi
+    call exit_with_code@PLT
+
+.section .rodata
+.stack_overflow_msg:
+    .byte 70,65,84,65,76,32,69,82,82,79,82,58,32
+    .byte 83,116,97,99,107,32,111,118,101,114,102,108,111,119,32
+    .byte 100,101,116,101,99,116,101,100
+    .byte 10,0
+.text
+
 
 .null_pointer_error:
     # Print error message for null pointer
