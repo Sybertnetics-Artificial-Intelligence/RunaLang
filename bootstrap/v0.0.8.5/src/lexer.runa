@@ -189,6 +189,7 @@ Let TOKEN_JOINED be 163
 Let TOKEN_CHAR_LITERAL be 164
 Let TOKEN_THROUGH be 165
 Let TOKEN_MOVE be 166
+Let TOKEN_FSTRING_LITERAL be 167
 
 Note: Additional string helper functions specific to lexer
 Process called "string_copy" takes dest as Integer, src as Integer returns Integer:
@@ -557,6 +558,140 @@ Process called "lexer_read_string_literal" takes lexer as Integer returns Intege
     Return 0  Note: Unterminated string
 End Process
 
+Note: Read f-string literal with variable interpolation
+Note: Returns serialized structure: segment_count, seg1_type, seg1_data, seg2_type, seg2_data, ...
+Note: Segment types: 0 = string literal, 1 = variable name
+Process called "lexer_read_fstring_literal" takes lexer as Integer returns Integer:
+    Let source be memory_get_pointer(lexer, 0)
+    Let position be memory_get_integer(lexer, 8)
+    Let length be memory_get_integer(lexer, 16)
+
+    Note: Advance past opening quote
+    Set position to position plus 1
+    memory_set_integer(lexer, 8, position)
+    memory_set_byte(lexer, 20, memory_get_byte(source, position))
+
+    Note: Allocate buffer for segments (max 32 segments)
+    Let max_segments be 32
+    Let segment_buffer be allocate(max_segments multiplied by 16)
+    Let segment_count be 0
+
+    Let current_segment_start be position
+    Let in_expression be 0
+
+    While position is less than length:
+        Let current_char be memory_get_byte(source, position)
+        Let quote be 34  Note: ASCII for '"'
+        Let open_brace be 123  Note: ASCII for '{'
+        Let close_brace be 125  Note: ASCII for '}'
+
+        Note: Check for closing quote
+        If current_char is equal to quote:
+            If in_expression is equal to 1:
+                print_string("[LEXER ERROR] Unclosed brace in f-string\n")
+                exit(1)
+            End If
+
+            Note: Save final string segment if any
+            If position is greater than current_segment_start:
+                Let segment_length be position minus current_segment_start
+                Let segment_text be allocate(segment_length plus 1)
+                Let i be 0
+                While i is less than segment_length:
+                    Let byte_val be memory_get_byte(source, current_segment_start plus i)
+                    memory_set_byte(segment_text, i, byte_val)
+                    Set i to i plus 1
+                End While
+                memory_set_byte(segment_text, segment_length, 0)
+
+                Let seg_offset be segment_count multiplied by 16
+                memory_set_int32(segment_buffer, seg_offset, 0)  Note: Type 0 = string
+                memory_set_pointer(segment_buffer, seg_offset plus 8, segment_text)
+                Set segment_count to segment_count plus 1
+            End If
+
+            Note: Build result and return
+            Set position to position plus 1
+            memory_set_integer(lexer, 8, position)
+            memory_set_byte(lexer, 20, memory_get_byte(source, position))
+
+            Let result_size be 8 plus (segment_count multiplied by 16)
+            Let result be allocate(result_size)
+            memory_set_int32(result, 0, segment_count)
+            Let i be 0
+            While i is less than (segment_count multiplied by 16):
+                Let byte_val be memory_get_byte(segment_buffer, i)
+                memory_set_byte(result, 8 plus i, byte_val)
+                Set i to i plus 1
+            End While
+            deallocate(segment_buffer)
+            Return result
+        End If
+
+        Note: Opening brace - start expression
+        If current_char is equal to open_brace:
+            If in_expression is equal to 1:
+                print_string("[LEXER ERROR] Nested braces not allowed in f-strings\n")
+                exit(1)
+            End If
+
+            Note: Save string segment if any
+            If position is greater than current_segment_start:
+                Let segment_length be position minus current_segment_start
+                Let segment_text be allocate(segment_length plus 1)
+                Let i be 0
+                While i is less than segment_length:
+                    Let byte_val be memory_get_byte(source, current_segment_start plus i)
+                    memory_set_byte(segment_text, i, byte_val)
+                    Set i to i plus 1
+                End While
+                memory_set_byte(segment_text, segment_length, 0)
+
+                Let seg_offset be segment_count multiplied by 16
+                memory_set_int32(segment_buffer, seg_offset, 0)  Note: Type 0 = string
+                memory_set_pointer(segment_buffer, seg_offset plus 8, segment_text)
+                Set segment_count to segment_count plus 1
+            End If
+
+            Set in_expression to 1
+            Set current_segment_start to position plus 1
+        End If
+
+        Note: Closing brace - end expression
+        If current_char is equal to close_brace:
+            If in_expression is equal to 0:
+                print_string("[LEXER ERROR] Unexpected '}' in f-string\n")
+                exit(1)
+            End If
+
+            Note: Save variable name
+            Let var_length be position minus current_segment_start
+            Let var_name be allocate(var_length plus 1)
+            Let i be 0
+            While i is less than var_length:
+                Let byte_val be memory_get_byte(source, current_segment_start plus i)
+                memory_set_byte(var_name, i, byte_val)
+                Set i to i plus 1
+            End While
+            memory_set_byte(var_name, var_length, 0)
+
+            Let seg_offset be segment_count multiplied by 16
+            memory_set_int32(segment_buffer, seg_offset, 1)  Note: Type 1 = variable
+            memory_set_pointer(segment_buffer, seg_offset plus 8, var_name)
+            Set segment_count to segment_count plus 1
+
+            Set in_expression to 0
+            Set current_segment_start to position plus 1
+        End If
+
+        Set position to position plus 1
+    End While
+
+    print_string("[LEXER ERROR] Unterminated f-string\n")
+    exit(1)
+    Return 0
+End Process
+
 Note: Read character literal
 Process called "lexer_read_char_literal" takes lexer as Integer returns Integer:
     Let dummy be lexer_advance(lexer)  Note: Skip opening single quote
@@ -717,6 +852,27 @@ Process called "lexer_next_token" takes lexer as Integer returns Integer:
             If is_space is equal to 1:
                 Let dummy be lexer_skip_whitespace(lexer)
             Otherwise:
+                Note: Check for f-string literal (f"...")
+                Let f_char be 102  Note: ASCII for 'f'
+                If current_char is equal to f_char:
+                    Note: Peek at next character to see if it's a quote
+                    Let source be memory_get_pointer(lexer, 0)
+                    Let position be memory_get_integer(lexer, 8)
+                    Let length be memory_get_integer(lexer, 16)
+                    Let next_pos be position plus 1
+                    If next_pos is less than length:
+                        Let next_char be memory_get_byte(source, next_pos)
+                        Let quote be 34  Note: ASCII for '"'
+                        If next_char is equal to quote:
+                            Note: This is an f-string - advance past 'f'
+                            Let dummy be lexer_advance(lexer)
+                            Let fstring_data be lexer_read_fstring_literal(lexer)
+                            Let token be token_create_owned(TOKEN_FSTRING_LITERAL, fstring_data, line, column)
+                            Return token
+                        End If
+                    End If
+                End If
+
                 Note: Check for string literal
                 Let quote be 34  Note: ASCII for '"'
                 If current_char is equal to quote:
