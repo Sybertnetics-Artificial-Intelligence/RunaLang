@@ -8061,9 +8061,12 @@ codegen_generate_binary_op:
     pushq %rax
     leaq .STR56(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -136(%rbp)
     movq -136(%rbp), %rax
     pushq %rax
@@ -8256,9 +8259,12 @@ codegen_generate_binary_op:
     pushq %rax
     leaq .STR64(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     pushq %rax
     leaq -136(%rbp), %rbx
     popq %rax
@@ -14287,16 +14293,22 @@ codegen_generate_expression:
     movq %rax, -608(%rbp)
     movq -600(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
-    call integer_to_string@PLT
+    popq %rsi
+    call codegen_arena_int_to_str
     movq %rax, -616(%rbp)
     movq -616(%rbp), %rax
     pushq %rax
     movq -608(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -624(%rbp)
     movq $8, %rax
     pushq %rax
@@ -14567,9 +14579,12 @@ codegen_generate_expression:
     pushq %rax
     movq -752(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -760(%rbp)
     movq $0, %rax
     pushq %rax
@@ -16864,17 +16879,23 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR273(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -352(%rbp)
     leaq .STR213(%rip), %rax
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -360(%rbp)
     movq -360(%rbp), %rax
     pushq %rax
@@ -16940,9 +16961,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR276(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -368(%rbp)
     movq -368(%rbp), %rax
     pushq %rax
@@ -17134,9 +17158,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR279(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -384(%rbp)
     movq -384(%rbp), %rax
     pushq %rax
@@ -17155,17 +17182,23 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR273(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -392(%rbp)
     leaq .STR213(%rip), %rax
     pushq %rax
     movq -392(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -400(%rbp)
     movq -400(%rbp), %rax
     pushq %rax
@@ -17389,9 +17422,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR273(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     pushq %rax
     leaq -352(%rbp), %rbx
     popq %rax
@@ -17400,9 +17436,12 @@ codegen_generate_statement:
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     pushq %rax
     leaq -360(%rbp), %rbx
     popq %rax
@@ -17445,9 +17484,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR284(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -416(%rbp)
     movq -416(%rbp), %rax
     pushq %rax
@@ -17585,9 +17627,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR279(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     pushq %rax
     leaq -384(%rbp), %rbx
     popq %rax
@@ -17609,9 +17654,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR273(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     pushq %rax
     leaq -392(%rbp), %rbx
     popq %rax
@@ -17620,9 +17668,12 @@ codegen_generate_statement:
     pushq %rax
     movq -392(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     pushq %rax
     leaq -400(%rbp), %rbx
     popq %rax
@@ -17791,9 +17842,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR294(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -456(%rbp)
     movq -456(%rbp), %rax
     pushq %rax
@@ -17899,17 +17953,23 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR273(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -496(%rbp)
     leaq .STR213(%rip), %rax
     pushq %rax
     movq -496(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -504(%rbp)
     movq -504(%rbp), %rax
     pushq %rax
@@ -17918,14 +17978,6 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
-    movq -496(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -504(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
     movq $32, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -17990,17 +18042,23 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR273(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -544(%rbp)
     leaq .STR213(%rip), %rax
     pushq %rax
     movq -544(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -552(%rbp)
     movq -552(%rbp), %rax
     pushq %rax
@@ -18009,14 +18067,6 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
-    movq -544(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -552(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -18172,9 +18222,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR294(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     pushq %rax
     leaq -456(%rbp), %rbx
     popq %rax
@@ -18283,9 +18336,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR273(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     pushq %rax
     leaq -392(%rbp), %rbx
     popq %rax
@@ -18294,9 +18350,12 @@ codegen_generate_statement:
     pushq %rax
     movq -392(%rbp), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     movq %rax, -608(%rbp)
     movq -608(%rbp), %rax
     pushq %rax
@@ -18305,14 +18364,6 @@ codegen_generate_statement:
     popq %rdi
     popq %rsi
     call emit_line
-    movq -392(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -608(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -20925,9 +20976,12 @@ codegen_generate_statement:
     pushq %rax
     leaq .STR337(%rip), %rax
     pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call codegen_arena_concat
     pushq %rax
     leaq -440(%rbp), %rbx
     popq %rax
