@@ -1,0 +1,669 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Linux ARM64 Machine Code Generation
+
+This file implements ARM64 (AArch64) machine code encoding for the Runa compiler.
+
+Platform-specific details:
+- OS: Linux
+- Architecture: ARM64 (AArch64)
+- Instruction format: Fixed-length (32-bit/4 bytes)
+- Encoding: Little-endian
+- Instruction structure: Fixed 32-bit format with encoded fields
+
+ARM64 instruction encoding:
+- Fixed length: 4 bytes per instruction (RISC architecture)
+- Byte order: Little-endian
+- Format: [op|Rd|Rn|Rm|...] (fields vary by instruction type)
+- Register encoding: 5 bits (0-31)
+- Immediate encoding: Varies by instruction (typically 12-16 bits)
+- Branch offsets: PC-relative with specific ranges
+
+This implementation provides core instruction encoders for:
+- Data movement (MOV, MOVZ, MOVK, LDR, STR)
+- Arithmetic (ADD, SUB, MUL, SDIV, UDIV)
+- Logic (AND, ORR, EOR)
+- Control flow (B, B.cond, BL, BR, BLR, RET)
+- Load/Store (LDR, STR, LDP, STP)
+- System calls (SVC)
+
+Dependencies: registers.runa for register number mappings
+:End Note
+
+Import "compiler/frontend/primitives/platform/linux_arm64/registers.runa" as Registers
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: INSTRUCTION BUFFER MANAGEMENT
+Note: ============================================================================
+Note: ARM64 instructions are always 4 bytes (fixed-length RISC)
+
+Process called "allocate_instruction_buffer" returns Integer:
+    Note: Allocate 4-byte buffer for encoded ARM64 instruction
+    Let buffer_ptr be Memory.allocate(4)
+    Return buffer_ptr
+End Process
+
+Process called "write_instruction_to_buffer" takes buffer_ptr as Integer, instruction as Integer returns Integer:
+    Note: Write 32-bit instruction to buffer (little-endian)
+    Note: instruction: 32-bit encoded instruction
+
+    Memory.memory_set_byte(buffer_ptr, 0, instruction bitwise_and 255)
+    Memory.memory_set_byte(buffer_ptr, 1, (instruction shifted_right 8) bitwise_and 255)
+    Memory.memory_set_byte(buffer_ptr, 2, (instruction shifted_right 16) bitwise_and 255)
+    Memory.memory_set_byte(buffer_ptr, 3, (instruction shifted_right 24) bitwise_and 255)
+
+    Return 4  Note: Always 4 bytes
+End Process
+
+Note: ============================================================================
+Note: REGISTER ENCODING HELPERS
+Note: ============================================================================
+
+Process called "encode_register" takes reg_num as Integer returns Integer:
+    Note: Encode register number (5 bits: 0-31)
+    Note: ARM64 uses 5-bit register encoding (0-30 for X0-X30, 31 for SP/XZR)
+    Return reg_num bitwise_and 31
+End Process
+
+Process called "is_extended_register" takes reg_num as Integer returns Integer:
+    Note: Check if register is extended (for SIMD/FP encoding)
+    Note: Registers 32-63 are V0-V31 in our encoding
+    If reg_num is greater than or equal to 32:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: DATA MOVEMENT INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_mov_reg_to_reg" takes dest_reg as Integer, src_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: MOV Xd, Xm
+    Note: ARM64 MOV is encoded as: ORR Xd, XZR, Xm
+    Note: Encoding: sf=1, opc=01, shift=00, N=0, Rm, imm6=000000, Rn=31 (XZR), Rd
+    Note: Format: 1010 1010 000 Rm(5) 000000 11111 Rd(5)
+    Note: Base: 0xAA0003E0 | (Rm << 16) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rm be encode_register(src_reg)
+
+    Note: MOV Xd, Xm = ORR Xd, XZR, Xm (sf=1, opc=01, shift=00, N=0)
+    Let instruction be 2852126688  Note: 0xAA0003E0 base encoding
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_movz_imm_to_reg" takes reg as Integer, immediate as Integer, shift as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: MOVZ Xd, #imm16, LSL #shift
+    Note: Used to load 16-bit immediate with optional left shift (0, 16, 32, 48)
+    Note: Format: sf=1, opc=10, hw(2), imm16(16), Rd(5)
+    Note: Base: 0xD2800000 | (hw << 21) | (imm16 << 5) | Rd
+
+    Let rd be encode_register(reg)
+    Let imm16 be immediate bitwise_and 65535  Note: Lower 16 bits
+    Let hw be shift divided by 16  Note: Convert shift to hw field (0-3)
+
+    Note: MOVZ encoding: sf=1, opc=10 (0xD2800000 base)
+    Let instruction be 3530776576  Note: 0xD2800000
+    Set instruction to instruction bitwise_or (hw shifted_left 21)
+    Set instruction to instruction bitwise_or (imm16 shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_movk_imm_to_reg" takes reg as Integer, immediate as Integer, shift as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: MOVK Xd, #imm16, LSL #shift
+    Note: Move 16-bit immediate with keep (doesn't clear other bits)
+    Note: Used for loading large 64-bit constants (MOVZ + MOVK + MOVK + MOVK)
+    Note: Format: sf=1, opc=11, hw(2), imm16(16), Rd(5)
+    Note: Base: 0xF2800000 | (hw << 21) | (imm16 << 5) | Rd
+
+    Let rd be encode_register(reg)
+    Let imm16 be immediate bitwise_and 65535
+    Let hw be shift divided by 16
+
+    Note: MOVK encoding: sf=1, opc=11 (0xF2800000 base)
+    Let instruction be 4076863488  Note: 0xF2800000
+    Set instruction to instruction bitwise_or (hw shifted_left 21)
+    Set instruction to instruction bitwise_or (imm16 shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Note: ============================================================================
+Note: ARITHMETIC INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_add_reg_reg" takes dest_reg as Integer, src1_reg as Integer, src2_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: ADD Xd, Xn, Xm
+    Note: Format: sf=1, op=0, S=0, shift=00, Rm(5), imm6=000000, Rn(5), Rd(5)
+    Note: Base: 0x8B000000 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src1_reg)
+    Let rm be encode_register(src2_reg)
+
+    Note: ADD Xd, Xn, Xm encoding (sf=1, op=0, S=0)
+    Let instruction be 2332033024  Note: 0x8B000000
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_add_reg_imm" takes dest_reg as Integer, src_reg as Integer, immediate as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: ADD Xd, Xn, #imm12
+    Note: Format: sf=1, op=0, S=0, shift=0, imm12(12), Rn(5), Rd(5)
+    Note: Base: 0x91000000 | (imm12 << 10) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src_reg)
+    Let imm12 be immediate bitwise_and 4095  Note: 12-bit immediate
+
+    Note: ADD Xd, Xn, #imm12 encoding
+    Let instruction be 2432696320  Note: 0x91000000
+    Set instruction to instruction bitwise_or (imm12 shifted_left 10)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_sub_reg_reg" takes dest_reg as Integer, src1_reg as Integer, src2_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: SUB Xd, Xn, Xm
+    Note: Format: sf=1, op=1, S=0, shift=00, Rm(5), imm6=000000, Rn(5), Rd(5)
+    Note: Base: 0xCB000000 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src1_reg)
+    Let rm be encode_register(src2_reg)
+
+    Note: SUB Xd, Xn, Xm encoding (sf=1, op=1, S=0)
+    Let instruction be 3405774848  Note: 0xCB000000
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_sub_reg_imm" takes dest_reg as Integer, src_reg as Integer, immediate as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: SUB Xd, Xn, #imm12
+    Note: Format: sf=1, op=1, S=0, shift=0, imm12(12), Rn(5), Rd(5)
+    Note: Base: 0xD1000000 | (imm12 << 10) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src_reg)
+    Let imm12 be immediate bitwise_and 4095
+
+    Note: SUB Xd, Xn, #imm12 encoding
+    Let instruction be 3506438144  Note: 0xD1000000
+    Set instruction to instruction bitwise_or (imm12 shifted_left 10)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_mul_reg_reg" takes dest_reg as Integer, src1_reg as Integer, src2_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: MUL Xd, Xn, Xm
+    Note: Format: sf=1, op54=00, Rm(5), o0=0, Ra=11111, Rn(5), Rd(5)
+    Note: Base: 0x9B007C00 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src1_reg)
+    Let rm be encode_register(src2_reg)
+
+    Note: MUL Xd, Xn, Xm encoding
+    Let instruction be 2600861696  Note: 0x9B007C00
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_sdiv_reg_reg" takes dest_reg as Integer, src1_reg as Integer, src2_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: SDIV Xd, Xn, Xm (signed divide)
+    Note: Format: sf=1, op54=00, Rm(5), opcode2=000011, Rn(5), Rd(5)
+    Note: Base: 0x9AC00C00 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src1_reg)
+    Let rm be encode_register(src2_reg)
+
+    Note: SDIV Xd, Xn, Xm encoding
+    Let instruction be 2596997120  Note: 0x9AC00C00
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_udiv_reg_reg" takes dest_reg as Integer, src1_reg as Integer, src2_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: UDIV Xd, Xn, Xm (unsigned divide)
+    Note: Format: sf=1, op54=00, Rm(5), opcode2=000010, Rn(5), Rd(5)
+    Note: Base: 0x9AC00800 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src1_reg)
+    Let rm be encode_register(src2_reg)
+
+    Note: UDIV Xd, Xn, Xm encoding
+    Let instruction be 2596996096  Note: 0x9AC00800
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Note: ============================================================================
+Note: LOGICAL INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_and_reg_reg" takes dest_reg as Integer, src1_reg as Integer, src2_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: AND Xd, Xn, Xm
+    Note: Format: sf=1, opc=00, shift=00, N=0, Rm(5), imm6=000000, Rn(5), Rd(5)
+    Note: Base: 0x8A000000 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src1_reg)
+    Let rm be encode_register(src2_reg)
+
+    Note: AND Xd, Xn, Xm encoding
+    Let instruction be 2315255808  Note: 0x8A000000
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_orr_reg_reg" takes dest_reg as Integer, src1_reg as Integer, src2_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: ORR Xd, Xn, Xm
+    Note: Format: sf=1, opc=01, shift=00, N=0, Rm(5), imm6=000000, Rn(5), Rd(5)
+    Note: Base: 0xAA000000 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src1_reg)
+    Let rm be encode_register(src2_reg)
+
+    Note: ORR Xd, Xn, Xm encoding
+    Let instruction be 2852126720  Note: 0xAA000000
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_eor_reg_reg" takes dest_reg as Integer, src1_reg as Integer, src2_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: EOR Xd, Xn, Xm (exclusive OR)
+    Note: Format: sf=1, opc=10, shift=00, N=0, Rm(5), imm6=000000, Rn(5), Rd(5)
+    Note: Base: 0xCA000000 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src1_reg)
+    Let rm be encode_register(src2_reg)
+
+    Note: EOR Xd, Xn, Xm encoding
+    Let instruction be 3388997632  Note: 0xCA000000
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Note: ============================================================================
+Note: COMPARISON INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_cmp_reg_reg" takes reg1 as Integer, reg2 as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: CMP Xn, Xm
+    Note: CMP is encoded as: SUBS XZR, Xn, Xm (subtract and set flags, discard result)
+    Note: Format: sf=1, op=1, S=1, shift=00, Rm(5), imm6=000000, Rn(5), Rd=11111
+    Note: Base: 0xEB00001F | (Rm << 16) | (Rn << 5)
+
+    Let rn be encode_register(reg1)
+    Let rm be encode_register(reg2)
+
+    Note: CMP Xn, Xm = SUBS XZR, Xn, Xm
+    Let instruction be 3942645791  Note: 0xEB00001F (Rd=31 for XZR)
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_cmp_reg_imm" takes reg as Integer, immediate as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: CMP Xn, #imm12
+    Note: Encoded as: SUBS XZR, Xn, #imm12
+    Note: Format: sf=1, op=1, S=1, shift=0, imm12(12), Rn(5), Rd=11111
+    Note: Base: 0xF100001F | (imm12 << 10) | (Rn << 5)
+
+    Let rn be encode_register(reg)
+    Let imm12 be immediate bitwise_and 4095
+
+    Note: CMP Xn, #imm12 = SUBS XZR, Xn, #imm12
+    Let instruction be 4043309087  Note: 0xF100001F
+    Set instruction to instruction bitwise_or (imm12 shifted_left 10)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Note: ============================================================================
+Note: CONTROL FLOW INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_b_unconditional" takes offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: B offset (unconditional branch)
+    Note: Format: op=0, imm26 (26-bit signed offset in instructions, ±128MB)
+    Note: Base: 0x14000000 | (imm26 & 0x3FFFFFF)
+    Note: offset is in bytes, divide by 4 for instruction offset
+
+    Let instruction_offset be offset divided by 4
+    Let imm26 be instruction_offset bitwise_and 67108863  Note: 26 bits
+
+    Note: B offset encoding
+    Let instruction be 335544320  Note: 0x14000000
+    Set instruction to instruction bitwise_or imm26
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_b_conditional" takes condition as Integer, offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: B.cond offset (conditional branch)
+    Note: Format: op=01010100, imm19, o1=0, cond(4)
+    Note: Base: 0x54000000 | (imm19 << 5) | cond
+    Note: condition: 0=EQ, 1=NE, 2=CS, 3=CC, 4=MI, 5=PL, 6=VS, 7=VC, 8=HI, 9=LS, 10=GE, 11=LT, 12=GT, 13=LE, 14=AL
+    Note: offset is in bytes, divide by 4 for instruction offset
+
+    Let instruction_offset be offset divided by 4
+    Let imm19 be instruction_offset bitwise_and 524287  Note: 19 bits
+    Let cond be condition bitwise_and 15  Note: 4 bits
+
+    Note: B.cond encoding
+    Let instruction be 1409286144  Note: 0x54000000
+    Set instruction to instruction bitwise_or (imm19 shifted_left 5)
+    Set instruction to instruction bitwise_or cond
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_bl" takes offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: BL offset (branch with link - function call)
+    Note: Format: op=1, imm26 (26-bit signed offset in instructions)
+    Note: Base: 0x94000000 | (imm26 & 0x3FFFFFF)
+
+    Let instruction_offset be offset divided by 4
+    Let imm26 be instruction_offset bitwise_and 67108863
+
+    Note: BL offset encoding
+    Let instruction be 2483027968  Note: 0x94000000
+    Set instruction to instruction bitwise_or imm26
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_br" takes reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: BR Xn (branch to register)
+    Note: Format: opc=0000, op2=11111, op3=000000, Rn(5), op4=00000
+    Note: Base: 0xD61F0000 | (Rn << 5)
+
+    Let rn be encode_register(reg)
+
+    Note: BR Xn encoding
+    Let instruction be 3587907584  Note: 0xD61F0000
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_blr" takes reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: BLR Xn (branch with link to register)
+    Note: Format: opc=0001, op2=11111, op3=000000, Rn(5), op4=00000
+    Note: Base: 0xD63F0000 | (Rn << 5)
+
+    Let rn be encode_register(reg)
+
+    Note: BLR Xn encoding
+    Let instruction be 3591987200  Note: 0xD63F0000
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_ret" takes buffer_ptr as Integer returns Integer:
+    Note: Encode: RET (return from subroutine)
+    Note: RET is encoded as: RET X30 (LR)
+    Note: Format: opc=0010, op2=11111, op3=000000, Rn=11110 (LR), op4=00000
+    Note: Fixed encoding: 0xD65F03C0
+
+    Note: RET encoding (returns to address in X30/LR)
+    Let instruction be 3597651904  Note: 0xD65F03C0
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Note: ============================================================================
+Note: LOAD/STORE INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_ldr_reg_offset" takes dest_reg as Integer, base_reg as Integer, offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: LDR Xt, [Xn, #offset]
+    Note: Format: size=11, V=0, opc=01, imm12, Rn(5), Rt(5)
+    Note: Base: 0xF9400000 | (imm12 << 10) | (Rn << 5) | Rt
+    Note: offset must be 8-byte aligned for 64-bit load, divided by 8 for encoding
+
+    Let rt be encode_register(dest_reg)
+    Let rn be encode_register(base_reg)
+    Let imm12 be offset divided by 8  Note: Scale by 8 for 64-bit access
+    Set imm12 to imm12 bitwise_and 4095
+
+    Note: LDR Xt, [Xn, #offset] encoding
+    Let instruction be 4183138304  Note: 0xF9400000
+    Set instruction to instruction bitwise_or (imm12 shifted_left 10)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rt
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_str_reg_offset" takes src_reg as Integer, base_reg as Integer, offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: STR Xt, [Xn, #offset]
+    Note: Format: size=11, V=0, opc=00, imm12, Rn(5), Rt(5)
+    Note: Base: 0xF9000000 | (imm12 << 10) | (Rn << 5) | Rt
+
+    Let rt be encode_register(src_reg)
+    Let rn be encode_register(base_reg)
+    Let imm12 be offset divided by 8
+    Set imm12 to imm12 bitwise_and 4095
+
+    Note: STR Xt, [Xn, #offset] encoding
+    Let instruction be 4178944000  Note: 0xF9000000
+    Set instruction to instruction bitwise_or (imm12 shifted_left 10)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rt
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_ldp_regs_offset" takes dest_reg1 as Integer, dest_reg2 as Integer, base_reg as Integer, offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: LDP Xt1, Xt2, [Xn, #offset]
+    Note: Load pair of registers (16 bytes total)
+    Note: Format: opc=10, V=0, mode=010, imm7, Rt2(5), Rn(5), Rt1(5)
+    Note: Base: 0xA9400000 | (imm7 << 15) | (Rt2 << 10) | (Rn << 5) | Rt1
+    Note: offset must be 8-byte aligned, divided by 8 for encoding (7-bit signed)
+
+    Let rt1 be encode_register(dest_reg1)
+    Let rt2 be encode_register(dest_reg2)
+    Let rn be encode_register(base_reg)
+    Let imm7 be offset divided by 8
+    Set imm7 to imm7 bitwise_and 127  Note: 7 bits
+
+    Note: LDP Xt1, Xt2, [Xn, #offset] encoding
+    Let instruction be 2840526848  Note: 0xA9400000
+    Set instruction to instruction bitwise_or (imm7 shifted_left 15)
+    Set instruction to instruction bitwise_or (rt2 shifted_left 10)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rt1
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_stp_regs_offset" takes src_reg1 as Integer, src_reg2 as Integer, base_reg as Integer, offset as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: STP Xt1, Xt2, [Xn, #offset]
+    Note: Store pair of registers (16 bytes total)
+    Note: Format: opc=10, V=0, mode=010, imm7, Rt2(5), Rn(5), Rt1(5)
+    Note: Base: 0xA9000000 | (imm7 << 15) | (Rt2 << 10) | (Rn << 5) | Rt1
+
+    Let rt1 be encode_register(src_reg1)
+    Let rt2 be encode_register(src_reg2)
+    Let rn be encode_register(base_reg)
+    Let imm7 be offset divided by 8
+    Set imm7 to imm7 bitwise_and 127
+
+    Note: STP Xt1, Xt2, [Xn, #offset] encoding
+    Let instruction be 2836332544  Note: 0xA9000000
+    Set instruction to instruction bitwise_or (imm7 shifted_left 15)
+    Set instruction to instruction bitwise_or (rt2 shifted_left 10)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rt1
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Note: ============================================================================
+Note: SYSTEM INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_svc" takes immediate as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: SVC #imm16 (supervisor call - system call)
+    Note: Format: opc=11010100, opc2=000, imm16(16), op3=00000, LL=01
+    Note: Base: 0xD4000001 | (imm16 << 5)
+
+    Let imm16 be immediate bitwise_and 65535  Note: 16 bits
+
+    Note: SVC #imm16 encoding (typically SVC #0 for Linux)
+    Let instruction be 3556769793  Note: 0xD4000001
+    Set instruction to instruction bitwise_or (imm16 shifted_left 5)
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_nop" takes buffer_ptr as Integer returns Integer:
+    Note: Encode: NOP (no operation)
+    Note: Fixed encoding: 0xD503201F
+
+    Note: NOP encoding
+    Let instruction be 3573694495  Note: 0xD503201F
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Note: ============================================================================
+Note: SHIFT INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_lsl_reg_reg" takes dest_reg as Integer, src_reg as Integer, shift_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: LSL Xd, Xn, Xm (logical shift left, variable)
+    Note: Format: sf=1, op=0, S=0, Rm(5), opcode=001000, Rn(5), Rd(5)
+    Note: Base: 0x9AC02000 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src_reg)
+    Let rm be encode_register(shift_reg)
+
+    Note: LSL Xd, Xn, Xm encoding
+    Let instruction be 2597003264  Note: 0x9AC02000
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_lsr_reg_reg" takes dest_reg as Integer, src_reg as Integer, shift_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: LSR Xd, Xn, Xm (logical shift right, variable)
+    Note: Format: sf=1, op=0, S=0, Rm(5), opcode=001001, Rn(5), Rd(5)
+    Note: Base: 0x9AC02400 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src_reg)
+    Let rm be encode_register(shift_reg)
+
+    Note: LSR Xd, Xn, Xm encoding
+    Let instruction be 2597004288  Note: 0x9AC02400
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Process called "encode_asr_reg_reg" takes dest_reg as Integer, src_reg as Integer, shift_reg as Integer, buffer_ptr as Integer returns Integer:
+    Note: Encode: ASR Xd, Xn, Xm (arithmetic shift right, variable)
+    Note: Format: sf=1, op=0, S=0, Rm(5), opcode=001010, Rn(5), Rd(5)
+    Note: Base: 0x9AC02800 | (Rm << 16) | (Rn << 5) | Rd
+
+    Let rd be encode_register(dest_reg)
+    Let rn be encode_register(src_reg)
+    Let rm be encode_register(shift_reg)
+
+    Note: ASR Xd, Xn, Xm encoding
+    Let instruction be 2597005312  Note: 0x9AC02800
+    Set instruction to instruction bitwise_or (rm shifted_left 16)
+    Set instruction to instruction bitwise_or (rn shifted_left 5)
+    Set instruction to instruction bitwise_or rd
+
+    Return write_instruction_to_buffer(buffer_ptr, instruction)
+End Process
+
+Note: ============================================================================
+Note: UTILITY FUNCTIONS
+Note: ============================================================================
+
+Process called "get_instruction_size" returns Integer:
+    Note: Get size of ARM64 instruction in bytes
+    Note: ARM64 instructions are always 4 bytes (fixed-length)
+    Return 4
+End Process
+
+Process called "align_code_pointer" takes code_ptr as Integer, alignment as Integer returns Integer:
+    Note: Align code pointer to specified byte boundary
+    Note: ARM64 instructions must be 4-byte aligned
+
+    Let remainder be code_ptr bitwise_and (alignment minus 1)
+    If remainder is equal to 0:
+        Return code_ptr  Note: Already aligned
+    End If
+
+    Let padding be alignment minus remainder
+    Return code_ptr plus padding
+End Process

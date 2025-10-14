@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,497 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles Darwin x86-64 calling convention and function call interface.
+Darwin x86-64 Calling Convention
 
-This file performs the following tasks:
-- Process Darwin x86-64 calling convention rules and parameter passing
-- Handle Darwin x86-64-specific register usage and register allocation
-- Manage Darwin x86-64 stack frame management and stack operations
-- Process Darwin x86-64 function call optimization and call interface
+This file implements the Darwin (macOS) x86-64 calling convention, which follows
+the System V AMD64 ABI with some Darwin-specific modifications.
 
-This file is essential because of the following reasons:
-- Darwin x86-64 calling convention ensures correct function calls on Intel Mac systems
-- Proper calling convention handling enables system integration and library compatibility
-- Darwin x86-64 support enables Runa compilation for Intel Mac platforms
+Darwin x86-64 Calling Convention Summary:
+- Integer/pointer arguments: RDI, RSI, RDX, RCX, R8, R9 (6 registers)
+- Floating-point arguments: XMM0-XMM7 (8 registers)
+- Additional arguments: Pushed on stack (right-to-left)
+- Return value: RAX (integer/pointer), XMM0 (float/double)
+- Secondary return: RDX (128-bit returns use RDX:RAX)
+- Stack alignment: 16-byte aligned BEFORE call (RSP % 16 == 0)
+- Caller-saved (volatile): RAX, RCX, RDX, RSI, RDI, R8-R11, XMM0-XMM15
+- Callee-saved (non-volatile): RBX, RBP, R12-R15
+- Frame pointer: RBP (optional but recommended)
+- Stack pointer: RSP
+- Red zone: 128 bytes below RSP (can be used by leaf functions without adjusting RSP)
 
-This file consists of the following functions/features/operation types:
-- Darwin x86-64 calling convention processing and parameter passing
-- Darwin x86-64 register usage and register allocation
-- Darwin x86-64 stack frame management and stack operations
-- Darwin x86-64 function call optimization and call interface
+Darwin-specific notes:
+1. Stack must be 16-byte aligned at call sites
+2. Red zone: 128 bytes below RSP available for leaf functions
+3. Return values larger than 16 bytes: passed via hidden pointer in RDI (first param)
+4. No shadow space (unlike Windows x64 which requires 32-byte shadow space)
+
+References:
+- System V Application Binary Interface - AMD64 Architecture Processor Supplement
+- Apple x86-64 ABI Documentation
+- Intel 64 and IA-32 Architectures Software Developer Manuals
+
+Dependencies: registers.runa for register mappings
 :End Note
 
-Note: TODO - Implement Darwin x86-64 calling convention functionality
+Import "compiler/frontend/primitives/platform/darwin_x86_64/registers.runa" as Registers
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: PARAMETER PASSING - INTEGER AND POINTER ARGUMENTS
+Note: ============================================================================
+
+Process called "get_integer_param_register" takes param_index as Integer returns Integer:
+    Note: Get register number for integer/pointer parameter
+    Note: Darwin x86-64: RDI, RSI, RDX, RCX, R8, R9 (indices 0-5)
+    Note: Returns register number (0-15), or -1 if passed on stack
+
+    If param_index is equal to 0:
+        Return 7  Note: RDI
+    End If
+
+    If param_index is equal to 1:
+        Return 6  Note: RSI
+    End If
+
+    If param_index is equal to 2:
+        Return 2  Note: RDX
+    End If
+
+    If param_index is equal to 3:
+        Return 1  Note: RCX
+    End If
+
+    If param_index is equal to 4:
+        Return 8  Note: R8
+    End If
+
+    If param_index is equal to 5:
+        Return 9  Note: R9
+    End If
+
+    Note: Parameters 6+ are passed on stack
+    Return -1
+End Process
+
+Process called "get_max_integer_register_params" returns Integer:
+    Note: Maximum number of integer/pointer parameters passed in registers
+    Return 6
+End Process
+
+Process called "is_param_in_register" takes param_index as Integer returns Integer:
+    Note: Check if parameter is passed in register (vs stack)
+    Note: Returns 1 if in register, 0 if on stack
+
+    If param_index is less than 6:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "get_stack_param_offset" takes param_index as Integer returns Integer:
+    Note: Get stack offset for parameter passed on stack
+    Note: Stack parameters start at [RSP + 8] (return address at [RSP])
+    Note: param_index must be >= 6 (first 6 are in registers)
+
+    If param_index is less than 6:
+        Return 0  Note: Not a stack parameter
+    End If
+
+    Note: Calculate offset: 8 bytes per parameter, starting at RSP + 8
+    Let stack_param_num be param_index minus 6
+    Let offset be 8 plus stack_param_num multiplied by 8
+
+    Return offset
+End Process
+
+Note: ============================================================================
+Note: PARAMETER PASSING - FLOATING-POINT ARGUMENTS
+Note: ============================================================================
+
+Process called "get_float_param_register" takes param_index as Integer returns Integer:
+    Note: Get XMM register number for floating-point parameter
+    Note: Darwin x86-64: XMM0-XMM7 (indices 0-7)
+    Note: Returns XMM register number (16-31 in our encoding), or -1 if passed on stack
+
+    If param_index is less than 8:
+        Return Registers.get_fp_param_register(param_index)
+    End If
+
+    Note: Parameters 8+ are passed on stack
+    Return -1
+End Process
+
+Process called "get_max_float_register_params" returns Integer:
+    Note: Maximum number of floating-point parameters passed in XMM registers
+    Return 8  Note: XMM0-XMM7
+End Process
+
+Process called "is_float_param_in_register" takes param_index as Integer returns Integer:
+    Note: Check if floating-point parameter is passed in register (vs stack)
+    Note: Returns 1 if in register, 0 if on stack
+
+    If param_index is less than 8:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: RETURN VALUE HANDLING
+Note: ============================================================================
+
+Process called "get_return_value_register" returns Integer:
+    Note: Get register number for return value
+    Note: Integer/pointer returns: RAX
+    Return 0  Note: RAX
+End Process
+
+Process called "get_secondary_return_register" returns Integer:
+    Note: Get register number for secondary return value
+    Note: 128-bit returns: RDX:RAX (RDX holds upper 64 bits)
+    Return 2  Note: RDX
+End Process
+
+Process called "get_float_return_register" returns Integer:
+    Note: Get register number for floating-point return value
+    Note: Float/double returns: XMM0
+    Return Registers.get_fp_return_register()  Note: Returns 16 (XMM0)
+End Process
+
+Process called "is_return_via_memory" takes return_size as Integer returns Integer:
+    Note: Check if return value is passed via memory (hidden pointer)
+    Note: Returns 1 if return via memory, 0 if in registers
+    Note: Darwin x86-64: Structures > 16 bytes returned via hidden pointer in RDI
+
+    If return_size is greater than 16:
+        Return 1  Note: Large structures returned via memory
+    End If
+
+    Return 0  Note: Return in registers
+End Process
+
+Process called "get_return_pointer_register" returns Integer:
+    Note: Get register for hidden return pointer (for large structs)
+    Note: Darwin x86-64: RDI holds address where large return values are written
+    Note: This makes RDI the implicit first parameter when returning via memory
+    Return 7  Note: RDI
+End Process
+
+Note: ============================================================================
+Note: REGISTER PRESERVATION (CALLER-SAVED vs CALLEE-SAVED)
+Note: ============================================================================
+
+Process called "is_caller_saved_register" takes reg_num as Integer returns Integer:
+    Note: Check if register is caller-saved (volatile)
+    Note: Caller-saved: RAX, RCX, RDX, RSI, RDI, R8-R11, XMM0-XMM15
+    Note: Returns 1 if caller-saved, 0 if callee-saved
+
+    Note: RAX (0), RCX (1), RDX (2), RSI (6), RDI (7)
+    If reg_num is equal to 0:
+        Return 1
+    End If
+    If reg_num is equal to 1:
+        Return 1
+    End If
+    If reg_num is equal to 2:
+        Return 1
+    End If
+    If reg_num is equal to 6:
+        Return 1
+    End If
+    If reg_num is equal to 7:
+        Return 1
+    End If
+
+    Note: R8-R11 (8-11) are caller-saved
+    If reg_num is greater than or equal to 8:
+        If reg_num is less than or equal to 11:
+            Return 1
+        End If
+    End If
+
+    Note: All XMM registers (16-31) are caller-saved
+    If reg_num is greater than or equal to 16:
+        If reg_num is less than or equal to 31:
+            Return 1
+        End If
+    End If
+
+    Return 0  Note: Callee-saved or special register
+End Process
+
+Process called "is_callee_saved_register" takes reg_num as Integer returns Integer:
+    Note: Check if register is callee-saved (non-volatile)
+    Note: Callee-saved: RBX, RBP, R12-R15
+    Note: Returns 1 if callee-saved, 0 if caller-saved
+
+    Note: RBX (3)
+    If reg_num is equal to 3:
+        Return 1
+    End If
+
+    Note: RBP (5)
+    If reg_num is equal to 5:
+        Return 1
+    End If
+
+    Note: R12-R15 (12-15) are callee-saved
+    If reg_num is greater than or equal to 12:
+        If reg_num is less than or equal to 15:
+            Return 1
+        End If
+    End If
+
+    Return 0  Note: Caller-saved
+End Process
+
+Process called "get_callee_saved_register_list" takes buffer_ptr as Integer returns Integer:
+    Note: Fill buffer with list of callee-saved register numbers
+    Note: buffer_ptr: pointer to array of at least 6 integers
+    Note: Returns: count of callee-saved registers (6)
+
+    Let offset be 0
+
+    Note: Store register numbers in buffer (8 bytes per integer)
+    Note: RBX (3)
+    Memory.memory_set_int64(buffer_ptr, offset, 3)
+    Set offset to offset plus 8
+
+    Note: RBP (5)
+    Memory.memory_set_int64(buffer_ptr, offset, 5)
+    Set offset to offset plus 8
+
+    Note: R12 (12)
+    Memory.memory_set_int64(buffer_ptr, offset, 12)
+    Set offset to offset plus 8
+
+    Note: R13 (13)
+    Memory.memory_set_int64(buffer_ptr, offset, 13)
+    Set offset to offset plus 8
+
+    Note: R14 (14)
+    Memory.memory_set_int64(buffer_ptr, offset, 14)
+    Set offset to offset plus 8
+
+    Note: R15 (15)
+    Memory.memory_set_int64(buffer_ptr, offset, 15)
+
+    Return 6  Note: 6 callee-saved integer registers
+End Process
+
+Note: ============================================================================
+Note: STACK FRAME MANAGEMENT
+Note: ============================================================================
+
+Process called "get_stack_alignment" returns Integer:
+    Note: Get required stack alignment in bytes
+    Note: Darwin x86-64: 16-byte alignment at call sites
+    Return 16
+End Process
+
+Process called "calculate_stack_frame_size" takes local_vars_size as Integer, num_callee_saved_regs as Integer returns Integer:
+    Note: Calculate total stack frame size with proper alignment
+    Note: local_vars_size: size of local variables in bytes
+    Note: num_callee_saved_regs: number of callee-saved registers to preserve
+    Note: Returns: total frame size (16-byte aligned)
+
+    Note: Saved registers: 8 bytes each
+    Let saved_regs_size be num_callee_saved_regs multiplied by 8
+
+    Note: Must also save RBP (frame pointer) for non-leaf functions
+    Note: This adds 8 bytes
+    Let frame_record_size be 8
+
+    Note: Total size before alignment
+    Let total_size be local_vars_size plus saved_regs_size plus frame_record_size
+
+    Note: Round up to 16-byte alignment
+    Let remainder be total_size bitwise_and 15
+    If remainder is not equal to 0:
+        Let padding be 16 minus remainder
+        Set total_size to total_size plus padding
+    End If
+
+    Return total_size
+End Process
+
+Process called "get_frame_pointer_register" returns Integer:
+    Note: Get frame pointer register number
+    Note: Darwin x86-64: RBP
+    Return 5  Note: RBP
+End Process
+
+Process called "get_stack_pointer_register" returns Integer:
+    Note: Get stack pointer register number
+    Note: Darwin x86-64: RSP
+    Return 4  Note: RSP
+End Process
+
+Process called "get_red_zone_size" returns Integer:
+    Note: Get red zone size in bytes
+    Note: x86-64 has a 128-byte red zone below RSP
+    Note: Leaf functions can use this without adjusting RSP
+    Return 128
+End Process
+
+Process called "can_use_red_zone" takes is_leaf_function as Integer returns Integer:
+    Note: Check if function can use red zone optimization
+    Note: Only leaf functions can safely use the red zone
+    Note: Returns 1 if red zone can be used, 0 otherwise
+
+    If is_leaf_function is equal to 1:
+        Return 1  Note: Leaf functions can use red zone
+    End If
+
+    Return 0  Note: Non-leaf functions must not use red zone
+End Process
+
+Note: ============================================================================
+Note: FUNCTION PROLOGUE AND EPILOGUE HELPERS
+Note: ============================================================================
+
+Process called "needs_frame_pointer" takes has_variable_sized_locals as Integer, has_alloca as Integer returns Integer:
+    Note: Determine if function needs frame pointer
+    Note: Frame pointer required for variable-sized locals or alloca
+    Note: Returns 1 if frame pointer needed, 0 if can use RSP directly
+
+    If has_variable_sized_locals is equal to 1:
+        Return 1
+    End If
+
+    If has_alloca is equal to 1:
+        Return 1
+    End If
+
+    Note: Darwin x86-64: Frame pointer optional for simple functions
+    Return 0
+End Process
+
+Process called "calculate_call_stack_adjustment" takes num_stack_args as Integer returns Integer:
+    Note: Calculate stack space needed for outgoing call arguments
+    Note: num_stack_args: number of arguments passed on stack (beyond first 6)
+    Note: Returns: stack adjustment in bytes (16-byte aligned)
+
+    If num_stack_args is less than or equal to 0:
+        Return 0  Note: No stack arguments
+    End If
+
+    Note: Each argument is 8 bytes
+    Let args_size be num_stack_args multiplied by 8
+
+    Note: Round up to 16-byte alignment
+    Let remainder be args_size bitwise_and 15
+    If remainder is not equal to 0:
+        Let padding be 16 minus remainder
+        Set args_size to args_size plus padding
+    End If
+
+    Return args_size
+End Process
+
+Note: ============================================================================
+Note: VARIADIC FUNCTION SUPPORT
+Note: ============================================================================
+
+Process called "get_variadic_gp_register_save_area_size" returns Integer:
+    Note: Size of save area for general-purpose register arguments
+    Note: Darwin x86-64: 6 registers × 8 bytes = 48 bytes
+    Return 48
+End Process
+
+Process called "get_variadic_fp_register_save_area_size" returns Integer:
+    Note: Size of save area for floating-point register arguments
+    Note: Darwin x86-64: 8 XMM registers × 16 bytes = 128 bytes
+    Return 128
+End Process
+
+Process called "get_variadic_total_save_area_size" returns Integer:
+    Note: Total size for variadic function register save area
+    Note: GP area (48) + FP area (128) = 176 bytes
+    Return 176
+End Process
+
+Note: ============================================================================
+Note: HELPER FUNCTIONS FOR CODE GENERATION
+Note: ============================================================================
+
+Process called "get_parameter_location" takes param_index as Integer, param_size as Integer, result_buffer as Integer returns Integer:
+    Note: Get location (register or stack offset) for parameter
+    Note: param_index: parameter position (0-based)
+    Note: param_size: size in bytes (for future struct handling)
+    Note: result_buffer: pointer to 2-integer array [location_type, value]
+    Note: location_type: 0 = register (value = reg_num), 1 = stack (value = offset)
+    Note: Returns: location_type
+
+    Let location_type be 0
+    Let value be 0
+
+    Note: Check if parameter is in register
+    If param_index is less than 6:
+        Set location_type to 0  Note: Register
+        Set value to get_integer_param_register(param_index)
+    Otherwise:
+        Set location_type to 1  Note: Stack
+        Set value to get_stack_param_offset(param_index)
+    End If
+
+    Note: Write results to buffer
+    Memory.memory_set_int64(result_buffer, 0, location_type)
+    Memory.memory_set_int64(result_buffer, 8, value)
+
+    Return location_type
+End Process
+
+Process called "get_call_setup_info" takes num_params as Integer, result_buffer as Integer returns Integer:
+    Note: Get information needed to set up a function call
+    Note: num_params: total number of parameters
+    Note: result_buffer: pointer to 3-integer array [reg_params, stack_params, stack_adjustment]
+    Note: Returns: number of stack parameters
+
+    Let reg_params be 6
+    Let stack_params be 0
+    Let stack_adjustment be 0
+
+    If num_params is less than or equal to 6:
+        Set reg_params to num_params
+    Otherwise:
+        Set stack_params to num_params minus 6
+        Set stack_adjustment to calculate_call_stack_adjustment(stack_params)
+    End If
+
+    Note: Write results to buffer
+    Memory.memory_set_int64(result_buffer, 0, reg_params)
+    Memory.memory_set_int64(result_buffer, 8, stack_params)
+    Memory.memory_set_int64(result_buffer, 16, stack_adjustment)
+
+    Return stack_params
+End Process
+
+Note: ============================================================================
+Note: CALLING CONVENTION VALIDATION AND UTILITIES
+Note: ============================================================================
+
+Process called "validate_stack_alignment" takes stack_offset as Integer returns Integer:
+    Note: Check if stack offset is properly aligned
+    Note: Returns 1 if aligned to 16 bytes, 0 otherwise
+
+    Let remainder be stack_offset bitwise_and 15
+    If remainder is equal to 0:
+        Return 1  Note: Properly aligned
+    End If
+
+    Return 0  Note: Misaligned
+End Process
+
+Process called "get_calling_convention_name" returns String:
+    Note: Return name of calling convention
+    Return "Darwin x86-64 (System V AMD64 ABI)"
+End Process
+
+Process called "get_abi_version" returns Integer:
+    Note: Return ABI version identifier
+    Note: Using System V AMD64 ABI version 1
+    Return 1
+End Process
