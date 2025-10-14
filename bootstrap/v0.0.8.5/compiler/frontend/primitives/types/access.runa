@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,22 +15,562 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles type field access and member access operations.
+This file handles struct/type field access operations with performance optimizations.
 
 This file performs the following tasks:
-- Process field access operations and member access operations
-- Handle struct field access and type member access
-- Manage field offset calculation and field access optimization
-- Process field access validation and member access validation
+- Calculate field offsets within structs (O(1) hash table lookup)
+- Access struct members by name with caching
+- Validate field access operations with detailed error reporting
 
 This file is essential because of the following reasons:
-- Field access is fundamental to object-oriented programming and struct manipulation
-- Proper field access ensures correct member access and type member operations
-- Field access optimization improves performance for struct and object operations
+- Enables struct field access (e.g., person.age)
+- Calculates memory offsets for field lookups
+- Foundation for object-oriented features
+- Performance-critical: used in every struct field access in compiled code
 
-This file consists of the following functions/features/operation types:
-- Field access operations and member access operations
-- Struct field access and type member access
-- Field offset calculation and field access optimization
-- Field access validation and member access validation
+Performance optimizations:
+- Hash table for O(1) field lookup (vs O(n) linear search)
+- Last-field cache for repeated accesses to same field
+- Detailed error messages only on failure (zero overhead in success path)
+
+Dependencies:
+- intrinsics/offsetof.runa (field offset calculations)
+- types/validation.runa (type checking)
+- core/string_core.runa (field name comparison, string_copy_to_buffer)
+- core/memory_core.runa (memory operations)
+- types/conversion.runa (integer_to_string for error messages)
+- memory/layout.runa (arena_allocate for hash table construction)
 :End Note
+
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/types/conversion.runa" as Conversion
+Import "compiler/frontend/primitives/memory/layout.runa" as MemoryLayout
+
+Note: ============================================================================
+Note: Wrapper Functions for Imported Dependencies
+Note: ============================================================================
+
+Process called "string_length" takes str as Integer returns Integer:
+    Return StringCore.string_length(str)
+End Process
+
+Process called "string_equals" takes str1 as Integer, str2 as Integer returns Integer:
+    Return StringCore.string_equals(str1, str2)
+End Process
+
+Process called "string_copy_to_buffer" takes src as Integer, dest as Integer, dest_offset as Integer returns Integer:
+    Return StringCore.string_copy_to_buffer(src, dest, dest_offset)
+End Process
+
+Process called "integer_to_string" takes value as Integer returns Integer:
+    Note: Convert integer to string in base 10
+    Return Conversion.integer_to_string(value, 10)
+End Process
+
+Process called "memory_get_byte" takes ptr as Integer, offset as Integer returns Integer:
+    Return MemoryCore.memory_get_byte(ptr, offset)
+End Process
+
+Process called "memory_set_byte" takes ptr as Integer, offset as Integer, value as Integer returns Integer:
+    Return MemoryCore.memory_set_byte(ptr, offset, value)
+End Process
+
+Process called "memory_get_int64" takes ptr as Integer, offset as Integer returns Integer:
+    Return MemoryCore.memory_get_int64(ptr, offset)
+End Process
+
+Process called "memory_set_int64" takes ptr as Integer, offset as Integer, value as Integer returns Integer:
+    Return MemoryCore.memory_set_int64(ptr, offset, value)
+End Process
+
+Process called "memory_zero" takes ptr as Integer, size as Integer returns Integer:
+    Return MemoryCore.memory_zero(ptr, size)
+End Process
+
+Process called "arena_allocate" takes arena as Integer, size as Integer returns Integer:
+    Return MemoryLayout.arena_allocate(arena, size)
+End Process
+
+Note: ============================================================================
+Note: Performance Optimization: Field Access Cache
+Note: ============================================================================
+
+Note: Cache the last field lookup to optimize repeated accesses to the same field
+Note: Common pattern: accessing the same field multiple times in a loop
+Note: Example: for (i = 0; i < 1000; i++) { sum += person.age; }
+Note: Without cache: 1000 hash lookups
+Note: With cache: 1 hash lookup + 999 cache hits
+
+Let LAST_STRUCT_PTR be 0
+Let LAST_FIELD_NAME be 0
+Let LAST_FIELD_OFFSET be 0
+Let LAST_FIELD_TYPE be 0
+
+Process called "clear_field_cache":
+    Note: Clear the field access cache
+    Note: Should be called when struct definitions change
+
+    Set LAST_STRUCT_PTR to 0
+    Set LAST_FIELD_NAME to 0
+    Set LAST_FIELD_OFFSET to 0
+    Set LAST_FIELD_TYPE to 0
+End Process
+
+Note: ============================================================================
+Note: Hash Table Implementation for Field Lookup
+Note: ============================================================================
+
+Process called "hash_string" takes str_ptr as Integer returns Integer:
+    Note: Compute hash of a string using DJB2 algorithm
+    Note: DJB2: hash = 5381; for each char: hash = hash * 33 + char
+    Note: Fast, good distribution, widely used in compilers
+
+    Let hash be 5381
+    Let i be 0
+    Let length be string_length(str_ptr)
+
+    While i is less than length:
+        Let char be memory_get_byte(str_ptr, i)
+        Set hash to hash multiplied by 33
+        Set hash to hash plus char
+        Set i to i plus 1
+    End While
+
+    Note: Return positive hash (avoid negative indices)
+    If hash is less than 0:
+        Set hash to 0 minus hash
+    End If
+
+    Return hash
+End Process
+
+Process called "get_field_offset_hashed" takes struct_ptr as Integer, field_name as Integer, field_name_hash as Integer returns Integer:
+    Note: Get field offset using hash table lookup (O(1) average case)
+    Note: struct_ptr points to struct metadata with hash table
+    Note: Returns field offset in bytes, or -1 if field not found
+
+    Note: Enhanced struct metadata layout with hash table:
+    Note:   offset 0:  field_count (int64)
+    Note:   offset 8:  field_names_ptr (pointer to string array)
+    Note:   offset 16: field_offsets_ptr (pointer to int64 array)
+    Note:   offset 24: field_types_ptr (pointer to string array)
+    Note:   offset 32: hash_table_ptr (pointer to hash table, 0 if not built)
+    Note:   offset 40: hash_table_size (int64, power of 2)
+
+    Let hash_table_ptr be memory_get_int64(struct_ptr, 32)
+
+    Note: If no hash table exists, fall back to linear search
+    If hash_table_ptr is equal to 0:
+        Return get_field_offset_linear(struct_ptr, field_name)
+    End If
+
+    Let hash_table_size be memory_get_int64(struct_ptr, 40)
+    Let hash_index be field_name_hash modulo hash_table_size
+
+    Note: Hash table uses open addressing with linear probing
+    Note: Each entry: [field_name_ptr:8][field_offset:8] (16 bytes)
+    Let max_probes be hash_table_size
+    Let probe_count be 0
+
+    While probe_count is less than max_probes:
+        Let entry_offset be hash_index multiplied by 16
+        Let stored_name_ptr be memory_get_int64(hash_table_ptr, entry_offset)
+
+        Note: Empty slot (0) means field not found
+        If stored_name_ptr is equal to 0:
+            Return -1
+        End If
+
+        Note: Check if this entry matches
+        If string_equals(stored_name_ptr, field_name) is equal to 1:
+            Let offset be memory_get_int64(hash_table_ptr, entry_offset plus 8)
+            Return offset
+        End If
+
+        Note: Collision - try next slot (linear probing)
+        Set hash_index to hash_index plus 1
+        If hash_index is greater than or equal to hash_table_size:
+            Set hash_index to 0
+        End If
+        Set probe_count to probe_count plus 1
+    End While
+
+    Note: Hash table full or corrupted - should never happen with proper sizing
+    Return -1
+End Process
+
+Process called "get_field_offset_linear" takes struct_ptr as Integer, field_name as Integer returns Integer:
+    Note: Linear search fallback for structs without hash tables
+    Note: Used for small structs (< 8 fields) where hash overhead not worth it
+
+    Let field_count be memory_get_int64(struct_ptr, 0)
+    Let field_names_ptr be memory_get_int64(struct_ptr, 8)
+    Let field_offsets_ptr be memory_get_int64(struct_ptr, 16)
+
+    Let i be 0
+    While i is less than field_count:
+        Let current_field_name be memory_get_int64(field_names_ptr, i multiplied by 8)
+        If string_equals(current_field_name, field_name) is equal to 1:
+            Let offset be memory_get_int64(field_offsets_ptr, i multiplied by 8)
+            Return offset
+        End If
+        Set i to i plus 1
+    End While
+
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: Public Field Access API with Caching and Error Reporting
+Note: ============================================================================
+
+Process called "get_field_offset" takes struct_ptr as Integer, field_name as Integer returns Integer:
+    Note: Get the offset of a field within a struct (optimized with cache)
+    Note: Returns field offset in bytes, or -1 if field not found
+
+    Note: Check cache first (O(1) when hit)
+    If LAST_STRUCT_PTR is equal to struct_ptr:
+        If LAST_FIELD_NAME is equal to field_name:
+            Note: Cache hit! Return cached offset
+            Return LAST_FIELD_OFFSET
+        End If
+    End If
+
+    Note: Cache miss - compute hash and lookup
+    Let field_name_hash be hash_string(field_name)
+    Let offset be get_field_offset_hashed(struct_ptr, field_name, field_name_hash)
+
+    Note: Update cache if found
+    If offset is not equal to -1:
+        Set LAST_STRUCT_PTR to struct_ptr
+        Set LAST_FIELD_NAME to field_name
+        Set LAST_FIELD_OFFSET to offset
+    End If
+
+    Return offset
+End Process
+
+Process called "get_field_offset_with_error" takes struct_ptr as Integer, field_name as Integer, error_msg_ptr as Integer returns Integer:
+    Note: Get field offset with detailed error message on failure
+    Note: error_msg_ptr: pointer to buffer for error message (min 256 bytes)
+    Note: Returns field offset or -1 on error (error message written to buffer)
+
+    Let offset be get_field_offset(struct_ptr, field_name)
+
+    If offset is equal to -1:
+        Note: Field not found - generate detailed error message
+        Let field_count be memory_get_int64(struct_ptr, 0)
+
+        Note: Build error message
+        Note: Format: "Field 'FIELDNAME' not found in struct (struct has N fields: field1, field2, ...)"
+
+        Note: Copy error prefix
+        Let prefix be "Field '"
+        string_copy_to_buffer(prefix, error_msg_ptr, 0)
+        Let write_offset be 7
+
+        Note: Copy field name
+        Let field_name_len be string_length(field_name)
+        string_copy_to_buffer(field_name, error_msg_ptr, write_offset)
+        Set write_offset to write_offset plus field_name_len
+
+        Note: Copy middle part
+        Let middle be "' not found in struct (struct has "
+        string_copy_to_buffer(middle, error_msg_ptr, write_offset)
+        Set write_offset to write_offset plus 33
+
+        Note: Convert field count to string
+        Let count_str be integer_to_string(field_count)
+        Let count_len be string_length(count_str)
+        string_copy_to_buffer(count_str, error_msg_ptr, write_offset)
+        Set write_offset to write_offset plus count_len
+
+        Note: Copy field list header
+        Let list_header be " fields: "
+        string_copy_to_buffer(list_header, error_msg_ptr, write_offset)
+        Set write_offset to write_offset plus 9
+
+        Note: List available fields (up to first 10)
+        Let field_names_ptr be memory_get_int64(struct_ptr, 8)
+        Let max_list be field_count
+        If max_list is greater than 10:
+            Set max_list to 10
+        End If
+
+        Let i be 0
+        While i is less than max_list:
+            Let current_field_name be memory_get_int64(field_names_ptr, i multiplied by 8)
+            Let current_name_len be string_length(current_field_name)
+            string_copy_to_buffer(current_field_name, error_msg_ptr, write_offset)
+            Set write_offset to write_offset plus current_name_len
+
+            Note: Add comma separator if not last
+            If i is less than max_list minus 1:
+                memory_set_byte(error_msg_ptr, write_offset, 44)
+                Set write_offset to write_offset plus 1
+                memory_set_byte(error_msg_ptr, write_offset, 32)
+                Set write_offset to write_offset plus 1
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Note: Add ellipsis if more fields exist
+        If field_count is greater than 10:
+            Let ellipsis be ", ..."
+            string_copy_to_buffer(ellipsis, error_msg_ptr, write_offset)
+            Set write_offset to write_offset plus 5
+        End If
+
+        Note: Add closing parenthesis
+        memory_set_byte(error_msg_ptr, write_offset, 41)
+        Set write_offset to write_offset plus 1
+
+        Note: Null terminator
+        memory_set_byte(error_msg_ptr, write_offset, 0)
+    End If
+
+    Return offset
+End Process
+
+Process called "get_field_type" takes struct_ptr as Integer, field_name as Integer returns Integer:
+    Note: Get the type name of a field within a struct (optimized with cache)
+    Note: Returns type name string pointer, or 0 if field not found
+
+    Note: Check cache first
+    If LAST_STRUCT_PTR is equal to struct_ptr:
+        If LAST_FIELD_NAME is equal to field_name:
+            Note: Cache hit! Return cached type
+            Return LAST_FIELD_TYPE
+        End If
+    End If
+
+    Note: Cache miss - do full lookup
+    Let field_count be memory_get_int64(struct_ptr, 0)
+    Let field_names_ptr be memory_get_int64(struct_ptr, 8)
+    Let field_types_ptr be memory_get_int64(struct_ptr, 24)
+
+    Note: Check if we can use hash table for field lookup
+    Let field_name_hash be hash_string(field_name)
+    Let offset be get_field_offset_hashed(struct_ptr, field_name, field_name_hash)
+
+    If offset is equal to -1:
+        Return 0
+    End If
+
+    Note: Field found, now get its type
+    Note: We need to find which index this field is at
+    Let i be 0
+    While i is less than field_count:
+        Let current_field_name be memory_get_int64(field_names_ptr, i multiplied by 8)
+        If string_equals(current_field_name, field_name) is equal to 1:
+            Let type_name be memory_get_int64(field_types_ptr, i multiplied by 8)
+
+            Note: Update cache
+            Set LAST_STRUCT_PTR to struct_ptr
+            Set LAST_FIELD_NAME to field_name
+            Set LAST_FIELD_OFFSET to offset
+            Set LAST_FIELD_TYPE to type_name
+
+            Return type_name
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Should not reach here if offset was valid
+    Return 0
+End Process
+
+Process called "field_exists" takes struct_ptr as Integer, field_name as Integer returns Integer:
+    Note: Check if a field exists in a struct
+    Note: Returns 1 if exists, 0 otherwise
+
+    Let offset be get_field_offset(struct_ptr, field_name)
+    If offset is equal to -1:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Array/Index Access Functions
+Note: ============================================================================
+
+Process called "calculate_array_element_offset" takes element_size as Integer, index as Integer returns Integer:
+    Note: Calculate byte offset for array element
+    Note: Returns element_size * index
+
+    Let offset be element_size multiplied by index
+    Return offset
+End Process
+
+Process called "validate_array_bounds" takes array_length as Integer, index as Integer returns Integer:
+    Note: Check if array index is within bounds
+    Note: Returns 1 if valid, 0 if out of bounds
+
+    If index is less than 0:
+        Return 0
+    End If
+
+    If index is greater than or equal to array_length:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "validate_array_bounds_with_error" takes array_length as Integer, index as Integer, error_msg_ptr as Integer returns Integer:
+    Note: Check array bounds with detailed error message on failure
+    Note: Returns 1 if valid, 0 if out of bounds (error message written to buffer)
+
+    If index is less than 0:
+        Note: Negative index error
+        Let msg be "Array index out of bounds: index "
+        string_copy_to_buffer(msg, error_msg_ptr, 0)
+        Let offset be 35
+
+        Let index_str be integer_to_string(index)
+        let index_len be string_length(index_str)
+        string_copy_to_buffer(index_str, error_msg_ptr, offset)
+        Set offset to offset plus index_len
+
+        Let suffix be " is negative (must be >= 0)"
+        string_copy_to_buffer(suffix, error_msg_ptr, offset)
+
+        Return 0
+    End If
+
+    If index is greater than or equal to array_length:
+        Note: Index too large error
+        Let msg be "Array index out of bounds: index "
+        string_copy_to_buffer(msg, error_msg_ptr, 0)
+        Let offset be 35
+
+        Let index_str be integer_to_string(index)
+        Let index_len be string_length(index_str)
+        string_copy_to_buffer(index_str, error_msg_ptr, offset)
+        Set offset to offset plus index_len
+
+        Let middle be " >= array length "
+        string_copy_to_buffer(middle, error_msg_ptr, offset)
+        Set offset to offset plus 17
+
+        Let length_str be integer_to_string(array_length)
+        Let length_len be string_length(length_str)
+        string_copy_to_buffer(length_str, error_msg_ptr, offset)
+
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Hash Table Construction (for struct metadata builders)
+Note: ============================================================================
+
+Process called "build_field_hash_table" takes struct_ptr as Integer, arena_ptr as Integer returns Integer:
+    Note: Build hash table for fast field lookups
+    Note: Call this when creating struct metadata with many fields
+    Note: Returns 1 on success, 0 on failure
+    Note: Only worthwhile for structs with 8+ fields
+
+    Let field_count be memory_get_int64(struct_ptr, 0)
+
+    Note: Skip hash table for small structs (linear search is faster)
+    If field_count is less than 8:
+        Return 1
+    End If
+
+    Note: Hash table size = next power of 2 >= field_count * 2 (50% load factor)
+    Let hash_table_size be 16
+    While hash_table_size is less than field_count multiplied by 2:
+        Set hash_table_size to hash_table_size multiplied by 2
+    End While
+
+    Note: Allocate hash table (16 bytes per entry)
+    Let hash_table_bytes be hash_table_size multiplied by 16
+    Let hash_table_ptr be arena_allocate(arena_ptr, hash_table_bytes)
+
+    Note: Zero-initialize hash table
+    memory_zero(hash_table_ptr, hash_table_bytes)
+
+    Note: Insert all fields into hash table
+    Let field_names_ptr be memory_get_int64(struct_ptr, 8)
+    Let field_offsets_ptr be memory_get_int64(struct_ptr, 16)
+
+    Let i be 0
+    While i is less than field_count:
+        Let field_name_ptr be memory_get_int64(field_names_ptr, i multiplied by 8)
+        Let field_offset be memory_get_int64(field_offsets_ptr, i multiplied by 8)
+
+        Note: Hash the field name
+        Let hash be hash_string(field_name_ptr)
+        Let hash_index be hash modulo hash_table_size
+
+        Note: Find empty slot using linear probing
+        Let found_slot be 0
+        Let probe_count be 0
+        While found_slot is equal to 0:
+            Let entry_offset be hash_index multiplied by 16
+            Let stored_name_ptr be memory_get_int64(hash_table_ptr, entry_offset)
+
+            If stored_name_ptr is equal to 0:
+                Note: Empty slot found - insert here
+                memory_set_int64(hash_table_ptr, entry_offset, field_name_ptr)
+                memory_set_int64(hash_table_ptr, entry_offset plus 8, field_offset)
+                Set found_slot to 1
+            End If
+            Otherwise:
+                Note: Collision - try next slot
+                Set hash_index to hash_index plus 1
+                If hash_index is greater than or equal to hash_table_size:
+                    Set hash_index to 0
+                End If
+                Set probe_count to probe_count plus 1
+
+                Note: Safety check - should never happen with 50% load factor
+                If probe_count is greater than or equal to hash_table_size:
+                    Return 0
+                End If
+            End If
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Store hash table pointer and size in struct metadata
+    memory_set_int64(struct_ptr, 32, hash_table_ptr)
+    memory_set_int64(struct_ptr, 40, hash_table_size)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Performance Statistics (optional, for profiling)
+Note: ============================================================================
+
+Let FIELD_ACCESS_CACHE_HITS be 0
+Let FIELD_ACCESS_CACHE_MISSES be 0
+
+Process called "get_cache_hit_rate" returns Integer:
+    Note: Get cache hit rate as percentage (0-100)
+    Note: Returns percentage of cache hits, or 0 if no accesses
+
+    Let total be FIELD_ACCESS_CACHE_HITS plus FIELD_ACCESS_CACHE_MISSES
+    If total is equal to 0:
+        Return 0
+    End If
+
+    Let hit_rate be FIELD_ACCESS_CACHE_HITS multiplied by 100
+    Set hit_rate to hit_rate divided by total
+
+    Return hit_rate
+End Process
+
+Process called "reset_cache_statistics":
+    Note: Reset cache statistics counters
+    Set FIELD_ACCESS_CACHE_HITS to 0
+    Set FIELD_ACCESS_CACHE_MISSES to 0
+End Process

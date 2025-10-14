@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,598 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles Windows calling convention and function call interface.
+Microsoft x64 Calling Convention (Windows x86_64)
 
-This file performs the following tasks:
-- Process Windows calling convention rules and parameter passing
-- Handle Windows-specific register usage and register allocation
-- Manage Windows stack frame management and stack operations
-- Process Windows function call optimization and call interface
+This file implements the Microsoft x64 calling convention used on Windows x86_64.
+This convention defines how functions receive parameters, return values, manage
+the stack, and preserve registers.
 
-This file is essential because of the following reasons:
-- Windows calling convention ensures correct function calls on Windows systems
-- Proper calling convention handling enables system integration and library compatibility
-- Windows support enables Runa compilation for Windows platforms
+Microsoft x64 Calling Convention Summary:
+- Integer/pointer arguments: RCX, RDX, R8, R9 (4 registers)
+- Floating-point arguments: XMM0-XMM3 (4 registers)
+- Additional arguments: Pushed on stack (left-to-right)
+- Return value: RAX (integer/pointer), XMM0 (float)
+- Stack alignment: 16-byte aligned before CALL instruction
+- Caller-saved (volatile): RAX, RCX, RDX, R8-R11, XMM0-XMM5
+- Callee-saved (non-volatile): RBX, RBP, RDI, RSI, RSP, R12-R15, XMM6-XMM15
+- Frame pointer: RBP (optional)
+- Stack pointer: RSP
+- Shadow space: 32 bytes (caller must allocate for spilling parameter registers)
 
-This file consists of the following functions/features/operation types:
-- Windows calling convention processing and parameter passing
-- Windows register usage and register allocation
-- Windows stack frame management and stack operations
-- Windows function call optimization and call interface
+Key differences from System V ABI (Linux/macOS):
+1. Only 4 parameter registers (vs 6 for System V)
+2. Parameters: RCX, RDX, R8, R9 (vs RDI, RSI, RDX, RCX, R8, R9)
+3. RSI and RDI are CALLEE-SAVED (vs caller-saved in System V)
+4. XMM6-XMM15 are CALLEE-SAVED (vs all caller-saved in System V)
+5. Mandatory 32-byte shadow space on stack
+6. No red zone (vs 128 bytes for System V)
+
+References:
+- Microsoft x64 Software Conventions
+- MSDN: x64 Calling Convention
+- Windows x64 ABI
+
+Dependencies: registers.runa for register mappings
 :End Note
 
-Note: TODO - Implement Windows calling convention functionality
+Import "compiler/frontend/primitives/platform/windows_x86_64/registers.runa" as Registers
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: PARAMETER PASSING - INTEGER AND POINTER ARGUMENTS
+Note: ============================================================================
+
+Process called "get_integer_param_register" takes param_index as Integer returns Integer:
+    Note: Get register number for integer/pointer parameter
+    Note: Microsoft x64: RCX, RDX, R8, R9 (indices 0-3)
+    Note: Returns register number (0-15), or -1 if passed on stack
+
+    If param_index is equal to 0:
+        Return 1  Note: RCX
+    End If
+
+    If param_index is equal to 1:
+        Return 2  Note: RDX
+    End If
+
+    If param_index is equal to 2:
+        Return 8  Note: R8
+    End If
+
+    If param_index is equal to 3:
+        Return 9  Note: R9
+    End If
+
+    Note: Parameters 4+ are passed on stack
+    Return -1
+End Process
+
+Process called "get_max_integer_register_params" returns Integer:
+    Note: Maximum number of integer/pointer parameters passed in registers
+    Note: Microsoft x64: 4 parameters (vs 6 for System V)
+    Return 4
+End Process
+
+Process called "is_param_in_register" takes param_index as Integer returns Integer:
+    Note: Check if parameter is passed in register (vs stack)
+    Note: Returns 1 if in register, 0 if on stack
+
+    If param_index is less than 4:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "get_stack_param_offset" takes param_index as Integer returns Integer:
+    Note: Get stack offset for parameter passed on stack
+    Note: Stack parameters start at [RSP + 40]
+    Note:   - [RSP + 0..7] = return address
+    Note:   - [RSP + 8..39] = 32 bytes shadow space
+    Note:   - [RSP + 40+] = stack parameters
+    Note: param_index must be >= 4 (first 4 are in registers)
+
+    If param_index is less than 4:
+        Return 0  Note: Not a stack parameter
+    End If
+
+    Note: Calculate offset: 40 bytes (return + shadow) + 8 bytes per param
+    Let stack_param_num be param_index minus 4
+    Let offset be 40 plus (stack_param_num multiplied by 8)
+
+    Return offset
+End Process
+
+Process called "get_shadow_space_size" returns Integer:
+    Note: Get size of mandatory shadow space for parameter registers
+    Note: Microsoft x64: 32 bytes (4 parameters × 8 bytes)
+    Note: Caller MUST allocate this space even if not used
+    Return 32
+End Process
+
+Note: ============================================================================
+Note: PARAMETER PASSING - FLOATING-POINT ARGUMENTS
+Note: ============================================================================
+
+Process called "get_float_param_register" takes param_index as Integer returns Integer:
+    Note: Get XMM register number for floating-point parameter
+    Note: Microsoft x64: XMM0-XMM3 (indices 0-3)
+    Note: Returns XMM register number (16-31), or -1 if passed on stack
+
+    If param_index is less than 4:
+        Return Registers.get_xmm_param_register(param_index)
+    End If
+
+    Note: Parameters 4+ are passed on stack
+    Return -1
+End Process
+
+Process called "get_max_float_register_params" returns Integer:
+    Note: Maximum number of floating-point parameters passed in XMM registers
+    Note: Microsoft x64: 4 parameters (matches integer param count)
+    Return Registers.get_max_xmm_register_params()  Note: Returns 4
+End Process
+
+Process called "is_float_param_in_register" takes param_index as Integer returns Integer:
+    Note: Check if floating-point parameter is passed in register (vs stack)
+    Note: Returns 1 if in register, 0 if on stack
+
+    If param_index is less than 4:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: RETURN VALUE HANDLING
+Note: ============================================================================
+
+Process called "get_return_value_register" returns Integer:
+    Note: Get register number for return value
+    Note: Integer/pointer returns: RAX
+    Return 0  Note: RAX
+End Process
+
+Process called "get_float_return_register" returns Integer:
+    Note: Get register number for floating-point return value
+    Note: Float/double returns: XMM0
+    Return Registers.get_xmm_return_register()  Note: Returns 16 (XMM0)
+End Process
+
+Process called "is_return_via_memory" takes return_size as Integer returns Integer:
+    Note: Check if return value is passed via memory (hidden pointer)
+    Note: Returns 1 if return via memory, 0 if in registers
+    Note: Microsoft x64: Structures > 8 bytes (and not 1, 2, 4, 8) returned via memory
+
+    If return_size is greater than 8:
+        Return 1  Note: Large structures returned via memory
+    End If
+
+    Note: Check for non-power-of-2 sizes up to 8 bytes (also returned via memory)
+    If return_size is equal to 3:
+        Return 1
+    End If
+
+    If return_size is equal to 5:
+        Return 1
+    End If
+
+    If return_size is equal to 6:
+        Return 1
+    End If
+
+    If return_size is equal to 7:
+        Return 1
+    End If
+
+    Return 0  Note: Return in registers (1, 2, 4, 8 bytes)
+End Process
+
+Note: ============================================================================
+Note: REGISTER PRESERVATION (CALLER-SAVED vs CALLEE-SAVED)
+Note: ============================================================================
+
+Process called "is_caller_saved_register" takes reg_num as Integer returns Integer:
+    Note: Check if register is caller-saved (volatile)
+    Note: Caller-saved: RAX, RCX, RDX, R8-R11, XMM0-XMM5
+    Note: Returns 1 if caller-saved, 0 if callee-saved
+
+    Note: RAX (0)
+    If reg_num is equal to 0:
+        Return 1
+    End If
+
+    Note: RCX (1)
+    If reg_num is equal to 1:
+        Return 1
+    End If
+
+    Note: RDX (2)
+    If reg_num is equal to 2:
+        Return 1
+    End If
+
+    Note: R8 (8)
+    If reg_num is equal to 8:
+        Return 1
+    End If
+
+    Note: R9 (9)
+    If reg_num is equal to 9:
+        Return 1
+    End If
+
+    Note: R10 (10)
+    If reg_num is equal to 10:
+        Return 1
+    End If
+
+    Note: R11 (11)
+    If reg_num is equal to 11:
+        Return 1
+    End If
+
+    Note: Check XMM0-XMM5 (16-21)
+    If reg_num is greater than or equal to 16:
+        If reg_num is less than or equal to 21:
+            Return 1  Note: XMM0-XMM5 are caller-saved
+        End If
+    End If
+
+    Return 0  Note: Callee-saved or special register
+End Process
+
+Process called "is_callee_saved_register" takes reg_num as Integer returns Integer:
+    Note: Check if register is callee-saved (non-volatile)
+    Note: Callee-saved: RBX, RBP, RDI, RSI, RSP, R12-R15, XMM6-XMM15
+    Note: Returns 1 if callee-saved, 0 if caller-saved
+
+    Note: KEY DIFFERENCE: RSI, RDI are CALLEE-SAVED on Windows (vs caller-saved on Linux)
+
+    Note: RBX (3)
+    If reg_num is equal to 3:
+        Return 1
+    End If
+
+    Note: RSP (4)
+    If reg_num is equal to 4:
+        Return 1  Note: Stack pointer always preserved
+    End If
+
+    Note: RBP (5)
+    If reg_num is equal to 5:
+        Return 1
+    End If
+
+    Note: RSI (6) - CALLEE-SAVED on Windows
+    If reg_num is equal to 6:
+        Return 1
+    End If
+
+    Note: RDI (7) - CALLEE-SAVED on Windows
+    If reg_num is equal to 7:
+        Return 1
+    End If
+
+    Note: R12 (12)
+    If reg_num is equal to 12:
+        Return 1
+    End If
+
+    Note: R13 (13)
+    If reg_num is equal to 13:
+        Return 1
+    End If
+
+    Note: R14 (14)
+    If reg_num is equal to 14:
+        Return 1
+    End If
+
+    Note: R15 (15)
+    If reg_num is equal to 15:
+        Return 1
+    End If
+
+    Note: Check XMM6-XMM15 (22-31) - CALLEE-SAVED on Windows
+    If reg_num is greater than or equal to 22:
+        If reg_num is less than or equal to 31:
+            Return 1  Note: XMM6-XMM15 are callee-saved
+        End If
+    End If
+
+    Return 0  Note: Caller-saved or special register
+End Process
+
+Process called "get_callee_saved_register_list" takes buffer_ptr as Integer returns Integer:
+    Note: Fill buffer with list of callee-saved register numbers
+    Note: buffer_ptr: pointer to array of at least 12 integers
+    Note: Returns: count of callee-saved registers (12)
+    Note: Includes: RBX, RBP, RSI, RDI, RSP, R12-R15, and optionally XMM6-XMM15
+
+    Let offset be 0
+
+    Note: Store register numbers in buffer (8 bytes per integer)
+    Note: RBX (3)
+    Memory.memory_set_int64(buffer_ptr, offset, 3)
+    Set offset to offset plus 8
+
+    Note: RBP (5)
+    Memory.memory_set_int64(buffer_ptr, offset, 5)
+    Set offset to offset plus 8
+
+    Note: RSI (6) - CALLEE-SAVED on Windows
+    Memory.memory_set_int64(buffer_ptr, offset, 6)
+    Set offset to offset plus 8
+
+    Note: RDI (7) - CALLEE-SAVED on Windows
+    Memory.memory_set_int64(buffer_ptr, offset, 7)
+    Set offset to offset plus 8
+
+    Note: R12 (12)
+    Memory.memory_set_int64(buffer_ptr, offset, 12)
+    Set offset to offset plus 8
+
+    Note: R13 (13)
+    Memory.memory_set_int64(buffer_ptr, offset, 13)
+    Set offset to offset plus 8
+
+    Note: R14 (14)
+    Memory.memory_set_int64(buffer_ptr, offset, 14)
+    Set offset to offset plus 8
+
+    Note: R15 (15)
+    Memory.memory_set_int64(buffer_ptr, offset, 15)
+
+    Return 8  Note: 8 callee-saved general-purpose registers (not counting XMM)
+End Process
+
+Note: ============================================================================
+Note: STACK FRAME MANAGEMENT
+Note: ============================================================================
+
+Process called "get_stack_alignment" returns Integer:
+    Note: Get required stack alignment in bytes
+    Note: Microsoft x64: 16-byte alignment before CALL
+    Return 16
+End Process
+
+Process called "calculate_stack_frame_size" takes local_vars_size as Integer, num_callee_saved_regs as Integer returns Integer:
+    Note: Calculate total stack frame size with proper alignment
+    Note: local_vars_size: size of local variables in bytes
+    Note: num_callee_saved_regs: number of callee-saved registers to preserve
+    Note: Returns: total frame size (16-byte aligned)
+
+    Note: Saved registers: 8 bytes each
+    Let saved_regs_size be num_callee_saved_regs multiplied by 8
+
+    Note: Total size before alignment
+    Let total_size be local_vars_size plus saved_regs_size
+
+    Note: Round up to 16-byte alignment
+    Let remainder be total_size bitwise_and 15
+    If remainder is not equal to 0:
+        Let padding be 16 minus remainder
+        Set total_size to total_size plus padding
+    End If
+
+    Return total_size
+End Process
+
+Process called "calculate_call_frame_size" takes local_frame_size as Integer, num_stack_args as Integer returns Integer:
+    Note: Calculate stack frame size including shadow space and stack arguments
+    Note: local_frame_size: size of local variables and saved registers
+    Note: num_stack_args: number of arguments passed on stack (beyond first 4)
+    Note: Returns: total frame size (16-byte aligned)
+
+    Note: Microsoft x64 requires:
+    Note: - 32 bytes shadow space (always)
+    Note: - 8 bytes per stack argument (for args 5+)
+    Note: - 16-byte alignment
+
+    Note: Shadow space is mandatory
+    Let shadow_space be 32
+
+    Note: Stack arguments (8 bytes each)
+    Let stack_args_size be 0
+    If num_stack_args is greater than 0:
+        Set stack_args_size to num_stack_args multiplied by 8
+    End If
+
+    Note: Total size before alignment
+    Let total_size be local_frame_size plus shadow_space plus stack_args_size
+
+    Note: Round up to 16-byte alignment
+    Let remainder be total_size bitwise_and 15
+    If remainder is not equal to 0:
+        Let padding be 16 minus remainder
+        Set total_size to total_size plus padding
+    End If
+
+    Return total_size
+End Process
+
+Process called "get_frame_pointer_register" returns Integer:
+    Note: Get frame pointer register number
+    Note: Microsoft x64: RBP (optional but recommended)
+    Return 5  Note: RBP
+End Process
+
+Process called "get_stack_pointer_register" returns Integer:
+    Note: Get stack pointer register number
+    Note: Microsoft x64: RSP
+    Return 4  Note: RSP
+End Process
+
+Process called "has_red_zone" returns Integer:
+    Note: Check if this calling convention has a red zone
+    Note: Microsoft x64: NO red zone (vs 128 bytes for System V)
+    Return 0
+End Process
+
+Process called "can_use_red_zone" takes is_leaf_function as Integer returns Integer:
+    Note: Check if function can use red zone optimization
+    Note: Microsoft x64 has NO red zone, so always return 0
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: FUNCTION PROLOGUE AND EPILOGUE HELPERS
+Note: ============================================================================
+
+Process called "needs_frame_pointer" takes has_variable_sized_locals as Integer, has_alloca as Integer returns Integer:
+    Note: Determine if function needs frame pointer
+    Note: Frame pointer required for variable-sized locals or alloca
+    Note: Returns 1 if frame pointer needed, 0 if can use RSP directly
+
+    If has_variable_sized_locals is equal to 1:
+        Return 1
+    End If
+
+    If has_alloca is equal to 1:
+        Return 1
+    End If
+
+    Note: Frame pointer optional for fixed-size frames
+    Note: Recommended for debugging and exception handling
+    Return 0
+End Process
+
+Process called "calculate_call_stack_adjustment" takes num_stack_args as Integer returns Integer:
+    Note: Calculate stack space needed for outgoing call arguments
+    Note: num_stack_args: number of arguments passed on stack (beyond first 4)
+    Note: Returns: stack adjustment in bytes (16-byte aligned, includes shadow space)
+
+    Note: Shadow space is mandatory (32 bytes)
+    Let shadow_space be 32
+
+    Note: Stack arguments (8 bytes each)
+    Let args_size be shadow_space
+    If num_stack_args is greater than 0:
+        Let stack_args be num_stack_args multiplied by 8
+        Set args_size to args_size plus stack_args
+    End If
+
+    Note: Round up to 16-byte alignment
+    Let remainder be args_size bitwise_and 15
+    If remainder is not equal to 0:
+        Let padding be 16 minus remainder
+        Set args_size to args_size plus padding
+    End If
+
+    Return args_size
+End Process
+
+Note: ============================================================================
+Note: VARIADIC FUNCTION SUPPORT
+Note: ============================================================================
+
+Process called "get_variadic_gp_register_save_area_size" returns Integer:
+    Note: Size of save area for general-purpose register arguments
+    Note: Microsoft x64: 4 registers × 8 bytes = 32 bytes
+    Return 32
+End Process
+
+Process called "get_variadic_fp_register_save_area_size" returns Integer:
+    Note: Size of save area for floating-point register arguments
+    Note: Microsoft x64: 4 XMM registers × 16 bytes = 64 bytes
+    Return 64
+End Process
+
+Process called "get_variadic_total_save_area_size" returns Integer:
+    Note: Total size for variadic function register save area
+    Note: GP area (32) + FP area (64) = 96 bytes
+    Return 96
+End Process
+
+Note: ============================================================================
+Note: HELPER FUNCTIONS FOR CODE GENERATION
+Note: ============================================================================
+
+Process called "get_parameter_location" takes param_index as Integer, param_size as Integer, result_buffer as Integer returns Integer:
+    Note: Get location (register or stack offset) for parameter
+    Note: param_index: parameter position (0-based)
+    Note: param_size: size in bytes (for future struct handling)
+    Note: result_buffer: pointer to 2-integer array [location_type, value]
+    Note: location_type: 0 = register (value = reg_num), 1 = stack (value = offset)
+    Note: Returns: location_type
+
+    Let location_type be 0
+    Let value be 0
+
+    Note: Check if parameter is in register
+    If param_index is less than 4:
+        Set location_type to 0  Note: Register
+        Set value to get_integer_param_register(param_index)
+    Otherwise:
+        Set location_type to 1  Note: Stack
+        Set value to get_stack_param_offset(param_index)
+    End If
+
+    Note: Write results to buffer
+    Memory.memory_set_int64(result_buffer, 0, location_type)
+    Memory.memory_set_int64(result_buffer, 8, value)
+
+    Return location_type
+End Process
+
+Process called "get_call_setup_info" takes num_params as Integer, result_buffer as Integer returns Integer:
+    Note: Get information needed to set up a function call
+    Note: num_params: total number of parameters
+    Note: result_buffer: pointer to 3-integer array [reg_params, stack_params, stack_adjustment]
+    Note: Returns: number of stack parameters
+
+    Let reg_params be 4
+    Let stack_params be 0
+    Let stack_adjustment be 0
+
+    If num_params is less than or equal to 4:
+        Set reg_params to num_params
+    Otherwise:
+        Set stack_params to num_params minus 4
+    End If
+
+    Note: Calculate stack adjustment (includes shadow space)
+    Set stack_adjustment to calculate_call_stack_adjustment(stack_params)
+
+    Note: Write results to buffer
+    Memory.memory_set_int64(result_buffer, 0, reg_params)
+    Memory.memory_set_int64(result_buffer, 8, stack_params)
+    Memory.memory_set_int64(result_buffer, 16, stack_adjustment)
+
+    Return stack_params
+End Process
+
+Note: ============================================================================
+Note: CALLING CONVENTION VALIDATION AND UTILITIES
+Note: ============================================================================
+
+Process called "validate_stack_alignment" takes stack_offset as Integer returns Integer:
+    Note: Check if stack offset is properly aligned
+    Note: Returns 1 if aligned to 16 bytes, 0 otherwise
+
+    Let remainder be stack_offset bitwise_and 15
+    If remainder is equal to 0:
+        Return 1  Note: Properly aligned
+    End If
+
+    Return 0  Note: Misaligned
+End Process
+
+Process called "get_calling_convention_name" returns String:
+    Note: Return name of calling convention
+    Return "Microsoft x64"
+End Process
+
+Process called "get_abi_version" returns Integer:
+    Note: Return ABI version identifier
+    Note: Using Microsoft x64 calling convention version 1
+    Return 1
+End Process
+
+Process called "requires_shadow_space" returns Integer:
+    Note: Check if this calling convention requires shadow space
+    Note: Microsoft x64: YES (32 bytes mandatory)
+    Return 1
+End Process

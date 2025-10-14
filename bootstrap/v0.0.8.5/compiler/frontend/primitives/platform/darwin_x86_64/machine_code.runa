@@ -1,0 +1,721 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Darwin x86-64 Machine Code Generation
+
+This file implements x86-64 machine code encoding for Darwin (macOS).
+
+x86-64 Instruction Encoding:
+- Variable-length instructions (1-15 bytes, CISC)
+- Little-endian byte order
+- Prefixes: REX (64-bit mode), VEX/EVEX (SIMD), legacy prefixes
+- ModR/M byte: specifies addressing mode and operands
+- SIB byte: scale-index-base for complex addressing
+- Immediate and displacement fields
+
+IMPORTANT: x86-64 machine code is IDENTICAL across platforms (Windows, Linux, macOS).
+The CPU doesn't know what OS is running - it just executes x86-64 instructions.
+Platform differences are in:
+1. Object file format (Mach-O for macOS vs ELF for Linux vs PE/COFF for Windows)
+2. Relocation types (handled by assembler/linker)
+3. Symbol table format (handled by assembler/linker)
+
+At the instruction level, a MOV instruction on macOS is byte-for-byte
+identical to the same MOV instruction on Linux or Windows.
+
+This file provides basic encoding utilities for common x86-64 instructions.
+For comprehensive x86-64 instruction encoding, reference the Intel/AMD
+Software Developer Manuals.
+
+Dependencies: memory_core.runa for buffer operations
+:End Note
+
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Note: ============================================================================
+Note: INSTRUCTION BUFFER OPERATIONS
+Note: ============================================================================
+
+Process called "write_byte" takes buffer_ptr as Integer, offset as Integer, byte_val as Integer returns Integer:
+    Note: Write single byte to buffer
+    Note: Returns offset + 1 (next write position)
+
+    Memory.memory_set_byte(buffer_ptr, offset, byte_val bitwise_and 255)
+    Return offset plus 1
+End Process
+
+Process called "write_word" takes buffer_ptr as Integer, offset as Integer, word_val as Integer returns Integer:
+    Note: Write 16-bit word to buffer (little-endian)
+    Note: Returns offset + 2
+
+    Memory.memory_set_byte(buffer_ptr, offset, word_val bitwise_and 255)
+    Memory.memory_set_byte(buffer_ptr, offset plus 1, (word_val shifted_right 8) bitwise_and 255)
+    Return offset plus 2
+End Process
+
+Process called "write_dword" takes buffer_ptr as Integer, offset as Integer, dword_val as Integer returns Integer:
+    Note: Write 32-bit dword to buffer (little-endian)
+    Note: Returns offset + 4
+
+    Memory.memory_set_byte(buffer_ptr, offset, dword_val bitwise_and 255)
+    Memory.memory_set_byte(buffer_ptr, offset plus 1, (dword_val shifted_right 8) bitwise_and 255)
+    Memory.memory_set_byte(buffer_ptr, offset plus 2, (dword_val shifted_right 16) bitwise_and 255)
+    Memory.memory_set_byte(buffer_ptr, offset plus 3, (dword_val shifted_right 24) bitwise_and 255)
+    Return offset plus 4
+End Process
+
+Process called "write_qword" takes buffer_ptr as Integer, offset as Integer, qword_val as Integer returns Integer:
+    Note: Write 64-bit qword to buffer (little-endian)
+    Note: Returns offset + 8
+
+    Let lower_dword be qword_val bitwise_and 4294967295
+    Let upper_dword be qword_val shifted_right 32
+
+    Let new_offset be write_dword(buffer_ptr, offset, lower_dword)
+    Return write_dword(buffer_ptr, new_offset, upper_dword)
+End Process
+
+Note: ============================================================================
+Note: REX PREFIX ENCODING
+Note: ============================================================================
+
+Process called "encode_rex" takes is_64bit as Integer, reg_ext as Integer, index_ext as Integer, rm_ext as Integer returns Integer:
+    Note: Encode REX prefix byte (0x40-0x4F)
+    Note: REX byte: 0100WRXB
+    Note: W=1 for 64-bit operand, R=reg extension, X=index extension, B=r/m extension
+
+    Let rex be 64  Note: Base REX prefix (0x40)
+
+    Note: Set W bit for 64-bit operand
+    If is_64bit is equal to 1:
+        Set rex to rex bitwise_or 8  Note: REX.W (0x48)
+    End If
+
+    Note: Set R bit if reg >= 8
+    If reg_ext is equal to 1:
+        Set rex to rex bitwise_or 4  Note: REX.R (0x44)
+    End If
+
+    Note: Set X bit if index >= 8
+    If index_ext is equal to 1:
+        Set rex to rex bitwise_or 2  Note: REX.X (0x42)
+    End If
+
+    Note: Set B bit if r/m >= 8
+    If rm_ext is equal to 1:
+        Set rex to rex bitwise_or 1  Note: REX.B (0x41)
+    End If
+
+    Return rex
+End Process
+
+Process called "needs_rex" takes reg as Integer, is_64bit as Integer returns Integer:
+    Note: Check if instruction needs REX prefix
+    Note: Returns 1 if REX needed, 0 otherwise
+
+    If is_64bit is equal to 1:
+        Return 1  Note: 64-bit operations need REX.W
+    End If
+
+    If reg is greater than or equal to 8:
+        Return 1  Note: R8-R15 need REX
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: ModR/M AND SIB BYTE ENCODING
+Note: ============================================================================
+
+Process called "encode_modrm" takes mod as Integer, reg as Integer, rm as Integer returns Integer:
+    Note: Encode ModR/M byte
+    Note: mod: addressing mode (00, 01, 10, 11)
+    Note: reg: register field (0-7, for R8-R15 use REX.R)
+    Note: rm: r/m field (0-7, for R8-R15 use REX.B)
+
+    Let modrm be 0
+
+    Note: mod field at bits 6-7
+    Let mod_bits be mod shifted_left 6
+    Set modrm to modrm bitwise_or mod_bits
+
+    Note: reg field at bits 3-5 (use only lower 3 bits)
+    Let reg_bits be (reg bitwise_and 7) shifted_left 3
+    Set modrm to modrm bitwise_or reg_bits
+
+    Note: rm field at bits 0-2 (use only lower 3 bits)
+    Let rm_bits be rm bitwise_and 7
+    Set modrm to modrm bitwise_or rm_bits
+
+    Return modrm
+End Process
+
+Process called "encode_sib" takes scale as Integer, index as Integer, base as Integer returns Integer:
+    Note: Encode SIB (scale-index-base) byte
+    Note: scale: 00=1, 01=2, 10=4, 11=8
+    Note: index: index register (0-7, for R8-R15 use REX.X)
+    Note: base: base register (0-7, for R8-R15 use REX.B)
+
+    Let sib be 0
+
+    Note: scale field at bits 6-7
+    Let scale_bits be scale shifted_left 6
+    Set sib to sib bitwise_or scale_bits
+
+    Note: index field at bits 3-5
+    Let index_bits be (index bitwise_and 7) shifted_left 3
+    Set sib to sib bitwise_or index_bits
+
+    Note: base field at bits 0-2
+    Let base_bits be base bitwise_and 7
+    Set sib to sib bitwise_or base_bits
+
+    Return sib
+End Process
+
+Note: ============================================================================
+Note: DATA MOVEMENT INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_mov_reg_reg" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, src_reg as Integer returns Integer:
+    Note: Encode MOV r64, r64 (register to register, 64-bit)
+    Note: Opcode: 0x89 (MOV r/m64, r64)
+    Note: Returns new offset
+
+    Let current_offset be offset
+
+    Note: Emit REX.W prefix for 64-bit operation
+    Let rex_needed be needs_rex(dest_reg, 1)
+    Let src_ext be 0
+    Let dest_ext be 0
+
+    If src_reg is greater than or equal to 8:
+        Set src_ext to 1
+    End If
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+
+    Let rex be encode_rex(1, src_ext, 0, dest_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Note: Emit opcode 0x89
+    Set current_offset to write_byte(buffer_ptr, current_offset, 137)
+
+    Note: Emit ModR/M byte (mod=11 for register direct, reg=src, rm=dest)
+    Let modrm be encode_modrm(3, src_reg, dest_reg)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Return current_offset
+End Process
+
+Process called "encode_mov_reg_imm64" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, immediate as Integer returns Integer:
+    Note: Encode MOV r64, imm64 (64-bit immediate to register)
+    Note: Opcode: 0xB8+rd (MOV r64, imm64)
+    Note: Returns new offset
+
+    Let current_offset be offset
+
+    Note: Emit REX.W prefix for 64-bit operation
+    Let dest_ext be 0
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+
+    Let rex be encode_rex(1, 0, 0, dest_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Note: Emit opcode 0xB8 + (dest_reg & 7)
+    Let opcode be 184 plus (dest_reg bitwise_and 7)
+    Set current_offset to write_byte(buffer_ptr, current_offset, opcode)
+
+    Note: Emit 64-bit immediate
+    Set current_offset to write_qword(buffer_ptr, current_offset, immediate)
+
+    Return current_offset
+End Process
+
+Process called "encode_mov_reg_imm32" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, immediate as Integer returns Integer:
+    Note: Encode MOV r64, imm32 (sign-extended 32-bit immediate)
+    Note: Opcode: 0xC7 /0 (MOV r/m64, imm32)
+    Note: More compact than full 64-bit immediate
+    Note: Returns new offset
+
+    Let current_offset be offset
+
+    Note: Emit REX.W prefix
+    Let dest_ext be 0
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+
+    Let rex be encode_rex(1, 0, 0, dest_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Note: Emit opcode 0xC7
+    Set current_offset to write_byte(buffer_ptr, current_offset, 199)
+
+    Note: Emit ModR/M byte (mod=11, reg=0, rm=dest_reg)
+    Let modrm be encode_modrm(3, 0, dest_reg)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Note: Emit 32-bit immediate (sign-extended to 64-bit)
+    Set current_offset to write_dword(buffer_ptr, current_offset, immediate)
+
+    Return current_offset
+End Process
+
+Note: ============================================================================
+Note: ARITHMETIC INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_add_reg_reg" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, src_reg as Integer returns Integer:
+    Note: Encode ADD r64, r64 (dest = dest + src)
+    Note: Opcode: 0x01 (ADD r/m64, r64)
+    Note: Returns new offset
+
+    Let current_offset be offset
+
+    Note: Emit REX.W prefix
+    Let src_ext be 0
+    Let dest_ext be 0
+    If src_reg is greater than or equal to 8:
+        Set src_ext to 1
+    End If
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+
+    Let rex be encode_rex(1, src_ext, 0, dest_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Note: Emit opcode 0x01
+    Set current_offset to write_byte(buffer_ptr, current_offset, 1)
+
+    Note: Emit ModR/M byte (mod=11, reg=src, rm=dest)
+    Let modrm be encode_modrm(3, src_reg, dest_reg)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Return current_offset
+End Process
+
+Process called "encode_add_reg_imm32" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, immediate as Integer returns Integer:
+    Note: Encode ADD r64, imm32 (sign-extended)
+    Note: Opcode: 0x81 /0 (ADD r/m64, imm32)
+    Note: Returns new offset
+
+    Let current_offset be offset
+
+    Note: Emit REX.W prefix
+    Let dest_ext be 0
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+
+    Let rex be encode_rex(1, 0, 0, dest_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Note: Emit opcode 0x81
+    Set current_offset to write_byte(buffer_ptr, current_offset, 129)
+
+    Note: Emit ModR/M byte (mod=11, reg=0, rm=dest_reg)
+    Let modrm be encode_modrm(3, 0, dest_reg)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Note: Emit 32-bit immediate
+    Set current_offset to write_dword(buffer_ptr, current_offset, immediate)
+
+    Return current_offset
+End Process
+
+Process called "encode_sub_reg_reg" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, src_reg as Integer returns Integer:
+    Note: Encode SUB r64, r64 (dest = dest - src)
+    Note: Opcode: 0x29 (SUB r/m64, r64)
+    Note: Returns new offset
+
+    Let current_offset be offset
+
+    Note: Emit REX.W prefix
+    Let src_ext be 0
+    Let dest_ext be 0
+    If src_reg is greater than or equal to 8:
+        Set src_ext to 1
+    End If
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+
+    Let rex be encode_rex(1, src_ext, 0, dest_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Note: Emit opcode 0x29
+    Set current_offset to write_byte(buffer_ptr, current_offset, 41)
+
+    Note: Emit ModR/M byte (mod=11, reg=src, rm=dest)
+    Let modrm be encode_modrm(3, src_reg, dest_reg)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Return current_offset
+End Process
+
+Process called "encode_imul_reg_reg" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, src_reg as Integer returns Integer:
+    Note: Encode IMUL r64, r64 (dest = dest * src, signed)
+    Note: Opcode: 0x0F 0xAF (IMUL r64, r/m64)
+    Note: Returns new offset
+
+    Let current_offset be offset
+
+    Note: Emit REX.W prefix
+    Let dest_ext be 0
+    Let src_ext be 0
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+    If src_reg is greater than or equal to 8:
+        Set src_ext to 1
+    End If
+
+    Let rex be encode_rex(1, dest_ext, 0, src_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Note: Emit two-byte opcode 0x0F 0xAF
+    Set current_offset to write_byte(buffer_ptr, current_offset, 15)
+    Set current_offset to write_byte(buffer_ptr, current_offset, 175)
+
+    Note: Emit ModR/M byte (mod=11, reg=dest, rm=src)
+    Let modrm be encode_modrm(3, dest_reg, src_reg)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Return current_offset
+End Process
+
+Note: ============================================================================
+Note: LOGICAL INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_xor_reg_reg" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, src_reg as Integer returns Integer:
+    Note: Encode XOR r64, r64 (dest = dest XOR src)
+    Note: Opcode: 0x31 (XOR r/m64, r64)
+    Note: XOR r,r is used to zero registers efficiently
+    Note: Returns new offset
+
+    Let current_offset be offset
+
+    Note: Emit REX.W prefix
+    Let src_ext be 0
+    Let dest_ext be 0
+    If src_reg is greater than or equal to 8:
+        Set src_ext to 1
+    End If
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+
+    Let rex be encode_rex(1, src_ext, 0, dest_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Note: Emit opcode 0x31
+    Set current_offset to write_byte(buffer_ptr, current_offset, 49)
+
+    Note: Emit ModR/M byte (mod=11, reg=src, rm=dest)
+    Let modrm be encode_modrm(3, src_reg, dest_reg)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Return current_offset
+End Process
+
+Process called "encode_and_reg_reg" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, src_reg as Integer returns Integer:
+    Note: Encode AND r64, r64 (dest = dest AND src)
+    Note: Opcode: 0x21 (AND r/m64, r64)
+
+    Let current_offset be offset
+
+    Let src_ext be 0
+    Let dest_ext be 0
+    If src_reg is greater than or equal to 8:
+        Set src_ext to 1
+    End If
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+
+    Let rex be encode_rex(1, src_ext, 0, dest_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 33)
+
+    Let modrm be encode_modrm(3, src_reg, dest_reg)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Return current_offset
+End Process
+
+Process called "encode_or_reg_reg" takes buffer_ptr as Integer, offset as Integer, dest_reg as Integer, src_reg as Integer returns Integer:
+    Note: Encode OR r64, r64 (dest = dest OR src)
+    Note: Opcode: 0x09 (OR r/m64, r64)
+
+    Let current_offset be offset
+
+    Let src_ext be 0
+    Let dest_ext be 0
+    If src_reg is greater than or equal to 8:
+        Set src_ext to 1
+    End If
+    If dest_reg is greater than or equal to 8:
+        Set dest_ext to 1
+    End If
+
+    Let rex be encode_rex(1, src_ext, 0, dest_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 9)
+
+    Let modrm be encode_modrm(3, src_reg, dest_reg)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Return current_offset
+End Process
+
+Note: ============================================================================
+Note: COMPARISON INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_cmp_reg_reg" takes buffer_ptr as Integer, offset as Integer, reg1 as Integer, reg2 as Integer returns Integer:
+    Note: Encode CMP r64, r64 (compare, sets flags)
+    Note: Opcode: 0x39 (CMP r/m64, r64)
+
+    Let current_offset be offset
+
+    Let reg2_ext be 0
+    Let reg1_ext be 0
+    If reg2 is greater than or equal to 8:
+        Set reg2_ext to 1
+    End If
+    If reg1 is greater than or equal to 8:
+        Set reg1_ext to 1
+    End If
+
+    Let rex be encode_rex(1, reg2_ext, 0, reg1_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 57)
+
+    Let modrm be encode_modrm(3, reg2, reg1)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Return current_offset
+End Process
+
+Process called "encode_test_reg_reg" takes buffer_ptr as Integer, offset as Integer, reg1 as Integer, reg2 as Integer returns Integer:
+    Note: Encode TEST r64, r64 (logical compare, sets flags)
+    Note: Opcode: 0x85 (TEST r/m64, r64)
+    Note: TEST r,r is efficient for zero checks
+
+    Let current_offset be offset
+
+    Let reg2_ext be 0
+    Let reg1_ext be 0
+    If reg2 is greater than or equal to 8:
+        Set reg2_ext to 1
+    End If
+    If reg1 is greater than or equal to 8:
+        Set reg1_ext to 1
+    End If
+
+    Let rex be encode_rex(1, reg2_ext, 0, reg1_ext)
+    Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 133)
+
+    Let modrm be encode_modrm(3, reg2, reg1)
+    Set current_offset to write_byte(buffer_ptr, current_offset, modrm)
+
+    Return current_offset
+End Process
+
+Note: ============================================================================
+Note: CONTROL FLOW INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_jmp_rel32" takes buffer_ptr as Integer, offset as Integer, rel_offset as Integer returns Integer:
+    Note: Encode JMP rel32 (near jump, ±2GB)
+    Note: Opcode: 0xE9 (JMP rel32)
+
+    Let current_offset be offset
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 233)
+    Set current_offset to write_dword(buffer_ptr, current_offset, rel_offset)
+
+    Return current_offset
+End Process
+
+Process called "encode_je_rel32" takes buffer_ptr as Integer, offset as Integer, rel_offset as Integer returns Integer:
+    Note: Encode JE/JZ rel32 (jump if equal/zero)
+    Note: Opcode: 0x0F 0x84
+
+    Let current_offset be offset
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 15)
+    Set current_offset to write_byte(buffer_ptr, current_offset, 132)
+    Set current_offset to write_dword(buffer_ptr, current_offset, rel_offset)
+
+    Return current_offset
+End Process
+
+Process called "encode_jne_rel32" takes buffer_ptr as Integer, offset as Integer, rel_offset as Integer returns Integer:
+    Note: Encode JNE/JNZ rel32 (jump if not equal/zero)
+    Note: Opcode: 0x0F 0x85
+
+    Let current_offset be offset
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 15)
+    Set current_offset to write_byte(buffer_ptr, current_offset, 133)
+    Set current_offset to write_dword(buffer_ptr, current_offset, rel_offset)
+
+    Return current_offset
+End Process
+
+Process called "encode_call_rel32" takes buffer_ptr as Integer, offset as Integer, rel_offset as Integer returns Integer:
+    Note: Encode CALL rel32 (near call, ±2GB)
+    Note: Opcode: 0xE8 (CALL rel32)
+
+    Let current_offset be offset
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 232)
+    Set current_offset to write_dword(buffer_ptr, current_offset, rel_offset)
+
+    Return current_offset
+End Process
+
+Process called "encode_ret" takes buffer_ptr as Integer, offset as Integer returns Integer:
+    Note: Encode RET (near return)
+    Note: Opcode: 0xC3 (RET)
+
+    Let current_offset be offset
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 195)
+
+    Return current_offset
+End Process
+
+Note: ============================================================================
+Note: STACK OPERATIONS
+Note: ============================================================================
+
+Process called "encode_push_reg" takes buffer_ptr as Integer, offset as Integer, reg as Integer returns Integer:
+    Note: Encode PUSH r64
+    Note: Opcode: 0x50+rd (PUSH r64)
+
+    Let current_offset be offset
+
+    Note: Emit REX if needed for R8-R15
+    If reg is greater than or equal to 8:
+        Let rex be encode_rex(0, 0, 0, 1)
+        Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+    End If
+
+    Note: Emit opcode 0x50 + (reg & 7)
+    Let opcode be 80 plus (reg bitwise_and 7)
+    Set current_offset to write_byte(buffer_ptr, current_offset, opcode)
+
+    Return current_offset
+End Process
+
+Process called "encode_pop_reg" takes buffer_ptr as Integer, offset as Integer, reg as Integer returns Integer:
+    Note: Encode POP r64
+    Note: Opcode: 0x58+rd (POP r64)
+
+    Let current_offset be offset
+
+    Note: Emit REX if needed for R8-R15
+    If reg is greater than or equal to 8:
+        Let rex be encode_rex(0, 0, 0, 1)
+        Set current_offset to write_byte(buffer_ptr, current_offset, rex)
+    End If
+
+    Note: Emit opcode 0x58 + (reg & 7)
+    Let opcode be 88 plus (reg bitwise_and 7)
+    Set current_offset to write_byte(buffer_ptr, current_offset, opcode)
+
+    Return current_offset
+End Process
+
+Note: ============================================================================
+Note: SYSTEM INSTRUCTIONS
+Note: ============================================================================
+
+Process called "encode_syscall" takes buffer_ptr as Integer, offset as Integer returns Integer:
+    Note: Encode SYSCALL (fast system call)
+    Note: Opcode: 0x0F 0x05 (SYSCALL)
+
+    Let current_offset be offset
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 15)
+    Set current_offset to write_byte(buffer_ptr, current_offset, 5)
+
+    Return current_offset
+End Process
+
+Process called "encode_nop" takes buffer_ptr as Integer, offset as Integer returns Integer:
+    Note: Encode NOP (no operation)
+    Note: Opcode: 0x90 (NOP - XCHG RAX, RAX)
+
+    Let current_offset be offset
+
+    Set current_offset to write_byte(buffer_ptr, current_offset, 144)
+
+    Return current_offset
+End Process
+
+Note: ============================================================================
+Note: CODE ALIGNMENT AND PADDING
+Note: ============================================================================
+
+Process called "align_code_to_boundary" takes buffer_ptr as Integer, current_offset as Integer, alignment as Integer returns Integer:
+    Note: Align code pointer to specified boundary (4, 8, 16 bytes)
+    Note: Fills with NOP instructions (0x90)
+    Note: Returns new offset after alignment
+
+    Let remainder be current_offset bitwise_and (alignment minus 1)
+    If remainder is equal to 0:
+        Return current_offset  Note: Already aligned
+    End If
+
+    Note: Calculate padding needed
+    Let padding_bytes be alignment minus remainder
+
+    Note: Fill with NOP instructions (1 byte each)
+    Let offset be current_offset
+    Let i be 0
+    While i is less than padding_bytes:
+        Set offset to encode_nop(buffer_ptr, offset)
+        Set i to i plus 1
+    End While
+
+    Return offset
+End Process
+
+Process called "get_min_instruction_size" returns Integer:
+    Note: Get minimum x86-64 instruction size
+    Return 1  Note: Single-byte instructions exist (e.g., NOP, RET)
+End Process
+
+Process called "get_max_instruction_size" returns Integer:
+    Note: Get maximum x86-64 instruction size
+    Return 15  Note: x86-64 instructions can be up to 15 bytes
+End Process
