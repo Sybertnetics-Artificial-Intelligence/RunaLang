@@ -50,7 +50,7 @@ Create `hello.runa`:
 
 ```runa
 Process called "main" returns Integer:
-    Display("Hello, Runa!")
+    Display "Hello, Runa!"
     Return 0
 End Process
 ```
@@ -204,8 +204,8 @@ Import "math_utils.runa"
 
 Process called "main" returns Integer:
     Let result be square(5)
-    Display("5 squared is: ")
-    Display(integer_to_string(result))
+    Display "5 squared is: "
+    Display integer_to_string(result)
     Return 0
 End Process
 ```
@@ -341,7 +341,7 @@ Process called "main" returns Integer:
 
     # Iterate with for-each
     For each num in numbers:
-        Display(integer_to_string(num))
+        Display integer_to_string(num)
     End For
 
     # Use runtime functions
@@ -358,8 +358,8 @@ End Process
 
 1. **Add Debug Output:**
    ```runa
-   Display("Debug: x = ")
-   Display(integer_to_string(x))
+   Display "Debug: x = "
+   Display integer_to_string(x)
    ```
 
 2. **Check Assembly Output:**
