@@ -174,15 +174,15 @@ curl -sSf https://get.runa-lang.org | sh
 ### Your First Runa Program
 ```runa
 Note: A simple greeting program
-Let user name be input with prompt "What's your name? "
-Let greeting be "Hello, " followed by user name followed by "!"
+Let username be input with prompt "What's your name?"
+Let greeting be "Hello, " joined with username followed by "!"
 
 Display greeting
-Display "Welcome to Runa programming!"
+Display "Welcome to Runa Programming!"
 ```
 
 ### Try the Online Playground
-Visit [playground.runa-lang.org](https://playground.runa-lang.org) to experiment with Runa in your browser.
+Visit [playground.runa-lang.org](https://playground.runa-lang.org) to experiment with Runa in your browser(Coming soon).
 
 ## Use Cases
 
