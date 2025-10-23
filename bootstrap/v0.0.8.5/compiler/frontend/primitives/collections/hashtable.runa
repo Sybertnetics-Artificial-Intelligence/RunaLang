@@ -1,0 +1,574 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HASHTABLE - Generic Hash Table Data Structure Primitive
+
+This file implements a general-purpose hash table (dictionary/map) for key-value storage.
+
+Architecture:
+- Open addressing with linear probing (simple, cache-friendly)
+- Automatic resizing at 75% load factor
+- String keys and integer values (extensible to generic types later)
+- Tombstone-based deletion for probe chain preservation
+
+Features:
+- O(1) average case insert, lookup, delete
+- Automatic memory management (uses Layout primitives)
+- Collision handling via linear probing
+- Load factor monitoring and automatic resizing
+
+Use Cases:
+- Symbol tables in compiler
+- Dictionaries in user programs
+- Configuration storage
+- Cache implementations
+
+Entry Structure (32 bytes):
+  offset 0:  state (0=empty, 1=occupied, 2=tombstone, 8 bytes)
+  offset 8:  key_ptr (pointer to string key, 8 bytes)
+  offset 16: value (integer value, 8 bytes)
+  offset 24: hash (cached hash value, 8 bytes)
+
+Hashtable Structure (32 bytes):
+  offset 0:  entries (pointer to Entry array, 8 bytes)
+  offset 8:  capacity (total slots, 8 bytes)
+  offset 16: count (occupied slots, 8 bytes)
+  offset 24: tombstones (deleted slots, 8 bytes)
+:End Note
+
+Import "memory/layout.runa" as Layout
+Import "core/memory_core.runa" as Memory
+Import "core/string_core.runa" as String
+
+Note: ============================================================================
+Note: CONSTANTS
+Note: ============================================================================
+
+Let HASHTABLE_INITIAL_CAPACITY be 16
+Let HASHTABLE_ENTRY_SIZE be 32
+Let HASHTABLE_LOAD_FACTOR_PERCENT be 75
+
+Note: Entry state constants
+Let ENTRY_STATE_EMPTY be 0
+Let ENTRY_STATE_OCCUPIED be 1
+Let ENTRY_STATE_TOMBSTONE be 2
+
+Note: ============================================================================
+Note: HASH FUNCTION
+Note: ============================================================================
+
+Process called "hashtable_hash_string" takes str as Integer returns Integer:
+    Note: FNV-1a hash function for strings
+    Note: Fast, good distribution, widely used
+    Note: Returns hash value (non-negative integer)
+
+    If str is equal to 0:
+        Return 0
+    End If
+
+    Note: FNV-1a constants (32-bit)
+    Let FNV_OFFSET_BASIS be 2166136261
+    Let FNV_PRIME be 16777619
+
+    Let hash be FNV_OFFSET_BASIS
+    Let i be 0
+    Let len be proc string_length from String with str
+
+    While i is less than len:
+        Let byte be proc memory_get_byte from Memory with str, i
+        Set hash to hash xor by byte
+        Set hash to hash multiplied by FNV_PRIME
+        Set i to i plus 1
+    End While
+
+    Note: Ensure non-negative hash
+    If hash is less than 0:
+        Set hash to 0 minus hash
+    End If
+
+    Return hash
+End Process
+
+Note: ============================================================================
+Note: HASHTABLE CREATION AND DESTRUCTION
+Note: ============================================================================
+
+Process called "hashtable_create" returns Integer:
+    Note: Create new hashtable with initial capacity
+    Note: Returns pointer to Hashtable structure (32 bytes), or 0 on failure
+
+    Note: Allocate hashtable structure
+    Let table be proc allocate from Layout with 32
+    If table is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate entries array
+    Let entries_size be HASHTABLE_INITIAL_CAPACITY multiplied by HASHTABLE_ENTRY_SIZE
+    Let entries be proc allocate from Layout with entries_size
+    If entries is equal to 0:
+        proc deallocate from Layout with table
+        Return 0
+    End If
+
+    Note: Zero out entries array
+    proc memory_fill from Memory with entries, 0, entries_size
+
+    Note: Initialize hashtable fields
+    proc memory_set_int64 from Memory with table, 0, entries    Note: entries pointer
+    proc memory_set_int64 from Memory with table, 8, HASHTABLE_INITIAL_CAPACITY  Note: capacity
+    proc memory_set_int64 from Memory with table, 16, 0         Note: count = 0
+    proc memory_set_int64 from Memory with table, 24, 0         Note: tombstones = 0
+
+    Return table
+End Process
+
+Process called "hashtable_destroy" takes table as Integer returns Integer:
+    Note: Destroy hashtable and free all memory
+    Note: Also frees all key strings stored in the table
+    Note: Returns 1 on success, 0 on failure
+
+    If table is equal to 0:
+        Return 0
+    End If
+
+    Note: Get hashtable fields
+    Let entries be proc memory_get_int64 from Memory with table, 0
+    Let capacity be proc memory_get_int64 from Memory with table, 8
+
+    Note: Free all key strings
+    Let i be 0
+    While i is less than capacity:
+        Let entry_offset be i multiplied by HASHTABLE_ENTRY_SIZE
+        Let entry_ptr be entries plus entry_offset
+        Let state be proc memory_get_int64 from Memory with entry_ptr, 0
+
+        If state is equal to ENTRY_STATE_OCCUPIED:
+            Let key_ptr be proc memory_get_int64 from Memory with entry_ptr, 8
+            If key_ptr is not equal to 0:
+                proc deallocate from Layout with key_ptr
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Free entries array
+    proc deallocate from Layout with entries
+
+    Note: Free hashtable structure
+    proc deallocate from Layout with table
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HASHTABLE LOOKUP
+Note: ============================================================================
+
+Process called "hashtable_find_entry" takes table as Integer, key as Integer, hash as Integer returns Integer:
+    Note: Find entry slot for key (internal helper)
+    Note: Returns pointer to Entry, or 0 if table is full
+    Note: Returns first tombstone encountered if key not found (for insertion)
+
+    Let entries be proc memory_get_int64 from Memory with table, 0
+    Let capacity be proc memory_get_int64 from Memory with table, 8
+
+    Let index be hash modulo by capacity
+    Let tombstone be 0
+    Let probes be 0
+
+    While probes is less than capacity:
+        Let entry_offset be index multiplied by HASHTABLE_ENTRY_SIZE
+        Let entry_ptr be entries plus entry_offset
+        Let state be proc memory_get_int64 from Memory with entry_ptr, 0
+
+        If state is equal to ENTRY_STATE_EMPTY:
+            Note: Found empty slot - return tombstone if we saw one, else this slot
+            If tombstone is not equal to 0:
+                Return tombstone
+            End If
+            Return entry_ptr
+        End If
+
+        If state is equal to ENTRY_STATE_TOMBSTONE:
+            Note: Remember first tombstone for potential insertion
+            If tombstone is equal to 0:
+                Set tombstone to entry_ptr
+            End If
+        Otherwise:
+            Note: State is OCCUPIED - check if this is our key
+            Let entry_hash be proc memory_get_int64 from Memory with entry_ptr, 24
+            If entry_hash is equal to hash:
+                Let entry_key be proc memory_get_int64 from Memory with entry_ptr, 8
+                Let keys_equal be proc string_equals from String with entry_key, key
+                If keys_equal is equal to 1:
+                    Return entry_ptr  Note: Found existing key
+                End If
+            End If
+        End If
+
+        Note: Linear probing - try next slot
+        Set index to index plus 1
+        If index is greater than or equal to capacity:
+            Set index to 0  Note: Wrap around
+        End If
+        Set probes to probes plus 1
+    End While
+
+    Note: Table is full (should not happen due to resize)
+    If tombstone is not equal to 0:
+        Return tombstone
+    End If
+    Return 0
+End Process
+
+Process called "hashtable_get" takes table as Integer, key as Integer returns Integer:
+    Note: Get value for key
+    Note: Returns value if found, 0 if not found
+    Note: WARNING: Cannot distinguish between value=0 and key not found
+    Note: Use hashtable_has() to check existence
+
+    If table is equal to 0:
+        Return 0
+    End If
+
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let hash be proc hashtable_hash_string with key
+    Let entry_ptr be proc hashtable_find_entry with table, key, hash
+
+    If entry_ptr is equal to 0:
+        Return 0  Note: Table full or error
+    End If
+
+    Let state be proc memory_get_int64 from Memory with entry_ptr, 0
+    If state is not equal to ENTRY_STATE_OCCUPIED:
+        Return 0  Note: Key not found
+    End If
+
+    Let value be proc memory_get_int64 from Memory with entry_ptr, 16
+    Return value
+End Process
+
+Process called "hashtable_has" takes table as Integer, key as Integer returns Integer:
+    Note: Check if key exists in table
+    Note: Returns 1 if key exists, 0 if not
+
+    If table is equal to 0:
+        Return 0
+    End If
+
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let hash be proc hashtable_hash_string with key
+    Let entry_ptr be proc hashtable_find_entry with table, key, hash
+
+    If entry_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let state be proc memory_get_int64 from Memory with entry_ptr, 0
+    If state is equal to ENTRY_STATE_OCCUPIED:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: HASHTABLE INSERTION
+Note: ============================================================================
+
+Process called "hashtable_resize" takes table as Integer returns Integer:
+    Note: Double hashtable capacity and rehash all entries
+    Note: Returns 1 on success, 0 on failure
+
+    Let old_entries be proc memory_get_int64 from Memory with table, 0
+    Let old_capacity be proc memory_get_int64 from Memory with table, 8
+    Let new_capacity be old_capacity multiplied by 2
+
+    Note: Allocate new entries array
+    Let new_size be new_capacity multiplied by HASHTABLE_ENTRY_SIZE
+    Let new_entries be proc allocate from Layout with new_size
+    If new_entries is equal to 0:
+        Return 0
+    End If
+
+    Note: Zero out new entries
+    proc memory_fill from Memory with new_entries, 0, new_size
+
+    Note: Update table to use new entries array
+    proc memory_set_int64 from Memory with table, 0, new_entries
+    proc memory_set_int64 from Memory with table, 8, new_capacity
+    proc memory_set_int64 from Memory with table, 16, 0  Note: Reset count
+    proc memory_set_int64 from Memory with table, 24, 0  Note: Reset tombstones
+
+    Note: Rehash all entries from old table
+    Let i be 0
+    While i is less than old_capacity:
+        Let old_entry_offset be i multiplied by HASHTABLE_ENTRY_SIZE
+        Let old_entry_ptr be old_entries plus old_entry_offset
+        Let state be proc memory_get_int64 from Memory with old_entry_ptr, 0
+
+        If state is equal to ENTRY_STATE_OCCUPIED:
+            Note: Re-insert this entry into new table
+            Let key_ptr be proc memory_get_int64 from Memory with old_entry_ptr, 8
+            Let value be proc memory_get_int64 from Memory with old_entry_ptr, 16
+            Let hash be proc memory_get_int64 from Memory with old_entry_ptr, 24
+
+            Note: Find slot in new table
+            Let new_index be hash modulo by new_capacity
+            Let found be 0
+
+            While found is equal to 0:
+                Let new_entry_offset be new_index multiplied by HASHTABLE_ENTRY_SIZE
+                Let new_entry_ptr be new_entries plus new_entry_offset
+                Let new_state be proc memory_get_int64 from Memory with new_entry_ptr, 0
+
+                If new_state is equal to ENTRY_STATE_EMPTY:
+                    Note: Insert here
+                    proc memory_set_int64 from Memory with new_entry_ptr, 0, ENTRY_STATE_OCCUPIED
+                    proc memory_set_int64 from Memory with new_entry_ptr, 8, key_ptr
+                    proc memory_set_int64 from Memory with new_entry_ptr, 16, value
+                    proc memory_set_int64 from Memory with new_entry_ptr, 24, hash
+                    Set found to 1
+                Otherwise:
+                    Note: Collision - try next slot
+                    Set new_index to new_index plus 1
+                    If new_index is greater than or equal to new_capacity:
+                        Set new_index to 0
+                    End If
+                End If
+            End While
+
+            Note: Increment count
+            Let current_count be proc memory_get_int64 from Memory with table, 16
+            Set current_count to current_count plus 1
+            proc memory_set_int64 from Memory with table, 16, current_count
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Free old entries array
+    proc deallocate from Layout with old_entries
+
+    Return 1
+End Process
+
+Process called "hashtable_set" takes table as Integer, key as Integer, value as Integer returns Integer:
+    Note: Insert or update key-value pair
+    Note: Returns 1 on success, 0 on failure
+    Note: Overwrites existing value if key already exists
+
+    If table is equal to 0:
+        Return 0
+    End If
+
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if resize needed (load factor > 75%)
+    Let capacity be proc memory_get_int64 from Memory with table, 8
+    Let count be proc memory_get_int64 from Memory with table, 16
+    Let tombstones be proc memory_get_int64 from Memory with table, 24
+    Let used be count plus tombstones
+
+    Let threshold be capacity multiplied by HASHTABLE_LOAD_FACTOR_PERCENT
+    Set threshold to threshold divided by 100
+
+    If used is greater than or equal to threshold:
+        Let resize_result be proc hashtable_resize with table
+        If resize_result is equal to 0:
+            Return 0  Note: Resize failed
+        End If
+    End If
+
+    Note: Hash the key
+    Let hash be proc hashtable_hash_string with key
+    Let entry_ptr be proc hashtable_find_entry with table, key, hash
+
+    If entry_ptr is equal to 0:
+        Return 0  Note: Table full or error
+    End If
+
+    Let state be proc memory_get_int64 from Memory with entry_ptr, 0
+
+    If state is equal to ENTRY_STATE_OCCUPIED:
+        Note: Key exists - update value
+        proc memory_set_int64 from Memory with entry_ptr, 16, value
+        Return 1
+    End If
+
+    Note: New key - need to duplicate key string
+    Let key_copy be proc string_duplicate from String with key
+    If key_copy is equal to 0:
+        Return 0  Note: Failed to duplicate key
+    End If
+
+    Note: Insert new entry
+    proc memory_set_int64 from Memory with entry_ptr, 0, ENTRY_STATE_OCCUPIED
+    proc memory_set_int64 from Memory with entry_ptr, 8, key_copy
+    proc memory_set_int64 from Memory with entry_ptr, 16, value
+    proc memory_set_int64 from Memory with entry_ptr, 24, hash
+
+    Note: Update count (and tombstones if we reused a tombstone slot)
+    If state is equal to ENTRY_STATE_TOMBSTONE:
+        Set tombstones to tombstones minus 1
+        proc memory_set_int64 from Memory with table, 24, tombstones
+    End If
+
+    Set count to count plus 1
+    proc memory_set_int64 from Memory with table, 16, count
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HASHTABLE DELETION
+Note: ============================================================================
+
+Process called "hashtable_delete" takes table as Integer, key as Integer returns Integer:
+    Note: Delete key from hashtable
+    Note: Uses tombstone to preserve probe chains
+    Note: Returns 1 if key was deleted, 0 if key not found
+
+    If table is equal to 0:
+        Return 0
+    End If
+
+    If key is equal to 0:
+        Return 0
+    End If
+
+    Let hash be proc hashtable_hash_string with key
+    Let entry_ptr be proc hashtable_find_entry with table, key, hash
+
+    If entry_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let state be proc memory_get_int64 from Memory with entry_ptr, 0
+    If state is not equal to ENTRY_STATE_OCCUPIED:
+        Return 0  Note: Key not found
+    End If
+
+    Note: Free key string
+    Let key_ptr be proc memory_get_int64 from Memory with entry_ptr, 8
+    proc deallocate from Layout with key_ptr
+
+    Note: Mark as tombstone
+    proc memory_set_int64 from Memory with entry_ptr, 0, ENTRY_STATE_TOMBSTONE
+    proc memory_set_int64 from Memory with entry_ptr, 8, 0  Note: Clear key pointer
+    proc memory_set_int64 from Memory with entry_ptr, 16, 0  Note: Clear value
+
+    Note: Update counts
+    Let count be proc memory_get_int64 from Memory with table, 16
+    Set count to count minus 1
+    proc memory_set_int64 from Memory with table, 16, count
+
+    Let tombstones be proc memory_get_int64 from Memory with table, 24
+    Set tombstones to tombstones plus 1
+    proc memory_set_int64 from Memory with table, 24, tombstones
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HASHTABLE STATISTICS
+Note: ============================================================================
+
+Process called "hashtable_get_count" takes table as Integer returns Integer:
+    Note: Get number of occupied entries
+    If table is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with table, 16
+End Process
+
+Process called "hashtable_get_capacity" takes table as Integer returns Integer:
+    Note: Get total capacity
+    If table is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with table, 8
+End Process
+
+Process called "hashtable_get_load_factor" takes table as Integer returns Integer:
+    Note: Get current load factor as percentage (0-100)
+    If table is equal to 0:
+        Return 0
+    End If
+
+    Let capacity be proc memory_get_int64 from Memory with table, 8
+    If capacity is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc memory_get_int64 from Memory with table, 16
+    Let load be count multiplied by 100
+    Set load to load divided by capacity
+    Return load
+End Process
+
+Process called "hashtable_clear" takes table as Integer returns Integer:
+    Note: Remove all entries from hashtable
+    Note: Frees all key strings
+    Note: Returns 1 on success
+
+    If table is equal to 0:
+        Return 0
+    End If
+
+    Let entries be proc memory_get_int64 from Memory with table, 0
+    Let capacity be proc memory_get_int64 from Memory with table, 8
+
+    Note: Free all key strings and clear entries
+    Let i be 0
+    While i is less than capacity:
+        Let entry_offset be i multiplied by HASHTABLE_ENTRY_SIZE
+        Let entry_ptr be entries plus entry_offset
+        Let state be proc memory_get_int64 from Memory with entry_ptr, 0
+
+        If state is equal to ENTRY_STATE_OCCUPIED:
+            Let key_ptr be proc memory_get_int64 from Memory with entry_ptr, 8
+            If key_ptr is not equal to 0:
+                proc deallocate from Layout with key_ptr
+            End If
+        End If
+
+        Note: Clear entry
+        proc memory_set_int64 from Memory with entry_ptr, 0, ENTRY_STATE_EMPTY
+        proc memory_set_int64 from Memory with entry_ptr, 8, 0
+        proc memory_set_int64 from Memory with entry_ptr, 16, 0
+        proc memory_set_int64 from Memory with entry_ptr, 24, 0
+
+        Set i to i plus 1
+    End While
+
+    Note: Reset counts
+    proc memory_set_int64 from Memory with table, 16, 0  Note: count = 0
+    proc memory_set_int64 from Memory with table, 24, 0  Note: tombstones = 0
+
+    Return 1
+End Process

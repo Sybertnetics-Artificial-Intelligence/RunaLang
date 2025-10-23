@@ -104,7 +104,7 @@ Only operators change between Canon and Developer modes:
 | Subtraction | `minus` | `-` |
 | Multiplication | `multiplied by` | `*` |
 | Division | `divided by` | `/` |
-| Modulo | `modulo` | `%` |
+| Modulo | `modulo by` | `%` |
 | Power | `to the power of` | `**` |
 | Equality | `is equal to` | `==` |
 | Inequality | `is not equal to` | `!=` |
@@ -121,7 +121,8 @@ Only operators change between Canon and Developer modes:
 | Bitwise NOT | `bitwise not` | `~` |
 | Left shift | `shifted left by` | `<<` |
 | Right shift | `shifted right by` | `>>` |
-| Assignment | `equals` | `=` |
+| Assignment | `Let ___ be` | `=` |
+| Reassignment | `Set ___ to` | `=` |
 | Add-assign | `gets increased by` | `+=` |
 | Sub-assign | `gets decreased by` | `-=` |
 | Mul-assign | `gets multiplied by` | `*=` |

@@ -22,10 +22,10 @@ This document provides the complete Extended Backus-Naur Form (EBNF) grammar for
 
 Runa supports three syntax modes for different audiences:
 - **Canon (writeable)**: Standard natural syntax; avoids symbols outside mathematical contexts
-- **Developer (writeable)**: Technical shorthand with symbols in mathematical contexts; auto-translated to Canon AST during parsing
+- **Developer (writeable)**: Developer Mode with symbols in mathematical contexts; auto-translated to Canon AST during parsing
 - **Viewer (read-only)**: Natural-language display; not writeable; generated from Canon/Developer
 
-Note: Mathematical symbols (`+`, `-`, `*`, `/`, etc.) are NOT part of canonical Runa. They are only permitted in technical mode and are automatically translated to canonical form during compilation.
+Note: Mathematical symbols (`+`, `-`, `*`, `/`, etc.) are NOT part of Canon Mode. They are only permitted in Developer Mode and are automatically translated to Canon Mode during compilation.
 
 ## Lexical Structure
 
@@ -108,13 +108,13 @@ keyword               ::= "Let" | "Define" | "Set" | "If" | "Otherwise" | "Unles
                         | "False" | "None" | "Null" | "Nil"
 ```
 
-### Mathematical Symbol Operators (Technical Mode Only)
+### Mathematical Symbol Operators (Developer Mode Only)
 
 ```ebnf
 technical_symbol_operator ::= '+' | '-' | '*' | '/' | '%' | '**' | '<' | '>' | '<=' | '>=' | '!=' | '=='
 ```
 
-**IMPORTANT**: These symbols are NOT part of canonical Runa. They are only permitted in technical mode and are **automatically translated** to canonical natural language form during compilation:
+**IMPORTANT**: These symbols are NOT part of Canon Mode. They are only permitted in Developer Mode and are **automatically translated** to Canon Mode natural language form during compilation:
 - `+` → `plus`
 - `-` → `minus` 
 - `*` → `multiplied by`
@@ -122,7 +122,7 @@ technical_symbol_operator ::= '+' | '-' | '*' | '/' | '%' | '**' | '<' | '>' | '
 - `==` → `is equal to`
 - etc.
 
-The compiler will parse technical symbols but internally convert them to canonical AST nodes.
+The compiler will parse Developer Mode symbols but internally convert them to Canon Mode AST nodes.
 
 ### Literals
 
@@ -469,9 +469,9 @@ comparison_op         ::= equality_operator
                         | "is" "of" "type" type_expression
                         | technical_symbol_operator
 
-# Equality operators - canonical form only
-equality_operator     ::= "is" "equal" "to"    # Canonical natural language form
-                        | "equals"              # Shorthand canonical form
+# Equality operators - Canon Mode only
+equality_operator     ::= "is" "equal" "to"    # Canon Mode natural language form
+                        | "equals"              # Shorthand Canon form
 
 # Identity and type operators - use 'is' for identity/type/state checks, not equality
 # Note: "is of type" is now properly handled in comparison_op for type checking expressions
@@ -482,7 +482,7 @@ additive_op           ::= "plus" | "minus" | "joined" "with" | technical_symbol_
 
 multiplicative_expression ::= unary_expression (multiplicative_op unary_expression)*
 
-multiplicative_op     ::= "multiplied" "by" | "divided" "by" | "modulo" | technical_symbol_operator
+multiplicative_op     ::= "multiplied" "by" | "divided" "by" | "modulo" "by" | technical_symbol_operator
 
 unary_expression      ::= unary_op unary_expression | power_expression
 
@@ -718,7 +718,7 @@ dict_entry            ::= identifier "as" expression
 2. Postfix operators (member access, indexing, function calls)
 3. Unary operators (negative, positive, not) - **Precedence 7**
 4. Power operator (to the power of, **) - **Precedence 6, Right associative**
-5. Multiplicative operators (multiplied by, divided by, modulo, *, /, %) - **Precedence 5, Left associative**
+5. Multiplicative operators (multiplied by, divided by, modulo by, *, /, %) - **Precedence 5, Left associative**
 6. Additive operators (plus, minus, joined with, +, -) - **Precedence 4, Left associative**
 7. Bitwise shift operators (shifted left by, shifted right by)
 8. Comparison operators (equals, is greater than, <, >, <=, >=, !=)
@@ -735,7 +735,7 @@ dict_entry            ::= identifier "as" expression
 
 The compiler enforces operator usage based on context:
 
-- **Mathematical**: `+`, `-`, `*`, `/`, `%`, `plus`, `minus`, `multiplied by`, `divided by`, `modulo`, `power of`
+- **Mathematical**: `+`, `-`, `*`, `/`, `%`, `plus`, `minus`, `multiplied by`, `divided by`, `modulo by`, `power of`
 - **Mathematical Comparison**: `<`, `>`, `<=`, `>=`, `!=`, `is greater than`, `is less than`, `is greater than or equal to`, `is less than or equal to`, `does not equal`, `is equal to`, `is not equal to`
 - **General Comparison**: `equals`, `contains`, `is in`, `is of type`
 - **Compound Assignment**: `gets increased by`, `gets decreased by`, `gets multiplied by`, `gets divided by`, `gets remainder from dividing by`, `gets shifted left by`, `gets shifted right by`
@@ -766,7 +766,7 @@ Runa supports multi-word identifiers separated by spaces:
 
 Runa supports both natural language and mathematical symbols:
 
-**Natural Language (Canonical)**:
+**Natural Language (Canon Mode)**:
 - Arithmetic: `plus`, `minus`, `multiplied by`, `divided by`
 - Comparison: `equals`, `is greater than`, `is less than or equal to`
 - Logical: `and`, `or`, `not`
@@ -855,14 +855,14 @@ This grammar specification provides the complete formal definition of Runa's syn
 context_block ::= "With" identifier "as" identifier ":" block
 block         ::= INDENT statement* DEDENT
 
-# Examples showing both canonical and technical syntax:
-# 
-# Canonical syntax (recommended):
+# Examples showing both Canon and Developer syntax:
+#
+# Canon syntax (recommended):
 # With open file with path as "data.txt" for reading as data_file:
 #     Let content be read_all from data_file
 #     Display content
 #
-# Technical shorthand (alternative):
+# Developer syntax (alternative):
 # With open_file("data.txt") as data_file:
 #     Let content be read_all from data_file
 #     Display content

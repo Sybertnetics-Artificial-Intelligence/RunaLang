@@ -208,11 +208,11 @@ Visit [playground.runa-lang.org](https://playground.runa-lang.org) to experiment
 
 ## Documentation
 
-- **[Language Reference](docs/language-reference.md)**: Complete syntax and semantics guide
-- **[Standard Library](docs/standard-library.md)**: Built-in functions and modules
-- **[AI Integration Guide](docs/ai-integration.md)**: Building AI-powered applications
-- **[Translation Guide](docs/translation.md)**: Converting between programming languages
-- **[Examples Gallery](examples/)**: Real-world Runa applications
+- **[Language Specification](docs/user/language-specification/runa_complete_specification.md)**: Complete syntax and semantics guide
+- **[Syntax Modes](docs/user/language-specification/runa_syntax_modes.md)**: Canon, Developer, and Viewer modes
+- **[Type System](docs/user/language-specification/runa_type_system_reference.md)**: Advanced type system reference
+- **[Standard Library](docs/user/language-specification/runa_standard_library.md)**: Built-in functions and modules
+- **[GitHub Wiki](https://github.com/Sybertnetics-Artificial-Intelligence/RunaLang/wiki)**: Tutorials, guides, and community resources
 
 ## Community and Support
 
@@ -233,12 +233,14 @@ See our [Contributing Guide](CONTRIBUTING.md) for details on:
 - **Attribution**: How your contributions will be recognized
 
 ### Areas Where We Need Help
-- **Language Translation**: Adding support for more spoken languages
-- **Platform Translation**: Adding support for more programming languages
-- **Standard Library**: Expanding built-in functions and modules
-- **Documentation**: Tutorials, examples, and guides
-- **Testing**: Edge cases, performance testing, and validation
+- **Standard Libraries**: Data structures, algorithms, I/O, networking, concurrency
+- **Compiler Optimizations**: Performance improvements, memory optimization, platform-specific tuning
+- **Translation Modes**: Language translators, syntax converters, documentation generators
+- **Platform Support**: Testing on different OSes, syscall implementations, ABI compliance
+- **Documentation**: Tutorials, examples, API references, and guides
 - **Tooling**: IDE plugins, debugging tools, and development utilities
+
+**Note**: The core compiler (lexer, parser, codegen) is currently maintained internally. Contributions are welcome in all other areas!
 
 ## The Vision
 
