@@ -1,26 +1,213 @@
 # Runa Implementation Guide
 *Complete Guide for Language Implementers and Tool Builders*
 
-**Last Updated**: 2025-08-15  
-**Implementation Status**: Mathematical symbol enforcement active, dual operator support implemented
+**Last Updated**: 2025-10-19
+**Implementation Status**: Canon Mode fully specified, Developer Mode planned, Viewer Mode planned
 
 ## Overview
 
 This implementation guide provides comprehensive instructions for building Runa language processors, including compilers, interpreters, transpilers, and development tools. It covers the complete implementation pipeline from lexical analysis through code generation and runtime support.
 
-**CRITICAL IMPLEMENTATION REQUIREMENT**: Mathematical symbols (`+`, `-`, `*`, `/`, `%`, `<`, `>`, `<=`, `>=`, `!=`) are **ONLY** permitted in mathematical contexts. Implementers must enforce this restriction through context analysis in the lexer and parser.
+**IMPORTANT**: Runa supports multiple syntax modes (Canon, Developer, Viewer). This guide focuses on implementing **Canon Mode** as the primary syntax. Developer Mode (symbolic operators) and Viewer Mode (natural language display) are planned future additions.
+
+## Syntax Modes
+
+Runa implements a triple syntax architecture to serve different audiences and use cases:
+
+### Canon Mode (Primary Implementation Target)
+- **Status**: Fully specified and ready for implementation
+- **Characteristics**:
+  - Natural language operators: `multiplied by`, `is equal to`, `is greater than`
+  - Multi-word identifiers: `user name`, `total count`, `maximum retry limit`
+  - Explicit block terminators: `End Process`, `End Type`, `End If`
+  - Standard Runa keywords: `Process`, `Type`, `Let`, `Set`
+- **Purpose**:
+  - Primary mode for human-readable code
+  - Optimal for AI code generation and comprehension
+  - Default mode for all Runa source files
+- **Implementation Priority**: **Implement this mode FIRST**
+
+### Developer Mode (Future)
+- **Status**: Planned, not yet implemented
+- **Characteristics**:
+  - Symbolic operators: `*`, `==`, `>`
+  - Same keywords as Canon mode (keywords don't change between modes)
+  - Same block terminators as Canon mode
+  - Familiar to programmers from other languages
+- **Purpose**:
+  - Efficient input for experienced developers
+  - Optional alternative to Canon Mode
+- **Implementation Note**: Developer Mode will auto-translate to Canon during parsing
+
+### Viewer Mode (Future)
+- **Status**: Planned, not yet implemented
+- **Characteristics**:
+  - Full natural language sentences
+  - Educational context and explanations
+  - Read-only display mode
+- **Purpose**:
+  - Documentation generation
+  - Code review by non-programmers
+  - Educational materials
+- **Implementation Note**: Post-processing layer on top of Canon/Developer AST
+
+### Mode Consistency Rules
+
+1. **Keywords are identical** across Canon and Developer modes
+2. **Only operators differ** between Canon and Developer modes
+3. **Block terminators are required** in both Canon and Developer modes
+4. **Viewer mode is generated**, not parsed
+
+For detailed syntax mode specifications, see the main language specification.
+
+## Key Syntax Patterns (Canon Mode)
+
+This section highlights critical syntax patterns that implementers must understand for Canon Mode.
+
+### Constructor Syntax
+
+Runa uses explicit constructor syntax to create new object instances:
+
+```runa
+Note: Basic constructor (no field initialization)
+Let user be a value of type User
+
+Note: Constructor with field initialization
+Let point be a value of type Point with x as 10, y as 20
+
+Note: Complex constructor
+Let config be a value of type Configuration with
+    debug_mode as true,
+    log_level as "INFO",
+    max_retries as 5
+
+Note: Shortened form (optional)
+Let settings be of type Settings with timeout as 30
+```
+
+**Important**: The pattern `a value of type TypeName` is REQUIRED for constructors. This disambiguates object creation from function calls.
+
+### Multi-Word Identifiers (Encasing Keyword Pairs)
+
+Runa supports natural multi-word variable names captured between keyword boundaries:
+
+```runa
+Note: Multi-word variable declarations
+Let user input value be 42
+Let maximum retry count be 3
+Let total calculation result be sum
+
+Note: Multi-word variable assignment
+Set total calculation result to new_sum
+Set user input value to user_input_value plus 1
+
+Note: "Last occurrence wins" for ambiguous cases
+Let to be or not to be be "that is the question"
+Note: Variable name is "to be or not to be", value is the string
+```
+
+### Imperative Statement Patterns
+
+Canon Mode includes natural imperative statements for common mutations:
+
+```runa
+Note: Compound assignment statements
+Increase count by 1
+Decrease health points by damage amount
+Multiply total price by tax rate
+Divide total cost by number of items
+
+Note: These are equivalent to:
+Set count to count gets increased by 1
+Set health points to health points gets decreased by damage amount
+Set total price to total price gets multiplied by tax rate
+Set total cost to total cost gets divided by number of items
+```
+
+### Block Terminators
+
+**CRITICAL**: All block structures in Runa MUST end with explicit `End` keywords:
+
+```runa
+Note: Function blocks
+Process called "calculate_area" that takes radius as Float returns Float:
+    Return 3.14159 multiplied by radius multiplied by radius
+End Process
+
+Note: Type blocks
+Type called "Point":
+    Field x as Float
+    Field y as Float
+End Type
+
+Note: Conditional blocks
+If value is greater than 10:
+    Display "Large value"
+Otherwise if value is greater than 5:
+    Display "Medium value"
+Otherwise:
+    Display "Small value"
+End If
+
+Note: Loop blocks
+For each item in items:
+    Display item
+End For
+
+While counter is less than limit:
+    Increase counter by 1
+End While
+```
+
+### Natural Language Operators
+
+Canon Mode uses natural language for ALL operators:
+
+```runa
+Note: Arithmetic
+Let result be a plus b
+Let product be width multiplied by height
+Let quotient be total divided by count
+Let remainder be value modulo by 10
+Let power be base to the power of exponent
+
+Note: Comparison
+If score is greater than 90:
+    Display "Excellent"
+End If
+
+If age is less than or equal to 18:
+    Display "Minor"
+End If
+
+If status is equal to "active":
+    Display "Running"
+End If
+
+Note: Logical
+If is_valid and is_complete:
+    Process the data
+End If
+
+If is_error or is_warning:
+    Log the message
+End If
+
+Note: String operations
+Let full_name be first_name joined with " " joined with last_name
+```
 
 ## Architecture Overview
 
 ### Core Components
 
-1. **Lexer** - Tokenizes Runa source code with mathematical symbol enforcement
-2. **Parser** - Builds Abstract Syntax Tree (AST) with operator context validation
-3. **Semantic Analyzer** - Performs type checking and validation with operator type classification
+1. **Lexer** - Tokenizes Runa source code (Canon Mode natural language syntax)
+2. **Parser** - Builds Abstract Syntax Tree (AST) from token stream
+3. **Semantic Analyzer** - Performs type checking and semantic validation
 4. **IR Generator** - Converts AST to intermediate representation
-5. **Runtime** - Executes compiled bytecode
-6. **Standard Library** - Provides essential functions and types
-7. **Formatter** - Symbol-to-word conversion for deployment
+5. **Runtime** - Executes compiled bytecode or generates target code
+6. **Standard Library** - Provides essential functions and types (14-tier architecture)
+7. **Formatter** - Pretty-prints Runa code in canonical style
 
 ### Language Keywords vs Standard Library
 
@@ -68,92 +255,117 @@ Target Executable/Script
 
 ### Module Structure
 
+Based on the v0.0.8.5 bootstrap implementation:
+
 ```
-runa-implementation/
-├── lexer/               # Tokenization and lexical analysis
-├── parser/              # Syntax analysis and AST generation
-├── semantic/            # Type checking and semantic analysis
-├── ir/                  # Intermediate representation
-├── codegen/             # Code generation for target languages
-├── runtime/             # Runtime library and support
-├── stdlib/              # Standard library implementation
-├── tools/               # Development tools (LSP, formatter, etc.)
-└── tests/               # Test suite and validation
+runa/bootstrap/v0.0.8.5/
+├── compiler/
+│   ├── frontend/           # Lexical analysis, parsing, AST generation
+│   ├── middle/             # Semantic analysis, type checking, IR
+│   ├── backend/            # Code generation
+│   │   ├── bytecode_gen/   # Bytecode generation
+│   │   ├── machine_code/   # Native code generation
+│   │   └── syscalls/       # System call interfaces
+│   ├── internal/           # Compiler internals
+│   ├── services/           # Compiler services
+│   ├── tools/              # Compiler-specific tools
+│   ├── testing/            # Compiler tests
+│   └── driver/             # Compiler driver/CLI
+├── runtime/
+│   ├── core/               # Core runtime functionality
+│   ├── core_asm/           # Assembly-level runtime support
+│   ├── concurrency/        # Concurrency primitives
+│   ├── io/                 # I/O operations
+│   ├── aott/               # Ahead-of-time translation
+│   ├── integration/        # External integrations
+│   ├── services/           # Runtime services
+│   └── tools/              # Runtime tools
+├── dev_tools/              # Development tools (LSP, debugger, formatter)
+├── docs/                   # Documentation
+└── tests/                  # Integration and system tests
 ```
 
 ## Phase 1: Lexical Analysis
 
 ### Token Definition
 
-```python
-from enum import Enum, auto
-from dataclasses import dataclass
-from typing import Optional, Any
+The Runa compiler is self-hosted (written in Runa). Token definitions are found in `compiler/frontend/lexer/token.runa`:
 
-class TokenType(Enum):
-    # Literals
-    INTEGER = auto()
-    FLOAT = auto()
-    STRING = auto()
-    BOOLEAN = auto()
-    NULL = auto()
-    
-    # Identifiers and Keywords
-    IDENTIFIER = auto()
-    MULTI_WORD_IDENTIFIER = auto()
-    
-    # Keywords
-    LET = auto()
-    DEFINE = auto()
-    SET = auto()
-    IF = auto()
-    OTHERWISE = auto()
-    UNLESS = auto()
-    WHEN = auto()
-    MATCH = auto()
-    PROCESS = auto()
-    TYPE = auto()
-    RETURN = auto()
-    # ... (all other keywords)
-    
-    # Natural Language Operators
-    PLUS = auto()          # "plus"
-    MINUS = auto()         # "minus"
-    MULTIPLIED_BY = auto() # "multiplied by"
-    DIVIDED_BY = auto()    # "divided by"
-    IS_EQUAL_TO = auto()   # "is equal to"
-    EQUALS = auto()        # "equals" (technical shorthand)
-    # ... (all other operators)
-    
-    # Punctuation
-    COLON = auto()         # ":"
-    COMMA = auto()         # ","
-    SEMICOLON = auto()     # ";"
-    LPAREN = auto()        # "("
-    RPAREN = auto()        # ")"
-    LBRACKET = auto()      # "["
-    RBRACKET = auto()      # "]"
-    LBRACE = auto()        # "{"
-    RBRACE = auto()        # "}"
-    
-    # Special tokens
-    INDENT = auto()
-    DEDENT = auto()
-    NEWLINE = auto()
-    EOF = auto()
-    
-    # AI Annotations
-    AT_REASONING = auto()      # "@Reasoning"
-    AT_END_REASONING = auto()  # "@End_Reasoning"
-    # ... (all other annotation tokens)
+```runa
+Note: Token type enumeration for Canon Mode
+Type called "TokenType":
+    Note: Literal types
+    Case LITERAL_INTEGER
+    Case LITERAL_FLOAT
+    Case LITERAL_STRING
+    Case LITERAL_BOOLEAN
+    Case LITERAL_NULL
 
-@dataclass
-class Token:
-    type: TokenType
-    value: Any
-    line: int
-    column: int
-    position: int
+    Note: Identifiers
+    Case IDENTIFIER
+    Case MULTI_WORD_IDENTIFIER
+
+    Note: Keywords
+    Case KEYWORD_LET
+    Case KEYWORD_DEFINE
+    Case KEYWORD_SET
+    Case KEYWORD_IF
+    Case KEYWORD_OTHERWISE
+    Case KEYWORD_UNLESS
+    Case KEYWORD_WHEN
+    Case KEYWORD_MATCH
+    Case KEYWORD_PROCESS
+    Case KEYWORD_TYPE
+    Case KEYWORD_RETURN
+    Case KEYWORD_END
+    Note: ... (all other keywords)
+
+    Note: Canon Mode natural language operators
+    Case OPERATOR_PLUS
+    Case OPERATOR_MINUS
+    Case OPERATOR_MULTIPLIED_BY
+    Case OPERATOR_DIVIDED_BY
+    Case OPERATOR_MODULO_BY
+    Case OPERATOR_IS_EQUAL_TO
+    Case OPERATOR_IS_NOT_EQUAL_TO
+    Case OPERATOR_IS_GREATER_THAN
+    Case OPERATOR_IS_LESS_THAN
+    Note: ... (all other operators)
+
+    Note: Punctuation
+    Case PUNCT_COLON
+    Case PUNCT_COMMA
+    Case PUNCT_SEMICOLON
+    Case PUNCT_LPAREN
+    Case PUNCT_RPAREN
+    Case PUNCT_LBRACKET
+    Case PUNCT_RBRACKET
+    Case PUNCT_LBRACE
+    Case PUNCT_RBRACE
+
+    Note: Special tokens
+    Case SPECIAL_INDENT
+    Case SPECIAL_DEDENT
+    Case SPECIAL_NEWLINE
+    Case SPECIAL_EOF
+
+    Note: AI Annotations
+    Case ANNOTATION_REASONING
+    Case ANNOTATION_END_REASONING
+    Case ANNOTATION_IMPLEMENTATION
+    Case ANNOTATION_END_IMPLEMENTATION
+    Note: ... (all other annotation tokens)
+End Type
+
+Note: Token structure with location information
+Type called "Token":
+    Field token_type as TokenType
+    Field value as String
+    Field line as Integer
+    Field column as Integer
+    Field position as Integer
+    Field length as Integer
+End Type
 ```
 
 ### Enhanced Lexer Implementation
@@ -235,13 +447,13 @@ Let lexer_config be dictionary containing:
 - **Large Files (100KB-1MB)**: 10-100ms processing time
 - **Very Large Files (>1MB)**: 100ms+ with streaming mode
 
-#### Legacy Python Implementation (Reference)
+#### Runa Lexer Implementation
 
-```python
-import re
-from typing import List, Iterator, Optional
+The actual lexer is implemented in `compiler/frontend/lexer/lexer.runa`:
 
-class RunaLexer:
+```runa
+Note: Runa Lexer - Tokenizes Canon Mode source code
+Type called "Lexer":
     def __init__(self, text: str):
         self.text = text
         self.position = 0
@@ -250,38 +462,27 @@ class RunaLexer:
         self.tokens = []
         self.indent_stack = [0]  # Track indentation levels
         
-        # Multi-word operator patterns (UPDATED for mathematical symbol enforcement)
+        # Canon Mode natural language operators
         self.multi_word_patterns = [
             (r'multiplied\s+by', TokenType.MULTIPLIED_BY),
             (r'divided\s+by', TokenType.DIVIDED_BY),
             (r'plus', TokenType.PLUS),
             (r'minus', TokenType.MINUS),
-            (r'modulo', TokenType.MODULO),
-            (r'is\s+equal\s+to', TokenType.IS_EQUAL_TO),  # Canonical natural language equality
-            (r'equals', TokenType.EQUALS),  # Technical shorthand equality
-            (r'does\s+not\s+equal', TokenType.DOES_NOT_EQUAL),
+            (r'modulo\s+by', TokenType.MODULO_BY),
+            (r'is\s+equal\s+to', TokenType.IS_EQUAL_TO),
+            (r'is\s+not\s+equal\s+to', TokenType.IS_NOT_EQUAL_TO),
             (r'is\s+greater\s+than\s+or\s+equal\s+to', TokenType.IS_GREATER_THAN_OR_EQUAL_TO),
             (r'is\s+less\s+than\s+or\s+equal\s+to', TokenType.IS_LESS_THAN_OR_EQUAL_TO),
             (r'is\s+greater\s+than', TokenType.IS_GREATER_THAN),
             (r'is\s+less\s+than', TokenType.IS_LESS_THAN),
-            (r'concatenated\s+with', TokenType.CONCATENATED_WITH),
+            (r'joined\s+with', TokenType.JOINED_WITH),
             (r'to\s+the\s+power\s+of', TokenType.TO_THE_POWER_OF),
+            (r'gets\s+increased\s+by', TokenType.GETS_INCREASED_BY),
+            (r'gets\s+decreased\s+by', TokenType.GETS_DECREASED_BY),
+            (r'gets\s+multiplied\s+by', TokenType.GETS_MULTIPLIED_BY),
+            (r'gets\s+divided\s+by', TokenType.GETS_DIVIDED_BY),
             # ... add all multi-word operators
         ]
-        
-        # Mathematical symbols (RESTRICTED to mathematical contexts)
-        self.mathematical_symbols = {
-            '+': TokenType.MATHEMATICAL_PLUS,
-            '-': TokenType.MATHEMATICAL_MINUS,
-            '*': TokenType.MATHEMATICAL_MULTIPLY,
-            '/': TokenType.MATHEMATICAL_DIVIDE,
-            '%': TokenType.MATHEMATICAL_MODULO,
-            '<': TokenType.MATHEMATICAL_LESS,
-            '>': TokenType.MATHEMATICAL_GREATER,
-            '<=': TokenType.MATHEMATICAL_LESS_EQUAL,
-            '>=': TokenType.MATHEMATICAL_GREATER_EQUAL,
-            '!=': TokenType.MATHEMATICAL_NOT_EQUAL
-        }
         
         # Keyword mapping
         self.keywords = {
@@ -303,27 +504,7 @@ class RunaLexer:
             'nil': TokenType.NULL,
             # ... add all keywords
         }
-    
-    def validate_mathematical_symbol_context(self, symbol: str, position: int) -> bool:
-        """
-        CRITICAL: Validate mathematical symbols are only used in mathematical contexts
-        """
-        # Context analysis implementation required
-        # Check previous and next tokens for mathematical context
-        # Return False if symbol is used in non-mathematical context
-        return self._is_mathematical_context(symbol, position)
-    
-    def _is_mathematical_context(self, symbol: str, position: int) -> bool:
-        """
-        Analyze surrounding context to determine if mathematical symbol usage is valid
-        """
-        # Implementation details:
-        # - Check if operands are numeric types
-        # - Verify not in string concatenation context
-        # - Validate mathematical expression context
-        # This is a CRITICAL implementation requirement
-        pass  # Implementation required
-    
+
     def tokenize(self) -> List[Token]:
         while not self._at_end():
             self._scan_token()
@@ -893,7 +1074,7 @@ class RunaParser:
         """Parse addition and subtraction"""
         expr = self._parse_multiplication()
         
-        while self._match(TokenType.PLUS, TokenType.MINUS, TokenType.CONCATENATED_WITH):
+        while self._match(TokenType.PLUS, TokenType.MINUS, TokenType.JOINED_WITH):
             operator = self._previous().value
             right = self._parse_multiplication()
             expr = BinaryExpression(expr, operator, right, expr.line, expr.column)
@@ -1199,7 +1380,7 @@ class TypeInferenceEngine:
                              "is greater than", "is less than"]:
             return BasicType("Boolean")
         
-        elif expr.operator == "concatenated with":
+        elif expr.operator == "joined with":
             return BasicType("String")
         
         raise TypeError(f"Invalid types for operator {expr.operator}: "
@@ -1414,43 +1595,32 @@ class PythonCodeGenerator(CodeGenerator):
         left = self.generate_expression(expr.left)
         right = self.generate_expression(expr.right)
         
-        # Map Runa operators to Python operators (UPDATED for canonical forms)
+        # Map Runa Canon Mode operators to Python operators
         operator_map = {
-            # Mathematical operators (natural language canonical)
+            # Arithmetic operators (Canon Mode)
             "plus": "+",
             "minus": "-",
             "multiplied by": "*",
             "divided by": "/",
             "modulo": "%",
+            "modulo by": "%",
             "to the power of": "**",
-            
-            # Mathematical symbols (when used in mathematical contexts)
-            "+": "+",
-            "-": "-",
-            "*": "*",
-            "/": "/",
-            "%": "%",
-            
-            # Comparison operators (updated canonical forms)
-            "is equal to": "==",  # Canonical natural language comparison
-            "equals": "=",  # Assignment operator
-            "is not equal to": "!=",  # Canonical inequality comparison
+
+            # Comparison operators (Canon Mode)
+            "is equal to": "==",
+            "is not equal to": "!=",
             "is greater than": ">",
             "is less than": "<",
             "is greater than or equal to": ">=",
             "is less than or equal to": "<=",
-            
-            # Mathematical comparison symbols (when in mathematical contexts)
-            "<": "<",
-            ">": ">",
-            "<=": ">=",
-            ">=": ">=",
-            "!=": "!=",
-            
+
             # Logical operators
             "and": "and",
             "or": "or",
-            "concatenated with": "+"
+            "not": "not",
+
+            # String operators
+            "joined with": "+"
         }
         
         python_op = operator_map.get(expr.operator)
@@ -1562,7 +1732,7 @@ class JavaScriptCodeGenerator(CodeGenerator):
                 "multiplied by": "*",
                 "divided by": "/",
                 "is equal to": "===",
-                "concatenated with": "+"
+                "joined with": "+"
             }
             
             op = js_operators.get(expr.operator, expr.operator)
@@ -2067,8 +2237,9 @@ class RunaCompilerTests(unittest.TestCase):
     def test_function_parsing(self):
         """Test function definition parsing"""
         code = '''
-Process called "add" that takes a and b returns Integer:
+Process called "add" that takes a as Integer and b as Integer returns Integer:
     Return a plus b
+End Process
 '''
         self.lexer = RunaLexer(code)
         tokens = self.lexer.tokenize()
@@ -2799,25 +2970,35 @@ class ConditionalCompiler:
 # Feature-based compilation
 When feature "async_support":
     Async Process called "async_function":
-        # Async implementation
+        Note: Async implementation
+    End Process
+End When
 Otherwise:
     Process called "async_function":
-        # Synchronous fallback
+        Note: Synchronous fallback
+    End Process
+End Otherwise
 
 # Target-based compilation
 When target "web":
     Import "web_utilities" as web_utilities
+End When
 When target "desktop":
     Import "desktop_utilities" as desktop_utilities
+End When
 
 # Debug vs Release
 When build_mode "debug":
-    Process called "debug_log" that takes message:
-        Display "[DEBUG] " with message message
+    Process called "debug_log" that takes message as String:
+        Display "[DEBUG] " joined with message
+    End Process
+End When
 When build_mode "release":
-    Process called "debug_log" that takes message:
-        # No-op in release builds
+    Process called "debug_log" that takes message as String:
+        Note: No-op in release builds
         Pass
+    End Process
+End When
 
 # Version-based compilation
 When version >= "2.0":

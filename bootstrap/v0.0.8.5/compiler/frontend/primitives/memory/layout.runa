@@ -20,7 +20,7 @@ This file implements the Four-Tier Memory Architecture for v0.0.8.5
 TIER 1: STACK - Automatic local variables (compiler-managed, zero-cost)
 TIER 2: ARENA - Temporary allocations (bump-pointer, bulk free, O(1))
 TIER 3: OWNED HEAP - Permanent structures (individual ownership, explicit free)
-TIER 4: SHARED - Reference counted (future: for shared ownership)
+TIER 4: SHARED - Reference counted (for shared ownership with atomic operations)
 
 GOLDEN RULE: "Arena for TEMPS, Ownership for PERMANENT"
 
@@ -36,6 +36,300 @@ Depends on:
 Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
 Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/core/alignment_core.runa" as Alignment
+Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+
+Note: ============================================================================
+Note: ALLOCATION REGISTRY - Internal allocation tracking for borrow validation
+Note: ============================================================================
+
+Note:
+This registry tracks all live allocations to enable runtime borrow lifetime validation.
+It detects use-after-free, use-after-realloc, and out-of-bounds access.
+
+Registry Entry Structure (56 bytes):
+  offset 0:  is_occupied (1=occupied, 0=empty, 8 bytes)
+  offset 8:  allocation_id (unique ID, 8 bytes)
+  offset 16: generation (incremented on reuse, 8 bytes)
+  offset 24: base_ptr (user data pointer, 8 bytes)
+  offset 32: size (allocation size in bytes, 8 bytes)
+  offset 40: alloc_type (1=brk, 2=mmap, 3=shared, 8 bytes)
+  offset 48: is_alive (1=allocated, 0=freed, 8 bytes)
+:End Note
+
+Let registry_table be 0           Note: Pointer to RegistryEntry array
+Let registry_capacity be 0        Note: Total slots in hash table
+Let registry_count be 0           Note: Number of occupied slots
+Let next_allocation_id be 1       Note: Global allocation ID counter (starts at 1)
+Let registry_initialized be 0     Note: 1 if registry has been initialized
+
+Let REGISTRY_INITIAL_CAPACITY be 1024     Note: Initial number of slots
+Let REGISTRY_ENTRY_SIZE be 56             Note: Size of each RegistryEntry
+Let REGISTRY_LOAD_FACTOR_PERCENT be 75    Note: Resize at 75% full
+
+Process called "registry_init" returns Integer:
+    Note: Initialize allocation registry with initial capacity
+    If registry_initialized is equal to 1:
+        Return 1  Note: Already initialized
+    End If
+
+    Let total_size be REGISTRY_INITIAL_CAPACITY multiplied by REGISTRY_ENTRY_SIZE
+    Let prot be 3   Note: PROT_READ | PROT_WRITE
+    Let flags be 34 Note: MAP_PRIVATE | MAP_ANONYMOUS
+    Let table_ptr be proc syscall_mmap from Syscall with 0, total_size, prot, flags, -1, 0
+
+    If table_ptr is less than 0:
+        Return 0  Note: mmap failed
+    End If
+
+    proc memory_fill from Memory with table_ptr, 0, total_size
+
+    Set registry_table to table_ptr
+    Set registry_capacity to REGISTRY_INITIAL_CAPACITY
+    Set registry_count to 0
+    Set next_allocation_id to 1
+    Set registry_initialized to 1
+
+    Return 1
+End Process
+
+Process called "registry_ensure_initialized" returns Integer:
+    If registry_initialized is equal to 1:
+        Return 1
+    End If
+    Return proc registry_init
+End Process
+
+Process called "registry_hash" takes alloc_id as Integer returns Integer:
+    Let index be alloc_id modulo by registry_capacity
+    Return index
+End Process
+
+Process called "registry_lookup" takes alloc_id as Integer returns Integer:
+    Let init_check be proc registry_ensure_initialized
+    If init_check is equal to 0:
+        Return 0
+    End If
+
+    Let start_index be proc registry_hash with alloc_id
+    Let current_index be start_index
+    Let max_probes be registry_capacity
+    Let probe_count be 0
+
+    While probe_count is less than max_probes:
+        Let entry_offset be current_index multiplied by REGISTRY_ENTRY_SIZE
+        Let entry_ptr be registry_table plus entry_offset
+        Let is_occupied be proc memory_get_int64 from Memory with entry_ptr, 0
+
+        If is_occupied is equal to 0:
+            Return 0
+        End If
+
+        Let stored_id be proc memory_get_int64 from Memory with entry_ptr, 8
+        If stored_id is equal to alloc_id:
+            Return entry_ptr
+        End If
+
+        Set current_index to current_index plus 1
+        If current_index is greater than or equal to registry_capacity:
+            Set current_index to 0
+        End If
+        Set probe_count to probe_count plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "registry_insert" takes alloc_id as Integer, generation as Integer, base_ptr as Integer, size as Integer, alloc_type as Integer returns Integer:
+    Let init_check be proc registry_ensure_initialized
+    If init_check is equal to 0:
+        Return 0
+    End If
+
+    Let threshold be registry_capacity multiplied by REGISTRY_LOAD_FACTOR_PERCENT
+    Set threshold to threshold divided by 100
+
+    If registry_count is greater than or equal to threshold:
+        Let resize_result be proc registry_resize
+        If resize_result is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Let start_index be proc registry_hash with alloc_id
+    Let current_index be start_index
+    Let max_probes be registry_capacity
+    Let probe_count be 0
+
+    While probe_count is less than max_probes:
+        Let entry_offset be current_index multiplied by REGISTRY_ENTRY_SIZE
+        Let entry_ptr be registry_table plus entry_offset
+        Let is_occupied be proc memory_get_int64 from Memory with entry_ptr, 0
+
+        If is_occupied is equal to 0:
+            proc memory_set_int64 from Memory with entry_ptr, 0, 1
+            proc memory_set_int64 from Memory with entry_ptr, 8, alloc_id
+            proc memory_set_int64 from Memory with entry_ptr, 16, generation
+            proc memory_set_int64 from Memory with entry_ptr, 24, base_ptr
+            proc memory_set_int64 from Memory with entry_ptr, 32, size
+            proc memory_set_int64 from Memory with entry_ptr, 40, alloc_type
+            proc memory_set_int64 from Memory with entry_ptr, 48, 1
+            Set registry_count to registry_count plus 1
+            Return 1
+        End If
+
+        Set current_index to current_index plus 1
+        If current_index is greater than or equal to registry_capacity:
+            Set current_index to 0
+        End If
+        Set probe_count to probe_count plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "registry_update_alive" takes alloc_id as Integer, is_alive as Integer returns Integer:
+    Let entry_ptr be proc registry_lookup with alloc_id
+    If entry_ptr is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with entry_ptr, 48, is_alive
+    Return 1
+End Process
+
+Process called "registry_increment_generation" takes alloc_id as Integer returns Integer:
+    Let entry_ptr be proc registry_lookup with alloc_id
+    If entry_ptr is equal to 0:
+        Return 0
+    End If
+    Let current_gen be proc memory_get_int64 from Memory with entry_ptr, 16
+    Let new_gen be current_gen plus 1
+    proc memory_set_int64 from Memory with entry_ptr, 16, new_gen
+    Return new_gen
+End Process
+
+Process called "registry_get_generation" takes alloc_id as Integer returns Integer:
+    Let entry_ptr be proc registry_lookup with alloc_id
+    If entry_ptr is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with entry_ptr, 16
+End Process
+
+Process called "registry_remove" takes alloc_id as Integer returns Integer:
+    Let entry_ptr be proc registry_lookup with alloc_id
+    If entry_ptr is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Memory with entry_ptr, 0, 0
+    Set registry_count to registry_count minus 1
+    Return 1
+End Process
+
+Process called "registry_resize" returns Integer:
+    Let old_table be registry_table
+    Let old_capacity be registry_capacity
+    Let new_capacity be old_capacity multiplied by 2
+    Let new_size be new_capacity multiplied by REGISTRY_ENTRY_SIZE
+
+    Let prot be 3
+    Let flags be 34
+    Let new_table be proc syscall_mmap from Syscall with 0, new_size, prot, flags, -1, 0
+
+    If new_table is less than 0:
+        Return 0
+    End If
+
+    proc memory_fill from Memory with new_table, 0, new_size
+
+    Let saved_table be registry_table
+    Let saved_capacity be registry_capacity
+    Let saved_count be registry_count
+
+    Set registry_table to new_table
+    Set registry_capacity to new_capacity
+    Set registry_count to 0
+
+    Let i be 0
+    While i is less than saved_capacity:
+        Let old_entry_offset be i multiplied by REGISTRY_ENTRY_SIZE
+        Let old_entry_ptr be saved_table plus old_entry_offset
+        Let is_occupied be proc memory_get_int64 from Memory with old_entry_ptr, 0
+
+        If is_occupied is equal to 1:
+            Let alloc_id be proc memory_get_int64 from Memory with old_entry_ptr, 8
+            Let generation be proc memory_get_int64 from Memory with old_entry_ptr, 16
+            Let base_ptr be proc memory_get_int64 from Memory with old_entry_ptr, 24
+            Let size be proc memory_get_int64 from Memory with old_entry_ptr, 32
+            Let alloc_type be proc memory_get_int64 from Memory with old_entry_ptr, 40
+            Let is_alive be proc memory_get_int64 from Memory with old_entry_ptr, 48
+
+            Let insert_result be proc registry_insert with alloc_id, generation, base_ptr, size, alloc_type
+
+            If insert_result is equal to 0:
+                proc syscall_munmap from Syscall with new_table, new_size
+                Set registry_table to saved_table
+                Set registry_capacity to saved_capacity
+                Set registry_count to saved_count
+                Return 0
+            End If
+
+            Let new_entry_ptr be proc registry_lookup with alloc_id
+            If new_entry_ptr is not equal to 0:
+                proc memory_set_int64 from Memory with new_entry_ptr, 48, is_alive
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Let old_size be saved_capacity multiplied by REGISTRY_ENTRY_SIZE
+    proc syscall_munmap from Syscall with saved_table, old_size
+
+    Return 1
+End Process
+
+Process called "registry_allocate_id" returns Integer:
+    Let new_id be next_allocation_id
+    Set next_allocation_id to next_allocation_id plus 1
+    Return new_id
+End Process
+
+Process called "registry_get_count" returns Integer:
+    Return registry_count
+End Process
+
+Process called "registry_get_capacity" returns Integer:
+    Return registry_capacity
+End Process
+
+Process called "registry_get_load_factor" returns Integer:
+    If registry_capacity is equal to 0:
+        Return 0
+    End If
+    Let load be registry_count multiplied by 100
+    Set load to load divided by registry_capacity
+    Return load
+End Process
+
+Process called "registry_is_initialized" returns Integer:
+    Return registry_initialized
+End Process
+
+Process called "registry_destroy" returns Integer:
+    If registry_initialized is equal to 0:
+        Return 1
+    End If
+    If registry_table is equal to 0:
+        Return 1
+    End If
+    Let total_size be registry_capacity multiplied by REGISTRY_ENTRY_SIZE
+    proc syscall_munmap from Syscall with registry_table, total_size
+    Set registry_table to 0
+    Set registry_capacity to 0
+    Set registry_count to 0
+    Set registry_initialized to 0
+    Return 1
+End Process
 
 Note: ============================================================================
 Note: TIER 2: ARENA ALLOCATOR (Temporary Allocations)
@@ -51,7 +345,7 @@ Process called "arena_create" takes initial_size as Integer returns Integer:
     Note: Returns pointer to Arena structure, or 0 on failure
 
     Note: Allocate arena structure (24 bytes)
-    Let arena be allocate(24)
+    Let arena be proc allocate with 24
     If arena is equal to 0:
         Return 0  Note: Failed to allocate arena structure
     End If
@@ -61,16 +355,16 @@ Process called "arena_create" takes initial_size as Integer returns Integer:
     Note: MAP_PRIVATE | MAP_ANONYMOUS = 0x22
     Let prot be 3
     Let flags be 34  Note: 0x22
-    Let buffer be syscall_mmap(0, initial_size, prot, flags, -1, 0)
+    Let buffer be proc syscall_mmap with 0, initial_size, prot, flags, -1, 0
 
     Note: Check for mmap failure (returns -1 or negative)
     If buffer is less than 0:
-        deallocate(arena)
+        proc deallocate with arena
         Return 0  Note: Failed to allocate buffer
     End If
 
     Note: Initialize arena fields
-    memory_set_pointer(arena, 0, buffer)      Note: buffer
+    proc memory_set_pointer with arena, 0, buffer      Note: buffer
     memory_set_int64(arena, 8, initial_size)  Note: size
     memory_set_int64(arena, 16, 0)            Note: used = 0
 
@@ -86,10 +380,10 @@ Process called "arena_allocate" takes arena as Integer, size as Integer returns 
     End If
 
     Note: Align allocation size to 8 bytes
-    Let aligned_size be align_up(size, 8)
+    Let aligned_size be proc align_up with size, 8
 
     Note: Get current state
-    Let buffer be memory_get_pointer(arena, 0)
+    Let buffer be proc memory_get_pointer with arena, 0
     Let capacity be memory_get_int64(arena, 8)
     Let used be memory_get_int64(arena, 16)
 
@@ -116,15 +410,15 @@ Process called "arena_string_duplicate" takes arena as Integer, str as Integer r
         Return 0
     End If
 
-    Let len be string_length(str)
+    Let len be proc string_length with str
     Let size be len plus 1  Note: Include null terminator
 
-    Let new_str be arena_allocate(arena, size)
+    Let new_str be proc arena_allocate with arena, size
     If new_str is equal to 0:
         Return 0  Note: Arena out of space
     End If
 
-    memory_copy(new_str, str, size)
+    proc memory_copy with new_str, str, size
     Return new_str
 End Process
 
@@ -133,9 +427,9 @@ Process called "arena_integer_to_string" takes arena as Integer, value as Intege
     Note: Eliminates temporary string leaks
 
     Note: Use heap version first, then copy to arena
-    Let heap_str be integer_to_string(value)
-    Let arena_str be arena_string_duplicate(arena, heap_str)
-    deallocate(heap_str)
+    Let heap_str be proc integer_to_string with value
+    Let arena_str be proc arena_string_duplicate with arena, heap_str
+    proc deallocate with heap_str
 
     Return arena_str
 End Process
@@ -144,9 +438,9 @@ Process called "arena_string_concat" takes arena as Integer, str1 as Integer, st
     Note: Concatenate strings using arena
     Note: Eliminates result leak
 
-    Let heap_result be string_concat(str1, str2)
-    Let arena_result be arena_string_duplicate(arena, heap_result)
-    deallocate(heap_result)
+    Let heap_result be proc string_concat with str1, str2
+    Let arena_result be proc arena_string_duplicate with arena, heap_result
+    proc deallocate with heap_result
 
     Return arena_result
 End Process
@@ -171,16 +465,16 @@ Process called "arena_destroy" takes arena as Integer returns Integer:
         Return 0
     End If
 
-    Let buffer be memory_get_pointer(arena, 0)
+    Let buffer be proc memory_get_pointer with arena, 0
     Let size be memory_get_int64(arena, 8)
 
     Note: Unmap the buffer
     If buffer is not equal to 0:
-        syscall_munmap(buffer, size)
+        proc syscall_munmap with buffer, size
     End If
 
     Note: Free arena structure
-    deallocate(arena)
+    proc deallocate with arena
 
     Return 1
 End Process
@@ -244,13 +538,13 @@ Process called "heap_init" returns Integer:
     End If
 
     Note: Get current brk (this will be our metadata location)
-    Let current_brk be syscall_brk(0)
+    Let current_brk be proc syscall_brk with 0
     Set heap_metadata_addr to current_brk
 
     Note: Reserve 16 bytes for metadata
     Let metadata_size be 16
     Let new_brk be current_brk plus metadata_size
-    Let result_brk be syscall_brk(new_brk)
+    Let result_brk be proc syscall_brk with new_brk
 
     If result_brk is less than new_brk:
         Set heap_metadata_addr to 0
@@ -258,7 +552,7 @@ Process called "heap_init" returns Integer:
     End If
 
     Note: Initialize metadata
-    memory_set_pointer(heap_metadata_addr, 0, 0)  Note: free_list_head = NULL
+    proc memory_set_pointer with heap_metadata_addr, 0, 0  Note: free_list_head = NULL
     memory_set_int64(heap_metadata_addr, 8, 1)     Note: heap_initialized = 1
 
     Return heap_metadata_addr
@@ -269,15 +563,15 @@ Process called "heap_get_free_list_head" returns Integer:
     If heap_metadata_addr is equal to 0:
         Return 0
     End If
-    Return memory_get_pointer(heap_metadata_addr, 0)
+    Return proc memory_get_pointer with heap_metadata_addr, 0
 End Process
 
 Process called "heap_set_free_list_head" takes head as Integer returns Integer:
     Note: Set the free list head pointer
     If heap_metadata_addr is equal to 0:
-        Let dummy be heap_init()
+        Let dummy be proc heap_init with 
     End If
-    memory_set_pointer(heap_metadata_addr, 0, head)
+    proc memory_set_pointer with heap_metadata_addr, 0, head
     Return 1
 End Process
 
@@ -285,14 +579,14 @@ Process called "free_list_find_fit" takes size as Integer returns Integer:
     Note: Find a free block that fits the requested size (first-fit algorithm)
     Note: Returns pointer to user data area, or 0 if no fit found
 
-    Let current be heap_get_free_list_head()
+    Let current be proc heap_get_free_list_head with 
 
     While current is not equal to 0:
-        Let block_size be free_block_get_size(current)
+        Let block_size be proc free_block_get_size with current
         If block_size is greater than or equal to size:
             Return current  Note: Found a fit
         End If
-        Set current to free_block_get_next(current)
+        Set current to proc free_block_get_next with current
     End While
 
     Return 0  Note: No suitable block found
@@ -301,24 +595,24 @@ End Process
 Process called "free_list_remove_block" takes block as Integer returns Integer:
     Note: Remove block from free list (when reusing it for allocation)
 
-    Let head be heap_get_free_list_head()
+    Let head be proc heap_get_free_list_head with 
     Let next be 0  Note: Declare once at function scope
 
     Note: If it's the head, update head pointer
     If block is equal to head:
-        Set next to free_block_get_next(block)
-        Let dummy be heap_set_free_list_head(next)
+        Set next to proc free_block_get_next with block
+        Let dummy be proc heap_set_free_list_head with next
         Return 1
     End If
 
     Note: Search for block in the list
     Let current be head
     While current is not equal to 0:
-        Set next to free_block_get_next(current)
+        Set next to proc free_block_get_next with current
         If next is equal to block:
             Note: Found it - unlink from list
-            Let next_next be free_block_get_next(block)
-            Let dummy2 be free_block_set_next(current, next_next)
+            Let next_next be proc free_block_get_next with block
+            Let dummy2 be proc free_block_set_next with current, next_next
             Return 1
         End If
         Set current to next
@@ -330,22 +624,22 @@ End Process
 Process called "free_list_add_block" takes block as Integer returns Integer:
     Note: Add block to the front of free list (LIFO)
 
-    Let old_head be heap_get_free_list_head()
-    Let dummy be free_block_set_next(block, old_head)
-    Let dummy2 be free_block_set_free_flag(block, 1)
-    Let dummy3 be heap_set_free_list_head(block)
+    Let old_head be proc heap_get_free_list_head with 
+    Let dummy be proc free_block_set_next with block, old_head
+    Let dummy2 be proc free_block_set_free_flag with block, 1
+    Let dummy3 be proc heap_set_free_list_head with block
     Return 1
 End Process
 
 Process called "free_block_set_next" takes block as Integer, next as Integer returns Integer:
     Note: Set next pointer in a free block (block points to user data area)
-    memory_set_pointer(block, 0, next)
+    proc memory_set_pointer with block, 0, next
     Return 1
 End Process
 
 Process called "free_block_get_next" takes block as Integer returns Integer:
     Note: Get next pointer from a free block
-    Return memory_get_pointer(block, 0)
+    Return proc memory_get_pointer with block, 0
 End Process
 
 Process called "free_block_set_free_flag" takes block as Integer, is_free as Integer returns Integer:
@@ -362,7 +656,7 @@ End Process
 Process called "free_block_get_size" takes block as Integer returns Integer:
     Note: Get total size of block from header (block points to user data)
     Let header_ptr be block minus 16
-    Return memory_get_int64(header_ptr, 0)
+    Return proc memory_get_int64 from Memory with header_ptr, 0
 End Process
 
 Note: ============================================================================
@@ -379,8 +673,8 @@ Process called "allocate" takes size as Integer returns Integer:
     End If
 
     Note: Align size to 8 bytes
-    Let aligned_size be align_up(size, 8)
-    Let header_size be 16  Note: 8 bytes size + 8 bytes type
+    Let aligned_size be proc align_up with size, 8
+    Let header_size be 32  Note: EXPANDED: allocation_id (8) + generation (8) + size (8) + type (8)
     Let total_size be header_size plus aligned_size
 
     Note: For small allocations, use brk
@@ -392,55 +686,97 @@ Process called "allocate" takes size as Integer returns Integer:
         Note: Large allocation - use mmap
         Let prot be 3  Note: PROT_READ | PROT_WRITE
         Let flags be 34  Note: MAP_PRIVATE | MAP_ANONYMOUS
-        Let header_ptr be syscall_mmap(0, total_size, prot, flags, -1, 0)
+        Let header_ptr be proc syscall_mmap with 0, total_size, prot, flags, -1, 0
 
         If header_ptr is less than 0:
             Return 0  Note: mmap failed
         End If
 
-        Note: Write header metadata
-        memory_set_int64(header_ptr, 0, total_size)  Note: size
-        memory_set_int64(header_ptr, 8, 2)           Note: type = mmap
+        Note: Allocate unique allocation ID
+        Let alloc_id be proc registry_allocate_id
 
-        Note: Return pointer to user data (skip header)
+        Note: Write header metadata (NEW EXPANDED HEADER)
+        proc memory_set_int64 from Memory with header_ptr, 0, alloc_id      Note: allocation_id
+        proc memory_set_int64 from Memory with header_ptr, 8, 0             Note: generation = 0
+        proc memory_set_int64 from Memory with header_ptr, 16, total_size   Note: size
+        proc memory_set_int64 from Memory with header_ptr, 24, 2            Note: type = mmap
+
+        Note: Calculate user data pointer
         Set user_ptr to header_ptr plus header_size
+
+        Note: Register allocation in registry
+        Let reg_result be proc registry_insert with alloc_id, 0, user_ptr, aligned_size, 2
+        Note: If registry insert fails, allocation still succeeds but validation will not work
+
         Return user_ptr
     End If
 
     Note: Small allocation - check free list first
     Note: Initialize heap metadata if needed
     If heap_metadata_addr is equal to 0:
-        Let init_result be heap_init()
+        Let init_result be proc heap_init
         If init_result is equal to 0:
             Return 0  Note: Failed to initialize heap
         End If
     End If
 
     Note: Try to find a free block that fits
-    Let free_block be free_list_find_fit(total_size)
+    Let free_block be proc free_list_find_fit with total_size
     If free_block is not equal to 0:
         Note: Found a suitable free block - reuse it!
-        Let dummy be free_list_remove_block(free_block)
-        Let dummy2 be free_block_set_free_flag(free_block, 0)  Note: Mark as allocated
+        Let dummy be proc free_list_remove_block with free_block
+        Let dummy2 be proc free_block_set_free_flag with free_block, 0
+
+        Note: Get old allocation metadata from header
+        Let free_block_header be free_block minus header_size
+        Let old_alloc_id be proc memory_get_int64 from Memory with free_block_header, 0
+        Let old_generation be proc memory_get_int64 from Memory with free_block_header, 8
+
+        Note: Remove old registry entry (address is being reused)
+        proc registry_remove with old_alloc_id
+
+        Note: Allocate new ID and increment generation for reuse
+        Let new_alloc_id be proc registry_allocate_id
+        Let new_generation be old_generation plus 1
+
+        Note: Update header with new metadata
+        proc memory_set_int64 from Memory with free_block_header, 0, new_alloc_id
+        proc memory_set_int64 from Memory with free_block_header, 8, new_generation
+
+        Note: Register new allocation
+        Let block_size be proc memory_get_int64 from Memory with free_block_header, 16
+        Let user_size be block_size minus header_size
+        proc registry_insert with new_alloc_id, new_generation, free_block, user_size, 1
+
         Return free_block
     End If
 
     Note: No suitable free block - allocate new memory with brk
-    Let current_brk be syscall_brk(0)
+    Let current_brk be proc syscall_brk with 0
     Let new_brk be current_brk plus total_size
-    Let result_brk be syscall_brk(new_brk)
+    Let result_brk be proc syscall_brk with new_brk
 
     If result_brk is less than new_brk:
         Return 0  Note: brk failed
     End If
 
-    Note: Write header metadata at current_brk
-    memory_set_int64(current_brk, 0, total_size)  Note: size
-    memory_set_int64(current_brk, 8, 1)           Note: type = brk
+    Note: Allocate unique allocation ID
+    Let alloc_id be proc registry_allocate_id
+
+    Note: Write header metadata at current_brk (NEW EXPANDED HEADER)
+    proc memory_set_int64 from Memory with current_brk, 0, alloc_id        Note: allocation_id
+    proc memory_set_int64 from Memory with current_brk, 8, 0               Note: generation = 0
+    proc memory_set_int64 from Memory with current_brk, 16, total_size     Note: size
+    proc memory_set_int64 from Memory with current_brk, 24, 1              Note: type = brk
+
+    Note: Calculate user data pointer
+    Set user_ptr to current_brk plus header_size
 
     Note: Initialize free flag (0 = allocated)
-    Set user_ptr to current_brk plus header_size
-    memory_set_int64(user_ptr, 8, 0)  Note: is_free = 0
+    proc memory_set_int64 from Memory with user_ptr, 8, 0  Note: is_free = 0
+
+    Note: Register allocation in registry
+    proc registry_insert with alloc_id, 0, user_ptr, aligned_size, 1
 
     Return user_ptr
 End Process
@@ -454,25 +790,39 @@ Process called "deallocate" takes ptr as Integer returns Integer:
         Return 0  Note: NULL pointer (safe to ignore)
     End If
 
-    Note: Get header pointer (16 bytes before user data)
-    Let header_size be 16
+    Note: Get header pointer (NOW 32 bytes before user data for owned allocations)
+    Let header_size be 32  Note: Owned allocation header
     Let header_ptr be ptr minus header_size
 
-    Note: Read allocation metadata from header
-    Let total_size be memory_get_int64(header_ptr, 0)
-    Let alloc_type be memory_get_int64(header_ptr, 8)
+    Note: Read allocation metadata from header (NEW EXPANDED HEADER)
+    Let alloc_id be proc memory_get_int64 from Memory with header_ptr, 0
+    Let generation be proc memory_get_int64 from Memory with header_ptr, 8
+    Let total_size be proc memory_get_int64 from Memory with header_ptr, 32
+    Let alloc_type be proc memory_get_int64 from Memory with header_ptr, 40
+
+    Note: Mark allocation as freed in registry (but keep entry for generation tracking)
+    proc registry_update_alive with alloc_id, 0
 
     Note: Type 2 = mmap allocation (can be freed immediately)
     If alloc_type is equal to 2:
-        Let result be syscall_munmap(header_ptr, total_size)
+        Note: Increment generation for safety (in case address is reused by OS)
+        proc registry_increment_generation with alloc_id
+
+        Let result be proc syscall_munmap with header_ptr, total_size
         If result is equal to 0:
-            Return 1  Note: Successfully freed
+            Note: Successfully freed - remove from registry
+            proc registry_remove with alloc_id
+            Return 1
         End If
         Return 0  Note: munmap failed
     End If
 
     Note: Type 1 = brk allocation - add to free list for reuse
-    Let dummy be free_list_add_block(ptr)
+    Note: Do NOT remove from registry - will be removed on reuse in allocate()
+    Note: Just mark as freed and increment generation
+    proc registry_increment_generation with alloc_id
+
+    Let dummy be proc free_list_add_block with ptr
     Return 1  Note: Successfully added to free list
 End Process
 
@@ -489,15 +839,17 @@ Note:   offset 24: is_parameter (integer)
 Process called "variable_create" takes name as String, stack_offset as Integer, type_name as String, is_parameter as Integer returns Integer:
     Note: Create variable entry (Tier 3: Owned)
 
-    Let var be allocate(32)
+    Let var be proc allocate with 32
     If var is equal to 0:
         Return 0
     End If
 
-    memory_set_pointer(var, 0, string_duplicate(name))
-    memory_set_int64(var, 8, stack_offset)
-    memory_set_pointer(var, 16, string_duplicate(type_name))
-    memory_set_int64(var, 24, is_parameter)
+    Let name_copy be proc string_duplicate with name
+    proc memory_set_pointer with var, 0, name_copy
+    proc memory_set_int64 with var, 8, stack_offset
+    Let type_copy be proc string_duplicate with type_name
+    proc memory_set_pointer with var, 16, type_copy
+    proc memory_set_int64 with var, 24, is_parameter
 
     Return var
 End Process
@@ -509,19 +861,349 @@ Process called "variable_destroy" takes var as Integer returns Integer:
         Return 0
     End If
 
-    Let name be memory_get_pointer(var, 0)
-    Let type_name be memory_get_pointer(var, 16)
+    Let name be proc memory_get_pointer with var, 0
+    Let type_name be proc memory_get_pointer with var, 16
 
     If name is not equal to 0:
-        deallocate(name)
+        proc deallocate with name
     End If
 
     If type_name is not equal to 0:
-        deallocate(type_name)
+        proc deallocate with type_name
     End If
 
-    deallocate(var)
+    proc deallocate with var
     Return 1
+End Process
+
+Note: ============================================================================
+Note: TIER 4: SHARED (Reference Counted)
+Note: ============================================================================
+
+Note:
+Shared object header structure (prepended to each shared allocation):
+offset -32: strong_refcount (atomic, 8 bytes) - counts strong references
+offset -24: weak_refcount (atomic, 8 bytes) - counts weak references
+offset -16: data_size (8 bytes) - size of user data
+offset -8: allocation_type (8 bytes, 3=shared)
+offset 0: user data begins here
+
+Strong references keep the object alive.
+Weak references allow checking if object is still alive without preventing deallocation.
+When strong_refcount reaches 0, user data is freed but header remains for weak pointers.
+When weak_refcount reaches 0, header is freed.
+:End Note
+
+Note:
+Weak Pointer Structure (16 bytes):
+offset 0: shared_header_ptr (pointer to shared object header, 8 bytes)
+offset 8: is_valid (1 if target alive, 0 if deallocated, 8 bytes)
+:End Note
+
+Note: ============================================================================
+Note: Atomic Operations (REMOVED - Now use core/atomic_core.runa)
+Note: ============================================================================
+
+Note: Atomic operations have been moved to core/atomic_core.runa
+Note: Use Atomic.Atomic.atomic_increment(), Atomic.Atomic.atomic_decrement(), etc.
+
+Note: ============================================================================
+Note: Shared Object Creation and Reference Management
+Note: ============================================================================
+
+Process called "shared_create" takes size as Integer returns Integer:
+    Note: Create shared object with initial refcount of 1
+    Note: Returns pointer to USER DATA (header is hidden 32 bytes before it)
+    Note: Must call shared_release() when done with this reference
+
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Align size to 8 bytes
+    Let aligned_size be proc align_up with size, 8
+    Let header_size be 48  Note: EXPANDED: allocation_id (8) + generation (8) + strong_refcount (8) + weak_refcount (8) + data_size (8) + allocation_type (8)
+    Let total_size be header_size plus aligned_size
+
+    Note: Always use mmap for shared allocations (can be unmapped independently)
+    Let prot be 3  Note: PROT_READ | PROT_WRITE
+    Let flags be 34  Note: MAP_PRIVATE | MAP_ANONYMOUS
+    Let header_ptr be proc syscall_mmap with 0, total_size, prot, flags, -1, 0
+
+    If header_ptr is less than 0:
+        Return 0  Note: mmap failed
+    End If
+
+    Note: Allocate unique allocation ID
+    Let alloc_id be proc registry_allocate_id
+
+    Note: Initialize header (NEW EXPANDED HEADER FOR SHARED)
+    proc memory_set_int64 from Memory with header_ptr, 0, alloc_id        Note: allocation_id
+    proc memory_set_int64 from Memory with header_ptr, 8, 0               Note: generation = 0
+    proc memory_set_int64 from Memory with header_ptr, 16, 1              Note: strong_refcount = 1
+    proc memory_set_int64 from Memory with header_ptr, 24, 0              Note: weak_refcount = 0
+    proc memory_set_int64 from Memory with header_ptr, 32, aligned_size   Note: data_size
+    proc memory_set_int64 from Memory with header_ptr, 40, 3              Note: allocation_type = 3 (shared)
+
+    Note: Calculate user data pointer
+    Let user_ptr be header_ptr plus header_size
+
+    Note: Register allocation in registry
+    proc registry_insert with alloc_id, 0, user_ptr, aligned_size, 3
+
+    Return user_ptr
+End Process
+
+Process called "shared_retain" takes ptr as Integer returns Integer:
+    Note: Increment reference count for shared object
+    Note: Returns the same pointer (for convenience)
+    Note: Returns 0 if ptr is NULL or invalid
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Get header pointer
+    Let header_size be 48  Note: EXPANDED shared header
+    Let header_ptr be ptr minus header_size
+
+    Note: Verify this is a shared allocation
+    Let alloc_type be proc memory_get_int64 from Memory with header_ptr, 40
+    If alloc_type is not equal to 3:
+        Return 0  Note: Not a shared allocation - error!
+    End If
+
+    Note: Atomically increment strong refcount
+    Let refcount_ptr be header_ptr plus 16  Note: strong_refcount at offset 16
+    Let new_count be proc atomic_increment from Atomic with refcount_ptr
+
+    Return ptr
+End Process
+
+Process called "shared_release" takes ptr as Integer returns Integer:
+    Note: Decrement reference count and free if zero
+    Note: Returns 1 if object still alive, 0 if deallocated
+    Note: Safe to call with NULL pointer (returns 0)
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Get header pointer
+    Let header_size be 48  Note: EXPANDED shared header
+    Let header_ptr be ptr minus header_size
+
+    Note: Verify this is a shared allocation
+    Let alloc_type be proc memory_get_int64 from Memory with header_ptr, 40
+    If alloc_type is not equal to 3:
+        Return 0  Note: Not a shared allocation - error!
+    End If
+
+    Note: Atomically decrement strong refcount
+    Let refcount_ptr be header_ptr plus 16  Note: strong_refcount at offset 16
+    Let new_count be proc atomic_decrement from Atomic with refcount_ptr
+
+    Note: If refcount reached 0, deallocate user data
+    If new_count is equal to 0:
+        Note: Weak pointers detect invalidity by checking strong_refcount = 0
+        Note: No need to walk weak pointer list - they check atomically on access
+
+        Note: Check if there are any weak references
+        Let weak_refcount_ptr be header_ptr plus 24  Note: weak_refcount at offset 24
+        Let weak_count be proc atomic_load_acquire from Atomic with weak_refcount_ptr
+
+        If weak_count is equal to 0:
+            Note: No weak references - free entire allocation
+            Let data_size be proc memory_get_int64 from Memory with header_ptr, 32
+            Let total_size be header_size plus data_size
+            proc syscall_munmap with header_ptr, total_size
+            Return 0  Note: Object fully deallocated
+        Otherwise:
+            Note: Weak references exist - keep header, zero user data for safety
+            Let data_size be proc memory_get_int64 from Memory with header_ptr, 32
+            proc memory_fill with ptr, 0, data_size
+            Return 0  Note: Object deallocated (header remains for weak refs)
+        End If
+    End If
+
+    Return 1  Note: Object still alive (refcount > 0)
+End Process
+
+Process called "shared_get_refcount" takes ptr as Integer returns Integer:
+    Note: Get current strong reference count
+    Note: Useful for debugging and testing
+    Note: Returns 0 if ptr is NULL or invalid
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Let header_size be 48  Note: EXPANDED shared header
+    Let header_ptr be ptr minus header_size
+
+    Note: Verify this is a shared allocation
+    Let alloc_type be proc memory_get_int64 from Memory with header_ptr, 40
+    If alloc_type is not equal to 3:
+        Return 0
+    End If
+
+    Let refcount_ptr be header_ptr plus 16  Note: strong_refcount at offset 16
+    Return proc atomic_load_acquire from Atomic with refcount_ptr
+End Process
+
+Note: ============================================================================
+Note: Weak Pointer Support
+Note: ============================================================================
+
+Process called "weak_create" takes strong_ptr as Integer returns Integer:
+    Note: Create weak pointer to shared object
+    Note: Weak pointer does NOT increase strong refcount
+    Note: Returns pointer to WeakPointer structure (16 bytes)
+    Note: Must call weak_destroy() when done
+
+    If strong_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Verify this is a shared allocation
+    Let header_size be 48  Note: EXPANDED shared header
+    Let header_ptr be strong_ptr minus header_size
+    Let alloc_type be proc memory_get_int64 from Memory with header_ptr, 40
+    If alloc_type is not equal to 3:
+        Return 0  Note: Not a shared allocation
+    End If
+
+    Note: Allocate weak pointer structure
+    Let weak_ptr be proc allocate with 16
+    If weak_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Increment weak refcount on shared object
+    Let weak_refcount_ptr be header_ptr plus 24  Note: weak_refcount at offset 24
+    Let dummy be proc atomic_increment from Atomic with weak_refcount_ptr
+
+    Note: Initialize weak pointer
+    proc memory_set_pointer with weak_ptr, 0, header_ptr
+    memory_set_int64(weak_ptr, 8, 1)  Note: is_valid = 1
+
+    Return weak_ptr
+End Process
+
+Process called "weak_lock" takes weak_ptr as Integer returns Integer:
+    Note: Try to promote weak pointer to strong reference
+    Note: Returns strong pointer if object still alive, 0 if deallocated
+    Note: If successful, caller must eventually call shared_release()
+
+    If weak_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Get shared object header
+    Let header_ptr be proc memory_get_pointer with weak_ptr, 0
+    If header_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if object is still alive (strong_refcount > 0)
+    Let refcount_ptr be header_ptr plus 16  Note: strong_refcount at offset 16
+    Let strong_count be proc atomic_load_acquire from Atomic with refcount_ptr
+
+    If strong_count is equal to 0:
+        Note: Object has been deallocated
+        memory_set_int64(weak_ptr, 8, 0)  Note: Mark weak pointer as invalid
+        Return 0
+    End If
+
+    Note: Object is alive - increment strong refcount
+    Let new_count be proc atomic_increment from Atomic with refcount_ptr
+
+    Note: Double-check it didn't get deallocated between load and increment
+    If new_count is less than or equal to 1:
+        Note: Race condition - object was being deallocated
+        Note: Undo our increment
+        Let dummy be proc atomic_decrement from Atomic with refcount_ptr
+        memory_set_int64(weak_ptr, 8, 0)
+        Return 0
+    End If
+
+    Note: Successfully promoted to strong reference
+    Let header_size be 48  Note: EXPANDED shared header
+    Let strong_ptr be header_ptr plus header_size
+    Return strong_ptr
+End Process
+
+Process called "weak_destroy" takes weak_ptr as Integer returns Integer:
+    Note: Destroy weak pointer
+    Note: Decrements weak refcount on shared object
+    Note: Returns 1 on success, 0 on error
+
+    If weak_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Get shared object header
+    Let header_ptr be proc memory_get_pointer with weak_ptr, 0
+
+    If header_ptr is not equal to 0:
+        Note: Decrement weak refcount
+        Let weak_refcount_ptr be header_ptr plus 24  Note: weak_refcount at offset 24
+        Let new_weak_count be proc atomic_decrement from Atomic with weak_refcount_ptr
+
+        Note: If both strong and weak counts are 0, free header
+        If new_weak_count is equal to 0:
+            Let strong_refcount_ptr be header_ptr
+            Let strong_count be proc atomic_load_acquire from Atomic with strong_refcount_ptr
+
+            If strong_count is equal to 0:
+                Note: No strong or weak refs - free header (data already freed)
+                Note: Allocate minimal size since we don't know exact original size
+                Note: Header is 32 bytes, but entire allocation may be larger
+                Note: We need to store total_size in header for proper cleanup
+                Note: For now, only free if we stored the size
+                Let data_size be proc memory_get_int64 from Memory with header_ptr, 32
+                Let header_size be 48  Note: EXPANDED shared header
+                Let total_size be header_size plus data_size
+                proc syscall_munmap with header_ptr, total_size
+            End If
+        End If
+    End If
+
+    Note: Free weak pointer structure itself
+    proc deallocate with weak_ptr
+    Return 1
+End Process
+
+Process called "weak_is_valid" takes weak_ptr as Integer returns Integer:
+    Note: Check if weak pointer still points to live object
+    Note: Returns 1 if alive, 0 if deallocated or invalid
+
+    If weak_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Check cached validity flag first
+    Let is_valid be memory_get_int64(weak_ptr, 8)
+    If is_valid is equal to 0:
+        Return 0  Note: Already known to be invalid
+    End If
+
+    Note: Check actual strong refcount
+    Let header_ptr be proc memory_get_pointer with weak_ptr, 0
+    If header_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let refcount_ptr be header_ptr plus 16  Note: strong_refcount at offset 16
+    Let strong_count be proc atomic_load_acquire from Atomic with refcount_ptr
+
+    If strong_count is equal to 0:
+        Note: Object has been deallocated - update cache
+        memory_set_int64(weak_ptr, 8, 0)
+        Return 0
+    End If
+
+    Return 1  Note: Object is still alive
 End Process
 
 Note: ============================================================================

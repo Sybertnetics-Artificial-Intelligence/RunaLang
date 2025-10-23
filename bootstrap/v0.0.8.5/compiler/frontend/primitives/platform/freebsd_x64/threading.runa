@@ -1,0 +1,462 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under the Apache License, Version 2.0
+:End Note
+
+Note:
+LINUX x86_64 THREADING - pthread implementation
+Uses pthread library (POSIX threads) for all thread operations.
+Syscalls: clone (for thread creation), futex (for synchronization)
+:End Note
+
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+
+Note: pthread syscall numbers (x86_64 Linux)
+Note: clone = 56, futex = 202, set_robust_list = 273
+
+Process called "thread_create" takes function_ptr as Integer, arg_ptr as Integer returns Integer:
+    Note: Create thread using clone syscall
+    Note: Returns thread ID (TID) or 0 on failure
+
+    Note: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM
+    Let flags be 16842752  Note: 0x01010100
+
+    Note: Allocate 8KB stack for new thread
+    Let stack_size be 8192
+    Let stack be proc syscall_mmap from Syscall with 0, stack_size, 3, 34, -1, 0
+    If stack is less than 0:
+        Return 0
+    End If
+
+    Note: Stack grows down, so pass stack + size as stack pointer
+    Let stack_ptr be stack plus stack_size
+
+    Note: clone(flags, stack_ptr, parent_tid, child_tid, tls)
+    Let tid be proc syscall_5 from Syscall with 56, flags, stack_ptr, 0, 0, 0
+
+    Return tid
+End Process
+
+Process called "thread_join" takes handle as Integer returns Integer:
+    Note: Wait for thread to finish
+    Note: Linux: use futex wait
+    Let futex_wait be 0
+    Let timeout_ptr be 0
+    Return proc syscall_4 from Syscall with 202, handle, futex_wait, 0, timeout_ptr
+End Process
+
+Process called "thread_detach" takes handle as Integer returns Integer:
+    Note: Detach thread (no-op on Linux, thread auto-cleans)
+    Return 1
+End Process
+
+Process called "thread_exit" takes exit_code as Integer returns Integer:
+    Note: Exit current thread
+    Return proc syscall_exit from Syscall with exit_code
+End Process
+
+Process called "thread_current_id" returns Integer:
+    Note: Get current thread ID (gettid syscall = 186)
+    Return proc syscall_0 from Syscall with 186
+End Process
+
+Process called "thread_yield" returns Integer:
+    Note: Yield CPU (sched_yield syscall = 24)
+    Return proc syscall_0 from Syscall with 24
+End Process
+
+Process called "thread_sleep" takes microseconds as Integer returns Integer:
+    Note: Sleep for microseconds (nanosleep syscall = 35)
+    Note: Convert microseconds to timespec (seconds, nanoseconds)
+    Let seconds be microseconds divided by 1000000
+    Let remaining_us be microseconds modulo by 1000000
+    Let nanoseconds be remaining_us multiplied by 1000
+
+    Note: Allocate timespec structure on stack (16 bytes: 8 for tv_sec, 8 for tv_nsec)
+    Let timespec_ptr be proc syscall_mmap from Syscall with 0, 16, 3, 34, -1, 0
+    If timespec_ptr is less than 0:
+        Return -1
+    End If
+
+    Note: Set timespec fields
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+    proc memory_set_int64 from Memory with timespec_ptr, 0, seconds
+    proc memory_set_int64 from Memory with timespec_ptr, 8, nanoseconds
+
+    Note: Call nanosleep(timespec_ptr, NULL)
+    Let result be proc syscall_2 from Syscall with 35, timespec_ptr, 0
+
+    Note: Cleanup timespec structure
+    proc syscall_munmap from Syscall with timespec_ptr, 16
+
+    Return result
+End Process
+
+Process called "thread_set_name" takes name as Integer returns Integer:
+    Note: Set thread name (prctl syscall = 157, PR_SET_NAME = 15)
+    Return proc syscall_2 from Syscall with 157, 15, name
+End Process
+
+Process called "thread_get_name" returns Integer:
+    Note: Get thread name (not commonly implemented, return 0)
+    Return 0
+End Process
+
+Note: Mutex operations (using futex)
+
+Process called "mutex_create" returns Integer:
+    Note: Create mutex (allocate 4 bytes for futex word, initialized to 0 = unlocked)
+    Let futex_word be proc syscall_mmap from Syscall with 0, 4, 3, 34, -1, 0
+    If futex_word is less than 0:
+        Return 0
+    End If
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+    proc memory_set_int32 from Memory with futex_word, 0, 0  Note: 0 = unlocked
+    Return futex_word
+End Process
+
+Process called "mutex_destroy" takes handle as Integer returns Integer:
+    Return proc syscall_munmap from Syscall with handle, 4
+End Process
+
+Process called "mutex_lock" takes handle as Integer returns Integer:
+    Note: Futex-based mutex lock using atomic CAS
+    Note: Protocol: Try to CAS from 0 (unlocked) to 1 (locked)
+    Note: If that fails, spin or use FUTEX_WAIT
+
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    Note: Fast path: try to acquire lock
+    Let expected be 0
+    Let success be proc atomic_compare_and_swap from Atomic with handle, expected, 1
+    If success is equal to 1:
+        Return 1  Note: Lock acquired
+    End If
+
+    Note: Slow path: lock is contended, use futex wait
+    Note: FUTEX_WAIT = 0, FUTEX_PRIVATE_FLAG = 128
+    Let futex_wait be 128
+    While 1 is equal to 1:
+        Let current be proc memory_get_int32 from Memory with handle, 0
+        If current is equal to 0:
+            Let success be proc atomic_compare_and_swap from Atomic with handle, 0, 1
+            If success is equal to 1:
+                Return 1
+            End If
+        End If
+        Note: Wait on futex (syscall 202)
+        proc syscall_4 from Syscall with 202, handle, futex_wait, 1, 0
+    End While
+
+    Return 1
+End Process
+
+Process called "mutex_unlock" takes handle as Integer returns Integer:
+    Note: Futex-based mutex unlock
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    Note: Release the lock (set to 0)
+    proc memory_set_int32 from Memory with handle, 0, 0
+    proc memory_barrier_release from Atomic
+
+    Note: Wake one waiter: FUTEX_WAKE = 1, FUTEX_PRIVATE_FLAG = 128
+    Let futex_wake be 129
+    proc syscall_3 from Syscall with 202, handle, futex_wake, 1
+
+    Return 1
+End Process
+
+Process called "mutex_try_lock" takes handle as Integer returns Integer:
+    Note: Try to lock without blocking
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+
+    Let expected be 0
+    Let success be proc atomic_compare_and_swap from Atomic with handle, expected, 1
+    Return success
+End Process
+
+Note: Semaphore operations
+
+Process called "semaphore_create" takes initial_count as Integer returns Integer:
+    Note: Create semaphore (allocate 4 bytes for futex counter)
+    Let sem_word be proc syscall_mmap from Syscall with 0, 4, 3, 34, -1, 0
+    If sem_word is less than 0:
+        Return 0
+    End If
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+    proc memory_set_int32 from Memory with sem_word, 0, initial_count
+    Return sem_word
+End Process
+
+Process called "semaphore_destroy" takes handle as Integer returns Integer:
+    Return proc syscall_munmap from Syscall with handle, 4
+End Process
+
+Process called "semaphore_wait" takes handle as Integer returns Integer:
+    Note: Decrement semaphore, wait if zero
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    While 1 is equal to 1:
+        Let current be proc memory_get_int32 from Memory with handle, 0
+        If current is greater than 0:
+            Note: Try to decrement atomically
+            Let new_val be current minus 1
+            Let old_val be proc atomic_fetch_add from Atomic with handle, -1
+            If old_val is greater than 0:
+                Return 1  Note: Successfully decremented
+            End If
+            Note: Race: someone else decremented, restore and retry
+            proc atomic_fetch_add from Atomic with handle, 1
+        End If
+
+        Note: Wait on futex (FUTEX_WAIT with FUTEX_PRIVATE_FLAG = 128)
+        proc syscall_4 from Syscall with 202, handle, 128, 0, 0
+    End While
+
+    Return 1
+End Process
+
+Process called "semaphore_signal" takes handle as Integer returns Integer:
+    Note: Increment semaphore and wake one waiter
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+
+    proc atomic_fetch_add from Atomic with handle, 1
+
+    Note: Wake one waiter: FUTEX_WAKE = 1, FUTEX_PRIVATE_FLAG = 128
+    Let futex_wake be 129
+    proc syscall_3 from Syscall with 202, handle, futex_wake, 1
+
+    Return 1
+End Process
+
+Process called "semaphore_try_wait" takes handle as Integer returns Integer:
+    Note: Try to decrement without blocking
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    Let current be proc memory_get_int32 from Memory with handle, 0
+    If current is greater than 0:
+        Let old_val be proc atomic_fetch_add from Atomic with handle, -1
+        If old_val is greater than 0:
+            Return 1  Note: Success
+        End If
+        Note: Race: restore value
+        proc atomic_fetch_add from Atomic with handle, 1
+    End If
+
+    Return 0  Note: Would block
+End Process
+
+Note: Condition variable operations
+
+Process called "condvar_create" returns Integer:
+    Note: Create condition variable (allocate 4 bytes for futex word)
+    Let cv_word be proc syscall_mmap from Syscall with 0, 4, 3, 34, -1, 0
+    If cv_word is less than 0:
+        Return 0
+    End If
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+    proc memory_set_int32 from Memory with cv_word, 0, 0
+    Return cv_word
+End Process
+
+Process called "condvar_destroy" takes handle as Integer returns Integer:
+    Return proc syscall_munmap from Syscall with handle, 4
+End Process
+
+Process called "condvar_wait" takes cv_handle as Integer, mutex_handle as Integer returns Integer:
+    Note: Atomically release mutex and wait on condition variable
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    Note: Get current sequence number
+    Let seq be proc memory_get_int32 from Memory with cv_handle, 0
+
+    Note: Unlock the mutex
+    mutex_unlock(mutex_handle)
+
+    Note: Wait on futex (FUTEX_WAIT with FUTEX_PRIVATE_FLAG = 128)
+    proc syscall_4 from Syscall with 202, cv_handle, 128, seq, 0
+
+    Note: Re-lock the mutex
+    mutex_lock(mutex_handle)
+
+    Return 1
+End Process
+
+Process called "condvar_timed_wait" takes cv_handle as Integer, mutex_handle as Integer, timeout_us as Integer returns Integer:
+    Note: Timed wait on condition variable
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    Note: Get current sequence number
+    Let seq be proc memory_get_int32 from Memory with cv_handle, 0
+
+    Note: Unlock the mutex
+    mutex_unlock(mutex_handle)
+
+    Note: Build timeout structure (timespec: 8 bytes sec, 8 bytes nsec)
+    Let seconds be timeout_us divided by 1000000
+    Let remaining_us be timeout_us modulo by 1000000
+    Let nanoseconds be remaining_us times 1000
+
+    Let timespec_ptr be proc syscall_mmap from Syscall with 0, 16, 3, 34, -1, 0
+    If timespec_ptr is greater than or equal to 0:
+        proc memory_set_int64 from Memory with timespec_ptr, 0, seconds
+        proc memory_set_int64 from Memory with timespec_ptr, 8, nanoseconds
+
+        Note: FUTEX_WAIT with timeout
+        Let result be proc syscall_4 from Syscall with 202, cv_handle, 128, seq, timespec_ptr
+
+        proc syscall_munmap from Syscall with timespec_ptr, 16
+    End If
+
+    Note: Re-lock the mutex
+    mutex_lock(mutex_handle)
+
+    Return 1
+End Process
+
+Process called "condvar_signal" takes handle as Integer returns Integer:
+    Note: Wake one waiter
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+
+    Note: Increment sequence number
+    proc atomic_fetch_add from Atomic with handle, 1
+
+    Note: Wake one waiter: FUTEX_WAKE = 1, FUTEX_PRIVATE_FLAG = 128
+    Let futex_wake be 129
+    proc syscall_3 from Syscall with 202, handle, futex_wake, 1
+
+    Return 1
+End Process
+
+Process called "condvar_broadcast" takes handle as Integer returns Integer:
+    Note: Wake all waiters
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+
+    Note: Increment sequence number
+    proc atomic_fetch_add from Atomic with handle, 1
+
+    Note: Wake all waiters: FUTEX_WAKE with INT_MAX
+    Let futex_wake be 129
+    Let int_max be 2147483647
+    proc syscall_3 from Syscall with 202, handle, futex_wake, int_max
+
+    Return 1
+End Process
+
+Note: Read-write lock operations
+
+Process called "rwlock_create" returns Integer:
+    Note: Create rwlock (4 bytes: high bit = write lock, lower bits = reader count)
+    Let rwlock_word be proc syscall_mmap from Syscall with 0, 4, 3, 34, -1, 0
+    If rwlock_word is less than 0:
+        Return 0
+    End If
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+    proc memory_set_int32 from Memory with rwlock_word, 0, 0
+    Return rwlock_word
+End Process
+
+Process called "rwlock_destroy" takes handle as Integer returns Integer:
+    Return proc syscall_munmap from Syscall with handle, 4
+End Process
+
+Process called "rwlock_read_lock" takes handle as Integer returns Integer:
+    Note: Acquire read lock (increment reader count if no writer)
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    While 1 is equal to 1:
+        Let current be proc memory_get_int32 from Memory with handle, 0
+        Note: Check if write-locked (bit 31 set means value >= 2147483648 when unsigned)
+        If current is less than 0:
+            Note: Writer holds lock, wait
+            proc syscall_4 from Syscall with 202, handle, 128, current, 0
+        End If
+        Otherwise:
+            Note: Try to increment reader count
+            Let new_val be current plus 1
+            Let old_val be proc atomic_compare_and_swap from Atomic with handle, current, new_val
+            If old_val is equal to 1:
+                Return 1  Note: Acquired read lock
+            End If
+        End Otherwise
+    End While
+
+    Return 1
+End Process
+
+Process called "rwlock_write_lock" takes handle as Integer returns Integer:
+    Note: Acquire write lock (set bit 31, ensure no readers)
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    Let write_bit be -2147483648  Note: 0x80000000
+
+    While 1 is equal to 1:
+        Let current be proc memory_get_int32 from Memory with handle, 0
+        If current is equal to 0:
+            Note: Try to acquire write lock
+            Let success be proc atomic_compare_and_swap from Atomic with handle, 0, write_bit
+            If success is equal to 1:
+                Return 1  Note: Acquired write lock
+            End If
+        End If
+        Note: Lock is held, wait
+        proc syscall_4 from Syscall with 202, handle, 128, current, 0
+    End While
+
+    Return 1
+End Process
+
+Process called "rwlock_unlock" takes handle as Integer returns Integer:
+    Note: Release read or write lock
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    Let current be proc memory_get_int32 from Memory with handle, 0
+    If current is less than 0:
+        Note: Was write-locked, clear it
+        proc memory_set_int32 from Memory with handle, 0, 0
+    End If
+    Otherwise:
+        Note: Was read-locked, decrement reader count
+        proc atomic_fetch_add from Atomic with handle, -1
+    End Otherwise
+
+    proc memory_barrier_release from Atomic
+
+    Note: Wake all waiters
+    Let futex_wake be 129
+    Let int_max be 2147483647
+    proc syscall_3 from Syscall with 202, handle, futex_wake, int_max
+
+    Return 1
+End Process
+
+Process called "rwlock_try_read_lock" takes handle as Integer returns Integer:
+    Note: Try to acquire read lock without blocking
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+    Import "compiler/frontend/primitives/memory/layout.runa" as Memory
+
+    Let current be proc memory_get_int32 from Memory with handle, 0
+    If current is less than 0:
+        Return 0  Note: Write-locked
+    End If
+
+    Let new_val be current plus 1
+    Let success be proc atomic_compare_and_swap from Atomic with handle, current, new_val
+    Return success
+End Process
+
+Process called "rwlock_try_write_lock" takes handle as Integer returns Integer:
+    Note: Try to acquire write lock without blocking
+    Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
+
+    Let write_bit be -2147483648  Note: 0x80000000
+    Let success be proc atomic_compare_and_swap from Atomic with handle, 0, write_bit
+    Return success
+End Process

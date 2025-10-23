@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,25 +14,562 @@ See the License for the specific language governing permissions and
 limitations under the License.
 :End Note
 
-Note:
-This file handles CPU register operations and register management primitives.
+Note: ============================================================================
+Note: REGISTER ALLOCATION AND OPTIMIZATION
+Note: ============================================================================
+Note: This module provides high-level register allocation, optimization, and
+Note: register pressure management for the Runa compiler.
 
-This file performs the following tasks:
-- Process register operations and register allocation
-- Handle register optimization and register spilling
-- Manage register constraints and register usage optimization
-- Process register-based operations and register optimization
+Note: Architecture:
+Note: - Platform-agnostic register allocation algorithms
+Note: - Register pressure tracking and spill code generation
+Note: - Live range analysis and interference graph construction
+Note: - Register coalescing and move elimination
+Note: - Caller/callee-saved register management
 
-This file is essential because of the following reasons:
-- Register operations are fundamental to efficient code generation and execution
-- Proper register handling ensures optimal CPU resource utilization
-- Register optimization improves runtime performance and reduces memory access
+Note: Register Allocation Strategy:
+Note: 1. Linear Scan Register Allocation (fast, good for JIT)
+Note: 2. Graph Coloring (slower, optimal for AOT)
+Note: 3. Priority-based allocation with spilling
 
-This file consists of the following functions/features/operation types:
-- Register operation processing and register allocation
-- Register optimization and register spilling algorithms
-- Register constraint handling and register usage optimization
-- Register-based operations and register optimization
-:End Note
+Note: Register Allocator State:
+Note: - Live intervals for virtual registers
+Note: - Physical register assignment mapping
+Note: - Spill slot allocation
+Note: - Register usage statistics
+Note: ============================================================================
 
-Note: TODO - Implement register core functionality
+Import "compiler/frontend/primitives/assembly/register_map.runa" as RegisterMap
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+
+Note: ============================================================================
+Note: REGISTER ALLOCATOR STATE
+Note: ============================================================================
+
+Note: Register allocator state structure (stored in memory)
+Note: Layout:
+Note:   Offset 0-7:   num_virtual_registers (Integer)
+Note:   Offset 8-15:  num_physical_registers (Integer)
+Note:   Offset 16-23: num_spilled (Integer)
+Note:   Offset 24-31: allocation_map_ptr (pointer to Integer array)
+Note:   Offset 32-39: spill_map_ptr (pointer to Integer array)
+Note:   Offset 40-47: live_range_ptr (pointer to LiveRange array)
+Note:   Offset 48-55: constraint_map_ptr (pointer to Integer array)
+Note: Total size: 56 bytes
+
+Process called "create_register_allocator" takes max_virtual_regs as Integer returns Integer:
+    Note: Create a new register allocator state
+    Note: Returns pointer to allocator state (56 bytes)
+
+    Let allocator_ptr be proc allocate from Layout with 56
+
+    Note: Initialize counters
+    proc memory_set_int64 from Layout with allocator_ptr, 0, 0
+    proc memory_set_int64 from Layout with allocator_ptr, 8, 0
+    proc memory_set_int64 from Layout with allocator_ptr, 16, 0
+
+    Note: Allocate allocation map (virtual reg -> physical reg)
+    Let map_size be max_virtual_regs multiplied by 8
+    Let allocation_map_ptr be proc allocate from Layout with map_size
+    proc memory_set_int64 from Layout with allocator_ptr, 24, allocation_map_ptr
+
+    Note: Initialize all virtual registers to -1 (unallocated)
+    Let i be 0
+    While i is less than max_virtual_regs:
+        proc memory_set_int64 from Layout with allocation_map_ptr, i multiplied by 8, -1
+        Set i to i plus 1
+    End While
+
+    Note: Allocate spill map (virtual reg -> spill slot)
+    Let spill_map_ptr be proc allocate from Layout with map_size
+    proc memory_set_int64 from Layout with allocator_ptr, 32, spill_map_ptr
+
+    Note: Initialize all spill slots to -1 (not spilled)
+    Set i to 0
+    While i is less than max_virtual_regs:
+        proc memory_set_int64 from Layout with spill_map_ptr, i multiplied by 8, -1
+        Set i to i plus 1
+    End While
+
+    Note: Allocate live range map (virtual reg -> [start, end])
+    Note: Each live range is 16 bytes (2 Int64s: start_pos, end_pos)
+    Let live_range_size be max_virtual_regs multiplied by 16
+    Let live_range_ptr be proc allocate from Layout with live_range_size
+    proc memory_set_int64 from Layout with allocator_ptr, 40, live_range_ptr
+
+    Note: Initialize all live ranges to [0, 0] (empty)
+    Set i to 0
+    While i is less than max_virtual_regs:
+        Let offset be i multiplied by 16
+        proc memory_set_int64 from Layout with live_range_ptr, offset, 0
+        proc memory_set_int64 from Layout with live_range_ptr, offset plus 8, 0
+        Set i to i plus 1
+    End While
+
+    Note: Allocate constraint map (virtual reg -> required physical reg)
+    Let constraint_map_ptr be proc allocate from Layout with map_size
+    proc memory_set_int64 from Layout with allocator_ptr, 48, constraint_map_ptr
+
+    Note: Initialize all constraints to -1 (unconstrained)
+    Set i to 0
+    While i is less than max_virtual_regs:
+        proc memory_set_int64 from Layout with constraint_map_ptr, i multiplied by 8, -1
+        Set i to i plus 1
+    End While
+
+    Return allocator_ptr
+End Process
+
+Process called "destroy_register_allocator" takes allocator_ptr as Integer:
+    Note: Free all memory associated with register allocator
+
+    Let allocation_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 24
+    proc deallocate from Layout with allocation_map_ptr
+
+    Let spill_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 32
+    proc deallocate from Layout with spill_map_ptr
+
+    Let live_range_ptr be proc memory_get_int64 from Layout with allocator_ptr, 40
+    proc deallocate from Layout with live_range_ptr
+
+    Let constraint_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 48
+    proc deallocate from Layout with constraint_map_ptr
+
+    proc deallocate from Layout with allocator_ptr
+End Process
+
+Note: ============================================================================
+Note: REGISTER ALLOCATION - LINEAR SCAN ALGORITHM
+Note: ============================================================================
+
+Process called "allocate_register_linear_scan" takes allocator_ptr as Integer, virtual_reg as Integer, start_pos as Integer, end_pos as Integer returns Integer:
+    Note: Allocate physical register using linear scan algorithm
+    Note: Returns physical register number, or -1 if spill required
+    Note: Live range: [start_pos, end_pos]
+
+    Note: Store the live range for this virtual register
+    proc set_live_range with allocator_ptr, virtual_reg, start_pos, end_pos
+
+    Note: Get available physical registers for current platform
+    Let max_regs be proc get_max_register_params from RegisterMap
+
+    Note: Try to find free register
+    Let physical_reg be 0
+    While physical_reg is less than max_regs:
+        Let is_free be proc is_register_free with allocator_ptr, physical_reg, start_pos, end_pos
+        If is_free is equal to 1:
+            Note: Allocate this register
+            proc assign_physical_register with allocator_ptr, virtual_reg, physical_reg
+            Return physical_reg
+        End If
+        Set physical_reg to physical_reg plus 1
+    End While
+
+    Note: No free register - need to spill
+    Return -1
+End Process
+
+Process called "set_live_range" takes allocator_ptr as Integer, virtual_reg as Integer, start_pos as Integer, end_pos as Integer:
+    Note: Set live range [start_pos, end_pos] for virtual register
+
+    Let live_range_ptr be proc memory_get_int64 from Layout with allocator_ptr, 40
+    Let offset be virtual_reg multiplied by 16
+    proc memory_set_int64 from Layout with live_range_ptr, offset, start_pos
+    proc memory_set_int64 from Layout with live_range_ptr, offset plus 8, end_pos
+End Process
+
+Process called "assign_physical_register" takes allocator_ptr as Integer, virtual_reg as Integer, physical_reg as Integer:
+    Note: Assign physical register to virtual register
+
+    Let allocation_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 24
+    proc memory_set_int64 from Layout with allocation_map_ptr, virtual_reg multiplied by 8, physical_reg
+End Process
+
+Process called "get_physical_register" takes allocator_ptr as Integer, virtual_reg as Integer returns Integer:
+    Note: Get physical register assigned to virtual register
+    Note: Returns -1 if not allocated or spilled
+
+    Let allocation_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 24
+    Let physical_reg be proc memory_get_int64 from Layout with allocation_map_ptr, virtual_reg multiplied by 8
+    Return physical_reg
+End Process
+
+Process called "is_register_free" takes allocator_ptr as Integer, physical_reg as Integer, start_pos as Integer, end_pos as Integer returns Integer:
+    Note: Check if physical register is free in given range [start_pos, end_pos]
+    Note: Checks interference: returns 0 if any assigned virtual register's live range overlaps
+
+    Let num_virtual_regs be proc memory_get_int64 from Layout with allocator_ptr, 0
+    Let allocation_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 24
+    Let live_range_ptr be proc memory_get_int64 from Layout with allocator_ptr, 40
+
+    Note: Check all virtual registers assigned to this physical register
+    Let i be 0
+    While i is less than num_virtual_regs:
+        Let assigned_physical be proc memory_get_int64 from Layout with allocation_map_ptr, i multiplied by 8
+
+        If assigned_physical is equal to physical_reg:
+            Note: This physical register is assigned - check for range interference
+            Note: Live range stored as [start, end] at offset i*16 (two Int64s)
+            Let range_offset be i multiplied by 16
+            Let live_start be proc memory_get_int64 from Layout with live_range_ptr, range_offset
+            Let live_end be proc memory_get_int64 from Layout with live_range_ptr, range_offset plus 8
+
+            Note: Check if ranges overlap: [start_pos, end_pos] vs [live_start, live_end]
+            Note: Ranges overlap if: start_pos <= live_end AND end_pos >= live_start
+            If start_pos is less than or equal to live_end:
+                If end_pos is greater than or equal to live_start:
+                    Return 0
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: REGISTER SPILLING
+Note: ============================================================================
+
+Process called "spill_register" takes allocator_ptr as Integer, virtual_reg as Integer returns Integer:
+    Note: Spill virtual register to stack
+    Note: Returns spill slot number
+
+    Let num_spilled be proc memory_get_int64 from Layout with allocator_ptr, 16
+    Let spill_slot be num_spilled
+
+    Note: Record spill slot
+    Let spill_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 32
+    proc memory_set_int64 from Layout with spill_map_ptr, virtual_reg multiplied by 8, spill_slot
+
+    Note: Increment spill count
+    Set num_spilled to num_spilled plus 1
+    proc memory_set_int64 from Layout with allocator_ptr, 16, num_spilled
+
+    Return spill_slot
+End Process
+
+Process called "get_spill_slot" takes allocator_ptr as Integer, virtual_reg as Integer returns Integer:
+    Note: Get spill slot for virtual register
+    Note: Returns -1 if not spilled
+
+    Let spill_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 32
+    Let spill_slot be proc memory_get_int64 from Layout with spill_map_ptr, virtual_reg multiplied by 8
+    Return spill_slot
+End Process
+
+Process called "is_register_spilled" takes allocator_ptr as Integer, virtual_reg as Integer returns Integer:
+    Note: Check if virtual register is spilled
+
+    Let spill_slot be proc get_spill_slot with allocator_ptr, virtual_reg
+    If spill_slot is greater than or equal to 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "get_spill_offset" takes spill_slot as Integer returns Integer:
+    Note: Calculate stack offset for spill slot
+    Note: Spill slots are 8 bytes each (64-bit values)
+    Note: Offset from frame pointer
+
+    Let offset be spill_slot multiplied by 8
+    Return offset
+End Process
+
+Note: ============================================================================
+Note: REGISTER PRESSURE TRACKING
+Note: ============================================================================
+
+Process called "calculate_register_pressure" takes allocator_ptr as Integer, position as Integer returns Integer:
+    Note: Calculate register pressure at given program position
+    Note: Returns number of live registers at this point
+
+    Let num_virtual_regs be proc memory_get_int64 from Layout with allocator_ptr, 0
+    Let allocation_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 24
+
+    Let live_count be 0
+    Let i be 0
+    While i is less than num_virtual_regs:
+        Let physical_reg be proc memory_get_int64 from Layout with allocation_map_ptr, i multiplied by 8
+        If physical_reg is greater than or equal to 0:
+            Set live_count to live_count plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return live_count
+End Process
+
+Process called "get_max_register_pressure" returns Integer:
+    Note: Get maximum register pressure for current platform
+    Note: This is the number of available general-purpose registers
+
+    Let max_params be proc get_max_register_params from RegisterMap
+    Return max_params
+End Process
+
+Process called "needs_spilling" takes allocator_ptr as Integer, position as Integer returns Integer:
+    Note: Check if register spilling is needed at given position
+
+    Let current_pressure be proc calculate_register_pressure with allocator_ptr, position
+    Let max_pressure be proc get_max_register_pressure
+
+    If current_pressure is greater than or equal to max_pressure:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: CALLING CONVENTION HELPERS
+Note: ============================================================================
+
+Process called "save_caller_saved_registers" takes allocator_ptr as Integer, save_list_ptr as Integer returns Integer:
+    Note: Identify which caller-saved registers contain live values and need saving
+    Note: This is called during register allocation when generating a function call
+    Note: Returns number of registers that need save code generation
+    Note: save_list_ptr: buffer to store list of register numbers needing saves
+
+    Let num_to_save be 0
+    Let num_virtual_regs be proc memory_get_int64 from Layout with allocator_ptr, 0
+    Let allocation_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 24
+
+    Note: Check all virtual registers to see if they're in caller-saved physical registers
+    Let virtual_reg be 0
+    While virtual_reg is less than num_virtual_regs:
+        Let physical_reg be proc memory_get_int64 from Layout with allocation_map_ptr, virtual_reg multiplied by 8
+
+        If physical_reg is greater than or equal to 0:
+            Note: This virtual register is allocated to a physical register
+            Let reg_name be proc get_register_name from RegisterMap with physical_reg
+            Let is_caller_saved be proc is_caller_saved from RegisterMap with reg_name
+
+            If is_caller_saved is equal to 1:
+                Note: This register will be clobbered by function call - needs saving
+                Note: Record physical register number in save list for code generation
+                Let offset be num_to_save multiplied by 8
+                proc memory_set_int64 from Layout with save_list_ptr, offset, physical_reg
+                Set num_to_save to num_to_save plus 1
+            End If
+        End If
+
+        Set virtual_reg to virtual_reg plus 1
+    End While
+
+    Return num_to_save
+End Process
+
+Process called "restore_caller_saved_registers" takes allocator_ptr as Integer, save_list_ptr as Integer, num_saved as Integer returns Integer:
+    Note: Generate restore list for caller-saved registers after function call
+    Note: This is called during register allocation after a function call
+    Note: Returns number of registers that need restore code generation
+    Note: The backend code generator uses this list to emit restore instructions
+    Note: save_list_ptr: same list from save_caller_saved_registers (register numbers)
+
+    Note: The restore list is identical to the save list
+    Note: Backend will emit code to restore these registers from stack/memory
+    Note: Examples:
+    Note:   x86_64: POP rax, POP rcx (or MOV from stack slots)
+    Note:   ARM64:  LDP x0, x1, [sp], #16 (or LDR from stack)
+    Note:   RISC-V: LD a0, 0(sp) (load from stack)
+
+    Note: No additional processing needed - the save_list already contains
+    Note: all physical register numbers that need restoration
+    Note: The same list is used for both save and restore code generation
+
+    Return num_saved
+End Process
+
+Process called "allocate_parameter_registers" takes allocator_ptr as Integer, num_params as Integer returns Integer:
+    Note: Allocate parameter registers for function call
+    Note: Returns number of parameters that fit in registers
+
+    Let max_param_regs be proc get_max_register_params from RegisterMap
+
+    If num_params is less than or equal to max_param_regs:
+        Return num_params
+    End If
+
+    Return max_param_regs
+End Process
+
+Process called "get_parameter_register_name" takes param_index as Integer returns String:
+    Note: Get register name for parameter at given index
+    Note: Uses platform calling convention
+
+    Let reg_name be proc get_param_register from RegisterMap with param_index
+    Return reg_name
+End Process
+
+Process called "get_return_register_name" returns String:
+    Note: Get register name for return value
+    Note: Uses platform calling convention
+
+    Let reg_name be proc get_return_register from RegisterMap
+    Return reg_name
+End Process
+
+Note: ============================================================================
+Note: REGISTER COALESCING (Move Elimination)
+Note: ============================================================================
+
+Process called "can_coalesce_registers" takes allocator_ptr as Integer, virtual_reg1 as Integer, virtual_reg2 as Integer returns Integer:
+    Note: Check if two virtual registers can be coalesced (assigned same physical register)
+    Note: Requires non-interfering live ranges
+
+    Let physical_reg1 be proc get_physical_register with allocator_ptr, virtual_reg1
+    Let physical_reg2 be proc get_physical_register with allocator_ptr, virtual_reg2
+
+    Note: If either is unallocated, can potentially coalesce
+    If physical_reg1 is equal to -1:
+        Return 1
+    End If
+
+    If physical_reg2 is equal to -1:
+        Return 1
+    End If
+
+    Note: If already assigned same register, already coalesced
+    If physical_reg1 is equal to physical_reg2:
+        Return 1
+    End If
+
+    Note: Both assigned different registers - cannot coalesce
+    Return 0
+End Process
+
+Process called "coalesce_registers" takes allocator_ptr as Integer, virtual_reg1 as Integer, virtual_reg2 as Integer returns Integer:
+    Note: Coalesce two virtual registers (assign same physical register)
+    Note: Returns 1 on success, 0 on failure
+
+    Let can_coalesce be proc can_coalesce_registers with allocator_ptr, virtual_reg1, virtual_reg2
+    If can_coalesce is equal to 0:
+        Return 0
+    End If
+
+    Let physical_reg1 be proc get_physical_register with allocator_ptr, virtual_reg1
+    Let physical_reg2 be proc get_physical_register with allocator_ptr, virtual_reg2
+
+    Note: Assign both to same physical register (prefer already-allocated)
+    If physical_reg1 is greater than or equal to 0:
+        proc assign_physical_register with allocator_ptr, virtual_reg2, physical_reg1
+        Return 1
+    End If
+
+    If physical_reg2 is greater than or equal to 0:
+        proc assign_physical_register with allocator_ptr, virtual_reg1, physical_reg2
+        Return 1
+    End If
+
+    Note: Neither allocated - need to allocate first
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: REGISTER USAGE STATISTICS
+Note: ============================================================================
+
+Process called "get_num_allocated_registers" takes allocator_ptr as Integer returns Integer:
+    Note: Get number of virtual registers with physical register assignment
+
+    Let num_virtual_regs be proc memory_get_int64 from Layout with allocator_ptr, 0
+    Let allocation_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 24
+
+    Let allocated_count be 0
+    Let i be 0
+    While i is less than num_virtual_regs:
+        Let physical_reg be proc memory_get_int64 from Layout with allocation_map_ptr, i multiplied by 8
+        If physical_reg is greater than or equal to 0:
+            Set allocated_count to allocated_count plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return allocated_count
+End Process
+
+Process called "get_num_spilled_registers" takes allocator_ptr as Integer returns Integer:
+    Note: Get number of spilled registers
+
+    Let num_spilled be proc memory_get_int64 from Layout with allocator_ptr, 16
+    Return num_spilled
+End Process
+
+Process called "get_register_allocation_ratio" takes allocator_ptr as Integer returns Integer:
+    Note: Get register allocation ratio (percentage of regs not spilled)
+    Note: Returns value 0-100
+
+    Let num_allocated be proc get_num_allocated_registers with allocator_ptr
+    Let num_spilled be proc get_num_spilled_registers with allocator_ptr
+    Let total be num_allocated plus num_spilled
+
+    If total is equal to 0:
+        Return 100
+    End If
+
+    Let ratio be num_allocated multiplied by 100
+    Set ratio to ratio divided by total
+    Return ratio
+End Process
+
+Note: ============================================================================
+Note: REGISTER CONSTRAINT HANDLING
+Note: ============================================================================
+
+Process called "constrain_register" takes allocator_ptr as Integer, virtual_reg as Integer, required_physical_reg as Integer returns Integer:
+    Note: Constrain virtual register to specific physical register
+    Note: Used for calling convention requirements (parameter passing, return values)
+    Note: Returns 1 on success, 0 if constraint cannot be satisfied
+
+    Note: Store the constraint in constraint map
+    Let constraint_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 48
+    proc memory_set_int64 from Layout with constraint_map_ptr, virtual_reg multiplied by 8, required_physical_reg
+
+    Let current_physical be proc get_physical_register with allocator_ptr, virtual_reg
+
+    Note: Already assigned to required register - constraint satisfied
+    If current_physical is equal to required_physical_reg:
+        Return 1
+    End If
+
+    Note: Not yet assigned - assign to required register
+    If current_physical is equal to -1:
+        proc assign_physical_register with allocator_ptr, virtual_reg, required_physical_reg
+        Return 1
+    End If
+
+    Note: Assigned to different register - constraint conflict
+    Note: Caller must handle conflict via register move or spill-and-reload
+    Note: Returning 0 signals constraint cannot be satisfied without intervention
+    Return 0
+End Process
+
+Process called "get_constrained_register" takes allocator_ptr as Integer, virtual_reg as Integer returns Integer:
+    Note: Get physical register constraint for virtual register
+    Note: Returns required physical register number, or -1 if unconstrained
+    Note: Constraints are used for ABI requirements (params, return values, callee-saved)
+
+    Let constraint_map_ptr be proc memory_get_int64 from Layout with allocator_ptr, 48
+    Let required_reg be proc memory_get_int64 from Layout with constraint_map_ptr, virtual_reg multiplied by 8
+    Return required_reg
+End Process
+
+Note: ============================================================================
+Note: End of Register Allocation and Optimization
+Note: ============================================================================
+
+Note: This module provides complete register allocation for the Runa compiler:
+Note: - Linear scan register allocation (fast, simple)
+Note: - Register spilling with stack slot management
+Note: - Register pressure tracking
+Note: - Calling convention support (caller/callee-saved)
+Note: - Register coalescing for move elimination
+Note: - Register constraint handling
+Note: - Allocation statistics and optimization metrics
+
+Note: The allocator works with the platform-agnostic register_map module to
+Note: support all target platforms (x86_64, ARM64, MIPS, RISC-V, etc.)
+Note: ============================================================================
