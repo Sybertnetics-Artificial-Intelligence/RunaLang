@@ -264,6 +264,10 @@ Runa is built upon decades of foundational research in computer science and prog
 - **Programming Language Design** principles developed by the broader research community
 - **The Open Source Community** that makes collaborative development possible
 
+## 💎 Our Featured Partners
+
+A huge thank you to our Partners who are investing in the future of Sybertnetics.
+
 ---
 
 **Ready to bridge the gap between human thinking and machine execution?**
