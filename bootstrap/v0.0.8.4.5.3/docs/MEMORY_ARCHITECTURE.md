@@ -16,26 +16,30 @@ Memory must be freed exactly once. Choose the allocation strategy based on data 
 
 ## Architecture Overview
 
-Runa uses a **four-tier memory model** that provides optimal performance and safety for different data lifetimes:
+Runa uses a **five-tier memory model** that provides optimal performance and safety for different data lifetimes:
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  TIER 1: STACK      │ Fastest, Deterministic        │
-│  - Local variables  │ Scope-based lifetime          │
-│  - Fixed buffers    │ Zero allocation overhead      │
-├─────────────────────────────────────────────────────┤
-│  TIER 2: ARENA      │ Fast Bulk, O(1) Cleanup       │
-│  - Temporary data   │ Operation-scoped lifetime     │
-│  - Compilation temps│ Thousands of allocations → 1  │
-├─────────────────────────────────────────────────────┤
-│  TIER 3: OWNED HEAP │ Permanent, Structured         │
-│  - Program data     │ Object-scoped lifetime        │
-│  - Data structures  │ Deterministic cleanup         │
-├─────────────────────────────────────────────────────┤
-│  TIER 4: SHARED     │ Multiple Owners, Ref-counted  │
-│  - Shared resources │ Last-owner-frees lifetime     │
-│  - Caches          │ Atomic reference counting     │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  TIER 1: STACK      │ Fastest, Deterministic            │
+│  - Local variables  │ Scope-based lifetime              │
+│  - Fixed buffers    │ Zero allocation overhead          │
+├──────────────────────────────────────────────────────────┤
+│  TIER 2: ARENA      │ Fast Bulk, O(1) Cleanup           │
+│  - Temporary data   │ Operation-scoped lifetime         │
+│  - Compilation temps│ Thousands of allocations → 1      │
+├──────────────────────────────────────────────────────────┤
+│  TIER 3: OWNED HEAP │ Permanent, Structured             │
+│  - Program data     │ Object-scoped lifetime            │
+│  - Data structures  │ Deterministic cleanup             │
+├──────────────────────────────────────────────────────────┤
+│  TIER 4: SHARED     │ Multiple Owners, Manual Refcount  │
+│  - Shared resources │ Last-owner-frees lifetime         │
+│  - Caches           │ YOU call retain/release           │
+├──────────────────────────────────────────────────────────┤
+│  TIER 5: ARC        │ Multiple Owners, Auto Refcount    │
+│  - Convenience tier │ COMPILER inserts retain/release   │
+│  - Non-critical code│ Deterministic, real-time safe     │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -374,6 +378,139 @@ End Process
 - ❌ More expensive than owned (ref counting overhead)
 - ⚠️ Watch for cycles (A→B→A = memory leak)
 - ⚠️ Use weak references to break cycles
+- ⚠️ **Manual control** - YOU must call retain/release
+
+---
+
+## Tier 5: ARC (Automatic Reference Counting)
+
+### What
+**Compiler-managed** reference counting where the compiler automatically inserts retain/release calls. Same runtime behavior as Tier 4, but zero manual effort.
+
+### When to Use
+- Non-critical code paths where convenience > control
+- Application-level data structures
+- Configuration objects
+- Shared resources where manual tracking is tedious
+- Anywhere you'd use Tier 4 but want automation
+
+### Performance
+- **Allocation:** ~100 nanoseconds (malloc + ref count init)
+- **Retain:** ~5 nanoseconds (atomic increment - **compiler inserts**)
+- **Release:** ~5-50 nanoseconds (atomic decrement + maybe free - **compiler inserts**)
+- **Overhead:** ~24-40 bytes (malloc + refcount metadata)
+
+### How It Works
+
+**The compiler analyzes your code and automatically inserts retain/release:**
+
+```runa
+Note: What you write (clean, simple)
+Let data as @ARC be MyClass.new()
+Let copy be data
+Set some_field to copy
+Note: Scope ends here
+
+Note: What the compiler generates (automatically)
+Let data be MyClass.new()
+refcount_init(data, 1)           Note: Compiler inserts
+Let copy be data
+refcount_retain(copy)            Note: Compiler inserts
+Set some_field to copy
+refcount_retain(some_field)      Note: Compiler inserts
+refcount_release(copy)           Note: Compiler inserts (scope end)
+refcount_release(data)           Note: Compiler inserts (scope end)
+```
+
+### Example: Automatic vs Manual
+
+**Tier 4 (Manual):**
+```runa
+Note: YOU manage every retain/release
+Let config be refcount_create(load_config())
+Let worker1_ref be refcount_retain(config)  // YOU call retain
+Let worker2_ref be refcount_retain(config)  // YOU call retain
+
+start_worker(worker1, worker1_ref)
+start_worker(worker2, worker2_ref)
+
+refcount_release(config)       // YOU call release
+refcount_release(worker1_ref)  // YOU call release
+refcount_release(worker2_ref)  // YOU call release
+```
+
+**Tier 5 (ARC - Automatic):**
+```runa
+Note: COMPILER manages all retain/release
+Let config as @ARC be Config.load()
+Let worker1_ref be config     // Compiler: retain
+Let worker2_ref be config     // Compiler: retain
+
+start_worker(worker1, worker1_ref)
+start_worker(worker2, worker2_ref)
+
+Note: Compiler automatically releases at scope end
+```
+
+### Weak References (Cycle Prevention)
+
+ARC requires **weak references** to prevent memory leaks from cycles:
+
+```runa
+Note: Strong + Weak prevents cycles
+Type called "Node" with annotation @ARC:
+    value as Integer
+    next as Node           Note: Strong reference (increments count)
+    prev as weak Node      Note: Weak reference (does NOT increment)
+End Type
+
+Note: Create doubly-linked list
+Let head as @ARC be Node.new(1)
+Let tail as @ARC be Node.new(2)
+
+Set head.next to tail    Note: Strong: head → tail (tail.count = 1)
+Set tail.prev to head    Note: Weak: tail ⇢ head (head.count still 1)
+
+Note: When head/tail go out of scope:
+Note: tail.count → 0, freed immediately
+Note: head.count → 0, freed immediately
+Note: No leak! ✅
+```
+
+### ARC vs Manual Shared Comparison
+
+| Feature | Tier 4 (Manual) | Tier 5 (ARC) |
+|---------|----------------|--------------|
+| Performance | Same (5ns retain/release) | Same (5ns retain/release) |
+| Retain/Release | **YOU call manually** | **Compiler inserts** |
+| Effort | High (easy to forget) | Zero (automatic) |
+| Control | Full (you decide when) | Minimal (scope-based) |
+| Safety | ⚠️ Easy to leak | ✅ Compiler-verified |
+| Cycles | Must use weak refs | Must use weak refs |
+| Real-time | ✅ YES (deterministic) | ✅ YES (deterministic) |
+
+### Rules
+- ✅ **Automatic** - Compiler handles retain/release
+- ✅ Deterministic - Freed immediately when count hits 0
+- ✅ Real-time safe - No pauses, no GC
+- ✅ Thread-safe - Atomic reference counting
+- ✅ Easy - Just annotate with `@ARC`
+- ⚠️ **Must use `weak` for cycles** (same as Tier 4)
+- ⚠️ Slightly less control than manual (scope-based)
+
+### When to Use Tier 4 vs Tier 5
+
+**Use Tier 4 (Manual Shared) when:**
+- You need precise control over retain/release timing
+- Interfacing with C libraries that manage refcounts
+- Performance-critical paths where you want explicit control
+- Debugging reference counting issues
+
+**Use Tier 5 (ARC) when:**
+- You want convenience over control
+- Non-critical application code
+- Rapid prototyping
+- You're coming from Swift/Python and want familiar semantics
 
 ---
 
@@ -412,9 +549,19 @@ START HERE
 │ Multiple owners needed?          │
 └─────────────────────────────────┘
     YES ↓              NO ↓
-    ┌──────────┐    ┌──────────────┐
-    │ SHARED   │    │  OWNED HEAP  │
-    └──────────┘    └──────────────┘
+    ↓               ┌──────────────┐
+    ↓               │  OWNED HEAP  │
+    ↓               └──────────────┘
+    ↓
+┌──────────────────────────────────┐
+│ Need explicit control over       │
+│ retain/release timing?            │
+└──────────────────────────────────┘
+    YES ↓              NO ↓
+    ┌──────────┐    ┌──────────┐
+    │ SHARED   │    │   ARC    │
+    │ (Manual) │    │  (Auto)  │
+    └──────────┘    └──────────┘
 ```
 
 ### Quick Reference
@@ -426,10 +573,12 @@ START HERE
 | Parsing tokens during compilation? | → ARENA |
 | Intermediate AST nodes? | → ARENA |
 | Final program AST? | → OWNED |
-| Configuration object? | → OWNED (or SHARED if multi-thread) |
-| Cached data shared by threads? | → SHARED |
+| Configuration object? | → OWNED (or ARC if shared, non-critical) |
+| Cached data shared by threads? | → SHARED (manual) or ARC (auto) |
 | String that outlives function? | → OWNED |
 | 100,000 temp strings during batch? | → ARENA |
+| Shared config for workers (easy)? | → ARC |
+| Shared config for workers (control)? | → SHARED (manual) |
 
 ---
 
@@ -560,7 +709,8 @@ This is planned for v1.0 with full ownership semantics.
 | STACK | 0 ns | `Let x as Integer` |
 | ARENA | ~10 ns | `arena_allocate(arena, 100)` |
 | OWNED | ~100 ns | `allocate(100)` |
-| SHARED | ~110 ns | `refcount_create(data)` |
+| SHARED (Manual) | ~110 ns | `refcount_create(data)` |
+| ARC (Auto) | ~110 ns | `Let x as @ARC be MyClass.new()` |
 
 ### Deallocation Speed
 
@@ -569,7 +719,8 @@ This is planned for v1.0 with full ownership semantics.
 | STACK | 0 ns | Automatic |
 | ARENA | ~100 ns | `arena_destroy(arena)` (all objects) |
 | OWNED | ~50 ns | `deallocate(ptr)` (per object) |
-| SHARED | ~5-50 ns | `refcount_release(rc)` |
+| SHARED (Manual) | ~5-50 ns | `refcount_release(rc)` (YOU call) |
+| ARC (Auto) | ~5-50 ns | Automatic (compiler inserts) |
 
 ### Memory Overhead
 
@@ -578,7 +729,8 @@ This is planned for v1.0 with full ownership semantics.
 | STACK | 0 bytes | Compiler-managed |
 | ARENA | ~0 bytes | Amortized (capacity waste only) |
 | OWNED | ~16-32 bytes | malloc metadata |
-| SHARED | ~24-40 bytes | malloc + ref count |
+| SHARED (Manual) | ~24-40 bytes | malloc + ref count |
+| ARC (Auto) | ~24-40 bytes | malloc + ref count (same as SHARED) |
 
 ### Throughput Comparison
 
@@ -915,11 +1067,12 @@ End Arena  // Automatic bulk free
 ### The Golden Rule
 > **"Arena for TEMPS, Ownership for PERMANENT"**
 
-### The Four Tiers
+### The Five Tiers
 1. **STACK** - Fastest, zero-cost, automatic
 2. **ARENA** - Fast bulk, O(1) cleanup, operation-scoped
 3. **OWNED** - Structured lifetime, deterministic, permanent
-4. **SHARED** - Multiple owners, ref-counted, when needed
+4. **SHARED** - Manual ref-counting, explicit control
+5. **ARC** - Automatic ref-counting, compiler-managed convenience
 
 ### Key Principles
 - ✅ Choose tier based on data lifetime
