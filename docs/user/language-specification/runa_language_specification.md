@@ -128,7 +128,7 @@ Identifier semantics (mode-scoped):
 7. **Compiler Normalization**: Only canonical forms (with spaces/underscores) are normalized. Non-canonical forms (camelCase/PascalCase) are preserved as distinct identifiers.
 8. **Style Enforcement**: Tooling actively discourages non-canonical forms through linting and auto-formatting to establish the spaced form as idiomatic Runa.
 
-**Reserved Keywords**: Let, Define, Set, If, Otherwise, Unless, When, Match, Process, Type, Import, Export, Try, Catch, Finally, For, While, Loop, Return, Yield, Break, Continue, Throw, Assert, Display, Delete, Await, Send, Receive, Spawn, New, Static, Public, Private, Async, External, Protocol, proc
+**Reserved Keywords**: Let, Define, Set, If, Otherwise, Unless, When, Match, Process, Type, Import, Try, Catch, Finally, For, While, Loop, Return, Yield, Break, Continue, Throw, Assert, Display, Delete, Await, Send, Receive, Spawn, New, Static, Private, Async, Protocol, proc
 
 ### Literals
 
@@ -2511,8 +2511,6 @@ When target_platform is "macos":
 Otherwise:
     Import "generic_implementation" as impl
 
-Export impl.primary_function
-Export impl.PlatformSpecificType
 
 Note: Feature-gated modules
 When feature_enabled("advanced_crypto"):
@@ -2520,8 +2518,6 @@ When feature_enabled("advanced_crypto"):
 Otherwise:
     Import "basic_crypto" as crypto
 
-Export crypto.encrypt
-Export crypto.decrypt
 
 Note: Dynamic module loading
 Process called "load_plugin" that takes plugin_name as String returns Optional of Module:

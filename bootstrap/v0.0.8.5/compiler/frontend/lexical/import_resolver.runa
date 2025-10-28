@@ -48,6 +48,8 @@ Import "compiler/frontend/lexical/keywords.runa" as Keywords
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/import_system/resolution.runa" as Resolution
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "diagnostics/errors.runa" as Errors
+Import "compiler/internal/file_utils.runa" as FileUtils
 
 Note: ============================================================================
 Note: Import Statement Structure
@@ -63,255 +65,918 @@ Type called "ImportStatement":
     line as Integer            Note: Line number of import statement
     column as Integer          Note: Column number of import statement
 
+Type called "ItemList":
+    items as Integer           Note: Pointer to array of item name strings
+    count as Integer           Note: Number of items in array
+
 Note: Import types
-Define constant IMPORT_SIMPLE as 0      Note: Import "path" as Alias
-Define constant IMPORT_SELECTIVE as 1   Note: Import {item1, item2} from "path"
-Define constant IMPORT_WILDCARD as 2    Note: Import * from "path" (if supported)
+Constant IMPORT_SIMPLE as Integer is 0      Note: Import "path" as Alias
+Constant IMPORT_SELECTIVE as Integer is 1   Note: Import {item1, item2} from "path"
+Constant IMPORT_WILDCARD as Integer is 2    Note: Import * from "path" (if supported)
 
 Note: ============================================================================
 Note: Import Statement Parsing
 Note: ============================================================================
 
 Process called "parse_import_statement" takes lexer as Integer, import_token as Integer returns Integer:
-    Note: Parse a complete import statement
     Note: 
-    Note: Supported import syntax:
-    Note:   Import "module/path" as ModuleName
-    Note:   Import "module/path"  (implicit alias from filename)
-    Note:   Import {item1, item2, item3} from "module/path"
-    Note:   Import * from "module/path" (if wildcard imports supported)
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to lexer state
-    Note:   import_token - The "Import" keyword token
-    Note: 
-    Note: Returns:
-    Note:   Pointer to ImportStatement structure with all fields populated
-    Note:   Returns 0 on syntax error
-    Note: 
-    Note: Algorithm:
-    Note: 1. Confirm import_token is TOKEN_IMPORT
-    Note: 2. Check next token:
-    Note:    - If string literal: simple import
-    Note:    - If {: selective import
-    Note:    - If *: wildcard import
-    Note: 3. Parse based on import type
-    Note: 4. Extract module path and alias
-    Note: 5. Validate import syntax
-    Note: 6. Create and return ImportStatement
-    Note: 
-    Note: TODO: Implement using:
-    Note: - parse_simple_import (defined below) for simple imports
-    Note: - parse_selective_import (defined below) for selective imports
-    Note: - validate_import_syntax (defined below) for validation
+    Parse a complete import statement
     
-    Return 0  Note: Placeholder
+    Supported import syntax:
+      Import "module/path" as ModuleName
+      Import "module/path"  (implicit alias from filename)
+      Import {item1, item2, item3} from "module/path"
+      Import * from "module/path" (if wildcard imports supported)
+    
+    Parameters:
+      lexer - Pointer to lexer state
+      import_token - The "Import" keyword token
+    
+    Returns:
+      Pointer to ImportStatement structure with all fields populated
+      Returns 0 on syntax error
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    If import_token is equal to 0:
+        Return 0
+    End If
+
+    Note: Verify import_token is TOKEN_IMPORT
+    Let token_type be proc memory_get_qword from Layout with import_token, 0
+    Let TOKEN_IMPORT be 330  Note: "Import" keyword
+
+    If token_type is not equal to TOKEN_IMPORT:
+        Return 0  Note: Not an import token
+    End If
+
+    Note: Advance past Import keyword
+    Let current_pos be proc memory_get_qword from Layout with lexer, 16
+    Set current_pos to current_pos plus 1
+    proc memory_set_qword from Layout with lexer, 16, current_pos
+
+    Note: Check next token to determine import type
+    Let tokens_ptr be proc memory_get_qword from Layout with lexer, 80
+    Let token_index be current_pos multiplied by 48
+    Let next_token_ptr be tokens_ptr plus token_index
+    Let next_token_type be proc memory_get_qword from Layout with next_token_ptr, 0
+
+    Let TOKEN_STRING be 101
+    Let TOKEN_LBRACE be 402  Note: {
+    Let TOKEN_ASTERISK be 503  Note: *
+
+    Let import_stmt be 0
+
+    Note: Dispatch based on next token
+    If next_token_type is equal to TOKEN_STRING:
+        Note: Simple import: Import "path" [as Alias]
+        Set import_stmt to proc parse_simple_import with lexer
+    Otherwise:
+        If next_token_type is equal to TOKEN_LBRACE:
+            Note: Selective import: Import {items} from "path"
+            Set import_stmt to proc parse_selective_import with lexer
+        Otherwise:
+            If next_token_type is equal to TOKEN_ASTERISK:
+                Note: Wildcard import: Import * from "path"
+                Set import_stmt to proc parse_wildcard_import with lexer
+            Otherwise:
+                Note: Unknown import syntax
+                Return 0
+            End If
+        End If
+    End If
+
+    If import_stmt is equal to 0:
+        Return 0  Note: Parsing failed
+    End If
+
+    Note: Get line and column from import token for error reporting
+    Let line be proc memory_get_qword from Layout with import_token, 16  Note: Token line at offset 16
+    Let column be proc memory_get_qword from Layout with import_token, 24  Note: Token column at offset 24
+
+    Note: Store line and column in import statement
+    proc memory_set_qword from Layout with import_stmt, 48, line
+    proc memory_set_qword from Layout with import_stmt, 56, column
+
+    Note: Validate the complete import syntax
+    Let is_valid be proc validate_import_syntax with import_stmt
+
+    If is_valid is equal to 0:
+        Return 0  Note: Validation failed
+    End If
+
+    Return import_stmt
 End Process
 
 Process called "parse_simple_import" takes lexer as Integer returns Integer:
-    Note: Parse simple import: Import "path" [as Alias]
     Note: 
-    Note: Syntax:
-    Note:   Import "module/path" as ModuleName
-    Note:   Import "module/path"  (alias derived from filename)
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to lexer state (positioned after "Import" keyword)
-    Note: 
-    Note: Returns:
-    Note:   Pointer to ImportStatement with import_type = IMPORT_SIMPLE
-    Note:   Returns 0 on syntax error
-    Note: 
-    Note: Algorithm:
-    Note: 1. Expect string literal token for module path
-    Note: 2. Extract module path from string literal
-    Note: 3. Check for "as" keyword
-    Note: 4. If "as" present:
-    Note:    - Expect identifier for alias
-    Note:    - Set is_explicit_alias = 1
-    Note: 5. If no "as":
-    Note:    - Derive alias from module path filename
-    Note:    - Set is_explicit_alias = 0
-    Note: 6. Create and return ImportStatement
-    Note: 
-    Note: TODO: Implement using:
-    Note: - extract_module_path (defined below)
-    Note: - extract_explicit_alias (defined below)
-    Note: - derive_implicit_alias (defined below)
+    Parse simple import: Import "path" [as Alias]
     
-    Return 0  Note: Placeholder
+    Syntax:
+      Import "module/path" as ModuleName
+      Import "module/path"  (alias derived from filename)
+    
+    Parameters:
+      lexer - Pointer to lexer state (positioned after "Import" keyword)
+    
+    Returns:
+      Pointer to ImportStatement with import_type = IMPORT_SIMPLE
+      Returns 0 on syntax error
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Get arena from lexer (offset 0)
+    Let arena be proc memory_get_qword from Layout with lexer, 0
+
+    Note: Create import statement structure
+    Let import_stmt be proc create_import_statement with arena, IMPORT_SIMPLE
+
+    If import_stmt is equal to 0:
+        Return 0
+    End If
+
+    Note: Get current token (should be string literal with module path)
+    Let tokens_ptr be proc memory_get_qword from Layout with lexer, 80
+    Let current_pos be proc memory_get_qword from Layout with lexer, 16
+
+    Let token_index be current_pos multiplied by 48
+    Let token_ptr be tokens_ptr plus token_index
+
+    Note: Get token type
+    Let token_type be proc memory_get_qword from Layout with token_ptr, 0
+    Let TOKEN_STRING be 101  Note: String literal token
+
+    If token_type is not equal to TOKEN_STRING:
+        Return 0  Note: Expected string literal
+    End If
+
+    Note: Extract module path
+    Let module_path be proc extract_module_path with arena, lexer, token_ptr
+
+    If module_path is equal to 0:
+        Return 0
+    End If
+
+    Note: Store module path in import statement (offset 8)
+    proc memory_set_qword from Layout with import_stmt, 8, module_path
+
+    Note: Advance to next token
+    Let next_pos be current_pos plus 1
+    proc memory_set_qword from Layout with lexer, 16, next_pos
+
+    Note: Check if next token is "as" keyword
+    Let next_token_index be next_pos multiplied by 48
+    Let next_token_ptr be tokens_ptr plus next_token_index
+    Let next_token_type be proc memory_get_qword from Layout with next_token_ptr, 0
+
+    Let TOKEN_AS be 332  Note: "as" keyword token
+    Let alias be 0
+    Let is_explicit be 0
+
+    If next_token_type is equal to TOKEN_AS:
+        Note: Explicit alias - advance past "as" and get identifier
+        Let alias_pos be next_pos plus 1
+        proc memory_set_qword from Layout with lexer, 16, alias_pos
+
+        Set alias to proc extract_explicit_alias with lexer
+
+        If alias is equal to 0:
+            Return 0  Note: Invalid alias
+        End If
+
+        Set is_explicit to 1
+    Otherwise:
+        Note: No explicit alias - derive from path
+        Set alias to proc derive_implicit_alias with arena, module_path
+
+        If alias is equal to 0:
+            Return 0
+        End If
+
+        Set is_explicit to 0
+    End If
+
+    Note: Store alias and is_explicit_alias
+    proc memory_set_qword from Layout with import_stmt, 16, alias
+    proc memory_set_qword from Layout with import_stmt, 24, is_explicit
+
+    Return import_stmt
 End Process
 
 Process called "parse_selective_import" takes lexer as Integer returns Integer:
-    Note: Parse selective import: Import {item1, item2} from "path"
     Note: 
-    Note: Syntax:
-    Note:   Import {item1, item2, item3} from "module/path"
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to lexer state (positioned after "Import" keyword)
-    Note: 
-    Note: Returns:
-    Note:   Pointer to ImportStatement with import_type = IMPORT_SELECTIVE
-    Note:   Returns 0 on syntax error
-    Note: 
-    Note: Algorithm:
-    Note: 1. Expect opening brace {
-    Note: 2. Parse comma-separated list of identifiers
-    Note: 3. Expect closing brace }
-    Note: 4. Expect "from" keyword
-    Note: 5. Expect string literal for module path
-    Note: 6. Create ImportStatement with selective_items array
-    Note: 
-    Note: TODO: Implement using:
-    Note: - parse_import_item_list (defined below)
-    Note: - extract_module_path
-    Note: - Validate item names are identifiers
+    Parse selective import: Import {item1, item2} from "path"
     
-    Return 0  Note: Placeholder
+    Syntax:
+      Import {item1, item2, item3} from "module/path"
+    
+    Parameters:
+      lexer - Pointer to lexer state (positioned after "Import" keyword)
+    
+    Returns:
+      Pointer to ImportStatement with import_type = IMPORT_SELECTIVE
+      Returns 0 on syntax error
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Get arena from lexer (offset 0)
+    Let arena be proc memory_get_qword from Layout with lexer, 0
+
+    Note: Create import statement
+    Let import_stmt be proc create_import_statement with arena, IMPORT_SELECTIVE
+
+    If import_stmt is equal to 0:
+        Return 0
+    End If
+
+    Note: Expect opening brace {
+    Let tokens_ptr be proc memory_get_qword from Layout with lexer, 80
+    Let current_pos be proc memory_get_qword from Layout with lexer, 16
+
+    Let token_index be current_pos multiplied by 48
+    Let token_ptr be tokens_ptr plus token_index
+    Let token_type be proc memory_get_qword from Layout with token_ptr, 0
+
+    Let TOKEN_LBRACE be 402  Note: {
+
+    If token_type is not equal to TOKEN_LBRACE:
+        Return 0  Note: Expected {
+    End If
+
+    Note: Advance past {
+    Set current_pos to current_pos plus 1
+    proc memory_set_qword from Layout with lexer, 16, current_pos
+
+    Note: Parse item list
+    Let item_list be proc parse_import_item_list with arena, lexer
+
+    If item_list is equal to 0:
+        Return 0
+    End If
+
+    Note: Extract items and count from ItemList structure
+    Let items_array be proc memory_get_qword from Layout with item_list, 0  Note: offset 0: items
+    Let item_count be proc memory_get_qword from Layout with item_list, 8   Note: offset 8: count
+
+    Note: ItemList structure cleaned up by arena (items_array stored in import_stmt)
+    Note: Store items in import statement
+    proc memory_set_qword from Layout with import_stmt, 32, items_array  Note: offset 32: selective_items
+    proc memory_set_qword from Layout with import_stmt, 40, item_count  Note: offset 40: item_count
+
+    Note: Advance past }
+    Set current_pos be proc memory_get_qword from Layout with lexer, 16
+    Set current_pos to current_pos plus 1
+    proc memory_set_qword from Layout with lexer, 16, current_pos
+
+    Note: Expect "from" keyword
+    Set token_index to current_pos multiplied by 48
+    Set token_ptr to tokens_ptr plus token_index
+    Set token_type to proc memory_get_qword from Layout with token_ptr, 0
+
+    Let TOKEN_FROM be 331  Note: "from" keyword
+
+    If token_type is not equal to TOKEN_FROM:
+        Return 0  Note: Expected "from"
+    End If
+
+    Note: Advance past "from"
+    Set current_pos to current_pos plus 1
+    proc memory_set_qword from Layout with lexer, 16, current_pos
+
+    Note: Expect string literal for module path
+    Set token_index to current_pos multiplied by 48
+    Set token_ptr to tokens_ptr plus token_index
+    Set token_type to proc memory_get_qword from Layout with token_ptr, 0
+
+    Let TOKEN_STRING be 101
+
+    If token_type is not equal to TOKEN_STRING:
+        Return 0  Note: Expected string literal
+    End If
+
+    Note: Extract module path
+    Let module_path be proc extract_module_path with arena, lexer, token_ptr
+
+    If module_path is equal to 0:
+        Return 0
+    End If
+
+    Note: Store module path
+    proc memory_set_qword from Layout with import_stmt, 8, module_path
+
+    Return import_stmt
+End Process
+
+Process called "parse_wildcard_import" takes lexer as Integer returns Integer:
+    Note:
+    Parse wildcard import: Import * from "path"
+
+    Syntax:
+      Import * from "module/path"
+
+    Parameters:
+      lexer - Pointer to lexer state (positioned after "Import" keyword, at asterisk)
+
+    Returns:
+      Pointer to ImportStatement with import_type = IMPORT_WILDCARD
+      Returns 0 on syntax error
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Get arena from lexer (offset 0)
+    Let arena be proc memory_get_qword from Layout with lexer, 0
+
+    Note: Create import statement
+    Let import_stmt be proc create_import_statement with arena, IMPORT_WILDCARD
+
+    If import_stmt is equal to 0:
+        Return 0
+    End If
+
+    Note: Get tokens and current position
+    Let tokens_ptr be proc memory_get_qword from Layout with lexer, 80
+    Let current_pos be proc memory_get_qword from Layout with lexer, 16
+
+    Note: Verify current token is asterisk
+    Let token_index be current_pos multiplied by 48
+    Let token_ptr be tokens_ptr plus token_index
+    Let token_type be proc memory_get_qword from Layout with token_ptr, 0
+
+    Let TOKEN_ASTERISK be 503  Note: *
+
+    If token_type is not equal to TOKEN_ASTERISK:
+        Return 0  Note: Expected *
+    End If
+
+    Note: Advance past asterisk
+    Set current_pos to current_pos plus 1
+    proc memory_set_qword from Layout with lexer, 16, current_pos
+
+    Note: Expect "from" keyword
+    Set token_index to current_pos multiplied by 48
+    Set token_ptr to tokens_ptr plus token_index
+    Set token_type to proc memory_get_qword from Layout with token_ptr, 0
+
+    Let TOKEN_FROM be 331  Note: "from" keyword
+
+    If token_type is not equal to TOKEN_FROM:
+        Return 0  Note: Expected "from"
+    End If
+
+    Note: Advance past "from"
+    Set current_pos to current_pos plus 1
+    proc memory_set_qword from Layout with lexer, 16, current_pos
+
+    Note: Expect string literal for module path
+    Set token_index to current_pos multiplied by 48
+    Set token_ptr to tokens_ptr plus token_index
+    Set token_type to proc memory_get_qword from Layout with token_ptr, 0
+
+    Let TOKEN_STRING be 101
+
+    If token_type is not equal to TOKEN_STRING:
+        Return 0  Note: Expected string literal
+    End If
+
+    Note: Extract module path
+    Let module_path be proc extract_module_path with arena, lexer, token_ptr
+
+    If module_path is equal to 0:
+        Return 0
+    End If
+
+    Note: Store module path in import statement (offset 8)
+    proc memory_set_qword from Layout with import_stmt, 8, module_path
+
+    Note: Derive implicit alias from module path (like simple imports)
+    Let alias be proc derive_implicit_alias with arena, module_path
+
+    If alias is equal to 0:
+        Return 0
+    End If
+
+    Note: Store alias and is_explicit_alias (offset 16 and 24)
+    proc memory_set_qword from Layout with import_stmt, 16, alias
+    proc memory_set_qword from Layout with import_stmt, 24, 0  Note: is_explicit_alias = false
+
+    Return import_stmt
 End Process
 
 Note: ============================================================================
 Note: Module Path and Alias Extraction
 Note: ============================================================================
 
-Process called "extract_module_path" takes lexer as Integer, string_token as Integer returns Integer:
-    Note: Extract module path from string literal token
+Process called "extract_module_path" takes arena as Integer, lexer as Integer, string_token as Integer returns Integer:
     Note: 
-    Note: Handles:
-    Note:   - Relative paths: "./module", "../other/module"
-    Note:   - Absolute paths: "/absolute/path/module"
-    Note:   - Package paths: "package/module/submodule"
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to lexer state
-    Note:   string_token - String literal token containing path
-    Note: 
-    Note: Returns:
-    Note:   Pointer to extracted and validated path string
-    Note:   Returns 0 on invalid path
-    Note: 
-    Note: Validation:
-    Note:   - Path must not be empty
-    Note:   - Path must be valid format (no invalid characters)
-    Note:   - Path separators normalized to /
-    Note: 
-    Note: TODO: Implement using:
-    Note: - StringCore string operations for extraction
-    Note: - validate_module_path (defined below) for validation
+    Extract module path from string literal token
     
-    Return 0  Note: Placeholder
+    Handles:
+      - Relative paths: "./module", "../other/module"
+      - Absolute paths: "/absolute/path/module"
+      - Package paths: "package/module/submodule"
+    
+    Parameters:
+      lexer - Pointer to lexer state
+      string_token - String literal token containing path
+    
+    Returns:
+      Pointer to extracted and validated path string
+      Returns 0 on invalid path
+    
+    Validation:
+      - Path must not be empty
+      - Path must be valid format (no invalid characters)
+      - Path separators normalized to /
+    :End Note
+
+    If string_token is equal to 0:
+        Return 0  Note: NULL token
+    End If
+
+    Note: Get token value string (offset 8 in Token structure)
+    Let path_str be proc memory_get_qword from Layout with string_token, 8
+
+    If path_str is equal to 0:
+        Return 0  Note: NULL path string
+    End If
+
+    Let path_len be proc string_length from StringCore with path_str
+
+    If path_len is equal to 0:
+        Return 0  Note: Empty path
+    End If
+
+    Note: Validate the path format
+    Let is_valid be proc validate_module_path with path_str
+
+    If is_valid is equal to 0:
+        Return 0  Note: Invalid path format
+    End If
+
+    Note: Normalize path separators (convert backslashes to forward slashes)
+    Note: Allocate new string for normalized path
+    Let normalized_path be proc arena_allocate from Layout with arena, path_len plus 1
+
+    If normalized_path is equal to 0:
+        Return 0  Note: Allocation failed
+    End If
+
+    Note: Copy and normalize path
+    Let i be 0
+    While i is less than path_len:
+        Let ch be proc string_char_at from StringCore with path_str, i
+
+        Note: Convert backslash (92) to forward slash (47)
+        If ch is equal to 92:
+            proc memory_set_byte from Layout with normalized_path, i, 47
+        Otherwise:
+            proc memory_set_byte from Layout with normalized_path, i, ch
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Null terminate
+    proc memory_set_byte from Layout with normalized_path, path_len, 0
+
+    Return normalized_path
 End Process
 
 Process called "extract_explicit_alias" takes lexer as Integer returns Integer:
-    Note: Extract explicit alias after "as" keyword
     Note: 
-    Note: Assumes lexer is positioned at identifier after "as" keyword
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to lexer state
-    Note: 
-    Note: Returns:
-    Note:   Pointer to alias identifier string
-    Note:   Returns 0 if not an identifier or invalid
-    Note: 
-    Note: Validation:
-    Note:   - Must be valid identifier
-    Note:   - Cannot be a reserved keyword
-    Note:   - Must start with letter or underscore
-    Note: 
-    Note: TODO: Implement using:
-    Note: - Expect identifier token
-    Note: - Keywords.is_reserved_word to check for keyword conflicts
+    Extract explicit alias after "as" keyword
     
-    Return 0  Note: Placeholder
+    Assumes lexer is positioned at identifier after "as" keyword
+    
+    Parameters:
+      lexer - Pointer to lexer state
+    
+    Returns:
+      Pointer to alias identifier string
+      Returns 0 if not an identifier or invalid
+    
+    Validation:
+      - Must be valid identifier
+      - Cannot be a reserved keyword
+      - Must start with letter or underscore
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0  Note: NULL lexer
+    End If
+
+    Note: Get current token from lexer
+    Note: LexerState structure: tokens at offset 80 (10 fields × 8 bytes)
+    Let tokens_ptr be proc memory_get_qword from Layout with lexer, 80
+    Let current_pos be proc memory_get_qword from Layout with lexer, 16  Note: current_position at offset 16
+
+    If tokens_ptr is equal to 0:
+        Return 0  Note: No tokens
+    End If
+
+    Note: Get current token (Token structure: type at offset 0, value at offset 8, etc.)
+    Note: Each token is 48 bytes (6 fields × 8 bytes)
+    Let token_index be current_pos multiplied by 48
+    Let token_ptr be tokens_ptr plus token_index
+
+    Note: Get token type (offset 0 in Token structure)
+    Let token_type be proc memory_get_qword from Layout with token_ptr, 0
+
+    Note: TOKEN_IDENTIFIER is in 200 series (see keywords.runa)
+    Let TOKEN_IDENTIFIER be 200
+    If token_type is not equal to TOKEN_IDENTIFIER:
+        Return 0  Note: Not an identifier
+    End If
+
+    Note: Get token value string (offset 8 in Token structure)
+    Let alias_str be proc memory_get_qword from Layout with token_ptr, 8
+
+    If alias_str is equal to 0:
+        Return 0  Note: NULL identifier value
+    End If
+
+    Note: Check if alias is a reserved keyword (not allowed as alias)
+    Let is_keyword be proc is_reserved_keyword from Keywords with alias_str
+
+    If is_keyword is equal to 1:
+        Return 0  Note: Cannot use keyword as alias
+    End If
+
+    Note: Validate identifier starts with letter or underscore
+    Let first_char be proc string_char_at from StringCore with alias_str, 0
+
+    Note: Check if first character is letter (A-Z: 65-90, a-z: 97-122) or underscore (95)
+    Let is_valid_start be 0
+    If first_char is greater than or equal to 65:
+        If first_char is less than or equal to 90:
+            Set is_valid_start to 1  Note: Uppercase letter
+        End If
+    End If
+    If first_char is greater than or equal to 97:
+        If first_char is less than or equal to 122:
+            Set is_valid_start to 1  Note: Lowercase letter
+        End If
+    End If
+    If first_char is equal to 95:
+        Set is_valid_start to 1  Note: Underscore
+    End If
+
+    If is_valid_start is equal to 0:
+        Return 0  Note: Invalid identifier start
+    End If
+
+    Return alias_str
 End Process
 
-Process called "derive_implicit_alias" takes module_path as Integer returns Integer:
-    Note: Derive implicit alias from module path filename
+Process called "derive_implicit_alias" takes arena as Integer, module_path as Integer returns Integer:
     Note: 
-    Note: Extracts filename from path and uses it as alias
-    Note: 
-    Note: Examples:
-    Note:   "module/path/file" -> "file"
-    Note:   "package/utils" -> "utils"
-    Note:   "./local_module" -> "local_module"
-    Note: 
-    Note: Parameters:
-    Note:   module_path - Full module path string
-    Note: 
-    Note: Returns:
-    Note:   Pointer to derived alias string
-    Note:   Returns 0 on error
-    Note: 
-    Note: Algorithm:
-    Note: 1. Find last path separator (/ or \)
-    Note: 2. Extract everything after last separator
-    Note: 3. Remove file extension if present (.runa)
-    Note: 4. Validate result is valid identifier
-    Note: 5. Return alias string
-    Note: 
-    Note: TODO: Implement using StringCore path operations
+    Derive implicit alias from module path filename
     
-    Return 0  Note: Placeholder
+    Extracts filename from path and uses it as alias
+    
+    Examples:
+      "module/path/file" -> "file"
+      "package/utils" -> "utils"
+      "./local_module" -> "local_module"
+    
+    Parameters:
+      module_path - Full module path string
+    
+    Returns:
+      Pointer to derived alias string
+      Returns 0 on error
+    
+    Algorithm:
+    1. Find last path separator (/ or \)
+    2. Extract everything after last separator
+    3. Remove file extension if present (.runa)
+    4. Validate result is valid identifier
+    5. Return alias string
+    :End Note
+
+    If module_path is equal to 0:
+        Return 0  Note: NULL path
+    End If
+
+    Let path_len be proc string_length from StringCore with module_path
+
+    If path_len is equal to 0:
+        Return 0  Note: Empty path
+    End If
+
+    Note: Find last occurrence of / or \ (path separator)
+    Let last_separator_pos be -1
+    Let i be 0
+    While i is less than path_len:
+        Let ch be proc string_char_at from StringCore with module_path, i
+        If ch is equal to 47:  Note: / character
+            Set last_separator_pos to i
+        End If
+        If ch is equal to 92:  Note: \ character
+            Set last_separator_pos to i
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Extract filename (everything after last separator, or entire string if no separator)
+    Let filename_start be last_separator_pos plus 1
+    Let filename_len be path_len minus filename_start
+
+    If filename_len is equal to 0:
+        Return 0  Note: Path ends with separator
+    End If
+
+    Note: Check if filename ends with .runa extension
+    Let extension_len be 5  Note: Length of ".runa"
+    Let alias_len be filename_len
+
+    If filename_len is greater than extension_len:
+        Note: Check last 5 characters for ".runa"
+        Let ext_pos be filename_start plus filename_len minus extension_len
+        Let dot_char be proc string_char_at from StringCore with module_path, ext_pos
+
+        If dot_char is equal to 46:  Note: . character
+            Let r_char be proc string_char_at from StringCore with module_path, ext_pos plus 1
+            Let u_char be proc string_char_at from StringCore with module_path, ext_pos plus 2
+            Let n_char be proc string_char_at from StringCore with module_path, ext_pos plus 3
+            Let a_char be proc string_char_at from StringCore with module_path, ext_pos plus 4
+
+            Note: Check if matches ".runa" (case-sensitive)
+            If r_char is equal to 114:  Note: 'r'
+                If u_char is equal to 117:  Note: 'u'
+                    If n_char is equal to 110:  Note: 'n'
+                        If a_char is equal to 97:  Note: 'a'
+                            Set alias_len to filename_len minus extension_len
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    If alias_len is equal to 0:
+        Return 0  Note: Just ".runa" with no name
+    End If
+
+    Note: Allocate string for alias
+    Let alias_str be proc arena_allocate from Layout with arena, alias_len plus 1  Note: +1 for null terminator
+
+    If alias_str is equal to 0:
+        Return 0  Note: Allocation failed
+    End If
+
+    Note: Copy alias characters
+    Set i to 0
+    While i is less than alias_len:
+        Let ch be proc string_char_at from StringCore with module_path, filename_start plus i
+        proc memory_set_byte from Layout with alias_str, i, ch
+        Set i to i plus 1
+    End While
+
+    Note: Null terminate
+    proc memory_set_byte from Layout with alias_str, alias_len, 0
+
+    Return alias_str
 End Process
 
 Note: ============================================================================
 Note: Selective Import Parsing
 Note: ============================================================================
 
-Process called "parse_import_item_list" takes lexer as Integer returns Integer:
-    Note: Parse comma-separated list of import items between braces
-    Note: 
-    Note: Syntax: {item1, item2, item3}
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to lexer state (positioned at opening {)
-    Note: 
-    Note: Returns:
-    Note:   Pointer to array of item name strings
-    Note:   Array length stored in separate parameter (passed by reference)
-    Note:   Returns 0 on syntax error
-    Note: 
-    Note: Algorithm:
-    Note: 1. Expect and consume opening brace {
-    Note: 2. Parse first identifier
-    Note: 3. While next token is comma:
-    Note:    - Consume comma
-    Note:    - Parse next identifier
-    Note:    - Add to items array
-    Note: 4. Expect and consume closing brace }
-    Note: 5. Return items array
-    Note: 
-    Note: Error cases:
-    Note:   - Empty list {} (invalid)
-    Note:   - Missing comma between items
-    Note:   - Missing closing brace
-    Note:   - Non-identifier in list
-    Note: 
-    Note: TODO: Implement item list parsing with error recovery
-    
-    Return 0  Note: Placeholder
+Process called "parse_import_item_list" takes arena as Integer, lexer as Integer returns Integer:
+    Note:
+    Parse comma-separated list of import items between braces
+
+    Syntax: {item1, item2, item3}
+
+    Parameters:
+      lexer - Pointer to lexer state (positioned at opening {)
+
+    Returns:
+      Pointer to ItemList structure containing items array and count
+      Returns 0 on syntax error
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate dynamic array for items with initial capacity of 32
+    Let capacity be 32
+    Let array_size be capacity multiplied by 8
+    Let items_array be proc arena_allocate from Layout with arena, array_size
+
+    If items_array is equal to 0:
+        Return 0
+    End If
+
+    Let item_count be 0
+
+    Note: Get tokens
+    Let tokens_ptr be proc memory_get_qword from Layout with lexer, 80
+    Let current_pos be proc memory_get_qword from Layout with lexer, 16
+
+    Note: Parse comma-separated identifiers
+    Let done be 0
+    While done is equal to 0:
+        Note: Get current token
+        Let token_index be current_pos multiplied by 48
+        Let token_ptr be tokens_ptr plus token_index
+        Let token_type be proc memory_get_qword from Layout with token_ptr, 0
+
+        Let TOKEN_IDENTIFIER be 200
+        Let TOKEN_RBRACE be 403  Note: }
+        Let TOKEN_COMMA be 404   Note: ,
+
+        Note: Check if closing brace (end of list)
+        If token_type is equal to TOKEN_RBRACE:
+            Set done to 1
+        Otherwise:
+            Note: Expect identifier
+            If token_type is not equal to TOKEN_IDENTIFIER:
+                Return 0  Note: Expected identifier
+            End If
+
+            Note: Get identifier value
+            Let item_name be proc memory_get_qword from Layout with token_ptr, 8
+
+            Note: Validate identifier
+            Let is_valid be proc validate_import_item with item_name
+
+            If is_valid is equal to 0:
+                Return 0
+            End If
+
+            Note: Check if array needs to grow
+            If item_count is greater than or equal to capacity:
+                Note: Double the capacity
+                Let new_capacity be capacity multiplied by 2
+                Let new_array_size be new_capacity multiplied by 8
+                Let new_array be proc arena_allocate from Layout with arena, new_array_size
+
+                If new_array is equal to 0:
+                    Return 0  Note: Allocation failed
+                End If
+
+                Note: Copy existing items to new array
+                Let copy_index be 0
+                While copy_index is less than item_count:
+                    Let src_offset be copy_index multiplied by 8
+                    Let item be proc memory_get_qword from Layout with items_array, src_offset
+                    proc memory_set_qword from Layout with new_array, src_offset, item
+                    Set copy_index to copy_index plus 1
+                End While
+
+                Note: Update to new array (old array cleaned up by arena)
+                Set items_array to new_array
+                Set capacity to new_capacity
+            End If
+
+            Note: Store in array
+            proc memory_set_qword from Layout with items_array, item_count multiplied by 8, item_name
+            Set item_count to item_count plus 1
+
+            Note: Advance to next token
+            Set current_pos to current_pos plus 1
+            proc memory_set_qword from Layout with lexer, 16, current_pos
+
+            Note: Check for comma or closing brace
+            Set token_index to current_pos multiplied by 48
+            Set token_ptr to tokens_ptr plus token_index
+            Set token_type to proc memory_get_qword from Layout with token_ptr, 0
+
+            If token_type is equal to TOKEN_COMMA:
+                Note: Consume comma and continue
+                Set current_pos to current_pos plus 1
+                proc memory_set_qword from Layout with lexer, 16, current_pos
+            Otherwise:
+                If token_type is not equal to TOKEN_RBRACE:
+                    Return 0  Note: Expected comma or }
+                End If
+                Set done to 1
+            End If
+        End If
+    End While
+
+    If item_count is equal to 0:
+        Return 0  Note: Empty list
+    End If
+
+    Note: Create ItemList structure (2 fields × 8 bytes = 16 bytes)
+    Let item_list be proc arena_allocate from Layout with arena, 16
+
+    If item_list is equal to 0:
+        Return 0  Note: Allocation failed (arena cleanup automatic)
+    End If
+
+    Note: Populate ItemList fields
+    proc memory_set_qword from Layout with item_list, 0, items_array  Note: offset 0: items
+    proc memory_set_qword from Layout with item_list, 8, item_count   Note: offset 8: count
+
+    Return item_list
 End Process
 
 Process called "validate_import_item" takes item_name as Integer returns Integer:
-    Note: Validate that import item name is valid identifier
     Note: 
-    Note: Parameters:
-    Note:   item_name - Item name string to validate
-    Note: 
-    Note: Returns:
-    Note:   1 if valid identifier, 0 if invalid
-    Note: 
-    Note: Checks:
-    Note:   - Not empty
-    Note:   - Valid identifier characters
-    Note:   - Not a reserved keyword
-    Note:   - Follows Runa identifier rules
-    Note: 
-    Note: TODO: Implement identifier validation rules
+    Validate that import item name is valid identifier
     
-    Return 1  Note: Placeholder
+    Parameters:
+      item_name - Item name string to validate
+    
+    Returns:
+      1 if valid identifier, 0 if invalid
+    
+    Checks:
+      - Not empty
+      - Valid identifier characters
+      - Not a reserved keyword
+      - Follows Runa identifier rules
+    :End Note
+
+    If item_name is equal to 0:
+        Return 0  Note: NULL item name
+    End If
+
+    Let name_len be proc string_length from StringCore with item_name
+
+    If name_len is equal to 0:
+        Return 0  Note: Empty item name
+    End If
+
+    Note: Check first character (must be letter or underscore)
+    Let first_char be proc string_char_at from StringCore with item_name, 0
+
+    Let is_valid_start be 0
+    If first_char is greater than or equal to 65:
+        If first_char is less than or equal to 90:
+            Set is_valid_start to 1  Note: A-Z
+        End If
+    End If
+    If first_char is greater than or equal to 97:
+        If first_char is less than or equal to 122:
+            Set is_valid_start to 1  Note: a-z
+        End If
+    End If
+    If first_char is equal to 95:
+        Set is_valid_start to 1  Note: _
+    End If
+
+    If is_valid_start is equal to 0:
+        Return 0  Note: Invalid first character
+    End If
+
+    Note: Check remaining characters (letter, digit, or underscore)
+    Let i be 1
+    While i is less than name_len:
+        Let ch be proc string_char_at from StringCore with item_name, i
+
+        Let is_valid_char be 0
+        If ch is greater than or equal to 65:
+            If ch is less than or equal to 90:
+                Set is_valid_char to 1  Note: A-Z
+            End If
+        End If
+        If ch is greater than or equal to 97:
+            If ch is less than or equal to 122:
+                Set is_valid_char to 1  Note: a-z
+            End If
+        End If
+        If ch is greater than or equal to 48:
+            If ch is less than or equal to 57:
+                Set is_valid_char to 1  Note: 0-9
+            End If
+        End If
+        If ch is equal to 95:
+            Set is_valid_char to 1  Note: _
+        End If
+
+        If is_valid_char is equal to 0:
+            Return 0  Note: Invalid character in identifier
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Check if it's a reserved keyword
+    Let is_keyword be proc is_reserved_keyword from Keywords with item_name
+
+    If is_keyword is equal to 1:
+        Return 0  Note: Reserved keyword cannot be import item
+    End If
+
+    Return 1  Note: Valid identifier
 End Process
 
 Note: ============================================================================
@@ -319,70 +984,255 @@ Note: Import Syntax Validation
 Note: ============================================================================
 
 Process called "validate_import_syntax" takes import_stmt as Integer returns Integer:
-    Note: Validate complete import statement syntax
     Note: 
-    Note: Checks:
-    Note:   - Module path is valid and non-empty
-    Note:   - Alias is valid identifier (if present)
-    Note:   - Selective items are valid (if selective import)
-    Note:   - No duplicate items in selective import list
-    Note:   - Path format is appropriate for import type
-    Note: 
-    Note: Parameters:
-    Note:   import_stmt - Pointer to ImportStatement to validate
-    Note: 
-    Note: Returns:
-    Note:   1 if valid, 0 if errors found
-    Note: 
-    Note: Side Effects:
-    Note:   - Reports specific validation errors
-    Note: 
-    Note: TODO: Implement validation checks for each import type
+    Validate complete import statement syntax
     
-    Return 1  Note: Placeholder
+    Checks:
+      - Module path is valid and non-empty
+      - Alias is valid identifier (if present)
+      - Selective items are valid (if selective import)
+      - No duplicate items in selective import list
+      - Path format is appropriate for import type
+    
+    Parameters:
+      import_stmt - Pointer to ImportStatement to validate
+    
+    Returns:
+      1 if valid, 0 if errors found
+    
+    Side Effects:
+      - Reports specific validation errors
+    :End Note
+
+    If import_stmt is equal to 0:
+        Return 0  Note: NULL import statement
+    End If
+
+    Note: Get module_path (offset 8)
+    Let module_path be proc memory_get_qword from Layout with import_stmt, 8
+
+    If module_path is equal to 0:
+        Note: Get line and column for error reporting (offsets 48, 56)
+        Let line be proc memory_get_qword from Layout with import_stmt, 48
+        Let column be proc memory_get_qword from Layout with import_stmt, 56
+        proc report_import_syntax_error with 1, line, column, 0  Note: Error type 1: Missing module path
+        Return 0
+    End If
+
+    Note: Validate module path format
+    Let path_valid be proc validate_module_path with module_path
+
+    If path_valid is equal to 0:
+        Let line be proc memory_get_qword from Layout with import_stmt, 48
+        Let column be proc memory_get_qword from Layout with import_stmt, 56
+        proc report_import_syntax_error with 2, line, column, module_path  Note: Error type 2: Invalid module path
+        Return 0
+    End If
+
+    Note: Get alias (offset 16) and check if present
+    Let alias be proc memory_get_qword from Layout with import_stmt, 16
+
+    If alias is not equal to 0:
+        Note: Validate alias is valid identifier
+        Let alias_valid be proc validate_import_item with alias
+
+        If alias_valid is equal to 0:
+            Let line be proc memory_get_qword from Layout with import_stmt, 48
+            Let column be proc memory_get_qword from Layout with import_stmt, 56
+            proc report_import_syntax_error with 4, line, column, alias  Note: Error type 4: Invalid alias
+            Return 0
+        End If
+    End If
+
+    Note: Get import_type (offset 0) and validate based on type
+    Let import_type be proc memory_get_qword from Layout with import_stmt, 0
+
+    If import_type is equal to IMPORT_SELECTIVE:
+        Note: Validate selective import items
+        Let selective_items be proc memory_get_qword from Layout with import_stmt, 32  Note: offset 32
+        Let item_count be proc memory_get_qword from Layout with import_stmt, 40       Note: offset 40
+
+        If item_count is equal to 0:
+            Let line be proc memory_get_qword from Layout with import_stmt, 48
+            Let column be proc memory_get_qword from Layout with import_stmt, 56
+            proc report_import_syntax_error with 5, line, column, 0  Note: Error type 5: Empty selective import list
+            Return 0
+        End If
+
+        Note: Validate each item and check for duplicates
+        Let i be 0
+        While i is less than item_count:
+            Let item_ptr be proc memory_get_qword from Layout with selective_items, i multiplied by 8
+            Let item_valid be proc validate_import_item with item_ptr
+
+            If item_valid is equal to 0:
+                Let line be proc memory_get_qword from Layout with import_stmt, 48
+                Let column be proc memory_get_qword from Layout with import_stmt, 56
+                proc report_import_syntax_error with 7, line, column, item_ptr  Note: Error type 7: Invalid import item
+                Return 0
+            End If
+
+            Note: Check for duplicates (compare with all previous items)
+            Let j be 0
+            While j is less than i:
+                Let prev_item_ptr be proc memory_get_qword from Layout with selective_items, j multiplied by 8
+                Let are_equal be proc string_equals from StringCore with item_ptr, prev_item_ptr
+
+                If are_equal is equal to 1:
+                    Let line be proc memory_get_qword from Layout with import_stmt, 48
+                    Let column be proc memory_get_qword from Layout with import_stmt, 56
+                    proc report_import_syntax_error with 8, line, column, item_ptr  Note: Error type 8: Duplicate item
+                    Return 0
+                End If
+
+                Set j to j plus 1
+            End While
+
+            Set i to i plus 1
+        End While
+    End If
+
+    Return 1  Note: All validation passed
 End Process
 
 Process called "validate_module_path" takes path as Integer returns Integer:
-    Note: Validate module path string format
     Note: 
-    Note: Checks:
-    Note:   - Path is not empty
-    Note:   - No invalid characters (null bytes, etc.)
-    Note:   - Path separators are consistent
-    Note:   - No directory traversal exploits (excessive ../)
-    Note:   - Path doesn't end with separator
-    Note: 
-    Note: Parameters:
-    Note:   path - Module path string to validate
-    Note: 
-    Note: Returns:
-    Note:   1 if valid path, 0 if invalid
-    Note: 
-    Note: TODO: Implement path validation rules
+    Validate module path string format
     
-    Return 1  Note: Placeholder
+    Checks:
+      - Path is not empty
+      - No invalid characters (null bytes, etc.)
+      - Path separators are consistent
+      - No directory traversal exploits (excessive ../)
+      - Path doesn't end with separator
+    
+    Parameters:
+      path - Module path string to validate
+    
+    Returns:
+      1 if valid path, 0 if invalid
+    :End Note
+
+    If path is equal to 0:
+        Return 0  Note: NULL path
+    End If
+
+    Let path_len be proc string_length from StringCore with path
+
+    If path_len is equal to 0:
+        Return 0  Note: Empty path
+    End If
+
+    Note: Check path doesn't end with separator
+    Let last_char be proc string_char_at from StringCore with path, path_len minus 1
+    If last_char is equal to 47:  Note: /
+        Return 0  Note: Path ends with separator
+    End If
+    If last_char is equal to 92:  Note: \
+        Return 0  Note: Path ends with separator
+    End If
+
+    Note: Validate characters and check for excessive directory traversal
+    Let dotdot_count be 0
+    Let max_dotdot_allowed be 5  Note: Allow at most 5 levels of ../
+    Let i be 0
+
+    While i is less than path_len:
+        Let ch be proc string_char_at from StringCore with path, i
+
+        Note: Check for null byte (0) - invalid in paths
+        If ch is equal to 0:
+            Return 0  Note: Null byte in path
+        End If
+
+        Note: Check for dangerous characters (< > | " * ?)
+        If ch is equal to 60:  Note: <
+            Return 0  Note: Invalid character
+        End If
+        If ch is equal to 62:  Note: >
+            Return 0  Note: Invalid character
+        End If
+        If ch is equal to 124:  Note: |
+            Return 0  Note: Invalid character
+        End If
+        If ch is equal to 34:  Note: "
+            Return 0  Note: Invalid character
+        End If
+        If ch is equal to 42:  Note: *
+            Return 0  Note: Invalid character
+        End If
+        If ch is equal to 63:  Note: ?
+            Return 0  Note: Invalid character
+        End If
+
+        Note: Detect ../ patterns for directory traversal counting
+        If ch is equal to 46:  Note: .
+            If i plus 1 is less than path_len:
+                Let next_ch be proc string_char_at from StringCore with path, i plus 1
+                If next_ch is equal to 46:  Note: Second .
+                    If i plus 2 is less than path_len:
+                        Let next_next_ch be proc string_char_at from StringCore with path, i plus 2
+                        If next_next_ch is equal to 47:  Note: /
+                            Set dotdot_count to dotdot_count plus 1
+                            If dotdot_count is greater than max_dotdot_allowed:
+                                Return 0  Note: Excessive directory traversal
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1  Note: Path is valid
 End Process
 
 Process called "check_circular_import" takes import_stmt as Integer, current_module as Integer returns Integer:
-    Note: Check if import would create circular dependency
     Note: 
-    Note: Circular import: Module A imports B, B imports A
-    Note: 
-    Note: Parameters:
-    Note:   import_stmt - Import statement to check
-    Note:   current_module - Path of current module being compiled
-    Note: 
-    Note: Returns:
-    Note:   1 if circular import detected, 0 if safe
-    Note: 
-    Note: Note: This is a preliminary check at lexical level
-    Note: Full circular dependency detection happens in import system
-    Note: 
-    Note: TODO: Implement basic circular import check
-    Note: - Check if import_stmt.module_path == current_module
-    Note: - Report error if circular
+    Check if import would create circular dependency
     
-    Return 0  Note: Placeholder
+    Circular import: Module A imports B, B imports A
+    
+    Parameters:
+      import_stmt - Import statement to check
+      current_module - Path of current module being compiled
+    
+    Returns:
+      1 if circular import detected, 0 if safe
+    
+    This is a preliminary check at lexical level
+    Full circular dependency detection happens in import system
+    :End Note
+
+    If import_stmt is equal to 0:
+        Return 0  Note: NULL import statement, not circular
+    End If
+
+    If current_module is equal to 0:
+        Return 0  Note: No current module to compare, not circular
+    End If
+
+    Note: Get module_path from import statement (offset 8)
+    Let import_path be proc memory_get_qword from Layout with import_stmt, 8
+
+    If import_path is equal to 0:
+        Return 0  Note: No import path, not circular
+    End If
+
+    Note: Check if import path matches current module path
+    Let paths_equal be proc string_equals from StringCore with import_path, current_module
+
+    If paths_equal is equal to 1:
+        Note: Circular import detected - report error
+        Let line be proc memory_get_qword from Layout with import_stmt, 48
+        Let column be proc memory_get_qword from Layout with import_stmt, 56
+        proc report_import_syntax_error with 9, line, column, import_path  Note: Error type 9: Circular import
+        Return 1  Note: Circular detected
+    End If
+
+    Return 0  Note: No circular import
 End Process
 
 Note: ============================================================================
@@ -390,63 +1240,147 @@ Note: Error Reporting
 Note: ============================================================================
 
 Process called "report_import_syntax_error" takes error_type as Integer, line as Integer, column as Integer, context as Integer returns Integer:
-    Note: Report import statement syntax error
     Note: 
-    Note: Error types:
-    Note:   1: Missing module path
-    Note:   2: Invalid module path format
-    Note:   3: Missing "as" or "from" keyword
-    Note:   4: Invalid alias identifier
-    Note:   5: Empty selective import list
-    Note:   6: Unclosed selective import braces
-    Note:   7: Invalid import item name
-    Note:   8: Duplicate items in selective import
-    Note:   9: Circular import detected
-    Note: 
-    Note: Parameters:
-    Note:   error_type - Error type constant
-    Note:   line - Line number where error occurs
-    Note:   column - Column number where error occurs
-    Note:   context - Additional context string for error message
-    Note: 
-    Note: Returns:
-    Note:   1 (error reported)
-    Note: 
-    Note: TODO: Implement detailed error messages with suggestions
+    Report import statement syntax error using error system
     
-    Return 1  Note: Placeholder
+    Error types:
+      1: Missing module path
+      2: Invalid module path format
+      3: Missing "as" or "from" keyword
+      4: Invalid alias identifier
+      5: Empty selective import list
+      6: Unclosed selective import braces
+      7: Invalid import item name
+      8: Duplicate items in selective import
+      9: Circular import detected
+    
+    Parameters:
+      error_type - Error type constant
+      line - Line number where error occurs
+      column - Column number where error occurs
+      context - Additional context string for error message
+    
+    Returns:
+      1 (error reported)
+    :End Note
+
+
+    Note: Determine error message based on error type
+    Let error_message be 0
+
+    If error_type is equal to 1:
+        Set error_message to "Import statement missing module path"
+    End If
+
+    If error_type is equal to 2:
+        Set error_message to "Invalid module path format in import statement"
+    End If
+
+    If error_type is equal to 3:
+        Set error_message to "Missing 'as' or 'from' keyword in import statement"
+    End If
+
+    If error_type is equal to 4:
+        Set error_message to "Invalid alias identifier in import statement"
+    End If
+
+    If error_type is equal to 5:
+        Set error_message to "Empty selective import list - must specify at least one item"
+    End If
+
+    If error_type is equal to 6:
+        Set error_message to "Unclosed braces in selective import list"
+    End If
+
+    If error_type is equal to 7:
+        Set error_message to "Invalid import item name in selective import"
+    End If
+
+    If error_type is equal to 8:
+        Set error_message to "Duplicate items in selective import list"
+    End If
+
+    If error_type is equal to 9:
+        Set error_message to "Circular import detected - module imports itself"
+    End If
+
+    If error_message is equal to 0:
+        Set error_message to "Unknown import statement error"
+    End If
+
+    Note: Use ERROR_TYPE_IMPORT_ERROR from errors.runa (205)
+    Let error_code be 205  Note: ERROR_TYPE_IMPORT_ERROR
+
+    Note: Create error using error system (no arena, so pass 0)
+    Let error_info be proc error_info_create from Errors with error_code, line, column, error_message, 0
+
+    Note: Error is now registered in error system
+    Note: Return 1 to indicate error was reported
+    Return 1
 End Process
 
 Note: ============================================================================
 Note: Utility Functions
 Note: ============================================================================
 
-Process called "create_import_statement" takes import_type as Integer returns Integer:
-    Note: Create a new ImportStatement structure
+Process called "create_import_statement" takes arena as Integer, import_type as Integer returns Integer:
     Note: 
-    Note: Parameters:
-    Note:   import_type - Type of import (IMPORT_SIMPLE, IMPORT_SELECTIVE, etc.)
-    Note: 
-    Note: Returns:
-    Note:   Pointer to initialized ImportStatement
-    Note: 
-    Note: TODO: Implement using Layout.allocate
+    Create a new ImportStatement structure
     
-    Return 0  Note: Placeholder
+    Parameters:
+      import_type - Type of import (IMPORT_SIMPLE, IMPORT_SELECTIVE, etc.)
+    
+    Returns:
+      Pointer to initialized ImportStatement
+    :End Note
+
+    Note: ImportStatement has 8 fields, each 8 bytes = 64 bytes total
+    Let stmt_size be 64
+    Let stmt be proc arena_allocate from Layout with arena, stmt_size
+
+    If stmt is equal to 0:
+        Return 0  Note: Allocation failed
+    End If
+
+    Note: Initialize all fields to zero/null
+    proc memory_set_qword from Layout with stmt, 0, import_type      Note: offset 0: import_type
+    proc memory_set_qword from Layout with stmt, 8, 0                Note: offset 8: module_path (null)
+    proc memory_set_qword from Layout with stmt, 16, 0               Note: offset 16: alias (null)
+    proc memory_set_qword from Layout with stmt, 24, 0               Note: offset 24: is_explicit_alias (0)
+    proc memory_set_qword from Layout with stmt, 32, 0               Note: offset 32: selective_items (null)
+    proc memory_set_qword from Layout with stmt, 40, 0               Note: offset 40: item_count (0)
+    proc memory_set_qword from Layout with stmt, 48, 0               Note: offset 48: line (0)
+    proc memory_set_qword from Layout with stmt, 56, 0               Note: offset 56: column (0)
+
+    Return stmt
 End Process
 
 Process called "import_type_to_string" takes import_type as Integer returns Integer:
-    Note: Convert import type constant to readable string
     Note: 
-    Note: Parameters:
-    Note:   import_type - Import type constant
-    Note: 
-    Note: Returns:
-    Note:   Pointer to type name ("simple", "selective", "wildcard")
-    Note: 
-    Note: Used for error messages and debugging
-    Note: 
-    Note: TODO: Implement simple lookup
+    Convert import type constant to readable string
     
-    Return 0  Note: Placeholder
+    Parameters:
+      import_type - Import type constant
+    
+    Returns:
+      Pointer to type name ("simple", "selective", "wildcard")
+    
+    Used for error messages and debugging
+    :End Note
+
+    Note: Use match-style logic for type lookup
+    If import_type is equal to IMPORT_SIMPLE:
+        Return proc string_literal from StringCore with "simple"
+    End If
+
+    If import_type is equal to IMPORT_SELECTIVE:
+        Return proc string_literal from StringCore with "selective"
+    End If
+
+    If import_type is equal to IMPORT_WILDCARD:
+        Return proc string_literal from StringCore with "wildcard"
+    End If
+
+    Note: Unknown import type
+    Return proc string_literal from StringCore with "unknown"
 End Process

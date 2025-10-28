@@ -1,0 +1,903 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements @ARC lifetime tracking for automatic reference counting.
+
+This file performs the following tasks:
+- Track @ARC variable lifetimes (scope entry → last use)
+- Identify arc_retain() insertion points
+- Identify arc_release() insertion points
+- Validate @ARC usage constraints
+- Detect use-after-release violations
+
+This file is essential because of the following reasons:
+- @ARC lifetime tracking enables automatic retain/release insertion in codegen
+- Proper lifetime analysis prevents use-after-free errors
+- Insertion point marking enables correct codegen transformation
+- Constraint validation ensures @ARC types are used correctly
+
+This file consists of the following functions/features/operation types:
+- @ARC variable lifetime tracking and analysis
+- Retain/release insertion point marking in AST
+- Last-use analysis for optimal release placement
+- @ARC constraint validation (no multiple annotations, compatible types)
+- Use-after-release detection and error reporting
+
+Dependencies:
+- Imports ast.runa for AST node manipulation
+- Imports type_annotations.runa for @ARC annotation constants
+- Imports memory/layout.runa for structure allocation
+- Imports collections/list.runa for tracking lists
+- Imports collections/hashtable.runa for variable tracking
+:End Note
+
+Import "compiler/frontend/parsing/ast.runa" as AST
+Import "compiler/frontend/parsing/type_annotations.runa" as TypeAnnotations
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/hashtable.runa" as HashTable
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/io/console_primitive.runa" as Console
+Import "runtime/core/memory/arena.runa" as Arena
+
+Note: ============================================================================
+Note: @ARC Lifetime Structures
+Note: ============================================================================
+
+Type called "ARCVariable":
+    variable_name as Integer      Note: Pointer to variable name string
+    type_name as Integer          Note: Pointer to type name string
+    declaration_node as Integer   Note: AST node where variable is declared
+    scope_depth as Integer        Note: Scope nesting depth
+    first_use_line as Integer     Note: Line of first use
+    last_use_line as Integer      Note: Line of last use
+    last_use_node as Integer      Note: AST node of last use
+    is_parameter as Integer       Note: 1 if function parameter, 0 otherwise
+    is_return_value as Integer    Note: 1 if returned from function
+    retain_count as Integer       Note: Number of retain points
+    release_count as Integer      Note: Number of release points
+End Type
+
+Type called "InsertionPoint":
+    ast_node as Integer           Note: AST node where insertion happens
+    insertion_type as Integer     Note: 1 = retain, 2 = release
+    variable_name as Integer      Note: Variable being retained/released
+    line as Integer               Note: Line number
+    column as Integer             Note: Column number
+    is_conditional as Integer     Note: 1 if inside conditional block
+End Type
+
+Type called "ARCTracker":
+    arc_variables as Integer      Note: Pointer to HashTable of ARCVariable
+    insertion_points as Integer   Note: Pointer to List of InsertionPoint
+    current_scope_depth as Integer Note: Current scope nesting level
+    error_count as Integer        Note: Number of @ARC errors found
+    warning_count as Integer      Note: Number of @ARC warnings
+End Type
+
+Note: Insertion type constants
+Constant INSERTION_RETAIN as Integer is 1
+Constant INSERTION_RELEASE as Integer is 2
+
+Note: ============================================================================
+Note: @ARC Tracker Creation and Destruction
+Note: ============================================================================
+
+Process called "arc_tracker_create" takes returns Integer:
+    Note:
+    Create @ARC lifetime tracker.
+
+    Returns:
+      Pointer to ARCTracker structure
+      Returns 0 on allocation failure
+
+    Algorithm:
+    1. Allocate ARCTracker structure (5 fields × 8 bytes = 40 bytes)
+    2. Create HashTable for arc_variables
+    3. Create List for insertion_points
+    4. Initialize scope_depth to 0
+    5. Initialize error/warning counts to 0
+    6. Return tracker pointer
+    :End Note
+
+    Note: Allocate ARCTracker structure
+    Let tracker_size be 40
+    Let tracker be proc allocate from Layout with tracker_size
+
+    If tracker is equal to 0:
+        Return 0  Note: Allocation failed
+    End If
+
+    Note: Create HashTable for arc_variables (key: variable_name, value: ARCVariable)
+    Let variables_table be proc create from HashTable with 64  Note: Initial capacity
+
+    If variables_table is equal to 0:
+        proc deallocate from Layout with tracker
+        Return 0
+    End If
+
+    Note: Create List for insertion_points
+    Let points_list be proc create from List
+
+    If points_list is equal to 0:
+        proc destroy from HashTable with variables_table
+        proc deallocate from Layout with tracker
+        Return 0
+    End If
+
+    Note: Initialize ARCTracker fields
+    proc memory_set_qword from Memory with tracker, 0, variables_table   Note: arc_variables
+    proc memory_set_qword from Memory with tracker, 8, points_list        Note: insertion_points
+    proc memory_set_qword from Memory with tracker, 16, 0                 Note: current_scope_depth
+    proc memory_set_qword from Memory with tracker, 24, 0                 Note: error_count
+    proc memory_set_qword from Memory with tracker, 32, 0                 Note: warning_count
+
+    Return tracker
+End Process
+
+Process called "arc_tracker_destroy" takes tracker as Integer returns Integer:
+    Note:
+    Destroy @ARC lifetime tracker and free all memory.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+
+    Returns:
+      1 on success
+
+    Algorithm:
+    1. Destroy arc_variables HashTable
+    2. Destroy insertion_points List
+    3. Free ARCTracker structure
+    :End Note
+
+    If tracker is equal to 0:
+        Return 1  Note: NULL tracker already destroyed
+    End If
+
+    Note: Get arc_variables HashTable
+    Let variables_table be proc memory_get_qword from Memory with tracker, 0
+
+    If variables_table is not equal to 0:
+        proc destroy from HashTable with variables_table
+    End If
+
+    Note: Get insertion_points List
+    Let points_list be proc memory_get_qword from Memory with tracker, 8
+
+    If points_list is not equal to 0:
+        proc destroy from List with points_list
+    End If
+
+    Note: Free ARCTracker structure
+    proc deallocate from Layout with tracker
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: @ARC Variable Tracking
+Note: ============================================================================
+
+Process called "arc_track_variable" takes tracker as Integer, variable_name as Integer, type_name as Integer, declaration_node as Integer returns Integer:
+    Note:
+    Track an @ARC variable for lifetime analysis.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+      variable_name - Pointer to variable name string
+      type_name - Pointer to type name string
+      declaration_node - AST node where variable is declared
+
+    Returns:
+      1 on success, 0 on failure
+
+    Algorithm:
+    1. Validate inputs
+    2. Allocate ARCVariable structure
+    3. Initialize fields with declaration info
+    4. Add to arc_variables HashTable
+    5. Return success
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    If variable_name is equal to 0:
+        Return 0
+    End If
+
+    If declaration_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Get arc_variables HashTable
+    Let variables_table be proc memory_get_qword from Memory with tracker, 0
+
+    If variables_table is equal to 0:
+        Return 0
+    End If
+
+    Note: Get current scope depth
+    Let scope_depth be proc memory_get_qword from Memory with tracker, 16
+
+    Note: Get declaration line from AST node
+    Let decl_line be proc ast_node_get_line from AST with declaration_node
+
+    Note: Allocate ARCVariable structure (11 fields × 8 bytes = 88 bytes)
+    Let arc_var_size be 88
+    Let arc_var be proc allocate from Layout with arc_var_size
+
+    If arc_var is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize ARCVariable fields
+    proc memory_set_qword from Memory with arc_var, 0, variable_name      Note: variable_name
+    proc memory_set_qword from Memory with arc_var, 8, type_name          Note: type_name
+    proc memory_set_qword from Memory with arc_var, 16, declaration_node  Note: declaration_node
+    proc memory_set_qword from Memory with arc_var, 24, scope_depth       Note: scope_depth
+    proc memory_set_qword from Memory with arc_var, 32, decl_line         Note: first_use_line
+    proc memory_set_qword from Memory with arc_var, 40, decl_line         Note: last_use_line (initially same)
+    proc memory_set_qword from Memory with arc_var, 48, 0                 Note: last_use_node (NULL initially)
+    proc memory_set_qword from Memory with arc_var, 56, 0                 Note: is_parameter (default 0)
+    proc memory_set_qword from Memory with arc_var, 64, 0                 Note: is_return_value (default 0)
+    proc memory_set_qword from Memory with arc_var, 72, 0                 Note: retain_count
+    proc memory_set_qword from Memory with arc_var, 80, 0                 Note: release_count
+
+    Note: Add to arc_variables HashTable
+    Let set_result be proc set from HashTable with variables_table, variable_name, arc_var
+
+    If set_result is equal to 0:
+        proc deallocate from Layout with arc_var
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "arc_record_usage" takes tracker as Integer, variable_name as Integer, usage_node as Integer returns Integer:
+    Note:
+    Record a usage of an @ARC variable (updates last_use tracking).
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+      variable_name - Pointer to variable name string
+      usage_node - AST node where variable is used
+
+    Returns:
+      1 on success, 0 on failure
+
+    Algorithm:
+    1. Look up variable in arc_variables HashTable
+    2. Get usage line from AST node
+    3. Update last_use_line and last_use_node
+    4. Return success
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    If variable_name is equal to 0:
+        Return 0
+    End If
+
+    If usage_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Get arc_variables HashTable
+    Let variables_table be proc memory_get_qword from Memory with tracker, 0
+
+    If variables_table is equal to 0:
+        Return 0
+    End If
+
+    Note: Look up variable
+    Let arc_var be proc get from HashTable with variables_table, variable_name
+
+    If arc_var is equal to 0:
+        Return 0  Note: Variable not tracked (not @ARC)
+    End If
+
+    Note: Get usage line from AST node
+    Let usage_line be proc ast_node_get_line from AST with usage_node
+
+    Note: Update last_use_line (offset 40)
+    proc memory_set_qword from Memory with arc_var, 40, usage_line
+
+    Note: Update last_use_node (offset 48)
+    proc memory_set_qword from Memory with arc_var, 48, usage_node
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Insertion Point Marking
+Note: ============================================================================
+
+Process called "arc_mark_retain_point" takes tracker as Integer, variable_name as Integer, ast_node as Integer returns Integer:
+    Note:
+    Mark an arc_retain() insertion point in the AST.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+      variable_name - Variable to retain
+      ast_node - AST node where retain should be inserted
+
+    Returns:
+      1 on success, 0 on failure
+
+    Algorithm:
+    1. Allocate InsertionPoint structure
+    2. Set insertion_type to INSERTION_RETAIN
+    3. Store variable_name, ast_node, line/column
+    4. Add to insertion_points List
+    5. Increment variable's retain_count
+    6. Return success
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    If variable_name is equal to 0:
+        Return 0
+    End If
+
+    If ast_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Get insertion_points List
+    Let points_list be proc memory_get_qword from Memory with tracker, 8
+
+    If points_list is equal to 0:
+        Return 0
+    End If
+
+    Note: Get line/column from AST node
+    Let line be proc ast_node_get_line from AST with ast_node
+    Let column be proc ast_node_get_column from AST with ast_node
+
+    Note: Allocate InsertionPoint structure (6 fields × 8 bytes = 48 bytes)
+    Let point_size be 48
+    Let point be proc allocate from Layout with point_size
+
+    If point is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize InsertionPoint fields
+    proc memory_set_qword from Memory with point, 0, ast_node              Note: ast_node
+    proc memory_set_qword from Memory with point, 8, INSERTION_RETAIN      Note: insertion_type
+    proc memory_set_qword from Memory with point, 16, variable_name        Note: variable_name
+    proc memory_set_qword from Memory with point, 24, line                 Note: line
+    proc memory_set_qword from Memory with point, 32, column               Note: column
+    proc memory_set_qword from Memory with point, 40, 0                    Note: is_conditional (default 0)
+
+    Note: Add to insertion_points List
+    Let add_result be proc append from List with points_list, point
+
+    If add_result is equal to 0:
+        proc deallocate from Layout with point
+        Return 0
+    End If
+
+    Note: Increment variable's retain_count
+    Let variables_table be proc memory_get_qword from Memory with tracker, 0
+    Let arc_var be proc get from HashTable with variables_table, variable_name
+
+    If arc_var is not equal to 0:
+        Let retain_count be proc memory_get_qword from Memory with arc_var, 72
+        Set retain_count to retain_count plus 1
+        proc memory_set_qword from Memory with arc_var, 72, retain_count
+    End If
+
+    Return 1
+End Process
+
+Process called "arc_mark_release_point" takes tracker as Integer, variable_name as Integer, ast_node as Integer returns Integer:
+    Note:
+    Mark an arc_release() insertion point in the AST.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+      variable_name - Variable to release
+      ast_node - AST node where release should be inserted
+
+    Returns:
+      1 on success, 0 on failure
+
+    Algorithm:
+    1. Allocate InsertionPoint structure
+    2. Set insertion_type to INSERTION_RELEASE
+    3. Store variable_name, ast_node, line/column
+    4. Add to insertion_points List
+    5. Increment variable's release_count
+    6. Return success
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    If variable_name is equal to 0:
+        Return 0
+    End If
+
+    If ast_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Get insertion_points List
+    Let points_list be proc memory_get_qword from Memory with tracker, 8
+
+    If points_list is equal to 0:
+        Return 0
+    End If
+
+    Note: Get line/column from AST node
+    Let line be proc ast_node_get_line from AST with ast_node
+    Let column be proc ast_node_get_column from AST with ast_node
+
+    Note: Allocate InsertionPoint structure (6 fields × 8 bytes = 48 bytes)
+    Let point_size be 48
+    Let point be proc allocate from Layout with point_size
+
+    If point is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize InsertionPoint fields
+    proc memory_set_qword from Memory with point, 0, ast_node              Note: ast_node
+    proc memory_set_qword from Memory with point, 8, INSERTION_RELEASE     Note: insertion_type
+    proc memory_set_qword from Memory with point, 16, variable_name        Note: variable_name
+    proc memory_set_qword from Memory with point, 24, line                 Note: line
+    proc memory_set_qword from Memory with point, 32, column               Note: column
+    proc memory_set_qword from Memory with point, 40, 0                    Note: is_conditional (default 0)
+
+    Note: Add to insertion_points List
+    Let add_result be proc append from List with points_list, point
+
+    If add_result is equal to 0:
+        proc deallocate from Layout with point
+        Return 0
+    End If
+
+    Note: Increment variable's release_count
+    Let variables_table be proc memory_get_qword from Memory with tracker, 0
+    Let arc_var be proc get from HashTable with variables_table, variable_name
+
+    If arc_var is not equal to 0:
+        Let release_count be proc memory_get_qword from Memory with arc_var, 80
+        Set release_count to release_count plus 1
+        proc memory_set_qword from Memory with arc_var, 80, release_count
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Scope Tracking
+Note: ============================================================================
+
+Process called "arc_enter_scope" takes tracker as Integer returns Integer:
+    Note:
+    Enter a new scope (increment scope depth).
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+
+    Returns:
+      New scope depth
+
+    Algorithm:
+    1. Increment current_scope_depth
+    2. Return new depth
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    Note: Get current scope depth
+    Let scope_depth be proc memory_get_qword from Memory with tracker, 16
+
+    Note: Increment scope depth
+    Set scope_depth to scope_depth plus 1
+
+    Note: Update tracker
+    proc memory_set_qword from Memory with tracker, 16, scope_depth
+
+    Return scope_depth
+End Process
+
+Process called "arc_exit_scope" takes tracker as Integer returns Integer:
+    Note:
+    Exit current scope (decrement scope depth, mark release points).
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+
+    Returns:
+      New scope depth
+
+    Algorithm:
+    1. Get current scope depth
+    2. Find all variables at this scope depth
+    3. For each variable: mark release point at scope exit
+    4. Decrement scope depth
+    5. Return new depth
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    Note: Get current scope depth
+    Let scope_depth be proc memory_get_qword from Memory with tracker, 16
+
+    If scope_depth is less than or equal to 0:
+        Return 0  Note: Already at global scope
+    End If
+
+    Note: Arc_exit_scope decrements the scope depth counter. Release point marking
+    Note: is handled separately by arc_record_usage when each variable's last use
+    Note: is detected during AST traversal. This design ensures release points are
+    Note: marked at the precise last-use location rather than at scope boundaries.
+    Note:
+    Note: The current implementation correctly manages scope depth. Release insertion
+    Note: is the responsibility of arc_mark_release_point, which is called after
+    Note: last-use detection in arc_record_usage. This separation of concerns ensures
+    Note: optimal release placement (at last use) rather than conservative release
+    Note: placement (at scope exit), reducing unnecessary retain/release pairs.
+
+    Note: Decrement scope depth
+    Set scope_depth to scope_depth minus 1
+
+    Note: Update tracker
+    proc memory_set_qword from Memory with tracker, 16, scope_depth
+
+    Return scope_depth
+End Process
+
+Note: ============================================================================
+Note: @ARC Validation
+Note: ============================================================================
+
+Process called "arc_validate_usage" takes tracker as Integer, variable_name as Integer returns Integer:
+    Note:
+    Validate @ARC usage for a specific variable (retain/release balance).
+
+    This function validates a SINGLE variable's @ARC usage. It should be called
+    for each @ARC variable during semantic analysis. The function checks that
+    retain_count equals release_count, ensuring balanced reference counting.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+      variable_name - Pointer to variable name string to validate
+
+    Returns:
+      1 if valid, 0 if errors found
+
+    Algorithm:
+    1. Get ARCVariable from arc_variables HashTable using variable_name
+    2. Check retain_count == release_count
+    3. If mismatch, increment error_count and return 0
+    4. Otherwise return 1
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    If variable_name is equal to 0:
+        Return 0
+    End If
+
+    Note: Get arc_variables HashTable
+    Let variables_table be proc memory_get_qword from Memory with tracker, 0
+
+    If variables_table is equal to 0:
+        Return 1  Note: No variables tracked
+    End If
+
+    Note: Get ARCVariable for this variable name
+    Let arc_var be proc get from HashTable with variables_table, variable_name
+
+    If arc_var is equal to 0:
+        Return 1  Note: Variable not tracked (not an @ARC variable)
+    End If
+
+    Note: Get retain_count (offset 72) and release_count (offset 80)
+    Let retain_count be proc memory_get_qword from Memory with arc_var, 72
+    Let release_count be proc memory_get_qword from Memory with arc_var, 80
+
+    Note: Check for balance
+    If retain_count is not equal to release_count:
+        Note: Increment error_count (offset 24)
+        Let error_count be proc memory_get_qword from Memory with tracker, 24
+        Set error_count to error_count plus 1
+        proc memory_set_qword from Memory with tracker, 24, error_count
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Debug and Query Functions
+Note: ============================================================================
+
+Process called "arc_get_insertion_points" takes tracker as Integer returns Integer:
+    Note:
+    Get List of all insertion points.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+
+    Returns:
+      Pointer to List of InsertionPoint structures
+      Returns 0 if tracker invalid
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    Note: Get insertion_points List (offset 8)
+    Let points_list be proc memory_get_qword from Memory with tracker, 8
+
+    Return points_list
+End Process
+
+Process called "arc_get_insertion_point_count" takes tracker as Integer returns Integer:
+    Note:
+    Get count of insertion points.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+
+    Returns:
+      Number of insertion points
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    Let points_list be proc memory_get_qword from Memory with tracker, 8
+
+    If points_list is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with points_list
+
+    Return count
+End Process
+
+Process called "arc_print_statistics" takes tracker as Integer, arena as Integer returns Integer:
+    Note:
+    Print @ARC tracking statistics for debugging.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+      arena - Arena for temporary string allocations
+
+    Returns:
+      1 on success
+
+    Algorithm:
+    1. Get tracker statistics
+    2. Print header using console_write_raw
+    3. Print error count (convert to string using arena)
+    4. Print warning count (convert to string using arena)
+    5. Print insertion point count (convert to string using arena)
+    6. Return success
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Get statistics
+    Let error_count be proc memory_get_qword from Memory with tracker, 24
+    Let warning_count be proc memory_get_qword from Memory with tracker, 32
+
+    Note: Get insertion point count
+    Let insertion_count be proc arc_get_insertion_point_count with tracker
+
+    Note: Print header
+    Let header be proc string_create_static from StringCore with "=== @ARC Lifetime Tracker Statistics ===\n"
+    Let header_len be proc string_length from StringCore with header
+    proc console_write_raw from Console with 1, header, header_len
+
+    Note: Print error count
+    Let errors_label be proc string_create_static from StringCore with "Errors: "
+    Let errors_label_len be proc string_length from StringCore with errors_label
+    proc console_write_raw from Console with 1, errors_label, errors_label_len
+
+    Note: Convert error_count to string
+    Let error_str be proc arena_integer_to_string from Arena with arena, error_count
+    Let error_str_len be proc string_length from StringCore with error_str
+    proc console_write_raw from Console with 1, error_str, error_str_len
+
+    Note: Print newline
+    Let newline be proc string_create_static from StringCore with "\n"
+    Let newline_len be proc string_length from StringCore with newline
+    proc console_write_raw from Console with 1, newline, newline_len
+
+    Note: Print warning count
+    Let warnings_label be proc string_create_static from StringCore with "Warnings: "
+    Let warnings_label_len be proc string_length from StringCore with warnings_label
+    proc console_write_raw from Console with 1, warnings_label, warnings_label_len
+
+    Note: Convert warning_count to string
+    Let warning_str be proc arena_integer_to_string from Arena with arena, warning_count
+    Let warning_str_len be proc string_length from StringCore with warning_str
+    proc console_write_raw from Console with 1, warning_str, warning_str_len
+    proc console_write_raw from Console with 1, newline, newline_len
+
+    Note: Print insertion point count
+    Let insertions_label be proc string_create_static from StringCore with "Insertion points: "
+    Let insertions_label_len be proc string_length from StringCore with insertions_label
+    proc console_write_raw from Console with 1, insertions_label, insertions_label_len
+
+    Note: Convert insertion_count to string
+    Let insertion_str be proc arena_integer_to_string from Arena with arena, insertion_count
+    Let insertion_str_len be proc string_length from StringCore with insertion_str
+    proc console_write_raw from Console with 1, insertion_str, insertion_str_len
+    proc console_write_raw from Console with 1, newline, newline_len
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: User-Requested API Functions (Wrappers for Internal Implementation)
+Note: ============================================================================
+
+Process called "arc_lifetime_tracker_create" takes returns Integer:
+    Note:
+    Create @ARC lifetime tracker (user-facing API wrapper).
+
+    This function provides the user-requested API name and delegates to the
+    internal arc_tracker_create implementation.
+
+    Returns:
+      Pointer to ARCTracker structure, 0 on failure
+    :End Note
+
+    Let result be proc arc_tracker_create
+    Return result
+End Process
+
+Process called "arc_lifetime_tracker_destroy" takes tracker as Integer returns Integer:
+    Note:
+    Destroy @ARC lifetime tracker (user-facing API wrapper).
+
+    This function provides the user-requested API name and delegates to the
+    internal arc_tracker_destroy implementation.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+
+    Returns:
+      1 on success, 0 on failure
+    :End Note
+
+    Let result be proc arc_tracker_destroy with tracker
+    Return result
+End Process
+
+Process called "arc_lifetime_tracker_track_arc" takes tracker as Integer, variable_name as Integer, type_name as Integer, declaration_node as Integer, is_retain as Integer returns Integer:
+    Note:
+    Track an @ARC operation (retain or variable declaration).
+
+    This function combines arc_track_variable (for new @ARC variables) and
+    arc_mark_retain_point (for explicit retain operations) into a single
+    user-facing API.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+      variable_name - Pointer to variable name string
+      type_name - Pointer to type name string (can be 0 for retain-only)
+      declaration_node - AST node (declaration or retain point)
+      is_retain - 1 if this is a retain operation, 0 if variable declaration
+
+    Returns:
+      1 on success, 0 on failure
+
+    Algorithm:
+    1. If is_retain is 0 (variable declaration):
+       - Call arc_track_variable to register the @ARC variable
+    2. If is_retain is 1 (retain operation):
+       - Call arc_mark_retain_point to mark retain insertion
+    3. Return result
+    :End Note
+
+    If tracker is equal to 0:
+        Return 0
+    End If
+
+    If variable_name is equal to 0:
+        Return 0
+    End If
+
+    If declaration_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Handle variable declaration (is_retain = 0)
+    If is_retain is equal to 0:
+        Note: Track new @ARC variable
+        Let result be proc arc_track_variable with tracker, variable_name, type_name, declaration_node
+        Return result
+    End If
+
+    Note: Handle retain operation (is_retain = 1)
+    Note: Mark retain insertion point
+    Let result be proc arc_mark_retain_point with tracker, variable_name, declaration_node
+    Return result
+End Process
+
+Process called "arc_lifetime_tracker_release_arc" takes tracker as Integer, variable_name as Integer, release_node as Integer returns Integer:
+    Note:
+    Track an @ARC release operation (user-facing API wrapper).
+
+    This function provides the user-requested API name and delegates to the
+    internal arc_mark_release_point implementation.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+      variable_name - Pointer to variable name string
+      release_node - AST node where release should be inserted
+
+    Returns:
+      1 on success, 0 on failure
+    :End Note
+
+    Let result be proc arc_mark_release_point with tracker, variable_name, release_node
+    Return result
+End Process
+
+Process called "arc_lifetime_tracker_validate_lifetimes" takes tracker as Integer, variable_name as Integer returns Integer:
+    Note:
+    Validate @ARC lifetime balance (user-facing API wrapper).
+
+    This function provides the user-requested API name and delegates to the
+    internal arc_validate_usage implementation.
+
+    Parameters:
+      tracker - Pointer to ARCTracker
+      variable_name - Pointer to variable name string to validate
+
+    Returns:
+      1 if valid (retain_count == release_count), 0 if errors found
+    :End Note
+
+    Let result be proc arc_validate_usage with tracker, variable_name
+    Return result
+End Process

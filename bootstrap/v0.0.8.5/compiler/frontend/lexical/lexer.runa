@@ -37,7 +37,7 @@ This file consists of the following functions/features/operation types:
 - Character-by-character source scanning
 - Token type determination and dispatch
 - Whitespace and comment processing
-- Indentation-based scoping (INDENT/DEDENT tokens)
+- Aesthetic indentation tracking (consistency warnings, not syntactic)
 - Error token generation and recovery
 - Token stream construction
 
@@ -57,120 +57,307 @@ Import "compiler/frontend/lexical/encasing_handler.runa" as EncasingHandler
 Import "compiler/frontend/lexical/statement_patterns.runa" as StatementPatterns
 Import "compiler/frontend/lexical/token_stream.runa" as TokenStream
 Import "compiler/frontend/lexical/import_resolver.runa" as ImportResolver
+Import "compiler/frontend/lexical/syntax_transformer.runa" as SyntaxTransformer
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/stack.runa" as Stack
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/diagnostics/diagnostics_engine.runa" as Diagnostics
+Import "compiler/frontend/diagnostics/errors.runa" as Errors
+Import "runtime/core/memory/arena.runa" as Arena
 
 Note: ============================================================================
 Note: Lexer Mode Constants
 Note: ============================================================================
 
-Define constant LEXER_MODE_CANON as 0       Note: Canon mode (natural language syntax)
-Define constant LEXER_MODE_DEVELOPER as 1   Note: Developer mode (symbol syntax)
-Define constant LEXER_MODE_VIEWER as 2      Note: Viewer mode (display-optimized)
+Constant LEXER_MODE_CANON as Integer is 0       Note: Canon mode (natural language syntax)
+Constant LEXER_MODE_DEVELOPER as Integer is 1   Note: Developer mode (symbol syntax)
+Constant LEXER_MODE_VIEWER as Integer is 2      Note: Viewer mode (display-optimized)
+
+Note: ============================================================================
+Note: Control Token Type Constants
+Note: ============================================================================
+
+Constant TOKEN_EOF as Integer is 0              Note: End of file
+Constant TOKEN_ERROR as Integer is 1            Note: Error token
+Constant TOKEN_IDENTIFIER as Integer is 200     Note: Identifier (variable/function name)
+Constant TOKEN_COMMENT as Integer is 250        Note: Comment token
+Constant TOKEN_NEWLINE as Integer is 10         Note: Newline character
+Constant TOKEN_WARNING as Integer is 2          Note: Warning token (non-fatal issues like inconsistent indentation)
+
+Note: TOKEN_INDENT and TOKEN_DEDENT are NOT used in Runa
+Note: Indentation is AESTHETIC ONLY - tracked for consistency warnings, NOT syntactic like Python
+Note: The lexer tracks indentation state but does NOT emit tokens that affect parsing
 
 Note: ============================================================================
 Note: Lexer State Structure
 Note: ============================================================================
 
 Type called "LexerState":
-    source_code as Integer      Note: Pointer to source code string
-    source_length as Integer    Note: Length of source code
-    current_position as Integer Note: Current character position in source
-    line as Integer            Note: Current line number (1-indexed)
-    column as Integer          Note: Current column number (1-indexed)
-    mode as Integer            Note: Lexer mode (CANON, DEVELOPER, VIEWER)
-    
+    source_code as Integer      Note: Pointer to source code string (offset 0)
+    source_length as Integer    Note: Length of source code (offset 8)
+    current_position as Integer Note: Current character position in source (offset 16)
+    line as Integer            Note: Current line number (1-indexed) (offset 24)
+    column as Integer          Note: Current column number (1-indexed) (offset 32)
+    mode as Integer            Note: Lexer mode (CANON, DEVELOPER, VIEWER) (offset 40)
+
     Note: Indentation tracking for scoping
-    indentation_stack as Integer Note: Stack of indentation levels
-    current_indent_level as Integer Note: Current indentation depth
-    indent_size as Integer      Note: Number of spaces per indent level (typically 4)
-    
+    indentation_stack as Integer Note: Stack of indentation levels (offset 48)
+    current_indent_level as Integer Note: Current indentation depth (offset 56)
+    indent_size as Integer      Note: Number of spaces per indent level (typically 4) (offset 64)
+
     Note: Tokenization state
-    tokens as Integer          Note: Dynamic array of generated tokens
-    token_count as Integer     Note: Number of tokens generated
-    
+    tokens as Integer          Note: Dynamic array of generated tokens (offset 72)
+    token_count as Integer     Note: Number of tokens generated (offset 80)
+
     Note: Error tracking
-    error_count as Integer     Note: Number of lexical errors encountered
-    errors as Integer          Note: Array of error structures
-    
+    error_count as Integer     Note: Number of lexical errors encountered (offset 88)
+    errors as Integer          Note: Array of error structures (offset 96)
+
     Note: Context tracking
-    in_string as Integer       Note: Boolean: 1 if inside string literal
-    in_comment as Integer      Note: Boolean: 1 if inside multi-line comment
-    in_encasing as Integer     Note: Boolean: 1 if in variable encasing context
-    delimiter_context as Integer Note: Pointer to DelimiterContext for bracket tracking
-    keyword_table as Integer   Note: Pointer to KeywordTable for keyword lookup
-    
+    in_string as Integer       Note: Boolean: 1 if inside string literal (offset 104)
+    in_comment as Integer      Note: Boolean: 1 if inside multi-line comment (offset 112)
+    in_encasing as Integer     Note: Boolean: 1 if in variable encasing context (offset 120)
+    delimiter_context as Integer Note: Pointer to DelimiterContext for bracket tracking (offset 128)
+    keyword_table as Integer   Note: Pointer to KeywordTable for keyword lookup (offset 136)
+
     Note: Configuration
-    strict_mode as Integer     Note: Boolean: 1 for strict error handling
-    allow_tabs as Integer      Note: Boolean: 1 to allow tab characters
-    report_warnings as Integer Note: Boolean: 1 to report non-fatal warnings
+    strict_mode as Integer        Note: Boolean: 1 for strict error handling (offset 144)
+    allow_tabs as Integer         Note: Boolean: 1 to allow tab characters (offset 152)
+    report_warnings as Integer    Note: Boolean: 1 to report non-fatal warnings (offset 160)
+    preserve_comments as Integer  Note: Boolean: 1 to keep comment tokens (offset 168)
+    preserve_whitespace as Integer Note: Boolean: 1 to keep whitespace tokens (offset 176)
+
+    Note: Indentation tracking state
+    at_line_start as Integer      Note: Boolean: 1 if at start of logical line (for indentation checking) (offset 184)
+
+    Note: Diagnostics integration (v0.0.8.5)
+    diagnostics_engine as Integer Note: OWNED DiagnosticsEngine for error reporting (offset 192)
+    arena as Integer              Note: Arena for temporary allocations during lexing (offset 200)
 
 Note: ============================================================================
 Note: Lexer Creation and Initialization
 Note: ============================================================================
 
-Process called "lexer_create" takes source_code as Integer, source_length as Integer, mode as Integer returns Integer:
-    Note: Create and initialize a new lexer
-    Note: 
-    Note: Parameters:
-    Note:   source_code - Pointer to source code string
-    Note:   source_length - Length of source code
-    Note:   mode - Lexer mode (LEXER_MODE_CANON, LEXER_MODE_DEVELOPER, etc.)
-    Note: 
-    Note: Returns:
-    Note:   Pointer to initialized LexerState structure
-    Note:   Returns 0 on allocation failure
-    Note: 
-    Note: Initialization:
-    Note:   - Position = 0, line = 1, column = 1
-    Note:   - Empty indentation stack (initial level 0)
-    Note:   - Empty token array
-    Note:   - Create DelimiterContext for bracket tracking
-    Note:   - Create KeywordTable for keyword recognition
-    Note:   - Set default configuration (strict_mode=1, allow_tabs=0, etc.)
-    Note: 
-    Note: Algorithm:
-    Note: 1. Allocate LexerState structure
-    Note: 2. Store source code pointer and length
-    Note: 3. Initialize position/line/column
-    Note: 4. Create indentation stack
-    Note: 5. Create token array (dynamic)
-    Note: 6. Create error array
-    Note: 7. Initialize DelimiterContext
-    Note: 8. Initialize KeywordTable
-    Note: 9. Set mode and configuration flags
-    Note: 10. Return LexerState
-    Note: 
-    Note: TODO: Implement using:
-    Note: - Layout.allocate for LexerState
-    Note: - DynamicArray for tokens and errors
-    Note: - Delimiters.create_delimiter_context
-    Note: - Keywords.create_keyword_table
-    
-    Return 0  Note: Placeholder
+Process called "lexer_create" takes source_code as Integer, source_length as Integer, mode as Integer, arena as Integer returns Integer:
+    Note:
+    Create and initialize a new lexer
+
+    Parameters:
+      source_code - Pointer to source code string
+      source_length - Length of source code
+      mode - Lexer mode (LEXER_MODE_CANON, LEXER_MODE_DEVELOPER, etc.)
+      arena - Arena for temporary allocations during lexing
+
+    Returns:
+      Pointer to initialized LexerState structure
+      Returns 0 on allocation failure
+    :End Note
+
+    Note: Validate inputs
+    If source_code is equal to 0:
+        Return 0  Note: NULL source code
+    End If
+
+    If source_length is less than or equal to 0:
+        Return 0  Note: Invalid length
+    End If
+
+    If arena is equal to 0:
+        Return 0  Note: NULL arena
+    End If
+
+    Note: Allocate LexerState structure (26 fields × 8 bytes = 208 bytes)
+    Let lexer_size be 208
+    Let lexer be proc allocate from Layout with lexer_size
+
+    If lexer is equal to 0:
+        Return 0  Note: Allocation failed
+    End If
+
+    Note: Store source code pointer and length (offsets 0, 8)
+    proc memory_set_qword from Layout with lexer, 0, source_code
+    proc memory_set_qword from Layout with lexer, 8, source_length
+
+    Note: Initialize position tracking (offsets 16, 24, 32)
+    proc memory_set_qword from Layout with lexer, 16, 0   Note: current_position = 0
+    proc memory_set_qword from Layout with lexer, 24, 1   Note: line = 1
+    proc memory_set_qword from Layout with lexer, 32, 1   Note: column = 1
+
+    Note: Store mode (offset 40)
+    proc memory_set_qword from Layout with lexer, 40, mode
+
+    Note: Initialize indentation tracking (offsets 48, 56, 64)
+    Let indent_stack be proc stack_create from Stack
+    proc memory_set_qword from Layout with lexer, 48, indent_stack  Note: indentation_stack
+    Note: Push initial indentation level 0 onto stack
+    Let push_result be proc stack_push from Stack with indent_stack, 0
+    proc memory_set_qword from Layout with lexer, 56, 0   Note: current_indent_level = 0
+    proc memory_set_qword from Layout with lexer, 64, 4   Note: indent_size = 4
+
+    Note: Initialize token tracking (offsets 72, 80)
+    Let tokens_list be proc create from List
+    proc memory_set_qword from Layout with lexer, 72, tokens_list
+    proc memory_set_qword from Layout with lexer, 80, 0   Note: token_count = 0
+
+    Note: Initialize error tracking (offsets 88, 96)
+    proc memory_set_qword from Layout with lexer, 88, 0   Note: error_count = 0
+    Let errors_list be proc create from List
+    proc memory_set_qword from Layout with lexer, 96, errors_list
+
+    Note: Initialize context flags (offsets 104, 112, 120)
+    proc memory_set_qword from Layout with lexer, 104, 0  Note: in_string = 0
+    proc memory_set_qword from Layout with lexer, 112, 0  Note: in_comment = 0
+    proc memory_set_qword from Layout with lexer, 120, 0  Note: in_encasing = 0
+
+    Note: Initialize delimiter context and keyword table (offsets 128, 136)
+    Let delimiter_context be proc create_delimiter_context from Delimiters
+    proc memory_set_qword from Layout with lexer, 128, delimiter_context
+    Let keyword_table be proc create_keyword_table from Keywords
+    proc memory_set_qword from Layout with lexer, 136, keyword_table
+
+    Note: Set default configuration (offsets 144, 152, 160, 168, 176)
+    proc memory_set_qword from Layout with lexer, 144, 1  Note: strict_mode = 1
+    proc memory_set_qword from Layout with lexer, 152, 0  Note: allow_tabs = 0
+    proc memory_set_qword from Layout with lexer, 160, 1  Note: report_warnings = 1
+    proc memory_set_qword from Layout with lexer, 168, 0  Note: preserve_comments = 0
+    proc memory_set_qword from Layout with lexer, 176, 0  Note: preserve_whitespace = 0
+
+    Note: Initialize indentation tracking state (offset 184)
+    proc memory_set_qword from Layout with lexer, 184, 1  Note: at_line_start = 1 (start at beginning of first line)
+
+    Note: Create diagnostics engine for error reporting (offset 192)
+    Let diagnostics_engine be proc diagnostics_engine_create from Diagnostics with arena
+
+    If diagnostics_engine is equal to 0:
+        Note: Cleanup on failure - cascade cleanup
+        If keyword_table is not equal to 0:
+            Let destroy_result be proc destroy_keyword_table from Keywords with keyword_table
+        End If
+        If delimiter_context is not equal to 0:
+            Let destroy_result be proc destroy_delimiter_context from Delimiters with delimiter_context
+        End If
+        If errors_list is not equal to 0:
+            Let destroy_result be proc destroy from List with errors_list
+        End If
+        If tokens_list is not equal to 0:
+            Let destroy_result be proc destroy from List with tokens_list
+        End If
+        If indent_stack is not equal to 0:
+            Let destroy_result be proc stack_destroy from Stack with indent_stack
+        End If
+        Let dealloc_result be proc deallocate from Layout with lexer
+        Return 0  Note: Diagnostics engine creation failed
+    End If
+
+    proc memory_set_qword from Layout with lexer, 192, diagnostics_engine
+
+    Note: Store arena reference (offset 200)
+    proc memory_set_qword from Layout with lexer, 200, arena
+
+    Return lexer
 End Process
 
 Process called "lexer_destroy" takes lexer as Integer returns Integer:
-    Note: Clean up and deallocate lexer resources
     Note: 
+    Clean up and deallocate lexer resources
+    
     Note: Parameters:
     Note:   lexer - Pointer to LexerState to destroy
-    Note: 
+    
     Note: Returns:
     Note:   1 on success
-    Note: 
-    Note: Frees:
-    Note:   - Indentation stack
-    Note:   - Token array and individual tokens
-    Note:   - Error array and individual errors
-    Note:   - DelimiterContext
-    Note:   - KeywordTable
-    Note:   - LexerState structure itself
-    Note: 
-    Note: TODO: Implement deallocation of all resources
-    
-    Return 1  Note: Placeholder
+    :End Note
+
+    If lexer is equal to 0:
+        Return 1  Note: NULL lexer, nothing to destroy
+    End If
+
+    Note: Deallocate indentation_stack (offset 48) if not NULL
+    Let indentation_stack be proc memory_get_qword from Layout with lexer, 48
+    If indentation_stack is not equal to 0:
+        Let destroy_result be proc stack_destroy from Stack with indentation_stack
+    End If
+
+    Note: Deallocate tokens array (offset 72) and individual tokens if not NULL
+    Let tokens be proc memory_get_qword from Layout with lexer, 72
+    Let token_count be proc memory_get_qword from Layout with lexer, 80
+    If tokens is not equal to 0:
+        Note: Free each individual token
+        Let token_index be 0
+        Loop forever:
+            If token_index is greater than or equal to token_count:
+                Break
+            End If
+
+            Note: Get token pointer from array (array stores pointers, each 8 bytes)
+            Let token_offset be token_index multiplied by 8
+            Let token_ptr be proc memory_get_qword from Layout with tokens, token_offset
+
+            Note: Free the token if it's not NULL
+            If token_ptr is not equal to 0:
+                Let dealloc_result be proc deallocate from Layout with token_ptr
+            End If
+
+            Set token_index to token_index plus 1
+        End Loop
+
+        Note: Free the tokens array itself
+        Let dealloc_result be proc deallocate from Layout with tokens
+    End If
+
+    Note: Deallocate errors array (offset 96) and individual errors if not NULL
+    Let errors be proc memory_get_qword from Layout with lexer, 96
+    Let error_count be proc memory_get_qword from Layout with lexer, 88
+    If errors is not equal to 0:
+        Note: Free each individual error
+        Let error_index be 0
+        Loop forever:
+            If error_index is greater than or equal to error_count:
+                Break
+            End If
+
+            Note: Get error pointer from array (array stores pointers, each 8 bytes)
+            Let error_offset be error_index multiplied by 8
+            Let error_ptr be proc memory_get_qword from Layout with errors, error_offset
+
+            Note: Free the error if it's not NULL
+            If error_ptr is not equal to 0:
+                Let dealloc_result be proc deallocate from Layout with error_ptr
+            End If
+
+            Set error_index to error_index plus 1
+        End Loop
+
+        Note: Free the errors array itself
+        Let dealloc_result be proc deallocate from Layout with errors
+    End If
+
+    Note: Deallocate delimiter_context (offset 128) if not NULL
+    Let delimiter_context be proc memory_get_qword from Layout with lexer, 128
+    If delimiter_context is not equal to 0:
+        Note: Delimiter context has its own cleanup function
+        Let destroy_result be proc destroy_delimiter_context from Delimiters with delimiter_context
+    End If
+
+    Note: Deallocate keyword_table (offset 136) if not NULL
+    Let keyword_table be proc memory_get_qword from Layout with lexer, 136
+    If keyword_table is not equal to 0:
+        Note: Keyword table has its own cleanup function
+        Let destroy_result be proc destroy_keyword_table from Keywords with keyword_table
+    End If
+
+    Note: Destroy diagnostics_engine (offset 192) if not NULL
+    Let diagnostics_engine be proc memory_get_qword from Layout with lexer, 192
+    If diagnostics_engine is not equal to 0:
+        proc diagnostics_engine_destroy from Diagnostics with diagnostics_engine
+    End If
+
+    Note: Deallocate the lexer structure itself
+    Let dealloc_result be proc deallocate from Layout with lexer
+
+    Return 1  Note: Success
 End Process
 
 Note: ============================================================================
@@ -178,97 +365,496 @@ Note: Main Tokenization Entry Points
 Note: ============================================================================
 
 Process called "lexer_tokenize_all" takes lexer as Integer returns Integer:
-    Note: Tokenize entire source code into token stream
     Note: 
-    Note: Main entry point for lexical analysis
-    Note: Processes entire source from start to end
-    Note: 
+    Tokenize entire source code into token stream
+    Note:
+    Note: Main entry point for lexical analysis - tokenizes all source code
+    Note: Performs Developer syntax to Canonical syntax transformation
+    Note:
     Note: Parameters:
     Note:   lexer - Pointer to LexerState
-    Note: 
+    Note:
     Note: Returns:
-    Note:   Pointer to TokenStream containing all tokens
+    Note:   Pointer to TokenStream containing all tokens (Canonical form)
     Note:   Returns 0 on fatal error
-    Note: 
-    Note: Algorithm:
-    Note: 1. While not at end of source:
-    Note:    - Get next token using lexer_next_token
-    Note:    - Add token to tokens array
-    Note:    - Check for errors
-    Note: 2. Add final EOF token
-    Note: 3. Check indentation stack is empty (all blocks closed)
-    Note: 4. Create TokenStream from tokens array
-    Note: 5. Return TokenStream
-    Note: 
-    Note: TODO: Implement main tokenization loop
-    Note: - Call lexer_next_token repeatedly
-    Note: - Handle errors and continue
-    Note: - Create TokenStream from results
-    
-    Return 0  Note: Placeholder
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Create List to collect raw tokens
+    Let raw_tokens be proc create from List
+
+    If raw_tokens is equal to 0:
+        Return 0
+    End If
+
+    Note: Tokenize until EOF
+    Loop forever:
+        Note: Get next token (may be Developer or Canonical)
+        Let token be proc lexer_next_token with lexer
+
+        If token is equal to 0:
+            Break  Note: Error occurred
+        End If
+
+        Note: Add token to list
+        Let append_result be proc append from List with raw_tokens, token
+
+        Note: Check token type
+        Let token_type be proc memory_get_qword from Layout with token, 0
+
+        Note: Check for EOF
+        If token_type is equal to TOKEN_EOF:
+            Break
+        End If
+    End Loop
+
+    Note: Transform Developer syntax to Canonical syntax
+    Let canonical_tokens be proc transform_token_stream from SyntaxTransformer with raw_tokens
+
+    If canonical_tokens is equal to 0:
+        Note: Transformation failed - use raw tokens
+        Set canonical_tokens to raw_tokens
+    End If
+
+    Note: Convert List to array for TokenStream
+    Let token_count be proc size from List with canonical_tokens
+    Let array_size be token_count multiplied by 8
+    Let token_array be proc allocate from Layout with array_size
+
+    If token_array is equal to 0:
+        Return 0
+    End If
+
+    Note: Copy tokens from List to array
+    Let i be 0
+    While i is less than token_count:
+        Let token be proc get from List with canonical_tokens, i
+        Let token_offset be i multiplied by 8
+        proc memory_set_qword from Layout with token_array, token_offset, token
+        Set i to i plus 1
+    End While
+
+    Note: Create TokenStream with Canonical tokens
+    Let stream be proc create_token_stream from TokenStream with token_array, token_count
+
+    Return stream
+End Process
+
+Note: ============================================================================
+Note: Developer Syntax Transformation Integration
+Note: ============================================================================
+
+Process called "lexer_transform_if_needed" takes token as Integer, output_list as Integer returns Integer:
+    Note:
+    Check if token is Developer syntax and transform to Canonical if needed.
+
+    This function integrates the syntax transformer into the lexer pipeline.
+    It checks if a token represents Developer syntax (operators like &, |, <<, etc.)
+    and transforms it into the equivalent Canonical token sequence.
+
+    Parameters:
+      token - Token to potentially transform
+      output_list - List to append transformed Canonical tokens to
+
+    Returns:
+      1 if token was transformed (output_list contains Canonical tokens)
+      0 if token should be kept as-is (not Developer syntax)
+
+    Side Effects:
+      - If transformation occurs, appends Canonical tokens to output_list
+      - Original token may be freed or reused depending on transformation
+    :End Note
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Note: Get token type to check if it's a Developer operator
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+
+    Note: Check if this is a Developer syntax operator
+    Let is_developer be proc is_developer_operator from SyntaxTransformer with token_type
+
+    If is_developer is equal to 0:
+        Note: Not a Developer operator, keep as-is
+        Return 0
+    End If
+
+    Note: Transform the Developer token to Canonical token sequence
+    Let transform_result be proc transform_developer_token from SyntaxTransformer with token, output_list
+
+    Return transform_result
 End Process
 
 Process called "lexer_next_token" takes lexer as Integer returns Integer:
-    Note: Get next token from source code
     Note: 
-    Note: Core tokenization function - determines token type and dispatches
-    Note: to appropriate recognizer
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   Pointer to next Token
-    Note:   Returns TOKEN_EOF when end of source reached
-    Note:   Returns TOKEN_ERROR on unrecognized input
-    Note: 
-    Note: Algorithm:
-    Note: 1. Skip whitespace (track indentation changes)
-    Note: 2. Check for end of file
-    Note: 3. Get current character
-    Note: 4. Determine token type:
-    Note:    - If digit: numeric literal
-    Note:    - If quote: string literal
-    Note:    - If letter/underscore: identifier or keyword
-    Note:    - If operator symbol: operator or delimiter
-    Note:    - If Note:: comment
-    Note:    - Otherwise: error
-    Note: 5. Call appropriate recognizer function
-    Note: 6. Update position/line/column
-    Note: 7. Return token
-    Note: 
-    Note: TODO: Implement token type dispatch logic
-    Note: - Call lexer_determine_token_type (defined below)
-    Note: - Dispatch to appropriate component (Literals, Keywords, etc.)
+    Get next token from source code
     
-    Return 0  Note: Placeholder
+    Core tokenization function - dispatches to appropriate recognizer
+    
+    Parameters:
+      lexer - Pointer to LexerState
+    
+    Returns:
+      Pointer to next Token (or TOKEN_EOF/TOKEN_ERROR)
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: AESTHETIC INDENTATION TRACKING - Does NOT generate tokens
+    Note: Indentation is tracked for consistency warnings only, NOT for syntax
+    Note: Check if at start of line and track indentation (offset 184)
+    Let at_line_start be proc memory_get_qword from Layout with lexer, 184
+    If at_line_start is equal to 1:
+        Note: Clear the at_line_start flag
+        proc memory_set_qword from Layout with lexer, 184, 0
+
+        Note: Calculate current indentation level
+        Let position be proc memory_get_qword from Layout with lexer, 16
+        Let saved_position be position
+        Let current_line be proc memory_get_qword from Layout with lexer, 24
+        Let current_column be proc memory_get_qword from Layout with lexer, 32
+
+        Note: Count spaces at start of line
+        Let space_count be 0
+        Let source be proc memory_get_qword from Layout with lexer, 0
+        Let length be proc memory_get_qword from Layout with lexer, 8
+
+        Loop forever:
+            If position is greater than or equal to length:
+                Break
+            End If
+            Let ch be proc string_char_at from StringCore with source, position
+            If ch is equal to 32:  Note: Space
+                Set space_count to space_count plus 1
+                Set position to position plus 1
+            Otherwise:
+                Break
+            End If
+        End Loop
+
+        Note: Restore position (whitespace will be skipped later)
+        proc memory_set_qword from Layout with lexer, 16, saved_position
+
+        Note: Calculate indent level
+        Let indent_size be proc memory_get_qword from Layout with lexer, 64
+        Let new_indent_level be space_count divided by indent_size
+
+        Note: Check for inconsistent indentation (not a multiple of indent_size)
+        Let expected_spaces be new_indent_level multiplied by indent_size
+        If space_count is not equal to expected_spaces:
+            If space_count is greater than 0:
+                Note: Inconsistent indentation - generate warning
+                Let warning_msg be proc string_create from StringCore with "Inconsistent indentation: "
+                Let spaces_str be proc integer_to_string from StringCore with space_count
+                Set warning_msg to proc string_concat from StringCore with warning_msg, spaces_str
+                Set warning_msg to proc string_concat from StringCore with warning_msg, " spaces (expected multiple of "
+                Let indent_str be proc integer_to_string from StringCore with indent_size
+                Set warning_msg to proc string_concat from StringCore with warning_msg, indent_str
+                Set warning_msg to proc string_concat from StringCore with warning_msg, ")"
+
+                Note: Create warning error token (non-fatal)
+                Let warning_token be proc allocate from Layout with 48
+                If warning_token is not equal to 0:
+                    proc memory_set_qword from Layout with warning_token, 0, TOKEN_WARNING
+                    proc memory_set_qword from Layout with warning_token, 8, warning_msg
+                    proc memory_set_qword from Layout with warning_token, 16, current_line
+                    proc memory_set_qword from Layout with warning_token, 24, current_column
+                    proc memory_set_qword from Layout with warning_token, 32, space_count
+                    proc memory_set_qword from Layout with warning_token, 40, 0
+
+                    Note: Add to errors list for reporting (offset 96)
+                    Let errors_list be proc memory_get_qword from Layout with lexer, 96
+                    If errors_list is not equal to 0:
+                        proc add from List with errors_list, warning_token
+                        Let error_count be proc memory_get_qword from Layout with lexer, 88
+                        Set error_count to error_count plus 1
+                        proc memory_set_qword from Layout with lexer, 88, error_count
+                    End If
+                End If
+            End If
+        End If
+
+        Note: Get current indent level from stack top
+        Let indent_stack be proc memory_get_qword from Layout with lexer, 48
+        Let stack_top be proc stack_peek from Stack with indent_stack
+
+        Note: Track indentation changes (but don't generate tokens)
+        If new_indent_level is greater than stack_top:
+            Note: Indentation increased - update stack for tracking
+            Let push_result be proc stack_push from Stack with indent_stack, new_indent_level
+            proc memory_set_qword from Layout with lexer, 56, new_indent_level
+        Otherwise If new_indent_level is less than stack_top:
+            Note: Indentation decreased - pop stack to match new level
+            Loop forever:
+                Let current_stack_top be proc stack_peek from Stack with indent_stack
+                If new_indent_level is greater than or equal to current_stack_top:
+                    Break
+                End If
+
+                Note: Check for misaligned dedent (not matching any previous indent level)
+                If current_stack_top is equal to 0:
+                    Note: Misaligned dedent - generate warning
+                    Let warning_msg be proc string_create from StringCore with "Misaligned dedent: indent level "
+                    Let level_str be proc integer_to_string from StringCore with new_indent_level
+                    Set warning_msg to proc string_concat from StringCore with warning_msg, level_str
+                    Set warning_msg to proc string_concat from StringCore with warning_msg, " doesn't match any previous indent level"
+
+                    Let warning_token be proc allocate from Layout with 48
+                    If warning_token is not equal to 0:
+                        proc memory_set_qword from Layout with warning_token, 0, TOKEN_WARNING
+                        proc memory_set_qword from Layout with warning_token, 8, warning_msg
+                        proc memory_set_qword from Layout with warning_token, 16, current_line
+                        proc memory_set_qword from Layout with warning_token, 24, current_column
+                        proc memory_set_qword from Layout with warning_token, 32, space_count
+                        proc memory_set_qword from Layout with warning_token, 40, 0
+
+                        Let errors_list be proc memory_get_qword from Layout with lexer, 96
+                        If errors_list is not equal to 0:
+                            proc add from List with errors_list, warning_token
+                            Let error_count be proc memory_get_qword from Layout with lexer, 88
+                            Set error_count to error_count plus 1
+                            proc memory_set_qword from Layout with lexer, 88, error_count
+                        End If
+                    End If
+                    Break
+                End If
+
+                Let popped_value be proc stack_pop from Stack with indent_stack
+            End Loop
+
+            Note: Update current indent level
+            proc memory_set_qword from Layout with lexer, 56, new_indent_level
+        End If
+        Note: If indentation is equal, no tracking changes needed
+        Note: Continue to normal tokenization - indentation does NOT affect parsing
+    End If
+
+    Note: Skip whitespace
+    proc lexer_skip_whitespace with lexer
+
+    Note: Check if at end
+    Let at_end be proc lexer_is_at_end with lexer
+    If at_end is equal to 1:
+        Note: Create EOF token
+        Let token be proc allocate from Layout with 48
+        If token is equal to 0:
+            Return 0
+        End If
+        proc memory_set_qword from Layout with token, 0, TOKEN_EOF
+        Return token
+    End If
+
+    Note: Get current character
+    Let current_char be proc lexer_peek_char with lexer, 0
+
+    Note: Determine token type
+    Let token_type be proc lexer_determine_token_type with lexer, current_char
+
+    Note: Dispatch based on type
+    If token_type is equal to 1:  Note: Digit - numeric literal
+        Let start_pos be proc memory_get_qword from Layout with lexer, 16
+        Let start_line be proc memory_get_qword from Layout with lexer, 24
+        Let start_column be proc memory_get_qword from Layout with lexer, 32
+        Let token be proc tokenize_numeric_literal from Literals with lexer, start_pos, start_line, start_column
+        Return token
+    End If
+
+    If token_type is equal to 2:  Note: String quote
+        Let start_pos be proc memory_get_qword from Layout with lexer, 16
+        Let start_line be proc memory_get_qword from Layout with lexer, 24
+        Let start_column be proc memory_get_qword from Layout with lexer, 32
+        Let token be proc tokenize_string_literal from Literals with lexer, start_pos, start_line, start_column
+        Return token
+    End If
+
+    If token_type is equal to 3:  Note: Identifier/keyword
+        Let token be proc lexer_tokenize_identifier_or_keyword with lexer
+        Return token
+    End If
+
+    If token_type is equal to 4:  Note: Delimiter
+        Let start_line be proc memory_get_qword from Layout with lexer, 24
+        Let start_column be proc memory_get_qword from Layout with lexer, 32
+        Let delimiter_context be proc memory_get_qword from Layout with lexer, 128
+
+        Note: Get delimiter type from tokenize_delimiter (returns integer token type)
+        Let delimiter_type be proc tokenize_delimiter from Delimiters with lexer, current_char, start_line, start_column, delimiter_context
+        If delimiter_type is equal to 0:
+            Return 0  Note: Unrecognized delimiter or error
+        End If
+
+        Note: Get delimiter symbol string for token value
+        Let delimiter_symbol be proc delimiter_type_to_string from Delimiters with delimiter_type
+
+        Note: Create full Token structure
+        Let token be proc create_delimiter_token from Delimiters with delimiter_type, delimiter_symbol, start_line, start_column
+        Return token
+    End If
+
+    If token_type is equal to 5:  Note: Operator
+        Let start_line be proc memory_get_qword from Layout with lexer, 24
+        Let start_column be proc memory_get_qword from Layout with lexer, 32
+
+        Note: Try @ operator first (type annotation marker)
+        If current_char is equal to 64:  Note: @ symbol
+            Let token be proc tokenize_at_operator from Operators with lexer, current_char, start_line, start_column
+            Return token
+        End If
+
+        Note: Try mathematical operators
+        Let token be proc tokenize_math_operator from MathSymbols with lexer, current_char, start_line, start_column
+        Return token
+    End If
+
+    If token_type is equal to 6:  Note: Comment
+        proc lexer_handle_comment with lexer
+        Note: Recursively get next token after comment
+        Let next be proc lexer_next_token with lexer
+        Return next
+    End If
+
+    Note: Unrecognized character - create error token
+    Let error_msg be proc string_create from StringCore with "Unrecognized character: '"
+
+    Note: Append the character itself (if printable)
+    If current_char is greater than or equal to 32:
+        If current_char is less than 127:
+            Let char_str be proc char_to_string from StringCore with current_char
+            Set error_msg to proc string_concat from StringCore with error_msg, char_str
+        End If
+    End If
+
+    Set error_msg to proc string_concat from StringCore with error_msg, "' (ASCII "
+    Let ascii_str be proc integer_to_string from StringCore with current_char
+    Set error_msg to proc string_concat from StringCore with error_msg, ascii_str
+    Set error_msg to proc string_concat from StringCore with error_msg, ")"
+
+    Let error_token be proc lexer_create_error_token with lexer, error_msg
+    Return error_token
 End Process
 
 Process called "lexer_determine_token_type" takes lexer as Integer, current_char as Integer returns Integer:
-    Note: Determine what type of token starts with current character
     Note: 
-    Note: Analyzes current character and lookahead to classify token type
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note:   current_char - Current character (ASCII code)
-    Note: 
-    Note: Returns:
-    Note:   Token type category constant (for dispatch to recognizer)
-    Note:   Returns 0 for unrecognized character
-    Note: 
-    Note: Classification rules:
-    Note:   - 48-57 (0-9): Numeric literal
-    Note:   - 34, 39 (" or '): String literal
-    Note:   - 65-90, 97-122, 95 (A-Z, a-z, _): Identifier/keyword
-    Note:   - 40, 41, 123, 125, 91, 93 (brackets): Delimiter
-    Note:   - 43, 45, 42, 47, etc. (symbols): Operator
-    Note:   - N followed by "ote:": Comment
-    Note:   - Otherwise: Error
-    Note: 
-    Note: TODO: Implement character classification with lookahead
+    Determine what type of token starts with current character
     
-    Return 0  Note: Placeholder
+    Analyzes current character and lookahead to classify token type
+    
+    Parameters:
+      lexer - Pointer to LexerState
+      current_char - Current character (ASCII code)
+    
+    Returns:
+      Token type category: 1=digit, 2=string, 3=identifier, 4=delimiter, 5=operator, 6=comment
+      Returns 0 for unrecognized character
+    :End Note
+
+    Note: Check for digits (0-9): ASCII 48-57
+    Let is_digit_result be proc is_digit with current_char
+    If is_digit_result is equal to 1:
+        Return 1  Note: Numeric literal
+    End If
+
+    Note: Check for string quotes (" or '): ASCII 34 or 39
+    If current_char is equal to 34:  Note: Double quote
+        Return 2  Note: String literal
+    End If
+
+    If current_char is equal to 39:  Note: Single quote
+        Return 2  Note: String literal
+    End If
+
+    Note: Check for letters or underscore (identifier/keyword start)
+    Let is_letter_result be proc is_letter with current_char
+    If is_letter_result is equal to 1:
+        Return 3  Note: Identifier or keyword
+    End If
+
+    If current_char is equal to 95:  Note: Underscore
+        Return 3  Note: Identifier or keyword
+    End If
+
+    Note: Check for delimiters (parentheses, brackets, braces)
+    If current_char is equal to 40:  Note: (
+        Return 4  Note: Delimiter
+    End If
+
+    If current_char is equal to 41:  Note: )
+        Return 4  Note: Delimiter
+    End If
+
+    If current_char is equal to 123:  Note: {
+        Return 4  Note: Delimiter
+    End If
+
+    If current_char is equal to 125:  Note: }
+        Return 4  Note: Delimiter
+    End If
+
+    If current_char is equal to 91:  Note: [
+        Return 4  Note: Delimiter
+    End If
+
+    If current_char is equal to 93:  Note: ]
+        Return 4  Note: Delimiter
+    End If
+
+    Note: Check for comment (N followed by "ote:")
+    If current_char is equal to 78:  Note: ASCII 'N'
+        Note: Peek ahead to check for "ote:"
+        Let next_char be proc lexer_peek_char with lexer, 1
+        If next_char is equal to 111:  Note: 'o'
+            Return 6  Note: Likely comment
+        End If
+    End If
+
+    Note: Check for common operators and symbols
+    If current_char is equal to 43:  Note: +
+        Return 5  Note: Operator
+    End If
+
+    If current_char is equal to 45:  Note: -
+        Return 5  Note: Operator
+    End If
+
+    If current_char is equal to 42:  Note: *
+        Return 5  Note: Operator
+    End If
+
+    If current_char is equal to 47:  Note: /
+        Return 5  Note: Operator
+    End If
+
+    If current_char is equal to 61:  Note: =
+        Return 5  Note: Operator
+    End If
+
+    If current_char is equal to 60:  Note: <
+        Return 5  Note: Operator
+    End If
+
+    If current_char is equal to 62:  Note: >
+        Return 5  Note: Operator
+    End If
+
+    If current_char is equal to 58:  Note: :
+        Return 5  Note: Operator/delimiter
+    End If
+
+    If current_char is equal to 44:  Note: ,
+        Return 4  Note: Delimiter
+    End If
+
+    If current_char is equal to 64:  Note: @ (type annotation)
+        Return 5  Note: Operator
+    End If
+
+    Return 0  Note: Unrecognized character
 End Process
 
 Note: ============================================================================
@@ -276,59 +862,115 @@ Note: Whitespace and Indentation Handling
 Note: ============================================================================
 
 Process called "lexer_skip_whitespace" takes lexer as Integer returns Integer:
-    Note: Skip whitespace and track indentation changes
     Note: 
-    Note: Handles spaces, tabs (if allowed), and newlines
-    Note: Generates INDENT and DEDENT tokens for scope changes
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   Pointer to INDENT, DEDENT, or NEWLINE token if generated
-    Note:   Returns 0 if just whitespace skipped (no token needed)
-    Note: 
-    Note: Runa uses indentation-based scoping:
-    Note:   - Increased indentation after : generates INDENT token
-    Note:   - Decreased indentation generates DEDENT token
-    Note:   - Indentation must be consistent (multiples of indent_size)
-    Note: 
-    Note: Algorithm:
-    Note: 1. While current character is whitespace:
-    Note:    - If newline: increment line, reset column, check indentation
-    Note:    - If space: increment column, count for indentation
-    Note:    - If tab: handle based on allow_tabs setting
-    Note: 2. If at start of line, calculate indentation level
-    Note: 3. Compare to current_indent_level:
-    Note:    - If increased: push to stack, generate INDENT token
-    Note:    - If decreased: pop from stack, generate DEDENT token(s)
-    Note:    - If same: no token
-    Note: 4. Return token or 0
-    Note: 
-    Note: TODO: Implement indentation tracking with stack
+    Skip whitespace and track indentation changes
     
-    Return 0  Note: Placeholder
+    Handles spaces, tabs (if allowed), and newlines
+    
+    Parameters:
+      lexer - Pointer to LexerState
+    
+    Returns:
+      0 (whitespace skipped, newline tracking and indentation handled)
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let source be proc memory_get_qword from Layout with lexer, 0
+    Let length be proc memory_get_qword from Layout with lexer, 8
+    Let position be proc memory_get_qword from Layout with lexer, 16
+    Let line be proc memory_get_qword from Layout with lexer, 24
+    Let column be proc memory_get_qword from Layout with lexer, 32
+
+    Note: Track if we encounter a newline (marks start of new logical line)
+    Let encountered_newline be 0
+
+    Note: Skip whitespace characters
+    Loop forever:
+        If position is greater than or equal to length:
+            Break
+        End If
+
+        Let ch be proc string_char_at from StringCore with source, position
+        Let is_ws be proc is_whitespace with ch
+
+        If is_ws is equal to 0:
+            Break  Note: Not whitespace, stop
+        End If
+
+        Note: Handle newline specially
+        If ch is equal to 10:  Note: Newline
+            Set line to line plus 1
+            Set column to 1
+            Set encountered_newline to 1
+        Otherwise:
+            Set column to column plus 1
+        End If
+
+        Set position to position plus 1
+    End Loop
+
+    Note: Update lexer state
+    proc memory_set_qword from Layout with lexer, 16, position
+    proc memory_set_qword from Layout with lexer, 24, line
+    proc memory_set_qword from Layout with lexer, 32, column
+
+    Note: If we encountered a newline, set at_line_start flag (offset 184)
+    If encountered_newline is equal to 1:
+        proc memory_set_qword from Layout with lexer, 184, 1
+    End If
+
+    Return 0
 End Process
 
 Process called "lexer_calculate_indentation" takes lexer as Integer returns Integer:
-    Note: Calculate indentation level at current line start
-    Note: 
-    Note: Counts spaces/tabs at beginning of line
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   Indentation level (0 for no indent, 1 for one level, etc.)
-    Note:   Returns -1 on error (inconsistent indentation)
-    Note: 
-    Note: Validation:
-    Note:   - Indentation must be multiple of indent_size
-    Note:   - Tabs and spaces cannot be mixed (unless allow_tabs=1)
-    Note: 
-    Note: TODO: Implement indentation counting and validation
+    Note:
+    Calculate indentation level at current line start
     
-    Return 0  Note: Placeholder
+    Counts spaces at beginning of line
+    
+    Parameters:
+      lexer - Pointer to LexerState
+    
+    Returns:
+      Indentation level (number of indent units)
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let source be proc memory_get_qword from Layout with lexer, 0
+    Let length be proc memory_get_qword from Layout with lexer, 8
+    Let position be proc memory_get_qword from Layout with lexer, 16
+    Let indent_size be proc memory_get_qword from Layout with lexer, 64
+
+    Note: Count spaces at start of line
+    Let space_count be 0
+
+    Loop forever:
+        If position is greater than or equal to length:
+            Break
+        End If
+
+        Let ch be proc string_char_at from StringCore with source, position
+
+        If ch is equal to 32:  Note: Space
+            Set space_count to space_count plus 1
+            Set position to position plus 1
+        Otherwise:
+            Break
+        End If
+    End Loop
+
+    Note: Update position
+    proc memory_set_qword from Layout with lexer, 16, position
+
+    Note: Calculate indent level
+    Let indent_level be space_count divided by indent_size
+    Return indent_level
 End Process
 
 Note: ============================================================================
@@ -336,35 +978,149 @@ Note: Comment Handling
 Note: ============================================================================
 
 Process called "lexer_handle_comment" takes lexer as Integer returns Integer:
-    Note: Process comment (single-line or multi-line)
     Note: 
-    Note: Runa comments:
-    Note:   Single-line: Note: text
-    Note:   Multi-line: Note: text :End Note
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   Pointer to TOKEN_COMMENT token (if comments are preserved)
-    Note:   Returns 0 if comments are skipped
-    Note: 
-    Note: Algorithm:
-    Note: 1. Confirm current position starts with "Note:"
-    Note: 2. Check if multi-line (look for :End Note on same line)
-    Note: 3. If single-line:
-    Note:    - Scan to end of line
-    Note:    - Create TOKEN_COMMENT if preserving comments
-    Note: 4. If multi-line:
-    Note:    - Scan until ":End Note" found
-    Note:    - Track line numbers
-    Note:    - Create TOKEN_COMMENT if preserving comments
-    Note: 5. Update position
-    Note: 6. Return token or 0
-    Note: 
-    Note: TODO: Implement comment recognition and skipping
+    Process comment (single-line or multi-line)
     
-    Return 0  Note: Placeholder
+    Runa comments: "Note" ... (single-line) or "Note" ... "End Note" (multi-line)
+    
+    Parameters:
+      lexer - Pointer to LexerState
+    
+    Returns:
+      Pointer to TOKEN_COMMENT token (if comments are preserved)
+      Returns 0 if comments are skipped
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0  Note: NULL lexer
+    End If
+
+    Note: Get current position, line, column (offsets 16, 24, 32)
+    Let start_pos be proc memory_get_qword from Layout with lexer, 16
+    Let start_line be proc memory_get_qword from Layout with lexer, 24
+    Let start_column be proc memory_get_qword from Layout with lexer, 32
+
+    Note: Skip "Note:" (5 characters)
+    Let position be start_pos plus 5
+    Let column be start_column plus 5
+    Let line be start_line
+
+    Note: Get source code and length (offsets 0, 8)
+    Let source be proc memory_get_qword from Layout with lexer, 0
+    Let length be proc memory_get_qword from Layout with lexer, 8
+
+    Note: Track whether this is multi-line comment
+    Let is_multiline be 0
+    Let end_found be 0
+
+    Note: Scan to end of line or ":End Note"
+    Loop forever:
+        If position is greater than or equal to length:
+            Break  Note: End of source
+        End If
+
+        Let current_char be proc string_char_at from StringCore with source, position
+
+        Note: Check for newline
+        If current_char is equal to 10:  Note: Newline
+            Note: Check if multi-line comment continues
+            Let next_pos be position plus 1
+            If next_pos is less than length:
+                Note: Peek ahead - if not at ":End Note", it's multi-line
+                Let peek_char be proc string_char_at from StringCore with source, next_pos
+                If peek_char is not equal to 58:  Note: Not starting with ':'
+                    Set is_multiline to 1
+                    Set position to next_pos
+                    Set line to line plus 1
+                    Set column to 1
+                    Note: Continue scanning
+                Otherwise:
+                    Note: Might be ":End Note", check further
+                    Break  Note: End of line, check for terminator
+                End If
+            Otherwise:
+                Break  Note: End of source
+            End If
+        Otherwise:
+            Note: Check for ":End Note" terminator (multi-line comment)
+            If current_char is equal to 58:  Note: Colon ':'
+                Note: Check if followed by "End Note"
+                Let check_pos be position plus 1
+                Let matches_end be 1
+
+                Note: Check "End Note" (8 characters: "End Note")
+                Let expected_end be "End Note"
+                Let check_index be 0
+                Loop forever:
+                    If check_index is greater than or equal to 8:
+                        Break
+                    End If
+
+                    If check_pos plus check_index is greater than or equal to length:
+                        Set matches_end to 0
+                        Break
+                    End If
+
+                    Let check_char be proc string_char_at from StringCore with source, check_pos plus check_index
+                    Let expected_char be proc string_char_at from StringCore with expected_end, check_index
+
+                    If check_char is not equal to expected_char:
+                        Set matches_end to 0
+                        Break
+                    End If
+
+                    Set check_index to check_index plus 1
+                End Loop
+
+                If matches_end is equal to 1:
+                    Note: Found ":End Note" terminator
+                    Set is_multiline to 1
+                    Set end_found to 1
+                    Set position to position plus 9  Note: Skip ":End Note" (9 chars)
+                    Set column to column plus 9
+                    Break
+                End If
+            End If
+
+            Note: Regular character in comment
+            Set position to position plus 1
+            Set column to column plus 1
+        End If
+    End Loop
+
+    Note: Update lexer position, line, and column (offsets 16, 24, 32)
+    proc memory_set_qword from Layout with lexer, 16, position
+    proc memory_set_qword from Layout with lexer, 24, line
+    proc memory_set_qword from Layout with lexer, 32, column
+
+    Note: Check preserve_comments flag (offset 168)
+    Let preserve_comments be proc memory_get_qword from Layout with lexer, 168
+
+    If preserve_comments is equal to 0:
+        Return 0  Note: Skip comments
+    End If
+
+    Note: Create TOKEN_COMMENT token
+    Let token_size be 48
+    Let token be proc allocate from Layout with token_size
+
+    If token is equal to 0:
+        Return 0  Note: Allocation failed
+    End If
+
+    Note: Calculate comment length and extract comment text
+    Let comment_length be position minus start_pos
+    Let comment_start be start_pos
+
+    Note: Set token fields
+    proc memory_set_qword from Layout with token, 0, TOKEN_COMMENT   Note: token_type
+    proc memory_set_qword from Layout with token, 8, source plus comment_start  Note: value (pointer to comment in source)
+    proc memory_set_qword from Layout with token, 16, start_line     Note: line
+    proc memory_set_qword from Layout with token, 24, start_column   Note: column
+    proc memory_set_qword from Layout with token, 32, comment_length Note: length
+    proc memory_set_qword from Layout with token, 40, is_multiline   Note: metadata (1 if multi-line, 0 if single-line)
+
+    Return token
 End Process
 
 Note: ============================================================================
@@ -372,53 +1128,119 @@ Note: Identifier and Keyword Recognition
 Note: ============================================================================
 
 Process called "lexer_tokenize_identifier_or_keyword" takes lexer as Integer returns Integer:
-    Note: Tokenize identifier or keyword
     Note: 
-    Note: Identifiers can be:
-    Note:   - Single word: variable_name, ClassName
-    Note:   - Multi-word (in encasing context): user name, total count
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   Pointer to TOKEN_IDENTIFIER or TOKEN_KEYWORD token
-    Note: 
-    Note: Algorithm:
-    Note: 1. Scan characters while alphanumeric or underscore
-    Note: 2. If in encasing context, scan multi-word identifier
-    Note: 3. Check if identifier is keyword using Keywords.lookup_keyword
-    Note: 4. If keyword: create keyword token
-    Note: 5. If not keyword: create identifier token
-    Note: 6. Update position
-    Note: 7. Return token
-    Note: 
-    Note: TODO: Implement using:
-    Note: - scan_identifier (defined below)
-    Note: - Keywords.lookup_keyword for keyword check
-    Note: - EncasingHandler for multi-word identifiers
+    Tokenize identifier or keyword
     
-    Return 0  Note: Placeholder
+    Parameters:
+      lexer - Pointer to LexerState
+    
+    Returns:
+      Pointer to TOKEN_IDENTIFIER token (keyword checking deferred to parser)
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Save start position for token
+    Let start_pos be proc memory_get_qword from Layout with lexer, 16
+    Let start_line be proc memory_get_qword from Layout with lexer, 24
+    Let start_column be proc memory_get_qword from Layout with lexer, 32
+
+    Note: Scan identifier
+    Let identifier_len be proc scan_identifier with lexer
+
+    If identifier_len is equal to 0:
+        Return 0  Note: No identifier found
+    End If
+
+    Note: Extract identifier string from source
+    Let source be proc memory_get_qword from Layout with lexer, 0
+    Let identifier_ptr be source plus start_pos
+
+    Note: Check if identifier is a keyword using keyword table
+    Let keyword_table be proc memory_get_qword from Layout with lexer, 136
+    Let token_type be TOKEN_IDENTIFIER
+
+    If keyword_table is not equal to 0:
+        Let keyword_token_type be proc lookup_keyword from Keywords with keyword_table, identifier_ptr
+        If keyword_token_type is not equal to 0:
+            Set token_type to keyword_token_type
+        End If
+    End If
+
+    Note: Create token (48 bytes)
+    Let token be proc allocate from Layout with 48
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Note: Set token fields (token_type is now keyword type if keyword, else TOKEN_IDENTIFIER)
+    proc memory_set_qword from Layout with token, 0, token_type  Note: token_type
+    proc memory_set_qword from Layout with token, 8, identifier_ptr  Note: value (pointer to identifier in source)
+    proc memory_set_qword from Layout with token, 16, start_line
+    proc memory_set_qword from Layout with token, 24, start_column
+    proc memory_set_qword from Layout with token, 32, identifier_len  Note: length
+    proc memory_set_qword from Layout with token, 40, 0  Note: metadata
+
+    Return token
 End Process
 
 Process called "scan_identifier" takes lexer as Integer returns Integer:
-    Note: Scan identifier characters from current position
     Note: 
-    Note: Identifier rules:
-    Note:   - Start with letter or underscore
-    Note:   - Continue with letters, digits, underscores
-    Note:   - In encasing context, may include spaces
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   Pointer to identifier string
-    Note:   Length stored in lexer state
-    Note: 
-    Note: TODO: Implement identifier scanning with encasing support
+    Scan identifier characters from current position
     
-    Return 0  Note: Placeholder
+    Identifier rules: letter/underscore start, then letters/digits/underscores
+    
+    Parameters:
+      lexer - Pointer to LexerState
+    
+    Returns:
+      Length of identifier scanned (position advanced in lexer)
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let source be proc memory_get_qword from Layout with lexer, 0
+    Let length be proc memory_get_qword from Layout with lexer, 8
+    Let position be proc memory_get_qword from Layout with lexer, 16
+    Let start_pos be position
+    Let column be proc memory_get_qword from Layout with lexer, 32
+
+    Note: Scan while alphanumeric or underscore
+    Loop forever:
+        If position is greater than or equal to length:
+            Break
+        End If
+
+        Let ch be proc string_char_at from StringCore with source, position
+        Let is_letter_res be proc is_letter with ch
+        Let is_digit_res be proc is_digit with ch
+
+        If is_letter_res is equal to 1:
+            Set position to position plus 1
+            Set column to column plus 1
+        Otherwise if is_digit_res is equal to 1:
+            Set position to position plus 1
+            Set column to column plus 1
+        Otherwise if ch is equal to 95:  Note: Underscore
+            Set position to position plus 1
+            Set column to column plus 1
+        Otherwise:
+            Break  Note: End of identifier
+        End If
+    End Loop
+
+    Note: Update lexer position and column
+    proc memory_set_qword from Layout with lexer, 16, position
+    proc memory_set_qword from Layout with lexer, 32, column
+
+    Note: Return length
+    Let identifier_length be position minus start_pos
+    Return identifier_length
 End Process
 
 Note: ============================================================================
@@ -426,48 +1248,145 @@ Note: Error Handling and Recovery
 Note: ============================================================================
 
 Process called "lexer_create_error_token" takes lexer as Integer, error_message as Integer returns Integer:
-    Note: Create error token for unrecognized or invalid input
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note:   error_message - Description of error
-    Note: 
-    Note: Returns:
-    Note:   Pointer to TOKEN_ERROR token with error information
-    Note: 
-    Note: Error token includes:
-    Note:   - Line and column of error
-    Note:   - Error message
-    Note:   - Surrounding context (5 chars before/after)
-    Note:   - Suggestion if available
-    Note: 
-    Note: Side Effects:
-    Note:   - Increments error_count
-    Note:   - Adds error to errors array
-    Note:   - Attempts recovery by skipping to next valid token
-    Note: 
-    Note: TODO: Implement error token creation with context
-    
-    Return 0  Note: Placeholder
+    Note:
+    Create error token and report to diagnostics system
+
+    Parameters:
+      lexer - Pointer to LexerState
+      error_message - Description of error
+
+    Returns:
+      Pointer to TOKEN_ERROR token with error information
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0  Note: NULL lexer
+    End If
+
+    Note: Get current line and column (offsets 24, 32)
+    Let line be proc memory_get_qword from Layout with lexer, 24
+    Let column be proc memory_get_qword from Layout with lexer, 32
+
+    Note: Get current position (offset 16)
+    Let position be proc memory_get_qword from Layout with lexer, 16
+
+    Note: Get diagnostics_engine and arena
+    Let diagnostics_engine be proc memory_get_qword from Layout with lexer, 192
+    Let arena be proc memory_get_qword from Layout with lexer, 200
+
+    Note: Report error to diagnostics system
+    If diagnostics_engine is not equal to 0:
+        If arena is not equal to 0:
+            Note: Create ErrorInfo structure in arena (15 fields × 8 bytes = 120 bytes)
+            Let error_info be proc arena_allocate from Arena with arena, 120
+
+            If error_info is not equal to 0:
+                Note: Get source file (from source_code pointer if available)
+                Let source_file be proc memory_get_qword from Layout with lexer, 0
+
+                Note: Initialize ErrorInfo fields
+                proc memory_set_qword from MemoryCore with error_info, 0, 0           Note: error_id
+                proc memory_set_qword from MemoryCore with error_info, 8, 1001        Note: error_code (LEXICAL_ERROR)
+                proc memory_set_qword from MemoryCore with error_info, 16, 1          Note: error_type (ERROR_TYPE_LEXICAL)
+                proc memory_set_qword from MemoryCore with error_info, 24, 1          Note: category (LEXICAL)
+                proc memory_set_qword from MemoryCore with error_info, 32, 1          Note: severity (ERROR)
+                proc memory_set_qword from MemoryCore with error_info, 40, line       Note: line_number
+                proc memory_set_qword from MemoryCore with error_info, 48, column     Note: column_number
+                proc memory_set_qword from MemoryCore with error_info, 56, error_message Note: message
+                proc memory_set_qword from MemoryCore with error_info, 64, 0          Note: context
+                proc memory_set_qword from MemoryCore with error_info, 72, 0          Note: suggestion
+                proc memory_set_qword from MemoryCore with error_info, 80, 0          Note: related_errors
+                proc memory_set_qword from MemoryCore with error_info, 88, source_file Note: source_file
+                proc memory_set_qword from MemoryCore with error_info, 96, 0          Note: phase (LEXICAL_PHASE)
+                proc memory_set_qword from MemoryCore with error_info, 104, 1         Note: is_recoverable
+                proc memory_set_qword from MemoryCore with error_info, 112, 100       Note: confidence
+
+                Note: Collect error through diagnostics engine
+                Let collect_result be proc diagnostics_engine_collect_error from Diagnostics with diagnostics_engine, error_info, 0, arena
+            End If
+        End If
+    End If
+
+    Note: Create error token (Token structure: 48 bytes, 6 fields)
+    Let token_size be 48
+    Let token be proc allocate from Layout with token_size
+
+    If token is equal to 0:
+        Return 0  Note: Allocation failed
+    End If
+
+    Note: Set token fields
+    proc memory_set_qword from Layout with token, 0, TOKEN_ERROR  Note: token_type
+    proc memory_set_qword from Layout with token, 8, error_message  Note: value (error message)
+    proc memory_set_qword from Layout with token, 16, line  Note: line
+    proc memory_set_qword from Layout with token, 24, column  Note: column
+    proc memory_set_qword from Layout with token, 32, 1  Note: length
+    proc memory_set_qword from Layout with token, 40, 0  Note: literal_metadata (NULL)
+
+    Note: Increment error_count (offset 88)
+    Let error_count be proc memory_get_qword from Layout with lexer, 88
+    Let new_error_count be error_count plus 1
+    proc memory_set_qword from Layout with lexer, 88, new_error_count
+
+    Return token
 End Process
 
 Process called "lexer_attempt_error_recovery" takes lexer as Integer returns Integer:
-    Note: Attempt to recover from lexical error
     Note: 
-    Note: Recovery strategies:
-    Note:   - Skip to next whitespace or delimiter
-    Note:   - Skip to end of line
-    Note:   - Skip to next keyword
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   1 if recovery successful, 0 if unable to recover
-    Note: 
-    Note: TODO: Implement error recovery heuristics
+    Attempt to recover from lexical error
     
-    Return 0  Note: Placeholder
+    Recovery strategy: Skip to next whitespace, newline, or delimiter
+    
+    Parameters:
+      lexer - Pointer to LexerState
+    
+    Returns:
+      1 if recovery successful, 0 if unable to recover
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0  Note: NULL lexer
+    End If
+
+    Note: Get current position and length (offsets 16, 8)
+    Let position be proc memory_get_qword from Layout with lexer, 16
+    Let length be proc memory_get_qword from Layout with lexer, 8
+
+    Note: Skip until we find whitespace or delimiter
+    Loop forever:
+        Note: Check if at end
+        If position is greater than or equal to length:
+            Return 1  Note: Reached end, recovery by termination
+        End If
+
+        Note: Get current character
+        Let source be proc memory_get_qword from Layout with lexer, 0
+        Let current_char be proc string_char_at from StringCore with source, position
+
+        Note: Check if whitespace
+        Let is_ws be proc is_whitespace with current_char
+        If is_ws is equal to 1:
+            Return 1  Note: Found whitespace, recovery successful
+        End If
+
+        Note: Check for common delimiters
+        If current_char is equal to 40:  Note: (
+            Return 1
+        End If
+
+        If current_char is equal to 41:  Note: )
+            Return 1
+        End If
+
+        Note: Advance position
+        Set position to position plus 1
+        proc memory_set_qword from Layout with lexer, 16, position
+
+        Note: Advance column (offset 32)
+        Let column be proc memory_get_qword from Layout with lexer, 32
+        Let new_column be column plus 1
+        proc memory_set_qword from Layout with lexer, 32, new_column
+    End Loop
 End Process
 
 Note: ============================================================================
@@ -475,61 +1394,135 @@ Note: Position and State Queries
 Note: ============================================================================
 
 Process called "lexer_get_current_position" takes lexer as Integer returns Integer:
-    Note: Get current character position in source
     Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   Current position (integer index)
-    Note: 
-    Note: TODO: Return lexer.current_position
+    Get current character position in source
     
-    Return 0  Note: Placeholder
+    Parameters:
+      lexer - Pointer to LexerState
+    
+    Returns:
+      Current position (integer index)
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0  Note: NULL lexer
+    End If
+
+    Note: Read current_position field (offset 16)
+    Let position be proc memory_get_qword from Layout with lexer, 16
+
+    Return position
 End Process
 
-Process called "lexer_get_line_and_column" takes lexer as Integer returns Integer:
-    Note: Get current line and column numbers
+Process called "lexer_get_line_and_column" takes lexer as Integer, out_line as Integer, out_column as Integer returns Integer:
     Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   Pointer to structure with line and column
-    Note: 
-    Note: TODO: Return lexer.line and lexer.column in structure
+    Get current line and column numbers
     
-    Return 0  Note: Placeholder
+    Parameters:
+      lexer - Pointer to LexerState
+      out_line - Pointer to location where line number should be written
+      out_column - Pointer to location where column number should be written
+    
+    Returns:
+      1 on success, 0 on error
+    
+    Memory Architecture Compliance:
+      Uses out parameters instead of heap allocation for temporary return values
+      Eliminates need for caller to deallocate - zero allocations, zero leaks
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0  Note: NULL lexer
+    End If
+
+    If out_line is equal to 0:
+        Return 0  Note: NULL out parameter
+    End If
+
+    If out_column is equal to 0:
+        Return 0  Note: NULL out parameter
+    End If
+
+    Note: Read line field (offset 24) from lexer
+    Let line be proc memory_get_qword from Layout with lexer, 24
+
+    Note: Read column field (offset 32) from lexer
+    Let column be proc memory_get_qword from Layout with lexer, 32
+
+    Note: Write to out parameters
+    proc memory_set_qword from Layout with out_line, 0, line
+    proc memory_set_qword from Layout with out_column, 0, column
+
+    Return 1  Note: Success
 End Process
 
 Process called "lexer_is_at_end" takes lexer as Integer returns Integer:
-    Note: Check if lexer has reached end of source
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note: 
-    Note: Returns:
-    Note:   1 if at end, 0 otherwise
-    Note: 
-    Note: TODO: Check if current_position >= source_length
-    
-    Return 0  Note: Placeholder
+    Note:
+    Check if lexer has reached end of source
+
+    Parameters:
+      lexer - Pointer to LexerState
+
+    Returns:
+      1 if at end, 0 otherwise
+    :End Note
+
+    If lexer is equal to 0:
+        Return 1  Note: NULL lexer is considered at end
+    End If
+
+    Note: Read current_position (offset 16)
+    Let position be proc memory_get_qword from Layout with lexer, 16
+
+    Note: Read source_length (offset 8)
+    Let length be proc memory_get_qword from Layout with lexer, 8
+
+    Note: Check if at or past end
+    If position is greater than or equal to length:
+        Return 1  Note: At end
+    End If
+
+    Return 0  Note: Not at end
 End Process
 
 Process called "lexer_peek_char" takes lexer as Integer, lookahead as Integer returns Integer:
-    Note: Peek at character without consuming it
-    Note: 
-    Note: Parameters:
-    Note:   lexer - Pointer to LexerState
-    Note:   lookahead - Number of characters to look ahead (0=current, 1=next, etc.)
-    Note: 
-    Note: Returns:
-    Note:   Character at position (current + lookahead)
-    Note:   Returns 0 if beyond end of source
-    Note: 
-    Note: TODO: Implement with bounds checking
-    
-    Return 0  Note: Placeholder
+    Note:
+     Peek at character without consuming it
+
+    Parameters:
+      lexer - Pointer to LexerState
+      lookahead - Number of characters to look ahead (0=current, 1=next, etc.)
+
+    Returns:
+      Character at position (current plus lookahead)
+      Returns 0 if beyond end of source
+    :End Note
+
+    If lexer is equal to 0:
+        Return 0  Note: NULL lexer
+    End If
+
+    Note: Read current_position (offset 16)
+    Let position be proc memory_get_qword from Layout with lexer, 16
+
+    Note: Read source_length (offset 8)
+    Let length be proc memory_get_qword from Layout with lexer, 8
+
+    Note: Calculate target position
+    Let target_pos be position plus lookahead
+
+    Note: Bounds check
+    If target_pos is greater than or equal to length:
+        Return 0  Note: Beyond end of source
+    End If
+
+    Note: Read source_code pointer (offset 0)
+    Let source be proc memory_get_qword from Layout with lexer, 0
+
+    Note: Get character at target position
+    Let character be proc string_char_at from StringCore with source, target_pos
+
+    Return character
 End Process
 
 Note: ============================================================================
@@ -537,49 +1530,85 @@ Note: Utility Functions
 Note: ============================================================================
 
 Process called "is_whitespace" takes character as Integer returns Integer:
-    Note: Check if character is whitespace
     Note: 
-    Note: Parameters:
-    Note:   character - ASCII character code
-    Note: 
-    Note: Returns:
-    Note:   1 if whitespace (space, tab, newline, carriage return), 0 otherwise
-    Note: 
-    Note: Whitespace characters: 32 (space), 9 (tab), 10 (newline), 13 (carriage return)
-    Note: 
-    Note: TODO: Check character code against whitespace values
+    Check if character is whitespace
     
-    Return 0  Note: Placeholder
+    Parameters:
+      character - ASCII character code
+    
+    Returns:
+      1 if whitespace (space, tab, newline, carriage return), 0 otherwise
+    
+    Whitespace characters: 32 (space), 9 (tab), 10 (newline), 13 (carriage return)
+    :End Note
+
+    If character is equal to 32:  Note: Space
+        Return 1
+    End If
+
+    If character is equal to 9:  Note: Tab
+        Return 1
+    End If
+
+    If character is equal to 10:  Note: Newline
+        Return 1
+    End If
+
+    If character is equal to 13:  Note: Carriage return
+        Return 1
+    End If
+
+    Return 0  Note: Not whitespace
 End Process
 
 Process called "is_letter" takes character as Integer returns Integer:
-    Note: Check if character is a letter
     Note: 
-    Note: Parameters:
-    Note:   character - ASCII character code
-    Note: 
-    Note: Returns:
-    Note:   1 if letter (A-Z or a-z), 0 otherwise
-    Note: 
-    Note: Letter ranges: 65-90 (A-Z), 97-122 (a-z)
-    Note: 
-    Note: TODO: Check character code against letter ranges
+    Check if character is a letter
     
-    Return 0  Note: Placeholder
+    Parameters:
+      character - ASCII character code
+    
+    Returns:
+      1 if letter (A-Z or a-z), 0 otherwise
+    
+    Letter ranges: 65-90 (A-Z), 97-122 (a-z)
+    :End Note
+    
+    Note: Check uppercase A-Z
+    If character is greater than or equal to 65:
+        If character is less than or equal to 90:
+            Return 1
+        End If
+    End If
+
+    Note: Check lowercase a-z
+    If character is greater than or equal to 97:
+        If character is less than or equal to 122:
+            Return 1
+        End If
+    End If
+
+    Return 0  Note: Not a letter
 End Process
 
 Process called "is_digit" takes character as Integer returns Integer:
-    Note: Check if character is a digit
-    Note: 
-    Note: Parameters:
-    Note:   character - ASCII character code
-    Note: 
-    Note: Returns:
-    Note:   1 if digit (0-9), 0 otherwise
-    Note: 
-    Note: Digit range: 48-57 (0-9)
-    Note: 
-    Note: TODO: Check character code against digit range
+    Note:
+    Check if character is a digit
     
-    Return 0  Note: Placeholder
+    Parameters:
+      character - ASCII character code
+    
+    Returns:
+      1 if digit (0-9), 0 otherwise
+    
+    Digit range: 48-57 (0-9)
+    :End Note
+
+    If character is greater than or equal to 48:
+        If character is less than or equal to 57:
+            Return 1
+        End If
+    End If
+
+    Return 0  Note: Not a digit
 End Process
