@@ -25,16 +25,558 @@ ARENA ALLOCATION - Fast Bulk, O(1) Cleanup
 - Handle arena reset and reuse functionality
 
 This file is essential because of the following reasons:
-- Arena allocation enables fast bulk temporary allocations
+- Arena allocation enables fast bulk temporary allocations (~10ns vs ~100ns heap)
 - Proper arena handling ensures O(1) cleanup for thousands of allocations
-- Arena support enables Runa runtime for high-performance temporary data workflows
+- Arena support enables high-performance temporary data workflows (compiler, parsing, batch processing)
+- Deterministic memory management for operation-scoped data
 
 This file consists of the following functions/features/operation types:
-- Arena creation and destruction
-- Arena allocation and deallocation (bulk)
-- Arena string operations and utilities
-- Arena capacity management and growth
-- Arena reset and reuse functionality
+- Arena creation and destruction (arena_create, arena_destroy)
+- Arena allocation (arena_allocate - pointer bump allocation)
+- Arena string operations (duplicate, concat, integer_to_string)
+- Arena capacity management and growth (automatic resizing)
+- Arena reset and reuse functionality (arena_reset)
+- Arena query functions (get_used, get_capacity)
+
+Dependencies:
+- Imports compiler/frontend/primitives/assembly/syscall.runa for mmap/munmap
+- Imports compiler/frontend/primitives/core/memory_core.runa for memory operations
+- Imports compiler/frontend/primitives/memory/layout.runa for allocate/deallocate
+- Imports compiler/frontend/primitives/core/string_core.runa for string operations
 :End Note
 
-Note: TODO - Implement arena functionality
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: Arena Structure Definition
+Note: ============================================================================
+
+Note:
+Arena structure layout (24 bytes):
+  Offset 0:  buffer (8 bytes) - Pointer to arena memory block
+  Offset 8:  capacity (8 bytes) - Total capacity of arena buffer
+  Offset 16: used (8 bytes) - Current bytes used in arena
+
+This structure enables fast pointer-bump allocation:
+- Allocation: buffer + used (O(1))
+- Used increment: used += size (O(1))
+- Destroy: munmap buffer, deallocate structure (O(1))
+:End Note
+
+Note: ============================================================================
+Note: Arena Constants
+Note: ============================================================================
+
+Constant ARENA_DEFAULT_CAPACITY as Integer is 65536   Note: 64KB default
+Constant ARENA_MIN_CAPACITY as Integer is 4096        Note: 4KB minimum
+Constant ARENA_MAX_CAPACITY as Integer is 1073741824  Note: 1GB maximum
+Constant ARENA_GROWTH_FACTOR as Integer is 2          Note: Double on growth
+Constant ARENA_ALIGNMENT as Integer is 8              Note: 8-byte alignment
+
+Note: ============================================================================
+Note: Arena Creation
+Note: ============================================================================
+
+Process called "arena_create" takes initial_capacity as Integer returns Integer:
+    Note:
+    Create arena allocator with specified initial capacity.
+
+    Uses mmap for large buffer allocation (better than malloc for arenas):
+    - No malloc overhead (16-32 bytes per allocation)
+    - Operating system manages memory pages
+    - Fast bulk deallocation with munmap
+
+    Parameters:
+      initial_capacity - Initial size of arena buffer in bytes
+
+    Returns:
+      Pointer to Arena structure, or 0 on failure
+
+    Performance:
+      ~100ns (one mmap syscall + structure allocation)
+    :End Note
+
+    Note: Validate capacity bounds
+    If initial_capacity is less than ARENA_MIN_CAPACITY:
+        Set initial_capacity to ARENA_MIN_CAPACITY
+    End If
+
+    If initial_capacity is greater than ARENA_MAX_CAPACITY:
+        Return 0  Note: Capacity too large
+    End If
+
+    Note: Allocate Arena structure (24 bytes)
+    Let arena be proc allocate from Layout with 24
+    If arena is equal to 0:
+        Return 0  Note: Failed to allocate arena structure
+    End If
+
+    Note: Allocate arena buffer using mmap
+    Note: PROT_READ | PROT_WRITE = 3, MAP_PRIVATE | MAP_ANONYMOUS = 0x22
+    Let prot be 3
+    Let flags be 34
+    Let buffer be proc syscall_mmap from Syscall with 0, initial_capacity, prot, flags, -1, 0
+
+    Note: Check for mmap failure (returns -1 or other negative values)
+    If buffer is less than 0:
+        Let dealloc_result be proc deallocate from Layout with arena
+        Return 0  Note: Failed to allocate buffer
+    End If
+
+    Note: Initialize Arena fields
+    proc memory_set_qword from Memory with arena, 0, buffer           Note: buffer
+    proc memory_set_qword from Memory with arena, 8, initial_capacity Note: capacity
+    proc memory_set_qword from Memory with arena, 16, 0               Note: used = 0
+
+    Return arena
+End Process
+
+Note: ============================================================================
+Note: Arena Allocation
+Note: ============================================================================
+
+Process called "arena_allocate" takes arena as Integer, size as Integer returns Integer:
+    Note:
+    Allocate memory from arena using pointer-bump allocation.
+
+    Algorithm:
+    1. Check if arena has space (used + size <= capacity)
+    2. If not, grow arena (double capacity)
+    3. Align allocation to ARENA_ALIGNMENT
+    4. Return buffer + used
+    5. Increment used by aligned size
+
+    Parameters:
+      arena - Pointer to Arena structure
+      size - Number of bytes to allocate
+
+    Returns:
+      Pointer to allocated memory, or 0 on failure
+
+    Performance:
+      ~10ns (pointer arithmetic + used increment)
+    :End Note
+
+    If arena is equal to 0:
+        Return 0  Note: NULL arena
+    End If
+
+    If size is less than or equal to 0:
+        Return 0  Note: Invalid size
+    End If
+
+    Note: Read arena fields
+    Let buffer be proc memory_get_qword from Memory with arena, 0
+    Let capacity be proc memory_get_qword from Memory with arena, 8
+    Let used be proc memory_get_qword from Memory with arena, 16
+
+    Note: Align size to ARENA_ALIGNMENT (8 bytes)
+    Let remainder be size modulo ARENA_ALIGNMENT
+    Let aligned_size be size
+    If remainder is not equal to 0:
+        Let padding be ARENA_ALIGNMENT minus remainder
+        Set aligned_size to size plus padding
+    End If
+
+    Note: Check if arena has space
+    Let required_space be used plus aligned_size
+    If required_space is greater than capacity:
+        Note: Grow arena - double capacity until sufficient
+        Let new_capacity be capacity
+        Loop forever:
+            Set new_capacity to new_capacity multiplied by ARENA_GROWTH_FACTOR
+            If new_capacity is greater than or equal to required_space:
+                Break
+            End If
+            If new_capacity is greater than ARENA_MAX_CAPACITY:
+                Return 0  Note: Cannot grow beyond max capacity
+            End If
+        End Loop
+
+        Note: Allocate new larger buffer
+        Let prot be 3
+        Let flags be 34
+        Let new_buffer be proc syscall_mmap from Syscall with 0, new_capacity, prot, flags, -1, 0
+
+        If new_buffer is less than 0:
+            Return 0  Note: Failed to grow arena
+        End If
+
+        Note: Copy existing data to new buffer
+        Let copy_result be proc memory_copy from Memory with new_buffer, buffer, used
+
+        Note: Free old buffer
+        Let munmap_result be proc syscall_munmap from Syscall with buffer, capacity
+
+        Note: Update arena with new buffer and capacity
+        proc memory_set_qword from Memory with arena, 0, new_buffer
+        proc memory_set_qword from Memory with arena, 8, new_capacity
+
+        Set buffer to new_buffer
+        Set capacity to new_capacity
+    End If
+
+    Note: Allocate from arena (pointer bump)
+    Let ptr be buffer plus used
+
+    Note: Update used count
+    Let new_used be used plus aligned_size
+    proc memory_set_qword from Memory with arena, 16, new_used
+
+    Return ptr
+End Process
+
+Note: ============================================================================
+Note: Arena String Operations
+Note: ============================================================================
+
+Process called "arena_string_duplicate" takes arena as Integer, source as Integer returns Integer:
+    Note:
+    Duplicate a string into arena memory.
+
+    Algorithm:
+    1. Get string length
+    2. Allocate length + 1 bytes (for null terminator)
+    3. Copy string data
+    4. Add null terminator
+    5. Return pointer
+
+    Parameters:
+      arena - Pointer to Arena structure
+      source - Pointer to source string (null-terminated)
+
+    Returns:
+      Pointer to duplicated string in arena, or 0 on failure
+    :End Note
+
+    If arena is equal to 0:
+        Return 0  Note: NULL arena
+    End If
+
+    If source is equal to 0:
+        Return 0  Note: NULL source string
+    End If
+
+    Note: Get string length
+    Let length be proc string_length from StringCore with source
+
+    Note: Allocate space for string + null terminator
+    Let str_size be length plus 1
+    Let dest be proc arena_allocate with arena, str_size
+
+    If dest is equal to 0:
+        Return 0  Note: Allocation failed
+    End If
+
+    Note: Copy string data
+    Let copy_result be proc memory_copy from Memory with dest, source, length
+
+    Note: Add null terminator
+    proc memory_set_byte from Memory with dest, length, 0
+
+    Return dest
+End Process
+
+Process called "arena_integer_to_string" takes arena as Integer, value as Integer returns Integer:
+    Note:
+    Convert integer to string representation in arena memory.
+
+    Algorithm:
+    1. Handle negative numbers (set flag, negate value)
+    2. Count digits
+    3. Allocate buffer (digits + sign + null terminator)
+    4. Fill buffer from right to left
+    5. Add sign if negative
+    6. Add null terminator
+    7. Return pointer
+
+    Parameters:
+      arena - Pointer to Arena structure
+      value - Integer value to convert
+
+    Returns:
+      Pointer to string representation in arena, or 0 on failure
+    :End Note
+
+    If arena is equal to 0:
+        Return 0  Note: NULL arena
+    End If
+
+    Note: Handle special case: value = 0
+    If value is equal to 0:
+        Let dest be proc arena_allocate with arena, 2  Note: "0" + null
+        If dest is equal to 0:
+            Return 0
+        End If
+        proc memory_set_byte from Memory with dest, 0, 48  Note: '0' = ASCII 48
+        proc memory_set_byte from Memory with dest, 1, 0   Note: null terminator
+        Return dest
+    End If
+
+    Note: Handle negative numbers
+    Let is_negative be 0
+    Let abs_value be value
+    If value is less than 0:
+        Set is_negative to 1
+        Set abs_value to 0 minus value
+    End If
+
+    Note: Count digits
+    Let digit_count be 0
+    Let temp be abs_value
+    Loop forever:
+        Set digit_count to digit_count plus 1
+        Set temp to temp divided by 10
+        If temp is equal to 0:
+            Break
+        End If
+    End Loop
+
+    Note: Calculate buffer size (digits + sign + null)
+    Let buffer_size be digit_count
+    If is_negative is equal to 1:
+        Set buffer_size to buffer_size plus 1
+    End If
+    Set buffer_size to buffer_size plus 1  Note: null terminator
+
+    Note: Allocate buffer
+    Let dest be proc arena_allocate with arena, buffer_size
+    If dest is equal to 0:
+        Return 0
+    End If
+
+    Note: Fill buffer from right to left with digits
+    Let pos be buffer_size minus 2  Note: Start before null terminator
+    Let remaining be abs_value
+    Loop forever:
+        Let digit be remaining modulo 10
+        Let ascii_digit be 48 plus digit  Note: '0' = 48
+        proc memory_set_byte from Memory with dest, pos, ascii_digit
+        Set pos to pos minus 1
+        Set remaining to remaining divided by 10
+        If remaining is equal to 0:
+            Break
+        End If
+    End Loop
+
+    Note: Add sign if negative
+    If is_negative is equal to 1:
+        proc memory_set_byte from Memory with dest, 0, 45  Note: '-' = ASCII 45
+    End If
+
+    Note: Add null terminator
+    Let null_pos be buffer_size minus 1
+    proc memory_set_byte from Memory with dest, null_pos, 0
+
+    Return dest
+End Process
+
+Process called "arena_string_concat" takes arena as Integer, str1 as Integer, str2 as Integer returns Integer:
+    Note:
+    Concatenate two strings into arena memory.
+
+    Algorithm:
+    1. Get lengths of both strings
+    2. Allocate len1 + len2 + 1 bytes
+    3. Copy str1
+    4. Copy str2
+    5. Add null terminator
+    6. Return pointer
+
+    Parameters:
+      arena - Pointer to Arena structure
+      str1 - Pointer to first string
+      str2 - Pointer to second string
+
+    Returns:
+      Pointer to concatenated string in arena, or 0 on failure
+    :End Note
+
+    If arena is equal to 0:
+        Return 0  Note: NULL arena
+    End If
+
+    Note: Handle NULL strings (treat as empty)
+    Let len1 be 0
+    If str1 is not equal to 0:
+        Set len1 to proc string_length from StringCore with str1
+    End If
+
+    Let len2 be 0
+    If str2 is not equal to 0:
+        Set len2 to proc string_length from StringCore with str2
+    End If
+
+    Note: Allocate buffer for concatenated string
+    Let total_length be len1 plus len2
+    Let buffer_size be total_length plus 1  Note: +1 for null terminator
+    Let dest be proc arena_allocate with arena, buffer_size
+
+    If dest is equal to 0:
+        Return 0  Note: Allocation failed
+    End If
+
+    Note: Copy first string
+    If str1 is not equal to 0:
+        Let copy_result be proc memory_copy from Memory with dest, str1, len1
+    End If
+
+    Note: Copy second string
+    If str2 is not equal to 0:
+        Let dest_offset be dest plus len1
+        Let copy_result be proc memory_copy from Memory with dest_offset, str2, len2
+    End If
+
+    Note: Add null terminator
+    proc memory_set_byte from Memory with dest, total_length, 0
+
+    Return dest
+End Process
+
+Note: ============================================================================
+Note: Arena Management
+Note: ============================================================================
+
+Process called "arena_reset" takes arena as Integer returns Integer:
+    Note:
+    Reset arena to empty state, reusing existing buffer.
+
+    This allows arena reuse without deallocation/reallocation overhead.
+    Perfect for processing multiple items with same arena.
+
+    Algorithm:
+    1. Set used = 0
+    2. Keep buffer and capacity unchanged
+
+    Parameters:
+      arena - Pointer to Arena structure
+
+    Returns:
+      1 on success, 0 on error
+
+    Performance:
+      ~5ns (one memory write)
+    :End Note
+
+    If arena is equal to 0:
+        Return 0  Note: NULL arena
+    End If
+
+    Note: Reset used counter to 0
+    proc memory_set_qword from Memory with arena, 16, 0
+
+    Return 1
+End Process
+
+Process called "arena_destroy" takes arena as Integer returns Integer:
+    Note:
+    Destroy arena and free all memory.
+
+    This is O(1) bulk cleanup - all allocations freed with one operation.
+    This is the key advantage of arenas over individual heap allocations.
+
+    Algorithm:
+    1. Read buffer and capacity
+    2. munmap buffer (frees all arena allocations)
+    3. deallocate Arena structure
+
+    Parameters:
+      arena - Pointer to Arena structure
+
+    Returns:
+      1 on success, 0 on error
+
+    Performance:
+      ~100ns (one munmap syscall + one free)
+    :End Note
+
+    If arena is equal to 0:
+        Return 1  Note: NULL arena, nothing to destroy
+    End If
+
+    Note: Read arena fields
+    Let buffer be proc memory_get_qword from Memory with arena, 0
+    Let capacity be proc memory_get_qword from Memory with arena, 8
+
+    Note: Free arena buffer using munmap
+    If buffer is not equal to 0:
+        Let munmap_result be proc syscall_munmap from Syscall with buffer, capacity
+    End If
+
+    Note: Free Arena structure itself
+    Let dealloc_result be proc deallocate from Layout with arena
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Arena Query Functions
+Note: ============================================================================
+
+Process called "arena_get_used" takes arena as Integer returns Integer:
+    Note:
+    Get number of bytes currently used in arena.
+
+    Parameters:
+      arena - Pointer to Arena structure
+
+    Returns:
+      Number of bytes used, or 0 if arena is NULL
+    :End Note
+
+    If arena is equal to 0:
+        Return 0  Note: NULL arena
+    End If
+
+    Note: Read used field (offset 16)
+    Let used be proc memory_get_qword from Memory with arena, 16
+    Return used
+End Process
+
+Process called "arena_get_capacity" takes arena as Integer returns Integer:
+    Note:
+    Get total capacity of arena buffer.
+
+    Parameters:
+      arena - Pointer to Arena structure
+
+    Returns:
+      Total capacity in bytes, or 0 if arena is NULL
+    :End Note
+
+    If arena is equal to 0:
+        Return 0  Note: NULL arena
+    End If
+
+    Note: Read capacity field (offset 8)
+    Let capacity be proc memory_get_qword from Memory with arena, 8
+    Return capacity
+End Process
+
+Process called "arena_get_remaining" takes arena as Integer returns Integer:
+    Note:
+    Get number of bytes remaining (capacity - used).
+
+    Useful for checking if arena needs to grow before large allocation.
+
+    Parameters:
+      arena - Pointer to Arena structure
+
+    Returns:
+      Number of bytes remaining, or 0 if arena is NULL
+    :End Note
+
+    If arena is equal to 0:
+        Return 0  Note: NULL arena
+    End If
+
+    Note: Read capacity and used
+    Let capacity be proc memory_get_qword from Memory with arena, 8
+    Let used be proc memory_get_qword from Memory with arena, 16
+
+    Let remaining be capacity minus used
+    Return remaining
+End Process

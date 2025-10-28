@@ -86,21 +86,21 @@ Note: ==========================================================================
 Note: Buffer Constants
 Note: ============================================================================
 
-Define constant BUFFER_DEFAULT_SIZE as 4096
-Define constant BUFFER_MIN_SIZE as 256
-Define constant BUFFER_MAX_SIZE as 1073741824
-Define constant BUFFER_ALIGNMENT as 8
-Define constant BUFFER_GROWTH_FACTOR as 2
-Define constant BUFFER_SHRINK_THRESHOLD as 4
+Constant BUFFER_DEFAULT_SIZE as 4096
+Constant BUFFER_MIN_SIZE as 256
+Constant BUFFER_MAX_SIZE as 1073741824
+Constant BUFFER_ALIGNMENT as 8
+Constant BUFFER_GROWTH_FACTOR as 2
+Constant BUFFER_SHRINK_THRESHOLD as 4
 
-Define constant BUFFER_ALLOCATION_SUCCESS as 0
-Define constant BUFFER_ALLOCATION_FAILED as -1
-Define constant BUFFER_ALLOCATION_OVERFLOW as -2
-Define constant BUFFER_ALLOCATION_INVALID as -3
+Constant BUFFER_ALLOCATION_SUCCESS as 0
+Constant BUFFER_ALLOCATION_FAILED as -1
+Constant BUFFER_ALLOCATION_OVERFLOW as -2
+Constant BUFFER_ALLOCATION_INVALID as -3
 
-Define constant BUFFER_ACCESS_READ as 0
-Define constant BUFFER_ACCESS_WRITE as 1
-Define constant BUFFER_ACCESS_READ_WRITE as 2
+Constant BUFFER_ACCESS_READ as 0
+Constant BUFFER_ACCESS_WRITE as 1
+Constant BUFFER_ACCESS_READ_WRITE as 2
 
 Note: ============================================================================
 Note: Buffer Creation and Destruction
@@ -1471,6 +1471,167 @@ Process called "buffer_verify" takes buffer as Integer returns Integer:
 
     Note: All checks passed
     Return 1
+End Process
+
+Note: ============================================================================
+Note: Buffer Capacity and Variable-Length Integer Operations
+Note: ============================================================================
+
+Process called "buffer_ensure_capacity" takes buffer as Integer, required_capacity as Integer returns Integer:
+    Note: Ensure buffer has at least required_capacity bytes
+    Note: Grows buffer if needed, no-op if already sufficient
+    Note: Returns 1 if successful, 0 if failed
+
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let current_capacity be proc memory_get_integer from MemoryCore with buffer, 16
+    If current_capacity is greater than or equal to required_capacity:
+        Return 1  Note: Already have enough capacity
+    End If
+
+    Note: Need to grow buffer
+    Let growth_needed be required_capacity minus current_capacity
+    Let result be proc buffer_grow with buffer, growth_needed
+    Return result
+End Process
+
+Process called "buffer_write_varint" takes buffer as Integer, value as Integer returns Integer:
+    Note: Write variable-length integer to buffer (LEB128 encoding)
+    Note: Uses unsigned LEB128: 7 bits per byte, MSB = continuation bit
+    Note: Returns number of bytes written, 0 if failed
+    Note: Efficient encoding: 0-127 = 1 byte, 128-16383 = 2 bytes, etc.
+
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Note: Calculate how many bytes needed (max 10 bytes for 64-bit value)
+    Let bytes_needed be 0
+    Let temp_value be value
+
+    Note: Count bytes needed
+    Let max_iterations be 10
+    Let iteration be 0
+    While iteration is less than max_iterations:
+        Set bytes_needed to bytes_needed plus 1
+        Set temp_value to temp_value divided by 128
+        If temp_value is equal to 0:
+            Set iteration to max_iterations  Note: Exit loop
+        End If
+        Otherwise:
+            Set iteration to iteration plus 1
+        End If
+    End While
+
+    Note: Ensure buffer has space
+    Let size be proc memory_get_integer from MemoryCore with buffer, 8
+    Let required_cap be size plus bytes_needed
+    Let ensure_result be proc buffer_ensure_capacity with buffer, required_cap
+    If ensure_result is equal to 0:
+        Return 0
+    End If
+
+    Note: Get current write position
+    Let data be proc memory_get_integer from MemoryCore with buffer, 0
+    Let write_ptr be data plus size
+
+    Note: Write LEB128 bytes
+    Set temp_value to value
+    Let bytes_written be 0
+    Set iteration to 0
+
+    While iteration is less than max_iterations:
+        Note: Extract 7 bits
+        Let seven_bits be temp_value modulo by 128
+        Set temp_value to temp_value divided by 128
+
+        Note: Set continuation bit if more bytes follow
+        Let byte_to_write be seven_bits
+        If temp_value is not equal to 0:
+            Set byte_to_write to seven_bits plus 128  Note: Set MSB
+        End If
+
+        Note: Write byte
+        Let dummy be proc memory_set_byte from MemoryCore with write_ptr, bytes_written, byte_to_write
+        Set bytes_written to bytes_written plus 1
+
+        Note: Done if no more bits
+        If temp_value is equal to 0:
+            Set iteration to max_iterations  Note: Exit loop
+        End If
+        Otherwise:
+            Set iteration to iteration plus 1
+        End If
+    End While
+
+    Note: Update buffer size
+    Let new_size be size plus bytes_written
+    Let dummy2 be proc memory_set_integer from MemoryCore with buffer, 8, new_size
+
+    Return bytes_written
+End Process
+
+Process called "buffer_read_varint" takes buffer as Integer, offset as Integer returns Integer:
+    Note: Read variable-length integer from buffer at offset (LEB128 decoding)
+    Note: Returns decoded value
+    Note: NOTE: Caller must track read position separately - this only decodes
+
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let data be proc memory_get_integer from MemoryCore with buffer, 0
+    Let size be proc memory_get_integer from MemoryCore with buffer, 8
+
+    If offset is greater than or equal to size:
+        Return 0  Note: Read past end
+    End If
+
+    Note: Decode LEB128 bytes
+    Let result_value be 0
+    Let shift_amount be 0
+    Let read_pos be offset
+    Let max_bytes be 10
+    Let byte_count be 0
+
+    While byte_count is less than max_bytes:
+        If read_pos is greater than or equal to size:
+            Return 0  Note: Truncated varint
+        End If
+
+        Note: Read byte
+        Let byte_val be proc memory_get_byte from MemoryCore with data, read_pos
+        Set read_pos to read_pos plus 1
+        Set byte_count to byte_count plus 1
+
+        Note: Extract 7 data bits
+        Let seven_bits be byte_val modulo by 128
+
+        Note: Calculate shift multiplier (1, 128, 16384, ...)
+        Let shift_multiplier be 1
+        Let shift_iter be 0
+        While shift_iter is less than shift_amount:
+            Set shift_multiplier to shift_multiplier multiplied by 128
+            Set shift_iter to shift_iter plus 1
+        End While
+
+        Note: Shift and add to result
+        Let shifted_bits be seven_bits multiplied by shift_multiplier
+        Set result_value to result_value plus shifted_bits
+        Set shift_amount to shift_amount plus 1
+
+        Note: Check continuation bit
+        Let has_continuation be byte_val divided by 128
+        If has_continuation is equal to 0:
+            Note: No continuation bit - done
+            Return result_value
+        End If
+    End While
+
+    Note: Should not reach here (max 10 bytes for 64-bit)
+    Return result_value
 End Process
 
 Note: ============================================================================

@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0
 :End Note
 
 Note:
-WINDOWS_X86_64 THREADING - Win32 API implementation
+WINDOWS_ARM64 THREADING - Win32 API implementation
 Uses NT syscalls from ntdll.dll for all threading operations
 :End Note
 
@@ -18,18 +18,61 @@ Note: NtDelayExecution = 0x34
 
 Process called "thread_create" takes function_ptr as Integer, arg_ptr as Integer returns Integer:
     Note: NtCreateThreadEx - create new thread
-    Note: Allocate handle storage
+    Note: Syscall 0xC5 (Windows 10 ARM64): NtCreateThreadEx
+    Note:
+    Note: Signature:
+    Note: NTSTATUS NtCreateThreadEx(
+    Note:   OUT PHANDLE ThreadHandle,
+    Note:   IN ACCESS_MASK DesiredAccess,
+    Note:   IN POBJECT_ATTRIBUTES ObjectAttributes OPTIONAL,
+    Note:   IN HANDLE ProcessHandle,
+    Note:   IN PVOID StartRoutine,
+    Note:   IN PVOID Argument OPTIONAL,
+    Note:   IN ULONG CreateFlags,
+    Note:   IN SIZE_T ZeroBits,
+    Note:   IN SIZE_T StackSize,
+    Note:   IN SIZE_T MaximumStackSize,
+    Note:   IN PPS_ATTRIBUTE_LIST AttributeList OPTIONAL
+    Note: )
+
+    Note: Allocate handle storage (8 bytes for HANDLE)
     Let handle_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
     If handle_ptr is less than 0:
         Return 0
     End If
 
-    Note: For now, use simplified thread creation
-    Note: In production, would call NtCreateThreadEx with full parameter structure
-    proc memory_set_int64 from Memory with handle_ptr, 0, function_ptr
+    Note: Initialize handle to 0
+    proc memory_set_int64 from Memory with handle_ptr, 0, 0
 
-    Note: Return handle (simplified - real implementation needs actual syscall)
-    Return handle_ptr
+    Note: NtCreateThreadEx parameters
+    Let desired_access be 2097151  Note: THREAD_ALL_ACCESS (0x1FFFFF)
+    Let object_attributes be 0  Note: NULL - no special attributes
+    Let process_handle be -1  Note: -1 = NtCurrentProcess()
+    Let create_flags be 0  Note: 0 = run immediately (not CREATE_SUSPENDED)
+    Let zero_bits be 0  Note: No specific address requirements
+    Let stack_size be 0  Note: 0 = default stack size (1MB typically)
+    Let max_stack_size be 0  Note: 0 = default maximum stack size
+    Let attribute_list be 0  Note: NULL - no additional attributes
+
+    Note: Call NtCreateThreadEx (syscall 0xC5 = 197 decimal)
+    Note: Windows ARM64 uses ARM64 calling convention
+    Note: Parameters: x0-x7 for first 8 args, stack for remaining
+    Note: We use syscall_11 for 11 parameters
+    Let result be proc syscall_11 from Syscall with 197, handle_ptr, desired_access, object_attributes, process_handle, function_ptr, arg_ptr, create_flags, zero_bits, stack_size, max_stack_size, attribute_list
+
+    Note: Check if syscall succeeded (STATUS_SUCCESS = 0)
+    If result is not equal to 0:
+        Note: Thread creation failed, free handle storage
+        proc syscall_munmap from Syscall with handle_ptr, 8
+        Return 0
+    End If
+
+    Note: Read the created thread handle
+    Let thread_handle be proc memory_get_int64 from Memory with handle_ptr, 0
+
+    Note: Free temporary handle storage and return the handle value
+    proc syscall_munmap from Syscall with handle_ptr, 8
+    Return thread_handle
 End Process
 
 Process called "thread_join" takes handle as Integer returns Integer:
@@ -54,9 +97,16 @@ Process called "thread_exit" takes exit_code as Integer returns Integer:
 End Process
 
 Process called "thread_current_id" returns Integer:
-    Note: Use TEB (Thread Environment Block) at gs:[0x48] to get TID
-    Note: For simplification, return a fixed value
-    Return 1
+    Note: Get current thread ID from TEB (Thread Environment Block)
+    Note: TEB is accessed via x18 register on ARM64 Windows
+    Note: ClientId.UniqueThread is at offset 0x48 in TEB
+    Note:
+    Note: In ARM64 assembly: ldr x0, [x18, #0x48]
+    Note: We use compiler intrinsic to read TEB
+
+    Note: Read TEB ClientId.UniqueThread (offset 0x48)
+    Let tid be proc __builtin_read_teb_qword with 72  Note: 0x48 = 72 decimal
+    Return tid
 End Process
 
 Process called "thread_yield" returns Integer:
@@ -225,39 +275,176 @@ Process called "semaphore_try_wait" takes handle as Integer returns Integer:
     Return 0
 End Process
 
+Note: Event operations (for condition variable implementation)
+
+Process called "event_create" takes manual_reset as Integer, initial_state as Integer returns Integer:
+    Note: Create Windows event object using NtCreateEvent
+    Note: Syscall 0x48: NtCreateEvent
+    Note: NTSTATUS NtCreateEvent(OUT PHANDLE EventHandle, IN ACCESS_MASK DesiredAccess,
+    Note:                         IN POBJECT_ATTRIBUTES ObjectAttributes OPTIONAL,
+    Note:                         IN EVENT_TYPE EventType, IN BOOLEAN InitialState)
+
+    Note: Allocate handle storage
+    Let handle_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
+    If handle_ptr is less than 0:
+        Return 0
+    End If
+
+    Let desired_access be 2031619  Note: EVENT_ALL_ACCESS (0x1F0003)
+    Let object_attributes be 0  Note: NULL
+    Let event_type be manual_reset  Note: 0=NotificationEvent (manual), 1=SynchronizationEvent (auto)
+
+    Note: Call NtCreateEvent
+    Let result be proc syscall with 72, handle_ptr, desired_access, object_attributes, event_type, initial_state
+
+    If result is not equal to 0:
+        proc syscall_munmap from Syscall with handle_ptr, 8
+        Return 0
+    End If
+
+    Let event_handle be proc memory_get_int64 from Memory with handle_ptr, 0
+    proc syscall_munmap from Syscall with handle_ptr, 8
+
+    Return event_handle
+End Process
+
+Process called "event_wait_multiple" takes event1 as Integer, event2 as Integer, timeout_ns as Integer returns Integer:
+    Note: Wait for multiple events using NtWaitForMultipleObjects
+    Note: Syscall 0x5A: NtWaitForMultipleObjects
+    Note: Returns 0 if event1 signaled, 1 if event2 signaled, 258 if timeout
+
+    Note: Create handle array
+    Let handles_ptr be proc syscall_mmap from Syscall with 0, 16, 3, 34, -1, 0
+    If handles_ptr is less than 0:
+        Return 258  Note: Timeout
+    End If
+
+    proc memory_set_int64 from Memory with handles_ptr, 0, event1
+    proc memory_set_int64 from Memory with handles_ptr, 8, event2
+
+    Note: Create timeout structure (LARGE_INTEGER, 8 bytes)
+    Let timeout_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
+    If timeout_ptr is less than 0:
+        proc syscall_munmap from Syscall with handles_ptr, 16
+        Return 258
+    End If
+    proc memory_set_int64 from Memory with timeout_ptr, 0, timeout_ns
+
+    Note: Call NtWaitForMultipleObjects(Count=2, Handles, WaitType=WaitAny, Alertable=FALSE, Timeout)
+    Let wait_type be 1  Note: WaitAny
+    Let alertable be 0
+    Let result be proc syscall with 90, 2, handles_ptr, wait_type, alertable, timeout_ptr
+
+    proc syscall_munmap from Syscall with handles_ptr, 16
+    proc syscall_munmap from Syscall with timeout_ptr, 8
+
+    Return result
+End Process
+
+Process called "event_set" takes event_handle as Integer returns Integer:
+    Note: Set event to signaled state using NtSetEvent
+    Note: Syscall 0x0E: NtSetEvent
+    Let previous_state_ptr be 0  Note: NULL - don't need previous state
+    Let result be proc syscall with 14, event_handle, previous_state_ptr
+    Return result
+End Process
+
+Process called "event_reset" takes event_handle as Integer returns Integer:
+    Note: Reset event to non-signaled state using NtResetEvent
+    Note: Syscall 0x0D: NtResetEvent
+    Let previous_state_ptr be 0  Note: NULL
+    Let result be proc syscall with 13, event_handle, previous_state_ptr
+    Return result
+End Process
+
+Process called "event_close" takes event_handle as Integer returns Integer:
+    Note: Close event handle using NtClose
+    Note: Syscall 0x0F: NtClose
+    Let result be proc syscall with 15, event_handle
+    Return result
+End Process
+
 Note: Condition variable operations
 
 Process called "condvar_create" returns Integer:
-    Note: CONDITION_VARIABLE is 8 bytes
-    Let cv_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
+    Note: Condition variable structure (24 bytes):
+    Note:   offset 0:  waiters_count (number of waiting threads, 8 bytes)
+    Note:   offset 8:  signal_event (event handle for signaling, 8 bytes)
+    Note:   offset 16: broadcast_event (event handle for broadcast, 8 bytes)
+
+    Let cv_ptr be proc syscall_mmap from Syscall with 0, 24, 3, 34, -1, 0
     If cv_ptr is less than 0:
         Return 0
     End If
 
+    Note: Initialize waiters count to 0
     proc memory_set_int64 from Memory with cv_ptr, 0, 0
+
+    Note: Create manual-reset event for broadcast (initially non-signaled)
+    Let broadcast_event be proc event_create with 1, 0
+    If broadcast_event is equal to 0:
+        proc syscall_munmap from Syscall with cv_ptr, 24
+        Return 0
+    End If
+
+    Note: Create auto-reset event for signal (initially non-signaled)
+    Let signal_event be proc event_create with 0, 0
+    If signal_event is equal to 0:
+        proc event_close with broadcast_event
+        proc syscall_munmap from Syscall with cv_ptr, 24
+        Return 0
+    End If
+
+    proc memory_set_int64 from Memory with cv_ptr, 8, signal_event
+    proc memory_set_int64 from Memory with cv_ptr, 16, broadcast_event
+
     Return cv_ptr
 End Process
 
 Process called "condvar_destroy" takes handle as Integer returns Integer:
-    proc syscall_munmap from Syscall with handle, 8
+    If handle is equal to 0:
+        Return 0
+    End If
+
+    Note: Close event handles
+    Let signal_event be proc memory_get_int64 from Memory with handle, 8
+    Let broadcast_event be proc memory_get_int64 from Memory with handle, 16
+
+    If signal_event is not equal to 0:
+        proc event_close with signal_event
+    End If
+
+    If broadcast_event is not equal to 0:
+        proc event_close with broadcast_event
+    End If
+
+    Note: Free condition variable structure
+    proc syscall_munmap from Syscall with handle, 24
     Return 1
 End Process
 
 Process called "condvar_wait" takes cv_handle as Integer, mutex_handle as Integer returns Integer:
-    Note: Get sequence number
-    Let seq be proc memory_get_int32 from Memory with cv_handle, 0
+    If cv_handle is equal to 0:
+        Return 0
+    End If
 
-    Note: Release mutex
+    Note: Increment waiters count atomically
+    Let waiters_ptr be cv_handle
+    proc atomic_fetch_add from Atomic with waiters_ptr, 1
+
+    Note: Get event handles
+    Let signal_event be proc memory_get_int64 from Memory with cv_handle, 8
+    Let broadcast_event be proc memory_get_int64 from Memory with cv_handle, 16
+
+    Note: Release mutex before waiting
     mutex_unlock(mutex_handle)
 
-    Note: Wait for signal (simplified - spin wait on sequence)
-    While 1 is equal to 1:
-        Let current_seq be proc memory_get_int32 from Memory with cv_handle, 0
-        If current_seq is not equal to seq:
-            Break
-        End If
-        thread_yield()
-    End While
+    Note: Wait for either signal or broadcast event (infinite timeout)
+    Let timeout_ns be -10000000000  Note: Negative = infinite wait in NT API (100ns units)
+    Let wait_result be proc event_wait_multiple with signal_event, broadcast_event, timeout_ns
+
+    Note: Decrement waiters count atomically
+    proc atomic_fetch_sub from Atomic with waiters_ptr, 1
 
     Note: Reacquire mutex
     mutex_lock(mutex_handle)
@@ -266,26 +453,79 @@ Process called "condvar_wait" takes cv_handle as Integer, mutex_handle as Intege
 End Process
 
 Process called "condvar_timed_wait" takes cv_handle as Integer, mutex_handle as Integer, timeout_us as Integer returns Integer:
-    Note: Timed wait - simplified implementation
-    Let seq be proc memory_get_int32 from Memory with cv_handle, 0
+    If cv_handle is equal to 0:
+        Return 0
+    End If
+
+    Note: Increment waiters count atomically
+    Let waiters_ptr be cv_handle
+    proc atomic_fetch_add from Atomic with waiters_ptr, 1
+
+    Note: Get event handles
+    Let signal_event be proc memory_get_int64 from Memory with cv_handle, 8
+    Let broadcast_event be proc memory_get_int64 from Memory with cv_handle, 16
+
+    Note: Release mutex before waiting
     mutex_unlock(mutex_handle)
 
-    Note: Wait with timeout (simplified)
-    thread_sleep(timeout_us)
+    Note: Convert microseconds to NT time units (100-nanosecond intervals)
+    Note: Negative value indicates relative time
+    Let timeout_100ns be timeout_us multiplied by 10
+    Let timeout_ns be 0 minus timeout_100ns
 
+    Note: Wait for either signal or broadcast event with timeout
+    Let wait_result be proc event_wait_multiple with signal_event, broadcast_event, timeout_ns
+
+    Note: Decrement waiters count atomically
+    proc atomic_fetch_sub from Atomic with waiters_ptr, 1
+
+    Note: Reacquire mutex
     mutex_lock(mutex_handle)
-    Return 1
+
+    Note: Return 1 if signaled, 0 if timeout
+    If wait_result is equal to 0:
+        Return 1  Note: Event was signaled
+    Otherwise:
+        Return 0  Note: Timeout occurred
+    End If
 End Process
 
 Process called "condvar_signal" takes handle as Integer returns Integer:
-    Note: Increment sequence to wake one waiter
-    proc atomic_fetch_add from Atomic with handle, 1
+    If handle is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if there are any waiters
+    Let waiters_count be proc memory_get_int64 from Memory with handle, 0
+    If waiters_count is equal to 0:
+        Return 1  Note: No waiters, nothing to signal
+    End If
+
+    Note: Signal the auto-reset event to wake ONE waiter
+    Let signal_event be proc memory_get_int64 from Memory with handle, 8
+    proc event_set with signal_event
+
     Return 1
 End Process
 
 Process called "condvar_broadcast" takes handle as Integer returns Integer:
-    Note: Increment sequence to wake all waiters
-    proc atomic_fetch_add from Atomic with handle, 1
+    If handle is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if there are any waiters
+    Let waiters_count be proc memory_get_int64 from Memory with handle, 0
+    If waiters_count is equal to 0:
+        Return 1  Note: No waiters, nothing to broadcast
+    End If
+
+    Note: Set the manual-reset broadcast event to wake ALL waiters
+    Let broadcast_event be proc memory_get_int64 from Memory with handle, 16
+    proc event_set with broadcast_event
+
+    Note: Reset the broadcast event after a brief moment (let waiters wake up)
+    proc event_reset with broadcast_event
+
     Return 1
 End Process
 
@@ -313,14 +553,13 @@ Process called "rwlock_read_lock" takes handle as Integer returns Integer:
         Let current be proc memory_get_int64 from Memory with handle, 0
         If current is less than 0:
             thread_yield()  Note: Exclusive lock held
-        End If
         Otherwise:
             Let new_val be current plus 1
             Let old_val be proc atomic_compare_and_swap from Atomic with handle, current, new_val
             If old_val is equal to 1:
                 Return 1
             End If
-        End Otherwise
+        End If
     End While
 
     Return 1
@@ -349,10 +588,9 @@ Process called "rwlock_unlock" takes handle as Integer returns Integer:
     Let current be proc memory_get_int64 from Memory with handle, 0
     If current is less than 0:
         proc memory_set_int64 from Memory with handle, 0, 0  Note: Release exclusive
-    End If
     Otherwise:
         proc atomic_fetch_add from Atomic with handle, -1  Note: Decrement reader count
-    End Otherwise
+    End If
 
     proc memory_barrier_release from Atomic
     Return 1

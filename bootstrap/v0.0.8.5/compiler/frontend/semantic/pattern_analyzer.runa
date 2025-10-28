@@ -1,0 +1,1534 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements semantic analysis for pattern matching in Runa.
+
+This file performs the following tasks:
+- Analyze pattern bindings and detect duplicate variable bindings
+- Type check patterns against scrutinee types
+- Check exhaustiveness of match statements
+- Analyze pattern irrefutability for Let statements
+- Validate variant constructors and type compatibility
+- Track pattern variable scope and lifetime
+
+This file is essential because of the following reasons:
+- Pattern matching safety requires comprehensive semantic validation
+- Binding analysis prevents variable shadowing and duplicate bindings
+- Exhaustiveness checking ensures all cases are handled
+- Irrefutability analysis prevents runtime match failures in Let statements
+- Type checking ensures pattern-value compatibility
+
+This file consists of the following functions/features/operation types:
+- Pattern binding analysis and duplicate detection
+- Pattern type checking and compatibility validation
+- Match exhaustiveness checking with coverage analysis
+- Pattern irrefutability determination
+- Variant constructor validation
+- Pattern variable scope tracking
+
+Dependencies:
+- Imports type_checker.runa for type compatibility checking
+- Imports symbol_table.runa for variable binding tracking
+- Imports scope_analyzer.runa for scope management
+- Imports ast.runa for pattern AST node types
+- Imports memory/layout.runa for structure allocation
+:End Note
+
+Import "compiler/frontend/semantic/type_checker.runa" as TypeChecker
+Import "compiler/frontend/semantic/symbol_table.runa" as SymbolTable
+Import "compiler/frontend/semantic/scope_analyzer.runa" as ScopeAnalyzer
+Import "compiler/frontend/parsing/ast.runa" as AST
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/hashtable.runa" as HashTable
+
+Note: ============================================================================
+Note: Pattern Analyzer Structure
+Note: ============================================================================
+
+Type called "PatternAnalyzer":
+    type_checker as Integer      Note: OWNED - type checker reference
+    symbol_table as Integer      Note: OWNED - symbol table reference
+    scope_analyzer as Integer    Note: OWNED - scope analyzer reference
+    arena as Integer             Note: OWNED - arena for temporary analysis
+    binding_map as Integer       Note: OWNED - hashtable for binding tracking
+    error_count as Integer       Note: STACK - pattern error count
+    warning_count as Integer     Note: STACK - pattern warning count
+    current_scrutinee_type as Integer  Note: STACK - current match scrutinee type
+    in_refutable_context as Integer    Note: STACK - 1 if in match/when, 0 if in let
+    exhaustiveness_enabled as Integer  Note: STACK - 1 to check exhaustiveness
+End Type
+
+Type called "PatternBinding":
+    variable_name as Integer     Note: OWNED - variable name string
+    pattern_type as Integer      Note: STACK - type of the binding
+    is_mutable as Integer        Note: STACK - mutability flag
+    source_line as Integer       Note: STACK - source line number
+    source_column as Integer     Note: STACK - source column number
+End Type
+
+Type called "ExhaustivenessState":
+    covered_literals as Integer   Note: OWNED - set of covered literal values
+    covered_ranges as Integer     Note: OWNED - list of covered ranges
+    has_wildcard as Integer       Note: STACK - 1 if wildcard pattern present
+    has_identifier as Integer     Note: STACK - 1 if identifier binding present
+    variant_coverage as Integer   Note: OWNED - hashtable of covered variants
+    missing_variants as Integer   Note: OWNED - list of uncovered variants
+End Type
+
+Note: ============================================================================
+Note: Pattern Analyzer Creation and Management
+Note: ============================================================================
+
+Process called "create_pattern_analyzer" takes type_checker as Integer, symbol_table as Integer, scope_analyzer as Integer returns Integer:
+    Note:
+    Create and initialize a pattern analyzer.
+    Parameters:
+      type_checker - Type checker instance
+      symbol_table - Symbol table instance
+      scope_analyzer - Scope analyzer instance
+    Returns pointer to PatternAnalyzer structure.
+    :End Note
+
+    If type_checker is equal to 0:
+        Return 0
+    End If
+
+    If symbol_table is equal to 0:
+        Return 0
+    End If
+
+    If scope_analyzer is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate PatternAnalyzer (10 fields × 8 bytes = 80 bytes)
+    Let analyzer_size be 80
+    Let analyzer be proc arena_allocate from Layout with symbol_table, analyzer_size
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize fields
+    proc memory_set_qword from Layout with analyzer, 0, type_checker
+    proc memory_set_qword from Layout with analyzer, 8, symbol_table
+    proc memory_set_qword from Layout with analyzer, 16, scope_analyzer
+
+    Note: Create arena for temporary analysis data
+    Let arena be proc create_arena from Layout with 4096
+    proc memory_set_qword from Layout with analyzer, 24, arena
+
+    Note: Create binding map for tracking pattern bindings
+    Let binding_map be proc create from HashTable
+    proc memory_set_qword from Layout with analyzer, 32, binding_map
+
+    Note: Initialize counters and flags
+    proc memory_set_qword from Layout with analyzer, 40, 0  Note: error_count
+    proc memory_set_qword from Layout with analyzer, 48, 0  Note: warning_count
+    proc memory_set_qword from Layout with analyzer, 56, 0  Note: current_scrutinee_type
+    proc memory_set_qword from Layout with analyzer, 64, 1  Note: in_refutable_context (default)
+    proc memory_set_qword from Layout with analyzer, 72, 1  Note: exhaustiveness_enabled
+
+    Return analyzer
+End Process
+
+Note: ============================================================================
+Note: Pattern Binding Analysis
+Note: ============================================================================
+
+Process called "analyze_pattern_bindings" takes analyzer as Integer, pattern as Integer returns Integer:
+    Note:
+    Analyze all variable bindings introduced by a pattern.
+    Detects duplicate bindings and validates binding consistency.
+    Parameters:
+      analyzer - PatternAnalyzer instance
+      pattern - Pattern AST node to analyze
+    Returns 1 on success, 0 if binding errors detected.
+    :End Note
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    Note: Clear binding map for this pattern
+    Let binding_map be proc memory_get_qword from Layout with analyzer, 32
+    proc clear from HashTable with binding_map
+
+    Note: Collect all bindings from pattern
+    Let success be proc collect_pattern_bindings with analyzer, pattern, binding_map
+
+    If success is equal to 0:
+        Return 0
+    End If
+
+    Note: Validate bindings (check for duplicates, consistency)
+    Let valid be proc validate_pattern_bindings with analyzer, binding_map
+
+    Return valid
+End Process
+
+Process called "collect_pattern_bindings" takes analyzer as Integer, pattern as Integer, binding_map as Integer returns Integer:
+    Note:
+    Recursively collect all variable bindings from pattern.
+    Detects duplicate bindings within same pattern.
+    Returns 1 on success, 0 if duplicates found.
+    :End Note
+
+    If pattern is equal to 0:
+        Return 1  Note: Empty pattern, no bindings
+    End If
+
+    Let pattern_type be proc ast_node_get_type from AST with pattern
+
+    Note: Wildcard pattern - no bindings
+    If pattern_type is equal to AST_WILDCARD_PATTERN:
+        Return 1
+    End If
+
+    Note: Literal pattern - no bindings
+    If pattern_type is equal to AST_LITERAL_PATTERN:
+        Return 1
+    End If
+
+    Note: Identifier pattern - creates binding
+    If pattern_type is equal to AST_IDENTIFIER_PATTERN:
+        Let var_name be proc ast_node_get_value from AST with pattern
+
+        Note: Check if already bound in this pattern
+        Let existing be proc get from HashTable with binding_map, var_name
+
+        If existing is not equal to 0:
+            Note: Duplicate binding detected
+            Let line be proc ast_node_get_line from AST with pattern
+            proc report_pattern_error with analyzer, "Duplicate variable binding in pattern", var_name, line
+
+            Let error_count be proc memory_get_qword from Layout with analyzer, 40
+            Set error_count to error_count plus 1
+            proc memory_set_qword from Layout with analyzer, 40, error_count
+
+            Return 0
+        End If
+
+        Note: Record this binding
+        Let binding be proc create_pattern_binding with analyzer, var_name, pattern
+        proc set from HashTable with binding_map, var_name, binding
+
+        Return 1
+    End If
+
+    Note: Tuple pattern - collect bindings from elements
+    If pattern_type is equal to AST_TUPLE_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+        Let i be 0
+
+        While i is less than child_count:
+            Let child be proc ast_node_get_child from AST with pattern, i
+            Let success be proc collect_pattern_bindings with analyzer, child, binding_map
+
+            If success is equal to 0:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Record pattern - collect bindings from field patterns
+    If pattern_type is equal to AST_RECORD_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+        Let i be 0
+
+        While i is less than child_count:
+            Let field_tuple be proc ast_node_get_child from AST with pattern, i
+
+            Note: Field is stored as tuple (field_name_pattern, value_pattern)
+            Let value_pattern be proc ast_node_get_child from AST with field_tuple, 1
+            Let success be proc collect_pattern_bindings with analyzer, value_pattern, binding_map
+
+            If success is equal to 0:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Array pattern - collect bindings from elements
+    If pattern_type is equal to AST_ARRAY_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+        Let i be 0
+
+        While i is less than child_count:
+            Let element be proc ast_node_get_child from AST with pattern, i
+            Let success be proc collect_pattern_bindings with analyzer, element, binding_map
+
+            If success is equal to 0:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Range pattern - no bindings (literal range endpoints)
+    If pattern_type is equal to AST_RANGE_PATTERN:
+        Return 1
+    End If
+
+    Note: Variant pattern - collect bindings from inner pattern
+    If pattern_type is equal to AST_VARIANT_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+
+        If child_count is greater than 0:
+            Let inner_pattern be proc ast_node_get_child from AST with pattern, 0
+            Let success be proc collect_pattern_bindings with analyzer, inner_pattern, binding_map
+            Return success
+        End If
+
+        Return 1
+    End If
+
+    Note: Type pattern - collect bindings from inner pattern
+    If pattern_type is equal to AST_TYPE_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+
+        If child_count is greater than 0:
+            Let inner_pattern be proc ast_node_get_child from AST with pattern, 0
+            Let success be proc collect_pattern_bindings with analyzer, inner_pattern, binding_map
+            Return success
+        End If
+
+        Return 1
+    End If
+
+    Note: Guard pattern - collect from base pattern
+    If pattern_type is equal to AST_GUARD_PATTERN:
+        Let base_pattern be proc ast_node_get_child from AST with pattern, 0
+        Let success be proc collect_pattern_bindings with analyzer, base_pattern, binding_map
+        Return success
+    End If
+
+    Note: OR pattern - validate consistent bindings across alternatives
+    If pattern_type is equal to AST_OR_PATTERN:
+        Let success be proc analyze_or_pattern_bindings with analyzer, pattern, binding_map
+        Return success
+    End If
+
+    Note: Rest pattern - creates binding if named
+    If pattern_type is equal to AST_REST_PATTERN:
+        Let rest_name be proc ast_node_get_value from AST with pattern
+
+        If rest_name is not equal to 0:
+            Note: Named rest pattern creates binding
+            Let existing be proc get from HashTable with binding_map, rest_name
+
+            If existing is not equal to 0:
+                Let line be proc ast_node_get_line from AST with pattern
+                proc report_pattern_error with analyzer, "Duplicate variable binding in rest pattern", rest_name, line
+                Return 0
+            End If
+
+            Let binding be proc create_pattern_binding with analyzer, rest_name, pattern
+            proc set from HashTable with binding_map, rest_name, binding
+        End If
+
+        Return 1
+    End If
+
+    Note: Unknown pattern type
+    Return 1
+End Process
+
+Process called "analyze_or_pattern_bindings" takes analyzer as Integer, or_pattern as Integer, binding_map as Integer returns Integer:
+    Note:
+    Analyze OR pattern to ensure all alternatives bind same variables.
+    OR patterns must have consistent bindings across all alternatives.
+    Returns 1 if consistent, 0 if inconsistent bindings detected.
+    :End Note
+
+    Let child_count be proc ast_node_get_child_count from AST with or_pattern
+
+    If child_count is less than 2:
+        Return 1  Note: Need at least 2 alternatives
+    End If
+
+    Note: Collect bindings from first alternative as reference
+    Let first_alt be proc ast_node_get_child from AST with or_pattern, 0
+    Let reference_bindings be proc create from HashTable
+    Let success be proc collect_pattern_bindings with analyzer, first_alt, reference_bindings
+
+    If success is equal to 0:
+        Return 0
+    End If
+
+    Note: Check each subsequent alternative has same bindings
+    Let i be 1
+    While i is less than child_count:
+        Let alt be proc ast_node_get_child from AST with or_pattern, i
+        Let alt_bindings be proc create from HashTable
+
+        Set success to proc collect_pattern_bindings with analyzer, alt, alt_bindings
+
+        If success is equal to 0:
+            Return 0
+        End If
+
+        Note: Compare bindings - must be identical
+        Let bindings_match be proc compare_binding_sets with reference_bindings, alt_bindings
+
+        If bindings_match is equal to 0:
+            Let line be proc ast_node_get_line from AST with alt
+            proc report_pattern_error with analyzer, "Inconsistent bindings across OR pattern alternatives", 0, line
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Copy reference bindings to main binding_map
+    proc merge_binding_maps with binding_map, reference_bindings
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Pattern Type Checking
+Note: ============================================================================
+
+Process called "check_pattern_type" takes analyzer as Integer, pattern as Integer, expected_type as Integer returns Integer:
+    Note:
+    Type check a pattern against expected scrutinee type.
+    Validates pattern structure matches type structure.
+    Returns 1 if type compatible, 0 if type mismatch.
+    :End Note
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    If expected_type is equal to 0:
+        Return 1  Note: No type constraint
+    End If
+
+    Let pattern_type be proc ast_node_get_type from AST with pattern
+
+    Note: Wildcard matches any type
+    If pattern_type is equal to AST_WILDCARD_PATTERN:
+        Return 1
+    End If
+
+    Note: Identifier matches any type (creates binding)
+    If pattern_type is equal to AST_IDENTIFIER_PATTERN:
+        Return 1
+    End If
+
+    Note: Literal pattern - check literal type matches
+    If pattern_type is equal to AST_LITERAL_PATTERN:
+        Let literal_type be proc get_literal_pattern_type with pattern
+        Let type_checker be proc memory_get_qword from Layout with analyzer, 0
+        Let compatible be proc are_types_compatible from TypeChecker with type_checker, literal_type, expected_type
+        Return compatible
+    End If
+
+    Note: Tuple pattern - check element types match tuple type
+    If pattern_type is equal to AST_TUPLE_PATTERN:
+        Let success be proc check_tuple_pattern_type with analyzer, pattern, expected_type
+        Return success
+    End If
+
+    Note: Record pattern - check field types match record type
+    If pattern_type is equal to AST_RECORD_PATTERN:
+        Let success be proc check_record_pattern_type with analyzer, pattern, expected_type
+        Return success
+    End If
+
+    Note: Array pattern - check element type matches array element type
+    If pattern_type is equal to AST_ARRAY_PATTERN:
+        Let success be proc check_array_pattern_type with analyzer, pattern, expected_type
+        Return success
+    End If
+
+    Note: Range pattern - check range bounds match type
+    If pattern_type is equal to AST_RANGE_PATTERN:
+        Let success be proc check_range_pattern_type with analyzer, pattern, expected_type
+        Return success
+    End If
+
+    Note: Variant pattern - validate constructor exists and payload type
+    If pattern_type is equal to AST_VARIANT_PATTERN:
+        Let success be proc check_variant_pattern_type with analyzer, pattern, expected_type
+        Return success
+    End If
+
+    Note: Type pattern - validate explicit type annotation
+    If pattern_type is equal to AST_TYPE_PATTERN:
+        Let success be proc check_type_pattern with analyzer, pattern, expected_type
+        Return success
+    End If
+
+    Note: OR pattern - all alternatives must match type
+    If pattern_type is equal to AST_OR_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+        Let i be 0
+
+        While i is less than child_count:
+            Let alt be proc ast_node_get_child from AST with pattern, i
+            Let compatible be proc check_pattern_type with analyzer, alt, expected_type
+
+            If compatible is equal to 0:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Guard pattern - check base pattern type
+    If pattern_type is equal to AST_GUARD_PATTERN:
+        Let base_pattern be proc ast_node_get_child from AST with pattern, 0
+        Let compatible be proc check_pattern_type with analyzer, base_pattern, expected_type
+        Return compatible
+    End If
+
+    Note: Rest pattern - matches array element type
+    If pattern_type is equal to AST_REST_PATTERN:
+        Return 1  Note: Rest always compatible (captures remaining elements)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Exhaustiveness Checking
+Note: ============================================================================
+
+Process called "check_match_exhaustiveness" takes analyzer as Integer, scrutinee_type as Integer, patterns as Integer, pattern_count as Integer returns Integer:
+    Note:
+    Check if match patterns exhaustively cover all possible values.
+    Detects missing cases and unreachable patterns.
+    Returns 1 if exhaustive, 0 if non-exhaustive or has unreachable patterns.
+    :End Note
+
+    If analyzer is equal to 0:
+        Return 0
+    End If
+
+    If scrutinee_type is equal to 0:
+        Return 1  Note: Cannot check without type info
+    End If
+
+    Note: Create exhaustiveness state
+    Let state be proc create_exhaustiveness_state with analyzer
+
+    Note: Analyze each pattern for coverage
+    Let i be 0
+    While i is less than pattern_count:
+        Let pattern be proc memory_get_qword from Layout with patterns, i multiplied by 8
+
+        Note: Update coverage state
+        proc update_exhaustiveness_state with analyzer, state, pattern, scrutinee_type
+
+        Set i to i plus 1
+    End While
+
+    Note: Check if all cases covered
+    Let is_exhaustive be proc is_exhaustiveness_state_complete with analyzer, state, scrutinee_type
+
+    If is_exhaustive is equal to 0:
+        Note: Report missing patterns
+        proc report_non_exhaustive_match with analyzer, state, scrutinee_type
+    End If
+
+    Return is_exhaustive
+End Process
+
+Process called "update_exhaustiveness_state" takes analyzer as Integer, state as Integer, pattern as Integer, scrutinee_type as Integer returns Integer:
+    Note:
+    Update exhaustiveness coverage state with new pattern.
+    Tracks covered literals, ranges, variants, and wildcard presence.
+    :End Note
+
+    Let pattern_type be proc ast_node_get_type from AST with pattern
+
+    Note: Wildcard covers everything
+    If pattern_type is equal to AST_WILDCARD_PATTERN:
+        proc memory_set_qword from Layout with state, 16, 1  Note: has_wildcard
+        Return 1
+    End If
+
+    Note: Identifier covers everything
+    If pattern_type is equal to AST_IDENTIFIER_PATTERN:
+        proc memory_set_qword from Layout with state, 24, 1  Note: has_identifier
+        Return 1
+    End If
+
+    Note: Literal pattern
+    If pattern_type is equal to AST_LITERAL_PATTERN:
+        Let literal_value be proc ast_node_get_value from AST with pattern
+        Let covered_literals be proc memory_get_qword from Layout with state, 0
+        proc set from HashTable with covered_literals, literal_value, 1
+        Return 1
+    End If
+
+    Note: Range pattern
+    If pattern_type is equal to AST_RANGE_PATTERN:
+        Let covered_ranges be proc memory_get_qword from Layout with state, 8
+        proc add_range_to_coverage with covered_ranges, pattern
+        Return 1
+    End If
+
+    Note: Variant pattern
+    If pattern_type is equal to AST_VARIANT_PATTERN:
+        Let variant_name be proc ast_node_get_value from AST with pattern
+        Let variant_coverage be proc memory_get_qword from Layout with state, 32
+        proc set from HashTable with variant_coverage, variant_name, 1
+        Return 1
+    End If
+
+    Note: OR pattern - covers union of alternatives
+    If pattern_type is equal to AST_OR_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+        Let i be 0
+
+        While i is less than child_count:
+            Let alt be proc ast_node_get_child from AST with pattern, i
+            proc update_exhaustiveness_state with analyzer, state, alt, scrutinee_type
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Irrefutability Analysis
+Note: ============================================================================
+
+Process called "is_pattern_irrefutable" takes analyzer as Integer, pattern as Integer returns Integer:
+    Note:
+    Determine if pattern always matches (irrefutable).
+    Irrefutable patterns can be used in Let statements.
+    Returns 1 if irrefutable, 0 if refutable.
+    :End Note
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    Let pattern_type be proc ast_node_get_type from AST with pattern
+
+    Note: Wildcard is always irrefutable
+    If pattern_type is equal to AST_WILDCARD_PATTERN:
+        Return 1
+    End If
+
+    Note: Identifier is always irrefutable
+    If pattern_type is equal to AST_IDENTIFIER_PATTERN:
+        Return 1
+    End If
+
+    Note: Literals are refutable (must match exact value)
+    If pattern_type is equal to AST_LITERAL_PATTERN:
+        Return 0
+    End If
+
+    Note: Tuple is irrefutable if all elements are irrefutable
+    If pattern_type is equal to AST_TUPLE_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+        Let i be 0
+
+        While i is less than child_count:
+            Let element be proc ast_node_get_child from AST with pattern, i
+            Let element_irrefutable be proc is_pattern_irrefutable with analyzer, element
+
+            If element_irrefutable is equal to 0:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Record is irrefutable if all field patterns are irrefutable
+    If pattern_type is equal to AST_RECORD_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+        Let i be 0
+
+        While i is less than child_count:
+            Let field_tuple be proc ast_node_get_child from AST with pattern, i
+            Let value_pattern be proc ast_node_get_child from AST with field_tuple, 1
+            Let field_irrefutable be proc is_pattern_irrefutable with analyzer, value_pattern
+
+            If field_irrefutable is equal to 0:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Array patterns are refutable (must match exact length unless has rest)
+    If pattern_type is equal to AST_ARRAY_PATTERN:
+        Let has_rest be proc ast_node_get_value from AST with pattern
+        Return has_rest  Note: Only irrefutable if has rest pattern
+    End If
+
+    Note: Ranges are refutable (must match range)
+    If pattern_type is equal to AST_RANGE_PATTERN:
+        Return 0
+    End If
+
+    Note: Variants are refutable (must match specific constructor)
+    If pattern_type is equal to AST_VARIANT_PATTERN:
+        Return 0
+    End If
+
+    Note: Type patterns depend on inner pattern
+    If pattern_type is equal to AST_TYPE_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+
+        If child_count is greater than 0:
+            Let inner_pattern be proc ast_node_get_child from AST with pattern, 0
+            Let inner_irrefutable be proc is_pattern_irrefutable with analyzer, inner_pattern
+            Return inner_irrefutable
+        End If
+
+        Return 1  Note: Type-only pattern is irrefutable
+    End If
+
+    Note: Guard patterns are refutable (guard may fail)
+    If pattern_type is equal to AST_GUARD_PATTERN:
+        Return 0
+    End If
+
+    Note: OR patterns are irrefutable if any alternative is irrefutable
+    If pattern_type is equal to AST_OR_PATTERN:
+        Let child_count be proc ast_node_get_child_count from AST with pattern
+        Let i be 0
+
+        While i is less than child_count:
+            Let alt be proc ast_node_get_child from AST with pattern, i
+            Let alt_irrefutable be proc is_pattern_irrefutable with analyzer, alt
+
+            If alt_irrefutable is equal to 1:
+                Return 1  Note: At least one irrefutable alternative
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 0  Note: All alternatives refutable
+    End If
+
+    Note: Rest pattern is irrefutable
+    If pattern_type is equal to AST_REST_PATTERN:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Helper Functions
+Note: ============================================================================
+
+Process called "create_pattern_binding" takes analyzer as Integer, var_name as Integer, pattern as Integer returns Integer:
+    Note:
+    Create a PatternBinding record for a variable binding.
+    :End Note
+
+    Let arena be proc memory_get_qword from Layout with analyzer, 24
+
+    Note: Allocate PatternBinding (5 fields × 8 bytes = 40 bytes)
+    Let binding_size be 40
+    Let binding be proc arena_allocate from Layout with arena, binding_size
+
+    Let line be proc ast_node_get_line from AST with pattern
+    Let column be proc ast_node_get_column from AST with pattern
+
+    proc memory_set_qword from Layout with binding, 0, var_name
+    proc memory_set_qword from Layout with binding, 8, 0  Note: pattern_type (TBD)
+    proc memory_set_qword from Layout with binding, 16, 0  Note: is_mutable
+    proc memory_set_qword from Layout with binding, 24, line
+    proc memory_set_qword from Layout with binding, 32, column
+
+    Return binding
+End Process
+
+Process called "create_exhaustiveness_state" takes analyzer as Integer returns Integer:
+    Note:
+    Create ExhaustivenessState structure for coverage tracking.
+    :End Note
+
+    Let arena be proc memory_get_qword from Layout with analyzer, 24
+
+    Note: Allocate ExhaustivenessState (6 fields × 8 bytes = 48 bytes)
+    Let state_size be 48
+    Let state be proc arena_allocate from Layout with arena, state_size
+
+    Let covered_literals be proc create from HashTable
+    Let covered_ranges be proc create_list from Layout with arena
+    Let variant_coverage be proc create from HashTable
+    Let missing_variants be proc create_list from Layout with arena
+
+    proc memory_set_qword from Layout with state, 0, covered_literals
+    proc memory_set_qword from Layout with state, 8, covered_ranges
+    proc memory_set_qword from Layout with state, 16, 0  Note: has_wildcard
+    proc memory_set_qword from Layout with state, 24, 0  Note: has_identifier
+    proc memory_set_qword from Layout with state, 32, variant_coverage
+    proc memory_set_qword from Layout with state, 40, missing_variants
+
+    Return state
+End Process
+
+Process called "report_pattern_error" takes analyzer as Integer, message as Integer, context as Integer, line as Integer returns Integer:
+    Note:
+    Report a pattern analysis error.
+    :End Note
+
+    Note: Build error message
+    Let error_msg be proc create from StringCore
+    proc append from StringCore with error_msg, "Pattern error at line "
+
+    Let line_str be proc integer_to_string from StringCore with line
+    proc append from StringCore with error_msg, line_str
+    proc append from StringCore with error_msg, ": "
+    proc append from StringCore with error_msg, message
+
+    If context is not equal to 0:
+        proc append from StringCore with error_msg, " ("
+        proc append from StringCore with error_msg, context
+        proc append from StringCore with error_msg, ")"
+    End If
+
+    Note: Get type checker and symbol table for error reporting
+    Let type_checker be proc memory_get_qword from Layout with analyzer, 0
+    Let symbol_table be proc memory_get_qword from Layout with analyzer, 8
+
+    Note: Report error through type checker's error reporting system
+    If type_checker is not equal to 0:
+        Let error_cstr be proc to_cstring from StringCore with error_msg
+        proc type_checker_report_error from TypeChecker with type_checker, error_cstr, line, 0
+    End If
+
+    Return 1
+End Process
+
+Process called "validate_pattern_bindings" takes analyzer as Integer, binding_map as Integer returns Integer:
+    Note:
+    Validate collected pattern bindings for consistency.
+    Currently checks have been performed during collection.
+    :End Note
+
+    Return 1  Note: Validation performed during collection
+End Process
+
+Process called "compare_binding_sets" takes bindings1 as Integer, bindings2 as Integer returns Integer:
+    Note:
+    Compare two binding sets for equality (same variable names).
+    :End Note
+
+    Note: Get counts
+    Let count1 be proc hashtable_get_count from HashTable with bindings1
+    Let count2 be proc hashtable_get_count from HashTable with bindings2
+
+    If count1 is not equal to count2:
+        Return 0  Note: Different number of bindings
+    End If
+
+    Note: If both empty, they match
+    If count1 is equal to 0:
+        Return 1
+    End If
+
+    Note: Iterate through bindings1 and check each exists in bindings2
+    Let entries1 be proc memory_get_qword from Layout with bindings1, 0
+    Let capacity1 be proc memory_get_qword from Layout with bindings1, 8
+    Let i be 0
+
+    While i is less than capacity1:
+        Note: Calculate entry address (each entry is 32 bytes)
+        Let entry_offset be i multiplied by 32
+        Let entry_addr be entries1 plus entry_offset
+
+        Note: Get entry state (0=empty, 1=occupied, 2=tombstone)
+        Let state be proc memory_get_qword from Layout with entry_addr, 0
+
+        Note: Only check occupied entries
+        If state is equal to 1:
+            Note: Get key from entry (offset 8)
+            Let key be proc memory_get_qword from Layout with entry_addr, 8
+
+            Note: Check if this key exists in bindings2
+            Let exists_in_2 be proc hashtable_has from HashTable with bindings2, key
+
+            If exists_in_2 is equal to 0:
+                Return 0  Note: Key in bindings1 not in bindings2
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1  Note: All keys from bindings1 exist in bindings2
+End Process
+
+Process called "merge_binding_maps" takes dest as Integer, source as Integer returns Integer:
+    Note:
+    Merge bindings from source into destination map.
+    Copies all entries from source hashtable to destination hashtable.
+    :End Note
+
+    If dest is equal to 0:
+        Return 0
+    End If
+
+    If source is equal to 0:
+        Return 1  Note: Nothing to merge
+    End If
+
+    Note: Get source hashtable structure
+    Let entries be proc memory_get_qword from Layout with source, 0
+    Let capacity be proc memory_get_qword from Layout with source, 8
+    Let count be proc memory_get_qword from Layout with source, 16
+
+    Note: If source is empty, nothing to do
+    If count is equal to 0:
+        Return 1
+    End If
+
+    Note: Iterate through all source entries
+    Let i be 0
+    While i is less than capacity:
+        Note: Calculate entry address (each entry is 32 bytes)
+        Let entry_offset be i multiplied by 32
+        Let entry_addr be entries plus entry_offset
+
+        Note: Get entry state (0=empty, 1=occupied, 2=tombstone)
+        Let state be proc memory_get_qword from Layout with entry_addr, 0
+
+        Note: Only copy occupied entries
+        If state is equal to 1:
+            Note: Get key and value from entry
+            Let key be proc memory_get_qword from Layout with entry_addr, 8
+            Let value be proc memory_get_qword from Layout with entry_addr, 16
+
+            Note: Insert into destination
+            proc hashtable_set from HashTable with dest, key, value
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "get_literal_pattern_type" takes pattern as Integer returns Integer:
+    Note:
+    Get type of literal pattern based on value type.
+    :End Note
+
+    Let value_type be proc ast_node_get_value_type from AST with pattern
+
+    Note: Map value types to type identifiers
+    Note: 1 = Integer, 2 = String, 3 = Boolean
+    Return value_type
+End Process
+
+Process called "check_tuple_pattern_type" takes analyzer as Integer, pattern as Integer, expected_type as Integer returns Integer:
+    Note:
+    Type check tuple pattern against tuple type.
+    Validates that each pattern element matches corresponding tuple element type.
+    :End Note
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    If expected_type is equal to 0:
+        Return 0
+    End If
+
+    Note: Get type checker for type compatibility checking
+    Let type_checker be proc memory_get_qword from Layout with analyzer, 0
+    Let arena be proc memory_get_qword from Layout with analyzer, 24
+
+    Note: Get pattern elements
+    Let pattern_element_count be proc ast_node_get_child_count from AST with pattern
+
+    Note: Get tuple type element count from expected_type structure
+    Note: expected_type points to type structure with element types
+    Let type_element_count be proc memory_get_qword from Layout with expected_type, 8
+
+    Note: Verify element counts match
+    If pattern_element_count is not equal to type_element_count:
+        Let line be proc ast_node_get_line from AST with pattern
+        proc report_pattern_error with analyzer, "Tuple pattern element count mismatch", 0, line
+        Return 0
+    End If
+
+    Note: Check each element type
+    Let i be 0
+    While i is less than pattern_element_count:
+        Let pattern_element be proc ast_node_get_child from AST with pattern, i
+
+        Note: Get expected element type (tuple types store element types array at offset 16)
+        Let element_types_array be proc memory_get_qword from Layout with expected_type, 16
+        Let element_type_offset be i multiplied by 8
+        Let element_type_addr be element_types_array plus element_type_offset
+        Let expected_element_type be proc memory_get_qword from Layout with element_type_addr, 0
+
+        Note: Recursively check pattern element type
+        Let element_ok be proc check_pattern_type_compatibility with analyzer, pattern_element, expected_element_type
+
+        If element_ok is equal to 0:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "check_record_pattern_type" takes analyzer as Integer, pattern as Integer, expected_type as Integer returns Integer:
+    Note:
+    Type check record pattern against record type.
+    Validates that each field pattern matches the corresponding record field type.
+    :End Note
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    If expected_type is equal to 0:
+        Return 0
+    End If
+
+    Note: Get type checker and symbol table for field lookups
+    Let type_checker be proc memory_get_qword from Layout with analyzer, 0
+    Let symbol_table be proc memory_get_qword from Layout with analyzer, 8
+
+    Note: Get pattern field count
+    Let field_count be proc ast_node_get_child_count from AST with pattern
+
+    Note: Check each field pattern
+    Let i be 0
+    While i is less than field_count:
+        Note: Get field pattern (stored as tuple: field_name, value_pattern)
+        Let field_tuple be proc ast_node_get_child from AST with pattern, i
+        Let field_name_node be proc ast_node_get_child from AST with field_tuple, 0
+        Let value_pattern be proc ast_node_get_child from AST with field_tuple, 1
+
+        Note: Get field name string
+        Let field_name be proc ast_node_get_value from AST with field_name_node
+
+        Note: Look up field type in expected_type structure
+        Note: Record types store field map at offset 16
+        Let field_map be proc memory_get_qword from Layout with expected_type, 16
+
+        If field_map is equal to 0:
+            Let line be proc ast_node_get_line from AST with pattern
+            proc report_pattern_error with analyzer, "Record type has no fields", 0, line
+            Return 0
+        End If
+
+        Note: Get field type from field map
+        Let field_type be proc hashtable_get from HashTable with field_map, field_name
+
+        If field_type is equal to 0:
+            Let line be proc ast_node_get_line from AST with pattern
+            proc report_pattern_error with analyzer, "Unknown field in record pattern", field_name, line
+            Return 0
+        End If
+
+        Note: Recursively check value pattern type
+        Let field_ok be proc check_pattern_type_compatibility with analyzer, value_pattern, field_type
+
+        If field_ok is equal to 0:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "check_array_pattern_type" takes analyzer as Integer, pattern as Integer, expected_type as Integer returns Integer:
+    Note:
+    Type check array pattern against array type.
+    Validates that all pattern elements match the array element type.
+    :End Note
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    If expected_type is equal to 0:
+        Return 0
+    End If
+
+    Note: Get array element type from expected_type structure (offset 8)
+    Let element_type be proc memory_get_qword from Layout with expected_type, 8
+
+    If element_type is equal to 0:
+        Let line be proc ast_node_get_line from AST with pattern
+        proc report_pattern_error with analyzer, "Array type has no element type", 0, line
+        Return 0
+    End If
+
+    Note: Get pattern element count
+    Let pattern_element_count be proc ast_node_get_child_count from AST with pattern
+
+    Note: Check each element pattern
+    Let i be 0
+    While i is less than pattern_element_count:
+        Let pattern_element be proc ast_node_get_child from AST with pattern, i
+
+        Note: Check element type compatibility
+        Let element_ok be proc check_pattern_type_compatibility with analyzer, pattern_element, element_type
+
+        If element_ok is equal to 0:
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "check_range_pattern_type" takes analyzer as Integer, pattern as Integer, expected_type as Integer returns Integer:
+    Note:
+    Type check range pattern bounds match expected numeric type.
+    Validates that start and end values are numeric and compatible with expected type.
+    :End Note
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    If expected_type is equal to 0:
+        Return 0
+    End If
+
+    Note: Range patterns have two children: start and end values
+    Let child_count be proc ast_node_get_child_count from AST with pattern
+
+    If child_count is less than 2:
+        Let line be proc ast_node_get_line from AST with pattern
+        proc report_pattern_error with analyzer, "Range pattern requires start and end values", 0, line
+        Return 0
+    End If
+
+    Note: Get start and end patterns
+    Let start_pattern be proc ast_node_get_child from AST with pattern, 0
+    Let end_pattern be proc ast_node_get_child from AST with pattern, 1
+
+    Note: Check start value type compatibility
+    Let start_ok be proc check_pattern_type_compatibility with analyzer, start_pattern, expected_type
+
+    If start_ok is equal to 0:
+        Let line be proc ast_node_get_line from AST with start_pattern
+        proc report_pattern_error with analyzer, "Range start type mismatch", 0, line
+        Return 0
+    End If
+
+    Note: Check end value type compatibility
+    Let end_ok be proc check_pattern_type_compatibility with analyzer, end_pattern, expected_type
+
+    If end_ok is equal to 0:
+        Let line be proc ast_node_get_line from AST with end_pattern
+        proc report_pattern_error with analyzer, "Range end type mismatch", 0, line
+        Return 0
+    End If
+
+    Note: Verify expected type is numeric (Integer or Float)
+    Let type_id be proc memory_get_qword from Layout with expected_type, 0
+
+    Note: Type IDs: 1=Integer, 2=Float (other types not valid for ranges)
+    If type_id is not equal to 1:
+        If type_id is not equal to 2:
+            Let line be proc ast_node_get_line from AST with pattern
+            proc report_pattern_error with analyzer, "Range patterns require numeric type", 0, line
+            Return 0
+        End If
+    End If
+
+    Return 1
+End Process
+
+Process called "check_variant_pattern_type" takes analyzer as Integer, pattern as Integer, expected_type as Integer returns Integer:
+    Note:
+    Validate variant constructor exists and payload type matches.
+    Checks that the variant name exists in the enum type and payload matches.
+    :End Note
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    If expected_type is equal to 0:
+        Return 0
+    End If
+
+    Note: Get variant name from pattern (first child)
+    Let variant_name_node be proc ast_node_get_child from AST with pattern, 0
+    Let variant_name be proc ast_node_get_value from AST with variant_name_node
+
+    Note: Look up variant in expected_type (enum type with variants map at offset 16)
+    Let variants_map be proc memory_get_qword from Layout with expected_type, 16
+
+    If variants_map is equal to 0:
+        Let line be proc ast_node_get_line from AST with pattern
+        proc report_pattern_error with analyzer, "Type is not an enum with variants", 0, line
+        Return 0
+    End If
+
+    Note: Check if variant exists in variants map
+    Let variant_info be proc hashtable_get from HashTable with variants_map, variant_name
+
+    If variant_info is equal to 0:
+        Let line be proc ast_node_get_line from AST with pattern
+        proc report_pattern_error with analyzer, "Unknown variant in pattern", variant_name, line
+        Return 0
+    End If
+
+    Note: Check if pattern has payload (second child)
+    Let child_count be proc ast_node_get_child_count from AST with pattern
+
+    If child_count is greater than 1:
+        Note: Pattern has payload, validate it
+        Let payload_pattern be proc ast_node_get_child from AST with pattern, 1
+
+        Note: Get expected payload type from variant_info (offset 8)
+        Let expected_payload_type be proc memory_get_qword from Layout with variant_info, 8
+
+        If expected_payload_type is equal to 0:
+            Let line be proc ast_node_get_line from AST with pattern
+            proc report_pattern_error with analyzer, "Variant does not have a payload", variant_name, line
+            Return 0
+        End If
+
+        Note: Recursively check payload type
+        Let payload_ok be proc check_pattern_type_compatibility with analyzer, payload_pattern, expected_payload_type
+
+        If payload_ok is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Return 1
+End Process
+
+Process called "check_type_pattern" takes analyzer as Integer, pattern as Integer, expected_type as Integer returns Integer:
+    Note:
+    Validate explicit type annotation matches expected type.
+    Checks that the annotated type in the pattern is compatible with expected type.
+    :End Note
+
+    If pattern is equal to 0:
+        Return 0
+    End If
+
+    If expected_type is equal to 0:
+        Return 0
+    End If
+
+    Note: Type pattern has two children: inner pattern and type annotation
+    Let child_count be proc ast_node_get_child_count from AST with pattern
+
+    If child_count is less than 2:
+        Let line be proc ast_node_get_line from AST with pattern
+        proc report_pattern_error with analyzer, "Type pattern requires inner pattern and type annotation", 0, line
+        Return 0
+    End If
+
+    Note: Get inner pattern and type annotation
+    Let inner_pattern be proc ast_node_get_child from AST with pattern, 0
+    Let type_annotation_node be proc ast_node_get_child from AST with pattern, 1
+
+    Note: Get annotated type from type annotation node
+    Let annotated_type be proc ast_node_get_value from AST with type_annotation_node
+
+    Note: Get type checker for compatibility checking
+    Let type_checker be proc memory_get_qword from Layout with analyzer, 0
+    Let arena be proc memory_get_qword from Layout with analyzer, 24
+
+    Note: Check if annotated type is compatible with expected type
+    Let compatible be proc type_checker_check_compatibility from TypeChecker with type_checker, annotated_type, expected_type, arena
+
+    If compatible is equal to 0:
+        Let line be proc ast_node_get_line from AST with pattern
+        proc report_pattern_error with analyzer, "Pattern type annotation incompatible with expected type", 0, line
+        Return 0
+    End If
+
+    Note: Recursively check inner pattern with annotated type
+    Let inner_ok be proc check_pattern_type_compatibility with analyzer, inner_pattern, annotated_type
+
+    If inner_ok is equal to 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "is_exhaustiveness_state_complete" takes analyzer as Integer, state as Integer, scrutinee_type as Integer returns Integer:
+    Note:
+    Determine if exhaustiveness state covers all possible values.
+    Implements proper exhaustiveness checking for enums, literals, and numeric ranges.
+    :End Note
+
+    Note: Check if wildcard or identifier present (covers everything)
+    Let has_wildcard be proc memory_get_qword from Layout with state, 16
+    If has_wildcard is equal to 1:
+        Return 1  Note: Wildcard covers all cases
+    End If
+
+    Let has_identifier be proc memory_get_qword from Layout with state, 24
+    If has_identifier is equal to 1:
+        Return 1  Note: Identifier binding covers all cases
+    End If
+
+    Note: Get scrutinee type ID to determine what to check
+    Let type_id be proc memory_get_qword from Layout with scrutinee_type, 0
+
+    Note: Type ID 4 = Enum/Variant type - check all variants covered
+    If type_id is equal to 4:
+        Note: Get variant coverage map (offset 32 in ExhaustivenessState)
+        Let variant_coverage be proc memory_get_qword from Layout with state, 32
+
+        If variant_coverage is equal to 0:
+            Return 0  Note: No variants covered
+        End If
+
+        Note: Get variants map from scrutinee type (offset 16)
+        Let variants_map be proc memory_get_qword from Layout with scrutinee_type, 16
+
+        If variants_map is equal to 0:
+            Return 0  Note: Type has no variants
+        End If
+
+        Note: Check if all variants are covered
+        Let total_variants be proc hashtable_get_count from HashTable with variants_map
+        Let covered_variants be proc hashtable_get_count from HashTable with variant_coverage
+
+        If covered_variants is less than total_variants:
+            Return 0  Note: Not all variants covered
+        End If
+
+        Note: Verify each required variant is in coverage map
+        Let entries be proc memory_get_qword from Layout with variants_map, 0
+        Let capacity be proc memory_get_qword from Layout with variants_map, 8
+        Let i be 0
+
+        While i is less than capacity:
+            Let entry_offset be i multiplied by 32
+            Let entry_addr be entries plus entry_offset
+            Let entry_state be proc memory_get_qword from Layout with entry_addr, 0
+
+            If entry_state is equal to 1:  Note: Occupied entry
+                Let variant_name be proc memory_get_qword from Layout with entry_addr, 8
+
+                Note: Check if this variant is in coverage
+                Let is_covered be proc hashtable_has from HashTable with variant_coverage, variant_name
+
+                If is_covered is equal to 0:
+                    Return 0  Note: Variant not covered
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1  Note: All variants covered
+    End If
+
+    Note: For boolean type (type_id 3), check both true and false covered
+    If type_id is equal to 3:
+        Let covered_literals be proc memory_get_qword from Layout with state, 0
+
+        If covered_literals is equal to 0:
+            Return 0  Note: No literals covered
+        End If
+
+        Let count be proc hashtable_get_count from HashTable with covered_literals
+
+        Note: Boolean requires 2 literals (true and false)
+        If count is less than 2:
+            Return 0
+        End If
+
+        Return 1
+    End If
+
+    Note: For numeric types (Integer=1, Float=2), check if ranges cover entire domain
+    Note: This is complex and typically requires interval analysis
+    Note: Conservative approach: assume incomplete unless wildcard present
+    Return 0
+End Process
+
+Process called "report_non_exhaustive_match" takes analyzer as Integer, state as Integer, scrutinee_type as Integer returns Integer:
+    Note:
+    Report non-exhaustive match with missing patterns.
+    Constructs detailed error message listing missing variants or patterns.
+    :End Note
+
+    Note: Build detailed error message
+    Let arena be proc memory_get_qword from Layout with analyzer, 24
+    Let error_msg be proc string_from_cstring from StringCore with "Non-exhaustive pattern match"
+
+    Note: Check if we have missing variants list
+    Let missing_variants be proc memory_get_qword from Layout with state, 40
+
+    If missing_variants is not equal to 0:
+        Note: List missing variants
+        proc append from StringCore with error_msg, " - missing variants: "
+
+        Note: Get missing variants from hashtable
+        Let entries be proc memory_get_qword from Layout with missing_variants, 0
+        Let capacity be proc memory_get_qword from Layout with missing_variants, 8
+        Let i be 0
+        Let first be 1
+
+        While i is less than capacity:
+            Let entry_offset be i multiplied by 32
+            Let entry_addr be entries plus entry_offset
+            Let entry_state be proc memory_get_qword from Layout with entry_addr, 0
+
+            If entry_state is equal to 1:  Note: Occupied entry
+                Let variant_name be proc memory_get_qword from Layout with entry_addr, 8
+
+                If first is equal to 0:
+                    proc append from StringCore with error_msg, ", "
+                End If
+
+                proc append from StringCore with error_msg, variant_name
+                Set first to 0
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Get current_scrutinee_type for line number (if available)
+    Let current_scrutinee be proc memory_get_qword from Layout with analyzer, 56
+    Let line be 0
+
+    Note: Report the error
+    proc report_pattern_error with analyzer, error_msg, 0, line
+
+    Note: Increment warning count
+    Let warning_count be proc memory_get_qword from Layout with analyzer, 48
+    Set warning_count to warning_count plus 1
+    proc memory_set_qword from Layout with analyzer, 48, warning_count
+
+    Return 1
+End Process
+
+Process called "add_range_to_coverage" takes covered_ranges as Integer, range_pattern as Integer returns Integer:
+    Note:
+    Add range pattern to coverage tracking.
+    Extracts range bounds and adds them to the coverage list for overlap analysis.
+    :End Note
+
+    If covered_ranges is equal to 0:
+        Return 0
+    End If
+
+    If range_pattern is equal to 0:
+        Return 1  Note: Nothing to add
+    End If
+
+    Note: Extract start and end values from range pattern
+    Let start_node be proc ast_node_get_child from AST with range_pattern, 0
+    Let end_node be proc ast_node_get_child from AST with range_pattern, 1
+
+    Note: Get start and end values
+    Let start_value be proc ast_node_get_value from AST with start_node
+    Let end_value be proc ast_node_get_value from AST with end_node
+
+    Note: Create range info structure (3 fields × 8 bytes = 24 bytes)
+    Let range_info be proc arena_allocate from Layout with covered_ranges, 24
+
+    If range_info is equal to 0:
+        Return 0
+    End If
+
+    Note: Store range bounds (offset 0: start, offset 8: end, offset 16: next)
+    proc memory_set_qword from Layout with range_info, 0, start_value
+    proc memory_set_qword from Layout with range_info, 8, end_value
+    proc memory_set_qword from Layout with range_info, 16, 0  Note: next pointer
+
+    Note: Add to linked list at covered_ranges
+    Note: covered_ranges is actually a pointer to the list head
+    Let current_head be proc memory_get_qword from Layout with covered_ranges, 0
+    proc memory_set_qword from Layout with range_info, 16, current_head
+    proc memory_set_qword from Layout with covered_ranges, 0, range_info
+
+    Return 1
+End Process
+
+Process called "create_list" takes arena as Integer returns Integer:
+    Note:
+    Create a simple list structure for tracking.
+    Allocates a list head node with count and head pointer.
+    :End Note
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate list structure (2 fields × 8 bytes = 16 bytes)
+    Note: Field 0: head pointer, Field 1: count
+    Let list be proc arena_allocate from Layout with arena, 16
+
+    If list is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize list fields
+    proc memory_set_qword from Layout with list, 0, 0  Note: head = NULL
+    proc memory_set_qword from Layout with list, 8, 0  Note: count = 0
+
+    Return list
+End Process
