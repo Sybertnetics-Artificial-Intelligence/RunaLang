@@ -9,19 +9,169 @@ jobs:
   assign-roles:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync GitHub Sponsors to Discord Roles
-        uses: Alec-White/github-sponsors-discord-role-bot@v1.1
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Assign GitHub Sponsors to Discord Roles (inline)
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PAT }}
-          
-          discord-token: ${{ secrets.DISCORD_BOT_TOKEN }}
-          
-          guild-id: '1428867889670258783'
-          
-          sponsorship-levels: |
-            {
-              "500": "1428869294007128104",
-              "2500": "1428869229821558954",
-              "10000": "1428869335383932948",
-              "50000": "1429222007181934784"
+          script: |
+            const fs = require('fs');
+            const fetch = global.fetch;
+
+            const guildId = '1428867889670258783';
+            const discordToken = process.env.DISCORD_BOT_TOKEN;
+            const mapPath = 'RunaLang/runa/.github/sponsors-discord-map.json';
+            const tierMap = {"500":"1428869294007128104","2500":"1428869229821558954","10000":"1428869335383932948","50000":"1429222007181934784"};
+
+            function loadMapping(path) {
+              if (!fs.existsSync(path)) return {};
+              const raw = fs.readFileSync(path, 'utf8');
+              return JSON.parse(raw);
             }
+
+            function pickRoleId(amountCents) {
+              const thresholds = Object.keys(tierMap).map(x => parseInt(x, 10)).sort((a,b)=>a-b);
+              let chosen = null;
+              for (const t of thresholds) {
+                if (amountCents >= t) chosen = tierMap[String(t)];
+              }
+              return chosen;
+            }
+
+            async function getAllSponsorsFor(login) {
+              const results = new Map(); // sponsorLogin -> max amount
+              // Helper to page through a connection and add to results
+              async function pageThrough(kind) {
+                let cursor = null;
+                while (true) {
+                  const query = kind === 'org' ?
+                  `query($login:String!,$cursor:String) {
+                    organization(login:$login) {
+                      sponsorshipsAsMaintainer(first:100, after:$cursor, includePrivate:true) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                          sponsorEntity { ... on User { login } ... on Organization { login } }
+                          tier { monthlyPriceInCents }
+                        }
+                      }
+                    }
+                  }` :
+                  `query($login:String!,$cursor:String) {
+                    user(login:$login) {
+                      sponsorshipsAsMaintainer(first:100, after:$cursor, includePrivate:true) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                          sponsorEntity { ... on User { login } ... on Organization { login } }
+                          tier { monthlyPriceInCents }
+                        }
+                      }
+                    }
+                  }`;
+
+                  const data = await github.graphql(query, { login, cursor });
+                  const container = kind === 'org' ? data.organization : data.user;
+                  if (!container) break;
+                  const page = container.sponsorshipsAsMaintainer;
+                  for (const n of page.nodes) {
+                    const sponsorLogin = n.sponsorEntity?.login;
+                    const amount = n.tier?.monthlyPriceInCents || 0;
+                    if (sponsorLogin) {
+                      const prev = results.get(sponsorLogin) || 0;
+                      if (amount > prev) results.set(sponsorLogin, amount);
+                    }
+                  }
+                  if (!page.pageInfo.hasNextPage) break;
+                  cursor = page.pageInfo.endCursor;
+                }
+              }
+              // Try both org and user; whichever exists will contribute
+              await pageThrough('org');
+              await pageThrough('user');
+              return Array.from(results, ([sponsorLogin, amount]) => ({ sponsorLogin, amount }));
+            }
+
+            async function getMember(discordId) {
+              const r = await fetch(`https://discord.com/api/v10/guilds/${guildId}/members/${discordId}`, {
+                headers: { 'Authorization': `Bot ${discordToken}` }
+              });
+              if (r.status === 404) return null;
+              if (!r.ok) throw new Error(`Discord get member failed: ${r.status}`);
+              return r.json();
+            }
+
+            async function addRole(discordId, roleId) {
+              const r = await fetch(`https://discord.com/api/v10/guilds/${guildId}/members/${discordId}/roles/${roleId}`, {
+                method: 'PUT',
+                headers: { 'Authorization': `Bot ${discordToken}` }
+              });
+              if (!r.ok && r.status !== 204) throw new Error(`Discord add role failed: ${r.status}`);
+            }
+
+            async function removeRole(discordId, roleId) {
+              const r = await fetch(`https://discord.com/api/v10/guilds/${guildId}/members/${discordId}/roles/${roleId}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bot ${discordToken}` }
+              });
+              if (!r.ok && r.status !== 204) throw new Error(`Discord remove role failed: ${r.status}`);
+            }
+
+            function sleep(ms) { return new Promise(r=>setTimeout(r, ms)); }
+
+            // Load mapping: { "githubLogin": "discordUserId" }
+            const ghToDiscord = loadMapping(mapPath);
+            if (!process.env.DISCORD_BOT_TOKEN) throw new Error('Missing DISCORD_BOT_TOKEN');
+
+            // Determine sponsorable account from repo owner
+            const sponsorable = process.env.SLUG_OWNER || process.env.GITHUB_REPOSITORY_OWNER;
+
+            core.info(`Fetching sponsors for ${sponsorable}...`);
+            const sponsors = await getAllSponsorsFor(sponsorable);
+
+            const ourRoleIds = new Set(Object.values(tierMap));
+
+            // Build sets for current sponsors (mapped to Discord IDs)
+            const currentSponsorLogins = new Set(sponsors.map(s => s.sponsorLogin));
+            const ourRoleIds = new Set(Object.values(tierMap));
+            const currentDiscordIds = new Set();
+
+            // Assign/update roles for current sponsors
+            for (const s of sponsors) {
+              const discordId = ghToDiscord[s.sponsorLogin];
+              if (!discordId) continue; // Not linked; skip safely
+              const targetRole = pickRoleId(s.amount);
+              if (!targetRole) continue;
+
+              const member = await getMember(discordId);
+              if (!member) continue; // not in guild
+
+              // Add target role
+              await addRole(discordId, targetRole);
+              await sleep(200);
+
+              // Remove any other sponsor roles to keep it single-tiered
+              for (const rId of member.roles) {
+                if (ourRoleIds.has(rId) && rId !== targetRole) {
+                  await removeRole(discordId, rId);
+                  await sleep(200);
+                }
+              }
+              currentDiscordIds.add(discordId);
+            }
+
+            // Remove roles from mapped users who are no longer sponsoring
+            for (const [ghLogin, discordId] of Object.entries(ghToDiscord)) {
+              if (currentSponsorLogins.has(ghLogin)) continue;
+              const member = await getMember(discordId);
+              if (!member) continue;
+              for (const rId of member.roles) {
+                if (ourRoleIds.has(rId)) {
+                  await removeRole(discordId, rId);
+                  await sleep(200);
+                }
+              }
+            }
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          SLUG_OWNER: ${{ github.repository_owner }}
