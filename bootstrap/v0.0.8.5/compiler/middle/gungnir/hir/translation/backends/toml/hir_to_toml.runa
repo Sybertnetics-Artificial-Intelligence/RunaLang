@@ -1,0 +1,678 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HIR to TOML Code Generator - Converts Runa HIR to TOML
+
+This file generates TOML output from Runa's High-level Intermediate
+Representation (HIR). This enables exporting Runa data structures
+as TOML configuration files.
+
+Translation Mapping:
+- Runa Dictionary[String, Value] → TOML key-value pairs or tables
+- Runa List[Value]               → TOML array
+- Runa String literal            → TOML string (quoted if needed)
+- Runa Integer literal           → TOML integer
+- Runa Boolean                   → TOML true/false
+
+Output Features:
+- Clean key-value pair formatting
+- Table sections when appropriate
+- String quoting when necessary
+- Comments support (if available in HIR)
+- Proper escaping
+
+Features:
+- Complete HIR node support
+- Pretty printing
+- String escaping
+- Integer-to-string conversion
+- Table hierarchy management
+
+Dependencies:
+- compiler/middle/gungnir/hir/hir.runa
+- toml_emitter.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/gungnir/hir/translation/backends/toml/toml_emitter.runa" as Emitter
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: TOML Generation Context
+Note: ============================================================================
+
+Type called "TOMLGenerationContext":
+    emitter as Integer          Note: TOML emitter for output
+    error_message as Integer    Note: Error message (if any)
+    has_error as Integer        Note: Boolean: 1 if error occurred
+    current_table as Integer    Note: Current table path (for nested tables)
+End Type
+
+Note: ============================================================================
+Note: Context Creation and Destruction
+Note: ============================================================================
+
+Process called "create_generation_context" returns Integer:
+    Note: Create TOML generation context
+
+    Let context_size be 32  Note: TOMLGenerationContext: 4 fields × 8 bytes
+    Let context be proc allocate from Layout with context_size
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Create emitter
+    Let emitter be proc create_toml_emitter from Emitter
+
+    If emitter is equal to 0:
+        proc deallocate from Layout with context
+        Return 0
+    End If
+
+    Note: Initialize context
+    proc memory_set_int64 from Layout with context, 0, emitter
+    proc memory_set_int64 from Layout with context, 8, 0   Note: error_message = null
+    proc memory_set_int64 from Layout with context, 16, 0  Note: has_error = false
+    proc memory_set_int64 from Layout with context, 24, 0  Note: current_table = null
+
+    Return context
+End Process
+
+Process called "destroy_generation_context" takes context as Integer returns Integer:
+    Note: Destroy TOML generation context
+
+    If context is equal to 0:
+        Return 1
+    End If
+
+    Note: Destroy emitter
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    If emitter is not equal to 0:
+        proc destroy_toml_emitter from Emitter with emitter
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with context, 8
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with context
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
+    Note: Set generation error message
+
+    Let error_message be proc memory_get_int64 from Layout with context, 8
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with context, 8, new_error
+    proc memory_set_int64 from Layout with context, 16, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: String Utilities
+Note: ============================================================================
+
+Process called "needs_quoting" takes str as Integer returns Integer:
+    Note: Check if string needs quoting in TOML
+
+    @Reasoning:
+    TOML bare keys can contain:
+    - Letters (a-z, A-Z)
+    - Numbers (0-9)
+    - Underscores (_)
+    - Dashes (-)
+
+    Anything else requires quoting.
+    @End Reasoning
+
+    Let length be proc string_length from StringCore with str
+
+    If length is equal to 0:
+        Return 1  Note: Empty strings must be quoted
+    End If
+
+    Let index be 0
+
+    While index is less than length:
+        Let char be proc memory_get_byte from Layout with str, index
+
+        Note: Check if char is alphanumeric, underscore, or dash
+        Let is_alpha be 0
+        Let is_digit be 0
+
+        If char is greater than or equal to 65:
+            If char is less than or equal to 90:  Note: A-Z
+                Set is_alpha to 1
+            End If
+        End If
+
+        If char is greater than or equal to 97:
+            If char is less than or equal to 122:  Note: a-z
+                Set is_alpha to 1
+            End If
+        End If
+
+        If char is greater than or equal to 48:
+            If char is less than or equal to 57:  Note: 0-9
+                Set is_digit to 1
+            End If
+        End If
+
+        If is_alpha is equal to 0:
+            If is_digit is equal to 0:
+                If char is not equal to 95:  Note: _
+                    If char is not equal to 45:  Note: -
+                        Return 1  Note: Needs quoting
+                    End If
+                End If
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: No quoting needed
+End Process
+
+Process called "emit_escaped_string" takes context as Integer, str as Integer returns Integer:
+    Note: Emit TOML basic string with proper escaping
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let str_length be proc string_length from StringCore with str
+
+    proc emit_char from Emitter with emitter, 34  Note: opening '"'
+
+    Let index be 0
+
+    While index is less than str_length:
+        Let char be proc memory_get_byte from Layout with str, index
+
+        If char is equal to 34:  Note: "
+            proc emit_char from Emitter with emitter, 92  Note: '\'
+            proc emit_char from Emitter with emitter, 34
+        Otherwise If char is equal to 92:  Note: \
+            proc emit_char from Emitter with emitter, 92
+            proc emit_char from Emitter with emitter, 92
+        Otherwise If char is equal to 10:  Note: newline
+            proc emit_char from Emitter with emitter, 92
+            proc emit_char from Emitter with emitter, 110  Note: 'n'
+        Otherwise If char is equal to 9:  Note: tab
+            proc emit_char from Emitter with emitter, 92
+            proc emit_char from Emitter with emitter, 116  Note: 't'
+        Otherwise If char is equal to 13:  Note: carriage return
+            proc emit_char from Emitter with emitter, 92
+            proc emit_char from Emitter with emitter, 114  Note: 'r'
+        Otherwise If char is equal to 8:  Note: backspace
+            proc emit_char from Emitter with emitter, 92
+            proc emit_char from Emitter with emitter, 98  Note: 'b'
+        Otherwise If char is equal to 12:  Note: form feed
+            proc emit_char from Emitter with emitter, 92
+            proc emit_char from Emitter with emitter, 102  Note: 'f'
+        Otherwise If char is less than 32:  Note: other control characters
+            proc emit_char from Emitter with emitter, 92
+            proc emit_char from Emitter with emitter, 117  Note: 'u'
+            Note: Emit 4-digit hex
+            Let hex_digits be 4
+            Let value be char
+
+            While hex_digits is greater than 0:
+                Set hex_digits to hex_digits minus 1
+                Let shift be hex_digits times 4
+                Let nibble be value divided by proc power_of_two from shift
+                Set nibble to nibble modulo 16
+
+                If nibble is less than 10:
+                    proc emit_char from Emitter with emitter, nibble plus 48
+                Otherwise:
+                    proc emit_char from Emitter with emitter, nibble plus 87
+                End If
+            End While
+        Otherwise:
+            proc emit_char from Emitter with emitter, char
+        End If
+
+        Set index to index plus 1
+    End While
+
+    proc emit_char from Emitter with emitter, 34  Note: closing '"'
+
+    Return 1
+End Process
+
+Process called "is_datetime_format" takes str as Integer returns Integer:
+    Note: Check if string matches RFC 3339 datetime format
+
+    @Reasoning:
+    TOML datetimes follow RFC 3339 format. Common patterns:
+    - Offset DateTime: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS±HH:MM
+    - Local DateTime: YYYY-MM-DDTHH:MM:SS
+    - Local Date: YYYY-MM-DD
+    - Local Time: HH:MM:SS or HH:MM:SS.ffffff
+    We check for these patterns to distinguish datetime from regular strings.
+    @End Reasoning
+
+    Let str_length be proc string_length from StringCore with str
+
+    If str_length is less than 5:
+        Return 0  Note: Too short to be datetime
+    End If
+
+    Let char0 be proc memory_get_byte from Layout with str, 0
+    Let char1 be proc memory_get_byte from Layout with str, 1
+    Let char2 be proc memory_get_byte from Layout with str, 2
+    Let char3 be proc memory_get_byte from Layout with str, 3
+    Let char4 be proc memory_get_byte from Layout with str, 4
+
+    Note: Check for date format YYYY-MM-DD (minimum 10 chars)
+    If str_length is greater than or equal to 10:
+        If proc is_digit from char0 is equal to 1:
+            If proc is_digit from char1 is equal to 1:
+                If proc is_digit from char2 is equal to 1:
+                    If proc is_digit from char3 is equal to 1:
+                        If char4 is equal to 45:  Note: - (YYYY-MM-DD)
+                            Let char5 be proc memory_get_byte from Layout with str, 5
+                            Let char6 be proc memory_get_byte from Layout with str, 6
+                            Let char7 be proc memory_get_byte from Layout with str, 7
+
+                            If proc is_digit from char5 is equal to 1:
+                                If proc is_digit from char6 is equal to 1:
+                                    If char7 is equal to 45:  Note: - (YYYY-MM-DD)
+                                        Return 1  Note: Datetime format detected
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: Check for time format HH:MM:SS (minimum 8 chars)
+    If str_length is greater than or equal to 8:
+        If proc is_digit from char0 is equal to 1:
+            If proc is_digit from char1 is equal to 1:
+                If char2 is equal to 58:  Note: : (HH:MM:SS)
+                    Let char5 be proc memory_get_byte from Layout with str, 5
+
+                    If char5 is equal to 58:  Note: : (HH:MM:SS)
+                        Return 1  Note: Time format detected
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Return 0  Note: Not a datetime format
+End Process
+
+Process called "is_digit" takes char as Integer returns Integer:
+    Note: Check if character is a digit (0-9)
+
+    If char is greater than or equal to 48:  Note: '0'
+        If char is less than or equal to 57:  Note: '9'
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "power_of_two" takes exponent as Integer returns Integer:
+    Note: Calculate 2^exponent
+
+    Let result be 1
+    Let count be 0
+
+    While count is less than exponent:
+        Set result to result times 2
+        Set count to count plus 1
+    End While
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Integer to String Conversion
+Note: ============================================================================
+
+Process called "emit_integer" takes context as Integer, value as Integer returns Integer:
+    Note: Emit integer as TOML number
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    If value is equal to 0:
+        proc emit_char from Emitter with emitter, 48  Note: '0'
+        Return 1
+    End If
+
+    Let buffer_size be 32
+    Let buffer be proc allocate from Layout with buffer_size
+    Let buffer_pos be 0
+
+    Let is_negative be 0
+    Let abs_value be value
+
+    If value is less than 0:
+        Set is_negative to 1
+        Set abs_value to 0 minus value
+    End If
+
+    Note: Convert digits (in reverse order)
+    While abs_value is greater than 0:
+        Let digit be abs_value modulo 10
+        Let digit_char be digit plus 48  Note: '0'
+        proc memory_set_byte from Layout with buffer, buffer_pos, digit_char
+        Set buffer_pos to buffer_pos plus 1
+        Set abs_value to abs_value divided by 10
+    End While
+
+    Note: Add negative sign if needed
+    If is_negative is equal to 1:
+        proc memory_set_byte from Layout with buffer, buffer_pos, 45  Note: '-'
+        Set buffer_pos to buffer_pos plus 1
+    End If
+
+    Note: Emit in correct order (reverse)
+    Let index be buffer_pos minus 1
+
+    While index is greater than or equal to 0:
+        Let char be proc memory_get_byte from Layout with buffer, index
+        proc emit_char from Emitter with emitter, char
+        Set index to index minus 1
+    End While
+
+    proc deallocate from Layout with buffer
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HIR Node Translation
+Note: ============================================================================
+
+Process called "generate_hir_node" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate TOML from HIR node
+
+    @Reasoning:
+    Main entry point for HIR→TOML translation.
+    Dispatches to appropriate generator based on HIR node type.
+    @End Reasoning
+
+    If hir_node is equal to 0:
+        proc set_generation_error from context, "Null HIR node"
+        Return 0
+    End If
+
+    Note: Get HIR node type
+    Let node_type be proc get_hir_node_type from HIR with hir_node
+
+    Note: Dictionary → TOML key-value pairs
+    If node_type is equal to HIR_DICTIONARY_LITERAL from HIR:
+        Return proc generate_toml_dictionary from context, hir_node
+    End If
+
+    Note: List → TOML array
+    If node_type is equal to HIR_LIST_LITERAL from HIR:
+        Return proc generate_toml_array from context, hir_node
+    End If
+
+    Note: String literal
+    If node_type is equal to HIR_STRING_LITERAL from HIR:
+        Return proc generate_toml_string from context, hir_node
+    End If
+
+    Note: Integer literal
+    If node_type is equal to HIR_INTEGER_LITERAL from HIR:
+        Return proc generate_toml_integer from context, hir_node
+    End If
+
+    Note: Boolean literal
+    If node_type is equal to HIR_BOOLEAN_LITERAL from HIR:
+        Return proc generate_toml_boolean from context, hir_node
+    End If
+
+    Note: Null literal (TOML doesn't have null, skip or use empty string)
+    If node_type is equal to HIR_NULL_LITERAL from HIR:
+        proc set_generation_error from context, "TOML does not support null values"
+        Return 0
+    End If
+
+    proc set_generation_error from context, "Unsupported HIR node type"
+    Return 0
+End Process
+
+Process called "generate_toml_dictionary" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate TOML key-value pairs from dictionary
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get dictionary entries
+    Let keys be proc get_dictionary_keys from HIR with hir_node
+    Let values be proc get_dictionary_values from HIR with hir_node
+
+    If keys is equal to 0:
+        proc set_generation_error from context, "Dictionary has no keys"
+        Return 0
+    End If
+
+    If values is equal to 0:
+        proc set_generation_error from context, "Dictionary has no values"
+        Return 0
+    End If
+
+    Let count be proc size from List with keys
+
+    Let index be 0
+
+    While index is less than count:
+        Let key be proc get_at from List with keys, index
+        Let value be proc get_at from List with values, index
+
+        Note: Emit key
+        Let needs_quotes be proc needs_quoting from key
+
+        If needs_quotes is equal to 1:
+            proc emit_escaped_string from context, key
+        Otherwise:
+            proc emit_string from Emitter with emitter, key
+        End If
+
+        proc emit_string from Emitter with emitter, " = "
+
+        Note: Emit value
+        proc generate_hir_node from context, value
+
+        proc emit_char from Emitter with emitter, 10  Note: newline
+
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "generate_toml_array" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate TOML array
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get list elements
+    Let elements be proc get_list_elements from HIR with hir_node
+
+    If elements is equal to 0:
+        proc set_generation_error from context, "List has no elements"
+        Return 0
+    End If
+
+    Let count be proc size from List with elements
+
+    proc emit_char from Emitter with emitter, 91  Note: '['
+
+    Let index be 0
+
+    While index is less than count:
+        Let element be proc get_at from List with elements, index
+
+        Note: Emit element
+        proc generate_hir_node from context, element
+
+        Note: Add comma separator if not last element
+        If index is less than count minus 1:
+            proc emit_string from Emitter with emitter, ", "
+        End If
+
+        Set index to index plus 1
+    End While
+
+    proc emit_char from Emitter with emitter, 93  Note: ']'
+
+    Return 1
+End Process
+
+Process called "generate_toml_string" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate TOML string
+
+    @Reasoning:
+    Most strings are quoted, but datetime values in RFC 3339 format
+    should be emitted as bare tokens per TOML specification.
+    We detect datetime format and emit accordingly.
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let str be proc get_string_value from HIR with hir_node
+
+    If str is equal to 0:
+        proc set_generation_error from context, "String node has no value"
+        Return 0
+    End If
+
+    Note: Check if string is a datetime value (RFC 3339 format)
+    Let is_datetime be proc is_datetime_format from str
+
+    If is_datetime is equal to 1:
+        Note: Emit datetime as bare token (unquoted)
+        proc emit_string from Emitter with emitter, str
+    Otherwise:
+        Note: Quote regular strings
+        proc emit_escaped_string from context, str
+    End If
+
+    Return 1
+End Process
+
+Process called "generate_toml_integer" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate TOML integer
+
+    Let value be proc get_integer_value from HIR with hir_node
+    proc emit_integer from context, value
+
+    Return 1
+End Process
+
+Process called "generate_toml_boolean" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate TOML boolean
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let value be proc get_boolean_value from HIR with hir_node
+
+    If value is equal to 1:
+        proc emit_string from Emitter with emitter, "true"
+    Otherwise:
+        proc emit_string from Emitter with emitter, "false"
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Top-Level TOML Generation
+Note: ============================================================================
+
+Process called "translate_hir_to_toml" takes hir_root as Integer returns Integer:
+    Note: Translate HIR to TOML output string
+
+    @Reasoning:
+    Top-level entry point for HIR→TOML translation.
+    Creates generation context, generates TOML, retrieves output.
+    @End Reasoning
+
+    If hir_root is equal to 0:
+        Return 0
+    End If
+
+    Note: Create generation context
+    Let context be proc create_generation_context
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Generate TOML from HIR
+    proc generate_hir_node from context, hir_root
+
+    Note: Check for errors
+    Let has_error be proc memory_get_int64 from Layout with context, 16
+
+    If has_error is equal to 1:
+        Let error_msg be proc memory_get_int64 from Layout with context, 8
+        proc print from "TOML generation error:", error_msg
+        proc destroy_generation_context from context
+        Return 0
+    End If
+
+    Note: Get output
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let output be proc get_output from Emitter with emitter
+
+    Note: Cleanup
+    proc destroy_generation_context from context
+
+    Return output
+End Process
+
+Note: End of HIR to TOML Code Generator

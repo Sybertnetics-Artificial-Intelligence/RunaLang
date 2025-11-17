@@ -1,0 +1,1548 @@
+Note: ============================================================================
+Note: ERLANG TO HIR TRANSLATOR - Production Translation Frontend
+Note: ============================================================================
+Note: Translates Erlang AST to HIR (High-level Intermediate Representation)
+Note: Handles: actor model, message passing, pattern matching, guards,
+Note: concurrent functional programming, fault tolerance
+Note: ============================================================================
+
+Import "erlang_parser.runa"
+Import "../../hir/hir_nodes.runa"
+
+Note: ============================================================================
+Note: TRANSLATION CONTEXT
+Note: ============================================================================
+
+Type called "ErlangTranslationContext":
+    current_module as String
+    exported_functions as List[Dictionary[String, Integer]]  Note: {name, arity}
+    records as Dictionary[String, ErlangRecord]
+    types as Dictionary[String, ErlangTypeDecl]
+    local_vars as Dictionary[String, HIRType]
+    errors as List[String]
+    next_temp_id as Integer
+End Type
+
+Process called "create_translation_context" that takes module_name as String returns ErlangTranslationContext:
+    Return a value of type ErlangTranslationContext with
+        current_module as module_name,
+        exported_functions as a list containing nothing,
+        records as a dictionary containing nothing,
+        types as a dictionary containing nothing,
+        local_vars as a dictionary containing nothing,
+        errors as a list containing nothing,
+        next_temp_id as 0
+End Process
+
+Process called "generate_temp_var" that takes ctx as ErlangTranslationContext returns String:
+    Let temp_name be "$erlang_temp_" concatenated with string representation of ctx.next_temp_id
+    Set ctx.next_temp_id to ctx.next_temp_id plus 1
+    Return temp_name
+End Process
+
+Note: ============================================================================
+Note: MODULE TRANSLATION
+Note: ============================================================================
+
+Process called "translate_erlang_module_to_hir" that takes erl_module as ErlangModule returns HIRModule:
+    Let ctx be create_translation_context with erl_module.module_name
+
+    Note: Process module attributes to extract exports and metadata
+    For Each attr in erl_module.attributes:
+        If attr.attr_type is equal to "export" and length of attr.attr_values is greater than 0:
+            Let export_list be attr.attr_values at index 0
+            Set ctx.exported_functions to export_list
+        End If
+    End For
+
+    Note: Index records by name
+    For Each record in erl_module.records:
+        Set ctx.records at key record.name to record
+    End For
+
+    Note: Index types by name
+    For Each type_decl in erl_module.types:
+        Set ctx.types at key type_decl.name to type_decl
+    End For
+
+    Note: Translate all functions
+    Let hir_functions be a list containing nothing
+
+    For Each erl_func in erl_module.functions:
+        Let hir_func be translate_function to erl_func and ctx
+        Add hir_func to end of hir_functions
+    End For
+
+    Note: Create HIR module
+    Let hir_module be a value of type HIRModule with
+        name as erl_module.module_name,
+        functions as hir_functions,
+        types as a list containing nothing,
+        imports as a list containing nothing,
+        exports as ctx.exported_functions
+
+    Return hir_module
+End Process
+
+Note: ============================================================================
+Note: FUNCTION TRANSLATION
+Note: ============================================================================
+
+Process called "translate_function" that takes erl_func as ErlangFunction, ctx as ErlangTranslationContext returns HIRFunction:
+    Note: Erlang functions can have multiple clauses with different patterns
+    Note: Translate to single HIR function with pattern matching dispatch
+
+    Let func_name be erl_func.name
+    Let arity be erl_func.arity
+
+    Note: Create parameter list from arity
+    Let parameters be a list containing nothing
+    Let param_types be a list containing nothing
+
+    For i from 0 to arity minus 1:
+        Let param_name be "arg" concatenated with string representation of i
+        Add param_name to end of parameters
+
+        Note: Erlang is dynamically typed - use Any type
+        Let param_type be create_hir_type with "any" and a list containing nothing
+        Add param_type to end of param_types
+    End For
+
+    Note: Create function signature
+    Let return_type be create_hir_type with "any" and a list containing nothing
+
+    Note: Build function body
+    Let body be a list containing nothing
+
+    Note: If single clause without guards or patterns, translate directly
+    If length of erl_func.clauses is equal to 1:
+        Let clause be erl_func.clauses at index 0
+
+        Let has_complex_patterns be false
+        For Each pattern in clause.patterns:
+            If not is_simple_variable_pattern with pattern:
+                Set has_complex_patterns to true
+                Break
+            End If
+        End For
+
+        If not has_complex_patterns and length of clause.guards is equal to 0:
+            Note: Simple case - just translate body
+            Set body to translate_expressions with clause.body and ctx
+        Otherwise:
+            Note: Complex patterns or guards - build match dispatch
+            Set body to translate_clauses_with_dispatch with erl_func.clauses, parameters, ctx
+        End If
+    Otherwise:
+        Note: Multiple clauses - build match dispatch
+        Set body to translate_clauses_with_dispatch with erl_func.clauses, parameters, ctx
+    End If
+
+    Note: Check if function is exported
+    Let is_exported be false
+    For Each export_info in ctx.exported_functions:
+        If export_info at key "name" is equal to func_name and export_info at key "arity" is equal to arity:
+            Set is_exported to true
+            Break
+        End If
+    End For
+
+    Let hir_func be a value of type HIRFunction with
+        name as func_name,
+        parameters as parameters,
+        param_types as param_types,
+        return_type as return_type,
+        body as body,
+        is_public as is_exported
+
+    Return hir_func
+End Process
+
+Process called "is_simple_variable_pattern" that takes pattern as ErlangExpression returns Boolean:
+    Note: Check if pattern is just a simple variable (no destructuring)
+    If pattern.expr_type is equal to "var":
+        Return true
+    End If
+
+    If pattern.expr_type is equal to "atom" and pattern.expr_data at key "value" is equal to "_":
+        Return true  Note: Underscore wildcard
+    End If
+
+    Return false
+End Process
+
+Process called "translate_clauses_with_dispatch" that takes clauses as List[ErlangFunctionClause], parameters as List[String], ctx as ErlangTranslationContext returns List[HIRStatement]:
+    Note: Build pattern matching dispatch for multiple clauses
+    Let body be a list containing nothing
+
+    Note: Generate nested if-else chain or match statement for clauses
+    For i from 0 to length of clauses minus 1:
+        Let clause be clauses at index i
+
+        Note: Build condition for this clause (pattern matching + guards)
+        Let clause_condition be build_clause_condition with clause, parameters, ctx
+
+        Note: Translate clause body
+        Let clause_body be translate_expressions with clause.body and ctx
+
+        Note: Create conditional block
+        If i is equal to 0:
+            Note: First clause - create if statement
+            Let if_stmt be create_hir_if with clause_condition, clause_body, a list containing nothing
+            Add if_stmt to end of body
+        Otherwise:
+            Note: Subsequent clauses - add else-if
+            Note: Build proper if-else chain for multiple guards
+            Let guard_count be proc list_length from List with guard_list
+            If guard_count is greater than 1:
+                Let else_if_chain be proc build_guard_chain from ctx, guard_list, hir_body
+                Set hir_body to else_if_chain
+            End If
+            Let if_stmt be create_hir_if with clause_condition, clause_body, a list containing nothing
+            Add if_stmt to end of body
+        End If
+    End For
+
+    Note: Add function_clause error if no clause matches
+    Let error_call be create_hir_call with "erlang:error" and a list containing create_hir_atom with "function_clause"
+    Add error_call to end of body
+
+    Return body
+End Process
+
+Process called "build_clause_condition" that takes clause as ErlangFunctionClause, parameters as List[String], ctx as ErlangTranslationContext returns HIRExpression:
+    Note: Build condition expression that checks if parameters match patterns and guards
+
+    Let conditions be a list containing nothing
+
+    Note: Build pattern matching conditions
+    For i from 0 to length of clause.patterns minus 1:
+        Let pattern be clause.patterns at index i
+        Let param_name be parameters at index i
+
+        Let pattern_check be build_pattern_match with pattern, param_name, ctx
+
+        If pattern_check is not null:
+            Add pattern_check to end of conditions
+        End If
+    End For
+
+    Note: Add guard conditions
+    For Each guard_seq in clause.guards:
+        For Each guard_expr in guard_seq:
+            Let guard_hir be translate_expression with guard_expr and ctx
+            Add guard_hir to end of conditions
+        End For
+    End For
+
+    Note: Combine all conditions with AND
+    If length of conditions is equal to 0:
+        Return create_hir_bool with true
+    End If
+
+    If length of conditions is equal to 1:
+        Return conditions at index 0
+    End If
+
+    Note: Build AND chain
+    Let result be conditions at index 0
+    For i from 1 to length of conditions minus 1:
+        Set result to create_hir_binary_op with "and", result, conditions at index i
+    End For
+
+    Return result
+End Process
+
+Process called "build_pattern_match" that takes pattern as ErlangExpression, target_var as String, ctx as ErlangTranslationContext returns HIRExpression OR Null:
+    Note: Build condition expression that checks if target_var matches pattern
+
+    Note: Simple variable or wildcard - always matches
+    If pattern.expr_type is equal to "var":
+        Let var_name be pattern.expr_data at key "name"
+
+        If var_name is equal to "_":
+            Return null  Note: Wildcard always matches
+        End If
+
+        Note: Binding variable - record in context
+        Let any_type be create_hir_type with "any" and a list containing nothing
+        Set ctx.local_vars at key var_name to any_type
+
+        Return null  Note: Variable pattern always matches
+    End If
+
+    Note: Atom literal - check equality
+    If pattern.expr_type is equal to "atom":
+        Let atom_value be pattern.expr_data at key "value"
+        Let target_expr be create_hir_var with target_var
+        Let pattern_expr be create_hir_atom with atom_value
+        Return create_hir_binary_op with "==", target_expr, pattern_expr
+    End If
+
+    Note: Integer literal - check equality
+    If pattern.expr_type is equal to "integer":
+        Let int_value be pattern.expr_data at key "value"
+        Let target_expr be create_hir_var with target_var
+        Let pattern_expr be create_hir_int with int_value
+        Return create_hir_binary_op with "==", target_expr, pattern_expr
+    End If
+
+    Note: List pattern - check structure and elements
+    If pattern.expr_type is equal to "list":
+        Let elements be pattern.expr_data at key "elements"
+        Let tail be pattern.expr_data at key "tail"
+
+        Note: Build list structure check
+        Let checks be a list containing nothing
+
+        Note: Check if target is a list
+        Let target_expr be create_hir_var with target_var
+        Let is_list_check be create_hir_call with "erlang:is_list" and a list containing target_expr
+        Add is_list_check to end of checks
+
+        Note: Check list length (if no tail)
+        If tail is null and length of elements is greater than 0:
+            Let length_call be create_hir_call with "erlang:length" and a list containing target_expr
+            Let expected_len be create_hir_int with length of elements
+            Let length_check be create_hir_binary_op with "==", length_call, expected_len
+            Add length_check to end of checks
+        End If
+
+        Note: Check each element
+        For i from 0 to length of elements minus 1:
+            Let elem_pattern be elements at index i
+            Let elem_temp be generate_temp_var with ctx
+
+            Note: Extract element
+            Let index_expr be create_hir_int with i
+            Let elem_access be create_hir_call with "erlang:nth" and a list containing index_expr, target_expr
+
+            Note: Build element match
+            Let elem_check be build_pattern_match with elem_pattern, elem_temp, ctx
+
+            If elem_check is not null:
+                Add elem_check to end of checks
+            End If
+        End For
+
+        Note: Combine all checks
+        If length of checks is equal to 0:
+            Return null
+        End If
+
+        Let result be checks at index 0
+        For i from 1 to length of checks minus 1:
+            Set result to create_hir_binary_op with "and", result, checks at index i
+        End For
+
+        Return result
+    End If
+
+    Note: Tuple pattern - check structure
+    If pattern.expr_type is equal to "tuple":
+        Let elements be pattern.expr_data at key "elements"
+
+        Let checks be a list containing nothing
+
+        Note: Check if target is a tuple
+        Let target_expr be create_hir_var with target_var
+        Let is_tuple_check be create_hir_call with "erlang:is_tuple" and a list containing target_expr
+        Add is_tuple_check to end of checks
+
+        Note: Check tuple size
+        Let size_call be create_hir_call with "erlang:tuple_size" and a list containing target_expr
+        Let expected_size be create_hir_int with length of elements
+        Let size_check be create_hir_binary_op with "==", size_call, expected_size
+        Add size_check to end of checks
+
+        Note: Check each element
+        For i from 0 to length of elements minus 1:
+            Let elem_pattern be elements at index i
+            Let elem_temp be generate_temp_var with ctx
+
+            Note: Extract element (1-indexed in Erlang)
+            Let index_expr be create_hir_int with i plus 1
+            Let elem_access be create_hir_call with "erlang:element" and a list containing index_expr, target_expr
+
+            Note: Build element match
+            Let elem_check be build_pattern_match with elem_pattern, elem_temp, ctx
+
+            If elem_check is not null:
+                Add elem_check to end of checks
+            End If
+        End For
+
+        Note: Combine all checks
+        Let result be checks at index 0
+        For i from 1 to length of checks minus 1:
+            Set result to create_hir_binary_op with "and", result, checks at index i
+        End For
+
+        Return result
+    End If
+
+    Note: Default - no additional check needed
+    Return null
+End Process
+
+Note: ============================================================================
+Note: EXPRESSION TRANSLATION
+Note: ============================================================================
+
+Process called "translate_expressions" that takes exprs as List[ErlangExpression], ctx as ErlangTranslationContext returns List[HIRStatement]:
+    Let statements be a list containing nothing
+
+    For i from 0 to length of exprs minus 1:
+        Let expr be exprs at index i
+        Let hir_expr be translate_expression with expr and ctx
+
+        Note: Last expression is return value
+        If i is equal to length of exprs minus 1:
+            Let return_stmt be create_hir_return with hir_expr
+            Add return_stmt to end of statements
+        Otherwise:
+            Note: Expression statement (side effect)
+            Let expr_stmt be create_hir_expr_statement with hir_expr
+            Add expr_stmt to end of statements
+        End If
+    End For
+
+    Return statements
+End Process
+
+Process called "translate_expression" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Note: Translate Erlang expression to HIR expression
+
+    Note: Atom literal
+    If expr.expr_type is equal to "atom":
+        Let atom_value be expr.expr_data at key "value"
+        Return create_hir_atom with atom_value
+    End If
+
+    Note: Variable reference
+    If expr.expr_type is equal to "var":
+        Let var_name be expr.expr_data at key "name"
+        Return create_hir_var with var_name
+    End If
+
+    Note: Integer literal
+    If expr.expr_type is equal to "integer":
+        Let int_value be expr.expr_data at key "value"
+        Return create_hir_int with int_value
+    End If
+
+    Note: Float literal
+    If expr.expr_type is equal to "float":
+        Let float_value be expr.expr_data at key "value"
+        Return create_hir_float with float_value
+    End If
+
+    Note: String literal
+    If expr.expr_type is equal to "string":
+        Let str_value be expr.expr_data at key "value"
+        Return create_hir_string with str_value
+    End If
+
+    Note: Character literal
+    If expr.expr_type is equal to "char":
+        Let char_value be expr.expr_data at key "value"
+        Return create_hir_char with char_value
+    End If
+
+    Note: List literal
+    If expr.expr_type is equal to "list":
+        Return translate_list with expr and ctx
+    End If
+
+    Note: Tuple literal
+    If expr.expr_type is equal to "tuple":
+        Return translate_tuple with expr and ctx
+    End If
+
+    Note: Binary literal
+    If expr.expr_type is equal to "binary":
+        Return translate_binary with expr and ctx
+    End If
+
+    Note: Binary operator
+    If expr.expr_type is equal to "op":
+        Return translate_binary_op with expr and ctx
+    End If
+
+    Note: Unary operator
+    If expr.expr_type is equal to "unary_op":
+        Return translate_unary_op with expr and ctx
+    End If
+
+    Note: Function call
+    If expr.expr_type is equal to "call":
+        Return translate_call with expr and ctx
+    End If
+
+    Note: Fun expression (anonymous function)
+    If expr.expr_type is equal to "fun":
+        Return translate_fun with expr and ctx
+    End If
+
+    Note: Case expression
+    If expr.expr_type is equal to "case":
+        Return translate_case with expr and ctx
+    End If
+
+    Note: If expression
+    If expr.expr_type is equal to "if":
+        Return translate_if with expr and ctx
+    End If
+
+    Note: Receive expression
+    If expr.expr_type is equal to "receive":
+        Return translate_receive with expr and ctx
+    End If
+
+    Note: Try expression
+    If expr.expr_type is equal to "try":
+        Return translate_try with expr and ctx
+    End If
+
+    Note: Begin expression
+    If expr.expr_type is equal to "begin":
+        Return translate_begin with expr and ctx
+    End If
+
+    Note: List comprehension
+    If expr.expr_type is equal to "list_comprehension":
+        Return translate_list_comprehension with expr and ctx
+    End If
+
+    Note: Binary comprehension
+    If expr.expr_type is equal to "binary_comprehension":
+        Return translate_binary_comprehension with expr and ctx
+    End If
+
+    Note: Record creation
+    If expr.expr_type is equal to "record_create":
+        Return translate_record_create with expr and ctx
+    End If
+
+    Note: Record access
+    If expr.expr_type is equal to "record_access":
+        Return translate_record_access with expr and ctx
+    End If
+
+    Note: Macro reference
+    If expr.expr_type is equal to "macro":
+        Let macro_name be expr.expr_data at key "name"
+        Return create_hir_macro with macro_name
+    End If
+
+    Note: Default - unsupported expression
+    Add "Unsupported Erlang expression type: " concatenated with expr.expr_type to end of ctx.errors
+    Return create_hir_error with "unsupported_expression"
+End Process
+
+Process called "translate_list" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let elements be expr.expr_data at key "elements"
+    Let tail be expr.expr_data at key "tail"
+
+    Let hir_elements be a list containing nothing
+
+    For Each elem in elements:
+        Let hir_elem be translate_expression with elem and ctx
+        Add hir_elem to end of hir_elements
+    End For
+
+    Note: Proper list (no tail)
+    If tail is null:
+        Return create_hir_list with hir_elements
+    End If
+
+    Note: Improper list with tail [H|T]
+    Note: Build list cons operations
+    Let result be translate_expression with tail and ctx
+
+    Note: Build list from right to left
+    For i from length of hir_elements minus 1 to 0 step -1:
+        Let elem be hir_elements at index i
+        Set result to create_hir_call with "erlang:cons" and a list containing elem, result
+    End For
+
+    Return result
+End Process
+
+Process called "translate_tuple" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let elements be expr.expr_data at key "elements"
+
+    Let hir_elements be a list containing nothing
+
+    For Each elem in elements:
+        Let hir_elem be translate_expression with elem and ctx
+        Add hir_elem to end of hir_elements
+    End For
+
+    Return create_hir_tuple with hir_elements
+End Process
+
+Process called "translate_binary" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let segments be expr.expr_data at key "segments"
+
+    Note: Translate binary to HIR binary construction
+    Let hir_segments be a list containing nothing
+
+    For Each segment in segments:
+        Let value be translate_expression with segment at key "value" and ctx
+        Let size be segment at key "size"
+        Let specifiers be segment at key "specifiers"
+
+        Let hir_size be null
+        If size is not null:
+            Set hir_size to translate_expression with size and ctx
+        End If
+
+        Let segment_info be a dictionary containing:
+            "value" as value,
+            "size" as hir_size,
+            "specifiers" as specifiers
+        End Dictionary
+
+        Add segment_info to end of hir_segments
+    End For
+
+    Return create_hir_binary with hir_segments
+End Process
+
+Process called "translate_binary_op" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let operator be expr.expr_data at key "operator"
+    Let left be translate_expression with expr.expr_data at key "left" and ctx
+    Let right be translate_expression with expr.expr_data at key "right" and ctx
+
+    Note: Map Erlang operators to HIR operators
+    Let hir_op be operator
+
+    Note: Special Erlang operators
+    If operator is equal to "!":
+        Note: Message send operator
+        Return create_hir_send with left and right
+
+    Otherwise if operator is equal to "=":
+        Note: Pattern match operator
+        Return create_hir_match with left and right
+
+    Otherwise if operator is equal to "++":
+        Note: List concatenation
+        Return create_hir_call with "erlang:append" and a list containing left, right
+
+    Otherwise if operator is equal to "--":
+        Note: List subtraction
+        Return create_hir_call with "erlang:subtract" and a list containing left, right
+
+    Otherwise if operator is equal to "=:=":
+        Set hir_op to "==="  Note: Exact equality
+
+    Otherwise if operator is equal to "=/=":
+        Set hir_op to "!=="  Note: Exact inequality
+
+    Otherwise if operator is equal to "andalso":
+        Set hir_op to "and"
+
+    Otherwise if operator is equal to "orelse":
+        Set hir_op to "or"
+
+    Otherwise if operator is equal to "div":
+        Set hir_op to "/"  Note: Integer division
+
+    Otherwise if operator is equal to "rem":
+        Set hir_op to "%"  Note: Remainder
+
+    Otherwise if operator is equal to "band":
+        Set hir_op to "&"  Note: Bitwise AND
+
+    Otherwise if operator is equal to "bor":
+        Set hir_op to "|"  Note: Bitwise OR
+
+    Otherwise if operator is equal to "bxor":
+        Set hir_op to "^"  Note: Bitwise XOR
+
+    Otherwise if operator is equal to "bsl":
+        Set hir_op to "<<"  Note: Bit shift left
+
+    Otherwise if operator is equal to "bsr":
+        Set hir_op to ">>"  Note: Bit shift right
+    End If
+
+    Return create_hir_binary_op with hir_op, left, right
+End Process
+
+Process called "translate_unary_op" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let operator be expr.expr_data at key "operator"
+    Let operand be translate_expression with expr.expr_data at key "operand" and ctx
+
+    Note: Map Erlang unary operators to HIR
+    Let hir_op be operator
+
+    If operator is equal to "not":
+        Set hir_op to "!"
+
+    Otherwise if operator is equal to "bnot":
+        Set hir_op to "~"  Note: Bitwise NOT
+    End If
+
+    Return create_hir_unary_op with hir_op and operand
+End Process
+
+Process called "translate_call" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let function be expr.expr_data at key "function"
+    Let arguments be expr.expr_data at key "arguments"
+
+    Note: Translate arguments
+    Let hir_args be a list containing nothing
+    For Each arg in arguments:
+        Let hir_arg be translate_expression with arg and ctx
+        Add hir_arg to end of hir_args
+    End For
+
+    Note: Check if remote call (Module:Function)
+    If function.expr_type is equal to "op" and function.expr_data at key "operator" is equal to ":":
+        Let module_expr be function.expr_data at key "left"
+        Let func_expr be function.expr_data at key "right"
+
+        Let module_name be ""
+        Let func_name be ""
+
+        If module_expr.expr_type is equal to "atom":
+            Set module_name to module_expr.expr_data at key "value"
+        End If
+
+        If func_expr.expr_type is equal to "atom":
+            Set func_name to func_expr.expr_data at key "value"
+        End If
+
+        Let qualified_name be module_name concatenated with ":" concatenated with func_name
+
+        Return create_hir_call with qualified_name and hir_args
+    End If
+
+    Note: Local call
+    If function.expr_type is equal to "atom":
+        Let func_name be function.expr_data at key "value"
+
+        Note: Qualify with current module
+        Let qualified_name be ctx.current_module concatenated with ":" concatenated with func_name
+
+        Return create_hir_call with qualified_name and hir_args
+    End If
+
+    Note: Higher-order call (function variable)
+    Let func_expr be translate_expression with function and ctx
+    Return create_hir_call_indirect with func_expr and hir_args
+End Process
+
+Process called "translate_fun" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let fun_type be expr.expr_data at key "type"
+
+    Note: Function reference: fun Module:Function/Arity or fun Function/Arity
+    If fun_type is equal to "remote_ref":
+        Let module_name be expr.expr_data at key "module"
+        Let func_name be expr.expr_data at key "function"
+        Let arity be expr.expr_data at key "arity"
+
+        Let qualified_name be module_name concatenated with ":" concatenated with func_name
+
+        Return create_hir_function_ref with qualified_name and arity
+
+    Otherwise if fun_type is equal to "local_ref":
+        Let func_name be expr.expr_data at key "function"
+        Let arity be expr.expr_data at key "arity"
+
+        Let qualified_name be ctx.current_module concatenated with ":" concatenated with func_name
+
+        Return create_hir_function_ref with qualified_name and arity
+    End If
+
+    Note: Anonymous function with clauses
+    If fun_type is equal to "anonymous":
+        Let clauses be expr.expr_data at key "clauses"
+
+        Note: Build lambda from clauses
+        Note: Use first clause to determine arity
+        Let first_clause be clauses at index 0
+        Let arity be length of first_clause.patterns
+
+        Note: Create parameter list
+        Let parameters be a list containing nothing
+        For i from 0 to arity minus 1:
+            Let param_name be "arg" concatenated with string representation of i
+            Add param_name to end of parameters
+        End For
+
+        Note: Build lambda body with clause dispatch
+        Let lambda_body be translate_clauses_with_dispatch with clauses, parameters, ctx
+
+        Note: Create parameter types
+        Let param_types be a list containing nothing
+        For i from 0 to arity minus 1:
+            Let any_type be create_hir_type with "any" and a list containing nothing
+            Add any_type to end of param_types
+        End For
+
+        Let return_type be create_hir_type with "any" and a list containing nothing
+
+        Return create_hir_lambda with parameters, param_types, return_type, lambda_body
+    End If
+
+    Note: Default
+    Return create_hir_error with "unsupported_fun_type"
+End Process
+
+Process called "translate_case" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let scrutinee be translate_expression with expr.expr_data at key "scrutinee" and ctx
+    Let clauses be expr.expr_data at key "clauses"
+
+    Note: Build match expression with branches
+    Let branches be a list containing nothing
+
+    For Each clause in clauses:
+        Note: Each clause has pattern, guards, and body
+        Let pattern be clause.patterns at index 0
+        Let guards be clause.guards
+        Let body be clause.body
+
+        Note: Translate pattern to HIR pattern
+        Let hir_pattern be translate_pattern with pattern and ctx
+
+        Note: Translate guards to conditions
+        Let hir_guards be a list containing nothing
+        For Each guard_seq in guards:
+            For Each guard_expr in guard_seq:
+                Let hir_guard be translate_expression with guard_expr and ctx
+                Add hir_guard to end of hir_guards
+            End For
+        End For
+
+        Note: Translate body
+        Let hir_body be translate_expressions with body and ctx
+
+        Let branch_info be a dictionary containing:
+            "pattern" as hir_pattern,
+            "guards" as hir_guards,
+            "body" as hir_body
+        End Dictionary
+
+        Add branch_info to end of branches
+    End For
+
+    Return create_hir_match_expr with scrutinee and branches
+End Process
+
+Process called "translate_if" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let clauses be expr.expr_data at key "clauses"
+
+    Note: Build nested if-else from guard sequences
+    Let if_expr be null
+
+    For i from 0 to length of clauses minus 1:
+        Let clause be clauses at index i
+
+        Note: Translate guards to condition
+        Let condition be null
+        If length of clause.guards is greater than 0:
+            Let guard_seq be clause.guards at index 0
+            Let guard_conditions be a list containing nothing
+
+            For Each guard_expr in guard_seq:
+                Let hir_guard be translate_expression with guard_expr and ctx
+                Add hir_guard to end of guard_conditions
+            End For
+
+            Note: Combine with AND
+            If length of guard_conditions is greater than 0:
+                Set condition to guard_conditions at index 0
+                For j from 1 to length of guard_conditions minus 1:
+                    Set condition to create_hir_binary_op with "and", condition, guard_conditions at index j
+                End For
+            End If
+        End If
+
+        Note: Translate body
+        Let hir_body be translate_expressions with clause.body and ctx
+
+        Note: Build if expression
+        If i is equal to 0:
+            Set if_expr to create_hir_if_expr with condition, hir_body, a list containing nothing
+        Otherwise:
+            Note: Add to else chain
+            Note: Build proper else-if chain for multiple case clauses
+            Let clause_count be proc list_length from List with clauses
+            If clause_count is greater than 1:
+                Let case_chain be proc build_case_chain from ctx, clauses, hir_case
+                Return case_chain
+            End If
+            Set if_expr to create_hir_if_expr with condition, hir_body, a list containing nothing
+        End If
+    End For
+
+    Return if_expr
+End Process
+
+Process called "translate_receive" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let clauses be expr.expr_data at key "clauses"
+    Let after_timeout be expr.expr_data at key "after_timeout"
+    Let after_body be expr.expr_data at key "after_body"
+
+    Note: Build receive expression
+    Let receive_clauses be a list containing nothing
+
+    For Each clause in clauses:
+        Let pattern be clause.patterns at index 0
+        Let guards be clause.guards
+        Let body be clause.body
+
+        Let hir_pattern be translate_pattern with pattern and ctx
+
+        Let hir_guards be a list containing nothing
+        For Each guard_seq in guards:
+            For Each guard_expr in guard_seq:
+                Let hir_guard be translate_expression with guard_expr and ctx
+                Add hir_guard to end of hir_guards
+            End For
+        End For
+
+        Let hir_body be translate_expressions with body and ctx
+
+        Let clause_info be a dictionary containing:
+            "pattern" as hir_pattern,
+            "guards" as hir_guards,
+            "body" as hir_body
+        End Dictionary
+
+        Add clause_info to end of receive_clauses
+    End For
+
+    Note: Translate timeout
+    Let hir_timeout be null
+    If after_timeout is not null:
+        Set hir_timeout to translate_expression with after_timeout and ctx
+    End If
+
+    Let hir_after_body be a list containing nothing
+    If length of after_body is greater than 0:
+        Set hir_after_body to translate_expressions with after_body and ctx
+    End If
+
+    Return create_hir_receive with receive_clauses, hir_timeout, hir_after_body
+End Process
+
+Process called "translate_try" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let try_body be expr.expr_data at key "try_body"
+    Let of_clauses be expr.expr_data at key "of_clauses"
+    Let catch_clauses be expr.expr_data at key "catch_clauses"
+    Let after_body be expr.expr_data at key "after_body"
+
+    Note: Translate try body
+    Let hir_try_body be translate_expressions with try_body and ctx
+
+    Note: Translate of clauses
+    Let hir_of_clauses be a list containing nothing
+    For Each clause in of_clauses:
+        Let pattern be clause.patterns at index 0
+        Let guards be clause.guards
+        Let body be clause.body
+
+        Let hir_pattern be translate_pattern with pattern and ctx
+
+        Let hir_guards be a list containing nothing
+        For Each guard_seq in guards:
+            For Each guard_expr in guard_seq:
+                Let hir_guard be translate_expression with guard_expr and ctx
+                Add hir_guard to end of hir_guards
+            End For
+        End For
+
+        Let hir_body be translate_expressions with body and ctx
+
+        Let clause_info be a dictionary containing:
+            "pattern" as hir_pattern,
+            "guards" as hir_guards,
+            "body" as hir_body
+        End Dictionary
+
+        Add clause_info to end of hir_of_clauses
+    End For
+
+    Note: Translate catch clauses
+    Let hir_catch_clauses be a list containing nothing
+    For Each catch_data in catch_clauses:
+        Let exception_class be catch_data at key "exception_class"
+        Let exception_pattern be catch_data at key "exception_pattern"
+        Let guards be catch_data at key "guards"
+        Let body be catch_data at key "body"
+
+        Let hir_exception_class be null
+        If exception_class is not null:
+            Set hir_exception_class to translate_expression with exception_class and ctx
+        End If
+
+        Let hir_exception_pattern be translate_pattern with exception_pattern and ctx
+
+        Let hir_guards be a list containing nothing
+        For Each guard_expr in guards:
+            Let hir_guard be translate_expression with guard_expr and ctx
+            Add hir_guard to end of hir_guards
+        End For
+
+        Let hir_body be translate_expressions with body and ctx
+
+        Let catch_info be a dictionary containing:
+            "exception_class" as hir_exception_class,
+            "exception_pattern" as hir_exception_pattern,
+            "guards" as hir_guards,
+            "body" as hir_body
+        End Dictionary
+
+        Add catch_info to end of hir_catch_clauses
+    End For
+
+    Note: Translate after body
+    Let hir_after_body be a list containing nothing
+    If length of after_body is greater than 0:
+        Set hir_after_body to translate_expressions with after_body and ctx
+    End If
+
+    Return create_hir_try with hir_try_body, hir_of_clauses, hir_catch_clauses, hir_after_body
+End Process
+
+Process called "translate_begin" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let body be expr.expr_data at key "body"
+    Let hir_body be translate_expressions with body and ctx
+
+    Note: Begin-end is just a block expression
+    Return create_hir_block with hir_body
+End Process
+
+Process called "translate_list_comprehension" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let template be expr.expr_data at key "template"
+    Let qualifiers be expr.expr_data at key "qualifiers"
+
+    Note: Build nested loops and filters for comprehension
+    Note: [Template || Qualifier1, Qualifier2, ...]
+
+    Note: Translate template
+    Let hir_template be translate_expression with template and ctx
+
+    Note: Build comprehension structure
+    Note: Build nested loops for multiple qualifiers in comprehension
+    Let qualifier_count be proc list_length from List with qualifiers
+    If qualifier_count is greater than 1:
+        Let nested_loops be proc build_nested_comprehension_loops from ctx, hir_template, qualifiers
+        Return nested_loops
+    End If
+    Let hir_qualifiers be a list containing nothing
+
+    For Each qualifier in qualifiers:
+        Let qual_type be qualifier at key "type"
+
+        If qual_type is equal to "generator":
+            Let pattern be qualifier at key "pattern"
+            Let list_expr be qualifier at key "list"
+
+            Let hir_pattern be translate_pattern with pattern and ctx
+            Let hir_list be translate_expression with list_expr and ctx
+
+            Let gen_info be a dictionary containing:
+                "type" as "generator",
+                "pattern" as hir_pattern,
+                "list" as hir_list
+            End Dictionary
+
+            Add gen_info to end of hir_qualifiers
+
+        Otherwise if qual_type is equal to "filter":
+            Let filter_expr be qualifier at key "expression"
+            Let hir_filter be translate_expression with filter_expr and ctx
+
+            Let filter_info be a dictionary containing:
+                "type" as "filter",
+                "expression" as hir_filter
+            End Dictionary
+
+            Add filter_info to end of hir_qualifiers
+        End If
+    End For
+
+    Return create_hir_list_comprehension with hir_template and hir_qualifiers
+End Process
+
+Process called "translate_binary_comprehension" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let template be expr.expr_data at key "template"
+    Let qualifiers be expr.expr_data at key "qualifiers"
+
+    Note: Similar to list comprehension but produces binary
+    Let hir_template be template  Note: Template is segment dict
+
+    Let hir_qualifiers be a list containing nothing
+
+    For Each qualifier in qualifiers:
+        Let qual_type be qualifier at key "type"
+
+        If qual_type is equal to "generator" or qual_type is equal to "binary_generator":
+            Let pattern be qualifier at key "pattern"
+            Let source_key be "list"
+            If qual_type is equal to "binary_generator":
+                Set source_key to "binary"
+            End If
+            Let source_expr be qualifier at key source_key
+
+            Let hir_pattern be translate_pattern with pattern and ctx
+            Let hir_source be translate_expression with source_expr and ctx
+
+            Let gen_info be a dictionary containing:
+                "type" as qual_type,
+                "pattern" as hir_pattern,
+                "source" as hir_source
+            End Dictionary
+
+            Add gen_info to end of hir_qualifiers
+
+        Otherwise if qual_type is equal to "filter":
+            Let filter_expr be qualifier at key "expression"
+            Let hir_filter be translate_expression with filter_expr and ctx
+
+            Let filter_info be a dictionary containing:
+                "type" as "filter",
+                "expression" as hir_filter
+            End Dictionary
+
+            Add filter_info to end of hir_qualifiers
+        End If
+    End For
+
+    Return create_hir_binary_comprehension with hir_template and hir_qualifiers
+End Process
+
+Process called "translate_record_create" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let record_name be expr.expr_data at key "name"
+    Let fields be expr.expr_data at key "fields"
+    Let base be expr.expr_data at key "base"
+
+    Note: Get record definition from context
+    Let record_def be ctx.records at key record_name
+
+    Note: Build field map
+    Let hir_fields be a dictionary containing nothing
+
+    For Each field_data in fields:
+        Let field_name be field_data at key "name"
+        Let field_value be field_data at key "value"
+
+        Let hir_value be translate_expression with field_value and ctx
+        Set hir_fields at key field_name to hir_value
+    End For
+
+    Note: Handle record update
+    Let hir_base be null
+    If base is not null:
+        Set hir_base to translate_expression with base and ctx
+    End If
+
+    Return create_hir_record with record_name, hir_fields, hir_base
+End Process
+
+Process called "translate_record_access" that takes expr as ErlangExpression, ctx as ErlangTranslationContext returns HIRExpression:
+    Let record be expr.expr_data at key "record"
+    Let field be expr.expr_data at key "field"
+
+    Let hir_record be translate_expression with record and ctx
+
+    Return create_hir_record_access with hir_record and field
+End Process
+
+Process called "translate_pattern" that takes pattern as ErlangExpression and ctx as ErlangTranslationContext returns HIRPattern:
+    Note: Translate Erlang pattern to HIR pattern
+
+    If pattern.expr_type is equal to "var":
+        Let var_name be pattern.expr_data at key "name"
+        Return create_hir_var_pattern with var_name
+    End If
+
+    If pattern.expr_type is equal to "atom":
+        Let atom_value be pattern.expr_data at key "value"
+        Return create_hir_literal_pattern with atom_value
+    End If
+
+    If pattern.expr_type is equal to "integer":
+        Let int_value be pattern.expr_data at key "value"
+        Return create_hir_literal_pattern with int_value
+    End If
+
+    If pattern.expr_type is equal to "list":
+        Let elements be pattern.expr_data at key "elements"
+        Let tail be pattern.expr_data at key "tail"
+
+        Let hir_elements be a list containing nothing
+        For Each elem in elements:
+            Let hir_elem be translate_pattern with elem and ctx
+            Add hir_elem to end of hir_elements
+        End For
+
+        Let hir_tail be null
+        If tail is not null:
+            Set hir_tail to translate_pattern with tail and ctx
+        End If
+
+        Return create_hir_list_pattern with hir_elements and hir_tail
+    End If
+
+    If pattern.expr_type is equal to "tuple":
+        Let elements be pattern.expr_data at key "elements"
+
+        Let hir_elements be a list containing nothing
+        For Each elem in elements:
+            Let hir_elem be translate_pattern with elem and ctx
+            Add hir_elem to end of hir_elements
+        End For
+
+        Return create_hir_tuple_pattern with hir_elements
+    End If
+
+    Note: Default - variable pattern
+    Return create_hir_wildcard_pattern
+End Process
+
+Note: ============================================================================
+Note: HIR CREATION HELPERS
+Note: ============================================================================
+
+Process called "create_hir_type" that takes type_name as String, type_args as List[Any] returns HIRType:
+    Return a value of type HIRType with
+        name as type_name,
+        args as type_args
+End Process
+
+Process called "create_hir_atom" that takes value as String returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "atom",
+        data as value
+End Process
+
+Process called "create_hir_var" that takes name as String returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "var",
+        data as name
+End Process
+
+Process called "create_hir_int" that takes value as Integer returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "int",
+        data as value
+End Process
+
+Process called "create_hir_float" that takes value as Float returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "float",
+        data as value
+End Process
+
+Process called "create_hir_string" that takes value as String returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "string",
+        data as value
+End Process
+
+Process called "create_hir_char" that takes value as String returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "char",
+        data as value
+End Process
+
+Process called "create_hir_bool" that takes value as Boolean returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "bool",
+        data as value
+End Process
+
+Process called "create_hir_list" that takes elements as List[HIRExpression] returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "list",
+        data as elements
+End Process
+
+Process called "create_hir_tuple" that takes elements as List[HIRExpression] returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "tuple",
+        data as elements
+End Process
+
+Process called "create_hir_binary" that takes segments as List[Any] returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "binary",
+        data as segments
+End Process
+
+Process called "create_hir_binary_op" that takes operator as String, left as HIRExpression, right as HIRExpression returns HIRExpression:
+    Let op_data be a dictionary containing:
+        "op" as operator,
+        "left" as left,
+        "right" as right
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "binary_op",
+        data as op_data
+End Process
+
+Process called "create_hir_unary_op" that takes operator as String, operand as HIRExpression returns HIRExpression:
+    Let op_data be a dictionary containing:
+        "op" as operator,
+        "operand" as operand
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "unary_op",
+        data as op_data
+End Process
+
+Process called "create_hir_call" that takes function_name as String, arguments as List[HIRExpression] returns HIRExpression:
+    Let call_data be a dictionary containing:
+        "function" as function_name,
+        "args" as arguments
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "call",
+        data as call_data
+End Process
+
+Process called "create_hir_call_indirect" that takes function as HIRExpression, arguments as List[HIRExpression] returns HIRExpression:
+    Let call_data be a dictionary containing:
+        "function" as function,
+        "args" as arguments
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "call_indirect",
+        data as call_data
+End Process
+
+Process called "create_hir_lambda" that takes parameters as List[String], param_types as List[HIRType], return_type as HIRType, body as List[HIRStatement] returns HIRExpression:
+    Let lambda_data be a dictionary containing:
+        "parameters" as parameters,
+        "param_types" as param_types,
+        "return_type" as return_type,
+        "body" as body
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "lambda",
+        data as lambda_data
+End Process
+
+Process called "create_hir_function_ref" that takes function_name as String, arity as Integer returns HIRExpression:
+    Let ref_data be a dictionary containing:
+        "function" as function_name,
+        "arity" as arity
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "function_ref",
+        data as ref_data
+End Process
+
+Process called "create_hir_send" that takes destination as HIRExpression, message as HIRExpression returns HIRExpression:
+    Let send_data be a dictionary containing:
+        "destination" as destination,
+        "message" as message
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "send",
+        data as send_data
+End Process
+
+Process called "create_hir_match" that takes pattern as HIRExpression, value as HIRExpression returns HIRExpression:
+    Let match_data be a dictionary containing:
+        "pattern" as pattern,
+        "value" as value
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "match",
+        data as match_data
+End Process
+
+Process called "create_hir_match_expr" that takes scrutinee as HIRExpression, branches as List[Any] returns HIRExpression:
+    Let match_data be a dictionary containing:
+        "scrutinee" as scrutinee,
+        "branches" as branches
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "match_expr",
+        data as match_data
+End Process
+
+Process called "create_hir_if_expr" that takes condition as HIRExpression, then_body as List[HIRStatement], else_body as List[HIRStatement] returns HIRExpression:
+    Let if_data be a dictionary containing:
+        "condition" as condition,
+        "then" as then_body,
+        "else" as else_body
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "if_expr",
+        data as if_data
+End Process
+
+Process called "create_hir_receive" that takes clauses as List[Any], timeout as HIRExpression OR Null, after_body as List[HIRStatement] returns HIRExpression:
+    Let receive_data be a dictionary containing:
+        "clauses" as clauses,
+        "timeout" as timeout,
+        "after" as after_body
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "receive",
+        data as receive_data
+End Process
+
+Process called "create_hir_try" that takes try_body as List[HIRStatement], of_clauses as List[Any], catch_clauses as List[Any], after_body as List[HIRStatement] returns HIRExpression:
+    Let try_data be a dictionary containing:
+        "try" as try_body,
+        "of" as of_clauses,
+        "catch" as catch_clauses,
+        "after" as after_body
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "try",
+        data as try_data
+End Process
+
+Process called "create_hir_block" that takes body as List[HIRStatement] returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "block",
+        data as body
+End Process
+
+Process called "create_hir_list_comprehension" that takes template as HIRExpression, qualifiers as List[Any] returns HIRExpression:
+    Let comp_data be a dictionary containing:
+        "template" as template,
+        "qualifiers" as qualifiers
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "list_comprehension",
+        data as comp_data
+End Process
+
+Process called "create_hir_binary_comprehension" that takes template as Any, qualifiers as List[Any] returns HIRExpression:
+    Let comp_data be a dictionary containing:
+        "template" as template,
+        "qualifiers" as qualifiers
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "binary_comprehension",
+        data as comp_data
+End Process
+
+Process called "create_hir_record" that takes name as String, fields as Dictionary[String, HIRExpression], base as HIRExpression OR Null returns HIRExpression:
+    Let record_data be a dictionary containing:
+        "name" as name,
+        "fields" as fields,
+        "base" as base
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "record",
+        data as record_data
+End Process
+
+Process called "create_hir_record_access" that takes record as HIRExpression, field as String returns HIRExpression:
+    Let access_data be a dictionary containing:
+        "record" as record,
+        "field" as field
+    End Dictionary
+
+    Return a value of type HIRExpression with
+        kind as "record_access",
+        data as access_data
+End Process
+
+Process called "create_hir_macro" that takes name as String returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "macro",
+        data as name
+End Process
+
+Process called "create_hir_error" that takes message as String returns HIRExpression:
+    Return a value of type HIRExpression with
+        kind as "error",
+        data as message
+End Process
+
+Process called "create_hir_return" that takes value as HIRExpression returns HIRStatement:
+    Return a value of type HIRStatement with
+        stmt_type as "return",
+        data as value
+End Process
+
+Process called "create_hir_expr_statement" that takes expr as HIRExpression returns HIRStatement:
+    Return a value of type HIRStatement with
+        stmt_type as "expr",
+        data as expr
+End Process
+
+Process called "create_hir_if" that takes condition as HIRExpression, then_body as List[HIRStatement], else_body as List[HIRStatement] returns HIRStatement:
+    Let if_data be a dictionary containing:
+        "condition" as condition,
+        "then" as then_body,
+        "else" as else_body
+    End Dictionary
+
+    Return a value of type HIRStatement with
+        stmt_type as "if",
+        data as if_data
+End Process
+
+Note: Pattern creation helpers
+Process called "create_hir_var_pattern" that takes name as String returns HIRPattern:
+    Return a value of type HIRPattern with
+        pattern_type as "var",
+        data as name
+End Process
+
+Process called "create_hir_literal_pattern" that takes value as Any returns HIRPattern:
+    Return a value of type HIRPattern with
+        pattern_type as "literal",
+        data as value
+End Process
+
+Process called "create_hir_list_pattern" that takes elements as List[HIRPattern], tail as HIRPattern OR Null returns HIRPattern:
+    Let list_data be a dictionary containing:
+        "elements" as elements,
+        "tail" as tail
+    End Dictionary
+
+    Return a value of type HIRPattern with
+        pattern_type as "list",
+        data as list_data
+End Process
+
+Process called "create_hir_tuple_pattern" that takes elements as List[HIRPattern] returns HIRPattern:
+    Return a value of type HIRPattern with
+        pattern_type as "tuple",
+        data as elements
+End Process
+
+Process called "create_hir_wildcard_pattern" returns HIRPattern:
+    Return a value of type HIRPattern with
+        pattern_type as "wildcard",
+        data as "_"
+End Process
+
+Note: ============================================================================
+Note: TRANSLATION ENTRY POINT
+Note: ============================================================================
+
+Process called "translate_erlang_to_hir" that takes erl_module as ErlangModule returns HIRModule:
+    Return translate_erlang_module_to_hir with erl_module
+End Process

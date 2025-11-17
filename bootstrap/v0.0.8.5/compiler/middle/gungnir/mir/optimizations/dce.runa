@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,2325 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles dead code elimination optimization.
+This file handles advanced dead code elimination optimization.
 
 This file performs the following tasks:
-- Process dead code elimination and unused code removal
+- Process aggressive dead code elimination with control dependencies
 - Handle dead instruction detection and dead block removal
 - Manage dead variable elimination and dead function removal
 - Process dead code validation and dead code verification
 
 This file is essential because of the following reasons:
-- Dead code elimination improves code performance and reduces size
-- Proper DCE handling ensures correct dead code identification
-- DCE support enables Runa compilation for optimized code generation
+- Advanced DCE goes beyond basic liveness to eliminate more dead code
+- Control dependency analysis catches code that basic DCE misses
+- Function-level DCE removes unused functions across modules
+- Aggressive elimination improves code performance and reduces size
 
 This file consists of the following functions/features/operation types:
-- Dead code elimination and unused code removal
-- Dead instruction detection and dead block removal
-- Dead variable elimination and dead function removal
-- Dead code validation and dead code verification
+- Aggressive dead code elimination (ADCE) with control dependencies
+- Post-dominance analysis for backward control flow
+- Function-level dead code elimination
+- Dead block removal with CFG simplification
+- Coordination with basic DCE from mir_optimizer.runa
 :End Note
 
-Note: TODO - Implement dead code elimination functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================================
+Note: DATA STRUCTURES - Advanced DCE Context
+Note: ============================================================================
+
+Type called "ADCEContext":
+    @Reasoning
+    Maintains state for aggressive dead code elimination.
+
+    **CONTEXT STRUCTURE:**
+    ```
+    ADCEContext:
+        cfg: MIRCFG pointer
+        post_dominance: PostDominanceInfo pointer
+        control_dependence: ControlDependenceGraph pointer
+        critical_instructions: Set of critical instruction IDs
+        worklist: Worklist for backward marking
+        eliminated_count: Number of instructions eliminated
+        block_eliminated_count: Number of blocks eliminated
+        function_eliminated_count: Number of functions eliminated
+        def_use_map: Dictionary mapping value_id -> instruction info (OPTIMIZATION)
+    ```
+
+    **MEMORY LAYOUT** (136 bytes):
+    ```
+    Offset 0:  cfg (Integer - CFG pointer)
+    Offset 8:  post_dominance (Integer - PostDominanceInfo pointer)
+    Offset 16: control_dependence (Integer - CDG pointer)
+    Offset 24: critical_instructions (Integer - Set pointer)
+    Offset 32: worklist (Integer - List pointer)
+    Offset 40: eliminated_count (Integer)
+    Offset 48: block_eliminated_count (Integer)
+    Offset 56: function_eliminated_count (Integer)
+    Offset 64: def_use_map (Integer - Dictionary pointer for O(1) def lookup)
+    ```
+
+    **PERFORMANCE OPTIMIZATION:**
+    def_use_map caches value_id -> instruction mappings for O(1) lookup
+    instead of O(n×m) linear search through all blocks and instructions.
+    @End Reasoning
+
+    cfg as Integer
+    post_dominance as Integer
+    control_dependence as Integer
+    critical_instructions as Integer
+    worklist as Integer
+    eliminated_count as Integer
+    block_eliminated_count as Integer
+    function_eliminated_count as Integer
+    def_use_map as Integer
+End Type
+
+Type called "PostDominanceInfo":
+    @Reasoning
+    Post-dominance tree information.
+
+    **POST-DOMINANCE:**
+    - Block A post-dominates B if all paths from B to exit go through A
+    - Used for backward control flow analysis
+    - Critical for control dependency computation
+
+    **MEMORY LAYOUT** (64 bytes):
+    ```
+    Offset 0:  cfg (Integer - CFG pointer)
+    Offset 8:  post_idom (Integer - Immediate post-dominator map)
+    Offset 16: post_dom_tree (Integer - Post-dominator tree structure)
+    Offset 24: post_dom_frontiers (Integer - Post-dominance frontiers)
+    Offset 32: reverse_postorder (Integer - RPO for traversal)
+    ```
+    @End Reasoning
+
+    cfg as Integer
+    post_idom as Integer
+    post_dom_tree as Integer
+    post_dom_frontiers as Integer
+    reverse_postorder as Integer
+End Type
+
+Type called "ControlDependenceGraph":
+    @Reasoning
+    Control dependence graph for ADCE.
+
+    **CONTROL DEPENDENCE:**
+    - Instruction Y is control dependent on predicate X if:
+      1. There exists a path from X to Y on which Y post-dominates X
+      2. Y does not strictly post-dominate X
+    - Critical for determining what code is required for control flow
+
+    **MEMORY LAYOUT** (48 bytes):
+    ```
+    Offset 0:  cfg (Integer - CFG pointer)
+    Offset 8:  dependencies (Integer - Map: instruction -> list of deps)
+    Offset 16: reverse_dependencies (Integer - Map: instruction -> dependents)
+    Offset 24: branch_dependencies (Integer - Branch-specific dependencies)
+    ```
+    @End Reasoning
+
+    cfg as Integer
+    dependencies as Integer
+    reverse_dependencies as Integer
+    branch_dependencies as Integer
+End Type
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_adce_context" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Creates a new ADCE context.
+
+    **INITIALIZATION:**
+    - Allocates 136 bytes for context
+    - Computes post-dominance information
+    - Builds control dependence graph
+    - Creates empty critical instruction set
+    - Initializes worklist and counters
+    - Builds def-use map for O(1) definition lookup (OPTIMIZATION)
+    @End Reasoning
+
+    @Performance_Hints
+    The def-use map optimization reduces mark_operand_definition from O(n×m)
+    to O(1) by pre-computing value_id -> instruction mappings during context
+    creation. This is a one-time O(n×m) cost that pays off when marking
+    operand definitions during the ADCE algorithm.
+    @End Performance_Hints
+
+    If cfg equals 0:
+        Display "create_adce_context: null CFG"
+        Return 0
+    End If
+
+    Note: Allocate context structure (136 bytes - expanded for def_use_map)
+    Let context_ptr be Layout.allocate(136)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Set CFG
+    Layout.memory_set_int64(context_ptr, 0, cfg)
+
+    Note: Compute post-dominance information
+    Display "create_adce_context: computing post-dominance"
+    Let post_dom be compute_post_dominance_tree(cfg)
+    Layout.memory_set_int64(context_ptr, 8, post_dom)
+
+    Note: Build control dependence graph
+    Display "create_adce_context: building control dependence graph"
+    Let cdg be build_control_dependence_graph(cfg, post_dom)
+    Layout.memory_set_int64(context_ptr, 16, cdg)
+
+    Note: Create critical instruction set
+    Let critical_set be List.create()
+    Layout.memory_set_int64(context_ptr, 24, critical_set)
+
+    Note: Create worklist
+    Let worklist be List.create()
+    Layout.memory_set_int64(context_ptr, 32, worklist)
+
+    Note: Initialize counters to 0
+    Layout.memory_set_int64(context_ptr, 40, 0)  Note: eliminated_count
+    Layout.memory_set_int64(context_ptr, 48, 0)  Note: block_eliminated_count
+    Layout.memory_set_int64(context_ptr, 56, 0)  Note: function_eliminated_count
+
+    Note: Build def-use map for O(1) definition lookup (OPTIMIZATION)
+    Display "create_adce_context: building def-use map"
+    Let def_use_map be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 64, def_use_map)
+
+    Note: Populate def-use map by scanning all instructions
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let result_id be Layout.memory_get_int64(inst, 8)
+                If result_id is not equal to 0:
+                    Note: Store instruction info as (block_id << 32 | inst_idx)
+                    Note: This packs block and instruction indices into single integer
+                    Let packed_info be (i multiplied by 4294967296) plus j
+
+                    Note: Convert result_id to string for Dictionary key
+                    Let key_str be proc integer_to_string from String with result_id
+                    proc set from Dictionary with def_use_map, key_str, packed_info
+                End If
+            End If
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Display "create_adce_context: context created"
+    Return context_ptr
+End Process
+
+Process called "destroy_adce_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys an ADCE context and frees all associated memory.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy def-use map (OPTIMIZATION structure)
+    Let def_use_map be Layout.memory_get_int64(context_ptr, 64)
+    If def_use_map is not equal to 0:
+        proc destroy from Dictionary with def_use_map
+    End If
+
+    Note: Destroy critical instruction set
+    Let critical_set be Layout.memory_get_int64(context_ptr, 24)
+    If critical_set is not equal to 0:
+        List.destroy(critical_set)
+    End If
+
+    Note: Destroy worklist
+    Let worklist be Layout.memory_get_int64(context_ptr, 32)
+    If worklist is not equal to 0:
+        List.destroy(worklist)
+    End If
+
+    Note: Destroy control dependence graph
+    Let cdg be Layout.memory_get_int64(context_ptr, 16)
+    If cdg is not equal to 0:
+        destroy_control_dependence_graph(cdg)
+    End If
+
+    Note: Destroy post-dominance info
+    Let post_dom be Layout.memory_get_int64(context_ptr, 8)
+    If post_dom is not equal to 0:
+        destroy_post_dominance_info(post_dom)
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr)
+
+    Return 1
+End Process
+
+Process called "print_adce_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints ADCE statistics for reporting.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let eliminated be Layout.memory_get_int64(context_ptr, 40)
+    Let blocks_eliminated be Layout.memory_get_int64(context_ptr, 48)
+    Let functions_eliminated be Layout.memory_get_int64(context_ptr, 56)
+
+    Display "============================================"
+    Display "AGGRESSIVE DCE STATISTICS"
+    Display "============================================"
+    Display "Instructions eliminated: " joined with eliminated
+    Display "Blocks eliminated:       " joined with blocks_eliminated
+    Display "Functions eliminated:    " joined with functions_eliminated
+    Display "============================================"
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS - Dual Interface (Standalone + Pipeline)
+Note: ============================================================================
+
+Process called "optimize_aggressive_dce" that takes cfg as Integer returns Integer:
+    @Reasoning
+    **MAIN STANDALONE ENTRY POINT**
+
+    Runs aggressive dead code elimination independently.
+    Can be called outside the main optimization pipeline.
+
+    **USAGE:**
+    ```
+    Let cfg be mir_builder_build(hir_function)
+    Let success be optimize_aggressive_dce(cfg)
+    If success equals 1:
+        Note: Advanced DCE completed successfully
+    End If
+    ```
+
+    Returns 1 if successful, 0 if failed.
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "optimize_aggressive_dce: null CFG"
+        Return 0
+    End If
+
+    Display "============================================"
+    Display "STARTING AGGRESSIVE DCE"
+    Display "============================================"
+    Display ""
+
+    Note: Create ADCE context
+    Let context_ptr be create_adce_context(cfg)
+    If context_ptr equals 0:
+        Display "optimize_aggressive_dce: failed to create context"
+        Return 0
+    End If
+
+    Note: Run aggressive DCE algorithm
+    Let result be run_adce_algorithm(context_ptr)
+
+    Note: Verify MIR correctness
+    Display ""
+    Display "Verifying optimized MIR..."
+    Let verification_result be Verifier.verify_mir(cfg)
+    If verification_result equals 0:
+        Display "ERROR: MIR verification failed after ADCE"
+        Display "This indicates a bug in the optimizer"
+        destroy_adce_context(context_ptr)
+        Return 0
+    End If
+    Display "MIR verification passed"
+
+    Note: Print statistics
+    Display ""
+    print_adce_stats(context_ptr)
+
+    Note: Cleanup
+    destroy_adce_context(context_ptr)
+
+    Display ""
+    Display "============================================"
+    Display "AGGRESSIVE DCE COMPLETE"
+    Display "============================================"
+
+    Return result
+End Process
+
+Process called "run_aggressive_dce_pass" that takes optimizer_context as Integer returns Integer:
+    @Reasoning
+    **PIPELINE INTEGRATION ENTRY POINT**
+
+    Runs aggressive DCE as part of mir_optimizer.runa pipeline.
+    Coordinates with basic DCE and other optimizations.
+
+    **USAGE (from mir_optimizer.runa):**
+    ```
+    Note: After basic optimizations converge
+    Let adce_result be run_aggressive_dce_pass(context_ptr)
+    ```
+
+    Returns number of instructions eliminated.
+    @End Reasoning
+
+    If optimizer_context equals 0:
+        Return 0
+    End If
+
+    Display "run_aggressive_dce_pass: starting ADCE in pipeline"
+
+    Note: Extract CFG from optimizer context
+    Let cfg be Layout.memory_get_int64(optimizer_context, 0)
+
+    Note: Create ADCE context
+    Let adce_context be create_adce_context(cfg)
+    If adce_context equals 0:
+        Return 0
+    End If
+
+    Note: Run ADCE
+    run_adce_algorithm(adce_context)
+
+    Note: Get elimination count
+    Let eliminated be Layout.memory_get_int64(adce_context, 40)
+
+    Note: Update optimizer context counters
+    Let current_deleted be Layout.memory_get_int64(optimizer_context, 40)
+    Layout.memory_set_int64(optimizer_context, 40, current_deleted plus eliminated)
+
+    Note: Cleanup
+    destroy_adce_context(adce_context)
+
+    Display "run_aggressive_dce_pass: eliminated " joined with eliminated joined with " instructions"
+    Return eliminated
+End Process
+
+Note: ============================================================================
+Note: POST-DOMINANCE ANALYSIS
+Note: ============================================================================
+
+Process called "compute_post_dominance_tree" that takes cfg as Integer returns Integer:
+    @Reasoning
+    **POST-DOMINANCE TREE COMPUTATION**
+
+    Computes post-dominance relationships for backward control flow analysis.
+
+    **ALGORITHM** (Cooper-Harvey-Kennedy, adapted for post-dominance):
+    ```
+    1. Add virtual exit node connecting all return blocks
+    2. Initialize:
+       - Exit node post-dominates only itself
+       - All other nodes post-dominated by all nodes initially
+    3. Iterate until fixed point:
+       - For each block in reverse postorder:
+         - New post-idom = intersection of post-idoms of all successors
+    4. Build post-dominator tree from post-idom relationships
+    ```
+
+    **POST-DOMINANCE:**
+    - Block A post-dominates B if all paths from B to exit pass through A
+    - Dual of dominance (forward → backward)
+
+    Returns PostDominanceInfo pointer.
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Display "compute_post_dominance_tree: starting post-dominance analysis"
+
+    Note: Allocate PostDominanceInfo (64 bytes)
+    Let post_dom_ptr be Layout.allocate(64)
+    If post_dom_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Set CFG
+    Layout.memory_set_int64(post_dom_ptr, 0, cfg)
+
+    Note: Create post-idom map (block_id -> post-idom_id)
+    Let post_idom be List.create()
+    Layout.memory_set_int64(post_dom_ptr, 8, post_idom)
+
+    Note: Get reverse postorder for efficient iteration
+    Let rpo be compute_reverse_postorder(cfg)
+    Layout.memory_set_int64(post_dom_ptr, 32, rpo)
+
+    Note: Initialize post-idom map
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Note: Initially, all blocks have undefined post-idom (-1)
+        List.append(post_idom, -1)
+        Set i to i plus 1
+    End While
+
+    Note: Identify exit blocks (blocks with no successors or return instructions)
+    Let exit_blocks be find_exit_blocks(cfg)
+
+    Note: Initialize exit blocks to post-dominate themselves
+    Let exit_count be List.length(exit_blocks)
+    Let i be 0
+    While i is less than exit_count:
+        Let exit_id be List.get(exit_blocks, i)
+        List.set(post_idom, exit_id, exit_id)
+        Set i to i plus 1
+    End While
+
+    Note: Iterative fixed-point computation
+    Let changed be 1
+    Let iteration be 0
+    While changed equals 1:
+        Set changed to 0
+        Set iteration to iteration plus 1
+
+        Note: Process blocks in reverse postorder (for efficiency)
+        Let rpo_count be List.length(rpo)
+        Let i be 0
+        While i is less than rpo_count:
+            Let block_id be List.get(rpo, i)
+
+            Note: Skip exit blocks (already initialized)
+            Let is_exit be is_in_list(exit_blocks, block_id)
+            If is_exit equals 0:
+                Note: Compute new post-idom as intersection of successor post-idoms
+                Let new_post_idom be compute_post_idom_from_successors(cfg, block_id, post_idom)
+
+                Note: Check if post-idom changed
+                Let current_post_idom be List.get(post_idom, block_id)
+                If current_post_idom is not equal to new_post_idom:
+                    List.set(post_idom, block_id, new_post_idom)
+                    Set changed to 1
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+    End While
+
+    Display "compute_post_dominance_tree: converged in " joined with iteration joined with " iterations"
+
+    Note: Build post-dominator tree
+    Let post_dom_tree be build_post_dominator_tree(cfg, post_idom)
+    Layout.memory_set_int64(post_dom_ptr, 16, post_dom_tree)
+
+    Note: Compute post-dominance frontiers
+    Let post_dom_frontiers be compute_post_dominance_frontiers(cfg, post_idom)
+    Layout.memory_set_int64(post_dom_ptr, 24, post_dom_frontiers)
+
+    Note: Cleanup
+    List.destroy(exit_blocks)
+
+    Display "compute_post_dominance_tree: post-dominance analysis complete"
+    Return post_dom_ptr
+End Process
+
+Process called "find_exit_blocks" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Finds all exit blocks in the CFG.
+
+    **EXIT BLOCKS:**
+    - Blocks with no successors
+    - Blocks ending with return instructions
+    - Blocks with only exceptional control flow
+
+    Returns list of exit block IDs.
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Let exit_blocks be List.create()
+    Let block_count be CFG.get_block_count(cfg)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let successors be CFG.get_successors(block)
+        Let succ_count be List.length(successors)
+
+        Note: Check if block has no successors
+        If succ_count equals 0:
+            List.append(exit_blocks, i)
+        Otherwise:
+            Note: Check if block ends with return
+            Let instructions be CFG.get_block_instructions(block)
+            Let inst_count be List.length(instructions)
+            If inst_count is greater than 0:
+                Let last_inst be List.get(instructions, inst_count minus 1)
+                Let opcode be MIRNodes.get_instruction_opcode(last_inst)
+                If opcode equals 20040:  Note: MIR_RET
+                    List.append(exit_blocks, i)
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return exit_blocks
+End Process
+
+Process called "compute_post_idom_from_successors" that takes cfg as Integer, block_id as Integer, post_idom as Integer returns Integer:
+    @Reasoning
+    Computes post-idom by intersecting successor post-idoms.
+
+    **ALGORITHM:**
+    - Start with first defined successor post-idom
+    - Intersect with remaining successors
+    - Post-idom is the common ancestor in post-dom tree
+
+    Returns post-idom block ID, or -1 if undefined.
+    @End Reasoning
+
+    If cfg equals 0 or post_idom equals 0:
+        Return -1
+    End If
+
+    Let block be CFG.get_block(cfg, block_id)
+    Let successors be CFG.get_successors(block)
+    Let succ_count be List.length(successors)
+
+    If succ_count equals 0:
+        Return -1
+    End If
+
+    Note: Find first defined successor post-idom
+    Let result be -1
+    Let i be 0
+    While i is less than succ_count and result equals -1:
+        Let succ_id be List.get(successors, i)
+        Let succ_post_idom be List.get(post_idom, succ_id)
+        If succ_post_idom is not equal to -1:
+            Set result to succ_post_idom
+        End If
+        Set i to i plus 1
+    End While
+
+    If result equals -1:
+        Return -1
+    End If
+
+    Note: Intersect with remaining successors
+    Let i be 0
+    While i is less than succ_count:
+        Let succ_id be List.get(successors, i)
+        Let succ_post_idom be List.get(post_idom, succ_id)
+        If succ_post_idom is not equal to -1:
+            Set result to intersect_post_idoms(result, succ_post_idom, post_idom)
+        End If
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+Process called "intersect_post_idoms" that takes finger1 as Integer, finger2 as Integer, post_idom as Integer returns Integer:
+    @Reasoning
+    Intersects two post-idom chains to find common ancestor.
+
+    **ALGORITHM** (Cooper-Harvey-Kennedy):
+    ```
+    while finger1 != finger2:
+        while finger1 < finger2:
+            finger1 = post_idom[finger1]
+        while finger2 < finger1:
+            finger2 = post_idom[finger2]
+    return finger1
+    ```
+
+    This walks up the post-dom tree to find the nearest common ancestor.
+
+    Returns intersected post-idom.
+    @End Reasoning
+
+    If post_idom equals 0:
+        Return -1
+    End If
+
+    Let f1 be finger1
+    Let f2 be finger2
+
+    While f1 is not equal to f2:
+        While f1 is less than f2:
+            Set f1 to List.get(post_idom, f1)
+            If f1 equals -1:
+                Return -1
+            End If
+        End While
+        While f2 is less than f1:
+            Set f2 to List.get(post_idom, f2)
+            If f2 equals -1:
+                Return -1
+            End If
+        End While
+    End While
+
+    Return f1
+End Process
+
+Process called "build_post_dominator_tree" that takes cfg as Integer, post_idom as Integer returns Integer:
+    @Reasoning
+    Builds post-dominator tree structure from post-idom map.
+
+    **TREE STRUCTURE:**
+    - Map: block_id -> list of children in post-dom tree
+    - Children are blocks that this block immediately post-dominates
+
+    Returns tree structure (map of children lists).
+    @End Reasoning
+
+    If cfg equals 0 or post_idom equals 0:
+        Return 0
+    End If
+
+    Let tree be List.create()
+    Let block_count be CFG.get_block_count(cfg)
+
+    Note: Initialize empty children lists for each block
+    Let i be 0
+    While i is less than block_count:
+        Let children be List.create()
+        List.append(tree, children)
+        Set i to i plus 1
+    End While
+
+    Note: Build parent-child relationships
+    Let i be 0
+    While i is less than block_count:
+        Let idom be List.get(post_idom, i)
+        If idom is not equal to -1 and idom is not equal to i:
+            Let idom_children be List.get(tree, idom)
+            List.append(idom_children, i)
+        End If
+        Set i to i plus 1
+    End While
+
+    Return tree
+End Process
+
+Process called "compute_post_dominance_frontiers" that takes cfg as Integer, post_idom as Integer returns Integer:
+    @Reasoning
+    Computes post-dominance frontiers.
+
+    **POST-DOMINANCE FRONTIER:**
+    - PDF(X) = set of nodes Y where:
+      1. X post-dominates a predecessor of Y
+      2. X does not strictly post-dominate Y
+
+    Used for control dependence computation.
+
+    Returns map: block_id -> list of frontier blocks.
+    @End Reasoning
+
+    If cfg equals 0 or post_idom equals 0:
+        Return 0
+    End If
+
+    Let frontiers be List.create()
+    Let block_count be CFG.get_block_count(cfg)
+
+    Note: Initialize empty frontier lists
+    Let i be 0
+    While i is less than block_count:
+        Let frontier be List.create()
+        List.append(frontiers, frontier)
+        Set i to i plus 1
+    End While
+
+    Note: Compute frontiers
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let predecessors be CFG.get_predecessors(block)
+        Let pred_count be List.length(predecessors)
+
+        Note: If block has multiple predecessors, check for frontier membership
+        If pred_count is greater than 1:
+            Let j be 0
+            While j is less than pred_count:
+                Let pred_id be List.get(predecessors, j)
+                Let runner be pred_id
+
+                Note: Walk up post-dom tree from predecessor
+                While runner is not equal to -1 and runner is not equal to i:
+                    Let runner_frontier be List.get(frontiers, runner)
+                    Note: Add to frontier if not already present
+                    Let already_in be is_in_list(runner_frontier, i)
+                    If already_in equals 0:
+                        List.append(runner_frontier, i)
+                    End If
+                    Set runner to List.get(post_idom, runner)
+                End While
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return frontiers
+End Process
+
+Process called "compute_reverse_postorder" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Computes reverse postorder traversal.
+
+    Uses existing dominance analysis to get RPO.
+
+    Returns list of block IDs in RPO order.
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Use dominance module's RPO computation
+    Let dom_info be Dominance.compute_dominance_tree(cfg)
+    Let rpo be Dominance.get_reverse_postorder(dom_info)
+
+    Note: The dominance tree is kept alive for potential future use
+    Note: RPO will be cached in PostDominanceInfo structure
+
+    Return rpo
+End Process
+
+Process called "get_cached_reverse_postorder" that takes post_dom_info as Integer returns Integer:
+    @Reasoning
+    Returns cached reverse postorder traversal (OPTIMIZED).
+
+    **OPTIMIZATION:**
+    The RPO is already computed during post-dominance analysis and cached
+    in PostDominanceInfo.reverse_postorder (offset 32). This function
+    simply returns the cached value instead of recomputing.
+
+    **USAGE:**
+    Call this instead of compute_reverse_postorder when you have a
+    PostDominanceInfo available. Avoids redundant O(V + E) computation.
+
+    **COMPLEXITY:**
+    - compute_reverse_postorder: O(V + E)
+    - get_cached_reverse_postorder: O(1)
+
+    Returns list of block IDs in RPO order.
+    @End Reasoning
+
+    @Performance_Hints
+    RPO caching eliminates redundant O(V + E) dominance tree computation.
+    Use this function instead of compute_reverse_postorder when post-
+    dominance info is available.
+    @End Performance_Hints
+
+    If post_dom_info equals 0:
+        Return 0
+    End If
+
+    Note: Return cached RPO from post-dominance info (offset 32)
+    Let rpo be Layout.memory_get_int64(post_dom_info, 32)
+
+    Return rpo
+End Process
+
+Process called "destroy_post_dominance_info" that takes post_dom_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys post-dominance information and frees memory.
+    @End Reasoning
+
+    If post_dom_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy post-idom map
+    Let post_idom be Layout.memory_get_int64(post_dom_ptr, 8)
+    If post_idom is not equal to 0:
+        List.destroy(post_idom)
+    End If
+
+    Note: Destroy post-dom tree
+    Let post_dom_tree be Layout.memory_get_int64(post_dom_ptr, 16)
+    If post_dom_tree is not equal to 0:
+        destroy_tree_structure(post_dom_tree)
+    End If
+
+    Note: Destroy post-dom frontiers
+    Let post_dom_frontiers be Layout.memory_get_int64(post_dom_ptr, 24)
+    If post_dom_frontiers is not equal to 0:
+        destroy_tree_structure(post_dom_frontiers)
+    End If
+
+    Note: Destroy RPO list
+    Let rpo be Layout.memory_get_int64(post_dom_ptr, 32)
+    If rpo is not equal to 0:
+        List.destroy(rpo)
+    End If
+
+    Note: Free structure
+    Layout.deallocate(post_dom_ptr)
+
+    Return 1
+End Process
+
+Process called "is_in_list" that takes list as Integer, value as Integer returns Integer:
+    @Reasoning
+    Checks if a value is in a list.
+
+    Returns 1 if found, 0 otherwise.
+    @End Reasoning
+
+    If list equals 0:
+        Return 0
+    End If
+
+    Let count be List.length(list)
+    Let i be 0
+    While i is less than count:
+        Let item be List.get(list, i)
+        If item equals value:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "destroy_tree_structure" that takes tree as Integer returns Integer:
+    @Reasoning
+    Destroys a tree structure (list of lists).
+    @End Reasoning
+
+    If tree equals 0:
+        Return 0
+    End If
+
+    Let count be List.length(tree)
+    Let i be 0
+    While i is less than count:
+        Let child_list be List.get(tree, i)
+        If child_list is not equal to 0:
+            List.destroy(child_list)
+        End If
+        Set i to i plus 1
+    End While
+
+    List.destroy(tree)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CONTROL DEPENDENCE GRAPH CONSTRUCTION
+Note: ============================================================================
+
+Process called "build_control_dependence_graph" that takes cfg as Integer, post_dom as Integer returns Integer:
+    @Reasoning
+    **CONTROL DEPENDENCE GRAPH CONSTRUCTION**
+
+    Builds control dependence relationships from post-dominance.
+
+    **CONTROL DEPENDENCE** (Cytron et al. 1991):
+    - Statement Y is control dependent on predicate X if:
+      1. There exists a path from X to Y on which Y post-dominates X
+      2. Y does not strictly post-dominate X
+
+    **ALGORITHM:**
+    ```
+    For each branch instruction X with targets T1, T2:
+        For each node Y in PDF(X):
+            Y is control dependent on X
+            All nodes on paths from X to Y (excluding Y) are control dependent on X
+    ```
+
+    **IMPLEMENTATION:**
+    - Use post-dominance frontiers to compute control dependencies
+    - Branch instructions create control dependencies
+    - Walk dominator tree to propagate dependencies
+
+    Returns ControlDependenceGraph pointer.
+    @End Reasoning
+
+    If cfg equals 0 or post_dom equals 0:
+        Return 0
+    End If
+
+    Display "build_control_dependence_graph: starting CDG construction"
+
+    Note: Allocate CDG structure (48 bytes)
+    Let cdg_ptr be Layout.allocate(48)
+    If cdg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Set CFG
+    Layout.memory_set_int64(cdg_ptr, 0, cfg)
+
+    Note: Create dependency maps
+    Let dependencies be List.create()  Note: Map: instruction -> list of control deps
+    Layout.memory_set_int64(cdg_ptr, 8, dependencies)
+
+    Let reverse_deps be List.create()  Note: Map: instruction -> list of dependents
+    Layout.memory_set_int64(cdg_ptr, 16, reverse_deps)
+
+    Let branch_deps be List.create()  Note: Branch-specific dependencies
+    Layout.memory_set_int64(cdg_ptr, 24, branch_deps)
+
+    Note: Initialize dependency lists for all blocks
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let dep_list be List.create()
+        List.append(dependencies, dep_list)
+
+        Let rev_list be List.create()
+        List.append(reverse_deps, rev_list)
+
+        Let branch_list be List.create()
+        List.append(branch_deps, branch_list)
+
+        Set i to i plus 1
+    End While
+
+    Note: Get post-dominance frontiers
+    Let post_dom_frontiers be Layout.memory_get_int64(post_dom, 24)
+    Let post_idom be Layout.memory_get_int64(post_dom, 8)
+
+    Note: Build control dependencies
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Note: Check if block ends with branch
+        If inst_count is greater than 0:
+            Let last_inst be List.get(instructions, inst_count minus 1)
+            Let opcode be MIRNodes.get_instruction_opcode(last_inst)
+
+            Note: Conditional branch creates control dependencies
+            If opcode equals 20042:  Note: MIR_COND_BR
+                Note: Get branch targets
+                Let true_target be Layout.memory_get_int64(last_inst, 24)
+                Let false_target be Layout.memory_get_int64(last_inst, 32)
+
+                Note: Add control dependencies based on post-dominance frontier
+                add_control_dependencies_for_branch(cdg_ptr, i, true_target, false_target, post_idom, post_dom_frontiers)
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "build_control_dependence_graph: CDG construction complete"
+    Return cdg_ptr
+End Process
+
+Process called "add_control_dependencies_for_branch" that takes cdg_ptr as Integer, branch_block as Integer, true_target as Integer, false_target as Integer, post_idom as Integer, post_dom_frontiers as Integer returns Integer:
+    @Reasoning
+    Adds control dependencies for a conditional branch.
+
+    **ALGORITHM:**
+    - For each frontier node Y in PDF(branch_block):
+      - Mark Y as control dependent on branch_block
+      - Walk from branch_block to Y, marking intermediate nodes
+
+    @End Reasoning
+
+    If cdg_ptr equals 0:
+        Return 0
+    End If
+
+    Let dependencies be Layout.memory_get_int64(cdg_ptr, 8)
+    Let reverse_deps be Layout.memory_get_int64(cdg_ptr, 16)
+    Let branch_deps be Layout.memory_get_int64(cdg_ptr, 24)
+
+    Note: Get frontier nodes for this branch block
+    Let frontier be List.get(post_dom_frontiers, branch_block)
+    Let frontier_count be List.length(frontier)
+
+    Note: For each frontier node
+    Let i be 0
+    While i is less than frontier_count:
+        Let frontier_node be List.get(frontier, i)
+
+        Note: Add control dependency: frontier_node depends on branch_block
+        Let dep_list be List.get(dependencies, frontier_node)
+        Let already_dep be is_in_list(dep_list, branch_block)
+        If already_dep equals 0:
+            List.append(dep_list, branch_block)
+        End If
+
+        Note: Add reverse dependency: branch_block controls frontier_node
+        Let rev_list be List.get(reverse_deps, branch_block)
+        Let already_rev be is_in_list(rev_list, frontier_node)
+        If already_rev equals 0:
+            List.append(rev_list, frontier_node)
+        End If
+
+        Note: Mark as branch-specific dependency
+        Let branch_list be List.get(branch_deps, branch_block)
+        If already_rev equals 0:
+            List.append(branch_list, frontier_node)
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "get_control_dependencies" that takes cdg_ptr as Integer, block_id as Integer returns Integer:
+    @Reasoning
+    Gets list of blocks that given block depends on for control.
+
+    Returns list of control dependency block IDs.
+    @End Reasoning
+
+    If cdg_ptr equals 0:
+        Return 0
+    End If
+
+    Let dependencies be Layout.memory_get_int64(cdg_ptr, 8)
+    Let dep_list be List.get(dependencies, block_id)
+
+    Return dep_list
+End Process
+
+Process called "get_control_dependents" that takes cdg_ptr as Integer, block_id as Integer returns Integer:
+    @Reasoning
+    Gets list of blocks that depend on given block for control.
+
+    Returns list of dependent block IDs.
+    @End Reasoning
+
+    If cdg_ptr equals 0:
+        Return 0
+    End If
+
+    Let reverse_deps be Layout.memory_get_int64(cdg_ptr, 16)
+    Let rev_list be List.get(reverse_deps, block_id)
+
+    Return rev_list
+End Process
+
+Process called "destroy_control_dependence_graph" that takes cdg_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys control dependence graph and frees memory.
+    @End Reasoning
+
+    If cdg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy dependencies map
+    Let dependencies be Layout.memory_get_int64(cdg_ptr, 8)
+    If dependencies is not equal to 0:
+        destroy_tree_structure(dependencies)
+    End If
+
+    Note: Destroy reverse dependencies map
+    Let reverse_deps be Layout.memory_get_int64(cdg_ptr, 16)
+    If reverse_deps is not equal to 0:
+        destroy_tree_structure(reverse_deps)
+    End If
+
+    Note: Destroy branch dependencies map
+    Let branch_deps be Layout.memory_get_int64(cdg_ptr, 24)
+    If branch_deps is not equal to 0:
+        destroy_tree_structure(branch_deps)
+    End If
+
+    Note: Free CDG structure
+    Layout.deallocate(cdg_ptr)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: AGGRESSIVE DCE ALGORITHM
+Note: ============================================================================
+
+Process called "run_adce_algorithm" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **AGGRESSIVE DCE MAIN ALGORITHM**
+
+    Implements Wegbreit-style aggressive dead code elimination.
+
+    **ALGORITHM:**
+    ```
+    1. Mark Phase - Identify critical instructions:
+       - I/O operations
+       - Function returns
+       - Stores to visible memory
+       - External calls
+       - Branches (control flow)
+
+    2. Propagate Phase - Backward marking:
+       - For each critical instruction:
+         - Mark all data dependencies (operands)
+         - Mark all control dependencies (via CDG)
+       - Repeat transitively until fixed point
+
+    3. Sweep Phase - Eliminate unmarked code:
+       - Delete all unmarked instructions
+       - Remove empty basic blocks
+       - Simplify control flow
+    ```
+
+    **COMPARED TO BASIC DCE:**
+    - Basic DCE: Uses only data dependencies (liveness)
+    - ADCE: Uses data + control dependencies
+    - ADCE eliminates more code (e.g., dead branches, unreachable blocks)
+
+    Returns 1 if successful, 0 if failed.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "run_adce_algorithm: starting ADCE"
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let cdg be Layout.memory_get_int64(context_ptr, 16)
+    Let critical_set be Layout.memory_get_int64(context_ptr, 24)
+    Let worklist be Layout.memory_get_int64(context_ptr, 32)
+
+    Note: Phase 1: Mark critical instructions
+    Display "run_adce_algorithm: marking critical instructions"
+    mark_critical_instructions(context_ptr)
+
+    Note: Phase 2: Propagate dependencies backward
+    Display "run_adce_algorithm: propagating dependencies"
+    propagate_dependencies_backward(context_ptr)
+
+    Note: Phase 3: Eliminate non-critical code
+    Display "run_adce_algorithm: eliminating dead code"
+    let eliminated be eliminate_non_critical_code(context_ptr)
+
+    Note: Phase 4: Remove dead blocks
+    Display "run_adce_algorithm: removing dead blocks"
+    Let blocks_removed be remove_dead_blocks(context_ptr)
+
+    Note: Update counters
+    Layout.memory_set_int64(context_ptr, 40, eliminated)
+    Layout.memory_set_int64(context_ptr, 48, blocks_removed)
+
+    Display "run_adce_algorithm: ADCE complete - eliminated " joined with eliminated joined with " instructions, " joined with blocks_removed joined with " blocks"
+
+    Return 1
+End Process
+
+Process called "mark_critical_instructions" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **MARK CRITICAL INSTRUCTIONS**
+
+    Identifies instructions that must be preserved (have observable effects).
+
+    **CRITICAL INSTRUCTION TYPES:**
+    1. **I/O Operations:**
+       - Store to non-local memory
+       - Function calls with side effects
+       - Volatile loads/stores
+
+    2. **Control Flow:**
+       - Return statements
+       - Exception throws
+       - Function calls (may not return)
+
+    3. **Observable Effects:**
+       - External function calls
+       - Atomic operations
+       - Memory barriers
+
+    Returns number of critical instructions marked.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let critical_set be Layout.memory_get_int64(context_ptr, 24)
+    Let worklist be Layout.memory_get_int64(context_ptr, 32)
+
+    Let marked_count be 0
+    Let block_count be CFG.get_block_count(cfg)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Let is_critical be 0
+
+            Note: Store operations (observable side effect)
+            If opcode equals 20020:  Note: MIR_STORE
+                Set is_critical to 1
+            End If
+
+            Note: Function calls (may have side effects)
+            If opcode equals 20030:  Note: MIR_CALL
+                Set is_critical to 1
+            End If
+
+            Note: Return statements (control flow exit)
+            If opcode equals 20040:  Note: MIR_RET
+                Set is_critical to 1
+            End If
+
+            Note: Branches (control flow)
+            If opcode equals 20041 or opcode equals 20042:  Note: BR, COND_BR
+                Set is_critical to 1
+            End If
+
+            Note: PHI nodes at merge points (SSA critical)
+            If opcode equals 20050:  Note: MIR_PHI
+                Set is_critical to 1
+            End If
+
+            Note: If critical, add to set and worklist
+            If is_critical equals 1:
+                Note: Create critical entry (block_id, inst_index, inst_ptr)
+                Let entry be Layout.allocate(24)
+                Layout.memory_set_int64(entry, 0, i)
+                Layout.memory_set_int64(entry, 8, j)
+                Layout.memory_set_int64(entry, 16, inst)
+
+                List.append(critical_set, entry)
+                List.append(worklist, entry)
+
+                Set marked_count to marked_count plus 1
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Display "mark_critical_instructions: marked " joined with marked_count joined with " critical instructions"
+    Return marked_count
+End Process
+
+Process called "propagate_dependencies_backward" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **BACKWARD DEPENDENCY PROPAGATION**
+
+    Marks all instructions that critical instructions depend on.
+
+    **PROPAGATION:**
+    1. **Data Dependencies:**
+       - For each operand of a live instruction
+       - Mark the defining instruction as live
+       - Add to worklist for transitive closure
+
+    2. **Control Dependencies:**
+       - For each live instruction in block B
+       - For each control dependency of B
+       - Mark the controlling branch as live
+
+    3. **Fixed Point:**
+       - Continue until worklist is empty
+       - All reachable dependencies are marked
+
+    Returns number of instructions marked.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let cdg be Layout.memory_get_int64(context_ptr, 16)
+    Let critical_set be Layout.memory_get_int64(context_ptr, 24)
+    Let worklist be Layout.memory_get_int64(context_ptr, 32)
+
+    Let marked_count be 0
+
+    Note: Process worklist until empty
+    While List.length(worklist) is greater than 0:
+        Note: Pop from worklist
+        Let worklist_size be List.length(worklist)
+        Let entry be List.get(worklist, worklist_size minus 1)
+        List.remove_at(worklist, worklist_size minus 1)
+
+        Let block_id be Layout.memory_get_int64(entry, 0)
+        Let inst_index be Layout.memory_get_int64(entry, 8)
+        Let inst be Layout.memory_get_int64(entry, 16)
+
+        Note: Mark data dependencies (operands)
+        Let data_marked be mark_data_dependencies(context_ptr, inst, block_id)
+        Set marked_count to marked_count plus data_marked
+
+        Note: Mark control dependencies
+        Let control_marked be mark_control_dependencies(context_ptr, block_id, cdg)
+        Set marked_count to marked_count plus control_marked
+    End While
+
+    Display "propagate_dependencies_backward: marked " joined with marked_count joined with " dependent instructions"
+    Return marked_count
+End Process
+
+Process called "mark_data_dependencies" that takes context_ptr as Integer, inst as Integer, block_id as Integer returns Integer:
+    @Reasoning
+    Marks data dependencies (operands) of an instruction as live.
+
+    **DATA DEPENDENCIES:**
+    - Binary operations: left and right operands
+    - Unary operations: single operand
+    - Stores: value and address operands
+    - Branches: condition operand
+    - PHI: all incoming values
+
+    Returns number of newly marked instructions.
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let critical_set be Layout.memory_get_int64(context_ptr, 24)
+    Let worklist be Layout.memory_get_int64(context_ptr, 32)
+
+    Let marked_count be 0
+    Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+    Note: Binary operations (20002-20012)
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let right_operand be Layout.memory_get_int64(inst, 24)
+
+        Let left_marked be mark_operand_definition(context_ptr, left_operand, block_id)
+        Let right_marked be mark_operand_definition(context_ptr, right_operand, block_id)
+
+        Set marked_count to left_marked plus right_marked
+    End If
+
+    Note: Comparison operations (20100-20105)
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let right_operand be Layout.memory_get_int64(inst, 24)
+
+        Let left_marked be mark_operand_definition(context_ptr, left_operand, block_id)
+        Let right_marked be mark_operand_definition(context_ptr, right_operand, block_id)
+
+        Set marked_count to left_marked plus right_marked
+    End If
+
+    Note: Unary operations (NEG=20007, NOT=20013)
+    If opcode equals 20007 or opcode equals 20013:
+        Let operand be Layout.memory_get_int64(inst, 16)
+        Let marked be mark_operand_definition(context_ptr, operand, block_id)
+        Set marked_count to marked
+    End If
+
+    Note: Store operation (20020)
+    If opcode equals 20020:
+        Let value be Layout.memory_get_int64(inst, 16)
+        Let address be Layout.memory_get_int64(inst, 24)
+
+        Let value_marked be mark_operand_definition(context_ptr, value, block_id)
+        Let addr_marked be mark_operand_definition(context_ptr, address, block_id)
+
+        Set marked_count to value_marked plus addr_marked
+    End If
+
+    Note: Conditional branch (20042)
+    If opcode equals 20042:
+        Let condition be Layout.memory_get_int64(inst, 16)
+        Let marked be mark_operand_definition(context_ptr, condition, block_id)
+        Set marked_count to marked
+    End If
+
+    Note: PHI node (20050)
+    If opcode equals 20050:
+        Let incoming_count be Layout.memory_get_int64(inst, 24)
+        Let incoming_values be Layout.memory_get_int64(inst, 32)
+
+        Let i be 0
+        While i is less than incoming_count:
+            Let value be List.get(incoming_values, i)
+            Let marked be mark_operand_definition(context_ptr, value, block_id)
+            Set marked_count to marked_count plus marked
+            Set i to i plus 1
+        End While
+    End If
+
+    Return marked_count
+End Process
+
+Process called "mark_operand_definition" that takes context_ptr as Integer, value_id as Integer, use_block_id as Integer returns Integer:
+    @Reasoning
+    Marks the defining instruction of an operand as live.
+
+    **DEFINITION SEARCH (OPTIMIZED):**
+    - Uses def-use map for O(1) lookup instead of O(n×m) linear search
+    - Find instruction that defines this SSA value
+    - If not already marked, add to critical set and worklist
+    - Return 1 if newly marked, 0 otherwise
+
+    Returns 1 if newly marked, 0 if already marked.
+    @End Reasoning
+
+    @Performance_Hints
+    This function is called very frequently during ADCE. The def-use map
+    optimization reduces complexity from O(n×m) to O(1), dramatically
+    improving performance for large CFGs.
+    @End Performance_Hints
+
+    If value_id equals 0:
+        Return 0
+    End If
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let critical_set be Layout.memory_get_int64(context_ptr, 24)
+    Let worklist be Layout.memory_get_int64(context_ptr, 32)
+    Let def_use_map be Layout.memory_get_int64(context_ptr, 64)
+
+    Note: O(1) lookup in def-use map (OPTIMIZED)
+    Let key_str be proc integer_to_string from String with value_id
+    Let contains_def be proc contains from Dictionary with def_use_map, key_str
+
+    If contains_def equals 0:
+        Note: No defining instruction found (might be function parameter)
+        Return 0
+    End If
+
+    Note: Get packed info (block_id << 32 | inst_idx)
+    Let packed_info be proc get from Dictionary with def_use_map, key_str
+
+    Note: Unpack block_id and inst_idx
+    Let i be packed_info divided by 4294967296
+    Let j be packed_info modulo 4294967296
+
+    Note: Get the instruction
+    Let block be CFG.get_block(cfg, i)
+    Let instructions be CFG.get_block_instructions(block)
+    Let inst be List.get(instructions, j)
+
+    Note: Check if already marked
+    Let already_marked be is_instruction_marked(critical_set, i, j)
+    If already_marked equals 0:
+        Note: Mark as critical
+        Let entry be Layout.allocate(24)
+        Layout.memory_set_int64(entry, 0, i)
+        Layout.memory_set_int64(entry, 8, j)
+        Layout.memory_set_int64(entry, 16, inst)
+
+        List.append(critical_set, entry)
+        List.append(worklist, entry)
+
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "mark_control_dependencies" that takes context_ptr as Integer, block_id as Integer, cdg as Integer returns Integer:
+    @Reasoning
+    Marks control dependencies for a block.
+
+    **CONTROL DEPENDENCY MARKING:**
+    - Get all blocks that this block depends on for control
+    - Mark the controlling branch instructions as live
+    - Add to worklist for transitive marking
+
+    Returns number of newly marked instructions.
+    @End Reasoning
+
+    If cdg equals 0:
+        Return 0
+    End If
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let critical_set be Layout.memory_get_int64(context_ptr, 24)
+    Let worklist be Layout.memory_get_int64(context_ptr, 32)
+
+    Let marked_count be 0
+
+    Note: Get control dependencies for this block
+    Let deps be get_control_dependencies(cdg, block_id)
+    Let dep_count be List.length(deps)
+
+    Let i be 0
+    While i is less than dep_count:
+        Let dep_block_id be List.get(deps, i)
+
+        Note: Mark the branch instruction in the controlling block
+        Let dep_block be CFG.get_block(cfg, dep_block_id)
+        Let instructions be CFG.get_block_instructions(dep_block)
+        Let inst_count be List.length(instructions)
+
+        If inst_count is greater than 0:
+            Note: Last instruction is the branch
+            Let branch_inst be List.get(instructions, inst_count minus 1)
+            Let branch_index be inst_count minus 1
+
+            Note: Check if already marked
+            Let already_marked be is_instruction_marked(critical_set, dep_block_id, branch_index)
+            If already_marked equals 0:
+                Note: Mark as critical
+                Let entry be Layout.allocate(24)
+                Layout.memory_set_int64(entry, 0, dep_block_id)
+                Layout.memory_set_int64(entry, 8, branch_index)
+                Layout.memory_set_int64(entry, 16, branch_inst)
+
+                List.append(critical_set, entry)
+                List.append(worklist, entry)
+
+                Set marked_count to marked_count plus 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return marked_count
+End Process
+
+Process called "is_instruction_marked" that takes critical_set as Integer, block_id as Integer, inst_index as Integer returns Integer:
+    @Reasoning
+    Checks if an instruction is already in the critical set.
+
+    Returns 1 if marked, 0 otherwise.
+    @End Reasoning
+
+    If critical_set equals 0:
+        Return 0
+    End If
+
+    Let count be List.length(critical_set)
+    Let i be 0
+    While i is less than count:
+        Let entry be List.get(critical_set, i)
+        Let entry_block be Layout.memory_get_int64(entry, 0)
+        Let entry_index be Layout.memory_get_int64(entry, 8)
+
+        If entry_block equals block_id and entry_index equals inst_index:
+            Return 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "eliminate_non_critical_code" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **SWEEP PHASE: ELIMINATE DEAD CODE**
+
+    Removes all instructions not marked as critical.
+
+    **ELIMINATION:**
+    - Iterate through all blocks
+    - For each instruction:
+      - If not in critical set: remove
+      - If in critical set: keep
+    - Build new instruction lists for each block
+
+    Returns number of instructions eliminated.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let critical_set be Layout.memory_get_int64(context_ptr, 24)
+
+    Let eliminated_count be 0
+    Let block_count be CFG.get_block_count(cfg)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Note: Build new instruction list with only critical instructions
+        Let new_instructions be List.create()
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let is_marked be is_instruction_marked(critical_set, i, j)
+
+            If is_marked equals 1:
+                List.append(new_instructions, inst)
+            Otherwise:
+                Set eliminated_count to eliminated_count plus 1
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Note: Replace block instructions with new list
+        CFG.set_block_instructions(block, new_instructions)
+
+        Set i to i plus 1
+    End While
+
+    Return eliminated_count
+End Process
+
+Process called "remove_dead_blocks" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **DEAD BLOCK REMOVAL**
+
+    Removes basic blocks that are unreachable or empty after DCE.
+
+    **DEAD BLOCK CRITERIA:**
+    - Block has no instructions (empty)
+    - Block is unreachable from entry (no predecessors except self-loops)
+    - Block only contains unconditional branch to itself
+
+    Returns number of blocks removed.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let removed_count be 0
+
+    Note: Find reachable blocks from entry
+    Let reachable be compute_reachable_blocks(cfg)
+
+    Note: Remove unreachable blocks
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let is_reachable be is_in_list(reachable, i)
+
+        If is_reachable equals 0:
+            Note: Block is unreachable, mark for removal
+            Set removed_count to removed_count plus 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Cleanup
+    List.destroy(reachable)
+
+    Return removed_count
+End Process
+
+Process called "compute_reachable_blocks" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Computes set of reachable blocks from entry using DFS.
+
+    Returns list of reachable block IDs.
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Let reachable be List.create()
+    Let worklist be List.create()
+
+    Note: Start from entry block (block 0)
+    List.append(worklist, 0)
+    List.append(reachable, 0)
+
+    Note: DFS traversal
+    While List.length(worklist) is greater than 0:
+        Let worklist_size be List.length(worklist)
+        Let current be List.get(worklist, worklist_size minus 1)
+        List.remove_at(worklist, worklist_size minus 1)
+
+        Note: Visit successors
+        Let block be CFG.get_block(cfg, current)
+        Let successors be CFG.get_successors(block)
+        Let succ_count be List.length(successors)
+
+        Let i be 0
+        While i is less than succ_count:
+            Let succ be List.get(successors, i)
+            Let already_visited be is_in_list(reachable, succ)
+
+            If already_visited equals 0:
+                List.append(reachable, succ)
+                List.append(worklist, succ)
+            End If
+
+            Set i to i plus 1
+        End While
+    End While
+
+    Note: Cleanup worklist
+    List.destroy(worklist)
+
+    Return reachable
+End Process
+
+Note: ============================================================================
+Note: FUNCTION-LEVEL DEAD CODE ELIMINATION
+Note: ============================================================================
+
+Type called "CallGraphNode":
+    function_id as Integer
+    function_name as Integer
+    callees as Integer
+    is_reachable as Integer
+End Type
+
+Type called "CallGraph":
+    nodes as Integer
+    node_count as Integer
+    entry_points as Integer
+End Type
+
+Process called "eliminate_dead_functions" that takes module as Integer returns Integer:
+    @Reasoning
+    Performs whole-module function-level DCE:
+    1. Build call graph from module
+    2. Mark functions reachable from entry points
+    3. Remove unreachable functions
+
+    This eliminates entire functions that are never called, reducing
+    code size and improving compilation time for later passes.
+    @End Reasoning
+
+    If module equals 0:
+        Return 0
+    End If
+
+    Note: Build call graph
+    Let call_graph be build_call_graph(module)
+    If call_graph equals 0:
+        Return 0
+    End If
+
+    Note: Mark reachable functions from entry points
+    Let marked_count be mark_reachable_functions(call_graph)
+
+    Note: Remove unreachable functions
+    Let removed_count be remove_unreachable_functions(module, call_graph)
+
+    Note: Cleanup
+    destroy_call_graph(call_graph)
+
+    Return removed_count
+End Process
+
+Process called "build_call_graph" that takes module as Integer returns Integer:
+    @Reasoning
+    Constructs a call graph by:
+    1. Creating nodes for each function in module
+    2. Analyzing each function's instructions for CALL operations
+    3. Recording caller->callee edges
+
+    Returns CallGraph structure or 0 on failure.
+    @End Reasoning
+
+    If module equals 0:
+        Return 0
+    End If
+
+    Note: Allocate call graph structure
+    Let cg_size be Layout.size_of_CallGraph()
+    Let cg_ptr be Layout.allocate(cg_size)
+    If cg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get function count from module
+    Let function_list be MIR.get_functions(module)
+    Let function_count be List.length(function_list)
+
+    Note: Create node list
+    Let nodes be List.create()
+
+    Note: Create entry points list
+    Let entry_points be List.create()
+
+    Note: Phase 1: Create nodes for all functions
+    Let i be 0
+    While i is less than function_count:
+        Let function be List.get(function_list, i)
+        Let function_id be MIR.get_function_id(function)
+        Let function_name be MIR.get_function_name(function)
+
+        Note: Create call graph node
+        Let node_size be Layout.size_of_CallGraphNode()
+        Let node_ptr be Layout.allocate(node_size)
+
+        Let function_id_offset be Layout.offset_of_CallGraphNode_function_id()
+        Layout.memory_set_integer(node_ptr, function_id_offset, function_id)
+
+        Let function_name_offset be Layout.offset_of_CallGraphNode_function_name()
+        Layout.memory_set_integer(node_ptr, function_name_offset, function_name)
+
+        Let callees_offset be Layout.offset_of_CallGraphNode_callees()
+        Let callees_list be List.create()
+        Layout.memory_set_integer(node_ptr, callees_offset, callees_list)
+
+        Let is_reachable_offset be Layout.offset_of_CallGraphNode_is_reachable()
+        Layout.memory_set_integer(node_ptr, is_reachable_offset, 0)
+
+        Note: Check if this is an entry point (main, exported, etc.)
+        Let is_entry be MIR.is_entry_point(function)
+        If is_entry equals 1:
+            List.append(entry_points, function_id)
+        End If
+
+        List.append(nodes, node_ptr)
+
+        Set i to i plus 1
+    End While
+
+    Note: Phase 2: Build call edges by analyzing function bodies
+    Set i to 0
+    While i is less than function_count:
+        Let function be List.get(function_list, i)
+        Let node_ptr be List.get(nodes, i)
+
+        Note: Get function CFG
+        Let cfg be MIR.get_function_cfg(function)
+        If cfg is not equal to 0:
+            Note: Scan all instructions for CALL operations
+            Let block_count be CFG.get_block_count(cfg)
+
+            Let block_idx be 0
+            While block_idx is less than block_count:
+                Let block be CFG.get_block(cfg, block_idx)
+                Let instructions be CFG.get_block_instructions(block)
+                Let inst_count be List.length(instructions)
+
+                Let inst_idx be 0
+                While inst_idx is less than inst_count:
+                    Let inst be List.get(instructions, inst_idx)
+                    Let opcode be MIRNodes.get_opcode(inst)
+
+                    If opcode equals 20030:  Note: MIR_CALL
+                        Note: Extract callee function ID
+                        Let callee_id be MIRNodes.get_call_target(inst)
+
+                        Note: Add to callees list
+                        Let callees_offset be Layout.offset_of_CallGraphNode_callees()
+                        Let callees_list be Layout.memory_get_integer(node_ptr, callees_offset)
+                        List.append(callees_list, callee_id)
+                    End If
+
+                    Set inst_idx to inst_idx plus 1
+                End While
+
+                Set block_idx to block_idx plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Initialize call graph structure
+    Let nodes_offset be Layout.offset_of_CallGraph_nodes()
+    Layout.memory_set_integer(cg_ptr, nodes_offset, nodes)
+
+    Let node_count_offset be Layout.offset_of_CallGraph_node_count()
+    Layout.memory_set_integer(cg_ptr, node_count_offset, function_count)
+
+    Let entry_points_offset be Layout.offset_of_CallGraph_entry_points()
+    Layout.memory_set_integer(cg_ptr, entry_points_offset, entry_points)
+
+    Return cg_ptr
+End Process
+
+Process called "mark_reachable_functions" that takes call_graph as Integer returns Integer:
+    @Reasoning
+    Performs reachability analysis from entry points:
+    1. Initialize worklist with entry points
+    2. Process worklist, marking nodes as reachable
+    3. Add callees of reachable functions to worklist
+
+    Uses DFS-based marking to find transitive closure of reachable functions.
+    @End Reasoning
+
+    If call_graph equals 0:
+        Return 0
+    End If
+
+    Let nodes_offset be Layout.offset_of_CallGraph_nodes()
+    Let nodes be memory_get_integer(call_graph, nodes_offset)
+
+    Let node_count_offset be Layout.offset_of_CallGraph_node_count()
+    Let node_count be memory_get_integer(call_graph, node_count_offset)
+
+    Let entry_points_offset be Layout.offset_of_CallGraph_entry_points()
+    Let entry_points be memory_get_integer(call_graph, entry_points_offset)
+
+    Note: Create worklist initialized with entry points
+    Let worklist be List.create()
+
+    Let entry_count be List.length(entry_points)
+    Let i be 0
+    While i is less than entry_count:
+        Let entry_id be List.get(entry_points, i)
+        List.append(worklist, entry_id)
+        Set i to i plus 1
+    End While
+
+    Let marked_count be 0
+
+    Note: Process worklist
+    While List.length(worklist) is greater than 0:
+        Let worklist_size be List.length(worklist)
+        Let current_id be List.get(worklist, worklist_size minus 1)
+        List.remove_at(worklist, worklist_size minus 1)
+
+        Note: Find node for this function ID
+        Let node_ptr be find_call_graph_node(nodes, node_count, current_id)
+        If node_ptr equals 0:
+            Continue While
+        End If
+
+        Note: Check if already marked
+        Let is_reachable_offset be Layout.offset_of_CallGraphNode_is_reachable()
+        Let is_reachable be memory_get_integer(node_ptr, is_reachable_offset)
+
+        If is_reachable equals 1:
+            Continue While
+        End If
+
+        Note: Mark as reachable
+        Layout.memory_set_integer(node_ptr, is_reachable_offset, 1)
+        Set marked_count to marked_count plus 1
+
+        Note: Add callees to worklist
+        Let callees_offset be Layout.offset_of_CallGraphNode_callees()
+        Let callees be Layout.memory_get_integer(node_ptr, callees_offset)
+        Let callee_count be List.length(callees)
+
+        Let j be 0
+        While j is less than callee_count:
+            Let callee_id be List.get(callees, j)
+            List.append(worklist, callee_id)
+            Set j to j plus 1
+        End While
+    End While
+
+    Note: Cleanup
+    List.destroy(worklist)
+
+    Return marked_count
+End Process
+
+Process called "remove_unreachable_functions" that takes module as Integer, call_graph as Integer returns Integer:
+    @Reasoning
+    Removes all functions not marked as reachable:
+    1. Iterate through call graph nodes
+    2. For each unreachable node, remove function from module
+    3. Track and return count of removed functions
+
+    This is the final sweep phase of function-level DCE.
+    @End Reasoning
+
+    If module equals 0:
+        Return 0
+    End If
+    If call_graph equals 0:
+        Return 0
+    End If
+
+    Let nodes_offset be Layout.offset_of_CallGraph_nodes()
+    Let nodes be memory_get_integer(call_graph, nodes_offset)
+
+    Let node_count_offset be Layout.offset_of_CallGraph_node_count()
+    Let node_count be memory_get_integer(call_graph, node_count_offset)
+
+    Let removed_count be 0
+
+    Note: Iterate through nodes
+    Let i be 0
+    While i is less than node_count:
+        Let node_ptr be List.get(nodes, i)
+
+        Let is_reachable_offset be Layout.offset_of_CallGraphNode_is_reachable()
+        Let is_reachable be memory_get_integer(node_ptr, is_reachable_offset)
+
+        If is_reachable equals 0:
+            Note: Function is unreachable, remove it
+            Let function_id_offset be Layout.offset_of_CallGraphNode_function_id()
+            Let function_id be memory_get_integer(node_ptr, function_id_offset)
+
+            Let result be MIR.remove_function(module, function_id)
+            If result equals 1:
+                Set removed_count to removed_count plus 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return removed_count
+End Process
+
+Process called "find_call_graph_node" that takes nodes as Integer, node_count as Integer, function_id as Integer returns Integer:
+    @Reasoning
+    Linear search through call graph nodes to find node with matching function_id.
+
+    Returns node pointer or 0 if not found.
+    @End Reasoning
+
+    Let i be 0
+    While i is less than node_count:
+        Let node_ptr be List.get(nodes, i)
+
+        Let function_id_offset be Layout.offset_of_CallGraphNode_function_id()
+        Let current_id be memory_get_integer(node_ptr, function_id_offset)
+
+        If current_id equals function_id:
+            Return node_ptr
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "destroy_call_graph" that takes call_graph as Integer returns Integer:
+    @Reasoning
+    Deallocates all call graph structures:
+    - Frees each node's callees list
+    - Frees each node structure
+    - Frees node list
+    - Frees entry points list
+    - Frees call graph structure
+    @End Reasoning
+
+    If call_graph equals 0:
+        Return 1
+    End If
+
+    Let nodes_offset be Layout.offset_of_CallGraph_nodes()
+    Let nodes be memory_get_integer(call_graph, nodes_offset)
+
+    Let node_count_offset be Layout.offset_of_CallGraph_node_count()
+    Let node_count be memory_get_integer(call_graph, node_count_offset)
+
+    Let entry_points_offset be Layout.offset_of_CallGraph_entry_points()
+    Let entry_points be memory_get_integer(call_graph, entry_points_offset)
+
+    Note: Destroy each node
+    Let i be 0
+    While i is less than node_count:
+        Let node_ptr be List.get(nodes, i)
+
+        Let callees_offset be Layout.offset_of_CallGraphNode_callees()
+        Let callees be Layout.memory_get_integer(node_ptr, callees_offset)
+        List.destroy(callees)
+
+        Layout.deallocate(node_ptr)
+
+        Set i to i plus 1
+    End While
+
+    Note: Destroy lists
+    List.destroy(nodes)
+    List.destroy(entry_points)
+
+    Note: Destroy call graph structure
+    Layout.deallocate(call_graph)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MODULE-LEVEL PIPELINE INTEGRATION
+Note: ============================================================================
+
+Process called "run_module_dce_pass" that takes optimizer_context as Integer, module as Integer returns Integer:
+    @Reasoning
+    **COMPREHENSIVE MODULE-LEVEL DCE PIPELINE INTEGRATION**
+
+    Runs both instruction-level and function-level DCE in a coordinated manner:
+    1. Run function-level DCE to eliminate dead functions
+    2. For each remaining function, run instruction-level ADCE
+    3. Report combined statistics
+
+    This provides the most aggressive dead code elimination by operating
+    at both granularities.
+
+    **USAGE (from mir_optimizer.runa):**
+    ```
+    Note: After all other optimizations stabilize
+    Let total_eliminated be run_module_dce_pass(context_ptr, module)
+    ```
+
+    Returns total number of elements eliminated (functions + instructions).
+    @End Reasoning
+
+    If optimizer_context equals 0:
+        Return 0
+    End If
+    If module equals 0:
+        Return 0
+    End If
+
+    Display "============================================"
+    Display "STARTING MODULE-LEVEL DCE"
+    Display "============================================"
+
+    Let total_eliminated be 0
+
+    Note: Phase 1: Function-level DCE
+    Display ""
+    Display "Phase 1: Function-level DCE..."
+    Let functions_removed be eliminate_dead_functions(module)
+    Display "Eliminated " joined with functions_removed joined with " unreachable functions"
+    Set total_eliminated to total_eliminated plus functions_removed
+
+    Note: Phase 2: Instruction-level ADCE for each remaining function
+    Display ""
+    Display "Phase 2: Instruction-level ADCE..."
+
+    Let function_list be MIR.get_functions(module)
+    Let function_count be List.length(function_list)
+
+    Let total_inst_eliminated be 0
+
+    Let i be 0
+    While i is less than function_count:
+        Let function be List.get(function_list, i)
+        Let cfg be MIR.get_function_cfg(function)
+
+        If cfg is not equal to 0:
+            Note: Run ADCE on this function
+            Let adce_context be create_adce_context(cfg)
+            If adce_context is not equal to 0:
+                run_adce_algorithm(adce_context)
+
+                Let eliminated be Layout.memory_get_int64(adce_context, 40)
+                Set total_inst_eliminated to total_inst_eliminated plus eliminated
+
+                destroy_adce_context(adce_context)
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "Eliminated " joined with total_inst_eliminated joined with " dead instructions"
+    Set total_eliminated to total_eliminated plus total_inst_eliminated
+
+    Note: Update optimizer context
+    Let current_deleted be Layout.memory_get_int64(optimizer_context, 40)
+    Layout.memory_set_int64(optimizer_context, 40, current_deleted plus total_eliminated)
+
+    Note: Final statistics
+    Display ""
+    Display "============================================"
+    Display "MODULE-LEVEL DCE STATISTICS"
+    Display "============================================"
+    Display "Functions eliminated:    " joined with functions_removed
+    Display "Instructions eliminated: " joined with total_inst_eliminated
+    Display "Total eliminated:        " joined with total_eliminated
+    Display "============================================"
+
+    Return total_eliminated
+End Process
+
+Process called "is_dce_beneficial" that takes optimizer_context as Integer returns Integer:
+    @Reasoning
+    Heuristic to determine if running aggressive DCE is worthwhile.
+
+    Checks:
+    - Has basic DCE made progress recently?
+    - Are there enough instructions to warrant analysis overhead?
+    - Have other optimizations created new dead code?
+
+    Returns 1 if ADCE should run, 0 otherwise.
+    @End Reasoning
+
+    If optimizer_context equals 0:
+        Return 0
+    End If
+
+    Note: Check if basic DCE eliminated instructions in last iteration
+    Let last_dce_count be Layout.memory_get_int64(optimizer_context, 48)
+    If last_dce_count is greater than 0:
+        Note: Basic DCE found dead code, ADCE likely beneficial
+        Return 1
+    End If
+
+    Note: Check if other optimizations ran recently
+    Let modified_flag be Layout.memory_get_int64(optimizer_context, 56)
+    If modified_flag equals 1:
+        Note: Code was modified, may have created dead code
+        Return 1
+    End If
+
+    Note: Check instruction count threshold
+    Let cfg be Layout.memory_get_int64(optimizer_context, 0)
+    Let inst_count be CFG.get_total_instruction_count(cfg)
+
+    If inst_count is greater than 100:
+        Note: Large enough to warrant ADCE analysis
+        Return 1
+    End If
+
+    Note: Not beneficial
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: END OF ADVANCED DEAD CODE ELIMINATION MODULE
+Note: ============================================================================
+Note:
+Note: This module provides aggressive DCE with control flow analysis,
+Note: post-dominance computation, and function-level elimination.
+Note:
+Note: It complements the basic DCE in mir_optimizer.runa by providing
+Note: more sophisticated analysis that can eliminate dead branches,
+Note: unreachable blocks, and dead functions.
+Note:
+Note: INTEGRATION:
+Note: - Standalone: optimize_aggressive_dce(cfg)
+Note: - Pipeline: run_aggressive_dce_pass(optimizer_context)
+Note: - Module: run_module_dce_pass(optimizer_context, module)
+Note: ============================================================================

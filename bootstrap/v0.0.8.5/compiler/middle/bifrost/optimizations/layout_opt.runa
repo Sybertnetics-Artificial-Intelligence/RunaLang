@@ -1,0 +1,1168 @@
+Note: ================================================================
+Note: Bifrost Data Layout Optimization
+Note: ================================================================
+Note: Optimizes data layout for GPU memory coalescing and cache locality.
+Note: Typical speedup: 10-30% from improved memory access patterns.
+Note: Techniques: AoS↔SoA, row/column major, tiling, padding, transpose.
+Note: ================================================================
+
+Import "../graph/graph.runa" as Graph
+Import "../graph/node.runa" as Node
+Import "../graph/edge.runa" as Edge
+Import "../analysis/memory_access.runa" as MemoryAccess
+Import "std/collections/list.runa" as List
+Import "std/collections/dict.runa" as Dict
+Import "std/core/string.runa" as String
+Import "std/core/math.runa" as Math
+
+Note: ================================================================
+Note: Layout Type Constants
+Note: ================================================================
+
+Constant LAYOUT_ROW_MAJOR as Integer is 0        Note: C-style: [row][col]
+Constant LAYOUT_COLUMN_MAJOR as Integer is 1     Note: Fortran-style: [col][row]
+Constant LAYOUT_AOS as Integer is 2              Note: Array of Structures
+Constant LAYOUT_SOA as Integer is 3              Note: Structure of Arrays
+Constant LAYOUT_TILED as Integer is 4            Note: Blocked for cache
+Constant LAYOUT_PADDED as Integer is 5           Note: Padding added for alignment
+
+Note: ================================================================
+Note: Transformation Type Constants
+Note: ================================================================
+
+Constant TRANSFORM_NONE as Integer is 0
+Constant TRANSFORM_TRANSPOSE as Integer is 1      Note: Swap dimensions
+Constant TRANSFORM_AOS_TO_SOA as Integer is 2     Note: Convert AoS → SoA
+Constant TRANSFORM_SOA_TO_AOS as Integer is 3     Note: Convert SoA → AoS
+Constant TRANSFORM_TILE as Integer is 4           Note: Apply tiling
+Constant TRANSFORM_PAD as Integer is 5            Note: Add padding
+
+Note: ================================================================
+Note: Type Definitions
+Note: ================================================================
+
+Type DataLayout is:
+    layout_type as Integer          Note: LAYOUT_* constant
+    dimensions as Integer           Note: List of dimension sizes
+    strides as Integer              Note: List of strides (bytes between elements)
+    tile_sizes as Integer           Note: List of tile sizes (if tiled)
+    padding as Integer              Note: Padding bytes per dimension
+    is_coalesced as Boolean         Note: Whether layout enables coalescing
+End Type
+
+Type LayoutTransformation is:
+    transform_type as Integer       Note: TRANSFORM_* constant
+    target_node as Integer          Note: Node whose layout to transform
+    source_layout as Integer        Note: Original DataLayout
+    target_layout as Integer        Note: Optimized DataLayout
+    estimated_benefit as Float      Note: Expected speedup
+    transformation_cost as Float    Note: Cost of layout conversion
+End Type
+
+Type TilingConfig is:
+    tile_dimensions as Integer      Note: Which dimensions to tile
+    tile_sizes as Integer           Note: Size of each tile
+    cache_level as Integer          Note: L1=1, L2=2, L3=3
+End Type
+
+Note: ================================================================
+Note: Layout Analysis
+Note: ================================================================
+
+Process called "analyze_current_layout" that takes graph as Integer, node as Integer returns Integer:
+    @Reasoning
+    Analyzes current data layout for a node.
+
+    Layout detection:
+    - Matrix: row-major or column-major
+    - Struct arrays: AoS or SoA
+    - Dimensions and strides
+    - Padding and alignment
+
+    Sources:
+    - Type information (Matrix, Tensor)
+    - Access patterns from memory analysis
+    - Metadata annotations
+    @End Reasoning
+
+    @Implementation
+    1. Get node output type
+    2. Extract dimensions from type
+    3. Compute default strides for layout
+    4. Check for existing layout metadata
+    5. Detect layout type from access patterns
+    6. Return DataLayout structure
+    @End Implementation
+
+    Let layout be a value of type DataLayout with
+        layout_type as LAYOUT_ROW_MAJOR,
+        dimensions as 0,
+        strides as 0,
+        tile_sizes as 0,
+        padding as 0,
+        is_coalesced as false
+
+    Note: Get output type
+    Let output_type be Node.get_node_output_type(node)
+    If output_type equals 0:
+        Return layout
+    End If
+
+    Let discriminant be Layout.memory_get_int64(output_type, 0)
+
+    Note: Matrix type
+    If discriminant equals 3:
+        Let rows be Layout.memory_get_int64(output_type, 16)
+        Let cols be Layout.memory_get_int64(output_type, 24)
+
+        Note: Create dimensions list
+        Let dimensions be List.create()
+        List.append(dimensions, rows)
+        List.append(dimensions, cols)
+        Set layout.dimensions to dimensions
+
+        Note: Compute row-major strides
+        Let element_type be Layout.memory_get_int64(output_type, 8)
+        Let element_size be get_primitive_size(element_type)
+
+        Let strides be List.create()
+        List.append(strides, cols * element_size)    Note: Row stride
+        List.append(strides, element_size)           Note: Column stride
+        Set layout.strides to strides
+
+        Note: Detect actual layout from metadata
+        Let metadata be Node.get_node_metadata(node)
+        If metadata is not equal to 0:
+            Let layout_hint be Dict.get(metadata, "layout")
+            If layout_hint equals "column_major":
+                Set layout.layout_type to LAYOUT_COLUMN_MAJOR
+
+                Note: Update strides for column-major
+                let col_major_strides be List.create()
+                List.append(col_major_strides, element_size)      Note: Row stride
+                List.append(col_major_strides, rows * element_size) Note: Column stride
+                Set layout.strides to col_major_strides
+            End If
+        End If
+
+        Return layout
+    End If
+
+    Note: Tensor type
+    If discriminant equals 5:
+        Let shape_ptr be Layout.memory_get_int64(output_type, 16)
+        If shape_ptr is not equal to 0:
+            Set layout.dimensions to shape_ptr
+
+            Note: Compute strides for row-major tensor
+            Let element_type be Layout.memory_get_int64(output_type, 8)
+            Let element_size be get_primitive_size(element_type)
+
+            Let strides be compute_row_major_strides(shape_ptr, element_size)
+            Set layout.strides to strides
+        End If
+
+        Return layout
+    End If
+
+    Return layout
+End Process
+
+Process called "detect_optimal_layout" that takes graph as Integer, node as Integer, current_layout as Integer returns Integer:
+    @Reasoning
+    Determines optimal data layout for memory coalescing.
+
+    Optimization goals:
+    1. Innermost dimension contiguous (stride=element_size)
+    2. Access pattern matches layout
+    3. Alignment to cache lines
+    4. Bank conflict avoidance
+
+    Strategy:
+    - Analyze access pattern (from memory_access.runa)
+    - If column-wise access, use column-major
+    - If row-wise access, use row-major
+    - Consider tiling for large arrays
+    - Add padding to eliminate conflicts
+    @End Reasoning
+
+    @Implementation
+    1. Analyze access pattern for node
+    2. Determine dominant access direction
+    3. Select layout that makes dominant access contiguous
+    4. Consider tiling based on cache size
+    5. Compute padding for alignment
+    6. Return optimized DataLayout
+    @End Implementation
+
+    Note: Analyze access pattern
+    Let access_pattern be MemoryAccess.analyze_access_pattern(graph, node)
+    Let pattern_type be Layout.memory_get_int64(access_pattern, 0)
+    Let stride be Layout.memory_get_int64(access_pattern, 8)
+
+    Note: Clone current layout
+    Let optimal_layout be clone_layout(current_layout)
+
+    Note: If access is already contiguous, keep current layout
+    If pattern_type equals 1:
+        Note: ACCESS_CONTIGUOUS
+        Set optimal_layout.is_coalesced to true
+        Return optimal_layout
+    End If
+
+    Note: If strided access, consider transpose
+    If pattern_type equals 2:
+        Note: ACCESS_STRIDED
+        Note: Get current layout type
+        Let current_type be Layout.memory_get_int64(current_layout, 0)
+
+        Note: Transpose layout to make access contiguous
+        If current_type equals LAYOUT_ROW_MAJOR:
+            Set optimal_layout.layout_type to LAYOUT_COLUMN_MAJOR
+            Note: Update strides
+            let dimensions be Layout.memory_get_int64(current_layout, 8)
+            Let element_size be stride
+            Let new_strides be compute_column_major_strides(dimensions, element_size)
+            Set optimal_layout.strides to new_strides
+            Set optimal_layout.is_coalesced to true
+        End If
+
+        If current_type equals LAYOUT_COLUMN_MAJOR:
+            Set optimal_layout.layout_type to LAYOUT_ROW_MAJOR
+            Let dimensions be Layout.memory_get_int64(current_layout, 8)
+            Let element_size be stride
+            Let new_strides be compute_row_major_strides(dimensions, element_size)
+            Set optimal_layout.strides to new_strides
+            Set optimal_layout.is_coalesced to true
+        End If
+
+        Return optimal_layout
+    End If
+
+    Note: For other patterns, analyze tiling opportunities
+    Let should_tile be should_apply_tiling(graph, node, current_layout)
+    If should_tile equals true:
+        let tiling_config be compute_optimal_tiling(graph, node, current_layout)
+        Set optimal_layout.layout_type to LAYOUT_TILED
+        Set optimal_layout.tile_sizes to Layout.memory_get_int64(tiling_config, 8)
+    End If
+
+    Note: Check if padding would help
+    Let should_pad be should_apply_padding(graph, node, optimal_layout)
+    If should_pad equals true:
+        Let padding_amount be compute_optimal_padding(optimal_layout)
+        Set optimal_layout.padding to padding_amount
+        Set optimal_layout.layout_type to LAYOUT_PADDED
+    End If
+
+    Return optimal_layout
+End Process
+
+Note: ================================================================
+Note: Layout Transformations
+Note: ================================================================
+
+Process called "generate_layout_transformations" that takes graph as Integer returns Integer:
+    @Reasoning
+    Generates layout transformation opportunities for all nodes.
+
+    Algorithm:
+    - For each node with array/matrix data
+    - Analyze current layout
+    - Detect optimal layout
+    - If different, create transformation
+    - Estimate benefit vs cost
+    @End Reasoning
+
+    @Implementation
+    1. Get all nodes from graph
+    2. Filter to array/matrix nodes
+    3. For each node:
+       - Analyze current layout
+       - Detect optimal layout
+       - If different, create transformation
+       - Estimate benefit and cost
+    4. Return list of LayoutTransformation structures
+    @End Implementation
+
+    Let transformations be List.create()
+
+    Note: Get all nodes
+    Let all_nodes be Graph.get_all_nodes(graph)
+    Let node_count be List.length(all_nodes)
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(all_nodes, i)
+
+        Note: Check if node has array/matrix data
+        Let has_layout be node_has_layout(node)
+
+        If has_layout equals true:
+            Note: Analyze current layout
+            Let current_layout be analyze_current_layout(graph, node)
+
+            Note: Detect optimal layout
+            Let optimal_layout be detect_optimal_layout(graph, node, current_layout)
+
+            Note: Check if transformation is needed
+            Let needs_transform be layouts_differ(current_layout, optimal_layout)
+
+            If needs_transform equals true:
+                Note: Determine transformation type
+                Let transform_type be determine_transform_type(current_layout, optimal_layout)
+
+                Note: Estimate benefit and cost
+                Let benefit be estimate_layout_benefit(graph, node, current_layout, optimal_layout)
+                Let cost be estimate_transformation_cost(current_layout, optimal_layout)
+
+                Note: Create transformation
+                Let transformation be a value of type LayoutTransformation with
+                    transform_type as transform_type,
+                    target_node as node,
+                    source_layout as current_layout,
+                    target_layout as optimal_layout,
+                    estimated_benefit as benefit,
+                    transformation_cost as cost
+
+                List.append(transformations, transformation)
+            End If
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return transformations
+End Process
+
+Process called "apply_layout_transformation" that takes graph as Integer, transformation as Integer returns Nothing:
+    @Reasoning
+    Applies layout transformation to graph.
+
+    Transformation process:
+    1. Insert layout conversion node
+    2. Update node metadata with new layout
+    3. Adjust strides in memory operations
+    4. Add transpose/tiling operations as needed
+
+    Graph modification:
+    - Add conversion nodes between incompatible layouts
+    - Update edges to preserve semantics
+    - Annotate nodes with layout information
+    @End Reasoning
+
+    @Implementation
+    1. Extract transformation info
+    2. Get target node
+    3. Create layout conversion operation
+    4. Insert into graph
+    5. Update metadata
+    6. Validate graph
+    @End Implementation
+
+    Let transform_type be Layout.memory_get_int64(transformation, 0)
+    Let target_node be Layout.memory_get_int64(transformation, 8)
+    Let target_layout be Layout.memory_get_int64(transformation, 24)
+
+    Note: Create layout conversion operation
+    If transform_type equals TRANSFORM_TRANSPOSE:
+        Note: Insert transpose operation
+        insert_transpose_op(graph, target_node, target_layout)
+    End If
+
+    If transform_type equals TRANSFORM_TILE:
+        Note: Insert tiling operations
+        insert_tiling_ops(graph, target_node, target_layout)
+    End If
+
+    If transform_type equals TRANSFORM_PAD:
+        Note: Add padding to layout
+        apply_padding(graph, target_node, target_layout)
+    End If
+
+    If transform_type equals TRANSFORM_AOS_TO_SOA:
+        Note: Convert AoS to SoA
+        convert_aos_to_soa(graph, target_node)
+    End If
+
+    Note: Update node metadata with new layout
+    update_layout_metadata(target_node, target_layout)
+
+    Note: Validate graph
+    Graph.validate_graph(graph)
+End Process
+
+Note: ================================================================
+Note: Tiling Optimization
+Note: ================================================================
+
+Process called "compute_optimal_tiling" that takes graph as Integer, node as Integer, layout as Integer returns Integer:
+    @Reasoning
+    Computes optimal tile sizes for cache locality.
+
+    Tiling goals:
+    - Fit working set in cache
+    - Maximize reuse
+    - Balance load across dimensions
+
+    Algorithm:
+    - Estimate cache size for each level
+    - Compute data access working set
+    - Find tile size that fits in target cache
+    - Balance tiles to minimize edge effects
+    @End Reasoning
+
+    @Implementation
+    1. Get cache sizes (L1: 32KB, L2: 256KB, L3: 8MB)
+    2. Get data dimensions
+    3. Compute tile size for L1 cache
+    4. Adjust for power-of-2 and divisibility
+    5. Create TilingConfig
+    6. Return tiling configuration
+    @End Implementation
+
+    Let tiling_config be a value of type TilingConfig with
+        tile_dimensions as 0,
+        tile_sizes as 0,
+        cache_level as 1
+
+    Note: Get dimensions
+    Let dimensions be Layout.memory_get_int64(layout, 8)
+    If dimensions equals 0:
+        Return tiling_config
+    End If
+
+    Let dim_count be List.length(dimensions)
+
+    Note: Target L1 cache (32KB)
+    Let l1_cache_size be 32768
+
+    Note: Get element size
+    Let strides be Layout.memory_get_int64(layout, 16)
+    Let element_size be List.get(strides, dim_count - 1)
+
+    Note: Compute tile sizes
+    Let tile_sizes be List.create()
+
+    Note: For 2D (matrix), use square tiles
+    If dim_count equals 2:
+        Let rows be List.get(dimensions, 0)
+        Let cols be List.get(dimensions, 1)
+
+        Note: Compute square tile that fits in L1
+        Note: tile_size^2 * element_size <= L1_size
+        Let max_tile_elements be l1_cache_size / element_size
+        Let max_tile_size be Math.sqrt(Math.int_to_float(max_tile_elements))
+
+        Note: Round down to power of 2 (16, 32, 64, etc.)
+        Let tile_size be round_down_to_power_of_2(Math.float_to_int(max_tile_size))
+
+        Note: Cap at reasonable maximum (128)
+        If tile_size is greater than 128:
+            Let tile_size be 128
+        End If
+
+        Note: Ensure tiles fit dimensions
+        If tile_size is greater than rows:
+            Let tile_size be rows
+        End If
+        If tile_size is greater than cols:
+            Let tile_size be cols
+        End If
+
+        List.append(tile_sizes, tile_size)
+        List.append(tile_sizes, tile_size)
+    End If
+
+    Note: For higher dimensions, use heuristics
+    If dim_count is greater than 2:
+        Note: Use smaller tiles for higher dimensions
+        Let base_tile_size be 32
+
+        Let i be 0
+        While i is less than dim_count:
+            List.append(tile_sizes, base_tile_size)
+            Let i be i + 1
+        End While
+    End If
+
+    Set tiling_config.tile_sizes to tile_sizes
+    Set tiling_config.tile_dimensions to dimensions
+
+    Return tiling_config
+End Process
+
+Process called "should_apply_tiling" that takes graph as Integer, node as Integer, layout as Integer returns Boolean:
+    @Reasoning
+    Determines if tiling would be beneficial.
+
+    Tiling benefits:
+    - Large arrays that don't fit in cache
+    - Regular access patterns
+    - Reuse across iterations
+
+    Skip tiling:
+    - Small arrays (fit in L1)
+    - Irregular access patterns
+    - Single-use data
+    @End Reasoning
+
+    @Implementation
+    1. Get data size
+    2. Check if larger than L1 cache
+    3. Check for regular access pattern
+    4. Check for reuse
+    5. Return true if tiling beneficial
+    @End Implementation
+
+    Note: Get data size
+    Let dimensions be Layout.memory_get_int64(layout, 8)
+    If dimensions equals 0:
+        Return false
+    End If
+
+    Let total_elements be 1
+    Let dim_count be List.length(dimensions)
+
+    Let i be 0
+    While i is less than dim_count:
+        Let dim_size be List.get(dimensions, i)
+        Let total_elements be total_elements * dim_size
+        Let i be i + 1
+    End While
+
+    Note: Get element size
+    Let strides be Layout.memory_get_int64(layout, 16)
+    Let element_size be List.get(strides, dim_count - 1)
+
+    Let total_bytes be total_elements * element_size
+
+    Note: L1 cache threshold (32KB)
+    Let l1_threshold be 32768
+
+    Note: Only tile if larger than L1
+    If total_bytes is less than or equal to l1_threshold:
+        Return false
+    End If
+
+    Note: Check for regular access pattern
+    Let access_pattern be MemoryAccess.analyze_access_pattern(graph, node)
+    Let pattern_type be Layout.memory_get_int64(access_pattern, 0)
+
+    Note: Tiling helps contiguous and strided access
+    If pattern_type equals 1:
+        Return true
+    End If
+    If pattern_type equals 2:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Note: ================================================================
+Note: Padding Optimization
+Note: ================================================================
+
+Process called "compute_optimal_padding" that takes layout as Integer returns Integer:
+    @Reasoning
+    Computes padding to avoid bank conflicts and improve alignment.
+
+    Padding goals:
+    - Align to cache line (64 bytes typical)
+    - Avoid shared memory bank conflicts (stride != bank_count)
+    - Minimize wasted space
+
+    Algorithm:
+    - Get innermost dimension size
+    - Compute padding to next cache line boundary
+    - Check for bank conflict patterns
+    - Return optimal padding amount
+    @End Reasoning
+
+    @Implementation
+    1. Get dimensions and strides
+    2. Compute current row size
+    3. Compute padding to cache line boundary
+    4. Check for bank conflicts
+    5. Return padding amount
+    @End Implementation
+
+    Let dimensions be Layout.memory_get_int64(layout, 8)
+    If dimensions equals 0:
+        Return 0
+    End If
+
+    Let strides be Layout.memory_get_int64(layout, 16)
+    Let dim_count be List.length(dimensions)
+
+    Note: Get innermost dimension size
+    Let inner_dim be List.get(dimensions, dim_count - 1)
+    Let element_size be List.get(strides, dim_count - 1)
+
+    Let row_size_bytes be inner_dim * element_size
+
+    Note: Cache line size (64 bytes)
+    Let cache_line_size be 64
+
+    Note: Compute padding to next cache line boundary
+    Let remainder be row_size_bytes % cache_line_size
+
+    If remainder equals 0:
+        Note: Already aligned
+        Return 0
+    End If
+
+    Let padding_bytes be cache_line_size - remainder
+
+    Note: Convert to elements
+    Let padding_elements be padding_bytes / element_size
+
+    Return padding_elements
+End Process
+
+Process called "should_apply_padding" that takes graph as Integer, node as Integer, layout as Integer returns Boolean:
+    @Reasoning
+    Determines if padding would be beneficial.
+
+    Padding benefits:
+    - Improves cache line alignment
+    - Reduces bank conflicts
+    - Enables better coalescing
+
+    Skip padding:
+    - Already aligned
+    - Padding wastes too much memory (>10%)
+    - Random access patterns (padding doesn't help)
+    @End Reasoning
+
+    @Implementation
+    1. Check current alignment
+    2. Estimate padding amount
+    3. Check memory waste percentage
+    4. Return true if beneficial
+    @End Implementation
+
+    Note: Compute padding needed
+    Let padding_needed be compute_optimal_padding(layout)
+
+    If padding_needed equals 0:
+        Note: Already aligned
+        Return false
+    End If
+
+    Note: Check memory waste percentage
+    Let dimensions be Layout.memory_get_int64(layout, 8)
+    Let dim_count be List.length(dimensions)
+    Let inner_dim be List.get(dimensions, dim_count - 1)
+
+    Note: Waste percentage = padding / (size + padding)
+    Let waste_ratio be Math.int_to_float(padding_needed) / Math.int_to_float(inner_dim + padding_needed)
+
+    Note: Only pad if waste < 10%
+    If waste_ratio is greater than 0.1:
+        Return false
+    End If
+
+    Note: Check access pattern
+    Let access_pattern be MemoryAccess.analyze_access_pattern(graph, node)
+    Let pattern_type be Layout.memory_get_int64(access_pattern, 0)
+
+    Note: Padding helps contiguous access
+    If pattern_type equals 1:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Note: ================================================================
+Note: Benefit Estimation
+Note: ================================================================
+
+Process called "estimate_layout_benefit" that takes graph as Integer, node as Integer, current_layout as Integer, optimal_layout as Integer returns Float:
+    @Reasoning
+    Estimates speedup from layout transformation.
+
+    Benefit sources:
+    - Improved memory coalescing
+    - Better cache locality
+    - Reduced bank conflicts
+
+    Measurement:
+    - Memory transactions: optimal vs current
+    - Cache hit rate improvement
+    - Bandwidth utilization
+    @End Reasoning
+
+    @Implementation
+    1. Analyze coalescing improvement
+    2. Estimate cache locality improvement
+    3. Compute overall speedup
+    4. Return benefit factor
+    @End Implementation
+
+    Note: Check if optimal layout enables coalescing
+    Let optimal_coalesced be Layout.memory_get_int64(optimal_layout, 40)
+    Let current_coalesced be Layout.memory_get_int64(current_layout, 40)
+
+    Note: Base benefit from coalescing
+    Let coalescing_benefit be 1.0
+
+    If optimal_coalesced equals true:
+        If current_coalesced equals false:
+            Note: Enabling coalescing: 1.3x to 2.0x typical
+            Let coalescing_benefit be 1.5
+        End If
+    End If
+
+    Note: Tiling benefit (cache locality)
+    Let tiling_benefit be 1.0
+
+    Let optimal_type be Layout.memory_get_int64(optimal_layout, 0)
+    Let current_type be Layout.memory_get_int64(current_layout, 0)
+
+    If optimal_type equals LAYOUT_TILED:
+        If current_type is not equal to LAYOUT_TILED:
+            Note: Tiling benefit: 1.1x to 1.3x typical
+            Let tiling_benefit be 1.2
+        End If
+    End If
+
+    Note: Padding benefit (bank conflicts)
+    Let padding_benefit be 1.0
+
+    Let optimal_padding be Layout.memory_get_int64(optimal_layout, 32)
+    Let current_padding be Layout.memory_get_int64(current_layout, 32)
+
+    If optimal_padding is greater than 0:
+        If current_padding equals 0:
+            Note: Padding benefit: 1.05x to 1.15x typical
+            Let padding_benefit be 1.1
+        End If
+    End If
+
+    Note: Combine benefits (multiplicative)
+    Let total_benefit be coalescing_benefit * tiling_benefit * padding_benefit
+
+    Return total_benefit
+End Process
+
+Process called "estimate_transformation_cost" that takes source_layout as Integer, target_layout as Integer returns Float:
+    @Reasoning
+    Estimates cost of layout transformation.
+
+    Costs:
+    - Memory allocation for new layout
+    - Data copying/reorganization
+    - Runtime overhead
+
+    Measurement:
+    - Data size
+    - Transformation complexity
+    - Execution time
+    @End Reasoning
+
+    @Implementation
+    1. Get data size
+    2. Estimate transformation time
+    3. Return cost (relative to original execution time)
+    @End Implementation
+
+    Note: Get data size
+    Let dimensions be Layout.memory_get_int64(source_layout, 8)
+    If dimensions equals 0:
+        Return 0.0
+    End If
+
+    Let total_elements be 1
+    Let dim_count be List.length(dimensions)
+
+    Let i be 0
+    While i is less than dim_count:
+        Let dim_size be List.get(dimensions, i)
+        Let total_elements be total_elements * dim_size
+        Let i be i + 1
+    End While
+
+    Note: Transformation cost proportional to data size
+    Note: Typical: 0.01 to 0.1 relative cost
+    Let base_cost be 0.05
+
+    Note: Higher cost for complex transformations
+    Let source_type be Layout.memory_get_int64(source_layout, 0)
+    Let target_type be Layout.memory_get_int64(target_layout, 0)
+
+    If source_type is not equal to target_type:
+        Note: Layout change requires data reorganization
+        Let base_cost be 0.1
+    End If
+
+    Return base_cost
+End Process
+
+Note: ================================================================
+Note: Optimization Orchestration
+Note: ================================================================
+
+Process called "optimize_data_layout" that takes graph as Integer returns Integer:
+    @Reasoning
+    Top-level data layout optimization.
+
+    Algorithm:
+    1. Generate all layout transformation candidates
+    2. Filter to beneficial transformations (benefit > cost)
+    3. Sort by net benefit
+    4. Apply transformations greedily
+    5. Validate graph after each transformation
+
+    Strategy:
+    - Prioritize high-benefit, low-cost transformations
+    - Apply transformations incrementally
+    - Revalidate after each change
+    @End Reasoning
+
+    @Implementation
+    1. Generate transformations
+    2. Filter and sort
+    3. Apply beneficial transformations
+    4. Return count of transformations applied
+    @End Implementation
+
+    Let transformations_applied be 0
+
+    Note: Generate layout transformations
+    Let transformations be generate_layout_transformations(graph)
+    Let transform_count be List.length(transformations)
+
+    If transform_count equals 0:
+        Return 0
+    End If
+
+    Note: Filter to beneficial transformations
+    Let beneficial be List.create()
+
+    Let i be 0
+    While i is less than transform_count:
+        Let transformation be List.get(transformations, i)
+        Let benefit be Layout.memory_get_float64(transformation, 32)
+        Let cost be Layout.memory_get_float64(transformation, 40)
+
+        Note: Net benefit = benefit / (1 + cost)
+        Let net_benefit be benefit / (1.0 + cost)
+
+        Note: Only apply if net benefit > 1.05 (5% improvement)
+        If net_benefit is greater than 1.05:
+            List.append(beneficial, transformation)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Let beneficial_count be List.length(beneficial)
+    If beneficial_count equals 0:
+        Return 0
+    End If
+
+    Note: Sort by net benefit (descending)
+    Let sorted be sort_transformations_by_benefit(beneficial)
+
+    Note: Apply transformations
+    Let j be 0
+    While j is less than beneficial_count:
+        Let transformation be List.get(sorted, j)
+        apply_layout_transformation(graph, transformation)
+        Let transformations_applied be transformations_applied + 1
+        Let j be j + 1
+    End While
+
+    Return transformations_applied
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Layout Management
+Note: ================================================================
+
+Process called "clone_layout" that takes layout as Integer returns Integer:
+    Let cloned be a value of type DataLayout with
+        layout_type as Layout.memory_get_int64(layout, 0),
+        dimensions as Layout.memory_get_int64(layout, 8),
+        strides as Layout.memory_get_int64(layout, 16),
+        tile_sizes as Layout.memory_get_int64(layout, 24),
+        padding as Layout.memory_get_int64(layout, 32),
+        is_coalesced as Layout.memory_get_int64(layout, 40)
+
+    Return cloned
+End Process
+
+Process called "layouts_differ" that takes layout1 as Integer, layout2 as Integer returns Boolean:
+    Let type1 be Layout.memory_get_int64(layout1, 0)
+    Let type2 be Layout.memory_get_int64(layout2, 0)
+
+    If type1 is not equal to type2:
+        Return true
+    End If
+
+    Let padding1 be Layout.memory_get_int64(layout1, 32)
+    Let padding2 be Layout.memory_get_int64(layout2, 32)
+
+    If padding1 is not equal to padding2:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "determine_transform_type" that takes current_layout as Integer, optimal_layout as Integer returns Integer:
+    Let current_type be Layout.memory_get_int64(current_layout, 0)
+    Let optimal_type be Layout.memory_get_int64(optimal_layout, 0)
+
+    If current_type equals LAYOUT_ROW_MAJOR:
+        If optimal_type equals LAYOUT_COLUMN_MAJOR:
+            Return TRANSFORM_TRANSPOSE
+        End If
+    End If
+
+    If current_type equals LAYOUT_COLUMN_MAJOR:
+        If optimal_type equals LAYOUT_ROW_MAJOR:
+            Return TRANSFORM_TRANSPOSE
+        End If
+    End If
+
+    If optimal_type equals LAYOUT_TILED:
+        Return TRANSFORM_TILE
+    End If
+
+    If optimal_type equals LAYOUT_PADDED:
+        Return TRANSFORM_PAD
+    End If
+
+    If current_type equals LAYOUT_AOS:
+        If optimal_type equals LAYOUT_SOA:
+            Return TRANSFORM_AOS_TO_SOA
+        End If
+    End If
+
+    Return TRANSFORM_NONE
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Stride Computation
+Note: ================================================================
+
+Process called "compute_row_major_strides" that takes dimensions as Integer, element_size as Integer returns Integer:
+    Let strides be List.create()
+    Let dim_count be List.length(dimensions)
+
+    Note: Row-major: rightmost dimension has stride=element_size
+    Note: Stride[i] = product of all dimensions to the right * element_size
+
+    Let i be dim_count - 1
+    Let stride be element_size
+
+    While i is greater than or equal to 0:
+        List.prepend(strides, stride)
+
+        If i is greater than 0:
+            Let dim_size be List.get(dimensions, i)
+            Let stride be stride * dim_size
+        End If
+
+        Let i be i - 1
+    End While
+
+    Return strides
+End Process
+
+Process called "compute_column_major_strides" that takes dimensions as Integer, element_size as Integer returns Integer:
+    Let strides be List.create()
+    Let dim_count be List.length(dimensions)
+
+    Note: Column-major: leftmost dimension has stride=element_size
+    Note: Stride[i] = product of all dimensions to the left * element_size
+
+    Let stride be element_size
+
+    Let i be 0
+    While i is less than dim_count:
+        List.append(strides, stride)
+
+        If i is less than dim_count - 1:
+            Let dim_size be List.get(dimensions, i)
+            Let stride be stride * dim_size
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return strides
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Graph Transformation
+Note: ================================================================
+
+Process called "insert_transpose_op" that takes graph as Integer, node as Integer, layout as Integer returns Nothing:
+    Note: Create transpose operation node
+    Note: OpKind MatrixTranspose (from node.runa)
+    Let transpose_op be 11
+
+    Let output_type be Node.get_node_output_type(node)
+    Let transpose_node be Node.create_operation_node(transpose_op, output_type)
+
+    Note: Insert transpose node in graph
+    Graph.add_node(graph, transpose_node)
+
+    Note: Redirect edges through transpose
+    Note: (Simplified - real implementation would update all edges)
+End Process
+
+Process called "insert_tiling_ops" that takes graph as Integer, node as Integer, layout as Integer returns Nothing:
+    Note: Insert tiling loop transformations
+    Note: (Simplified - real implementation would insert loop nest)
+End Process
+
+Process called "apply_padding" that takes graph as Integer, node as Integer, layout as Integer returns Nothing:
+    Note: Update memory allocation with padding
+    Note: (Simplified - real implementation would modify allocation sizes)
+End Process
+
+Process called "convert_aos_to_soa" that takes graph as Integer, node as Integer returns Nothing:
+    Note: Convert Array of Structures to Structure of Arrays
+    Note: (Simplified - real implementation would restructure data)
+End Process
+
+Process called "update_layout_metadata" that takes node as Integer, layout as Integer returns Nothing:
+    Let metadata be Node.get_node_metadata(node)
+    If metadata equals 0:
+        Let metadata be Dict.create()
+    End If
+
+    Let layout_type be Layout.memory_get_int64(layout, 0)
+
+    If layout_type equals LAYOUT_ROW_MAJOR:
+        Dict.set(metadata, "layout", "row_major")
+    End If
+    If layout_type equals LAYOUT_COLUMN_MAJOR:
+        Dict.set(metadata, "layout", "column_major")
+    End If
+    If layout_type equals LAYOUT_TILED:
+        Dict.set(metadata, "layout", "tiled")
+    End If
+
+    Node.set_node_metadata(node, metadata)
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Utilities
+Note: ================================================================
+
+Process called "node_has_layout" that takes node as Integer returns Boolean:
+    Let output_type be Node.get_node_output_type(node)
+    If output_type equals 0:
+        Return false
+    End If
+
+    Let discriminant be Layout.memory_get_int64(output_type, 0)
+
+    Note: Matrix and Tensor types have layouts
+    If discriminant equals 3:
+        Return true
+    End If
+    If discriminant equals 5:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "get_primitive_size" that takes primitive_kind as Integer returns Integer:
+    Note: Map primitive type kind to byte size
+    Note: INT8=0, INT16=1, INT32=2, INT64=3, FLOAT32=6, FLOAT64=7
+
+    If primitive_kind equals 0:
+        Return 1
+    End If
+    If primitive_kind equals 1:
+        Return 2
+    End If
+    If primitive_kind equals 2:
+        Return 4
+    End If
+    If primitive_kind equals 3:
+        Return 8
+    End If
+    If primitive_kind equals 6:
+        Return 4
+    End If
+    If primitive_kind equals 7:
+        Return 8
+    End If
+
+    Return 4
+End Process
+
+Process called "round_down_to_power_of_2" that takes n as Integer returns Integer:
+    Note: Round down to nearest power of 2
+    If n is less than or equal to 0:
+        Return 1
+    End If
+
+    If n is greater than or equal to 128:
+        Return 128
+    End If
+    If n is greater than or equal to 64:
+        Return 64
+    End If
+    If n is greater than or equal to 32:
+        Return 32
+    End If
+    If n is greater than or equal to 16:
+        Return 16
+    End If
+    If n is greater than or equal to 8:
+        Return 8
+    End If
+    If n is greater than or equal to 4:
+        Return 4
+    End If
+    If n is greater than or equal to 2:
+        Return 2
+    End If
+
+    Return 1
+End Process
+
+Process called "sort_transformations_by_benefit" that takes transformations as Integer returns Integer:
+    Note: Simple bubble sort by net benefit (descending)
+    Let sorted be List.clone(transformations)
+    Let n be List.length(sorted)
+
+    Let i be 0
+    While i is less than n - 1:
+        Let j be 0
+        While j is less than n - i - 1:
+            Let t1 be List.get(sorted, j)
+            Let t2 be List.get(sorted, j + 1)
+
+            Let benefit1 be Layout.memory_get_float64(t1, 32)
+            Let cost1 be Layout.memory_get_float64(t1, 40)
+            Let net1 be benefit1 / (1.0 + cost1)
+
+            Let benefit2 be Layout.memory_get_float64(t2, 32)
+            Let cost2 be Layout.memory_get_float64(t2, 40)
+            Let net2 be benefit2 / (1.0 + cost2)
+
+            If net1 is less than net2:
+                List.set(sorted, j, t2)
+                List.set(sorted, j + 1, t1)
+            End If
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Return sorted
+End Process

@@ -35,4 +35,1356 @@ This file consists of the following functions/features/operation types:
 - Remainder loop generation and phi node rewriting
 :End Note
 
-Note: TODO - Implement loop unrolling optimization functionality
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/frontend/primitives/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/set.runa" as Set
+Import "compiler/frontend/primitives/list.runa" as List
+Import "stdlib/memory/layout.runa" as Layout
+
+Note: Type definition for induction variable information (88 bytes)
+Type called "InductionVariable":
+    phi_inst_ptr as Integer          Note: Pointer to phi instruction defining IV
+    block_id as Integer               Note: Block containing the phi (loop header)
+    init_value_ptr as Integer         Note: Initial value from preheader
+    step_value_ptr as Integer         Note: Step value operand
+    step_constant as Integer          Note: 1 if step is constant, 0 otherwise
+    step_amount as Integer            Note: Constant step amount if known
+    update_inst_ptr as Integer        Note: Instruction computing IV + step
+    exit_condition_ptr as Integer     Note: Branch instruction for exit test
+    bound_value_ptr as Integer        Note: Loop bound operand in comparison
+    comparison_opcode as Integer      Note: Comparison operation (LT, LE, GT, GE)
+    is_canonical as Integer           Note: 1 if IV = phi(init, IV+step), 0 otherwise
+End Type
+
+Note: Type definition for loop information (72 bytes)
+Type called "LoopInfo":
+    header_id as Integer              Note: Loop header block ID
+    preheader_id as Integer           Note: Preheader block ID (single entry)
+    latch_id as Integer               Note: Block with back-edge to header
+    exit_block_id as Integer          Note: Primary exit block
+    body_blocks as Integer            Note: Set of block IDs in loop body
+    back_edges as Integer             Note: List of (source, target) pairs
+    nesting_level as Integer          Note: Loop nesting depth
+    induction_vars as Integer         Note: List of InductionVariable structures
+    trip_count as Integer             Note: -1 if unknown, else constant count
+    has_multiple_exits as Integer     Note: 1 if multiple exits, 0 otherwise
+End Type
+
+Note: Type definition for loop unrolling context (88 bytes)
+Type called "LoopUnrollContext":
+    cfg as Integer                    Note: CFG pointer
+    loops as Integer                  Note: List of LoopInfo
+    dominance_ptr as Integer          Note: Dominance tree
+    ssa_ptr as Integer                Note: SSA information
+    block_clone_map as Integer        Note: original_block_id -> cloned_block_id
+    value_rename_map as Integer       Note: original_value -> list of renamed values
+    full_unrolls as Integer           Note: Counter for full unrolls performed
+    partial_unrolls as Integer        Note: Counter for partial unrolls performed
+    unroll_factor as Integer          Note: Default unroll factor (4)
+    max_unroll_iterations as Integer  Note: Max iterations for full unroll (16)
+    code_size_threshold as Integer    Note: Max instructions to unroll (200)
+End Type
+
+@Reasoning
+Loop unrolling optimization workflow:
+
+1. **Loop Detection** - Identify natural loops via back-edge analysis
+2. **Induction Variable Identification** - Find canonical IVs (phi nodes with add/sub updates)
+3. **Trip Count Analysis** - Compute constant trip counts when possible
+4. **Profitability Analysis** - Determine if unrolling benefits outweigh costs
+5. **Transformation** - Full unroll (constant small trips) or partial unroll (large/unknown trips)
+6. **SSA Maintenance** - Rename cloned values and update phi nodes
+
+Full unrolling transforms `for(i=0; i<3; i++) body(i);` into `body(0); body(1); body(2);`
+
+Partial unrolling with factor K transforms iterations to process K elements per iteration,
+reducing loop overhead by factor K while maintaining correctness via remainder loop.
+@End Reasoning
+
+Note: Create loop unrolling context with initialized data structures
+Process called "create_loop_unroll_context" that takes cfg_ptr as Integer returns Integer:
+    @Implementation
+    Allocates 88-byte context structure on Tier 3 OWNED HEAP.
+    Initializes CFG reference, empty loops list, computes dominance tree,
+    creates clone/rename maps, sets default parameters.
+    @End Implementation
+
+    Let context_size be 88
+    Let context_ptr be Layout.allocate_memory(context_size, 8)
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG pointer
+    Set the Integer at context_ptr to cfg_ptr
+
+    Note: Create empty loops list
+    Let loops_list be List.create()
+    Set the Integer at (context_ptr plus 8) to loops_list
+
+    Note: Compute dominance information (required for back-edge detection)
+    Let dominance_ptr be Dominance.compute_dominance(cfg_ptr)
+    Set the Integer at (context_ptr plus 16) to dominance_ptr
+
+    Note: Get SSA information from CFG
+    Let ssa_ptr be CFG.get_ssa_info(cfg_ptr)
+    Set the Integer at (context_ptr plus 24) to ssa_ptr
+
+    Note: Create block clone map (original_id -> cloned_id)
+    Let block_clone_map be Dictionary.create()
+    Set the Integer at (context_ptr plus 32) to block_clone_map
+
+    Note: Create value rename map (original_value -> renamed_values_per_iteration)
+    Let value_rename_map be Dictionary.create()
+    Set the Integer at (context_ptr plus 40) to value_rename_map
+
+    Note: Initialize counters to zero
+    Set the Integer at (context_ptr plus 48) to 0  Note: full_unrolls
+    Set the Integer at (context_ptr plus 56) to 0  Note: partial_unrolls
+
+    Note: Set default unrolling parameters
+    Set the Integer at (context_ptr plus 64) to 4   Note: unroll_factor
+    Set the Integer at (context_ptr plus 72) to 16  Note: max_unroll_iterations
+    Set the Integer at (context_ptr plus 80) to 200 Note: code_size_threshold
+
+    Return context_ptr
+End Process
+
+Note: Destroy loop unrolling context and free all allocated memory
+Process called "destroy_loop_unroll_context" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Note: Free loops list and all nested structures
+    Let loops_list be the Integer at (context_ptr plus 8)
+    If loops_list is not equal to 0:
+        Let loops_count be List.length(loops_list)
+        Let loop_idx be 0
+
+        While loop_idx is less than loops_count:
+            Let loop_ptr be List.get(loops_list, loop_idx)
+
+            If loop_ptr is not equal to 0:
+                Note: Free body blocks set
+                Let body_blocks be the Integer at (loop_ptr plus 32)
+                If body_blocks is not equal to 0:
+                    proc destroy from Set with body_blocks
+                End If
+
+                Note: Free back edges list (including edge pair allocations)
+                Let back_edges be the Integer at (loop_ptr plus 40)
+                If back_edges is not equal to 0:
+                    Let edge_count be List.length(back_edges)
+                    Let edge_idx be 0
+                    While edge_idx is less than edge_count:
+                        Let edge_pair be List.get(back_edges, edge_idx)
+                        If edge_pair is not equal to 0:
+                            Layout.deallocate_memory(edge_pair, 16)
+                        End If
+                        Set edge_idx to edge_idx plus 1
+                    End While
+                    List.destroy(back_edges)
+                End If
+
+                Note: Free induction variables list and IV structures
+                Let induction_vars be the Integer at (loop_ptr plus 56)
+                If induction_vars is not equal to 0:
+                    Let iv_count be List.length(induction_vars)
+                    Let iv_idx be 0
+                    While iv_idx is less than iv_count:
+                        Let iv_ptr be List.get(induction_vars, iv_idx)
+                        If iv_ptr is not equal to 0:
+                            Layout.deallocate_memory(iv_ptr, 88)
+                        End If
+                        Set iv_idx to iv_idx plus 1
+                    End While
+                    List.destroy(induction_vars)
+                End If
+
+                Note: Free LoopInfo structure (72 bytes)
+                Layout.deallocate_memory(loop_ptr, 72)
+            End If
+
+            Set loop_idx to loop_idx plus 1
+        End While
+
+        List.destroy(loops_list)
+    End If
+
+    Note: Free dominance tree
+    Let dominance_ptr be the Integer at (context_ptr plus 16)
+    If dominance_ptr is not equal to 0:
+        Dominance.destroy_dominance(dominance_ptr)
+    End If
+
+    Note: Free block clone map
+    Let block_clone_map be the Integer at (context_ptr plus 32)
+    If block_clone_map is not equal to 0:
+        Dictionary.destroy(block_clone_map)
+    End If
+
+    Note: Free value rename map (including nested lists)
+    Let value_rename_map be the Integer at (context_ptr plus 40)
+    If value_rename_map is not equal to 0:
+        Let keys be Dictionary.keys(value_rename_map)
+        Let key_count be List.length(keys)
+        Let key_idx be 0
+        While key_idx is less than key_count:
+            Let key be List.get(keys, key_idx)
+            Let rename_list be Dictionary.get(value_rename_map, key)
+            If rename_list is not equal to 0:
+                List.destroy(rename_list)
+            End If
+            Set key_idx to key_idx plus 1
+        End While
+        Dictionary.destroy(value_rename_map)
+    End If
+
+    Note: Free context structure (88 bytes)
+    Layout.deallocate_memory(context_ptr, 88)
+End Process
+
+Note: Print loop unrolling statistics
+Process called "print_loop_unrolling_stats" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Let full_unrolls be the Integer at (context_ptr plus 48)
+    Let partial_unrolls be the Integer at (context_ptr plus 56)
+    Let total_unrolls be full_unrolls plus partial_unrolls
+
+    Note: Print statistics
+End Process
+
+Note: Check if edge (source -> target) is a back edge using dominance
+Process called "is_back_edge" that takes source_id as Integer, target_id as Integer, dominance_ptr as Integer returns Integer:
+    @Implementation
+    A back edge occurs when the target dominates the source (target -> ... -> source -> target).
+    This forms the basis of natural loop detection.
+    @End Implementation
+
+    If dominance_ptr equals 0:
+        Return 0
+    End If
+
+    Let dominates be Dominance.does_dominate(dominance_ptr, target_id, source_id)
+    Return dominates
+End Process
+
+Note: Find all back edges in the CFG
+Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as Integer returns Integer:
+    @Implementation
+    Scans all edges in the CFG. For each edge (B -> H), checks if H dominates B.
+    If so, (B -> H) is a back edge and H is a loop header.
+    Returns list of (source, target) pairs representing back edges.
+    @End Implementation
+
+    Let back_edges be List.create()
+    Let blocks_count be CFG.get_block_count(cfg_ptr)
+    Let block_idx be 0
+
+    While block_idx is less than blocks_count:
+        Let block_id be CFG.get_block_id_at_index(cfg_ptr, block_idx)
+        Let successors be CFG.get_successors(cfg_ptr, block_id)
+        Let succ_count be List.length(successors)
+        Let succ_idx be 0
+
+        While succ_idx is less than succ_count:
+            Let succ_id be List.get(successors, succ_idx)
+            Let is_back be is_back_edge(block_id, succ_id, dominance_ptr)
+
+            If is_back equals 1:
+                Note: Allocate edge pair structure (16 bytes: source, target)
+                Let edge_pair be Layout.allocate_memory(16, 8)
+                Set the Integer at edge_pair to block_id
+                Set the Integer at (edge_pair plus 8) to succ_id
+                List.append(back_edges, edge_pair)
+            End If
+
+            Set succ_idx to succ_idx plus 1
+        End While
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Return back_edges
+End Process
+
+Note: Compute natural loop body for back edge (latch -> header)
+Process called "compute_loop_body" that takes header_id as Integer, latch_id as Integer, cfg_ptr as Integer returns Integer:
+    @Implementation
+    Natural loop body consists of all nodes that can reach the latch without
+    going through the header. Uses worklist algorithm starting from latch,
+    adding predecessors until reaching header.
+
+    Algorithm:
+    1. Initialize body = {header, latch}
+    2. worklist = {latch}
+    3. While worklist not empty:
+         node = worklist.pop()
+         for pred in predecessors(node):
+             if pred != header and pred not in body:
+                 body.add(pred)
+                 worklist.add(pred)
+    @End Implementation
+
+    Let body_blocks be proc create from Set
+    Let header_str be MIR.int_to_string(header_id)
+    Let latch_str be MIR.int_to_string(latch_id)
+
+    Note: Add header and latch to body
+    proc add from Set with body_blocks, header_str
+    proc add from Set with body_blocks, latch_str
+
+    Note: Handle self-loop case
+    If header_id equals latch_id:
+        Return body_blocks
+    End If
+
+    Note: Worklist algorithm to find all predecessors that reach latch
+    Let worklist be List.create()
+    List.append(worklist, latch_id)
+
+    While List.length(worklist) is greater than 0:
+        Let current_id be List.pop(worklist)
+        Let predecessors be CFG.get_predecessors(cfg_ptr, current_id)
+        Let pred_count be List.length(predecessors)
+        Let pred_idx be 0
+
+        While pred_idx is less than pred_count:
+            Let pred_id be List.get(predecessors, pred_idx)
+
+            Note: Don't go beyond loop header
+            If pred_id is not equal to header_id:
+                Let pred_str be MIR.int_to_string(pred_id)
+                Let already_in_body be proc contains from Set with body_blocks, pred_str
+
+                If already_in_body equals 0:
+                    proc add from Set with body_blocks, pred_str
+                    List.append(worklist, pred_id)
+                End If
+            End If
+
+            Set pred_idx to pred_idx plus 1
+        End While
+    End While
+
+    List.destroy(worklist)
+    Return body_blocks
+End Process
+
+Note: Detect all natural loops in the CFG using back-edge analysis
+Process called "detect_natural_loops" that takes context_ptr as Integer returns Integer:
+    @Implementation
+    Natural loop detection algorithm:
+    1. Find all back edges (B -> H where H dominates B)
+    2. For each back edge, H is loop header, B is latch
+    3. Compute loop body (nodes reaching B without going through H)
+    4. Create LoopInfo structure for each loop
+    @End Implementation
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let dominance_ptr be the Integer at (context_ptr plus 16)
+    Let loops_list be the Integer at (context_ptr plus 8)
+
+    Let back_edges be find_back_edges(cfg_ptr, dominance_ptr)
+    Let back_edge_count be List.length(back_edges)
+    Let edge_idx be 0
+
+    While edge_idx is less than back_edge_count:
+        Let edge_pair be List.get(back_edges, edge_idx)
+        Let latch_id be the Integer at edge_pair
+        Let header_id be the Integer at (edge_pair plus 8)
+
+        Let body_blocks be compute_loop_body(header_id, latch_id, cfg_ptr)
+
+        Note: Allocate LoopInfo structure (72 bytes)
+        Let loop_ptr be Layout.allocate_memory(72, 8)
+        Set the Integer at loop_ptr to header_id
+        Set the Integer at (loop_ptr plus 8) to 0              Note: preheader_id (computed later if needed)
+        Set the Integer at (loop_ptr plus 16) to latch_id
+        Set the Integer at (loop_ptr plus 24) to 0             Note: exit_block_id (computed later if needed)
+        Set the Integer at (loop_ptr plus 32) to body_blocks
+
+        Note: Create back edges list for this loop
+        Let loop_back_edges be List.create()
+        List.append(loop_back_edges, edge_pair)
+        Set the Integer at (loop_ptr plus 40) to loop_back_edges
+
+        Note: Compute nesting level by checking if any body block is a loop header
+        Let nesting_level be 0
+        Let body_list be proc to_list from Set with body_blocks
+        Let body_count be List.length(body_list)
+        Let body_idx be 0
+
+        While body_idx is less than body_count:
+            Let body_block_str be List.get(body_list, body_idx)
+            Let body_block_id be MIR.string_to_int(body_block_str)
+
+            Note: Check if this body block is a loop header (has back edges to it)
+            Let inner_edge_idx be 0
+            While inner_edge_idx is less than back_edge_count:
+                Let inner_edge_pair be List.get(back_edges, inner_edge_idx)
+                Let inner_target_id be the Integer at (inner_edge_pair plus 8)
+
+                Note: If body block is target of a back edge, it's a nested loop header
+                If body_block_id equals inner_target_id:
+                    Set nesting_level to nesting_level plus 1
+                End If
+
+                Set inner_edge_idx to inner_edge_idx plus 1
+            End While
+
+            Set body_idx to body_idx plus 1
+        End While
+
+        Set the Integer at (loop_ptr plus 48) to nesting_level
+
+        Note: Create empty induction variables list
+        Let induction_vars be List.create()
+        Set the Integer at (loop_ptr plus 56) to induction_vars
+
+        Set the Integer at (loop_ptr plus 64) to -1            Note: trip_count (unknown initially)
+        Set the Integer at (loop_ptr plus 68) to 0             Note: has_multiple_exits
+
+        List.append(loops_list, loop_ptr)
+        Set edge_idx to edge_idx plus 1
+    End While
+
+    Return List.length(loops_list)
+End Process
+
+Note: Identify induction variables in a loop
+Process called "identify_induction_variables" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Implementation
+    Induction variable pattern:
+    - Phi node in loop header: iv = phi([init, preheader], [next, latch])
+    - Update in loop body: next = iv + step (or iv - step)
+    - Step is loop-invariant (constant or defined outside loop)
+
+    Algorithm:
+    1. Get all phi nodes in header
+    2. For each phi with 2 operands:
+         a. Identify init (from preheader) and next (from latch)
+         b. Check if next is computed by add/sub using iv
+         c. Extract step value
+         d. Create InductionVariable structure
+    @End Implementation
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let ssa_ptr be the Integer at (context_ptr plus 24)
+    Let header_id be the Integer at loop_ptr
+    Let latch_id be the Integer at (loop_ptr plus 16)
+    Let induction_vars be the Integer at (loop_ptr plus 56)
+
+    Let block_ptr be CFG.get_block_by_id(cfg_ptr, header_id)
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Let phi_list be MIR.get_phi_nodes(block_ptr)
+    If phi_list equals 0:
+        Return 0
+    End If
+
+    Let phi_count be List.length(phi_list)
+    Let phi_idx be 0
+    Let found_count be 0
+
+    While phi_idx is less than phi_count:
+        Let phi_inst_ptr be List.get(phi_list, phi_idx)
+        Let operands be MIR.get_phi_operands(phi_inst_ptr)
+        Let operand_count be List.length(operands)
+
+        Note: Canonical IV has exactly 2 operands
+        If operand_count equals 2:
+            Let op0_pair be List.get(operands, 0)
+            Let op1_pair be List.get(operands, 1)
+            Let op0_value be the Integer at op0_pair
+            Let op0_block be the Integer at (op0_pair plus 8)
+            Let op1_value be the Integer at op1_pair
+            Let op1_block be the Integer at (op1_pair plus 8)
+
+            Note: Determine which operand comes from latch
+            Let init_value be 0
+            Let next_value be 0
+
+            If op0_block equals latch_id:
+                Set next_value to op0_value
+                Set init_value to op1_value
+            End If
+
+            If op1_block equals latch_id:
+                Set next_value to op1_value
+                Set init_value to op0_value
+            End If
+
+            If next_value is not equal to 0:
+                Let next_inst_ptr be SSA.get_defining_instruction(ssa_ptr, next_value)
+
+                If next_inst_ptr is not equal to 0:
+                    Let next_opcode be MIR.get_opcode(next_inst_ptr)
+
+                    Note: Check for add or sub instruction
+                    If next_opcode equals MIR.MIR_ADD or next_opcode equals MIR.MIR_SUB:
+                        Let next_op0 be MIR.get_operand(next_inst_ptr, 0)
+                        Let next_op1 be MIR.get_operand(next_inst_ptr, 1)
+                        Let phi_result be MIR.get_result(phi_inst_ptr)
+
+                        Note: Check if one operand is phi itself
+                        Let step_value be 0
+                        Let is_canonical be 0
+
+                        If next_op0 equals phi_result:
+                            Set step_value to next_op1
+                            Set is_canonical to 1
+                        End If
+
+                        If next_op1 equals phi_result:
+                            Set step_value to next_op0
+                            Set is_canonical to 1
+                        End If
+
+                        If step_value is not equal to 0:
+                            Note: Allocate InductionVariable structure (88 bytes)
+                            Let iv_ptr be Layout.allocate_memory(88, 8)
+                            Set the Integer at iv_ptr to phi_inst_ptr
+                            Set the Integer at (iv_ptr plus 8) to header_id
+                            Set the Integer at (iv_ptr plus 16) to init_value
+                            Set the Integer at (iv_ptr plus 24) to step_value
+
+                            Note: Check if step is constant
+                            Let step_is_constant be MIR.is_constant(step_value)
+                            Set the Integer at (iv_ptr plus 32) to step_is_constant
+
+                            Note: Get constant step value if available
+                            Let step_amount be 0
+                            If step_is_constant equals 1:
+                                Set step_amount to MIR.get_constant_value(step_value)
+                            End If
+                            Set the Integer at (iv_ptr plus 40) to step_amount
+
+                            Set the Integer at (iv_ptr plus 48) to next_inst_ptr
+                            Set the Integer at (iv_ptr plus 56) to 0  Note: exit_condition_ptr
+                            Set the Integer at (iv_ptr plus 64) to 0  Note: bound_value_ptr
+                            Set the Integer at (iv_ptr plus 72) to 0  Note: comparison_opcode
+                            Set the Integer at (iv_ptr plus 80) to is_canonical
+
+                            List.append(induction_vars, iv_ptr)
+                            Set found_count to found_count plus 1
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set phi_idx to phi_idx plus 1
+    End While
+
+    Return found_count
+End Process
+
+Note: Analyze loop exit condition to compute trip count
+Process called "analyze_trip_count" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Implementation
+    Trip count computation for canonical loops:
+
+    for (iv = init; iv < bound; iv += step):
+        trip_count = (bound - init) / step
+
+    Algorithm:
+    1. Find exit branch instruction (in latch or exiting block)
+    2. Get comparison instruction feeding the branch
+    3. Check if comparison uses an induction variable
+    4. If IV, bound, and step are all constant, compute trip count
+    5. Handle different comparison operators (LT, LE, GT, GE, EQ, NE)
+
+    Returns computed trip count or -1 if non-constant.
+    @End Implementation
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let ssa_ptr be the Integer at (context_ptr plus 24)
+    Let header_id be the Integer at loop_ptr
+    Let latch_id be the Integer at (loop_ptr plus 16)
+    Let induction_vars be the Integer at (loop_ptr plus 56)
+
+    Let latch_ptr be CFG.get_block_by_id(cfg_ptr, latch_id)
+    If latch_ptr equals 0:
+        Return -1
+    End If
+
+    Let terminator_ptr be MIR.get_terminator(latch_ptr)
+    If terminator_ptr equals 0:
+        Return -1
+    End If
+
+    Let term_opcode be MIR.get_opcode(terminator_ptr)
+    If term_opcode is not equal to MIR.MIR_BR_COND:
+        Return -1
+    End If
+
+    Let condition_value be MIR.get_operand(terminator_ptr, 0)
+    If condition_value equals 0:
+        Return -1
+    End If
+
+    Let cmp_inst_ptr be SSA.get_defining_instruction(ssa_ptr, condition_value)
+    If cmp_inst_ptr equals 0:
+        Return -1
+    End If
+
+    Let cmp_opcode be MIR.get_opcode(cmp_inst_ptr)
+    Let is_comparison be 0
+
+    If cmp_opcode equals MIR.MIR_CMP_LT or cmp_opcode equals MIR.MIR_CMP_LE or cmp_opcode equals MIR.MIR_CMP_GT or cmp_opcode equals MIR.MIR_CMP_GE or cmp_opcode equals MIR.MIR_CMP_EQ or cmp_opcode equals MIR.MIR_CMP_NE:
+        Set is_comparison to 1
+    End If
+
+    If is_comparison equals 0:
+        Return -1
+    End If
+
+    Let cmp_op0 be MIR.get_operand(cmp_inst_ptr, 0)
+    Let cmp_op1 be MIR.get_operand(cmp_inst_ptr, 1)
+
+    Note: Find which operand is an induction variable
+    Let iv_count be List.length(induction_vars)
+    Let iv_idx be 0
+    Let matching_iv_ptr be 0
+    Let bound_value be 0
+
+    While iv_idx is less than iv_count:
+        Let iv_ptr be List.get(induction_vars, iv_idx)
+        Let phi_inst_ptr be the Integer at iv_ptr
+        Let phi_result be MIR.get_result(phi_inst_ptr)
+
+        If cmp_op0 equals phi_result:
+            Set matching_iv_ptr to iv_ptr
+            Set bound_value to cmp_op1
+        End If
+
+        If cmp_op1 equals phi_result:
+            Set matching_iv_ptr to iv_ptr
+            Set bound_value to cmp_op0
+        End If
+
+        Set iv_idx to iv_idx plus 1
+    End While
+
+    If matching_iv_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Update IV with exit condition information
+    Set the Integer at (matching_iv_ptr plus 56) to cmp_inst_ptr
+    Set the Integer at (matching_iv_ptr plus 64) to bound_value
+    Set the Integer at (matching_iv_ptr plus 72) to cmp_opcode
+
+    Note: Attempt constant trip count computation
+    Let init_value be the Integer at (matching_iv_ptr plus 16)
+    Let step_is_constant be the Integer at (matching_iv_ptr plus 32)
+    Let step_amount be the Integer at (matching_iv_ptr plus 40)
+    Let init_is_constant be MIR.is_constant(init_value)
+    Let bound_is_constant be MIR.is_constant(bound_value)
+
+    If init_is_constant equals 1 and bound_is_constant equals 1 and step_is_constant equals 1:
+        Let init_val be MIR.get_constant_value(init_value)
+        Let bound_val be MIR.get_constant_value(bound_value)
+        Let trip_count be -1
+
+        Note: Compute trip count based on comparison operator
+        If cmp_opcode equals MIR.MIR_CMP_LT:
+            If step_amount is greater than 0:
+                Let range be bound_val minus init_val
+                Set trip_count to range divided by step_amount
+            End If
+        End If
+
+        If cmp_opcode equals MIR.MIR_CMP_LE:
+            If step_amount is greater than 0:
+                Let range be bound_val minus init_val plus 1
+                Set trip_count to range divided by step_amount
+            End If
+        End If
+
+        If cmp_opcode equals MIR.MIR_CMP_GT:
+            If step_amount is less than 0:
+                Let abs_step be 0 minus step_amount
+                Let range be init_val minus bound_val
+                Set trip_count to range divided by abs_step
+            End If
+        End If
+
+        If cmp_opcode equals MIR.MIR_CMP_GE:
+            If step_amount is less than 0:
+                Let abs_step be 0 minus step_amount
+                Let range be init_val minus bound_val plus 1
+                Set trip_count to range divided by abs_step
+            End If
+        End If
+
+        Note: Ensure non-negative trip count
+        If trip_count is less than 0:
+            Set trip_count to 0
+        End If
+
+        Set the Integer at (loop_ptr plus 64) to trip_count
+        Return trip_count
+    End If
+
+    Return -1
+End Process
+
+Note: Determine if loop unrolling is profitable
+Process called "is_profitable_to_unroll" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Implementation
+    Profitability analysis considers:
+
+    1. **Code Size**: Loop body size vs. threshold
+       - Large bodies cause excessive code bloat when unrolled
+       - Threshold: 200 instructions for full unroll, 50 for partial
+
+    2. **Trip Count**: Known constant vs. unknown
+       - Full unroll requires constant trip count <= 16
+       - Partial unroll works with any trip count
+
+    3. **Loop Complexity**:
+       - Multiple exits complicate unrolling (less profitable)
+       - Function calls reduce benefit (unless inlinable)
+       - Memory operations benefit less from unrolling
+
+    Return values:
+    - 0: Not profitable (don't unroll)
+    - 1: Profitable for partial unrolling (factor 4)
+    - 2: Profitable for full unrolling (eliminate loop)
+    @End Implementation
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let max_unroll_iterations be the Integer at (context_ptr plus 72)
+    Let code_size_threshold be the Integer at (context_ptr plus 80)
+    Let body_blocks be the Integer at (loop_ptr plus 32)
+    Let trip_count be the Integer at (loop_ptr plus 64)
+    Let has_multiple_exits be the Integer at (loop_ptr plus 68)
+
+    Note: Count instructions and analyze complexity
+    Let total_instructions be 0
+    Let has_non_inlinable_calls be 0
+    Let memory_ops be 0
+    Let inline_size_threshold be 20
+
+    Let body_list be proc to_list from Set with body_blocks
+    Let body_count be List.length(body_list)
+    Let block_idx be 0
+
+    While block_idx is less than body_count:
+        Let block_id_str be List.get(body_list, block_idx)
+        Let block_id be MIR.string_to_int(block_id_str)
+        Let block_ptr be CFG.get_block_by_id(cfg_ptr, block_id)
+
+        If block_ptr is not equal to 0:
+            Let inst_list be MIR.get_instructions(block_ptr)
+            Let inst_count be List.length(inst_list)
+            Set total_instructions to total_instructions plus inst_count
+
+            Let inst_idx be 0
+            While inst_idx is less than inst_count:
+                Let inst_ptr be List.get(inst_list, inst_idx)
+                Let opcode be MIR.get_opcode(inst_ptr)
+
+                If opcode equals MIR.MIR_CALL:
+                    Note: Check if this call is inlinable
+                    Let callee_fn_ptr be MIR.get_call_target(inst_ptr)
+                    Let is_inlinable be 0
+
+                    If callee_fn_ptr is not equal to 0:
+                        Note: Get callee function size
+                        Let callee_cfg be MIR.get_function_cfg(callee_fn_ptr)
+                        If callee_cfg is not equal to 0:
+                            Let callee_inst_count be CFG.count_instructions(callee_cfg)
+
+                            Note: Function is inlinable if small and non-recursive
+                            If callee_inst_count is less than or equal to inline_size_threshold:
+                                Note: Check for recursion (callee doesn't call itself)
+                                Let has_recursion be MIR.function_is_recursive(callee_fn_ptr)
+                                If has_recursion equals 0:
+                                    Set is_inlinable to 1
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Note: If call is not inlinable, mark as problematic for unrolling
+                    If is_inlinable equals 0:
+                        Set has_non_inlinable_calls to 1
+                    End If
+                End If
+
+                If opcode equals MIR.MIR_LOAD or opcode equals MIR.MIR_STORE:
+                    Set memory_ops to memory_ops plus 1
+                End If
+
+                Set inst_idx to inst_idx plus 1
+            End While
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Reject if too large
+    If total_instructions is greater than code_size_threshold:
+        Return 0
+    End If
+
+    Note: Reject if multiple exits (complex control flow)
+    If has_multiple_exits equals 1:
+        Return 0
+    End If
+
+    Note: Reject if non-inlinable function calls present
+    If has_non_inlinable_calls equals 1:
+        Return 0
+    End If
+
+    Note: Check for full unroll opportunity
+    If trip_count is greater than 0 and trip_count is less than or equal to max_unroll_iterations:
+        Note: Small constant trip count - full unroll is beneficial
+        Return 2
+    End If
+
+    Note: Check for partial unroll opportunity
+    If trip_count is greater than max_unroll_iterations or trip_count equals -1:
+        Let partial_threshold be code_size_threshold divided by 4
+        If total_instructions is less than or equal to partial_threshold:
+            Note: Reasonably small body - partial unroll beneficial
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: Clone a basic block with unique suffix
+Process called "clone_block" that takes context_ptr as Integer, original_block_id as Integer, suffix as Integer returns Integer:
+    @Implementation
+    Block cloning creates a copy of all instructions in the block with new IDs.
+
+    Steps:
+    1. Generate unique block ID (original_id * 1000 + suffix)
+    2. Create new block in CFG
+    3. Clone each instruction using MIR.clone_instruction
+    4. Add cloned instructions to new block
+    5. Update block_clone_map for edge rewriting
+
+    Returns new block ID or 0 on failure.
+    @End Implementation
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let block_clone_map be the Integer at (context_ptr plus 32)
+    Let original_block_ptr be CFG.get_block_by_id(cfg_ptr, original_block_id)
+
+    If original_block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Generate unique block ID
+    Let new_block_id be original_block_id times 1000 plus suffix
+    Let new_block_ptr be CFG.create_block(cfg_ptr, new_block_id)
+
+    If new_block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Clone all instructions
+    Let inst_list be MIR.get_instructions(original_block_ptr)
+    Let inst_count be List.length(inst_list)
+    Let inst_idx be 0
+
+    While inst_idx is less than inst_count:
+        Let original_inst_ptr be List.get(inst_list, inst_idx)
+        Let cloned_inst_ptr be MIR.clone_instruction(original_inst_ptr)
+        MIR.add_instruction(new_block_ptr, cloned_inst_ptr)
+        Set inst_idx to inst_idx plus 1
+    End While
+
+    Note: Update clone map
+    Let original_id_str be MIR.int_to_string(original_block_id)
+    Let new_id_str be MIR.int_to_string(new_block_id)
+    Dictionary.set(block_clone_map, original_id_str, new_id_str)
+
+    Return new_block_id
+End Process
+
+Note: Rename SSA values in cloned block for specific iteration
+Process called "rename_cloned_values" that takes context_ptr as Integer, cloned_block_id as Integer, iteration as Integer returns Nothing:
+    @Implementation
+    SSA renaming ensures each cloned instruction produces unique values.
+
+    For iteration N:
+    - Original: %result = add %a, %b
+    - Renamed: %result.N = add %a.N, %b.N
+
+    Algorithm:
+    1. For each instruction in cloned block:
+         a. Create new SSA name for result value
+         b. Update value_rename_map[original_result][iteration] = new_result
+         c. For each operand:
+              - Look up renamed value from current/previous iterations
+              - Update operand to use renamed value
+
+    The value_rename_map maintains: original_value -> list[iteration] -> renamed_value
+    @End Implementation
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let ssa_ptr be the Integer at (context_ptr plus 24)
+    Let value_rename_map be the Integer at (context_ptr plus 40)
+    Let block_ptr be CFG.get_block_by_id(cfg_ptr, cloned_block_id)
+
+    If block_ptr equals 0:
+        Return
+    End If
+
+    Let inst_list be MIR.get_instructions(block_ptr)
+    Let inst_count be List.length(inst_list)
+    Let inst_idx be 0
+
+    While inst_idx is less than inst_count:
+        Let inst_ptr be List.get(inst_list, inst_idx)
+        Let original_result be MIR.get_result(inst_ptr)
+
+        Note: Rename result value
+        If original_result is not equal to 0:
+            Let new_result be SSA.create_new_value(ssa_ptr, original_result, iteration)
+            MIR.set_result(inst_ptr, new_result)
+
+            Note: Update rename map
+            Let original_result_str be MIR.int_to_string(original_result)
+            Let rename_list be Dictionary.get(value_rename_map, original_result_str)
+
+            If rename_list equals 0:
+                Set rename_list to List.create()
+                Dictionary.set(value_rename_map, original_result_str, rename_list)
+            End If
+
+            Note: Ensure list is large enough
+            While List.length(rename_list) is less than or equal to iteration:
+                List.append(rename_list, 0)
+            End While
+
+            List.set(rename_list, iteration, new_result)
+        End If
+
+        Note: Rename operands
+        Let operand_count be MIR.get_operand_count(inst_ptr)
+        Let op_idx be 0
+
+        While op_idx is less than operand_count:
+            Let original_operand be MIR.get_operand(inst_ptr, op_idx)
+            Let original_operand_str be MIR.int_to_string(original_operand)
+            Let rename_list be Dictionary.get(value_rename_map, original_operand_str)
+
+            If rename_list is not equal to 0:
+                Note: Get renamed value from appropriate iteration
+                If iteration is less than List.length(rename_list):
+                    Let renamed_operand be List.get(rename_list, iteration)
+                    If renamed_operand is not equal to 0:
+                        MIR.set_operand(inst_ptr, op_idx, renamed_operand)
+                    End If
+                End If
+            End If
+
+            Set op_idx to op_idx plus 1
+        End While
+
+        Set inst_idx to inst_idx plus 1
+    End While
+End Process
+
+Note: Perform full loop unrolling (completely eliminate loop)
+Process called "full_unroll_loop" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Implementation
+    Full unrolling transforms:
+    ```
+    for (i = 0; i < N; i++)
+        body(i);
+    ```
+    Into:
+    ```
+    body(0);
+    body(1);
+    ...
+    body(N-1);
+    ```
+
+    Algorithm:
+    1. Verify trip count is constant and <= max_unroll_iterations
+    2. Get canonical induction variable
+    3. For each iteration 0..N-1:
+         a. Clone loop body blocks
+         b. Rename SSA values with iteration suffix
+         c. Substitute IV uses with constant iteration value
+    4. Connect cloned blocks sequentially
+    5. Remove original loop blocks and branches
+    6. Redirect preheader to first iteration, last iteration to exit
+
+    Returns 1 on success, 0 on failure.
+    @End Implementation
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let max_unroll_iterations be the Integer at (context_ptr plus 72)
+    Let header_id be the Integer at loop_ptr
+    Let latch_id be the Integer at (loop_ptr plus 16)
+    Let body_blocks be the Integer at (loop_ptr plus 32)
+    Let trip_count be the Integer at (loop_ptr plus 64)
+    Let induction_vars be the Integer at (loop_ptr plus 56)
+
+    If trip_count is less than or equal to 0 or trip_count is greater than max_unroll_iterations:
+        Return 0
+    End If
+
+    Let iv_count be List.length(induction_vars)
+    If iv_count is less than 1:
+        Return 0
+    End If
+
+    Note: Get primary induction variable
+    Let iv_ptr be List.get(induction_vars, 0)
+    Let phi_inst_ptr be the Integer at iv_ptr
+    Let phi_result be MIR.get_result(phi_inst_ptr)
+    Let init_value be the Integer at (iv_ptr plus 16)
+    Let step_amount be the Integer at (iv_ptr plus 40)
+    Let init_constant be MIR.get_constant_value(init_value)
+
+    Note: Get body blocks excluding header and latch
+    Let body_list be proc to_list from Set with body_blocks
+    Let body_count be List.length(body_list)
+    Let cloned_blocks_per_iteration be List.create()
+
+    Note: Clone body for each iteration
+    Let iter be 0
+    While iter is less than trip_count:
+        Let iv_value be init_constant plus (iter times step_amount)
+        Let iteration_blocks be List.create()
+        Let block_idx be 0
+
+        While block_idx is less than body_count:
+            Let block_id_str be List.get(body_list, block_idx)
+            Let block_id be MIR.string_to_int(block_id_str)
+
+            If block_id is not equal to header_id and block_id is not equal to latch_id:
+                Let cloned_block_id be clone_block(context_ptr, block_id, iter)
+                List.append(iteration_blocks, cloned_block_id)
+                rename_cloned_values(context_ptr, cloned_block_id, iter)
+
+                Note: Substitute IV with constant
+                Let cloned_block_ptr be CFG.get_block_by_id(cfg_ptr, cloned_block_id)
+                MIR.substitute_value_with_constant(cloned_block_ptr, phi_result, iv_value)
+            End If
+
+            Set block_idx to block_idx plus 1
+        End While
+
+        List.append(cloned_blocks_per_iteration, iteration_blocks)
+        Set iter to iter plus 1
+    End While
+
+    Note: Connect iterations sequentially and remove loop blocks
+    Let preheader_id be the Integer at (loop_ptr plus 8)
+    Let exit_block_id be the Integer at (loop_ptr plus 24)
+
+    Note: Get first and last iteration block IDs for redirection
+    Let first_iteration_blocks be List.get(cloned_blocks_per_iteration, 0)
+    Let last_iteration_blocks be List.get(cloned_blocks_per_iteration, trip_count minus 1)
+
+    If first_iteration_blocks is not equal to 0 and List.length(first_iteration_blocks) is greater than 0:
+        Let first_block_id be List.get(first_iteration_blocks, 0)
+
+        Note: Redirect preheader to first iteration block
+        If preheader_id is not equal to 0:
+            Let preheader_block be CFG.get_block_by_id(cfg_ptr, preheader_id)
+            If preheader_block is not equal to 0:
+                Note: Update preheader terminator to branch to first iteration instead of header
+                CFG.redirect_block_successor(preheader_block, header_id, first_block_id)
+            End If
+        End If
+    End If
+
+    Note: Connect iterations sequentially
+    Let iteration_idx be 0
+    While iteration_idx is less than trip_count minus 1:
+        Let current_iter_blocks be List.get(cloned_blocks_per_iteration, iteration_idx)
+        Let next_iter_blocks be List.get(cloned_blocks_per_iteration, iteration_idx plus 1)
+
+        If current_iter_blocks is not equal to 0 and next_iter_blocks is not equal to 0:
+            Let current_count be List.length(current_iter_blocks)
+            Let next_first_block be List.get(next_iter_blocks, 0)
+
+            If current_count is greater than 0:
+                Note: Get last block of current iteration
+                Let current_last_block_id be List.get(current_iter_blocks, current_count minus 1)
+                Let current_last_block be CFG.get_block_by_id(cfg_ptr, current_last_block_id)
+
+                If current_last_block is not equal to 0:
+                    Note: Redirect to next iteration instead of looping back
+                    CFG.redirect_block_successor(current_last_block, header_id, next_first_block)
+                End If
+            End If
+        End If
+
+        Set iteration_idx to iteration_idx plus 1
+    End While
+
+    Note: Redirect last iteration to exit
+    If last_iteration_blocks is not equal to 0 and exit_block_id is not equal to 0:
+        Let last_count be List.length(last_iteration_blocks)
+        If last_count is greater than 0:
+            Let last_block_id be List.get(last_iteration_blocks, last_count minus 1)
+            Let last_block be CFG.get_block_by_id(cfg_ptr, last_block_id)
+
+            If last_block is not equal to 0:
+                Note: Redirect last iteration to exit instead of looping back
+                CFG.redirect_block_successor(last_block, header_id, exit_block_id)
+            End If
+        End If
+    End If
+
+    Note: Remove original loop blocks from CFG
+    Let body_idx be 0
+    While body_idx is less than body_count:
+        Let block_id_str be List.get(body_list, body_idx)
+        Let block_id be MIR.string_to_int(block_id_str)
+        CFG.remove_block(cfg_ptr, block_id)
+        Set body_idx to body_idx plus 1
+    End While
+
+    Let full_unrolls be the Integer at (context_ptr plus 48)
+    Set the Integer at (context_ptr plus 48) to full_unrolls plus 1
+
+    List.destroy(cloned_blocks_per_iteration)
+    Return 1
+End Process
+
+Note: Perform partial loop unrolling with remainder loop
+Process called "partial_unroll_loop" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Implementation
+    Partial unrolling with factor K transforms:
+    ```
+    for (i = 0; i < N; i += 1)
+        body(i);
+    ```
+    Into:
+    ```
+    for (i = 0; i < N - (N % K); i += K) {
+        body(i);
+        body(i+1);
+        ...
+        body(i+K-1);
+    }
+    for (; i < N; i += 1)
+        body(i);  // Remainder loop
+    ```
+
+    Algorithm:
+    1. Clone loop body (K-1) times within the loop
+    2. Rename SSA values for each clone
+    3. Update IV step: step * K
+    4. Adjust loop bound: N - (N % K)
+    5. Create remainder loop for N % K iterations
+    6. Update phi nodes for new control flow
+
+    Returns 1 on success, 0 on failure.
+    @End Implementation
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let unroll_factor be the Integer at (context_ptr plus 64)
+    Let header_id be the Integer at loop_ptr
+    Let latch_id be the Integer at (loop_ptr plus 16)
+    Let body_blocks be the Integer at (loop_ptr plus 32)
+    Let induction_vars be the Integer at (loop_ptr plus 56)
+
+    Let iv_count be List.length(induction_vars)
+    If iv_count is less than 1:
+        Return 0
+    End If
+
+    Let iv_ptr be List.get(induction_vars, 0)
+    Let update_inst_ptr be the Integer at (iv_ptr plus 48)
+    Let step_amount be the Integer at (iv_ptr plus 40)
+    Let new_step be step_amount times unroll_factor
+
+    Note: Get body blocks
+    Let body_list be proc to_list from Set with body_blocks
+    Let body_count be List.length(body_list)
+
+    Note: Clone body (unroll_factor - 1) times
+    Let clone_idx be 1
+    While clone_idx is less than unroll_factor:
+        Let block_idx be 0
+        While block_idx is less than body_count:
+            Let block_id_str be List.get(body_list, block_idx)
+            Let block_id be MIR.string_to_int(block_id_str)
+
+            If block_id is not equal to header_id:
+                Let cloned_block_id be clone_block(context_ptr, block_id, clone_idx)
+                rename_cloned_values(context_ptr, cloned_block_id, clone_idx)
+            End If
+
+            Set block_idx to block_idx plus 1
+        End While
+        Set clone_idx to clone_idx plus 1
+    End While
+
+    Note: Update induction variable step in main loop
+    Let new_step_value be MIR.create_constant(new_step)
+    MIR.set_operand(update_inst_ptr, 1, new_step_value)
+
+    Note: Create remainder loop for (N % unroll_factor) iterations
+    Note: Remainder loop handles remaining iterations with original step
+    Let exit_block_id be the Integer at (loop_ptr plus 24)
+    Let remainder_suffix be 9000
+
+    Note: Clone header for remainder loop
+    Let remainder_header_id be clone_block(context_ptr, header_id, remainder_suffix)
+
+    Note: Clone body blocks for remainder loop (with different suffix)
+    Let remainder_blocks be List.create()
+    Let block_idx be 0
+    While block_idx is less than body_count:
+        Let block_id_str be List.get(body_list, block_idx)
+        Let block_id be MIR.string_to_int(block_id_str)
+
+        If block_id is not equal to header_id and block_id is not equal to latch_id:
+            Let remainder_block_id be clone_block(context_ptr, block_id, remainder_suffix)
+            List.append(remainder_blocks, remainder_block_id)
+            Note: Rename values in remainder block
+            rename_cloned_values(context_ptr, remainder_block_id, remainder_suffix)
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Clone latch for remainder loop
+    Let remainder_latch_id be clone_block(context_ptr, latch_id, remainder_suffix)
+
+    Note: Connect main loop exit to remainder loop header
+    Let main_latch_block be CFG.get_block_by_id(cfg_ptr, latch_id)
+    If main_latch_block is not equal to 0:
+        Note: When main loop exits, enter remainder loop instead of final exit
+        CFG.redirect_block_successor(main_latch_block, exit_block_id, remainder_header_id)
+    End If
+
+    Note: Connect remainder loop exit to original exit block
+    Let remainder_latch_block be CFG.get_block_by_id(cfg_ptr, remainder_latch_id)
+    If remainder_latch_block is not equal to 0:
+        Note: Remainder loop exits to original exit block
+        CFG.redirect_block_successor(remainder_latch_block, remainder_header_id, exit_block_id)
+    End If
+
+    Note: Ensure remainder loop uses original step (not multiplied step)
+    Let remainder_phi be MIR.get_phi_node(remainder_header_id, phi_result)
+    If remainder_phi is not equal to 0:
+        Let remainder_update be MIR.get_phi_update_instruction(remainder_phi)
+        If remainder_update is not equal to 0:
+            Note: Reset step to original value (before multiplication)
+            Let original_step_value be MIR.create_constant(step_amount)
+            MIR.set_operand(remainder_update, 1, original_step_value)
+        End If
+    End If
+
+    List.destroy(remainder_blocks)
+
+    Let partial_unrolls be the Integer at (context_ptr plus 56)
+    Set the Integer at (context_ptr plus 56) to partial_unrolls plus 1
+
+    Return 1
+End Process
+
+Note: Main entry point for loop unrolling optimization
+Process called "optimize_function_with_loop_unrolling" that takes cfg_ptr as Integer returns Integer:
+    @Implementation
+    Loop unrolling pipeline:
+
+    1. Initialize context with CFG, dominance tree, SSA info
+    2. Detect natural loops using back-edge analysis
+    3. For each loop:
+         a. Identify induction variables
+         b. Analyze trip count (constant or symbolic)
+         c. Evaluate profitability (code size, complexity)
+         d. Apply transformation (full or partial unroll)
+    4. Report statistics and clean up
+
+    Returns 1 on success, 0 on failure.
+    @End Implementation
+
+    Let context_ptr be create_loop_unroll_context(cfg_ptr)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let loops_count be detect_natural_loops(context_ptr)
+    If loops_count equals 0:
+        destroy_loop_unroll_context(context_ptr)
+        Return 1
+    End If
+
+    Let loops_list be the Integer at (context_ptr plus 8)
+    Let loop_idx be 0
+
+    While loop_idx is less than loops_count:
+        Let loop_ptr be List.get(loops_list, loop_idx)
+        Let iv_count be identify_induction_variables(context_ptr, loop_ptr)
+        Let trip_count be analyze_trip_count(context_ptr, loop_ptr)
+        Let profitable be is_profitable_to_unroll(context_ptr, loop_ptr)
+
+        If profitable equals 2:
+            full_unroll_loop(context_ptr, loop_ptr)
+        End If
+
+        If profitable equals 1:
+            partial_unroll_loop(context_ptr, loop_ptr)
+        End If
+
+        Set loop_idx to loop_idx plus 1
+    End While
+
+    print_loop_unrolling_stats(context_ptr)
+    destroy_loop_unroll_context(context_ptr)
+
+    Return 1
+End Process
+
+Note: Wrapper for optimization pass execution
+Process called "run_loop_unrolling_pass" that takes cfg_ptr as Integer returns Integer:
+    Let should_run be should_run_loop_unrolling(cfg_ptr)
+    If should_run equals 0:
+        Return 1
+    End If
+
+    Return optimize_function_with_loop_unrolling(cfg_ptr)
+End Process
+
+Note: Check if loop unrolling pass should execute
+Process called "should_run_loop_unrolling" that takes cfg_ptr as Integer returns Integer:
+    Note: Check if CFG has loops (presence of back edges)
+    Let blocks_count be CFG.get_block_count(cfg_ptr)
+    If blocks_count is less than 2:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: Get optimization pass name for pipeline integration
+Process called "get_loop_unrolling_pass_name" returns String:
+    Return "Loop Unrolling"
+End Process
+
+Note: Get optimization pass description
+Process called "get_loop_unrolling_pass_description" returns String:
+    Return "Unrolls loops to reduce branch overhead and enable instruction-level parallelism"
+End Process

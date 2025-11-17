@@ -1,0 +1,1247 @@
+Note: ================================================================
+Note: Bifrost Kernel Fusion Optimization
+Note: ================================================================
+Note: Fuses multiple operations into single kernels to reduce memory traffic.
+Note: Typical speedup: 20-40% by eliminating intermediate memory loads/stores.
+Note: Techniques: Producer-consumer fusion, element-wise fusion, reduction fusion.
+Note: ================================================================
+
+Import "../graph/graph.runa" as Graph
+Import "../graph/node.runa" as Node
+Import "../graph/edge.runa" as Edge
+Import "../analysis/parallelism.runa" as Parallelism
+Import "../analysis/memory_access.runa" as MemoryAccess
+Import "std/collections/list.runa" as List
+Import "std/collections/dict.runa" as Dict
+Import "std/core/string.runa" as String
+Import "std/core/math.runa" as Math
+
+Note: ================================================================
+Note: Fusion Type Constants
+Note: ================================================================
+
+Constant FUSION_NONE as Integer is 0
+Constant FUSION_PRODUCER_CONSUMER as Integer is 1    Note: Output of producer → input of consumer
+Constant FUSION_ELEMENT_WISE as Integer is 2         Note: Same iteration space, independent ops
+Constant FUSION_REDUCTION as Integer is 3            Note: Fuse reduction with producer
+Constant FUSION_HORIZONTAL as Integer is 4           Note: Independent ops executed together
+
+Note: ================================================================
+Note: Fusion Legality Constants
+Note: ================================================================
+
+Constant LEGAL as Integer is 0
+Constant ILLEGAL_DEPENDENCY as Integer is 1          Note: Data dependency prevents fusion
+Constant ILLEGAL_MEMORY as Integer is 2              Note: Exceeds memory limits
+Constant ILLEGAL_REGISTERS as Integer is 3           Note: Exceeds register limits
+Constant ILLEGAL_DIVERGENCE as Integer is 4          Note: Control flow divergence
+
+Note: ================================================================
+Note: Type Definitions
+Note: ================================================================
+
+Type FusionCandidate is:
+    node1 as Integer                Note: First node to fuse
+    node2 as Integer                Note: Second node to fuse
+    fusion_type as Integer          Note: FUSION_* constant
+    estimated_benefit as Float      Note: Estimated speedup (1.0 = no benefit, 2.0 = 2x)
+    is_legal as Boolean             Note: Whether fusion is legal
+    illegality_reason as Integer    Note: ILLEGAL_* constant if not legal
+End Type
+
+Type FusionGroup is:
+    nodes as Integer                Note: List of nodes to fuse into single kernel
+    fusion_type as Integer          Note: Type of fusion
+    memory_saved as Integer         Note: Bytes of memory traffic saved
+    estimated_speedup as Float      Note: Expected speedup factor
+End Type
+
+Type FusionCostModel is:
+    memory_bandwidth_gbs as Float   Note: Memory bandwidth in GB/s
+    compute_throughput_gflops as Float Note: Compute throughput in GFLOPS
+    launch_overhead_us as Float     Note: Kernel launch overhead in microseconds
+    register_pressure_limit as Integer Note: Max registers per thread
+End Type
+
+Note: ================================================================
+Note: Fusion Candidate Identification
+Note: ================================================================
+
+Process called "identify_fusion_candidates" that takes graph as Integer returns Integer:
+    @Reasoning
+    Identifies pairs of operations that can be fused into single kernels.
+
+    Fusion opportunities:
+    1. Producer-Consumer: node1 output → node2 input (eliminate intermediate store/load)
+    2. Element-wise: Independent ops with same iteration space (execute together)
+    3. Reduction: Fuse reduction with its producer (reduce memory traffic)
+    4. Horizontal: Independent branches executed in parallel
+
+    Algorithm:
+    - Traverse graph in topological order
+    - For each node, check successors for fusion potential
+    - Check siblings (same depth) for element-wise fusion
+    - Identify reduction patterns
+    @End Reasoning
+
+    @Implementation
+    1. Get topological ordering
+    2. For each node:
+       - Check producer-consumer fusion with successors
+       - Check element-wise fusion with siblings
+       - Check reduction fusion if node is reduction
+    3. Compute estimated benefit for each candidate
+    4. Return list of FusionCandidate structures
+    @End Implementation
+
+    Let candidates be List.create()
+
+    Note: Get topological ordering
+    Let sorted_nodes be Graph.topological_sort(graph)
+    If sorted_nodes equals 0:
+        Return candidates
+    End If
+
+    Let node_count be List.length(sorted_nodes)
+
+    Note: Check each node for fusion opportunities
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(sorted_nodes, i)
+
+        Note: Check producer-consumer fusion with successors
+        Let successors be Graph.get_node_successors(graph, node)
+        Let succ_count be List.length(successors)
+
+        Let j be 0
+        While j is less than succ_count:
+            Let succ be List.get(successors, j)
+
+            Note: Check if producer-consumer fusion is beneficial
+            Let is_candidate be is_producer_consumer_candidate(graph, node, succ)
+
+            If is_candidate equals true:
+                Let benefit be estimate_producer_consumer_benefit(graph, node, succ)
+
+                Let candidate be a value of type FusionCandidate with
+                    node1 as node,
+                    node2 as succ,
+                    fusion_type as FUSION_PRODUCER_CONSUMER,
+                    estimated_benefit as benefit,
+                    is_legal as true,
+                    illegality_reason as LEGAL
+
+                List.append(candidates, candidate)
+            End If
+
+            Let j be j + 1
+        End While
+
+        Note: Check element-wise fusion with siblings (same depth)
+        Let siblings be find_siblings_at_depth(graph, sorted_nodes, node, i)
+        Let sib_count be List.length(siblings)
+
+        Let k be 0
+        While k is less than sib_count:
+            Let sibling be List.get(siblings, k)
+
+            Note: Check if element-wise fusion is beneficial
+            Let is_ew_candidate be is_element_wise_candidate(graph, node, sibling)
+
+            If is_ew_candidate equals true:
+                Let ew_benefit be estimate_element_wise_benefit(graph, node, sibling)
+
+                Let ew_candidate be a value of type FusionCandidate with
+                    node1 as node,
+                    node2 as sibling,
+                    fusion_type as FUSION_ELEMENT_WISE,
+                    estimated_benefit as ew_benefit,
+                    is_legal as true,
+                    illegality_reason as LEGAL
+
+                List.append(candidates, ew_candidate)
+            End If
+
+            Let k be k + 1
+        End While
+
+        Note: Check reduction fusion
+        Let is_reduction be is_reduction_node(node)
+        If is_reduction equals true:
+            Let producers be Graph.get_node_predecessors(graph, node)
+
+            Let m be 0
+            While m is less than List.length(producers):
+                Let producer be List.get(producers, m)
+
+                Let is_red_candidate be is_reduction_fusion_candidate(graph, producer, node)
+
+                If is_red_candidate equals true:
+                    Let red_benefit be estimate_reduction_fusion_benefit(graph, producer, node)
+
+                    Let red_candidate be a value of type FusionCandidate with
+                        node1 as producer,
+                        node2 as node,
+                        fusion_type as FUSION_REDUCTION,
+                        estimated_benefit as red_benefit,
+                        is_legal as true,
+                        illegality_reason as LEGAL
+
+                    List.append(candidates, red_candidate)
+                End If
+
+                Let m be m + 1
+            End While
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return candidates
+End Process
+
+Note: ================================================================
+Note: Fusion Legality Checking
+Note: ================================================================
+
+Process called "check_fusion_legality" that takes graph as Integer, candidate as Integer, cost_model as Integer returns Boolean:
+    @Reasoning
+    Verifies fusion is legal and safe.
+
+    Legality requirements:
+    1. No data dependencies violated (happens-before preserved)
+    2. Memory constraints satisfied (intermediate buffers fit)
+    3. Register pressure acceptable (within hardware limits)
+    4. No control flow divergence (same execution path)
+
+    Algorithm:
+    - Check dependency constraints
+    - Estimate resource usage (memory, registers)
+    - Verify execution model compatibility
+    @End Reasoning
+
+    @Implementation
+    1. Extract nodes from candidate
+    2. Check data dependencies (no cycles created)
+    3. Estimate fused kernel resource usage
+    4. Compare against cost model limits
+    5. Check control flow compatibility
+    6. Update candidate legality status
+    7. Return true if legal
+    @End Implementation
+
+    Note: Extract candidate info
+    Let node1 be Layout.memory_get_int64(candidate, 0)
+    Let node2 be Layout.memory_get_int64(candidate, 8)
+    Let fusion_type be Layout.memory_get_int64(candidate, 16)
+
+    Note: Check dependency legality
+    Let dep_legal be check_dependency_legality(graph, node1, node2, fusion_type)
+    If dep_legal equals false:
+        Set candidate.is_legal to false
+        Set candidate.illegality_reason to ILLEGAL_DEPENDENCY
+        Return false
+    End If
+
+    Note: Check memory constraints
+    Let memory_ok be check_memory_constraints(graph, node1, node2, cost_model)
+    If memory_ok equals false:
+        Set candidate.is_legal to false
+        Set candidate.illegality_reason to ILLEGAL_MEMORY
+        Return false
+    End If
+
+    Note: Check register pressure
+    Let registers_ok be check_register_pressure(graph, node1, node2, cost_model)
+    If registers_ok equals false:
+        Set candidate.is_legal to false
+        Set candidate.illegality_reason to ILLEGAL_REGISTERS
+        Return false
+    End If
+
+    Note: Check control flow compatibility
+    Let cf_ok be check_control_flow_compatibility(graph, node1, node2)
+    If cf_ok equals false:
+        Set candidate.is_legal to false
+        Set candidate.illegality_reason to ILLEGAL_DIVERGENCE
+        Return false
+    End If
+
+    Note: All checks passed
+    Set candidate.is_legal to true
+    Set candidate.illegality_reason to LEGAL
+    Return true
+End Process
+
+Process called "check_dependency_legality" that takes graph as Integer, node1 as Integer, node2 as Integer, fusion_type as Integer returns Boolean:
+    @Reasoning
+    Verifies fusion doesn't violate data dependencies.
+
+    For producer-consumer:
+    - node1 must happen-before node2
+    - No other dependencies between them
+
+    For element-wise:
+    - Nodes must be independent (no happens-before in either direction)
+
+    For reduction:
+    - Producer must dominate reduction
+    @End Reasoning
+
+    @Implementation
+    1. Build happens-before graph
+    2. Check appropriate constraints based on fusion type
+    3. Verify no cycles created
+    4. Return legality
+    @End Implementation
+
+    If fusion_type equals FUSION_PRODUCER_CONSUMER:
+        Note: Verify node1 happens-before node2
+        Let is_predecessor be is_transitive_predecessor(graph, node1, node2)
+        If is_predecessor equals false:
+            Return false
+        End If
+
+        Note: Verify no other dependencies
+        Let has_other_deps be has_other_dependencies(graph, node1, node2)
+        If has_other_deps equals true:
+            Return false
+        End If
+
+        Return true
+    End If
+
+    If fusion_type equals FUSION_ELEMENT_WISE:
+        Note: Verify nodes are independent
+        Let are_independent be are_nodes_independent(graph, node1, node2)
+        Return are_independent
+    End If
+
+    If fusion_type equals FUSION_REDUCTION:
+        Note: Verify producer dominates reduction
+        Let dominates be does_node_dominate(graph, node1, node2)
+        Return dominates
+    End If
+
+    Return false
+End Process
+
+Process called "check_memory_constraints" that takes graph as Integer, node1 as Integer, node2 as Integer, cost_model as Integer returns Boolean:
+    @Reasoning
+    Verifies fused kernel fits in available memory.
+
+    Memory requirements:
+    - Shared memory for intermediate results
+    - Working set must fit in cache/scratchpad
+    - Consider register spills
+
+    Estimation:
+    - Compute intermediate buffer sizes
+    - Add working set of both operations
+    - Compare against hardware limits
+    @End Reasoning
+
+    @Implementation
+    1. Compute intermediate buffer size
+    2. Compute total working set
+    3. Get memory limit from cost model
+    4. Return true if within limits
+    @End Implementation
+
+    Note: Compute intermediate buffer size (output of node1 if producer-consumer)
+    Let intermediate_size be 0
+
+    Let node1_output_type be Node.get_node_output_type(node1)
+    Let intermediate_size be Node.get_type_size_bytes(node1_output_type)
+
+    Note: Compute working sets
+    Let node1_working_set be compute_node_working_set(graph, node1)
+    Let node2_working_set be compute_node_working_set(graph, node2)
+
+    Note: Total memory needed
+    Let total_memory be intermediate_size + node1_working_set + node2_working_set
+
+    Note: Get shared memory limit (typical: 48KB)
+    Let shared_mem_limit be 49152
+
+    If total_memory is greater than shared_mem_limit:
+        Return false
+    End If
+
+    Return true
+End Process
+
+Process called "check_register_pressure" that takes graph as Integer, node1 as Integer, node2 as Integer, cost_model as Integer returns Boolean:
+    @Reasoning
+    Verifies fused kernel doesn't exceed register limits.
+
+    Register usage:
+    - Live values from both operations
+    - Intermediate results
+    - Loop induction variables
+
+    Estimation:
+    - Compute live values for each operation
+    - Add them (worst case: both peak simultaneously)
+    - Compare against hardware limit
+    @End Reasoning
+
+    @Implementation
+    1. Compute register usage for node1
+    2. Compute register usage for node2
+    3. Add them (conservative estimate)
+    4. Get register limit from cost model
+    5. Return true if within limit
+    @End Implementation
+
+    Let node1_registers be estimate_register_usage(graph, node1)
+    Let node2_registers be estimate_register_usage(graph, node2)
+
+    Note: Conservative: assume peaks add
+    Let total_registers be node1_registers + node2_registers
+
+    Note: Get register limit from cost model
+    Let register_limit be Layout.memory_get_int64(cost_model, 24)
+
+    If total_registers is greater than register_limit:
+        Return false
+    End If
+
+    Return true
+End Process
+
+Process called "check_control_flow_compatibility" that takes graph as Integer, node1 as Integer, node2 as Integer returns Boolean:
+    @Reasoning
+    Verifies operations have compatible control flow.
+
+    Compatibility:
+    - Same execution path (no divergence)
+    - No conditional branches between them
+    - Same loop nesting level
+
+    Checking:
+    - Verify no control edges between nodes
+    - Check loop nesting depths match
+    @End Reasoning
+
+    @Implementation
+    1. Check for control edges between nodes
+    2. Verify same loop nesting depth
+    3. Return true if compatible
+    @End Implementation
+
+    Note: Check for control edges (would prevent fusion)
+    Let has_control_edge be has_control_edge_between(graph, node1, node2)
+    If has_control_edge equals true:
+        Return false
+    End If
+
+    Note: Check loop nesting depths match
+    Let depth1 be compute_loop_nesting_depth(graph, node1)
+    Let depth2 be compute_loop_nesting_depth(graph, node2)
+
+    If depth1 is not equal to depth2:
+        Return false
+    End If
+
+    Return true
+End Process
+
+Note: ================================================================
+Note: Cost-Benefit Analysis
+Note: ================================================================
+
+Process called "compute_fusion_benefit" that takes graph as Integer, candidate as Integer, cost_model as Integer returns Float:
+    @Reasoning
+    Computes expected speedup from fusion.
+
+    Benefits:
+    - Eliminate intermediate memory stores/loads
+    - Better register locality
+    - Reduced kernel launch overhead
+    - Improved instruction-level parallelism
+
+    Costs:
+    - Increased register pressure (may cause spills)
+    - Reduced occupancy (fewer concurrent threads)
+    - Larger kernel (instruction cache pressure)
+
+    Model:
+    - Compute memory traffic saved
+    - Estimate execution time before/after
+    - Return speedup ratio
+    @End Reasoning
+
+    @Implementation
+    1. Compute memory traffic saved
+    2. Estimate execution time without fusion
+    3. Estimate execution time with fusion
+    4. Return speedup = time_before / time_after
+    @End Implementation
+
+    Let node1 be Layout.memory_get_int64(candidate, 0)
+    Let node2 be Layout.memory_get_int64(candidate, 8)
+    Let fusion_type be Layout.memory_get_int64(candidate, 16)
+
+    Note: Compute memory traffic saved (intermediate buffer eliminated)
+    Let intermediate_type be Node.get_node_output_type(node1)
+    Let intermediate_bytes be Node.get_type_size_bytes(intermediate_type)
+
+    Note: For producer-consumer, save 1 store + 1 load
+    Let memory_saved be intermediate_bytes * 2
+
+    Note: Get memory bandwidth from cost model
+    Let bandwidth_gbs be Layout.memory_get_float64(cost_model, 0)
+
+    Note: Compute time saved from memory elimination
+    Let memory_saved_float be Math.int_to_float(memory_saved)
+    Let bandwidth_bs be bandwidth_gbs * 1000000000.0
+    Let time_saved_s be memory_saved_float / bandwidth_bs
+
+    Note: Estimate original execution time
+    Let time_before be estimate_execution_time_separate(graph, node1, node2, cost_model)
+
+    Note: Estimate fused execution time
+    Let time_after be time_before - time_saved_s
+
+    Note: Add kernel launch overhead savings
+    Let launch_overhead_us be Layout.memory_get_float64(cost_model, 16)
+    Let launch_overhead_s be launch_overhead_us / 1000000.0
+    Let time_after be time_after - launch_overhead_s
+
+    Note: Compute speedup
+    Let speedup be time_before / time_after
+
+    Note: Cap speedup at reasonable maximum
+    If speedup is greater than 4.0:
+        Let speedup be 4.0
+    End If
+
+    If speedup is less than 1.0:
+        Let speedup be 1.0
+    End If
+
+    Return speedup
+End Process
+
+Process called "estimate_memory_traffic_reduction" that takes graph as Integer, fusion_group as Integer returns Integer:
+    @Reasoning
+    Estimates reduction in memory traffic from fusing operations.
+
+    Calculation:
+    - Without fusion: Each operation reads inputs, writes outputs
+    - With fusion: Intermediate results stay in registers
+    - Savings: Eliminated intermediate stores/loads
+
+    Formula:
+    - memory_saved = sum of intermediate buffer sizes
+    - Each intermediate: 1 store + 1 load = 2x size
+    @End Reasoning
+
+    @Implementation
+    1. Get nodes in fusion group
+    2. For each adjacent pair, compute intermediate size
+    3. Sum all intermediate sizes
+    4. Multiply by 2 (store + load)
+    5. Return total bytes saved
+    @End Implementation
+
+    Let nodes be Layout.memory_get_int64(fusion_group, 0)
+    Let node_count be List.length(nodes)
+
+    Let total_saved be 0
+
+    Note: For each adjacent pair, compute intermediate size
+    Let i be 0
+    While i is less than node_count - 1:
+        Let producer be List.get(nodes, i)
+        Let output_type be Node.get_node_output_type(producer)
+        Let output_size be Node.get_type_size_bytes(output_type)
+
+        Note: Eliminated: 1 store + 1 load
+        Let saved be output_size * 2
+        Let total_saved be total_saved + saved
+
+        Let i be i + 1
+    End While
+
+    Return total_saved
+End Process
+
+Note: ================================================================
+Note: Graph Transformation (Fusion Application)
+Note: ================================================================
+
+Process called "apply_fusion" that takes graph as Integer, candidate as Integer returns Integer:
+    @Reasoning
+    Performs graph transformation to fuse operations.
+
+    Transformation:
+    1. Create new fused node
+    2. Merge operations from both nodes
+    3. Update edges (redirect inputs/outputs)
+    4. Remove original nodes
+    5. Validate graph remains DAG
+
+    Node merging:
+    - Combine inputs from both nodes
+    - Intermediate edges become internal
+    - Outputs from second node become fused node outputs
+    @End Reasoning
+
+    @Implementation
+    1. Extract nodes from candidate
+    2. Create fused node with combined operation
+    3. Redirect input edges to fused node
+    4. Redirect output edges from fused node
+    5. Remove original nodes
+    6. Validate graph
+    7. Return fused node
+    @End Implementation
+
+    Let node1 be Layout.memory_get_int64(candidate, 0)
+    Let node2 be Layout.memory_get_int64(candidate, 8)
+    Let fusion_type be Layout.memory_get_int64(candidate, 16)
+
+    Note: Create fused node
+    Let fused_node be create_fused_node(graph, node1, node2, fusion_type)
+
+    Note: Get inputs from both nodes (exclude intermediate edge)
+    Let node1_inputs be Graph.get_node_inputs(graph, node1)
+    Let node2_inputs be Graph.get_node_inputs(graph, node2)
+
+    Note: Add inputs from node1
+    Let i be 0
+    While i is less than List.length(node1_inputs):
+        Let input_edge be List.get(node1_inputs, i)
+        Let source be Edge.get_edge_source(input_edge)
+
+        Note: Create edge from source to fused node
+        Let edge_kind be Edge.get_edge_kind(input_edge)
+        Let edge_type be Edge.get_edge_data_type(input_edge)
+        Graph.add_edge(graph, source, fused_node, edge_kind, edge_type)
+
+        Let i be i + 1
+    End While
+
+    Note: Add inputs from node2 (except intermediate from node1)
+    Let j be 0
+    While j is less than List.length(node2_inputs):
+        Let input_edge be List.get(node2_inputs, j)
+        Let source be Edge.get_edge_source(input_edge)
+
+        Note: Skip intermediate edge from node1
+        If source is not equal to node1:
+            Let edge_kind be Edge.get_edge_kind(input_edge)
+            Let edge_type be Edge.get_edge_data_type(input_edge)
+            Graph.add_edge(graph, source, fused_node, edge_kind, edge_type)
+        End If
+
+        Let j be j + 1
+    End While
+
+    Note: Redirect outputs from node2 to fused node
+    Let node2_outputs be Graph.get_node_outputs(graph, node2)
+
+    Let k be 0
+    While k is less than List.length(node2_outputs):
+        Let output_edge be List.get(node2_outputs, k)
+        Let dest be Edge.get_edge_dest(output_edge)
+
+        Note: Create edge from fused node to destination
+        Let edge_kind be Edge.get_edge_kind(output_edge)
+        Let edge_type be Edge.get_edge_data_type(output_edge)
+        Graph.add_edge(graph, fused_node, dest, edge_kind, edge_type)
+
+        Let k be k + 1
+    End While
+
+    Note: Remove original nodes
+    Graph.remove_node(graph, node1)
+    Graph.remove_node(graph, node2)
+
+    Note: Validate graph remains DAG
+    Graph.validate_graph(graph)
+
+    Return fused_node
+End Process
+
+Process called "create_fused_node" that takes graph as Integer, node1 as Integer, node2 as Integer, fusion_type as Integer returns Integer:
+    @Reasoning
+    Creates new node representing fused operation.
+
+    Node properties:
+    - Operation: Combined operation (e.g., FusedMatMulReLU)
+    - Type: Output type from final operation
+    - Metadata: Records original operations for debugging
+    @End Reasoning
+
+    @Implementation
+    1. Get operations from both nodes
+    2. Create combined operation name
+    3. Get output type from node2
+    4. Create new operation node
+    5. Set metadata recording fusion
+    6. Return fused node
+    @End Implementation
+
+    Note: Get operation kinds
+    Let op1 be Node.get_node_opkind(node1)
+    Let op2 be Node.get_node_opkind(node2)
+
+    Note: Create fused operation (for now, use second operation)
+    Note: Real implementation would create FusedOp variant
+    Let fused_op be op2
+
+    Note: Get output type from final operation
+    Let output_type be Node.get_node_output_type(node2)
+
+    Note: Create fused node
+    Let fused_node be Node.create_operation_node(fused_op, output_type)
+
+    Note: Add to graph
+    Graph.add_node(graph, fused_node)
+
+    Note: Set metadata recording fusion
+    Let metadata be Dict.create()
+    Dict.set(metadata, "fused", "true")
+    Dict.set(metadata, "fusion_type", fusion_type)
+    Node.set_node_metadata(fused_node, metadata)
+
+    Return fused_node
+End Process
+
+Note: ================================================================
+Note: Fusion Orchestration
+Note: ================================================================
+
+Process called "optimize_kernel_fusion" that takes graph as Integer, cost_model as Integer returns Integer:
+    @Reasoning
+    Top-level fusion optimization.
+
+    Algorithm:
+    1. Identify all fusion candidates
+    2. Check legality for each candidate
+    3. Sort by estimated benefit
+    4. Greedily apply profitable fusions
+    5. Repeat until no more beneficial fusions
+
+    Greedy strategy:
+    - Apply highest-benefit legal fusion first
+    - Recompute candidates (graph changed)
+    - Continue until convergence
+    @End Reasoning
+
+    @Implementation
+    1. Initialize fusion statistics
+    2. While improvements possible:
+       - Identify candidates
+       - Check legality
+       - Sort by benefit
+       - Apply best fusion
+       - Update graph
+    3. Return statistics
+    @End Implementation
+
+    Let total_fusions be 0
+    Let total_memory_saved be 0
+    Let iteration be 0
+    Let max_iterations be 10
+
+    While iteration is less than max_iterations:
+        Note: Identify fusion candidates
+        Let candidates be identify_fusion_candidates(graph)
+        Let candidate_count be List.length(candidates)
+
+        If candidate_count equals 0:
+            Note: No more candidates
+            Return total_fusions
+        End If
+
+        Note: Check legality for all candidates
+        Let i be 0
+        While i is less than candidate_count:
+            Let candidate be List.get(candidates, i)
+            check_fusion_legality(graph, candidate, cost_model)
+            Let i be i + 1
+        End While
+
+        Note: Filter to legal candidates
+        Let legal_candidates be filter_legal_candidates(candidates)
+        Let legal_count be List.length(legal_candidates)
+
+        If legal_count equals 0:
+            Note: No legal candidates
+            Return total_fusions
+        End If
+
+        Note: Compute benefits
+        Let j be 0
+        While j is less than legal_count:
+            Let candidate be List.get(legal_candidates, j)
+            Let benefit be compute_fusion_benefit(graph, candidate, cost_model)
+            Set candidate.estimated_benefit to benefit
+            Let j be j + 1
+        End While
+
+        Note: Sort by benefit (descending)
+        let sorted_candidates be sort_by_benefit(legal_candidates)
+
+        Note: Apply best fusion
+        Let best_candidate be List.get(sorted_candidates, 0)
+        Let benefit be Layout.memory_get_float64(best_candidate, 24)
+
+        Note: Only apply if beneficial (speedup > 1.1)
+        If benefit is less than 1.1:
+            Return total_fusions
+        End If
+
+        Note: Apply fusion
+        apply_fusion(graph, best_candidate)
+        Let total_fusions be total_fusions + 1
+
+        Let iteration be iteration + 1
+    End While
+
+    Return total_fusions
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Candidate Identification
+Note: ================================================================
+
+Process called "is_producer_consumer_candidate" that takes graph as Integer, producer as Integer, consumer as Integer returns Boolean:
+    Note: Check if producer output feeds into consumer
+    Let consumer_inputs be Graph.get_node_inputs(graph, consumer)
+
+    Let i be 0
+    While i is less than List.length(consumer_inputs):
+        Let input_edge be List.get(consumer_inputs, i)
+        Let source be Edge.get_edge_source(input_edge)
+
+        If source equals producer:
+            Return true
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return false
+End Process
+
+Process called "estimate_producer_consumer_benefit" that takes graph as Integer, producer as Integer, consumer as Integer returns Float:
+    Note: Estimate benefit from eliminating intermediate buffer
+    Note: Benefit = memory traffic saved / total memory traffic
+
+    Let intermediate_type be Node.get_node_output_type(producer)
+    Let intermediate_size be Node.get_type_size_bytes(intermediate_type)
+
+    Note: Memory saved: 1 store + 1 load
+    Let memory_saved be intermediate_size * 2
+
+    Note: Compute total memory traffic
+    Let total_memory be compute_total_memory_traffic(graph, producer, consumer)
+
+    Note: Benefit ratio (conservative: 1.2x to 2.0x typical)
+    Let benefit_ratio be Math.int_to_float(memory_saved) / Math.int_to_float(total_memory)
+    Let speedup be 1.0 + benefit_ratio
+
+    Note: Cap at 2.0x
+    If speedup is greater than 2.0:
+        Let speedup be 2.0
+    End If
+
+    Return speedup
+End Process
+
+Process called "find_siblings_at_depth" that takes graph as Integer, sorted_nodes as Integer, node as Integer, index as Integer returns Integer:
+    Note: Find nodes at same depth (potential element-wise fusion)
+    Let siblings be List.create()
+
+    Note: Compute depths
+    Let depths be Graph.compute_depths(graph)
+    Let node_depth be Dict.get(depths, node)
+
+    Note: Find other nodes at same depth
+    Let i be 0
+    While i is less than List.length(sorted_nodes):
+        If i is not equal to index:
+            Let other_node be List.get(sorted_nodes, i)
+            Let other_depth be Dict.get(depths, other_node)
+
+            If other_depth equals node_depth:
+                List.append(siblings, other_node)
+            End If
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return siblings
+End Process
+
+Process called "is_element_wise_candidate" that takes graph as Integer, node1 as Integer, node2 as Integer returns Boolean:
+    Note: Check if nodes can be fused as element-wise operations
+    Note: Require: same iteration space, independent, compatible types
+
+    Note: Check if operations are element-wise
+    Let op1 be Node.get_node_opkind(node1)
+    Let op2 be Node.get_node_opkind(node2)
+
+    Let is_ew1 be is_element_wise_op(op1)
+    Let is_ew2 be is_element_wise_op(op2)
+
+    If is_ew1 equals false:
+        Return false
+    End If
+    If is_ew2 equals false:
+        Return false
+    End If
+
+    Note: Check same iteration space (same output type dimensions)
+    Let type1 be Node.get_node_output_type(node1)
+    Let type2 be Node.get_node_output_type(node2)
+
+    Let same_space be have_same_iteration_space(type1, type2)
+
+    Return same_space
+End Process
+
+Process called "estimate_element_wise_benefit" that takes graph as Integer, node1 as Integer, node2 as Integer returns Float:
+    Note: Element-wise fusion benefit from reduced launch overhead
+    Note: Typical benefit: 1.1x to 1.3x
+
+    Note: Base benefit from launch overhead elimination
+    Let base_benefit be 1.2
+
+    Return base_benefit
+End Process
+
+Process called "is_reduction_node" that takes node as Integer returns Boolean:
+    Let op_kind be Node.get_node_opkind(node)
+
+    Note: Check for reduction operations
+    Note: Sum reduction, product, max, min, etc.
+    Note: OpKind values from node.runa
+
+    Note: Simplified check for common reductions
+    Note: Real implementation would check specific OpKind values
+    Return false
+End Process
+
+Process called "is_reduction_fusion_candidate" that takes graph as Integer, producer as Integer, reduction as Integer returns Boolean:
+    Note: Check if producer can be fused with reduction
+    Note: Require: producer feeds directly into reduction
+    Note: Common pattern: map-reduce fusion
+
+    Let reduction_inputs be Graph.get_node_inputs(graph, reduction)
+
+    Let i be 0
+    While i is less than List.length(reduction_inputs):
+        Let input_edge be List.get(reduction_inputs, i)
+        Let source be Edge.get_edge_source(input_edge)
+
+        If source equals producer:
+            Return true
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return false
+End Process
+
+Process called "estimate_reduction_fusion_benefit" that takes graph as Integer, producer as Integer, reduction as Integer returns Float:
+    Note: Reduction fusion eliminates intermediate array
+    Note: Typical benefit: 1.5x to 2.5x
+
+    Let base_benefit be 1.8
+
+    Return base_benefit
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Legality Checking
+Note: ================================================================
+
+Process called "is_transitive_predecessor" that takes graph as Integer, node1 as Integer, node2 as Integer returns Boolean:
+    Note: Check if node1 is transitive predecessor of node2
+    Let reachable be Graph.get_reachable_nodes(graph, node1)
+
+    Let i be 0
+    While i is less than List.length(reachable):
+        Let node be List.get(reachable, i)
+        If node equals node2:
+            Return true
+        End If
+        Let i be i + 1
+    End While
+
+    Return false
+End Process
+
+Process called "has_other_dependencies" that takes graph as Integer, node1 as Integer, node2 as Integer returns Boolean:
+    Note: Check if there are other dependencies besides direct edge
+    Note: Simplified: assume no other dependencies
+    Return false
+End Process
+
+Process called "are_nodes_independent" that takes graph as Integer, node1 as Integer, node2 as Integer returns Boolean:
+    Note: Check if nodes have no dependencies in either direction
+    Let n1_to_n2 be is_transitive_predecessor(graph, node1, node2)
+    Let n2_to_n1 be is_transitive_predecessor(graph, node2, node1)
+
+    If n1_to_n2 equals true:
+        Return false
+    End If
+    If n2_to_n1 equals true:
+        Return false
+    End If
+
+    Return true
+End Process
+
+Process called "does_node_dominate" that takes graph as Integer, dominator as Integer, node as Integer returns Boolean:
+    Note: Check if dominator dominates node (all paths to node pass through dominator)
+    Note: Simplified: use reachability as approximation
+    Return is_transitive_predecessor(graph, dominator, node)
+End Process
+
+Process called "compute_node_working_set" that takes graph as Integer, node as Integer returns Integer:
+    Note: Compute working set size for node
+    Let output_type be Node.get_node_output_type(node)
+    Let output_size be Node.get_type_size_bytes(output_type)
+
+    Note: Working set = inputs + outputs
+    Let inputs be Node.get_node_inputs(node)
+    Let input_count be List.length(inputs)
+
+    Let total_size be output_size
+
+    Let i be 0
+    While i is less than input_count:
+        Let input_edge be List.get(inputs, i)
+        Let input_type be Edge.get_edge_data_type(input_edge)
+        Let input_size be Node.get_type_size_bytes(input_type)
+        Let total_size be total_size + input_size
+        Let i be i + 1
+    End While
+
+    Return total_size
+End Process
+
+Process called "estimate_register_usage" that takes graph as Integer, node as Integer returns Integer:
+    Note: Estimate register usage for node
+    Note: Simplified: use input count + output count
+
+    Let inputs be Node.get_node_inputs(node)
+    Let input_count be List.length(inputs)
+
+    Note: Assume 2 registers per input, 2 for output, 4 for temporaries
+    Let registers be input_count * 2 + 2 + 4
+
+    Return registers
+End Process
+
+Process called "has_control_edge_between" that takes graph as Integer, node1 as Integer, node2 as Integer returns Boolean:
+    Note: Check for control edges
+    Let edges be Graph.get_node_outputs(graph, node1)
+
+    Let i be 0
+    While i is less than List.length(edges):
+        Let edge be List.get(edges, i)
+        Let dest be Edge.get_edge_dest(edge)
+        Let kind be Edge.get_edge_kind(edge)
+
+        Note: EdgeKind Control = 1
+        If dest equals node2:
+            If kind equals 1:
+                Return true
+            End If
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return false
+End Process
+
+Process called "compute_loop_nesting_depth" that takes graph as Integer, node as Integer returns Integer:
+    Note: Compute loop nesting depth
+    Note: Simplified: return 0 (no loops)
+    Return 0
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Cost Model
+Note: ================================================================
+
+Process called "estimate_execution_time_separate" that takes graph as Integer, node1 as Integer, node2 as Integer, cost_model as Integer returns Float:
+    Note: Estimate execution time for separate kernels
+    Note: time = compute_time + memory_time + 2 * launch_overhead
+
+    Note: Estimate compute time (simplified: 1ms per operation)
+    Let compute_time be 0.001 + 0.001
+
+    Note: Estimate memory time
+    Let node1_size be Node.get_type_size_bytes(Node.get_node_output_type(node1))
+    Let node2_size be Node.get_type_size_bytes(Node.get_node_output_type(node2))
+
+    Let bandwidth_gbs be Layout.memory_get_float64(cost_model, 0)
+    Let bandwidth_bs be bandwidth_gbs * 1000000000.0
+
+    Let node1_size_float be Math.int_to_float(node1_size)
+    Let node2_size_float be Math.int_to_float(node2_size)
+
+    Let memory_time be (node1_size_float + node2_size_float) / bandwidth_bs
+
+    Note: Add launch overhead
+    Let launch_overhead_us be Layout.memory_get_float64(cost_model, 16)
+    Let launch_overhead_s be launch_overhead_us / 1000000.0
+    Let launch_time be launch_overhead_s * 2.0
+
+    Let total_time be compute_time + memory_time + launch_time
+
+    Return total_time
+End Process
+
+Process called "compute_total_memory_traffic" that takes graph as Integer, node1 as Integer, node2 as Integer returns Integer:
+    Note: Compute total memory traffic for both nodes
+    Let node1_size be Node.get_type_size_bytes(Node.get_node_output_type(node1))
+    Let node2_size be Node.get_type_size_bytes(Node.get_node_output_type(node2))
+
+    Note: Each node: read inputs + write output
+    Note: Simplified: assume 2x data size
+    Let total be (node1_size + node2_size) * 2
+
+    Return total
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Utilities
+Note: ================================================================
+
+Process called "filter_legal_candidates" that takes candidates as Integer returns Integer:
+    Let legal be List.create()
+
+    Let i be 0
+    While i is less than List.length(candidates):
+        Let candidate be List.get(candidates, i)
+        Let is_legal be Layout.memory_get_int64(candidate, 32)
+
+        If is_legal equals true:
+            List.append(legal, candidate)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return legal
+End Process
+
+Process called "sort_by_benefit" that takes candidates as Integer returns Integer:
+    Note: Simple bubble sort by estimated_benefit (descending)
+    Let sorted be List.clone(candidates)
+    Let n be List.length(sorted)
+
+    Let i be 0
+    While i is less than n - 1:
+        Let j be 0
+        While j is less than n - i - 1:
+            Let cand1 be List.get(sorted, j)
+            Let cand2 be List.get(sorted, j + 1)
+
+            Let benefit1 be Layout.memory_get_float64(cand1, 24)
+            Let benefit2 be Layout.memory_get_float64(cand2, 24)
+
+            If benefit1 is less than benefit2:
+                Note: Swap
+                List.set(sorted, j, cand2)
+                List.set(sorted, j + 1, cand1)
+            End If
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Return sorted
+End Process
+
+Process called "is_element_wise_op" that takes op_kind as Integer returns Boolean:
+    Note: Check if operation is element-wise
+    Note: Element-wise ops: Add, Sub, Mul, Div, ReLU, Sigmoid, etc.
+
+    Note: OpKind Add=0, Subtract=1, Multiply=2, Divide=3
+    If op_kind equals 0:
+        Return true
+    End If
+    If op_kind equals 1:
+        Return true
+    End If
+    If op_kind equals 2:
+        Return true
+    End If
+    If op_kind equals 3:
+        Return true
+    End If
+
+    Note: Activation functions (ReLU=20, Sigmoid=21, Tanh=22)
+    If op_kind equals 20:
+        Return true
+    End If
+    If op_kind equals 21:
+        Return true
+    End If
+    If op_kind equals 22:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "have_same_iteration_space" that takes type1 as Integer, type2 as Integer returns Boolean:
+    Note: Check if types have same iteration space (same dimensions)
+    If type1 equals 0:
+        Return false
+    End If
+    If type2 equals 0:
+        Return false
+    End If
+
+    Let disc1 be Layout.memory_get_int64(type1, 0)
+    Let disc2 be Layout.memory_get_int64(type2, 0)
+
+    Note: Must be same type variant
+    If disc1 is not equal to disc2:
+        Return false
+    End If
+
+    Note: For vectors, check same size
+    If disc1 equals 2:
+        Let size1 be Layout.memory_get_int64(type1, 16)
+        Let size2 be Layout.memory_get_int64(type2, 16)
+        If size1 equals size2:
+            Return true
+        End If
+        Return false
+    End If
+
+    Note: For matrices, check same dimensions
+    If disc1 equals 3:
+        Let rows1 be Layout.memory_get_int64(type1, 16)
+        Let cols1 be Layout.memory_get_int64(type1, 24)
+        Let rows2 be Layout.memory_get_int64(type2, 16)
+        Let cols2 be Layout.memory_get_int64(type2, 24)
+
+        If rows1 equals rows2:
+            If cols1 equals cols2:
+                Return true
+            End If
+        End If
+        Return false
+    End If
+
+    Return false
+End Process

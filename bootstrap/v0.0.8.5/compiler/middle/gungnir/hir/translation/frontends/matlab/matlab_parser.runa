@@ -1,0 +1,1779 @@
+Note: ===================================================================
+Note: MATLAB PARSER
+Note: ===================================================================
+Note: Syntactic analysis for MATLAB (Matrix Laboratory) producing an
+Note: Abstract Syntax Tree (AST) for the Translation translation system.
+Note:
+Note: MATLAB parsing challenges:
+Note: - Matrix literals with space/comma/semicolon delimiters
+Note: - Multiple return values: function [a, b] = f(x)
+Note: - Complex indexing: A(1:end, :), A{1,2}
+Note: - Function handles: @func, @(x) expr
+Note: - Command syntax vs function syntax
+Note: - End keyword context-sensitive (end function, end if, array end)
+Note: - Transpose operator ambiguity (after expression vs string)
+Note:
+Note: Part of the Translation Translation System
+Note: Location: compiler/middle/gungnir/hir/translation/frontends/matlab/matlab_parser.runa
+Note: ===================================================================
+
+Import "compiler/middle/gungnir/hir/translation/frontends/matlab/matlab_lexer.runa" as Lexer
+Import "stdlib/core/string.runa" as StringCore
+Import "stdlib/collections/list.runa" as ListCore
+
+Note: ===================================================================
+Note: AST NODE TYPES
+Note: ===================================================================
+
+Constant MATLAB_PROGRAM as Integer is 1000
+Constant MATLAB_SCRIPT as Integer is 1001
+Constant MATLAB_FUNCTION as Integer is 1002
+Constant MATLAB_CLASSDEF as Integer is 1003
+
+Note: Statements
+Constant MATLAB_ASSIGN_STMT as Integer is 1010
+Constant MATLAB_EXPR_STMT as Integer is 1011
+Constant MATLAB_IF_STMT as Integer is 1012
+Constant MATLAB_FOR_STMT as Integer is 1013
+Constant MATLAB_WHILE_STMT as Integer is 1014
+Constant MATLAB_SWITCH_STMT as Integer is 1015
+Constant MATLAB_TRY_STMT as Integer is 1016
+Constant MATLAB_RETURN_STMT as Integer is 1017
+Constant MATLAB_BREAK_STMT as Integer is 1018
+Constant MATLAB_CONTINUE_STMT as Integer is 1019
+Constant MATLAB_GLOBAL_STMT as Integer is 1020
+Constant MATLAB_PERSISTENT_STMT as Integer is 1021
+
+Note: Expressions
+Constant MATLAB_BINARY_EXPR as Integer is 1030
+Constant MATLAB_UNARY_EXPR as Integer is 1031
+Constant MATLAB_INDEX_EXPR as Integer is 1032
+Constant MATLAB_CALL_EXPR as Integer is 1033
+Constant MATLAB_MATRIX_EXPR as Integer is 1034
+Constant MATLAB_CELL_EXPR as Integer is 1035
+Constant MATLAB_FUNC_HANDLE_EXPR as Integer is 1036
+Constant MATLAB_LAMBDA_EXPR as Integer is 1037
+Constant MATLAB_FIELD_EXPR as Integer is 1038
+Constant MATLAB_COLON_EXPR as Integer is 1039
+Constant MATLAB_TRANSPOSE_EXPR as Integer is 1040
+Constant MATLAB_DYNAMIC_FIELD_EXPR as Integer is 1041
+Constant MATLAB_SPMD_STMT as Integer is 1042
+
+Note: Literals
+Constant MATLAB_NUMBER_LITERAL as Integer is 1050
+Constant MATLAB_STRING_LITERAL as Integer is 1051
+Constant MATLAB_IDENTIFIER as Integer is 1052
+
+Note: Class-related
+Constant MATLAB_PROPERTIES as Integer is 1060
+Constant MATLAB_METHODS as Integer is 1061
+Constant MATLAB_EVENTS as Integer is 1062
+Constant MATLAB_ENUMERATION as Integer is 1063
+
+Note: ===================================================================
+Note: PARSER STATE
+Note: ===================================================================
+
+Type called "MATLABParser":
+    lexer as Integer
+    current_token as Integer
+    peek_token as Integer
+End Type
+
+Type called "ASTNode":
+    node_type as Integer
+    value as Integer
+    children as Integer
+    metadata as Integer
+End Type
+
+Note: ===================================================================
+Note: PARSER INITIALIZATION
+Note: ===================================================================
+
+Process called "matlab_parser_create" takes lexer as Integer returns Integer:
+    Let parser be a value of type MATLABParser with
+        lexer as lexer,
+        current_token as 0,
+        peek_token as 0
+
+    Note: Initialize current and peek tokens
+    Set parser.current_token to proc matlab_lexer_next_token from Lexer with lexer
+    Set parser.peek_token to proc matlab_lexer_next_token from Lexer with lexer
+
+    Return parser
+End Process
+
+Process called "create_ast_node" takes node_type as Integer returns Integer:
+    Let node be a value of type ASTNode with
+        node_type as node_type,
+        value as "",
+        children as proc list_create from ListCore,
+        metadata as proc list_create from ListCore
+
+    Return node
+End Process
+
+Process called "ast_set_value" takes node as Integer, value as Integer:
+    Set node.value to value
+End Process
+
+Process called "ast_add_child" takes node as Integer, child as Integer:
+    proc list_append from ListCore with node.children, child
+End Process
+
+Process called "ast_node_type" takes node as Integer returns Integer:
+    Return node.node_type
+End Process
+
+Process called "ast_node_value" takes node as Integer returns Integer:
+    Return node.value
+End Process
+
+Process called "ast_node_children" takes node as Integer returns Integer:
+    Return node.children
+End Process
+
+Process called "ast_node_child_count" takes node as Integer returns Integer:
+    Return proc list_length from ListCore with node.children
+End Process
+
+Process called "ast_node_child" takes node as Integer, index as Integer returns Integer:
+    Return proc list_get from ListCore with node.children, index
+End Process
+
+Note: ===================================================================
+Note: TOKEN HANDLING
+Note: ===================================================================
+
+Process called "advance" takes parser as Integer:
+    Set parser.current_token to parser.peek_token
+    Set parser.peek_token to proc matlab_lexer_next_token from Lexer with parser.lexer
+End Process
+
+Process called "current_type" takes parser as Integer returns Integer:
+    Return proc matlab_token_type from Lexer with parser.current_token
+End Process
+
+Process called "expect" takes parser as Integer, expected_type as Integer returns Integer:
+    Let token_type be proc current_type from parser
+
+    If token_type is equal to expected_type:
+        Let token be parser.current_token
+        proc advance from parser
+        Return token
+    End If
+
+    Note: Error - unexpected token
+    Return 0
+End Process
+
+Process called "match" takes parser as Integer, token_type as Integer returns Integer:
+    Let current be proc current_type from parser
+    If current is equal to token_type:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "skip_newlines" takes parser as Integer:
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+        If token_type is equal to Lexer.TOKEN_NEWLINE:
+            proc advance from parser
+        Otherwise:
+            Return
+        End If
+    End While
+End Process
+
+Note: ===================================================================
+Note: PROGRAM PARSING
+Note: ===================================================================
+
+Process called "parse_program" takes parser as Integer returns Integer:
+    Let program be proc create_ast_node from MATLAB_PROGRAM
+
+    proc skip_newlines from parser
+
+    Note: Determine if script or function file
+    Let token_type be proc current_type from parser
+
+    If token_type is equal to Lexer.TOKEN_FUNCTION:
+        Note: Function file - parse function definitions
+        While token_type is not equal to Lexer.TOKEN_EOF:
+            If token_type is equal to Lexer.TOKEN_FUNCTION:
+                Let func be proc parse_function from parser
+                proc ast_add_child from program, func
+            End If
+
+            proc skip_newlines from parser
+            Set token_type to proc current_type from parser
+        End While
+    Otherwise:
+        If token_type is equal to Lexer.TOKEN_CLASSDEF:
+            Note: Class file - parse class definition
+            Let class_def be proc parse_classdef from parser
+            proc ast_add_child from program, class_def
+        Otherwise:
+            Note: Script file - parse statements
+            Let script be proc create_ast_node from MATLAB_SCRIPT
+            proc parse_statement_list from parser, script
+            proc ast_add_child from program, script
+        End If
+    End If
+
+    Return program
+End Process
+
+Note: ===================================================================
+Note: FUNCTION PARSING
+Note: ===================================================================
+
+Process called "parse_function" takes parser as Integer returns Integer:
+    Let func be proc create_ast_node from MATLAB_FUNCTION
+
+    Note: Expect 'function' keyword
+    proc expect from parser, Lexer.TOKEN_FUNCTION
+    proc skip_newlines from parser
+
+    Note: Parse output parameters [out1, out2] or single output
+    Let token_type be proc current_type from parser
+
+    If token_type is equal to Lexer.TOKEN_LBRACKET:
+        Note: Multiple outputs
+        proc advance from parser
+        proc skip_newlines from parser
+
+        Let outputs be proc create_ast_node from MATLAB_IDENTIFIER
+        proc ast_set_value from outputs, "outputs"
+
+        While 1 is equal to 1:
+            Set token_type to proc current_type from parser
+            If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+                Let output be proc create_ast_node from MATLAB_IDENTIFIER
+                Let output_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+                Let output_name be proc matlab_token_value from Lexer with output_token
+                proc ast_set_value from output, output_name
+                proc ast_add_child from outputs, output
+            End If
+
+            proc skip_newlines from parser
+            Set token_type to proc current_type from parser
+
+            If token_type is equal to Lexer.TOKEN_COMMA:
+                proc advance from parser
+                proc skip_newlines from parser
+            Otherwise:
+                If token_type is equal to Lexer.TOKEN_RBRACKET:
+                    proc advance from parser
+                    proc skip_newlines from parser
+                    proc ast_add_child from func, outputs
+                    Note: Expect '='
+                    proc expect from parser, Lexer.TOKEN_ASSIGN
+                    proc skip_newlines from parser
+                    Let done be 1
+                    Return
+                End If
+                Return
+            End If
+        End While
+
+        proc ast_add_child from func, outputs
+    Otherwise:
+        If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+            Note: Single output or just function name
+            Let output be proc create_ast_node from MATLAB_IDENTIFIER
+            Let output_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+            Let output_name be proc matlab_token_value from Lexer with output_token
+            proc ast_set_value from output, output_name
+
+            proc skip_newlines from parser
+            Set token_type to proc current_type from parser
+
+            If token_type is equal to Lexer.TOKEN_ASSIGN:
+                Note: This was an output parameter
+                proc advance from parser
+                proc skip_newlines from parser
+                proc ast_add_child from func, output
+            Otherwise:
+                Note: This was the function name, no output
+                proc ast_set_value from func, output_name
+            End If
+        End If
+    End If
+
+    Note: Parse function name
+    Set token_type to proc current_type from parser
+    If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+        Let name_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+        Let func_name be proc matlab_token_value from Lexer with name_token
+
+        Note: Only set name if not already set
+        Let current_name be proc ast_node_value from func
+        Let name_len be proc string_length from StringCore with current_name
+        If name_len is equal to 0:
+            proc ast_set_value from func, func_name
+        End If
+    End If
+
+    Note: Parse input parameters
+    proc skip_newlines from parser
+    Set token_type to proc current_type from parser
+
+    If token_type is equal to Lexer.TOKEN_LPAREN:
+        proc advance from parser
+        proc skip_newlines from parser
+
+        Let inputs be proc create_ast_node from MATLAB_IDENTIFIER
+        proc ast_set_value from inputs, "inputs"
+
+        While 1 is equal to 1:
+            Set token_type to proc current_type from parser
+            If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+                Let input be proc create_ast_node from MATLAB_IDENTIFIER
+                Let input_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+                Let input_name be proc matlab_token_value from Lexer with input_token
+                proc ast_set_value from input, input_name
+                proc ast_add_child from inputs, input
+            End If
+
+            proc skip_newlines from parser
+            Set token_type to proc current_type from parser
+
+            If token_type is equal to Lexer.TOKEN_COMMA:
+                proc advance from parser
+                proc skip_newlines from parser
+            Otherwise:
+                If token_type is equal to Lexer.TOKEN_RPAREN:
+                    proc advance from parser
+                    proc skip_newlines from parser
+                    Let done be 1
+                    Return
+                End If
+                Return
+            End If
+        End While
+
+        proc ast_add_child from func, inputs
+    End If
+
+    Note: Parse function body
+    proc skip_newlines from parser
+    Let body be proc create_ast_node from MATLAB_SCRIPT
+    proc parse_statement_list_until_end from parser, body
+    proc ast_add_child from func, body
+
+    Note: Expect 'end' keyword
+    proc expect from parser, Lexer.TOKEN_END
+    proc skip_newlines from parser
+
+    Return func
+End Process
+
+Note: ===================================================================
+Note: CLASS PARSING
+Note: ===================================================================
+
+Process called "parse_classdef" takes parser as Integer returns Integer:
+    Let class_def be proc create_ast_node from MATLAB_CLASSDEF
+
+    Note: Expect 'classdef' keyword
+    proc expect from parser, Lexer.TOKEN_CLASSDEF
+    proc skip_newlines from parser
+
+    Note: Parse class name
+    Let name_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+    Let class_name be proc matlab_token_value from Lexer with name_token
+    proc ast_set_value from class_def, class_name
+
+    proc skip_newlines from parser
+
+    Note: Check for base class
+    Let token_type be proc current_type from parser
+    If token_type is equal to Lexer.TOKEN_LESS_THAN:
+        proc advance from parser
+        proc skip_newlines from parser
+
+        Let base_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+        Let base_name be proc matlab_token_value from Lexer with base_token
+        Let base be proc create_ast_node from MATLAB_IDENTIFIER
+        proc ast_set_value from base, base_name
+        proc ast_add_child from class_def, base
+    End If
+
+    proc skip_newlines from parser
+
+    Note: Parse class body (properties, methods, events, enumeration)
+    While 1 is equal to 1:
+        Set token_type to proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_PROPERTIES:
+            Let props be proc parse_properties from parser
+            proc ast_add_child from class_def, props
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_METHODS:
+                Let methods be proc parse_methods from parser
+                proc ast_add_child from class_def, methods
+            Otherwise:
+                If token_type is equal to Lexer.TOKEN_EVENTS:
+                    Let events be proc parse_events from parser
+                    proc ast_add_child from class_def, events
+                Otherwise:
+                    If token_type is equal to Lexer.TOKEN_ENUMERATION:
+                        Let enums be proc parse_enumeration from parser
+                        proc ast_add_child from class_def, enums
+                    Otherwise:
+                        If token_type is equal to Lexer.TOKEN_END:
+                            proc advance from parser
+                            Return class_def
+                        Otherwise:
+                            Note: Unexpected token
+                            Return class_def
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        proc skip_newlines from parser
+    End While
+
+    Return class_def
+End Process
+
+Process called "parse_properties" takes parser as Integer returns Integer:
+    Let props be proc create_ast_node from MATLAB_PROPERTIES
+
+    proc expect from parser, Lexer.TOKEN_PROPERTIES
+    proc skip_newlines from parser
+
+    Note: Parse property declarations until 'end'
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+            Let prop be proc create_ast_node from MATLAB_IDENTIFIER
+            Let prop_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+            Let prop_name be proc matlab_token_value from Lexer with prop_token
+            proc ast_set_value from prop, prop_name
+            proc ast_add_child from props, prop
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_END:
+                proc advance from parser
+                Return props
+            Otherwise:
+                proc skip_newlines from parser
+            End If
+        End If
+
+        proc skip_newlines from parser
+    End While
+
+    Return props
+End Process
+
+Process called "parse_methods" takes parser as Integer returns Integer:
+    Let methods be proc create_ast_node from MATLAB_METHODS
+
+    proc expect from parser, Lexer.TOKEN_METHODS
+    proc skip_newlines from parser
+
+    Note: Parse method definitions until 'end'
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_FUNCTION:
+            Let method be proc parse_function from parser
+            proc ast_add_child from methods, method
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_END:
+                proc advance from parser
+                Return methods
+            Otherwise:
+                proc skip_newlines from parser
+            End If
+        End If
+
+        proc skip_newlines from parser
+    End While
+
+    Return methods
+End Process
+
+Process called "parse_events" takes parser as Integer returns Integer:
+    Let events be proc create_ast_node from MATLAB_EVENTS
+
+    proc expect from parser, Lexer.TOKEN_EVENTS
+    proc skip_newlines from parser
+
+    Note: Parse event names until 'end'
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+            Let event be proc create_ast_node from MATLAB_IDENTIFIER
+            Let event_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+            Let event_name be proc matlab_token_value from Lexer with event_token
+            proc ast_set_value from event, event_name
+            proc ast_add_child from events, event
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_END:
+                proc advance from parser
+                Return events
+            Otherwise:
+                proc skip_newlines from parser
+            End If
+        End If
+
+        proc skip_newlines from parser
+    End While
+
+    Return events
+End Process
+
+Process called "parse_enumeration" takes parser as Integer returns Integer:
+    Let enums be proc create_ast_node from MATLAB_ENUMERATION
+
+    proc expect from parser, Lexer.TOKEN_ENUMERATION
+    proc skip_newlines from parser
+
+    Note: Parse enumeration values until 'end'
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+            Let enum_val be proc create_ast_node from MATLAB_IDENTIFIER
+            Let enum_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+            Let enum_name be proc matlab_token_value from Lexer with enum_token
+            proc ast_set_value from enum_val, enum_name
+            proc ast_add_child from enums, enum_val
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_END:
+                proc advance from parser
+                Return enums
+            Otherwise:
+                proc skip_newlines from parser
+            End If
+        End If
+
+        proc skip_newlines from parser
+    End While
+
+    Return enums
+End Process
+
+Note: ===================================================================
+Note: STATEMENT PARSING
+Note: ===================================================================
+
+Process called "parse_statement_list" takes parser as Integer, container as Integer:
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        Note: Skip newlines
+        If token_type is equal to Lexer.TOKEN_NEWLINE:
+            proc advance from parser
+        Otherwise:
+            Note: Check for end of file
+            If token_type is equal to Lexer.TOKEN_EOF:
+                Return
+            Otherwise:
+                Note: Parse statement
+                Let stmt be proc parse_statement from parser
+                If stmt is not equal to 0:
+                    proc ast_add_child from container, stmt
+                End If
+            End If
+        End If
+    End While
+End Process
+
+Process called "parse_statement_list_until_end" takes parser as Integer, container as Integer:
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        Note: Skip newlines
+        If token_type is equal to Lexer.TOKEN_NEWLINE:
+            proc advance from parser
+        Otherwise:
+            Note: Check for 'end' keyword
+            If token_type is equal to Lexer.TOKEN_END:
+                Return
+            Otherwise:
+                Note: Parse statement
+                Let stmt be proc parse_statement from parser
+                If stmt is not equal to 0:
+                    proc ast_add_child from container, stmt
+                End If
+            End If
+        End If
+    End While
+End Process
+
+Process called "parse_statement" takes parser as Integer returns Integer:
+    proc skip_newlines from parser
+
+    Let token_type be proc current_type from parser
+
+    Note: Control flow statements
+    If token_type is equal to Lexer.TOKEN_IF:
+        Return proc parse_if_statement from parser
+    End If
+
+    If token_type is equal to Lexer.TOKEN_FOR:
+        Return proc parse_for_statement from parser
+    End If
+
+    If token_type is equal to Lexer.TOKEN_PARFOR:
+        Return proc parse_for_statement from parser
+    End If
+
+    If token_type is equal to Lexer.TOKEN_SPMD:
+        Return proc parse_spmd_statement from parser
+    End If
+
+    If token_type is equal to Lexer.TOKEN_WHILE:
+        Return proc parse_while_statement from parser
+    End If
+
+    If token_type is equal to Lexer.TOKEN_SWITCH:
+        Return proc parse_switch_statement from parser
+    End If
+
+    If token_type is equal to Lexer.TOKEN_TRY:
+        Return proc parse_try_statement from parser
+    End If
+
+    Note: Jump statements
+    If token_type is equal to Lexer.TOKEN_RETURN:
+        proc advance from parser
+        Return proc create_ast_node from MATLAB_RETURN_STMT
+    End If
+
+    If token_type is equal to Lexer.TOKEN_BREAK:
+        proc advance from parser
+        Return proc create_ast_node from MATLAB_BREAK_STMT
+    End If
+
+    If token_type is equal to Lexer.TOKEN_CONTINUE:
+        proc advance from parser
+        Return proc create_ast_node from MATLAB_CONTINUE_STMT
+    End If
+
+    Note: Global/persistent declarations
+    If token_type is equal to Lexer.TOKEN_GLOBAL:
+        Return proc parse_global_statement from parser
+    End If
+
+    If token_type is equal to Lexer.TOKEN_PERSISTENT:
+        Return proc parse_persistent_statement from parser
+    End If
+
+    Note: Assignment or expression statement
+    Return proc parse_assignment_or_expr_statement from parser
+End Process
+
+Process called "parse_if_statement" takes parser as Integer returns Integer:
+    Let if_stmt be proc create_ast_node from MATLAB_IF_STMT
+
+    proc expect from parser, Lexer.TOKEN_IF
+    proc skip_newlines from parser
+
+    Note: Parse condition
+    Let cond be proc parse_expression from parser
+    proc ast_add_child from if_stmt, cond
+
+    proc skip_newlines from parser
+
+    Note: Parse then block
+    Let then_block be proc create_ast_node from MATLAB_SCRIPT
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_ELSE:
+            proc ast_add_child from if_stmt, then_block
+            proc advance from parser
+            proc skip_newlines from parser
+
+            Note: Parse else block
+            Let else_block be proc create_ast_node from MATLAB_SCRIPT
+            proc parse_statement_list_until_end from parser, else_block
+            proc ast_add_child from if_stmt, else_block
+
+            proc expect from parser, Lexer.TOKEN_END
+            Return if_stmt
+        End If
+
+        If token_type is equal to Lexer.TOKEN_ELSEIF:
+            proc ast_add_child from if_stmt, then_block
+            proc advance from parser
+            proc skip_newlines from parser
+
+            Note: Parse elseif condition
+            Let elseif_cond be proc parse_expression from parser
+            proc ast_add_child from if_stmt, elseif_cond
+
+            proc skip_newlines from parser
+
+            Note: Continue parsing as new then block
+            Set then_block to proc create_ast_node from MATLAB_SCRIPT
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_END:
+                proc ast_add_child from if_stmt, then_block
+                proc advance from parser
+                Return if_stmt
+            Otherwise:
+                Let stmt be proc parse_statement from parser
+                If stmt is not equal to 0:
+                    proc ast_add_child from then_block, stmt
+                End If
+            End If
+        End If
+    End While
+
+    Return if_stmt
+End Process
+
+Process called "parse_for_statement" takes parser as Integer returns Integer:
+    Let for_stmt be proc create_ast_node from MATLAB_FOR_STMT
+
+    Note: Check if this is parfor or regular for
+    Let token_type be proc current_type from parser
+    Let is_parfor be 0
+    If token_type is equal to Lexer.TOKEN_PARFOR:
+        Set is_parfor to 1
+        proc expect from parser, Lexer.TOKEN_PARFOR
+    Otherwise:
+        proc expect from parser, Lexer.TOKEN_FOR
+    End If
+    proc skip_newlines from parser
+
+    Note: Parse loop variable
+    Let var_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+    Let var_name be proc matlab_token_value from Lexer with var_token
+    Let var_node be proc create_ast_node from MATLAB_IDENTIFIER
+    proc ast_set_value from var_node, var_name
+    proc ast_add_child from for_stmt, var_node
+
+    proc skip_newlines from parser
+    proc expect from parser, Lexer.TOKEN_ASSIGN
+    proc skip_newlines from parser
+
+    Note: Parse iteration expression
+    Let iter_expr be proc parse_expression from parser
+    proc ast_add_child from for_stmt, iter_expr
+
+    proc skip_newlines from parser
+
+    Note: Parse loop body
+    Let body be proc create_ast_node from MATLAB_SCRIPT
+    proc parse_statement_list_until_end from parser, body
+    proc ast_add_child from for_stmt, body
+
+    proc expect from parser, Lexer.TOKEN_END
+
+    Note: Mark as parfor if needed
+    If is_parfor is equal to 1:
+        Note: Store parfor flag in metadata
+        Let parfor_marker be proc create_ast_node from MATLAB_IDENTIFIER
+        proc ast_set_value from parfor_marker, "parfor"
+        proc ast_add_child from for_stmt, parfor_marker
+    End If
+
+    Return for_stmt
+End Process
+
+Process called "parse_spmd_statement" takes parser as Integer returns Integer:
+    Let spmd_stmt be proc create_ast_node from MATLAB_SPMD_STMT
+
+    proc expect from parser, Lexer.TOKEN_SPMD
+    proc skip_newlines from parser
+
+    Note: Parse SPMD body
+    Let body be proc create_ast_node from MATLAB_SCRIPT
+    proc parse_statement_list_until_end from parser, body
+    proc ast_add_child from spmd_stmt, body
+
+    proc expect from parser, Lexer.TOKEN_END
+    Return spmd_stmt
+End Process
+
+Process called "parse_while_statement" takes parser as Integer returns Integer:
+    Let while_stmt be proc create_ast_node from MATLAB_WHILE_STMT
+
+    proc expect from parser, Lexer.TOKEN_WHILE
+    proc skip_newlines from parser
+
+    Note: Parse condition
+    Let cond be proc parse_expression from parser
+    proc ast_add_child from while_stmt, cond
+
+    proc skip_newlines from parser
+
+    Note: Parse loop body
+    Let body be proc create_ast_node from MATLAB_SCRIPT
+    proc parse_statement_list_until_end from parser, body
+    proc ast_add_child from while_stmt, body
+
+    proc expect from parser, Lexer.TOKEN_END
+    Return while_stmt
+End Process
+
+Process called "parse_switch_statement" takes parser as Integer returns Integer:
+    Let switch_stmt be proc create_ast_node from MATLAB_SWITCH_STMT
+
+    proc expect from parser, Lexer.TOKEN_SWITCH
+    proc skip_newlines from parser
+
+    Note: Parse switch expression
+    Let expr be proc parse_expression from parser
+    proc ast_add_child from switch_stmt, expr
+
+    proc skip_newlines from parser
+
+    Note: Parse case blocks
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_CASE:
+            proc advance from parser
+            proc skip_newlines from parser
+
+            Note: Parse case value
+            Let case_val be proc parse_expression from parser
+            proc ast_add_child from switch_stmt, case_val
+
+            proc skip_newlines from parser
+
+            Note: Parse case body
+            Let case_body be proc create_ast_node from MATLAB_SCRIPT
+            While 1 is equal to 1:
+                Set token_type to proc current_type from parser
+
+                If token_type is equal to Lexer.TOKEN_CASE:
+                    proc ast_add_child from switch_stmt, case_body
+                    Let done be 1
+                    Return
+                End If
+
+                If token_type is equal to Lexer.TOKEN_OTHERWISE:
+                    proc ast_add_child from switch_stmt, case_body
+                    Let done be 1
+                    Return
+                End If
+
+                If token_type is equal to Lexer.TOKEN_END:
+                    proc ast_add_child from switch_stmt, case_body
+                    Let done be 1
+                    Return
+                End If
+
+                Let stmt be proc parse_statement from parser
+                If stmt is not equal to 0:
+                    proc ast_add_child from case_body, stmt
+                End If
+            End While
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_OTHERWISE:
+                proc advance from parser
+                proc skip_newlines from parser
+
+                Note: Parse otherwise body
+                Let otherwise_body be proc create_ast_node from MATLAB_SCRIPT
+                proc parse_statement_list_until_end from parser, otherwise_body
+                proc ast_add_child from switch_stmt, otherwise_body
+
+                proc expect from parser, Lexer.TOKEN_END
+                Return switch_stmt
+            Otherwise:
+                If token_type is equal to Lexer.TOKEN_END:
+                    proc advance from parser
+                    Return switch_stmt
+                Otherwise:
+                    proc skip_newlines from parser
+                End If
+            End If
+        End If
+    End While
+
+    Return switch_stmt
+End Process
+
+Process called "parse_try_statement" takes parser as Integer returns Integer:
+    Let try_stmt be proc create_ast_node from MATLAB_TRY_STMT
+
+    proc expect from parser, Lexer.TOKEN_TRY
+    proc skip_newlines from parser
+
+    Note: Parse try block
+    Let try_block be proc create_ast_node from MATLAB_SCRIPT
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_CATCH:
+            proc ast_add_child from try_stmt, try_block
+            proc advance from parser
+            proc skip_newlines from parser
+
+            Note: Optional exception variable
+            Set token_type to proc current_type from parser
+            If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+                Let exc_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+                Let exc_name be proc matlab_token_value from Lexer with exc_token
+                Let exc_node be proc create_ast_node from MATLAB_IDENTIFIER
+                proc ast_set_value from exc_node, exc_name
+                proc ast_add_child from try_stmt, exc_node
+            End If
+
+            proc skip_newlines from parser
+
+            Note: Parse catch block
+            Let catch_block be proc create_ast_node from MATLAB_SCRIPT
+            proc parse_statement_list_until_end from parser, catch_block
+            proc ast_add_child from try_stmt, catch_block
+
+            proc expect from parser, Lexer.TOKEN_END
+            Return try_stmt
+        End If
+
+        If token_type is equal to Lexer.TOKEN_END:
+            proc ast_add_child from try_stmt, try_block
+            proc advance from parser
+            Return try_stmt
+        End If
+
+        Let stmt be proc parse_statement from parser
+        If stmt is not equal to 0:
+            proc ast_add_child from try_block, stmt
+        End If
+    End While
+
+    Return try_stmt
+End Process
+
+Process called "parse_global_statement" takes parser as Integer returns Integer:
+    Let global_stmt be proc create_ast_node from MATLAB_GLOBAL_STMT
+
+    proc expect from parser, Lexer.TOKEN_GLOBAL
+    proc skip_newlines from parser
+
+    Note: Parse variable names
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+            Let var_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+            Let var_name be proc matlab_token_value from Lexer with var_token
+            Let var_node be proc create_ast_node from MATLAB_IDENTIFIER
+            proc ast_set_value from var_node, var_name
+            proc ast_add_child from global_stmt, var_node
+        Otherwise:
+            Return global_stmt
+        End If
+
+        proc skip_newlines from parser
+    End While
+
+    Return global_stmt
+End Process
+
+Process called "parse_persistent_statement" takes parser as Integer returns Integer:
+    Let persistent_stmt be proc create_ast_node from MATLAB_PERSISTENT_STMT
+
+    proc expect from parser, Lexer.TOKEN_PERSISTENT
+    proc skip_newlines from parser
+
+    Note: Parse variable names
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+            Let var_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+            Let var_name be proc matlab_token_value from Lexer with var_token
+            Let var_node be proc create_ast_node from MATLAB_IDENTIFIER
+            proc ast_set_value from var_node, var_name
+            proc ast_add_child from persistent_stmt, var_node
+        Otherwise:
+            Return persistent_stmt
+        End If
+
+        proc skip_newlines from parser
+    End While
+
+    Return persistent_stmt
+End Process
+
+Process called "parse_assignment_or_expr_statement" takes parser as Integer returns Integer:
+    Note: Try to parse as assignment, fall back to expression statement
+    Let expr be proc parse_expression from parser
+
+    proc skip_newlines from parser
+    Let token_type be proc current_type from parser
+
+    Note: Check for assignment operator
+    If token_type is equal to Lexer.TOKEN_ASSIGN:
+        Let assign_stmt be proc create_ast_node from MATLAB_ASSIGN_STMT
+        proc ast_add_child from assign_stmt, expr
+
+        proc advance from parser
+        proc skip_newlines from parser
+
+        Let rhs be proc parse_expression from parser
+        proc ast_add_child from assign_stmt, rhs
+
+        Return assign_stmt
+    End If
+
+    Note: Just an expression statement
+    Let expr_stmt be proc create_ast_node from MATLAB_EXPR_STMT
+    proc ast_add_child from expr_stmt, expr
+    Return expr_stmt
+End Process
+
+Note: ===================================================================
+Note: EXPRESSION PARSING (with operator precedence)
+Note: ===================================================================
+
+Process called "parse_expression" takes parser as Integer returns Integer:
+    Return proc parse_logical_or from parser
+End Process
+
+Process called "parse_logical_or" takes parser as Integer returns Integer:
+    Let left be proc parse_logical_and from parser
+
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_OR:
+            Let op_token be proc expect from parser, Lexer.TOKEN_OR
+            proc skip_newlines from parser
+            Let right be proc parse_logical_and from parser
+
+            Let binary be proc create_ast_node from MATLAB_BINARY_EXPR
+            proc ast_set_value from binary, "|"
+            proc ast_add_child from binary, left
+            proc ast_add_child from binary, right
+            Set left to binary
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_SHORT_OR:
+                Let op_token be proc expect from parser, Lexer.TOKEN_SHORT_OR
+                proc skip_newlines from parser
+                Let right be proc parse_logical_and from parser
+
+                Let binary be proc create_ast_node from MATLAB_BINARY_EXPR
+                proc ast_set_value from binary, "||"
+                proc ast_add_child from binary, left
+                proc ast_add_child from binary, right
+                Set left to binary
+            Otherwise:
+                Return left
+            End If
+        End If
+    End While
+
+    Return left
+End Process
+
+Process called "parse_logical_and" takes parser as Integer returns Integer:
+    Let left be proc parse_comparison from parser
+
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_AND:
+            Let op_token be proc expect from parser, Lexer.TOKEN_AND
+            proc skip_newlines from parser
+            Let right be proc parse_comparison from parser
+
+            Let binary be proc create_ast_node from MATLAB_BINARY_EXPR
+            proc ast_set_value from binary, "&"
+            proc ast_add_child from binary, left
+            proc ast_add_child from binary, right
+            Set left to binary
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_SHORT_AND:
+                Let op_token be proc expect from parser, Lexer.TOKEN_SHORT_AND
+                proc skip_newlines from parser
+                Let right be proc parse_comparison from parser
+
+                Let binary be proc create_ast_node from MATLAB_BINARY_EXPR
+                proc ast_set_value from binary, "&&"
+                proc ast_add_child from binary, left
+                proc ast_add_child from binary, right
+                Set left to binary
+            Otherwise:
+                Return left
+            End If
+        End If
+    End While
+
+    Return left
+End Process
+
+Process called "parse_comparison" takes parser as Integer returns Integer:
+    Let left be proc parse_colon from parser
+
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+        Let op_str be ""
+
+        If token_type is equal to Lexer.TOKEN_EQUAL:
+            Set op_str to "=="
+        End If
+        If token_type is equal to Lexer.TOKEN_NOT_EQUAL:
+            Set op_str to "~="
+        End If
+        If token_type is equal to Lexer.TOKEN_LESS_THAN:
+            Set op_str to "<"
+        End If
+        If token_type is equal to Lexer.TOKEN_LESS_EQUAL:
+            Set op_str to "<="
+        End If
+        If token_type is equal to Lexer.TOKEN_GREATER_THAN:
+            Set op_str to ">"
+        End If
+        If token_type is equal to Lexer.TOKEN_GREATER_EQUAL:
+            Set op_str to ">="
+        End If
+
+        Let op_len be proc string_length from StringCore with op_str
+        If op_len is greater than 0:
+            proc advance from parser
+            proc skip_newlines from parser
+            Let right be proc parse_colon from parser
+
+            Let binary be proc create_ast_node from MATLAB_BINARY_EXPR
+            proc ast_set_value from binary, op_str
+            proc ast_add_child from binary, left
+            proc ast_add_child from binary, right
+            Set left to binary
+        Otherwise:
+            Return left
+        End If
+    End While
+
+    Return left
+End Process
+
+Process called "parse_colon" takes parser as Integer returns Integer:
+    Note: Handle colon operator (range)
+    Let left be proc parse_additive from parser
+
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_COLON:
+            proc advance from parser
+            proc skip_newlines from parser
+            Let middle be proc parse_additive from parser
+
+            Note: Check for step colon (start:step:end)
+            Set token_type to proc current_type from parser
+            If token_type is equal to Lexer.TOKEN_COLON:
+                proc advance from parser
+                proc skip_newlines from parser
+                Let right be proc parse_additive from parser
+
+                Let colon be proc create_ast_node from MATLAB_COLON_EXPR
+                proc ast_add_child from colon, left
+                proc ast_add_child from colon, middle
+                proc ast_add_child from colon, right
+                Set left to colon
+            Otherwise:
+                Note: Simple colon (start:end)
+                Let colon be proc create_ast_node from MATLAB_COLON_EXPR
+                proc ast_add_child from colon, left
+                proc ast_add_child from colon, middle
+                Set left to colon
+            End If
+        Otherwise:
+            Return left
+        End If
+    End While
+
+    Return left
+End Process
+
+Process called "parse_additive" takes parser as Integer returns Integer:
+    Let left be proc parse_multiplicative from parser
+
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+        Let op_str be ""
+
+        If token_type is equal to Lexer.TOKEN_PLUS:
+            Set op_str to "+"
+        End If
+        If token_type is equal to Lexer.TOKEN_MINUS:
+            Set op_str to "-"
+        End If
+
+        Let op_len be proc string_length from StringCore with op_str
+        If op_len is greater than 0:
+            proc advance from parser
+            proc skip_newlines from parser
+            Let right be proc parse_multiplicative from parser
+
+            Let binary be proc create_ast_node from MATLAB_BINARY_EXPR
+            proc ast_set_value from binary, op_str
+            proc ast_add_child from binary, left
+            proc ast_add_child from binary, right
+            Set left to binary
+        Otherwise:
+            Return left
+        End If
+    End While
+
+    Return left
+End Process
+
+Process called "parse_multiplicative" takes parser as Integer returns Integer:
+    Let left be proc parse_power from parser
+
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+        Let op_str be ""
+
+        If token_type is equal to Lexer.TOKEN_STAR:
+            Set op_str to "*"
+        End If
+        If token_type is equal to Lexer.TOKEN_SLASH:
+            Set op_str to "/"
+        End If
+        If token_type is equal to Lexer.TOKEN_BACKSLASH:
+            Set op_str to "\\"
+        End If
+        If token_type is equal to Lexer.TOKEN_DOT_STAR:
+            Set op_str to ".*"
+        End If
+        If token_type is equal to Lexer.TOKEN_DOT_SLASH:
+            Set op_str to "./"
+        End If
+        If token_type is equal to Lexer.TOKEN_DOT_BACKSLASH:
+            Set op_str to ".\\"
+        End If
+
+        Let op_len be proc string_length from StringCore with op_str
+        If op_len is greater than 0:
+            proc advance from parser
+            proc skip_newlines from parser
+            Let right be proc parse_power from parser
+
+            Let binary be proc create_ast_node from MATLAB_BINARY_EXPR
+            proc ast_set_value from binary, op_str
+            proc ast_add_child from binary, left
+            proc ast_add_child from binary, right
+            Set left to binary
+        Otherwise:
+            Return left
+        End If
+    End While
+
+    Return left
+End Process
+
+Process called "parse_power" takes parser as Integer returns Integer:
+    Let left be proc parse_unary from parser
+
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+        Let op_str be ""
+
+        If token_type is equal to Lexer.TOKEN_POWER:
+            Set op_str to "^"
+        End If
+        If token_type is equal to Lexer.TOKEN_DOT_POWER:
+            Set op_str to ".^"
+        End If
+
+        Let op_len be proc string_length from StringCore with op_str
+        If op_len is greater than 0:
+            proc advance from parser
+            proc skip_newlines from parser
+            Let right be proc parse_unary from parser
+
+            Let binary be proc create_ast_node from MATLAB_BINARY_EXPR
+            proc ast_set_value from binary, op_str
+            proc ast_add_child from binary, left
+            proc ast_add_child from binary, right
+            Set left to binary
+        Otherwise:
+            Return left
+        End If
+    End While
+
+    Return left
+End Process
+
+Process called "parse_unary" takes parser as Integer returns Integer:
+    Let token_type be proc current_type from parser
+
+    Note: Unary operators
+    If token_type is equal to Lexer.TOKEN_PLUS:
+        proc advance from parser
+        proc skip_newlines from parser
+        Let operand be proc parse_unary from parser
+
+        Let unary be proc create_ast_node from MATLAB_UNARY_EXPR
+        proc ast_set_value from unary, "+"
+        proc ast_add_child from unary, operand
+        Return unary
+    End If
+
+    If token_type is equal to Lexer.TOKEN_MINUS:
+        proc advance from parser
+        proc skip_newlines from parser
+        Let operand be proc parse_unary from parser
+
+        Let unary be proc create_ast_node from MATLAB_UNARY_EXPR
+        proc ast_set_value from unary, "-"
+        proc ast_add_child from unary, operand
+        Return unary
+    End If
+
+    If token_type is equal to Lexer.TOKEN_NOT:
+        proc advance from parser
+        proc skip_newlines from parser
+        Let operand be proc parse_unary from parser
+
+        Let unary be proc create_ast_node from MATLAB_UNARY_EXPR
+        proc ast_set_value from unary, "~"
+        proc ast_add_child from unary, operand
+        Return unary
+    End If
+
+    Return proc parse_postfix from parser
+End Process
+
+Process called "parse_postfix" takes parser as Integer returns Integer:
+    Let expr be proc parse_primary from parser
+
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        Note: Transpose
+        If token_type is equal to Lexer.TOKEN_TRANSPOSE:
+            proc advance from parser
+            Let transpose be proc create_ast_node from MATLAB_TRANSPOSE_EXPR
+            proc ast_set_value from transpose, "'"
+            proc ast_add_child from transpose, expr
+            Set expr to transpose
+        Otherwise:
+            Note: Element-wise transpose
+            If token_type is equal to Lexer.TOKEN_DOT_TRANSPOSE:
+                proc advance from parser
+                Let transpose be proc create_ast_node from MATLAB_TRANSPOSE_EXPR
+                proc ast_set_value from transpose, ".'"
+                proc ast_add_child from transpose, expr
+                Set expr to transpose
+            Otherwise:
+                Note: Field access (static or dynamic)
+                If token_type is equal to Lexer.TOKEN_DOT:
+                    proc advance from parser
+
+                    Note: Check for dynamic field access: obj.(expr)
+                    Set token_type to proc current_type from parser
+                    If token_type is equal to Lexer.TOKEN_LPAREN:
+                        Note: Dynamic field access
+                        proc advance from parser
+                        proc skip_newlines from parser
+
+                        Let field_name_expr be proc parse_expression from parser
+                        proc skip_newlines from parser
+                        proc expect from parser, Lexer.TOKEN_RPAREN
+
+                        Let dynamic_field_expr be proc create_ast_node from MATLAB_DYNAMIC_FIELD_EXPR
+                        proc ast_add_child from dynamic_field_expr, expr
+                        proc ast_add_child from dynamic_field_expr, field_name_expr
+                        Set expr to dynamic_field_expr
+                    Otherwise:
+                        Note: Static field access
+                        Let field_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+                        Let field_name be proc matlab_token_value from Lexer with field_token
+
+                        Let field_expr be proc create_ast_node from MATLAB_FIELD_EXPR
+                        proc ast_add_child from field_expr, expr
+                        Let field_node be proc create_ast_node from MATLAB_IDENTIFIER
+                        proc ast_set_value from field_node, field_name
+                        proc ast_add_child from field_expr, field_node
+                        Set expr to field_expr
+                    End If
+                Otherwise:
+                    Note: Function call or array indexing
+                    If token_type is equal to Lexer.TOKEN_LPAREN:
+                        Set expr to proc parse_call_or_index from parser, expr, 0
+                    Otherwise:
+                        Note: Cell indexing
+                        If token_type is equal to Lexer.TOKEN_LBRACE:
+                            Set expr to proc parse_call_or_index from parser, expr, 1
+                        Otherwise:
+                            Return expr
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Return expr
+End Process
+
+Process called "parse_call_or_index" takes parser as Integer, base_expr as Integer, is_cell as Integer returns Integer:
+    Note: Parse function call or array/cell indexing
+    Let result be proc create_ast_node from MATLAB_CALL_EXPR
+
+    If is_cell is equal to 1:
+        Note: Change to cell indexing
+        Set result.node_type to MATLAB_INDEX_EXPR
+        proc advance from parser
+        proc skip_newlines from parser
+
+        proc ast_add_child from result, base_expr
+
+        Note: Parse indices
+        While 1 is equal to 1:
+            Let token_type be proc current_type from parser
+
+            If token_type is equal to Lexer.TOKEN_RBRACE:
+                proc advance from parser
+                Return result
+            End If
+
+            Let index_expr be proc parse_expression from parser
+            proc ast_add_child from result, index_expr
+
+            Set token_type to proc current_type from parser
+            If token_type is equal to Lexer.TOKEN_COMMA:
+                proc advance from parser
+                proc skip_newlines from parser
+            End If
+        End While
+    Otherwise:
+        proc advance from parser
+        proc skip_newlines from parser
+
+        proc ast_add_child from result, base_expr
+
+        Note: Parse arguments/indices
+        While 1 is equal to 1:
+            Let token_type be proc current_type from parser
+
+            If token_type is equal to Lexer.TOKEN_RPAREN:
+                proc advance from parser
+                Return result
+            End If
+
+            Note: Check for colon (all elements)
+            If token_type is equal to Lexer.TOKEN_COLON:
+                proc advance from parser
+                Let colon_node be proc create_ast_node from MATLAB_COLON_EXPR
+                proc ast_add_child from result, colon_node
+
+                Set token_type to proc current_type from parser
+                If token_type is equal to Lexer.TOKEN_COMMA:
+                    proc advance from parser
+                    proc skip_newlines from parser
+                End If
+            Otherwise:
+                Let arg_expr be proc parse_expression from parser
+                proc ast_add_child from result, arg_expr
+
+                Set token_type to proc current_type from parser
+                If token_type is equal to Lexer.TOKEN_COMMA:
+                    proc advance from parser
+                    proc skip_newlines from parser
+                End If
+            End If
+        End While
+    End If
+
+    Return result
+End Process
+
+Process called "parse_primary" takes parser as Integer returns Integer:
+    Let token_type be proc current_type from parser
+
+    Note: Number literal
+    If token_type is equal to Lexer.TOKEN_NUMBER:
+        Let token be proc expect from parser, Lexer.TOKEN_NUMBER
+        Let value be proc matlab_token_value from Lexer with token
+        Let num be proc create_ast_node from MATLAB_NUMBER_LITERAL
+        proc ast_set_value from num, value
+        Return num
+    End If
+
+    Note: String literal
+    If token_type is equal to Lexer.TOKEN_STRING:
+        Let token be proc expect from parser, Lexer.TOKEN_STRING
+        Let value be proc matlab_token_value from Lexer with token
+        Let str be proc create_ast_node from MATLAB_STRING_LITERAL
+        proc ast_set_value from str, value
+        Return str
+    End If
+
+    If token_type is equal to Lexer.TOKEN_CHAR:
+        Let token be proc expect from parser, Lexer.TOKEN_CHAR
+        Let value be proc matlab_token_value from Lexer with token
+        Let str be proc create_ast_node from MATLAB_STRING_LITERAL
+        proc ast_set_value from str, value
+        Return str
+    End If
+
+    Note: Identifier
+    If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+        Let token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+        Let value be proc matlab_token_value from Lexer with token
+        Let id be proc create_ast_node from MATLAB_IDENTIFIER
+        proc ast_set_value from id, value
+        Return id
+    End If
+
+    Note: Special constants
+    If token_type is equal to Lexer.TOKEN_TRUE:
+        proc advance from parser
+        Let bool be proc create_ast_node from MATLAB_NUMBER_LITERAL
+        proc ast_set_value from bool, "1"
+        Return bool
+    End If
+
+    If token_type is equal to Lexer.TOKEN_FALSE:
+        proc advance from parser
+        Let bool be proc create_ast_node from MATLAB_NUMBER_LITERAL
+        proc ast_set_value from bool, "0"
+        Return bool
+    End If
+
+    If token_type is equal to Lexer.TOKEN_PI:
+        proc advance from parser
+        Let pi be proc create_ast_node from MATLAB_NUMBER_LITERAL
+        proc ast_set_value from pi, "pi"
+        Return pi
+    End If
+
+    If token_type is equal to Lexer.TOKEN_INF:
+        proc advance from parser
+        Let inf be proc create_ast_node from MATLAB_NUMBER_LITERAL
+        proc ast_set_value from inf, "Inf"
+        Return inf
+    End If
+
+    If token_type is equal to Lexer.TOKEN_NAN:
+        proc advance from parser
+        Let nan be proc create_ast_node from MATLAB_NUMBER_LITERAL
+        proc ast_set_value from nan, "NaN"
+        Return nan
+    End If
+
+    Note: Matrix literal
+    If token_type is equal to Lexer.TOKEN_LBRACKET:
+        Return proc parse_matrix_literal from parser
+    End If
+
+    Note: Cell array literal
+    If token_type is equal to Lexer.TOKEN_LBRACE:
+        Return proc parse_cell_literal from parser
+    End If
+
+    Note: Function handle
+    If token_type is equal to Lexer.TOKEN_AT:
+        Return proc parse_function_handle from parser
+    End If
+
+    Note: Parenthesized expression
+    If token_type is equal to Lexer.TOKEN_LPAREN:
+        proc advance from parser
+        proc skip_newlines from parser
+        Let expr be proc parse_expression from parser
+        proc skip_newlines from parser
+        proc expect from parser, Lexer.TOKEN_RPAREN
+        Return expr
+    End If
+
+    Note: Unknown - return error node
+    Return proc create_ast_node from MATLAB_IDENTIFIER
+End Process
+
+Process called "parse_matrix_literal" takes parser as Integer returns Integer:
+    Let matrix be proc create_ast_node from MATLAB_MATRIX_EXPR
+
+    proc expect from parser, Lexer.TOKEN_LBRACKET
+    proc skip_newlines from parser
+
+    Note: Parse rows separated by semicolons or newlines
+    Let current_row be proc list_create from ListCore
+
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_RBRACKET:
+            Note: End of matrix
+            If proc list_length from ListCore with current_row is greater than 0:
+                Note: Add final row
+                Let row_node be proc create_ast_node from MATLAB_MATRIX_EXPR
+                Let row_count be proc list_length from ListCore with current_row
+                Let i be 0
+                While i is less than row_count:
+                    Let elem be proc list_get from ListCore with current_row, i
+                    proc ast_add_child from row_node, elem
+                    Set i to i plus 1
+                End While
+                proc ast_add_child from matrix, row_node
+            End If
+            proc advance from parser
+            Return matrix
+        End If
+
+        Note: Semicolon or newline starts new row
+        If token_type is equal to Lexer.TOKEN_SEMICOLON:
+            If proc list_length from ListCore with current_row is greater than 0:
+                Let row_node be proc create_ast_node from MATLAB_MATRIX_EXPR
+                Let row_count be proc list_length from ListCore with current_row
+                Let i be 0
+                While i is less than row_count:
+                    Let elem be proc list_get from ListCore with current_row, i
+                    proc ast_add_child from row_node, elem
+                    Set i to i plus 1
+                End While
+                proc ast_add_child from matrix, row_node
+                Set current_row to proc list_create from ListCore
+            End If
+            proc advance from parser
+            proc skip_newlines from parser
+        Otherwise:
+            If token_type is equal to Lexer.TOKEN_NEWLINE:
+                If proc list_length from ListCore with current_row is greater than 0:
+                    Let row_node be proc create_ast_node from MATLAB_MATRIX_EXPR
+                    Let row_count be proc list_length from ListCore with current_row
+                    Let i be 0
+                    While i is less than row_count:
+                        Let elem be proc list_get from ListCore with current_row, i
+                        proc ast_add_child from row_node, elem
+                        Set i to i plus 1
+                    End While
+                    proc ast_add_child from matrix, row_node
+                    Set current_row to proc list_create from ListCore
+                End If
+                proc advance from parser
+            Otherwise:
+                Note: Parse element
+                If token_type is not equal to Lexer.TOKEN_COMMA:
+                    Let elem be proc parse_expression from parser
+                    proc list_append from ListCore with current_row, elem
+                Otherwise:
+                    proc advance from parser
+                End If
+
+                proc skip_newlines from parser
+            End If
+        End If
+    End While
+
+    Return matrix
+End Process
+
+Process called "parse_cell_literal" takes parser as Integer returns Integer:
+    Let cell be proc create_ast_node from MATLAB_CELL_EXPR
+
+    proc expect from parser, Lexer.TOKEN_LBRACE
+    proc skip_newlines from parser
+
+    Note: Parse cell elements
+    While 1 is equal to 1:
+        Let token_type be proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_RBRACE:
+            proc advance from parser
+            Return cell
+        End If
+
+        Let elem be proc parse_expression from parser
+        proc ast_add_child from cell, elem
+
+        proc skip_newlines from parser
+        Set token_type to proc current_type from parser
+
+        If token_type is equal to Lexer.TOKEN_COMMA:
+            proc advance from parser
+            proc skip_newlines from parser
+        End If
+
+        If token_type is equal to Lexer.TOKEN_SEMICOLON:
+            proc advance from parser
+            proc skip_newlines from parser
+        End If
+    End While
+
+    Return cell
+End Process
+
+Process called "parse_function_handle" takes parser as Integer returns Integer:
+    proc expect from parser, Lexer.TOKEN_AT
+
+    Let token_type be proc current_type from parser
+
+    Note: Named function handle (@func)
+    If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+        Let token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+        Let func_name be proc matlab_token_value from Lexer with token
+
+        Let handle be proc create_ast_node from MATLAB_FUNC_HANDLE_EXPR
+        proc ast_set_value from handle, func_name
+        Return handle
+    End If
+
+    Note: Anonymous function (@(x) expr)
+    If token_type is equal to Lexer.TOKEN_LPAREN:
+        Let lambda be proc create_ast_node from MATLAB_LAMBDA_EXPR
+
+        proc advance from parser
+        proc skip_newlines from parser
+
+        Note: Parse parameters
+        Let params be proc create_ast_node from MATLAB_IDENTIFIER
+        proc ast_set_value from params, "params"
+
+        While 1 is equal to 1:
+            Set token_type to proc current_type from parser
+
+            If token_type is equal to Lexer.TOKEN_IDENTIFIER:
+                Let param_token be proc expect from parser, Lexer.TOKEN_IDENTIFIER
+                Let param_name be proc matlab_token_value from Lexer with param_token
+                Let param be proc create_ast_node from MATLAB_IDENTIFIER
+                proc ast_set_value from param, param_name
+                proc ast_add_child from params, param
+            End If
+
+            proc skip_newlines from parser
+            Set token_type to proc current_type from parser
+
+            If token_type is equal to Lexer.TOKEN_COMMA:
+                proc advance from parser
+                proc skip_newlines from parser
+            Otherwise:
+                If token_type is equal to Lexer.TOKEN_RPAREN:
+                    proc advance from parser
+                    proc skip_newlines from parser
+                    Let done be 1
+                    Return
+                End If
+                Return
+            End If
+        End While
+
+        proc ast_add_child from lambda, params
+
+        Note: Parse body expression
+        Let body be proc parse_expression from parser
+        proc ast_add_child from lambda, body
+
+        Return lambda
+    End If
+
+    Note: Error - unexpected token after @
+    Return proc create_ast_node from MATLAB_FUNC_HANDLE_EXPR
+End Process
+
+Note: ===================================================================
+Note: END OF MATLAB PARSER
+Note: ===================================================================

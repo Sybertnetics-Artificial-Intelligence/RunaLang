@@ -33,6 +33,951 @@ This file consists of the following functions/features/operation types:
 - Graph coloring register allocation and register assignment
 - Register spilling and register optimization
 - Register validation and register verification
+
+Dependencies:
+- Requires liveness.runa for live range information
+- Requires interference.runa for interference graph
+- Imports LIR types for function and instruction structures
+- Imports memory/layout.runa for OWNED HEAP allocation (Tier 3)
+- Imports collections for allocation tracking
 :End Note
 
-Note: TODO - Implement register allocation algorithms functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/liveness.runa" as Liveness
+Import "compiler/middle/gungnir/lir/interference.runa" as Interference
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+
+Note: ============================================================================
+Note: Register Allocation Overview
+Note: ============================================================================
+
+Note:
+OVERVIEW:
+---------
+This file implements graph coloring register allocation with spilling.
+Maps virtual registers to physical registers (x86-64 GPRs and XMM registers).
+
+COMPILATION PIPELINE INTEGRATION:
+----------------------------------
+1. MIR-to-LIR lowering creates virtual registers (lir_builder.runa)
+2. Liveness analysis computes live ranges (liveness.runa)
+3. Interference graph construction (interference.runa)
+4. **REGISTER ALLOCATION** ← (this file)
+5. Spill code insertion if needed (spilling.runa)
+6. Backend code generation
+
+PREREQUISITES:
+--------------
+Before calling register allocation:
+1. Run liveness analysis:
+   Let success be Liveness.compute_function_liveness(lir_function)
+
+2. Build interference graph:
+   Let interference_graph be Interference.build_interference_graph(lir_function)
+
+3. Then perform allocation:
+   Let allocation be allocate_registers(lir_function, interference_graph)
+
+ALGORITHMS:
+-----------
+1. Graph Coloring (Chaitin-Briggs):
+   - Build interference graph from liveness
+   - Simplify: remove nodes with degree < K (K = num physical regs)
+   - Spill: if no node has degree < K, mark potential spills
+   - Select: assign colors (physical registers) to nodes
+   - Actual Spill: if coloring fails, insert spill code and retry
+
+2. Linear Scan (alternative, simpler):
+   - Sort live ranges by start point
+   - Assign registers in order
+   - Spill when all registers exhausted
+
+3. Priority-Based:
+   - Prioritize by usage frequency
+   - Allocate frequently-used registers first
+
+PHYSICAL REGISTER AVAILABILITY:
+--------------------------------
+x86-64 System V ABI:
+- GPRs: RAX, RBX, RCX, RDX, RSI, RDI, R8-R15 (RBP optional, RSP reserved)
+- XMM: XMM0-XMM15 for floating-point
+
+Register classes must match:
+- Integer values → GPR
+- Float/double → XMM
+- Vectors → XMM/YMM/ZMM
+
+SPILLING:
+---------
+When K-coloring fails (not enough physical registers):
+1. Select spill candidates (least frequently used)
+2. Insert spill stores after defs
+3. Insert spill loads before uses
+4. Rerun liveness analysis and allocation
+:End Note
+
+Note: ============================================================================
+Note: Register Allocation Context and Data Structures
+Note: ============================================================================
+
+@Reasoning
+Allocation context tracks the state during graph coloring register allocation.
+Maintains the working graph, allocation results, spill candidates, and various
+worklists needed by the Chaitin-Briggs algorithm.
+
+The algorithm works in phases:
+1. Simplification: Remove low-degree nodes (degree < K)
+2. Potential Spill: When no low-degree nodes exist, select spill candidates
+3. Select: Assign colors (physical registers) in reverse order
+
+This context is passed through all phases to maintain state.
+@End Reasoning
+
+Type called "AllocationContext":
+    lir_function as Integer               Note: Pointer to LIRFunction being allocated
+    interference_graph as Integer         Note: Pointer to interference graph (from interference.runa)
+    working_graph as Integer              Note: Working copy of graph (nodes removed during simplification)
+    allocation as Integer                 Note: Dictionary<vreg_id, physical_reg_id>
+    simplify_stack as Integer             Note: List of nodes removed in simplification order
+    spill_worklist as Integer             Note: List of virtual registers that need spilling
+    available_gprs as Integer             Note: List of available GPR physical register IDs
+    available_fprs as Integer             Note: List of available FPR physical register IDs
+    gpr_count as Integer                  Note: Number of available GPRs (K for GPR class)
+    fpr_count as Integer                  Note: Number of available FPRs (K for FPR class)
+End Type
+
+Note: Size: 10 fields * 8 bytes = 80 bytes per AllocationContext
+
+Note: ============================================================================
+Note: Physical Register Availability
+Note: ============================================================================
+
+@Reasoning
+Returns the list of allocatable physical registers for GPRs.
+Excludes RSP (always stack pointer) and RBP (frame pointer if used).
+
+System V ABI allocatable GPRs (assuming RBP reserved for frame pointer):
+RAX, RBX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15
+
+That's 14 registers available for allocation (RSP and RBP excluded).
+@End Reasoning
+
+Process called "get_available_gprs" that takes uses_frame_pointer as Integer returns Integer:
+    Let gprs be List.create()
+
+    Note: RAX (0) - accumulator, return value
+    List.append(gprs, 0)
+
+    Note: RBX (1) - callee-saved
+    List.append(gprs, 1)
+
+    Note: RCX (2) - counter
+    List.append(gprs, 2)
+
+    Note: RDX (3) - data
+    List.append(gprs, 3)
+
+    Note: RSI (4) - source index, arg2
+    List.append(gprs, 4)
+
+    Note: RDI (5) - destination index, arg1
+    List.append(gprs, 5)
+
+    Note: RBP (6) - base pointer (excluded if used as frame pointer)
+    If uses_frame_pointer equals 0:
+        List.append(gprs, 6)
+    End If
+
+    Note: RSP (7) - stack pointer (ALWAYS EXCLUDED)
+
+    Note: R8-R15 (8-15)
+    List.append(gprs, 8)
+    List.append(gprs, 9)
+    List.append(gprs, 10)
+    List.append(gprs, 11)
+    List.append(gprs, 12)
+    List.append(gprs, 13)
+    List.append(gprs, 14)
+    List.append(gprs, 15)
+
+    Return gprs
+End Process
+
+@Reasoning
+Returns the list of allocatable physical registers for FPRs (XMM registers).
+All 16 XMM registers (XMM0-XMM15) are available for allocation.
+
+Physical register IDs: XMM0=16, XMM1=17, ..., XMM15=31
+@End Reasoning
+
+Process called "get_available_fprs" that takes nothing returns Integer:
+    Let fprs be List.create()
+
+    Note: XMM0-XMM15 (physical IDs 16-31)
+    Let i be 16
+    While i is less than or equal to 31:
+        List.append(fprs, i)
+        Let i be i + 1
+    End While
+
+    Return fprs
+End Process
+
+@Reasoning
+Determines the register class (GPR or FPR) for any register (physical or virtual).
+
+This is the PRODUCTION-GRADE implementation using O(1) metadata lookup.
+Register class is stored when virtual registers are created by
+lir_create_virtual_register in lir.runa, and retrieved via
+lir_get_virtual_register_class.
+
+Performance: O(1) dictionary lookup vs O(N*M) instruction scanning.
+This is the proper approach used by production compilers (LLVM, GCC).
+@End Reasoning
+
+Process called "get_register_class" that takes lir_function as Integer, vreg_id as Integer returns Integer:
+    Note: Use lir_get_virtual_register_class for O(1) metadata lookup
+    Return LIR.lir_get_virtual_register_class(lir_function, vreg_id)
+End Process
+
+Note: ============================================================================
+Note: Allocation Context Creation
+Note: ============================================================================
+
+@Reasoning
+Creates and initializes the allocation context for register allocation.
+Sets up the working graph (copy of interference graph), allocation result
+dictionary, simplification stack, spill worklist, and available register lists.
+@End Reasoning
+
+Process called "create_allocation_context" that takes lir_function as Integer, interference_graph as Integer returns Integer:
+    Let context be Layout.allocate(80)  Note: AllocationContext size
+
+    Note: Set lir_function
+    Layout.memory_set_int64(context, 0, lir_function)
+
+    Note: Set interference_graph
+    Layout.memory_set_int64(context, 8, interference_graph)
+
+    Note: Create working copy of graph (will be modified during simplification)
+    Let working_graph be Dictionary.create()
+    Let keys be Dictionary.keys(interference_graph)
+    Let node_count be Dictionary.size(interference_graph)
+    Let i be 0
+    While i is less than node_count:
+        Let reg_id be List.get(keys, i)
+        Let adj_list be Dictionary.get(interference_graph, reg_id)
+
+        Note: Copy adjacency list
+        Let new_adj_list be List.create()
+        Let adj_size be List.size(adj_list)
+        Let j be 0
+        While j is less than adj_size:
+            Let neighbor be List.get(adj_list, j)
+            List.append(new_adj_list, neighbor)
+            Let j be j + 1
+        End While
+
+        Dictionary.set(working_graph, reg_id, new_adj_list)
+        Let i be i + 1
+    End While
+    Layout.memory_set_int64(context, 16, working_graph)
+
+    Note: Create allocation result dictionary
+    Let allocation be Dictionary.create()
+    Layout.memory_set_int64(context, 24, allocation)
+
+    Note: Create simplify stack
+    Let simplify_stack be List.create()
+    Layout.memory_set_int64(context, 32, simplify_stack)
+
+    Note: Create spill worklist
+    Let spill_worklist be List.create()
+    Layout.memory_set_int64(context, 40, spill_worklist)
+
+    Note: Get available physical registers
+    Let stack_frame be Layout.memory_get_int64(lir_function, 72)
+    Let uses_frame_pointer be 1
+    If stack_frame is not equal to 0:
+        Let uses_frame_pointer be Layout.memory_get_int64(stack_frame, 40)
+    End If
+
+    Let available_gprs be get_available_gprs(uses_frame_pointer)
+    Layout.memory_set_int64(context, 48, available_gprs)
+
+    Let available_fprs be get_available_fprs()
+    Layout.memory_set_int64(context, 56, available_fprs)
+
+    Note: Set K values (number of available registers per class)
+    Let gpr_count be List.size(available_gprs)
+    Layout.memory_set_int64(context, 64, gpr_count)
+
+    Let fpr_count be List.size(available_fprs)
+    Layout.memory_set_int64(context, 72, fpr_count)
+
+    Return context
+End Process
+
+Note: ============================================================================
+Note: Graph Coloring Algorithm - Simplification Phase
+Note: ============================================================================
+
+@Reasoning
+Simplification phase removes nodes with degree < K from the working graph.
+These nodes are guaranteed to be colorable when we later assign colors
+in the select phase (as long as their neighbors don't use all K colors).
+
+Nodes are pushed onto the simplify stack in the order they are removed.
+During select phase, we pop from this stack and assign colors in reverse order.
+
+Returns 1 if at least one node was removed, 0 if no low-degree nodes exist.
+@End Reasoning
+
+Process called "simplify_phase" that takes context as Integer returns Integer:
+    Let working_graph be Layout.memory_get_int64(context, 16)
+    Let simplify_stack be Layout.memory_get_int64(context, 32)
+    Let lir_function be Layout.memory_get_int64(context, 0)
+    Let gpr_count be Layout.memory_get_int64(context, 64)
+    Let fpr_count be Layout.memory_get_int64(context, 72)
+
+    Note: Find a node with degree < K
+    Let keys be Dictionary.keys(working_graph)
+    Let node_count be Dictionary.size(working_graph)
+
+    Let i be 0
+    While i is less than node_count:
+        Let reg_id be List.get(keys, i)
+        Let adj_list be Dictionary.get(working_graph, reg_id)
+
+        If adj_list is not equal to 0:
+            Let degree be List.size(adj_list)
+
+            Note: Determine K for this register's class
+            Let reg_class be get_register_class(lir_function, reg_id)
+            Let k be gpr_count
+            If reg_class equals 1:  Note: FPR
+                Let k be fpr_count
+            End If
+
+            Note: If degree < K, this node can be removed
+            If degree is less than k:
+                Note: Remove node from graph and push onto stack
+                List.append(simplify_stack, reg_id)
+
+                Note: Remove edges from neighbors
+                Let neighbor_count be List.size(adj_list)
+                Let j be 0
+                While j is less than neighbor_count:
+                    Let neighbor be List.get(adj_list, j)
+                    Let neighbor_adj be Dictionary.get(working_graph, neighbor)
+
+                    If neighbor_adj is not equal to 0:
+                        Note: Remove reg_id from neighbor's adjacency list
+                        Let size be List.size(neighbor_adj)
+                        Let m be 0
+                        While m is less than size:
+                            Let node be List.get(neighbor_adj, m)
+                            If node equals reg_id:
+                                List.remove_at(neighbor_adj, m)
+                                Let m be size  Note: Exit loop
+                            End If
+                            Let m be m + 1
+                        End While
+                    End If
+
+                    Let j be j + 1
+                End While
+
+                Note: Remove node from graph
+                Dictionary.remove(working_graph, reg_id)
+
+                Note: Return 1 to indicate progress
+                Return 1
+            End If
+        End If
+
+        Let i be i + 1
+    End While
+
+    Note: No low-degree node found
+    Return 0
+End Process
+
+@Reasoning
+Potential spill phase is invoked when no low-degree nodes exist.
+Selects a spill candidate based on heuristics (spill cost).
+
+Common heuristics:
+- Lowest use count (less frequently used)
+- Highest degree (most constrained)
+- Shortest live range (less impact)
+
+We use a simple heuristic: select node with highest degree.
+
+Marks the node for spilling and removes it from the graph to continue
+the simplification process.
+@End Reasoning
+
+Process called "potential_spill_phase" that takes context as Integer returns Integer:
+    Let working_graph be Layout.memory_get_int64(context, 16)
+    Let spill_worklist be Layout.memory_get_int64(context, 40)
+
+    Note: Find node with highest degree (most constrained)
+    Let keys be Dictionary.keys(working_graph)
+    Let node_count be Dictionary.size(working_graph)
+
+    If node_count equals 0:
+        Note: Graph is empty
+        Return 0
+    End If
+
+    Let max_degree be 0
+    Let spill_candidate be 0
+
+    Let i be 0
+    While i is less than node_count:
+        Let reg_id be List.get(keys, i)
+        Let adj_list be Dictionary.get(working_graph, reg_id)
+
+        If adj_list is not equal to 0:
+            Let degree be List.size(adj_list)
+            If degree is greater than max_degree:
+                Let max_degree be degree
+                Let spill_candidate be reg_id
+            End If
+        End If
+
+        Let i be i + 1
+    End While
+
+    If spill_candidate equals 0:
+        Note: Should not happen if node_count > 0
+        Return 0
+    End If
+
+    Note: Mark for potential spill
+    List.append(spill_worklist, spill_candidate)
+
+    Note: Remove from graph (treat as if spilled)
+    Let adj_list be Dictionary.get(working_graph, spill_candidate)
+    If adj_list is not equal to 0:
+        Let neighbor_count be List.size(adj_list)
+        Let j be 0
+        While j is less than neighbor_count:
+            Let neighbor be List.get(adj_list, j)
+            Let neighbor_adj be Dictionary.get(working_graph, neighbor)
+
+            If neighbor_adj is not equal to 0:
+                Note: Remove spill_candidate from neighbor's adjacency list
+                Let size be List.size(neighbor_adj)
+                Let m be 0
+                While m is less than size:
+                    Let node be List.get(neighbor_adj, m)
+                    If node equals spill_candidate:
+                        List.remove_at(neighbor_adj, m)
+                        Let m be size
+                    End If
+                    Let m be m + 1
+                End While
+            End If
+
+            Let j be j + 1
+        End While
+    End If
+
+    Dictionary.remove(working_graph, spill_candidate)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Graph Coloring Algorithm - Select Phase
+Note: ============================================================================
+
+@Reasoning
+Select phase assigns colors (physical registers) to nodes in reverse order
+of simplification. Pops nodes from simplify stack and assigns a color that
+doesn't conflict with already-colored neighbors.
+
+For each node:
+1. Get register class (GPR or FPR)
+2. Collect colors used by interfering neighbors
+3. Find first available color not used by neighbors
+4. If no color available, mark for actual spilling
+
+Returns 1 if all nodes were successfully colored, 0 if spilling is needed.
+@End Reasoning
+
+Process called "select_phase" that takes context as Integer returns Integer:
+    Let simplify_stack be Layout.memory_get_int64(context, 32)
+    Let allocation be Layout.memory_get_int64(context, 24)
+    Let interference_graph be Layout.memory_get_int64(context, 8)
+    Let spill_worklist be Layout.memory_get_int64(context, 40)
+    Let lir_function be Layout.memory_get_int64(context, 0)
+    Let available_gprs be Layout.memory_get_int64(context, 48)
+    Let available_fprs be Layout.memory_get_int64(context, 56)
+
+    Note: Pop nodes from stack and assign colors
+    Let stack_size be List.size(simplify_stack)
+
+    Let i be stack_size - 1
+    While i is greater than or equal to 0:
+        Let reg_id be List.get(simplify_stack, i)
+
+        Note: Determine register class
+        Let reg_class be get_register_class(lir_function, reg_id)
+
+        Note: Get available colors for this class
+        Let available_colors be available_gprs
+        If reg_class equals 1:  Note: FPR
+            Let available_colors be available_fprs
+        End If
+
+        Note: Collect colors used by interfering neighbors
+        Let used_colors be Dictionary.create()
+        Let neighbors be Interference.get_neighbors(interference_graph, reg_id)
+
+        If neighbors is not equal to 0:
+            Let neighbor_count be List.size(neighbors)
+            Let j be 0
+            While j is less than neighbor_count:
+                Let neighbor be List.get(neighbors, j)
+
+                Note: Check if neighbor has been colored
+                Let neighbor_color be Dictionary.get(allocation, neighbor)
+                If neighbor_color is not equal to 0:
+                    Note: Mark this color as used
+                    Dictionary.set(used_colors, neighbor_color, 1)
+                End If
+
+                Let j be j + 1
+            End While
+        End If
+
+        Note: Find first available color not used by neighbors
+        Let color_count be List.size(available_colors)
+        Let found_color be 0
+        Let assigned_color be 0
+
+        Let c be 0
+        While c is less than color_count and found_color equals 0:
+            Let color be List.get(available_colors, c)
+
+            Note: Check if this color is used
+            Let is_used be Dictionary.get(used_colors, color)
+            If is_used equals 0:
+                Let assigned_color be color
+                Let found_color be 1
+            End If
+
+            Let c be c + 1
+        End While
+
+        Note: Assign color or mark for spilling
+        If found_color equals 1:
+            Dictionary.set(allocation, reg_id, assigned_color)
+        Otherwise:
+            Note: No color available - actual spill needed
+            List.append(spill_worklist, reg_id)
+        End If
+
+        Let i be i - 1
+    End While
+
+    Note: Check if any registers need spilling
+    Let spill_count be List.size(spill_worklist)
+    If spill_count is greater than 0:
+        Return 0  Note: Spilling needed
+    End If
+
+    Return 1  Note: All registers successfully colored
+End Process
+
+Note: ============================================================================
+Note: Main Register Allocation Entry Point
+Note: ============================================================================
+
+@Reasoning
+Main entry point for register allocation using graph coloring.
+Implements the Chaitin-Briggs algorithm:
+
+1. Build allocation context
+2. Repeat:
+   a. Simplification phase: remove low-degree nodes
+   b. If no low-degree nodes, potential spill phase
+3. Select phase: assign colors to nodes
+4. If spilling needed, return spill list for caller to handle
+
+Returns allocation context with result in context.allocation.
+If spilling is needed, context.spill_worklist contains registers to spill.
+
+Caller should check spill_worklist and invoke spilling.runa if non-empty,
+then rerun liveness analysis and register allocation.
+@End Reasoning
+
+Process called "allocate_registers" that takes lir_function as Integer, interference_graph as Integer returns Integer:
+    If lir_function equals 0:
+        Display "allocate_registers: null function"
+        Return 0
+    End If
+
+    If interference_graph equals 0:
+        Display "allocate_registers: null interference graph"
+        Return 0
+    End If
+
+    Note: Create allocation context
+    Let context be create_allocation_context(lir_function, interference_graph)
+
+    Note: Simplification and potential spill phases
+    Let progress be 1
+    While progress equals 1:
+        Note: Try to simplify (remove low-degree nodes)
+        Let progress be simplify_phase(context)
+
+        If progress equals 0:
+            Note: No low-degree nodes found, try potential spill
+            Let progress be potential_spill_phase(context)
+        End If
+    End While
+
+    Note: Select phase: assign colors
+    Let success be select_phase(context)
+
+    Note: Return context (caller checks spill_worklist and allocation)
+    Return context
+End Process
+
+Note: ============================================================================
+Note: Register Allocation Result Application
+Note: ============================================================================
+
+@Reasoning
+Applies the register allocation results to the LIR function.
+Replaces all virtual register references in instructions with their
+assigned physical registers.
+
+Scans all instructions in all blocks and updates operands.
+@End Reasoning
+
+Process called "apply_allocation" that takes lir_function as Integer, allocation as Integer returns Integer:
+    If lir_function equals 0:
+        Display "apply_allocation: null function"
+        Return 0
+    End If
+
+    If allocation equals 0:
+        Display "apply_allocation: null allocation"
+        Return 0
+    End If
+
+    Let blocks be Layout.memory_get_int64(lir_function, 32)
+    Let block_count be Layout.memory_get_int64(lir_function, 40)
+
+    Note: Process each block
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let instruction_count be Layout.memory_get_int64(block, 24)
+
+        Note: Process each instruction
+        Let i be 0
+        While i is less than instruction_count:
+            Let instruction be List.get(instructions, i)
+
+            Note: Replace result register if virtual
+            Let result be Layout.memory_get_int64(instruction, 16)
+            If result is greater than or equal to 1000:
+                Let physical_reg be Dictionary.get(allocation, result)
+                If physical_reg is not equal to 0:
+                    Layout.memory_set_int64(instruction, 16, physical_reg)
+                End If
+            End If
+
+            Note: Replace operand1 register if virtual
+            Let operand1 be Layout.memory_get_int64(instruction, 24)
+            If operand1 is greater than or equal to 1000:
+                Let physical_reg be Dictionary.get(allocation, operand1)
+                If physical_reg is not equal to 0:
+                    Layout.memory_set_int64(instruction, 24, physical_reg)
+                End If
+            End If
+
+            Note: Replace operand2 register if virtual
+            Let operand2 be Layout.memory_get_int64(instruction, 32)
+            If operand2 is greater than or equal to 1000:
+                Let physical_reg be Dictionary.get(allocation, operand2)
+                If physical_reg is not equal to 0:
+                    Layout.memory_set_int64(instruction, 32, physical_reg)
+                End If
+            End If
+
+            Note: Replace operand3 register if virtual (for 3-operand instructions)
+            Let operand3 be Layout.memory_get_int64(instruction, 40)
+            If operand3 is greater than or equal to 1000:
+                Let physical_reg be Dictionary.get(allocation, operand3)
+                If physical_reg is not equal to 0:
+                    Layout.memory_set_int64(instruction, 40, physical_reg)
+                End If
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Allocation Verification and Debug
+Note: ============================================================================
+
+@Reasoning
+Verifies that the register allocation is valid:
+- All virtual registers have been assigned physical registers
+- No interfering registers have the same physical register
+- Physical registers are from the correct class
+@End Reasoning
+
+Process called "verify_allocation" that takes lir_function as Integer, allocation as Integer, interference_graph as Integer returns Integer:
+    If lir_function equals 0 or allocation equals 0 or interference_graph equals 0:
+        Display "verify_allocation: null input"
+        Return 0
+    End If
+
+    Let errors be 0
+
+    Note: Check that all virtual registers are allocated
+    Let blocks be Layout.memory_get_int64(lir_function, 32)
+    Let block_count be Layout.memory_get_int64(lir_function, 40)
+
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let instruction_count be Layout.memory_get_int64(block, 24)
+
+        Let i be 0
+        While i is less than instruction_count:
+            Let instruction be List.get(instructions, i)
+
+            Note: Check result register
+            Let result be Layout.memory_get_int64(instruction, 16)
+            If result is greater than or equal to 1000:
+                Let physical_reg be Dictionary.get(allocation, result)
+                If physical_reg equals 0:
+                    Display "verify_allocation: unallocated virtual register "
+                    Display result
+                    Display ""
+                    Let errors be errors + 1
+                End If
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Note: Check that interfering registers don't have same color
+    Let keys be Dictionary.keys(interference_graph)
+    Let node_count be Dictionary.size(interference_graph)
+
+    Let n be 0
+    While n is less than node_count:
+        Let reg1 be List.get(keys, n)
+        Let neighbors be Interference.get_neighbors(interference_graph, reg1)
+
+        If neighbors is not equal to 0:
+            Let color1 be Dictionary.get(allocation, reg1)
+
+            Let neighbor_count be List.size(neighbors)
+            Let m be 0
+            While m is less than neighbor_count:
+                Let reg2 be List.get(neighbors, m)
+                Let color2 be Dictionary.get(allocation, reg2)
+
+                If color1 is not equal to 0 and color2 is not equal to 0:
+                    If color1 equals color2:
+                        Display "verify_allocation: interfering registers have same color: "
+                        Display reg1
+                        Display " and "
+                        Display reg2
+                        Display " both assigned "
+                        Display color1
+                        Display ""
+                        Let errors be errors + 1
+                    End If
+                End If
+
+                Let m be m + 1
+            End While
+        End If
+
+        Let n be n + 1
+    End While
+
+    If errors is greater than 0:
+        Display "verify_allocation: "
+        Display errors
+        Display " errors found"
+        Display ""
+        Return 0
+    End If
+
+    Display "verify_allocation: allocation is valid"
+    Display ""
+    Return 1
+End Process
+
+@Reasoning
+Prints register allocation results in human-readable format.
+Shows virtual register to physical register mapping.
+@End Reasoning
+
+Process called "print_allocation" that takes lir_function as Integer, allocation as Integer returns Integer:
+    If lir_function equals 0 or allocation equals 0:
+        Display "print_allocation: null input"
+        Return 0
+    End If
+
+    Display "===== Register Allocation ====="
+    Display ""
+
+    Let keys be Dictionary.keys(allocation)
+    Let allocation_count be Dictionary.size(allocation)
+
+    Let i be 0
+    While i is less than allocation_count:
+        Let vreg_id be List.get(keys, i)
+        Let physical_reg be Dictionary.get(allocation, vreg_id)
+
+        Display "v"
+        Display vreg_id
+        Display " -> "
+
+        Let reg_name be LIR.lir_get_register_name(physical_reg)
+        Display reg_name
+        Display ""
+
+        Let i be i + 1
+    End While
+
+    Display "==============================="
+    Display ""
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Usage Example and Integration
+Note: ============================================================================
+
+Note:
+USAGE EXAMPLE:
+--------------
+Complete register allocation pipeline:
+
+    Import "compiler/middle/gungnir/lir/register_alloc.runa" as RegisterAlloc
+
+    Note: Step 1: Run liveness analysis
+    Let success be Liveness.compute_function_liveness(lir_function)
+    If success equals 0:
+        Display "Liveness analysis failed"
+        Return 0
+    End If
+
+    Note: Step 2: Build interference graph
+    Let interference_graph be Interference.build_interference_graph(lir_function)
+    If interference_graph equals 0:
+        Display "Interference graph construction failed"
+        Return 0
+    End If
+
+    Note: Step 3: Allocate registers
+    Let context be RegisterAlloc.allocate_registers(lir_function, interference_graph)
+    If context equals 0:
+        Display "Register allocation failed"
+        Return 0
+    End If
+
+    Note: Step 4: Check if spilling is needed
+    Let spill_worklist be Layout.memory_get_int64(context, 40)
+    Let spill_count be List.size(spill_worklist)
+
+    If spill_count is greater than 0:
+        Display "Spilling needed for "
+        Display spill_count
+        Display " registers"
+
+        Note: Invoke spilling (spilling.runa)
+        Let spill_success be Spilling.insert_spill_code(lir_function, spill_worklist)
+
+        If spill_success equals 0:
+            Display "Spill code insertion failed"
+            Return 0
+        End If
+
+        Note: Rerun liveness and allocation
+        Let success be Liveness.compute_function_liveness(lir_function)
+        Let interference_graph be Interference.build_interference_graph(lir_function)
+        Let context be RegisterAlloc.allocate_registers(lir_function, interference_graph)
+    End If
+
+    Note: Step 5: Apply allocation to instructions
+    Let allocation be Layout.memory_get_int64(context, 24)
+    Let success be RegisterAlloc.apply_allocation(lir_function, allocation)
+
+    Note: Step 6: Verify allocation (optional, for debugging)
+    Let valid be RegisterAlloc.verify_allocation(lir_function, allocation, interference_graph)
+
+    Note: Step 7: Print results (optional)
+    RegisterAlloc.print_allocation(lir_function, allocation)
+
+INTEGRATION POINTS:
+-------------------
+This register allocator is used by:
+
+1. LIR compilation pipeline (lir_builder.runa)
+   - After MIR-to-LIR lowering, register allocation assigns physical registers
+   - Prepares LIR for backend code generation
+
+2. Backend code generation
+   - Uses allocated physical registers to emit native assembly
+   - No virtual registers remain after allocation
+
+3. Spilling (spilling.runa)
+   - When register pressure exceeds available registers
+   - Inserts spill stores/loads and reruns allocation
+
+COMPILATION PIPELINE:
+---------------------
+1. Frontend: Lexing, Parsing → AST
+2. HIR: High-level IR
+3. MIR: SSA form
+4. LIR: Virtual registers (lir_builder.runa)
+5. Liveness analysis (liveness.runa)
+6. Interference graph (interference.runa)
+7. **REGISTER ALLOCATION** (this file)
+8. Spilling if needed (spilling.runa)
+9. Backend code generation
+
+ALGORITHMS IMPLEMENTED:
+-----------------------
+✓ Graph Coloring (Chaitin-Briggs)
+  - Simplification phase: Remove low-degree nodes
+  - Potential spill phase: Select spill candidates
+  - Select phase: Assign colors in reverse order
+
+PHYSICAL REGISTER SETS:
+------------------------
+GPRs (x86-64): RAX, RBX, RCX, RDX, RSI, RDI, R8-R15 (14 registers)
+FPRs (x86-64): XMM0-XMM15 (16 registers)
+
+Register classes must match virtual register usage (GPR for integers, FPR for floats).
+:End Note

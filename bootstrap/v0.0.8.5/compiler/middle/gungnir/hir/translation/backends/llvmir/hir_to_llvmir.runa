@@ -1,0 +1,727 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HIR to LLVM IR Code Generator - Converts Runa HIR to LLVM IR
+
+This file generates LLVM IR from Runa's High-level Intermediate Representation.
+Converts Runa dictionaries back to valid LLVM IR syntax with proper formatting.
+
+Translation Mapping (reverse of llvmir_to_hir):
+- Dictionary with "_type": "llvm_module" → LLVM IR module
+- Dictionary with "_type": "llvm_function" → Function definition
+- Dictionary with "_type": "llvm_basic_block" → Basic block with label
+- Dictionary with "_type": "llvm_instruction" → Instruction
+- String literals → LLVM IR types and values
+
+Features:
+- Pretty printing with proper indentation
+- Function definition generation
+- Basic block generation
+- Instruction generation (arithmetic, memory, control flow)
+- Type generation
+- SSA register formatting
+
+Dependencies:
+- llvmir_emitter.runa
+- compiler/middle/gungnir/hir/hir.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/backends/llvmir/llvmir_emitter.runa" as Emitter
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: LLVM IR Generation Context
+Note: ============================================================================
+
+Type called "LLVMIRGenContext":
+    emitter as Integer          Note: LLVMIREmitter instance
+    indent_level as Integer     Note: Current indentation level
+    error_message as Integer    Note: Error message (if any)
+    has_error as Integer        Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Context Creation and Destruction
+Note: ============================================================================
+
+Process called "create_generation_context" returns Integer:
+    Note: Create LLVM IR generation context
+
+    Let context_size be 32  Note: LLVMIRGenContext: 4 fields × 8 bytes
+    Let context be proc allocate from Layout with context_size
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Let emitter be proc create_llvmir_emitter from Emitter
+
+    If emitter is equal to 0:
+        proc deallocate from Layout with context
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with context, 0, emitter
+    proc memory_set_int64 from Layout with context, 8, 0   Note: indent_level = 0
+    proc memory_set_int64 from Layout with context, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with context, 24, 0  Note: has_error = false
+
+    Return context
+End Process
+
+Process called "destroy_generation_context" takes context as Integer returns Integer:
+    Note: Destroy generation context and free resources
+
+    If context is equal to 0:
+        Return 1
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    If emitter is not equal to 0:
+        proc destroy_llvmir_emitter from Emitter with emitter
+    End If
+
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with context
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
+    Note: Set generation error message
+
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with context, 16, new_error
+    proc memory_set_int64 from Layout with context, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Process called "has_generation_error" takes context as Integer returns Integer:
+    Note: Check if generation has error
+
+    Let has_error be proc memory_get_int64 from Layout with context, 24
+
+    Return has_error
+End Process
+
+Note: ============================================================================
+Note: HIR Node Type Detection
+Note: ============================================================================
+
+Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a dictionary literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "DictionaryLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_string_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a string literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "StringLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_list_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a list literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "ListLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: HIR Dictionary Key Access
+Note: ============================================================================
+
+Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get string value from HIR dictionary by key
+
+    Let entries be proc get_dictionary_entries from HIR with hir_dict
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Let matches be proc strings_equal from StringCore with key, entry_key
+
+        If matches is equal to 1:
+            Let is_string be proc is_string_hir from entry_value
+
+            If is_string is equal to 1:
+                Return proc get_string_literal_value from HIR with entry_value
+            End If
+
+            Return 0  Note: Value is not a string
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Process called "get_dict_hir_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get HIR node value from HIR dictionary by key
+
+    Let entries be proc get_dictionary_entries from HIR with hir_dict
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Let matches be proc strings_equal from StringCore with key, entry_key
+
+        If matches is equal to 1:
+            Return entry_value
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Note: ============================================================================
+Note: Indentation
+Note: ============================================================================
+
+Process called "emit_indent" takes context as Integer returns Integer:
+    Note: Emit indentation for current level
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+
+    proc emit_indent from Emitter with emitter, indent_level
+
+    Return 1
+End Process
+
+Process called "increase_indent" takes context as Integer returns Integer:
+    Note: Increase indentation level
+
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+    proc memory_set_int64 from Layout with context, 8, indent_level plus 1
+
+    Return 1
+End Process
+
+Process called "decrease_indent" takes context as Integer returns Integer:
+    Note: Decrease indentation level
+
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+
+    If indent_level is greater than 0:
+        proc memory_set_int64 from Layout with context, 8, indent_level minus 1
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Module Generation
+Note: ============================================================================
+
+Process called "generate_module" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate LLVM IR module
+
+    @Reasoning:
+    Modules contain global declarations and function definitions.
+    We generate each function in sequence.
+    @End Reasoning
+
+    Let functions be proc get_dict_hir_value from hir_node, "functions"
+
+    If functions is not equal to 0:
+        Let is_list be proc is_list_hir from functions
+
+        If is_list is equal to 1:
+            Let func_items be proc get_list_elements from HIR with functions
+            Let count be proc size from List with func_items
+            Let index be 0
+
+            While index is less than count:
+                Let func_hir be proc get_at from List with func_items, index
+                proc generate_function from context, func_hir
+
+                Let emitter be proc memory_get_int64 from Layout with context, 0
+                proc emit_newline from Emitter with emitter
+
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Function Generation
+Note: ============================================================================
+
+Process called "generate_function" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate LLVM IR function definition
+
+    @Reasoning:
+    Generates:
+    define return_type @function_name() {
+    basic_block1:
+      instructions
+    basic_block2:
+      instructions
+    }
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Generate function signature
+    proc emit_string from Emitter with emitter, "define "
+
+    Note: Get return type
+    Let ret_type be proc get_dict_hir_value from hir_node, "return_type"
+
+    If ret_type is not equal to 0:
+        Let is_string be proc is_string_hir from ret_type
+
+        If is_string is equal to 1:
+            Let type_str be proc get_string_literal_value from HIR with ret_type
+            proc emit_string from Emitter with emitter, type_str
+            proc emit_space from Emitter with emitter
+        End If
+    End If
+
+    Note: Get function name
+    Let func_name be proc get_dict_string_value from hir_node, "name"
+
+    If func_name is not equal to 0:
+        proc emit_string from Emitter with emitter, func_name
+    End If
+
+    Note: Generate parameter list from HIR function parameters
+    proc emit_string from Emitter with emitter, "("
+
+    Let parameters be proc get_dict_hir_value from hir_node, "parameters"
+
+    If parameters is not equal to 0:
+        Let is_list be proc is_list_hir from parameters
+
+        If is_list is equal to 1:
+            Let param_items be proc get_list_elements from HIR with parameters
+            Let param_count be proc size from List with param_items
+            Let param_idx be 0
+
+            While param_idx is less than param_count:
+                Let param_hir be proc get_at from List with param_items, param_idx
+
+                Note: Get parameter type
+                Let param_type be proc get_dict_hir_value from param_hir, "type"
+                If param_type is not equal to 0:
+                    Let param_type_str be proc get_string_literal_value from HIR with param_type
+                    proc emit_string from Emitter with emitter, param_type_str
+                    proc emit_space from Emitter with emitter
+                End If
+
+                Note: Get parameter name
+                Let param_name be proc get_dict_string_value from param_hir, "name"
+                If param_name is not equal to 0:
+                    proc emit_string from Emitter with emitter, "%"
+                    proc emit_string from Emitter with emitter, param_name
+                End If
+
+                Note: Add comma if not last parameter
+                If param_idx is less than param_count minus 1:
+                    proc emit_string from Emitter with emitter, ", "
+                End If
+
+                Set param_idx to param_idx plus 1
+            End While
+        End If
+    End If
+
+    proc emit_string from Emitter with emitter, ")"
+
+    Note: Opening brace
+    proc emit_string from Emitter with emitter, " {"
+    proc emit_newline from Emitter with emitter
+
+    proc increase_indent from context
+
+    Note: Generate basic blocks
+    Let basic_blocks be proc get_dict_hir_value from hir_node, "basic_blocks"
+
+    If basic_blocks is not equal to 0:
+        Let is_list be proc is_list_hir from basic_blocks
+
+        If is_list is equal to 1:
+            Let bb_items be proc get_list_elements from HIR with basic_blocks
+            Let count be proc size from List with bb_items
+            Let index be 0
+
+            While index is less than count:
+                Let bb_hir be proc get_at from List with bb_items, index
+                proc generate_basic_block from context, bb_hir
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    proc decrease_indent from context
+
+    Note: Closing brace
+    proc emit_string from Emitter with emitter, "}"
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Basic Block Generation
+Note: ============================================================================
+
+Process called "generate_basic_block" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate LLVM IR basic block
+
+    @Reasoning:
+    Basic blocks have a label followed by instructions.
+    Format:
+    label_name:
+      instruction1
+      instruction2
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Generate label
+    Let label_name be proc get_dict_string_value from hir_node, "label"
+
+    If label_name is not equal to 0:
+        proc emit_indent from context
+        proc emit_string from Emitter with emitter, label_name
+        proc emit_string from Emitter with emitter, ":"
+        proc emit_newline from Emitter with emitter
+    End If
+
+    Note: Generate instructions
+    Let instructions be proc get_dict_hir_value from hir_node, "instructions"
+
+    If instructions is not equal to 0:
+        Let is_list be proc is_list_hir from instructions
+
+        If is_list is equal to 1:
+            Let inst_items be proc get_list_elements from HIR with instructions
+            Let count be proc size from List with inst_items
+            Let index be 0
+
+            While index is less than count:
+                Let inst_hir be proc get_at from List with inst_items, index
+                proc generate_instruction from context, inst_hir
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Instruction Generation
+Note: ============================================================================
+
+Process called "generate_instruction" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate LLVM IR instruction
+
+    @Reasoning:
+    Instructions have optional result register, opcode, and operands.
+    Format:
+    %result = opcode type operand1, operand2
+    OR
+    opcode type operand1, operand2
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_space from Emitter with emitter
+    proc emit_space from Emitter with emitter
+
+    Note: Emit result register if present
+    Let result_reg be proc get_dict_string_value from hir_node, "result"
+
+    If result_reg is not equal to 0:
+        proc emit_string from Emitter with emitter, result_reg
+        proc emit_string from Emitter with emitter, " = "
+    End If
+
+    Note: Emit opcode
+    Let opcode be proc get_dict_string_value from hir_node, "opcode"
+
+    If opcode is not equal to 0:
+        proc emit_string from Emitter with emitter, opcode
+        proc emit_space from Emitter with emitter
+    End If
+
+    Note: Emit operands
+    Let operands be proc get_dict_hir_value from hir_node, "operands"
+
+    If operands is not equal to 0:
+        Let is_list be proc is_list_hir from operands
+
+        If is_list is equal to 1:
+            Let op_items be proc get_list_elements from HIR with operands
+            Let count be proc size from List with op_items
+            Let index be 0
+
+            While index is less than count:
+                Let operand_hir be proc get_at from List with op_items, index
+                proc generate_operand from context, operand_hir
+
+                Let is_last be index plus 1
+
+                If is_last is less than count:
+                    proc emit_string from Emitter with emitter, ", "
+                End If
+
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Operand Generation
+Note: ============================================================================
+
+Process called "generate_operand" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate LLVM IR operand (type or value)
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Check if string literal
+    Let is_string be proc is_string_hir from hir_node
+
+    If is_string is equal to 1:
+        Let str_value be proc get_string_literal_value from HIR with hir_node
+        proc emit_string from Emitter with emitter, str_value
+        Return 1
+    End If
+
+    Note: Handle dictionary operands (complex operands with type and value)
+    Let is_dict be proc is_dictionary_hir from hir_node
+
+    If is_dict is equal to 1:
+        Note: Check operand kind to determine how to emit it
+        Let kind_str be proc get_dict_string_value from hir_node, "kind"
+
+        If kind_str is not equal to 0:
+            Note: Register reference (e.g., %0, %1, %varname)
+            Let is_register be proc string_equals from StringCore with kind_str, "register"
+            If is_register is equal to 1:
+                Let reg_name be proc get_dict_string_value from hir_node, "name"
+                If reg_name is not equal to 0:
+                    proc emit_string from Emitter with emitter, "%"
+                    proc emit_string from Emitter with emitter, reg_name
+                    Return 1
+                End If
+            End If
+
+            Note: Global reference (e.g., @global_var)
+            Let is_global be proc string_equals from StringCore with kind_str, "global"
+            If is_global is equal to 1:
+                Let global_name be proc get_dict_string_value from hir_node, "name"
+                If global_name is not equal to 0:
+                    proc emit_string from Emitter with emitter, "@"
+                    proc emit_string from Emitter with emitter, global_name
+                    Return 1
+                End If
+            End If
+
+            Note: Integer constant
+            Let is_int be proc string_equals from StringCore with kind_str, "integer"
+            If is_int is equal to 1:
+                Let int_value be proc get_dict_string_value from hir_node, "value"
+                If int_value is not equal to 0:
+                    proc emit_string from Emitter with emitter, int_value
+                    Return 1
+                End If
+            End If
+
+            Note: Float constant
+            Let is_float be proc string_equals from StringCore with kind_str, "float"
+            If is_float is equal to 1:
+                Let float_value be proc get_dict_string_value from hir_node, "value"
+                If float_value is not equal to 0:
+                    proc emit_string from Emitter with emitter, float_value
+                    Return 1
+                End If
+            End If
+
+            Note: Label reference
+            Let is_label be proc string_equals from StringCore with kind_str, "label"
+            If is_label is equal to 1:
+                Let label_name be proc get_dict_string_value from hir_node, "name"
+                If label_name is not equal to 0:
+                    proc emit_string from Emitter with emitter, "label %"
+                    proc emit_string from Emitter with emitter, label_name
+                    Return 1
+                End If
+            End If
+        End If
+
+        Note: Fallback: emit value field if present
+        Let value_str be proc get_dict_string_value from hir_node, "value"
+        If value_str is not equal to 0:
+            proc emit_string from Emitter with emitter, value_str
+            Return 1
+        End If
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Top-Level Generation
+Note: ============================================================================
+
+Process called "generate_llvmir" takes hir_node as Integer returns Integer:
+    Note: Generate LLVM IR from HIR (top-level entry point)
+
+    @Reasoning:
+    Entry point for generating LLVM IR code from HIR representation.
+    @End Reasoning
+
+    Let context be proc create_generation_context
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if HIR node is a module
+    Let is_dict be proc is_dictionary_hir from hir_node
+
+    If is_dict is equal to 1:
+        Let type_str be proc get_dict_string_value from hir_node, "_type"
+
+        If type_str is not equal to 0:
+            Let is_module be proc strings_equal from StringCore with type_str, "llvm_module"
+
+            If is_module is equal to 1:
+                proc generate_module from context, hir_node
+            Otherwise:
+                Note: Not a module, might be function or other node
+                Let is_function be proc strings_equal from StringCore with type_str, "llvm_function"
+
+                If is_function is equal to 1:
+                    proc generate_function from context, hir_node
+                End If
+            End If
+        End If
+    End If
+
+    Note: Check for errors
+    Let has_error be proc has_generation_error from context
+
+    If has_error is equal to 1:
+        proc destroy_generation_context from context
+        Return 0
+    End If
+
+    Note: Get output
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let output be proc get_output from Emitter with emitter
+
+    Note: Destroy context
+    proc destroy_generation_context from context
+
+    Return output
+End Process

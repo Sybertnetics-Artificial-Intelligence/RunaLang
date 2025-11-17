@@ -1,0 +1,757 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HIR to XML Code Generator - Converts Runa HIR to XML
+
+This file generates XML from Runa's High-level Intermediate Representation (HIR).
+Converts Runa dictionaries and literals back to valid XML syntax with proper
+formatting and escaping.
+
+Translation Mapping (reverse of xml_to_hir):
+- Runa Dictionary with "_tag" key → XML Element
+  - "_tag" value: element name
+  - "_attributes" dictionary: element attributes
+  - "_children" list: child nodes (elements and text)
+- Runa String literal → XML text content (with entity escaping)
+- Dictionary with "_comment" key → XML comment
+- Dictionary with "_pi" key → XML processing instruction
+
+Features:
+- Pretty printing with configurable indentation
+- Proper XML entity escaping (text and attributes)
+- Self-closing tag detection (empty elements)
+- Mixed content support
+- Comment and PI generation
+- XML declaration generation
+
+Dependencies:
+- xml_emitter.runa (for buffered output)
+- compiler/middle/gungnir/hir/hir.runa (for HIR nodes)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/backends/xml/xml_emitter.runa" as Emitter
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Note: ============================================================================
+Note: XML Generation Context
+Note: ============================================================================
+
+Type called "XMLGenContext":
+    emitter as Integer          Note: XMLEmitter instance
+    indent_level as Integer     Note: Current indentation level
+    indent_string as Integer    Note: Indentation string (e.g., "  " for 2 spaces)
+    pretty_print as Integer     Note: Boolean: enable pretty printing
+    include_declaration as Integer  Note: Boolean: include XML declaration
+    error_message as Integer    Note: Error message (if any)
+    has_error as Integer        Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Context Creation and Destruction
+Note: ============================================================================
+
+Process called "create_generation_context" returns Integer:
+    Note: Create XML generation context with default settings
+
+    Let context_size be 56  Note: XMLGenContext: 7 fields × 8 bytes
+    Let context be proc allocate from Layout with context_size
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Create emitter
+    Let emitter be proc create_xml_emitter from Emitter
+
+    If emitter is equal to 0:
+        proc deallocate from Layout with context
+        Return 0
+    End If
+
+    Note: Create default indent string (2 spaces)
+    Let indent_str be proc allocate from Layout with 3
+    proc memory_set_byte from Layout with indent_str, 0, 32  Note: space
+    proc memory_set_byte from Layout with indent_str, 1, 32  Note: space
+    proc memory_set_byte from Layout with indent_str, 2, 0   Note: null terminator
+
+    Note: Initialize context
+    proc memory_set_int64 from Layout with context, 0, emitter
+    proc memory_set_int64 from Layout with context, 8, 0     Note: indent_level = 0
+    proc memory_set_int64 from Layout with context, 16, indent_str
+    proc memory_set_int64 from Layout with context, 24, 1    Note: pretty_print = true
+    proc memory_set_int64 from Layout with context, 32, 1    Note: include_declaration = true
+    proc memory_set_int64 from Layout with context, 40, 0    Note: error_message = null
+    proc memory_set_int64 from Layout with context, 48, 0    Note: has_error = false
+
+    Return context
+End Process
+
+Process called "destroy_generation_context" takes context as Integer returns Integer:
+    Note: Destroy generation context and free resources
+
+    If context is equal to 0:
+        Return 1
+    End If
+
+    Note: Free emitter
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    If emitter is not equal to 0:
+        proc destroy_xml_emitter from Emitter with emitter
+    End If
+
+    Note: Free indent string
+    Let indent_str be proc memory_get_int64 from Layout with context, 16
+    If indent_str is not equal to 0:
+        proc deallocate from Layout with indent_str
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with context, 40
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Free context
+    proc deallocate from Layout with context
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
+    Note: Set generation error message
+
+    Let error_message be proc memory_get_int64 from Layout with context, 40
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with context, 40, new_error
+    proc memory_set_int64 from Layout with context, 48, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Indentation
+Note: ============================================================================
+
+Process called "emit_indent" takes context as Integer returns Integer:
+    Note: Emit indentation for current level
+
+    Let pretty_print be proc memory_get_int64 from Layout with context, 24
+
+    If pretty_print is equal to 0:
+        Return 1  Note: Pretty printing disabled
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+    Let indent_str be proc memory_get_int64 from Layout with context, 16
+
+    Let count be 0
+    While count is less than indent_level:
+        proc emit_string from Emitter with emitter, indent_str
+        Set count to count plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "emit_newline" takes context as Integer returns Integer:
+    Note: Emit newline if pretty printing is enabled
+
+    Let pretty_print be proc memory_get_int64 from Layout with context, 24
+
+    If pretty_print is equal to 0:
+        Return 1
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_char from Emitter with emitter, 10  Note: newline
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HIR Node Type Detection
+Note: ============================================================================
+
+Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a dictionary literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "DictionaryLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_string_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a string literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "StringLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_list_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a list literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "ListLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: HIR Dictionary Key Access
+Note: ============================================================================
+
+Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get string value from HIR dictionary by key
+
+    @Reasoning:
+    HIR dictionaries store key-value pairs. We look up the key
+    and extract the string literal value.
+    @End Reasoning
+
+    Let entries be proc get_dictionary_entries from HIR with hir_dict
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Note: Compare key strings
+        Let key_length be proc string_length from StringCore with key
+        Let entry_key_length be proc string_length from StringCore with entry_key
+
+        If key_length is equal to entry_key_length:
+            Let matches be 1
+            Let key_index be 0
+
+            While key_index is less than key_length:
+                Let k1 be proc memory_get_byte from Layout with key, key_index
+                Let k2 be proc memory_get_byte from Layout with entry_key, key_index
+
+                If k1 is not equal to k2:
+                    Set matches to 0
+                    Break
+                End If
+
+                Set key_index to key_index plus 1
+            End While
+
+            If matches is equal to 1:
+                Note: Found matching key, extract string value
+                Let is_string be proc is_string_hir from entry_value
+
+                If is_string is equal to 1:
+                    Return proc get_string_literal_value from HIR with entry_value
+                End If
+
+                Return entry_value  Note: Return node even if not string
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Process called "get_dict_hir_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get HIR node value from HIR dictionary by key
+
+    Let entries be proc get_dictionary_entries from HIR with hir_dict
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Note: Compare key strings
+        Let key_length be proc string_length from StringCore with key
+        Let entry_key_length be proc string_length from StringCore with entry_key
+
+        If key_length is equal to entry_key_length:
+            Let matches be 1
+            Let key_index be 0
+
+            While key_index is less than key_length:
+                Let k1 be proc memory_get_byte from Layout with key, key_index
+                Let k2 be proc memory_get_byte from Layout with entry_key, key_index
+
+                If k1 is not equal to k2:
+                    Set matches to 0
+                    Break
+                End If
+
+                Set key_index to key_index plus 1
+            End While
+
+            If matches is equal to 1:
+                Return entry_value
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Note: ============================================================================
+Note: XML Element Generation
+Note: ============================================================================
+
+Process called "generate_element" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate XML element from HIR dictionary
+
+    @Reasoning:
+    HIR dictionaries representing XML elements have:
+    - "_tag" key: element name
+    - "_attributes" key: dictionary of attributes
+    - "_children" key: list of child nodes
+    This function generates the opening tag, attributes, children, and closing tag.
+    @End Reasoning
+
+    Let is_dict be proc is_dictionary_hir from hir_node
+
+    If is_dict is equal to 0:
+        proc set_generation_error from context, "Expected dictionary HIR node for element"
+        Return 0
+    End If
+
+    Note: Get tag name
+    Let tag_name be proc get_dict_string_value from hir_node, "_tag"
+
+    If tag_name is equal to 0:
+        proc set_generation_error from context, "Element missing _tag key"
+        Return 0
+    End If
+
+    Note: Get attributes and children
+    Let attributes_hir be proc get_dict_hir_value from hir_node, "_attributes"
+    Let children_hir be proc get_dict_hir_value from hir_node, "_children"
+
+    Note: Emit opening tag
+    proc emit_indent from context
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    proc emit_char from Emitter with emitter, 60  Note: <
+    proc emit_string from Emitter with emitter, tag_name
+
+    Note: Emit attributes
+    If attributes_hir is not equal to 0:
+        proc generate_attributes from context, attributes_hir
+    End If
+
+    Note: Check if element has children
+    Let has_children be 0
+
+    If children_hir is not equal to 0:
+        Let is_list be proc is_list_hir from children_hir
+
+        If is_list is equal to 1:
+            Let children_list be proc get_list_elements from HIR with children_hir
+            If children_list is not equal to 0:
+                Let child_count be proc size from List with children_list
+                If child_count is greater than 0:
+                    Set has_children to 1
+                End If
+            End If
+        End If
+    End If
+
+    Note: Self-closing tag if no children
+    If has_children is equal to 0:
+        proc emit_string from Emitter with emitter, " />"
+        proc emit_newline from context
+        Return 1
+    End If
+
+    Note: Close opening tag
+    proc emit_char from Emitter with emitter, 62  Note: >
+
+    Note: Generate children
+    Let children_list be proc get_list_elements from HIR with children_hir
+    Let child_count be proc size from List with children_list
+
+    Note: Check if children are all text (inline content)
+    Let all_text be 1
+    Let child_index be 0
+
+    While child_index is less than child_count:
+        Let child be proc get_at from List with children_list, child_index
+        Let is_string be proc is_string_hir from child
+
+        If is_string is equal to 0:
+            Set all_text to 0
+            Break
+        End If
+
+        Set child_index to child_index plus 1
+    End While
+
+    Note: Inline text content (no newlines/indentation)
+    If all_text is equal to 1:
+        Set child_index to 0
+        While child_index is less than child_count:
+            Let child be proc get_at from List with children_list, child_index
+            proc generate_text from context, child
+            Set child_index to child_index plus 1
+        End While
+
+        Note: Closing tag (inline)
+        proc emit_string from Emitter with emitter, "</"
+        proc emit_string from Emitter with emitter, tag_name
+        proc emit_char from Emitter with emitter, 62  Note: >
+        proc emit_newline from context
+
+        Return 1
+    End If
+
+    Note: Mixed/element children (use newlines and indentation)
+    proc emit_newline from context
+
+    Note: Increase indentation
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+    Set indent_level to indent_level plus 1
+    proc memory_set_int64 from Layout with context, 8, indent_level
+
+    Note: Generate children
+    Set child_index to 0
+    While child_index is less than child_count:
+        Let child be proc get_at from List with children_list, child_index
+        proc generate_node from context, child
+        Set child_index to child_index plus 1
+    End While
+
+    Note: Decrease indentation
+    Set indent_level to indent_level minus 1
+    proc memory_set_int64 from Layout with context, 8, indent_level
+
+    Note: Closing tag
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "</"
+    proc emit_string from Emitter with emitter, tag_name
+    proc emit_char from Emitter with emitter, 62  Note: >
+    proc emit_newline from context
+
+    Return 1
+End Process
+
+Process called "generate_attributes" takes context as Integer, attributes_hir as Integer returns Integer:
+    Note: Generate XML attributes from HIR dictionary
+
+    Let is_dict be proc is_dictionary_hir from attributes_hir
+
+    If is_dict is equal to 0:
+        Return 0  Note: Not a dictionary, skip attributes
+    End If
+
+    Let entries be proc get_dictionary_entries from HIR with attributes_hir
+
+    If entries is equal to 0:
+        Return 1  Note: No attributes
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let attr_name be proc memory_get_int64 from Layout with entry, 0
+        Let attr_value_hir be proc memory_get_int64 from Layout with entry, 8
+
+        Note: Emit attribute
+        proc emit_char from Emitter with emitter, 32  Note: space
+        proc emit_string from Emitter with emitter, attr_name
+        proc emit_char from Emitter with emitter, 61  Note: =
+        proc emit_char from Emitter with emitter, 34  Note: "
+
+        Note: Get string value and emit with escaping
+        Let is_string be proc is_string_hir from attr_value_hir
+
+        If is_string is equal to 1:
+            Let attr_value be proc get_string_literal_value from HIR with attr_value_hir
+            proc emit_escaped_attribute from Emitter with emitter, attr_value
+        End If
+
+        proc emit_char from Emitter with emitter, 34  Note: "
+
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Text Content Generation
+Note: ============================================================================
+
+Process called "generate_text" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate XML text content from HIR string literal
+
+    Let is_string be proc is_string_hir from hir_node
+
+    If is_string is equal to 0:
+        proc set_generation_error from context, "Expected string HIR node for text"
+        Return 0
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let text_value be proc get_string_literal_value from HIR with hir_node
+
+    If text_value is not equal to 0:
+        proc emit_escaped_text from Emitter with emitter, text_value
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Comment and Processing Instruction Generation
+Note: ============================================================================
+
+Process called "generate_comment" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate XML comment from HIR dictionary with "_comment" key
+
+    Let comment_value_hir be proc get_dict_hir_value from hir_node, "_comment"
+
+    If comment_value_hir is equal to 0:
+        Return 0
+    End If
+
+    Let is_string be proc is_string_hir from comment_value_hir
+
+    If is_string is equal to 0:
+        Return 0
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let comment_text be proc get_string_literal_value from HIR with comment_value_hir
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "<!--"
+    proc emit_string from Emitter with emitter, comment_text
+    proc emit_string from Emitter with emitter, "-->"
+    proc emit_newline from context
+
+    Return 1
+End Process
+
+Process called "generate_processing_instruction" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate XML processing instruction from HIR dictionary with "_pi" key
+
+    Let pi_value_hir be proc get_dict_hir_value from hir_node, "_pi"
+
+    If pi_value_hir is equal to 0:
+        Return 0
+    End If
+
+    Let is_string be proc is_string_hir from pi_value_hir
+
+    If is_string is equal to 0:
+        Return 0
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let pi_text be proc get_string_literal_value from HIR with pi_value_hir
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "<?"
+    proc emit_string from Emitter with emitter, pi_text
+    proc emit_string from Emitter with emitter, "?>"
+    proc emit_newline from context
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Node Type Dispatch
+Note: ============================================================================
+
+Process called "generate_node" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate XML from HIR node (dispatch based on node type)
+
+    @Reasoning:
+    Determines node type and calls appropriate generator.
+    Handles elements, text, comments, and processing instructions.
+    @End Reasoning
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if string (text content)
+    Let is_string be proc is_string_hir from hir_node
+
+    If is_string is equal to 1:
+        Note: Text content in mixed children - emit on its own line with indent
+        proc emit_indent from context
+        proc generate_text from context, hir_node
+        proc emit_newline from context
+        Return 1
+    End If
+
+    Note: Check if dictionary (element, comment, or PI)
+    Let is_dict be proc is_dictionary_hir from hir_node
+
+    If is_dict is equal to 1:
+        Note: Check for special keys
+        Let comment_value be proc get_dict_hir_value from hir_node, "_comment"
+        If comment_value is not equal to 0:
+            Return proc generate_comment from context, hir_node
+        End If
+
+        Let pi_value be proc get_dict_hir_value from hir_node, "_pi"
+        If pi_value is not equal to 0:
+            Return proc generate_processing_instruction from context, hir_node
+        End If
+
+        Note: Regular element
+        Return proc generate_element from context, hir_node
+    End If
+
+    Note: Unknown node type
+    proc set_generation_error from context, "Unknown HIR node type"
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Top-Level Generation Function
+Note: ============================================================================
+
+Process called "generate_xml_from_hir" takes hir_root as Integer, translation_context as Integer returns Integer:
+    Note: Generate XML from HIR root node
+
+    @Reasoning:
+    Entry point for HIR→XML generation. Creates generation context,
+    optionally emits XML declaration, generates XML tree, handles errors,
+    and returns generated XML string.
+    @End Reasoning
+
+    If hir_root is equal to 0:
+        proc add_translation_error from Translation with translation_context, "Null HIR root"
+        Return 0
+    End If
+
+    Note: Create generation context
+    Let context be proc create_generation_context
+
+    If context is equal to 0:
+        proc add_translation_error from Translation with translation_context, "Out of memory"
+        Return 0
+    End If
+
+    Note: Emit XML declaration
+    Let include_declaration be proc memory_get_int64 from Layout with context, 32
+
+    If include_declaration is equal to 1:
+        Let emitter be proc memory_get_int64 from Layout with context, 0
+        proc emit_string from Emitter with emitter, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        proc emit_newline from context
+    End If
+
+    Note: Generate XML from HIR
+    proc generate_node from context, hir_root
+
+    Note: Check for generation errors
+    Let has_error be proc memory_get_int64 from Layout with context, 48
+
+    If has_error is equal to 1:
+        Let error_msg be proc memory_get_int64 from Layout with context, 40
+        proc add_translation_error from Translation with translation_context, error_msg
+        proc destroy_generation_context from context
+        Return 0
+    End If
+
+    Note: Get output
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let output be proc get_output from Emitter with emitter
+
+    Note: Cleanup
+    proc destroy_generation_context from context
+
+    Return output
+End Process
+
+Note: End of HIR to XML Code Generator

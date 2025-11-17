@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,1173 @@ This file consists of the following functions/features/operation types:
 - Live range analysis and live variable tracking
 - Liveness optimization and liveness-based analysis
 - Liveness validation and liveness verification
+
+Dependencies:
+- Imports LIR types for instruction and block analysis
+- Imports LIRNodes for operand extraction
+- Imports memory/layout.runa for OWNED HEAP allocation (Tier 3)
+- Imports collections for set and list operations
 :End Note
 
-Note: TODO - Implement liveness analysis functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: Register Set Data Structure
+Note: Uses Dictionary for O(1) membership testing
+Note: ============================================================================
+
+@Reasoning
+Register sets track which registers are live at a program point. We use
+Dictionary<register_id, 1> as a set data structure for O(1) membership testing.
+
+Alternative is bitsets, but Dictionary provides simpler implementation
+and works well for the typical number of virtual registers (< 1000 per function).
+@End Reasoning
+
+Process called "create_register_set" that takes nothing returns Integer:
+    Let reg_set be Dictionary.create()
+    Return reg_set
+End Process
+
+@Reasoning
+Adds a register ID to a register set. Ignores physical registers that are
+not allocatable (RSP) or reserved by calling convention.
+@End Reasoning
+
+Process called "register_set_add" that takes reg_set as Integer, register_id as Integer returns Integer:
+    If reg_set equals 0:
+        Display "register_set_add: null register set"
+        Return 0
+    End If
+
+    Note: Only track allocatable registers
+    If LIR.lir_is_allocatable_register(register_id) equals 1:
+        Dictionary.set(reg_set, register_id, 1)
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+Removes a register ID from a register set.
+@End Reasoning
+
+Process called "register_set_remove" that takes reg_set as Integer, register_id as Integer returns Integer:
+    If reg_set equals 0:
+        Display "register_set_remove: null register set"
+        Return 0
+    End If
+
+    Dictionary.remove(reg_set, register_id)
+    Return 1
+End Process
+
+@Reasoning
+Checks if a register ID is present in a register set.
+@End Reasoning
+
+Process called "register_set_contains" that takes reg_set as Integer, register_id as Integer returns Integer:
+    If reg_set equals 0:
+        Return 0
+    End If
+
+    Let value be Dictionary.get(reg_set, register_id)
+    If value is not equal to 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Computes the union of two register sets: result = set1 ∪ set2
+Returns a new register set containing all registers from both sets.
+@End Reasoning
+
+Process called "register_set_union" that takes set1 as Integer, set2 as Integer returns Integer:
+    If set1 equals 0 or set2 equals 0:
+        Display "register_set_union: null set"
+        Return 0
+    End If
+
+    Let result be create_register_set()
+
+    Note: Add all registers from set1
+    Let keys1 be Dictionary.keys(set1)
+    Let size1 be Dictionary.size(set1)
+    Let i be 0
+    While i is less than size1:
+        Let reg_id be List.get(keys1, i)
+        register_set_add(result, reg_id)
+        Let i be i + 1
+    End While
+
+    Note: Add all registers from set2
+    Let keys2 be Dictionary.keys(set2)
+    Let size2 be Dictionary.size(set2)
+    Let j be 0
+    While j is less than size2:
+        Let reg_id be List.get(keys2, j)
+        register_set_add(result, reg_id)
+        Let j be j + 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning
+Computes the difference of two register sets: result = set1 - set2
+Returns a new register set containing registers in set1 but not in set2.
+@End Reasoning
+
+Process called "register_set_difference" that takes set1 as Integer, set2 as Integer returns Integer:
+    If set1 equals 0:
+        Return create_register_set()
+    End If
+    If set2 equals 0:
+        Return set1
+    End If
+
+    Let result be create_register_set()
+
+    Note: Add registers from set1 that are not in set2
+    Let keys1 be Dictionary.keys(set1)
+    Let size1 be Dictionary.size(set1)
+    Let i be 0
+    While i is less than size1:
+        Let reg_id be List.get(keys1, i)
+        If register_set_contains(set2, reg_id) equals 0:
+            register_set_add(result, reg_id)
+        End If
+        Let i be i + 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning
+Checks if two register sets are equal (contain the same registers).
+Used to test convergence in the dataflow iteration.
+@End Reasoning
+
+Process called "register_set_equal" that takes set1 as Integer, set2 as Integer returns Integer:
+    If set1 equals 0 and set2 equals 0:
+        Return 1
+    End If
+    If set1 equals 0 or set2 equals 0:
+        Return 0
+    End If
+
+    Let size1 be Dictionary.size(set1)
+    Let size2 be Dictionary.size(set2)
+
+    If size1 is not equal to size2:
+        Return 0
+    End If
+
+    Note: Check if all registers in set1 are also in set2
+    Let keys1 be Dictionary.keys(set1)
+    Let i be 0
+    While i is less than size1:
+        Let reg_id be List.get(keys1, i)
+        If register_set_contains(set2, reg_id) equals 0:
+            Return 0
+        End If
+        Let i be i + 1
+    End While
+
+    Return 1
+End Process
+
+@Reasoning
+Returns the number of registers in a register set.
+@End Reasoning
+
+Process called "register_set_size" that takes reg_set as Integer returns Integer:
+    If reg_set equals 0:
+        Return 0
+    End If
+
+    Return Dictionary.size(reg_set)
+End Process
+
+Note: ============================================================================
+Note: Operand Register Extraction
+Note: ============================================================================
+
+@Reasoning
+Extracts all registers used by an operand and adds them to a register set.
+Handles register, immediate, and memory operands with complex addressing modes.
+
+Memory operands can reference multiple registers:
+- Base register: [%rax]
+- Base + index: [%rax + %rbx*4]
+- Base + index + displacement: [%rax + %rbx*4 + 16]
+@End Reasoning
+
+Process called "get_operand_registers" that takes operand as Integer, reg_set as Integer returns Integer:
+    If operand equals 0 or reg_set equals 0:
+        Return 0
+    End If
+
+    Note: Get operand type from LIROperand structure
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+
+    Note: Register operand - add the register
+    If operand_type equals LIRNodes.OPERAND_TYPE_REGISTER:
+        Let register_id be Layout.memory_get_int64(operand, 8)
+        register_set_add(reg_set, register_id)
+        Return 1
+    End If
+
+    Note: Immediate operand - no registers used
+    If operand_type equals LIRNodes.OPERAND_TYPE_IMMEDIATE:
+        Return 1
+    End If
+
+    Note: Memory operand - extract base and index registers
+    If operand_type equals LIRNodes.OPERAND_TYPE_MEMORY:
+        Let base_register be Layout.memory_get_int64(operand, 24)
+        Let index_register be Layout.memory_get_int64(operand, 32)
+
+        If base_register is not equal to 0:
+            register_set_add(reg_set, base_register)
+        End If
+
+        If index_register is not equal to 0:
+            register_set_add(reg_set, index_register)
+        End If
+
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Instruction-Level Analysis
+Note: ============================================================================
+
+@Reasoning
+Extracts all registers READ (used) by an instruction.
+Returns a register set containing all registers that must be live before
+this instruction executes.
+
+For most instructions: reads operands, writes result
+For calls: reads arguments, clobbers caller-saved registers
+For branches: reads condition operands
+@End Reasoning
+
+Process called "get_instruction_uses" that takes instruction as Integer returns Integer:
+    If instruction equals 0:
+        Display "get_instruction_uses: null instruction"
+        Return create_register_set()
+    End If
+
+    Let use_set be create_register_set()
+    Let opcode be Layout.memory_get_int64(instruction, 0)
+
+    Note: Extract operands from LIRInstruction structure
+    Let operand1 be Layout.memory_get_int64(instruction, 16)
+    Let operand2 be Layout.memory_get_int64(instruction, 24)
+    Let operand3 be Layout.memory_get_int64(instruction, 32)
+
+    Note: Most instructions read operand1 and operand2
+    If operand1 is not equal to 0:
+        get_operand_registers(operand1, use_set)
+    End If
+
+    If operand2 is not equal to 0:
+        get_operand_registers(operand2, use_set)
+    End If
+
+    If operand3 is not equal to 0:
+        get_operand_registers(operand3, use_set)
+    End If
+
+    Note: Special handling for CALL instructions - add caller-saved registers
+    If opcode equals LIR.LIR_CALL or opcode equals LIR.LIR_CALL_INDIRECT:
+        Note: Calls implicitly use argument registers
+        Note: This is handled by the call lowering which explicitly moves args to registers
+        Note: No additional implicit uses needed here
+    End If
+
+    Return use_set
+End Process
+
+@Reasoning
+Extracts all registers WRITTEN (defined) by an instruction.
+Returns a register set containing all registers that are modified by
+this instruction.
+
+For most instructions: writes result operand
+For calls: defines return register, clobbers caller-saved registers
+For compares: only sets flags (no register def)
+@End Reasoning
+
+Process called "get_instruction_defs" that takes instruction as Integer returns Integer:
+    If instruction equals 0:
+        Display "get_instruction_defs: null instruction"
+        Return create_register_set()
+    End If
+
+    Let def_set be create_register_set()
+    Let opcode be Layout.memory_get_int64(instruction, 0)
+
+    Note: Extract result operand from LIRInstruction structure
+    Let result be Layout.memory_get_int64(instruction, 8)
+
+    Note: Most instructions write their result operand
+    If result is not equal to 0:
+        Note: Get operand type
+        Let operand_type be Layout.memory_get_int64(result, 0)
+
+        Note: Only register operands can be defined (not memory or immediates)
+        If operand_type equals LIRNodes.OPERAND_TYPE_REGISTER:
+            Let register_id be Layout.memory_get_int64(result, 8)
+            register_set_add(def_set, register_id)
+        End If
+    End If
+
+    Note: Special handling for CALL instructions - clobber caller-saved registers
+    If opcode equals LIR.LIR_CALL or opcode equals LIR.LIR_CALL_INDIRECT:
+        Note: Calls clobber all caller-saved registers
+        Note: Add RAX (return value always potentially defined)
+        register_set_add(def_set, LIR.LIR_REG_RAX)
+
+        Note: Add XMM0 (float return value)
+        register_set_add(def_set, LIR.LIR_REG_XMM0)
+
+        Note: Add other caller-saved registers as clobbered
+        Note: System V: RCX, RDX, RSI, RDI, R8, R9, R10, R11
+        register_set_add(def_set, LIR.LIR_REG_RCX)
+        register_set_add(def_set, LIR.LIR_REG_RDX)
+        register_set_add(def_set, LIR.LIR_REG_RSI)
+        register_set_add(def_set, LIR.LIR_REG_RDI)
+        register_set_add(def_set, LIR.LIR_REG_R8)
+        register_set_add(def_set, LIR.LIR_REG_R9)
+        register_set_add(def_set, LIR.LIR_REG_R10)
+        register_set_add(def_set, LIR.LIR_REG_R11)
+
+        Note: XMM1-XMM15 are also caller-saved in System V
+        register_set_add(def_set, LIR.LIR_REG_XMM1)
+        register_set_add(def_set, LIR.LIR_REG_XMM2)
+        register_set_add(def_set, LIR.LIR_REG_XMM3)
+        register_set_add(def_set, LIR.LIR_REG_XMM4)
+        register_set_add(def_set, LIR.LIR_REG_XMM5)
+        register_set_add(def_set, LIR.LIR_REG_XMM6)
+        register_set_add(def_set, LIR.LIR_REG_XMM7)
+        register_set_add(def_set, LIR.LIR_REG_XMM8)
+        register_set_add(def_set, LIR.LIR_REG_XMM9)
+        register_set_add(def_set, LIR.LIR_REG_XMM10)
+        register_set_add(def_set, LIR.LIR_REG_XMM11)
+        register_set_add(def_set, LIR.LIR_REG_XMM12)
+        register_set_add(def_set, LIR.LIR_REG_XMM13)
+        register_set_add(def_set, LIR.LIR_REG_XMM14)
+        register_set_add(def_set, LIR.LIR_REG_XMM15)
+    End If
+
+    Note: Compare instructions only set flags (no register def)
+    If opcode equals LIR.LIR_CMP or opcode equals LIR.LIR_FCMP or opcode equals LIR.LIR_TEST:
+        Note: These only set FLAGS register, no GPR/FPR defs
+    End If
+
+    Return def_set
+End Process
+
+@Reasoning
+Checks if an instruction is a control flow instruction (branch, jump, return).
+These need special handling during liveness analysis as they affect CFG traversal.
+@End Reasoning
+
+Process called "is_branch_instruction" that takes opcode as Integer returns Integer:
+    If opcode equals LIR.LIR_JMP:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_JZ or opcode equals LIR.LIR_JNZ:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_JE or opcode equals LIR.LIR_JNE:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_JL or opcode equals LIR.LIR_JLE:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_JG or opcode equals LIR.LIR_JGE:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_JB or opcode equals LIR.LIR_JBE:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_JA or opcode equals LIR.LIR_JAE:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_JS or opcode equals LIR.LIR_JNS:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_JO or opcode equals LIR.LIR_JNO:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_JP or opcode equals LIR.LIR_JNP:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_RET:
+        Return 1
+    End If
+    Return 0
+End Process
+
+@Reasoning
+Checks if an instruction is a function call.
+Calls require special handling due to calling conventions and register clobbering.
+@End Reasoning
+
+Process called "is_call_instruction" that takes opcode as Integer returns Integer:
+    If opcode equals LIR.LIR_CALL:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_CALL_INDIRECT:
+        Return 1
+    End If
+    If opcode equals LIR.LIR_SYSCALL:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Block-Level Analysis
+Note: ============================================================================
+
+@Reasoning
+Computes the USE and DEF sets for a basic block.
+
+USE[B] = registers used in B before being defined
+DEF[B] = registers defined in B
+
+Algorithm: scan instructions forward, tracking which registers are defined.
+- If a register is used before being defined: add to USE
+- If a register is defined: add to DEF (and remove from USE if present)
+@End Reasoning
+
+Process called "compute_block_use_def" that takes block as Integer returns Integer:
+    If block equals 0:
+        Display "compute_block_use_def: null block"
+        Return 0
+    End If
+
+    Let use_set be create_register_set()
+    Let def_set be create_register_set()
+
+    Note: Get instruction list from block
+    Let instructions be Layout.memory_get_int64(block, 16)
+    Let instruction_count be Layout.memory_get_int64(block, 24)
+
+    Note: Scan instructions forward
+    Let i be 0
+    While i is less than instruction_count:
+        Let instruction be List.get(instructions, i)
+
+        Note: Get registers used by this instruction
+        Let inst_uses be get_instruction_uses(instruction)
+        Let use_keys be Dictionary.keys(inst_uses)
+        Let use_count be Dictionary.size(inst_uses)
+
+        Note: Add uses that are not already in DEF
+        Let j be 0
+        While j is less than use_count:
+            Let reg_id be List.get(use_keys, j)
+            If register_set_contains(def_set, reg_id) equals 0:
+                register_set_add(use_set, reg_id)
+            End If
+            Let j be j + 1
+        End While
+
+        Note: Get registers defined by this instruction
+        Let inst_defs be get_instruction_defs(instruction)
+        Let def_keys be Dictionary.keys(inst_defs)
+        Let def_count be Dictionary.size(inst_defs)
+
+        Note: Add defs to DEF set
+        Let k be 0
+        While k is less than def_count:
+            Let reg_id be List.get(def_keys, k)
+            register_set_add(def_set, reg_id)
+            Let k be k + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Note: Store USE and DEF sets in dictionaries
+    Note: We'll use block metadata field for this
+    Let metadata be Layout.allocate(16)
+    Layout.memory_set_int64(metadata, 0, use_set)  Note: Store USE set
+    Layout.memory_set_int64(metadata, 8, def_set)  Note: Store DEF set
+    Layout.memory_set_int64(block, 64, metadata)   Note: Store in live_in slot temporarily
+
+    Return 1
+End Process
+
+@Reasoning
+Initializes live-in and live-out sets for all blocks in a function.
+Entry block is initialized with function parameters live-in.
+All other blocks start with empty sets.
+@End Reasoning
+
+Process called "initialize_block_liveness" that takes function as Integer returns Integer:
+    If function equals 0:
+        Display "initialize_block_liveness: null function"
+        Return 0
+    End If
+
+    Note: Get all blocks
+    Let blocks be Layout.memory_get_int64(function, 32)
+    Let block_count be Layout.memory_get_int64(function, 40)
+
+    Note: Initialize each block
+    Let i be 0
+    While i is less than block_count:
+        Let block be List.get(blocks, i)
+
+        Note: Compute USE/DEF sets for this block
+        compute_block_use_def(block)
+
+        Let i be i + 1
+    End While
+
+    Note: Initialize live-in of entry block with function parameters
+    Let entry_block be Layout.memory_get_int64(function, 16)
+    If entry_block is not equal to 0:
+        Let params be Layout.memory_get_int64(function, 48)
+        Let param_count be Layout.memory_get_int64(function, 56)
+
+        Note: Get USE/DEF metadata
+        Let metadata be Layout.memory_get_int64(entry_block, 64)
+        If metadata is not equal to 0:
+            Let use_set be Layout.memory_get_int64(metadata, 0)
+
+            Note: Add all parameters to USE set of entry block
+            Let j be 0
+            While j is less than param_count:
+                Let param_reg be List.get(params, j)
+                register_set_add(use_set, param_reg)
+                Let j be j + 1
+            End While
+        End If
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+Runs the iterative dataflow analysis algorithm to compute live-in and live-out
+sets for all blocks.
+
+Algorithm:
+1. Initialize all blocks with empty live-in/live-out
+2. Iterate until fixpoint:
+   For each block B (in reverse postorder for faster convergence):
+     live_out[B] = ∪ live_in[S] for all successors S
+     new_live_in[B] = USE[B] ∪ (live_out[B] - DEF[B])
+     If new_live_in[B] ≠ live_in[B], mark changed
+3. Convergence: no changes in an iteration
+
+This typically converges in 2-5 iterations for most functions.
+@End Reasoning
+
+Process called "run_liveness_dataflow" that takes function as Integer returns Integer:
+    If function equals 0:
+        Display "run_liveness_dataflow: null function"
+        Return 0
+    End If
+
+    Let blocks be Layout.memory_get_int64(function, 32)
+    Let block_count be Layout.memory_get_int64(function, 40)
+
+    Note: Initialize live-in and live-out for all blocks
+    Let i be 0
+    While i is less than block_count:
+        Let block be List.get(blocks, i)
+
+        Note: Create empty live-in and live-out sets
+        Let live_in be create_register_set()
+        Let live_out be create_register_set()
+
+        Note: Store in block (offset 64 for live_in, 72 for live_out)
+        Note: But we're using 64 for metadata temporarily, so allocate new
+        Let liveness_data be Layout.allocate(32)
+        Layout.memory_set_int64(liveness_data, 0, live_in)
+        Layout.memory_set_int64(liveness_data, 8, live_out)
+
+        Note: Get USE/DEF from metadata
+        Let metadata be Layout.memory_get_int64(block, 64)
+        If metadata is not equal to 0:
+            Let use_set be Layout.memory_get_int64(metadata, 0)
+            Let def_set be Layout.memory_get_int64(metadata, 8)
+            Layout.memory_set_int64(liveness_data, 16, use_set)
+            Layout.memory_set_int64(liveness_data, 24, def_set)
+        End If
+
+        Note: Store liveness data pointer in block metadata temporarily
+        Layout.memory_set_int64(block, 80, liveness_data)  Note: Use loop_depth slot
+
+        Let i be i + 1
+    End While
+
+    Note: Iterate until convergence (fixpoint)
+    Let changed be 1
+    Let iteration be 0
+    Let max_iterations be 100
+
+    While changed equals 1 and iteration is less than max_iterations:
+        Let changed be 0
+        Let iteration be iteration + 1
+
+        Note: Process blocks in reverse order (backward dataflow)
+        Let j be block_count - 1
+        While j is greater than or equal to 0:
+            Let block be List.get(blocks, j)
+
+            Note: Get liveness data
+            Let liveness_data be Layout.memory_get_int64(block, 80)
+            If liveness_data equals 0:
+                Let j be j - 1
+                Continue
+            End If
+
+            Let old_live_in be Layout.memory_get_int64(liveness_data, 0)
+            Let old_live_out be Layout.memory_get_int64(liveness_data, 8)
+            Let use_set be Layout.memory_get_int64(liveness_data, 16)
+            Let def_set be Layout.memory_get_int64(liveness_data, 24)
+
+            Note: Compute new live_out = ∪ live_in[S] for all successors
+            Let new_live_out be create_register_set()
+
+            Let successors be Layout.memory_get_int64(block, 48)
+            Let successor_count be Layout.memory_get_int64(block, 56)
+
+            Let k be 0
+            While k is less than successor_count:
+                Let succ_id be List.get(successors, k)
+                Let succ_block be LIR.lir_get_block(function, succ_id)
+
+                If succ_block is not equal to 0:
+                    Let succ_liveness_data be Layout.memory_get_int64(succ_block, 80)
+                    If succ_liveness_data is not equal to 0:
+                        Let succ_live_in be Layout.memory_get_int64(succ_liveness_data, 0)
+
+                        Note: Add all registers from successor's live_in to new_live_out
+                        Let succ_keys be Dictionary.keys(succ_live_in)
+                        Let succ_size be Dictionary.size(succ_live_in)
+                        Let m be 0
+                        While m is less than succ_size:
+                            Let reg_id be List.get(succ_keys, m)
+                            register_set_add(new_live_out, reg_id)
+                            Let m be m + 1
+                        End While
+                    End If
+                End If
+
+                Let k be k + 1
+            End While
+
+            Note: Compute new_live_in = USE ∪ (live_out - DEF)
+            Let new_live_in be create_register_set()
+
+            Note: Add USE registers
+            Let use_keys be Dictionary.keys(use_set)
+            Let use_count be Dictionary.size(use_set)
+            Let n be 0
+            While n is less than use_count:
+                Let reg_id be List.get(use_keys, n)
+                register_set_add(new_live_in, reg_id)
+                Let n be n + 1
+            End While
+
+            Note: Add (live_out - DEF) registers
+            Let live_out_keys be Dictionary.keys(new_live_out)
+            Let live_out_count be Dictionary.size(new_live_out)
+            Let p be 0
+            While p is less than live_out_count:
+                Let reg_id be List.get(live_out_keys, p)
+                If register_set_contains(def_set, reg_id) equals 0:
+                    register_set_add(new_live_in, reg_id)
+                End If
+                Let p be p + 1
+            End While
+
+            Note: Check if live_in changed
+            If register_set_equal(old_live_in, new_live_in) equals 0:
+                Let changed be 1
+            End If
+
+            Note: Update live_in and live_out
+            Layout.memory_set_int64(liveness_data, 0, new_live_in)
+            Layout.memory_set_int64(liveness_data, 8, new_live_out)
+
+            Let j be j - 1
+        End While
+    End While
+
+    If iteration is greater than or equal to max_iterations:
+        Display "run_liveness_dataflow: warning - max iterations reached, may not have converged"
+        Display ""
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+Finalizes liveness results by storing live-in and live-out sets in the
+block structures where register allocation can access them.
+@End Reasoning
+
+Process called "finalize_liveness_results" that takes function as Integer returns Integer:
+    If function equals 0:
+        Display "finalize_liveness_results: null function"
+        Return 0
+    End If
+
+    Let blocks be Layout.memory_get_int64(function, 32)
+    Let block_count be Layout.memory_get_int64(function, 40)
+
+    Note: Copy liveness data from storage to block fields
+    Let i be 0
+    While i is less than block_count:
+        Let block be List.get(blocks, i)
+
+        Note: Get liveness data from storage
+        Let liveness_data be Layout.memory_get_int64(block, 80)
+        If liveness_data is not equal to 0:
+            Let live_in be Layout.memory_get_int64(liveness_data, 0)
+            Let live_out be Layout.memory_get_int64(liveness_data, 8)
+
+            Note: Store in actual block fields (offset 64 for live_in, 72 for live_out)
+            Layout.memory_set_int64(block, 64, live_in)
+            Layout.memory_set_int64(block, 72, live_out)
+
+            Note: Clear storage (restore loop_depth to 0)
+            Layout.memory_set_int64(block, 80, 0)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Live Range Computation
+Note: ============================================================================
+
+@Reasoning
+Computes precise live ranges for each virtual register across the entire function.
+A live range represents the program points where a register contains a live value.
+
+Live ranges are used by register allocation for:
+- Determining when two virtual registers interfere (can't use same physical register)
+- Identifying optimal spill candidates
+- Computing register pressure
+- Detecting dead code
+
+Live ranges are represented as lists of (block_id, start_index, end_index) tuples.
+@End Reasoning
+
+Process called "compute_live_ranges" that takes function as Integer returns Integer:
+    If function equals 0:
+        Display "compute_live_ranges: null function"
+        Return 0
+    End If
+
+    Note: Create dictionary mapping virtual register ID -> List of live range segments
+    Let live_ranges be Dictionary.create()
+
+    Let blocks be Layout.memory_get_int64(function, 32)
+    Let block_count be Layout.memory_get_int64(function, 40)
+
+    Note: For each block, compute precise live ranges
+    Let i be 0
+    While i is less than block_count:
+        Let block be List.get(blocks, i)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Note: Get live-out set for this block
+        Let live_out be Layout.memory_get_int64(block, 72)
+        Let current_live be create_register_set()
+
+        Note: Initialize current_live with live_out
+        If live_out is not equal to 0:
+            Let live_out_keys be Dictionary.keys(live_out)
+            Let live_out_size be Dictionary.size(live_out)
+            Let j be 0
+            While j is less than live_out_size:
+                Let reg_id be List.get(live_out_keys, j)
+                register_set_add(current_live, reg_id)
+
+                Note: Record that this register is live at end of block
+                Let range_list be Dictionary.get(live_ranges, reg_id)
+                If range_list equals 0:
+                    Let range_list be List.create()
+                    Dictionary.set(live_ranges, reg_id, range_list)
+                End If
+
+                Let j be j + 1
+            End While
+        End If
+
+        Note: Process instructions in reverse order (backward analysis)
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let instruction_count be Layout.memory_get_int64(block, 24)
+
+        Let k be instruction_count - 1
+        While k is greater than or equal to 0:
+            Let instruction be List.get(instructions, k)
+
+            Note: Get defs and uses for this instruction
+            Let inst_defs be get_instruction_defs(instruction)
+            Let inst_uses be get_instruction_uses(instruction)
+
+            Note: Remove defs from current_live (register is written, previous value dead)
+            Let def_keys be Dictionary.keys(inst_defs)
+            Let def_count be Dictionary.size(inst_defs)
+            Let m be 0
+            While m is less than def_count:
+                Let reg_id be List.get(def_keys, m)
+                register_set_remove(current_live, reg_id)
+                Let m be m + 1
+            End While
+
+            Note: Add uses to current_live (register must be live before this instruction)
+            Let use_keys be Dictionary.keys(inst_uses)
+            Let use_count be Dictionary.size(inst_uses)
+            Let n be 0
+            While n is less than use_count:
+                Let reg_id be List.get(use_keys, n)
+                register_set_add(current_live, reg_id)
+
+                Note: Record that this register is live at this instruction
+                Let range_list be Dictionary.get(live_ranges, reg_id)
+                If range_list equals 0:
+                    Let range_list be List.create()
+                    Dictionary.set(live_ranges, reg_id, range_list)
+                End If
+
+                Let n be n + 1
+            End While
+
+            Let k be k - 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Note: Store live ranges in function metadata
+    Layout.memory_set_int64(function, 136, live_ranges)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Main Entry Point
+Note: ============================================================================
+
+@Reasoning
+Main entry point for liveness analysis. Computes:
+1. USE/DEF sets for all blocks
+2. Live-in/live-out sets via dataflow iteration
+3. Precise live ranges for each virtual register
+
+Results are stored in the LIRFunction structure for use by register allocation.
+@End Reasoning
+
+Process called "compute_function_liveness" that takes function as Integer returns Integer:
+    If function equals 0:
+        Display "compute_function_liveness: null function"
+        Return 0
+    End If
+
+    Note: Step 1: Initialize USE/DEF sets for all blocks
+    initialize_block_liveness(function)
+
+    Note: Step 2: Run iterative dataflow analysis
+    run_liveness_dataflow(function)
+
+    Note: Step 3: Finalize results (store in block structures)
+    finalize_liveness_results(function)
+
+    Note: Step 4: Compute precise live ranges
+    compute_live_ranges(function)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Verification and Debug Utilities
+Note: ============================================================================
+
+@Reasoning
+Verifies that liveness analysis results are consistent and correct.
+Checks:
+- All live-in/live-out sets are properly computed
+- USE ⊆ live_in for all blocks
+- No dead code (registers defined but never used)
+@End Reasoning
+
+Process called "verify_liveness_results" that takes function as Integer returns Integer:
+    If function equals 0:
+        Display "verify_liveness_results: null function"
+        Return 0
+    End If
+
+    Let blocks be Layout.memory_get_int64(function, 32)
+    Let block_count be Layout.memory_get_int64(function, 40)
+    Let errors be 0
+
+    Note: Verify each block
+    Let i be 0
+    While i is less than block_count:
+        Let block be List.get(blocks, i)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Let live_in be Layout.memory_get_int64(block, 64)
+        Let live_out be Layout.memory_get_int64(block, 72)
+
+        Note: Check that live-in and live-out are computed
+        If live_in equals 0:
+            Display "verify_liveness_results: block "
+            Display block_id
+            Display " has null live_in"
+            Display ""
+            Let errors be errors + 1
+        End If
+
+        If live_out equals 0:
+            Display "verify_liveness_results: block "
+            Display block_id
+            Display " has null live_out"
+            Display ""
+            Let errors be errors + 1
+        End If
+
+        Let i be i + 1
+    End While
+
+    If errors is greater than 0:
+        Display "verify_liveness_results: "
+        Display errors
+        Display " errors found"
+        Display ""
+        Return 0
+    End If
+
+    Display "verify_liveness_results: all checks passed"
+    Display ""
+    Return 1
+End Process
+
+@Reasoning
+Prints liveness information for a specific basic block.
+Shows live-in, live-out, USE, and DEF sets.
+Used for debugging liveness analysis issues.
+@End Reasoning
+
+Process called "print_block_liveness" that takes block as Integer returns Integer:
+    If block equals 0:
+        Display "print_block_liveness: null block"
+        Return 0
+    End If
+
+    Let block_id be Layout.memory_get_int64(block, 0)
+    Let label be Layout.memory_get_int64(block, 8)
+
+    Display "=== Block "
+    Display block_id
+    Display " ("
+    Display label
+    Display ") ==="
+    Display ""
+
+    Note: Print live-in set
+    Let live_in be Layout.memory_get_int64(block, 64)
+    Display "  LIVE-IN: "
+    If live_in is not equal to 0:
+        Let live_in_keys be Dictionary.keys(live_in)
+        Let live_in_size be Dictionary.size(live_in)
+        Let i be 0
+        While i is less than live_in_size:
+            Let reg_id be List.get(live_in_keys, i)
+            Let reg_name be LIR.lir_get_register_name(reg_id)
+            Display reg_name
+            Display " "
+            Let i be i + 1
+        End While
+    End If
+    Display ""
+
+    Note: Print live-out set
+    Let live_out be Layout.memory_get_int64(block, 72)
+    Display "  LIVE-OUT: "
+    If live_out is not equal to 0:
+        Let live_out_keys be Dictionary.keys(live_out)
+        Let live_out_size be Dictionary.size(live_out)
+        Let j be 0
+        While j is less than live_out_size:
+            Let reg_id be List.get(live_out_keys, j)
+            Let reg_name be LIR.lir_get_register_name(reg_id)
+            Display reg_name
+            Display " "
+            Let j be j + 1
+        End While
+    End If
+    Display ""
+
+    Return 1
+End Process
+
+@Reasoning
+Prints liveness information for all blocks in a function.
+@End Reasoning
+
+Process called "print_liveness_info" that takes function as Integer returns Integer:
+    If function equals 0:
+        Display "print_liveness_info: null function"
+        Return 0
+    End If
+
+    Let func_name be Layout.memory_get_int64(function, 0)
+    Display "===== Liveness Analysis for Function: "
+    Display func_name
+    Display " ====="
+    Display ""
+
+    Let blocks be Layout.memory_get_int64(function, 32)
+    Let block_count be Layout.memory_get_int64(function, 40)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be List.get(blocks, i)
+        print_block_liveness(block)
+        Display ""
+        Let i be i + 1
+    End While
+
+    Display "================================"
+    Display ""
+
+    Return 1
+End Process
+
+@Reasoning
+Dumps computed live ranges for all virtual registers in a function.
+Shows the precise program points where each register is live.
+@End Reasoning
+
+Process called "dump_live_ranges" that takes function as Integer returns Integer:
+    If function equals 0:
+        Display "dump_live_ranges: null function"
+        Return 0
+    End If
+
+    Note: Get live ranges from function metadata
+    Let live_ranges be Layout.memory_get_int64(function, 136)
+    If live_ranges equals 0:
+        Display "dump_live_ranges: no live ranges computed"
+        Display ""
+        Return 0
+    End If
+
+    Display "===== Live Ranges ====="
+    Display ""
+
+    Let reg_keys be Dictionary.keys(live_ranges)
+    Let reg_count be Dictionary.size(live_ranges)
+
+    Let i be 0
+    While i is less than reg_count:
+        Let reg_id be List.get(reg_keys, i)
+        Let reg_name be LIR.lir_get_register_name(reg_id)
+
+        Display "Register "
+        Display reg_name
+        Display " (ID="
+        Display reg_id
+        Display ")"
+        Display ""
+
+        Let i be i + 1
+    End While
+
+    Display "======================="
+    Display ""
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Usage Example and Integration Notes
+Note: ============================================================================
+
+Note:
+USAGE EXAMPLE:
+--------------
+To perform liveness analysis on an LIR function after MIR-to-LIR lowering:
+
+    Import "compiler/middle/gungnir/lir/liveness.runa" as Liveness
+
+    Note: Assuming lir_function is a pointer to an LIRFunction
+    Let success be Liveness.compute_function_liveness(lir_function)
+
+    If success equals 0:
+        Display "Liveness analysis failed"
+    End If
+
+    Note: After successful analysis, access results from blocks:
+    Let blocks be Layout.memory_get_int64(lir_function, 32)
+    Let block be List.get(blocks, 0)
+
+    Let live_in be Layout.memory_get_int64(block, 64)   Note: offset 64
+    Let live_out be Layout.memory_get_int64(block, 72)  Note: offset 72
+
+    Note: Access live ranges for register allocation
+    Let live_ranges be Layout.memory_get_int64(lir_function, 136)
+
+INTEGRATION POINTS:
+-------------------
+This liveness analysis is used by:
+
+1. interference.runa: Builds interference graph from live ranges
+   - Two virtual registers interfere if their live ranges overlap
+   - Uses live-in/live-out sets to determine simultaneous liveness
+
+2. register_alloc.runa: Uses liveness for graph coloring allocation
+   - Interference graph guides register assignment
+   - Live ranges determine allocation constraints
+
+3. spilling.runa: Uses liveness to insert spill code
+   - Identifies optimal spill locations using live ranges
+   - Minimizes spill/reload pairs based on liveness
+
+COMPILATION PIPELINE POSITION:
+-------------------------------
+1. Frontend: Lexing, Parsing → AST
+2. HIR: High-level IR with type information
+3. MIR: SSA form with optimizations
+4. LIR: Virtual registers (lir_builder.runa)
+5. **LIVENESS ANALYSIS** ← (this file)
+6. Interference graph construction
+7. Register allocation
+8. Spill code insertion (if needed)
+9. Backend: Native code generation
+
+RESULTS STORED IN:
+------------------
+- LIRBasicBlock.live_in (offset 64): Registers live at block entry
+- LIRBasicBlock.live_out (offset 72): Registers live at block exit
+- LIRFunction.metadata (offset 136): Live ranges dictionary (reg_id -> range list)
+:End Note

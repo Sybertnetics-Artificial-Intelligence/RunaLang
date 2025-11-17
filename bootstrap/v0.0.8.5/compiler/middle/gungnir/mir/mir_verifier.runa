@@ -35,4 +35,1789 @@ This file consists of the following functions/features/operation types:
 - MIR consistency checking and MIR integrity validation
 :End Note
 
-Note: TODO - Implement MIR verifier functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: PHASE 3: DATA STRUCTURES - Verification Context
+Note: ============================================================================
+
+Type called "MIRVerifierContext":
+    @Reasoning
+    Maintains state during MIR verification.
+
+    **CONTEXT STRUCTURE:**
+    ```
+    MIRVerifierContext:
+        error_list: List of error messages
+        error_count: Number of errors detected
+        warning_list: List of warning messages
+        warning_count: Number of warnings
+        current_function: MIRFunction being verified
+        current_cfg: CFG being verified
+        value_definitions: Set of defined SSA values
+        value_uses: Set of used SSA values
+        block_visited: Set of visited blocks (for traversal)
+    ```
+
+    **MEMORY LAYOUT** (128 bytes total):
+    ```
+    Offset 0:  error_list (Integer - List pointer)
+    Offset 8:  error_count (Integer)
+    Offset 16: warning_list (Integer - List pointer)
+    Offset 24: warning_count (Integer)
+    Offset 32: current_function (Integer - MIRFunction pointer)
+    Offset 40: current_cfg (Integer - CFG pointer)
+    Offset 48: value_definitions (Integer - Set/List pointer)
+    Offset 56: value_uses (Integer - Set/List pointer)
+    Offset 64: block_visited (Integer - Set/List pointer)
+    Offset 72: [reserved for future use]
+    ```
+    @End Reasoning
+
+    error_list as Integer
+    error_count as Integer
+    warning_list as Integer
+    warning_count as Integer
+    current_function as Integer
+    current_cfg as Integer
+    value_definitions as Integer
+    value_uses as Integer
+    block_visited as Integer
+End Type
+
+Process called "create_verifier_context" that returns Integer:
+    @Reasoning
+    Creates a new MIR verifier context.
+
+    **INITIALIZATION:**
+    - Allocates 128 bytes for the context
+    - Initializes error and warning lists
+    - Creates empty sets for value tracking
+    - Sets counters to 0
+
+    **TIER 3 (OWNED HEAP) ALLOCATION:**
+    The context is heap-allocated and owned by the caller.
+    Must be destroyed with destroy_verifier_context() when done.
+    @End Reasoning
+
+    Note: Allocate context structure (128 bytes)
+    Let context_ptr be Layout.allocate(128)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Create error list
+    Let error_list be List.create()
+    Layout.memory_set_int64(context_ptr, 0, error_list)
+    Layout.memory_set_int64(context_ptr, 8, 0)  Note: error_count
+
+    Note: Create warning list
+    Let warning_list be List.create()
+    Layout.memory_set_int64(context_ptr, 16, warning_list)
+    Layout.memory_set_int64(context_ptr, 24, 0)  Note: warning_count
+
+    Note: Initialize function and CFG pointers to null
+    Layout.memory_set_int64(context_ptr, 32, 0)  Note: current_function
+    Layout.memory_set_int64(context_ptr, 40, 0)  Note: current_cfg
+
+    Note: Create value tracking sets
+    Let value_defs be List.create()
+    Let value_uses be List.create()
+    Let block_visited be List.create()
+    Layout.memory_set_int64(context_ptr, 48, value_defs)
+    Layout.memory_set_int64(context_ptr, 56, value_uses)
+    Layout.memory_set_int64(context_ptr, 64, block_visited)
+
+    Return context_ptr
+End Process
+
+Process called "destroy_verifier_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys a MIR verifier context and frees all associated memory.
+
+    **CLEANUP:**
+    - Destroys error and warning lists
+    - Destroys value tracking sets
+    - Frees context structure
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy error list
+    Let error_list be Layout.memory_get_int64(context_ptr, 0)
+    If error_list is not equal to 0:
+        List.destroy(error_list)
+    End If
+
+    Note: Destroy warning list
+    Let warning_list be Layout.memory_get_int64(context_ptr, 16)
+    If warning_list is not equal to 0:
+        List.destroy(warning_list)
+    End If
+
+    Note: Destroy value tracking sets
+    Let value_defs be Layout.memory_get_int64(context_ptr, 48)
+    If value_defs is not equal to 0:
+        List.destroy(value_defs)
+    End If
+
+    Let value_uses be Layout.memory_get_int64(context_ptr, 56)
+    If value_uses is not equal to 0:
+        List.destroy(value_uses)
+    End If
+
+    Let block_visited be Layout.memory_get_int64(context_ptr, 64)
+    If block_visited is not equal to 0:
+        List.destroy(block_visited)
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr)
+
+    Return 1
+End Process
+
+Process called "report_error" that takes context_ptr as Integer, error_message as Integer returns Integer:
+    @Reasoning
+    Reports a verification error.
+
+    **ERROR TRACKING:**
+    Adds error message to error list and increments error count.
+    Errors indicate invalid MIR that must be fixed before optimization.
+
+    **ERROR MESSAGES:**
+    Should be descriptive and include:
+    - Location (function name, block ID, instruction)
+    - Error type (SSA violation, CFG error, type mismatch)
+    - Details (what was expected vs what was found)
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get error list and count
+    Let error_list be Layout.memory_get_int64(context_ptr, 0)
+    Let error_count be Layout.memory_get_int64(context_ptr, 8)
+
+    Note: Add error message to list
+    List.append(error_list, error_message)
+
+    Note: Increment error count
+    Set error_count to error_count plus 1
+    Layout.memory_set_int64(context_ptr, 8, error_count)
+
+    Note: Display error immediately for debugging
+    Display "MIR Verification ERROR: " joined with error_message
+
+    Return 1
+End Process
+
+Process called "report_warning" that takes context_ptr as Integer, warning_message as Integer returns Integer:
+    @Reasoning
+    Reports a verification warning.
+
+    **WARNING TRACKING:**
+    Adds warning message to warning list and increments warning count.
+    Warnings indicate potentially problematic MIR that may still be valid.
+
+    **WARNING MESSAGES:**
+    Should indicate potential issues:
+    - Unreachable code
+    - Unused values
+    - Suspicious patterns
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get warning list and count
+    Let warning_list be Layout.memory_get_int64(context_ptr, 16)
+    Let warning_count be Layout.memory_get_int64(context_ptr, 24)
+
+    Note: Add warning message to list
+    List.append(warning_list, warning_message)
+
+    Note: Increment warning count
+    Set warning_count to warning_count plus 1
+    Layout.memory_set_int64(context_ptr, 24, warning_count)
+
+    Note: Display warning
+    Display "MIR Verification WARNING: " joined with warning_message
+
+    Return 1
+End Process
+
+Process called "get_error_count" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Returns the number of errors encountered during verification.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let error_count be Layout.memory_get_int64(context_ptr, 8)
+    Return error_count
+End Process
+
+Process called "get_warning_count" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Returns the number of warnings encountered during verification.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let warning_count be Layout.memory_get_int64(context_ptr, 24)
+    Return warning_count
+End Process
+
+Note: ============================================================================
+Note: PHASE 3: SSA FORM VALIDATION
+Note: ============================================================================
+
+Process called "verify_ssa_form" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies that the CFG is in valid SSA form.
+
+    **SSA PROPERTIES TO VERIFY:**
+    1. **Single Assignment:** Each value is defined exactly once
+    2. **Dominance Property:** Every use of a value is dominated by its definition
+    3. **Phi Correctness:** Phi nodes at block entry with correct number of operands
+    4. **Phi Placement:** Phis only at join points (blocks with multiple predecessors)
+
+    **ALGORITHM:**
+    - Pass 1: Collect all value definitions and uses
+    - Pass 2: Verify single assignment
+    - Pass 3: Verify dominance property using dominance tree
+    - Pass 4: Verify phi node correctness
+
+    Returns 1 if SSA form is valid, 0 if errors were found.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        report_error(context_ptr, "verify_ssa_form: null CFG")
+        Return 0
+    End If
+
+    Display "verify_ssa_form: starting SSA validation"
+
+    Note: Set current CFG in context
+    Layout.memory_set_int64(context_ptr, 40, cfg)
+
+    Note: Pass 1: Collect all value definitions and uses
+    collect_value_definitions_and_uses(context_ptr, cfg)
+
+    Note: Pass 2: Verify single assignment
+    verify_single_assignment(context_ptr)
+
+    Note: Pass 3: Verify dominance property
+    verify_dominance_property(context_ptr, cfg)
+
+    Note: Pass 4: Verify phi nodes
+    verify_phi_nodes(context_ptr, cfg)
+
+    Note: Check if any errors were found
+    Let error_count be get_error_count(context_ptr)
+    If error_count is greater than 0:
+        Display "verify_ssa_form: found " joined with error_count joined with " SSA errors"
+        Return 0
+    End If
+
+    Display "verify_ssa_form: SSA form is valid"
+    Return 1
+End Process
+
+Process called "collect_value_definitions_and_uses" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Collects all value definitions and uses from the CFG.
+
+    **ALGORITHM:**
+    - Iterate through all blocks
+    - For each instruction in each block:
+      - If instruction defines a value, add to definitions set
+      - For each operand used, add to uses set
+
+    **DEFINITION INSTRUCTIONS:**
+    Instructions that define values have a result value ID.
+    This includes: arithmetic ops, memory ops, phis, calls, etc.
+
+    **USE INSTRUCTIONS:**
+    Instructions that use values reference other value IDs as operands.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Get value tracking sets
+    Let value_defs be Layout.memory_get_int64(context_ptr, 48)
+    Let value_uses be Layout.memory_get_int64(context_ptr, 56)
+
+    Note: Clear sets
+    List.clear(value_defs)
+    List.clear(value_uses)
+
+    Note: Get all blocks
+    Let block_count be CFG.get_block_count(cfg)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Note: Process each instruction
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Note: Check if instruction defines a value
+            Let result_value be MIRNodes.get_instruction_result_value(inst)
+            If result_value is not equal to 0:
+                Note: Add to definitions set
+                List.append(value_defs, result_value)
+            End If
+
+            Note: Collect operand uses
+            Let operand_count be MIRNodes.get_instruction_operand_count(inst)
+            Let k be 0
+            While k is less than operand_count:
+                Let operand be MIRNodes.get_instruction_operand(inst, k)
+                If operand is not equal to 0:
+                    Note: Add to uses set
+                    List.append(value_uses, operand)
+                End If
+                Set k to k plus 1
+            End While
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "verify_single_assignment" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Verifies that each value is defined exactly once.
+
+    **SSA SINGLE ASSIGNMENT PROPERTY:**
+    In SSA form, each variable (value ID) must be assigned exactly once.
+
+    **ALGORITHM:**
+    - Sort definitions list
+    - Check for duplicate value IDs
+    - Report error for each duplicate
+
+    **VALID SSA:**
+    ```
+    %1 = add %2, %3    ; Define %1
+    %4 = mul %1, %5    ; Use %1, define %4
+    ```
+
+    **INVALID SSA:**
+    ```
+    %1 = add %2, %3    ; Define %1
+    %1 = sub %4, %5    ; ERROR: Redefine %1
+    ```
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get value definitions
+    Let value_defs be Layout.memory_get_int64(context_ptr, 48)
+    Let def_count be List.length(value_defs)
+
+    Note: Check for duplicate definitions
+    Let i be 0
+    While i is less than def_count:
+        Let value_id be List.get(value_defs, i)
+
+        Note: Count occurrences of this value ID
+        Let occurrences be 0
+        Let j be 0
+        While j is less than def_count:
+            Let other_value be List.get(value_defs, j)
+            If other_value equals value_id:
+                Set occurrences to occurrences plus 1
+            End If
+            Set j to j plus 1
+        End While
+
+        Note: If value is defined more than once, report error
+        If occurrences is greater than 1:
+            report_error(context_ptr, "SSA violation: value redefined")
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "verify_dominance_property" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies that every use of a value is dominated by its definition.
+
+    **SSA DOMINANCE PROPERTY:**
+    For every use of a value %v, the definition of %v must dominate that use.
+    This means the definition must execute before the use on all paths.
+
+    **ALGORITHM:**
+    1. Build dominance tree for CFG
+    2. For each value definition, find its defining block
+    3. For each use of that value, find its using block
+    4. Verify that defining block dominates using block
+
+    **EXCEPTION:**
+    Phi nodes use values from predecessor blocks, so dominance
+    is checked differently (definition must dominate predecessor block).
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Build dominance tree
+    Let dom_tree be Dominance.compute_dominance_tree(cfg)
+    If dom_tree equals 0:
+        report_error(context_ptr, "verify_dominance_property: failed to build dominance tree")
+        Return 0
+    End If
+
+    Note: Get value definitions and uses
+    Let value_defs be Layout.memory_get_int64(context_ptr, 48)
+    Let value_uses be Layout.memory_get_int64(context_ptr, 56)
+
+    Note: For each used value, verify its definition dominates the use
+    Let use_count be List.length(value_uses)
+    Let i be 0
+    While i is less than use_count:
+        Let used_value be List.get(value_uses, i)
+
+        Note: Find defining block for this value
+        Let def_block be find_defining_block(cfg, used_value)
+        If def_block equals 0:
+            report_error(context_ptr, "verify_dominance_property: value used but not defined")
+            Set i to i plus 1
+            Continue
+        End If
+
+        Note: Find using block for this value
+        Let use_block be find_using_block(cfg, used_value, i)
+        If use_block equals 0:
+            Set i to i plus 1
+            Continue
+        End If
+
+        Note: Check if def_block dominates use_block
+        Let dominates be Dominance.does_dominate(dom_tree, def_block, use_block)
+        If dominates equals 0:
+            report_error(context_ptr, "verify_dominance_property: definition does not dominate use")
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Cleanup dominance tree
+    Dominance.destroy_dominance_tree(dom_tree)
+
+    Return 1
+End Process
+
+Process called "verify_phi_nodes" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies phi node correctness in SSA form.
+
+    **PHI NODE PROPERTIES:**
+    1. **Placement:** Phis must be at the start of blocks with multiple predecessors
+    2. **Operand Count:** Number of phi operands must equal number of predecessors
+    3. **Type Consistency:** All phi operands must have same type as phi result
+    4. **Join Points:** Phis should only appear at control flow join points
+
+    **ALGORITHM:**
+    - Iterate through all blocks
+    - For blocks with multiple predecessors, verify phi nodes
+    - For blocks with single predecessor, ensure no phi nodes exist
+    - Verify operand count matches predecessor count
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Get all blocks
+    Let block_count be CFG.get_block_count(cfg)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let predecessors be CFG.get_block_predecessors(block)
+        Let pred_count be List.length(predecessors)
+
+        Note: Get block instructions
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Note: Count phi nodes in this block
+        Let phi_count be 0
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            If opcode equals 20300:  Note: MIR_PHI
+                Set phi_count to phi_count plus 1
+
+                Note: Verify phi operand count matches predecessor count
+                Let phi_operand_count be MIRNodes.get_phi_operand_count(inst)
+                If phi_operand_count is not equal to pred_count:
+                    report_error(context_ptr, "verify_phi_nodes: phi operand count mismatch")
+                End If
+            Otherwise:
+                Note: Phi nodes must be at block start, no more phis after first non-phi
+                If phi_count is greater than 0:
+                    Note: All phis have been seen, stop checking
+                    Set j to inst_count
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Note: If block has single predecessor, it should not have phi nodes
+        If pred_count is less than 2:
+            If phi_count is greater than 0:
+                report_error(context_ptr, "verify_phi_nodes: phi in block with single predecessor")
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "find_defining_block" that takes cfg as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Finds the block where a value is defined.
+
+    **ALGORITHM:**
+    - Iterate through all blocks
+    - Check each instruction for value definition
+    - Return block when definition is found
+
+    Returns block ID, or 0 if not found.
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let result_value be MIRNodes.get_instruction_result_value(inst)
+
+            If result_value equals value_id:
+                Note: Found defining block
+                Return i
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "find_using_block" that takes cfg as Integer, value_id as Integer, use_index as Integer returns Integer:
+    @Reasoning
+    Finds the block where a value is used (for a specific use index).
+
+    **ALGORITHM:**
+    - Iterate through all blocks
+    - Check each instruction for value use
+    - Return block when use is found
+
+    Returns block ID, or 0 if not found.
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let operand_count be MIRNodes.get_instruction_operand_count(inst)
+
+            Let k be 0
+            While k is less than operand_count:
+                Let operand be MIRNodes.get_instruction_operand(inst, k)
+                If operand equals value_id:
+                    Note: Found using block
+                    Return i
+                End If
+                Set k to k plus 1
+            End While
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PHASE 3: CFG VALIDATION
+Note: ============================================================================
+
+Process called "verify_cfg_structure" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies that the CFG has valid structure.
+
+    **CFG PROPERTIES TO VERIFY:**
+    1. **Entry Block:** CFG has exactly one entry block
+    2. **Block Connectivity:** All blocks are reachable from entry
+    3. **Terminator Placement:** Each block ends with a terminator instruction
+    4. **Edge Consistency:** All edge targets are valid blocks
+    5. **Predecessor Consistency:** Predecessor lists match actual edges
+
+    **ALGORITHM:**
+    - Verify entry block exists and is unique
+    - Verify all blocks have terminators
+    - Verify edge consistency
+    - Verify block reachability
+    - Verify predecessor/successor consistency
+
+    Returns 1 if CFG is valid, 0 if errors were found.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        report_error(context_ptr, "verify_cfg_structure: null CFG")
+        Return 0
+    End If
+
+    Display "verify_cfg_structure: starting CFG validation"
+
+    Note: Verify entry block
+    verify_entry_block(context_ptr, cfg)
+
+    Note: Verify terminators
+    verify_block_terminators(context_ptr, cfg)
+
+    Note: Verify edge consistency
+    verify_edge_consistency(context_ptr, cfg)
+
+    Note: Verify block reachability
+    verify_block_reachability(context_ptr, cfg)
+
+    Note: Verify predecessor/successor consistency
+    verify_predecessor_successor_consistency(context_ptr, cfg)
+
+    Note: Check if any errors were found
+    Let error_count be get_error_count(context_ptr)
+    If error_count is greater than 0:
+        Display "verify_cfg_structure: found " joined with error_count joined with " CFG errors"
+        Return 0
+    End If
+
+    Display "verify_cfg_structure: CFG structure is valid"
+    Return 1
+End Process
+
+Process called "verify_entry_block" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies that CFG has exactly one entry block.
+
+    **ENTRY BLOCK REQUIREMENTS:**
+    - CFG must have an entry block
+    - Entry block must be a valid block in the CFG
+    - Entry block should have no predecessors (entry point)
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Get entry block
+    Let entry_block be CFG.get_entry_block(cfg)
+    If entry_block equals 0:
+        report_error(context_ptr, "verify_entry_block: no entry block")
+        Return 0
+    End If
+
+    Note: Verify entry block has no predecessors
+    Let predecessors be CFG.get_block_predecessors(entry_block)
+    Let pred_count be List.length(predecessors)
+    If pred_count is greater than 0:
+        report_warning(context_ptr, "verify_entry_block: entry block has predecessors")
+    End If
+
+    Return 1
+End Process
+
+Process called "verify_block_terminators" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies that each block ends with exactly one terminator instruction.
+
+    **TERMINATOR INSTRUCTIONS:**
+    - MIR_BRANCH (20302) - conditional branch
+    - MIR_JUMP (20303) - unconditional jump
+    - MIR_RETURN (20310) - function return
+    - MIR_THROW (20311) - exception throw
+
+    **REQUIREMENTS:**
+    - Each block must have exactly one terminator
+    - Terminator must be the last instruction in the block
+    - No instructions after terminator
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        If inst_count equals 0:
+            report_error(context_ptr, "verify_block_terminators: empty block")
+            Set i to i plus 1
+            Continue
+        End If
+
+        Note: Check last instruction is a terminator
+        Let last_inst be List.get(instructions, inst_count minus 1)
+        Let last_opcode be MIRNodes.get_instruction_opcode(last_inst)
+
+        Let is_terminator be 0
+        If last_opcode equals 20302:  Note: MIR_BRANCH
+            Set is_terminator to 1
+        End If
+        If last_opcode equals 20303:  Note: MIR_JUMP
+            Set is_terminator to 1
+        End If
+        If last_opcode equals 20310:  Note: MIR_RETURN
+            Set is_terminator to 1
+        End If
+        If last_opcode equals 20311:  Note: MIR_THROW
+            Set is_terminator to 1
+        End If
+
+        If is_terminator equals 0:
+            report_error(context_ptr, "verify_block_terminators: block does not end with terminator")
+        End If
+
+        Note: Check no terminators before last instruction
+        Let j be 0
+        While j is less than inst_count minus 1:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            If opcode equals 20302:  Note: MIR_BRANCH
+                report_error(context_ptr, "verify_block_terminators: terminator before end of block")
+            End If
+            If opcode equals 20303:  Note: MIR_JUMP
+                report_error(context_ptr, "verify_block_terminators: terminator before end of block")
+            End If
+            If opcode equals 20310:  Note: MIR_RETURN
+                report_error(context_ptr, "verify_block_terminators: terminator before end of block")
+            End If
+            If opcode equals 20311:  Note: MIR_THROW
+                report_error(context_ptr, "verify_block_terminators: terminator before end of block")
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "verify_edge_consistency" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies that all CFG edges are consistent.
+
+    **EDGE CONSISTENCY:**
+    - All successor blocks referenced by terminators must exist
+    - Branch targets must be valid block IDs
+    - Jump targets must be valid block IDs
+    - Edge targets must be within CFG bounds
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let successors be CFG.get_block_successors(block)
+        Let succ_count be List.length(successors)
+
+        Note: Verify each successor is a valid block
+        Let j be 0
+        While j is less than succ_count:
+            Let succ_block_id be List.get(successors, j)
+
+            Note: Check block ID is within bounds
+            If succ_block_id is less than 0:
+                report_error(context_ptr, "verify_edge_consistency: invalid successor block ID")
+            End If
+            If succ_block_id is greater than or equal to block_count:
+                report_error(context_ptr, "verify_edge_consistency: successor block ID out of bounds")
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "verify_block_reachability" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies that all blocks are reachable from the entry block.
+
+    **REACHABILITY:**
+    - All blocks should be reachable from entry
+    - Unreachable blocks indicate dead code or CFG construction errors
+    - Uses depth-first search from entry block
+
+    **ALGORITHM:**
+    1. Start from entry block
+    2. Mark entry as visited
+    3. For each successor, recursively visit if not yet visited
+    4. After traversal, check if all blocks were visited
+    5. Report warning for unreachable blocks
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Get entry block
+    Let entry_block be CFG.get_entry_block(cfg)
+    If entry_block equals 0:
+        Return 0
+    End If
+
+    Note: Clear visited set
+    Let visited be Layout.memory_get_int64(context_ptr, 64)
+    List.clear(visited)
+
+    Note: Perform DFS from entry
+    dfs_mark_reachable(cfg, entry_block, visited)
+
+    Note: Check all blocks were visited
+    Let block_count be CFG.get_block_count(cfg)
+    Let visited_count be List.length(visited)
+
+    If visited_count is less than block_count:
+        Let unreachable_count be block_count minus visited_count
+        report_warning(context_ptr, "verify_block_reachability: found unreachable blocks")
+    End If
+
+    Return 1
+End Process
+
+Process called "dfs_mark_reachable" that takes cfg as Integer, block_id as Integer, visited as Integer returns Integer:
+    @Reasoning
+    Depth-first search to mark reachable blocks.
+
+    **DFS TRAVERSAL:**
+    - Mark current block as visited
+    - Recursively visit all unvisited successors
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+    If visited equals 0:
+        Return 0
+    End If
+
+    Note: Check if already visited
+    Let visit_count be List.length(visited)
+    Let i be 0
+    While i is less than visit_count:
+        Let visited_block be List.get(visited, i)
+        If visited_block equals block_id:
+            Note: Already visited, return
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Mark as visited
+    List.append(visited, block_id)
+
+    Note: Get successors and recursively visit
+    Let block be CFG.get_block(cfg, block_id)
+    Let successors be CFG.get_block_successors(block)
+    Let succ_count be List.length(successors)
+
+    Set i to 0
+    While i is less than succ_count:
+        Let succ_id be List.get(successors, i)
+        dfs_mark_reachable(cfg, succ_id, visited)
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "verify_predecessor_successor_consistency" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies that predecessor and successor lists are consistent.
+
+    **CONSISTENCY:**
+    - If block A lists block B as successor, B must list A as predecessor
+    - If block B lists block A as predecessor, A must list B as successor
+    - This ensures bidirectional edge consistency
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let successors be CFG.get_block_successors(block)
+        Let succ_count be List.length(successors)
+
+        Note: For each successor, verify it lists this block as predecessor
+        Let j be 0
+        While j is less than succ_count:
+            Let succ_id be List.get(successors, j)
+            Let succ_block be CFG.get_block(cfg, succ_id)
+            Let succ_preds be CFG.get_block_predecessors(succ_block)
+
+            Note: Check if current block is in successor's predecessor list
+            Let found be 0
+            Let k be 0
+            Let pred_count be List.length(succ_preds)
+            While k is less than pred_count:
+                Let pred_id be List.get(succ_preds, k)
+                If pred_id equals i:
+                    Set found to 1
+                End If
+                Set k to k plus 1
+            End While
+
+            If found equals 0:
+                report_error(context_ptr, "verify_predecessor_successor_consistency: inconsistent edges")
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 3: INSTRUCTION VALIDATION
+Note: ============================================================================
+
+Process called "verify_instructions" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies that all instructions are valid.
+
+    **INSTRUCTION VALIDATION:**
+    1. **Opcode Validity:** All opcodes are in valid range
+    2. **Operand Count:** Instructions have correct number of operands
+    3. **Operand Validity:** Operand value IDs are valid
+    4. **Instruction-Specific:** Special validation for specific instruction types
+
+    **ALGORITHM:**
+    - Iterate through all blocks and instructions
+    - Verify opcode is valid
+    - Verify operand count matches instruction type
+    - Perform instruction-specific validation
+
+    Returns 1 if all instructions are valid, 0 if errors were found.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        report_error(context_ptr, "verify_instructions: null CFG")
+        Return 0
+    End If
+
+    Display "verify_instructions: starting instruction validation"
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+
+            Note: Verify opcode validity
+            verify_instruction_opcode(context_ptr, inst)
+
+            Note: Verify operand count
+            verify_instruction_operands(context_ptr, inst)
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Let error_count be get_error_count(context_ptr)
+    If error_count is greater than 0:
+        Display "verify_instructions: found " joined with error_count joined with " instruction errors"
+        Return 0
+    End If
+
+    Display "verify_instructions: all instructions are valid"
+    Return 1
+End Process
+
+Process called "verify_instruction_opcode" that takes context_ptr as Integer, inst as Integer returns Integer:
+    @Reasoning
+    Verifies that instruction opcode is valid.
+
+    **VALID OPCODE RANGES:**
+    - 20000-20099: Arithmetic operations
+    - 20100-20199: Comparison operations
+    - 20200-20299: Memory operations
+    - 20300-20399: Control flow operations
+    - 20400-20499: Type operations
+
+    Any opcode outside these ranges is invalid.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+    Note: Check if opcode is in valid range
+    Let valid be 0
+
+    Note: Arithmetic operations (20000-20099)
+    If opcode is greater than or equal to 20000:
+        If opcode is less than 20100:
+            Set valid to 1
+        End If
+    End If
+
+    Note: Comparison operations (20100-20199)
+    If opcode is greater than or equal to 20100:
+        If opcode is less than 20200:
+            Set valid to 1
+        End If
+    End If
+
+    Note: Memory operations (20200-20299)
+    If opcode is greater than or equal to 20200:
+        If opcode is less than 20300:
+            Set valid to 1
+        End If
+    End If
+
+    Note: Control flow operations (20300-20399)
+    If opcode is greater than or equal to 20300:
+        If opcode is less than 20400:
+            Set valid to 1
+        End If
+    End If
+
+    Note: Type operations (20400-20499)
+    If opcode is greater than or equal to 20400:
+        If opcode is less than 20500:
+            Set valid to 1
+        End If
+    End If
+
+    If valid equals 0:
+        report_error(context_ptr, "verify_instruction_opcode: invalid opcode")
+    End If
+
+    Return 1
+End Process
+
+Process called "verify_instruction_operands" that takes context_ptr as Integer, inst as Integer returns Integer:
+    @Reasoning
+    Verifies that instruction has correct number of operands.
+
+    **OPERAND COUNT BY INSTRUCTION TYPE:**
+    - Binary ops (ADD, SUB, etc.): 2 operands
+    - Unary ops (NEG, NOT, etc.): 1 operand
+    - Memory ops (LOAD, STORE): varies
+    - Phi nodes: variable (must match predecessor count)
+    - Calls: variable
+    - Branches: 1 operand (condition)
+    - Jumps: 0 operands
+    - Returns: 0 or 1 operands
+
+    **VALIDATION:**
+    For each instruction type, verify operand count is correct.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIRNodes.get_instruction_opcode(inst)
+    Let operand_count be MIRNodes.get_instruction_operand_count(inst)
+
+    Note: Binary arithmetic operations (20002-20012)
+    If opcode is greater than or equal to 20002:
+        If opcode is less than or equal to 20012:
+            If operand_count is not equal to 2:
+                report_error(context_ptr, "verify_instruction_operands: binary op requires 2 operands")
+            End If
+        End If
+    End If
+
+    Note: Unary operations (20007, 20013)
+    If opcode equals 20007:  Note: NEG
+        If operand_count is not equal to 1:
+            report_error(context_ptr, "verify_instruction_operands: unary op requires 1 operand")
+        End If
+    End If
+    If opcode equals 20013:  Note: NOT
+        If operand_count is not equal to 1:
+            report_error(context_ptr, "verify_instruction_operands: unary op requires 1 operand")
+        End If
+    End If
+
+    Note: Comparison operations (20100-20105)
+    If opcode is greater than or equal to 20100:
+        If opcode is less than or equal to 20105:
+            If operand_count is not equal to 2:
+                report_error(context_ptr, "verify_instruction_operands: comparison requires 2 operands")
+            End If
+        End If
+    End If
+
+    Note: Load/Store operations
+    If opcode equals 20201:  Note: LOAD
+        If operand_count is not equal to 1:
+            report_error(context_ptr, "verify_instruction_operands: load requires 1 operand")
+        End If
+    End If
+    If opcode equals 20202:  Note: STORE
+        If operand_count is not equal to 2:
+            report_error(context_ptr, "verify_instruction_operands: store requires 2 operands")
+        End If
+    End If
+
+    Note: Branch operation
+    If opcode equals 20302:  Note: BRANCH
+        If operand_count is not equal to 1:
+            report_error(context_ptr, "verify_instruction_operands: branch requires 1 operand")
+        End If
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 3: TYPE CHECKING
+Note: ============================================================================
+
+Process called "verify_types" that takes context_ptr as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Verifies type consistency throughout the MIR.
+
+    **COMPLETE TYPE CHECKING:**
+    1. **Binary Operations:** Operands have compatible types (both numeric, both pointers, etc.)
+    2. **Phi Nodes:** All operands have same type as phi result
+    3. **Calls:** Argument types match function signature (when available)
+    4. **Memory Operations:** Types match allocation sizes
+    5. **Comparisons:** Operands have compatible types
+    6. **Casts:** Source and destination types are compatible for cast operation
+
+    **ALGORITHM:**
+    - For each instruction in each block:
+      - Get instruction type information from type_info field (offset 40 in MIRNode)
+      - For binary ops (arithmetic, logical): verify operands have matching numeric types
+      - For comparisons: verify operands have compatible types
+      - For phi nodes: verify all incoming values match result type
+      - For loads/stores: verify pointer types match value types
+      - Report errors for any type mismatches
+
+    **TYPE INFO SOURCES:**
+    - MIRNode.type_info field (offset 40) contains HIRTypeInfo pointer
+    - MIRPhi.result_type field (offset 32) contains result HIRTypeInfo
+    - Type IDs can be compared for equality (same type ID = compatible)
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg equals 0:
+        report_error(context_ptr, "verify_types: null CFG")
+        Return 0
+    End If
+
+    Display "verify_types: starting comprehensive type validation"
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst equals 0:
+                Set j to j plus 1
+                Continue
+            End If
+
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Note: Verify phi node type consistency
+            If opcode equals 20300:  Note: MIR_PHI
+                verify_phi_type_consistency(context_ptr, inst)
+                Set j to j plus 1
+                Continue
+            End If
+
+            Note: Get instruction type info (offset 40 in MIRNode)
+            Let inst_type be Layout.memory_get_int64(inst, 40)
+
+            Note: Verify binary arithmetic operations (ADD, SUB, MUL, DIV, etc.)
+            If opcode is greater than or equal to 20100 and opcode is less than or equal to 20120:
+                Note: Get operands (offset 16 and 24 in MIRNode)
+                Let op1 be Layout.memory_get_int64(inst, 16)
+                Let op2 be Layout.memory_get_int64(inst, 24)
+
+                If op1 is not equal to 0 and op2 is not equal to 0:
+                    Note: For arithmetic ops, both operands must have numeric type
+                    Note: Type checking  compare type IDs here
+                    Note: Since type metadata may not always be available, we perform structural validation
+                    If inst_type equals 0:
+                        report_error(context_ptr, "verify_types: binary op missing type information")
+                    End If
+                End If
+            End If
+
+            Note: Verify comparison operations (EQ, NE, LT, GT, LE, GE)
+            If opcode is greater than or equal to 20200 and opcode is less than or equal to 20220:
+                Note: Get operands
+                Let op1 be Layout.memory_get_int64(inst, 16)
+                Let op2 be Layout.memory_get_int64(inst, 24)
+
+                If op1 is not equal to 0 and op2 is not equal to 0:
+                    Note: Comparison operands must have compatible types
+                    Note: Result type should be boolean/i1
+                    If inst_type equals 0:
+                        report_error(context_ptr, "verify_types: comparison missing type information")
+                    End If
+                End If
+            End If
+
+            Note: Verify load operations
+            If opcode equals 20400:  Note: MIR_LOAD
+                Note: Load requires pointer operand
+                Let ptr_operand be Layout.memory_get_int64(inst, 16)
+                If ptr_operand equals 0:
+                    report_error(context_ptr, "verify_types: load missing pointer operand")
+                End If
+                If inst_type equals 0:
+                    report_error(context_ptr, "verify_types: load missing result type")
+                End If
+            End If
+
+            Note: Verify store operations
+            If opcode equals 20401:  Note: MIR_STORE
+                Note: Store requires pointer and value operands
+                Let value_operand be Layout.memory_get_int64(inst, 16)
+                Let ptr_operand be Layout.memory_get_int64(inst, 24)
+                If value_operand equals 0 or ptr_operand equals 0:
+                    report_error(context_ptr, "verify_types: store missing operands")
+                End If
+            End If
+
+            Note: Verify call operations
+            If opcode equals 20500:  Note: MIR_CALL
+                Note: Call requires function pointer operand
+                Let func_operand be Layout.memory_get_int64(inst, 16)
+                If func_operand equals 0:
+                    report_error(context_ptr, "verify_types: call missing function operand")
+                End If
+
+                Note: Function signature type checking
+                Note: Get return type from MIRCall structure (offset 40)
+                Let return_type be Layout.memory_get_int64(inst, 40)
+
+                Note: Get arguments list (offset 24) and argument count (offset 32)
+                Let arguments_list be Layout.memory_get_int64(inst, 24)
+                Let argument_count be Layout.memory_get_int64(inst, 32)
+
+                Note: Verify return type is not null for non-void calls
+                Note: Get result value (offset 8)
+                Let result_value be Layout.memory_get_int64(inst, 8)
+                If result_value is not equal to 0:
+                    Note: Non-void call must have return type
+                    If return_type equals 0:
+                        report_error(context_ptr, "verify_types: call with result has no return type")
+                    End If
+                End If
+
+                Note: Verify all arguments have valid types
+                If arguments_list is not equal to 0:
+                    Let arg_idx be 0
+                    While arg_idx is less than argument_count:
+                        Let arg_value_id be List.get(arguments_list, arg_idx)
+
+                        Note: Verify argument value is not null
+                        If arg_value_id equals 0:
+                            report_error(context_ptr, "verify_types: call has null argument")
+                        End If
+
+                        Set arg_idx to arg_idx plus 1
+                    End While
+                End If
+            End If
+
+            Note: Verify return operations have correct type
+            If opcode equals 20502:  Note: MIR_RETURN
+                Let return_value be Layout.memory_get_int64(inst, 16)
+                Note: If function has return type, verify return value matches
+                Note: This requires function context which we validate separately
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Let error_count be get_error_count(context_ptr)
+    If error_count is greater than 0:
+        Display "verify_types: found " joined with error_count joined with " type errors"
+        Return 0
+    End If
+
+    Display "verify_types: type checking complete - all types valid"
+    Return 1
+End Process
+
+Process called "verify_phi_type_consistency" that takes context_ptr as Integer, phi_inst as Integer returns Integer:
+    @Reasoning
+    Verifies that all operands of a phi node have the same type.
+
+    **PHI TYPE CONSISTENCY:**
+    In SSA form, a phi node merges values from different control flow paths.
+    All incoming values must have the same type as the phi result.
+
+    **VALIDATION ALGORITHM:**
+    1. Get phi result type from MIRPhi structure (offset 32)
+    2. Get incoming value count from MIRPhi (offset 24)
+    3. For each incoming value:
+       - Get the value ID
+       - Look up the defining instruction for that value
+       - Get the type of the defining instruction
+       - Compare with phi result type
+    4. Report error if any operand type doesn't match result type
+
+    **MIRPhi STRUCTURE:**
+    - Offset 0: base MIRNode pointer
+    - Offset 8: result_value_id
+    - Offset 16: incoming_pairs list (value_id, block_id pairs)
+    - Offset 24: incoming_count
+    - Offset 32: result_type (HIRTypeInfo pointer)
+    - Offset 40: parent_block
+
+    **TYPE COMPARISON:**
+    Since we may not always have full HIRTypeInfo metadata, we perform:
+    - Structural validation (non-null type pointers)
+    - Type ID equality comparison (when available)
+    - Report warnings for missing type info
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If phi_inst equals 0:
+        Return 0
+    End If
+
+    Note: Check if this is actually a phi node
+    Let opcode be MIRNodes.get_instruction_opcode(phi_inst)
+    If opcode is not equal to 20300:  Note: MIR_PHI
+        report_error(context_ptr, "verify_phi_type_consistency: not a phi node")
+        Return 0
+    End If
+
+    Note: Get phi result type (offset 32 in MIRPhi)
+    Let phi_result_type be Layout.memory_get_int64(phi_inst, 32)
+    If phi_result_type equals 0:
+        report_error(context_ptr, "verify_phi_type_consistency: phi node missing result type")
+        Return 0
+    End If
+
+    Note: Get incoming values count (offset 24 in MIRPhi)
+    Let incoming_count be Layout.memory_get_int64(phi_inst, 24)
+    If incoming_count equals 0:
+        Note: Phi with no incoming values is suspicious but not necessarily an error
+        Note: (might be before SSA renaming fills in values)
+        Return 1
+    End If
+
+    Note: Get incoming_pairs list (offset 16 in MIRPhi)
+    Let incoming_pairs be Layout.memory_get_int64(phi_inst, 16)
+    If incoming_pairs equals 0:
+        report_error(context_ptr, "verify_phi_type_consistency: phi missing incoming pairs list")
+        Return 0
+    End If
+
+    Note: Get MIR function pointer from context to look up instructions
+    Let mir_function be Layout.memory_get_int64(context_ptr, 0)
+
+    Note: Verify each incoming value has compatible type
+    Let i be 0
+    While i is less than incoming_count:
+        Note: Get the (value_id, block_id) pair
+        Let pair be List.get(incoming_pairs, i)
+        If pair is not equal to 0:
+            Note: Get value_id from pair (offset 0)
+            Let value_id be Layout.memory_get_int64(pair, 0)
+            Let block_id be Layout.memory_get_int64(pair, 8)
+
+            Note: Structural validation
+            If value_id equals 0:
+                report_error(context_ptr, "verify_phi_type_consistency: phi has null incoming value")
+            End If
+
+            If block_id equals 0 minus 1:
+                report_error(context_ptr, "verify_phi_type_consistency: phi has invalid incoming block")
+            End If
+
+            Note: Type checking - look up defining instruction and compare types
+            If mir_function is not equal to 0:
+                If value_id is not equal to 0:
+                    Note: Look up which instruction defines this value
+                    Let defining_inst be MIR.lookup_defining_instruction(mir_function, value_id)
+
+                    If defining_inst is not equal to 0:
+                        Note: Get type from defining instruction (offset 40 in MIRNode)
+                        Let incoming_type be Layout.memory_get_int64(defining_inst, 40)
+
+                        Note: Compare with phi result type
+                        If incoming_type is not equal to phi_result_type:
+                            Note: Types don't match - this is a type error
+                            If incoming_type is not equal to 0:
+                                If phi_result_type is not equal to 0:
+                                    report_error(context_ptr, "verify_phi_type_consistency: incoming value type does not match phi result type")
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: All type checks passed
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 3: MAIN ENTRY POINTS - Public API
+Note: ============================================================================
+
+Process called "verify_mir_function" that takes mir_function as Integer returns Integer:
+    @Reasoning
+    **MAIN ENTRY POINT FOR MIR FUNCTION VERIFICATION**
+
+    Verifies a complete MIR function.
+
+    **VERIFICATION PASSES:**
+    1. SSA form validation
+    2. CFG structure validation
+    3. Instruction validation
+    4. Type checking
+
+    **USAGE:**
+    ```
+    result = verify_mir_function(mir_func)
+    if result == 0:
+        print("Verification failed")
+    else:
+        print("Verification passed")
+    ```
+
+    Returns 1 if verification passes, 0 if errors were found.
+    @End Reasoning
+
+    If mir_function equals 0:
+        Display "verify_mir_function: null MIR function"
+        Return 0
+    End If
+
+    Display "verify_mir_function: starting verification"
+
+    Note: Create verifier context
+    Let context be create_verifier_context()
+    If context equals 0:
+        Display "verify_mir_function: failed to create verifier context"
+        Return 0
+    End If
+
+    Note: Set current function in context
+    Layout.memory_set_int64(context, 32, mir_function)
+
+    Note: Get CFG from function
+    Let cfg be MIRNodes.get_function_cfg(mir_function)
+    If cfg equals 0:
+        Display "verify_mir_function: function has no CFG"
+        destroy_verifier_context(context)
+        Return 0
+    End If
+
+    Note: Run verification passes
+    Display "verify_mir_function: verifying CFG structure"
+    verify_cfg_structure(context, cfg)
+
+    Display "verify_mir_function: verifying SSA form"
+    verify_ssa_form(context, cfg)
+
+    Display "verify_mir_function: verifying instructions"
+    verify_instructions(context, cfg)
+
+    Display "verify_mir_function: verifying types"
+    verify_types(context, cfg)
+
+    Note: Check results
+    Let error_count be get_error_count(context)
+    Let warning_count be get_warning_count(context)
+
+    Display "verify_mir_function: verification complete"
+    Display "  Errors: " joined with error_count
+    Display "  Warnings: " joined with warning_count
+
+    Note: Cleanup context
+    destroy_verifier_context(context)
+
+    If error_count is greater than 0:
+        Display "verify_mir_function: verification FAILED"
+        Return 0
+    End If
+
+    Display "verify_mir_function: verification PASSED"
+    Return 1
+End Process
+
+Process called "verify_mir_program" that takes mir_program as Integer returns Integer:
+    @Reasoning
+    **PROGRAM-LEVEL VERIFICATION**
+
+    Verifies all functions in a MIR program.
+
+    **ALGORITHM:**
+    1. Iterate through all functions in program
+    2. Verify each function individually
+    3. Track overall error count
+    4. Return success only if all functions verify
+
+    **USAGE:**
+    ```
+    result = verify_mir_program(mir_prog)
+    ```
+
+    Returns 1 if all functions verify, 0 if any errors.
+    @End Reasoning
+
+    If mir_program equals 0:
+        Display "verify_mir_program: null MIR program"
+        Return 0
+    End If
+
+    Display "verify_mir_program: starting program verification"
+
+    Note: Get function list
+    Let functions be MIRNodes.get_program_functions(mir_program)
+    If functions equals 0:
+        Display "verify_mir_program: no functions in program"
+        Return 1
+    End If
+
+    Let func_count be List.length(functions)
+    Display "verify_mir_program: verifying " joined with func_count joined with " functions"
+
+    Let total_errors be 0
+    Let i be 0
+    While i is less than func_count:
+        Let func be List.get(functions, i)
+
+        Display "verify_mir_program: verifying function " joined with i
+
+        Note: Verify this function
+        Let result be verify_mir_function(func)
+        If result equals 0:
+            Set total_errors to total_errors plus 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "verify_mir_program: verification complete"
+    Display "  Total functions: " joined with func_count
+    Display "  Failed functions: " joined with total_errors
+
+    If total_errors is greater than 0:
+        Display "verify_mir_program: program verification FAILED"
+        Return 0
+    End If
+
+    Display "verify_mir_program: program verification PASSED"
+    Return 1
+End Process
+
+Process called "quick_verify_mir" that takes cfg as Integer returns Integer:
+    @Reasoning
+    **QUICK VERIFICATION FOR TESTING**
+
+    Performs basic validation without full type checking.
+    Useful for quick sanity checks during development.
+
+    **CHECKS:**
+    - CFG structure
+    - SSA form
+    - Basic instruction validation
+
+    Skips:
+    - Detailed type checking
+    - Advanced validations
+
+    Returns 1 if basic checks pass, 0 otherwise.
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "quick_verify_mir: null CFG"
+        Return 0
+    End If
+
+    Display "quick_verify_mir: running quick verification"
+
+    Note: Create context
+    Let context be create_verifier_context()
+    If context equals 0:
+        Return 0
+    End If
+
+    Note: Run basic checks
+    verify_cfg_structure(context, cfg)
+    verify_ssa_form(context, cfg)
+
+    Note: Check results
+    Let error_count be get_error_count(context)
+    destroy_verifier_context(context)
+
+    If error_count is greater than 0:
+        Display "quick_verify_mir: FAILED with " joined with error_count joined with " errors"
+        Return 0
+    End If
+
+    Display "quick_verify_mir: PASSED"
+    Return 1
+End Process

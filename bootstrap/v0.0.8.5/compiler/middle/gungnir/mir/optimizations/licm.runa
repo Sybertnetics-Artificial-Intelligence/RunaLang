@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles loop-invariant code motion optimization.
+This file handles loop-invariant code motion (LICM) optimization.
 
 This file performs the following tasks:
 - Process loop-invariant code motion and loop optimization
@@ -24,8 +24,8 @@ This file performs the following tasks:
 - Process loop validation and loop verification
 
 This file is essential because of the following reasons:
-- Loop-invariant code motion improves loop performance and reduces redundant computations
-- Proper LICM handling ensures correct invariant identification
+- Loop-invariant code motion improves loop performance by hoisting invariant computations
+- Proper LICM handling ensures correct invariant identification and safe hoisting
 - LICM support enables Runa compilation for optimized loop code generation
 
 This file consists of the following functions/features/operation types:
@@ -35,4 +35,1305 @@ This file consists of the following functions/features/operation types:
 - Loop validation and loop verification
 :End Note
 
-Note: TODO - Implement loop-invariant code motion functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================================
+Note: TYPE DEFINITIONS - Loop Information and LICM Context
+Note: ============================================================================
+
+Type called "LoopInfo":
+    @Reasoning
+    Represents a natural loop in the CFG.
+
+    **NATURAL LOOP:**
+    A natural loop is defined by a back edge (B → H) where:
+    - H (header) dominates B (back-edge source)
+    - Loop body = nodes that can reach B without going through H
+
+    **MEMORY LAYOUT** (64 bytes):
+    ```
+    Offset 0:  header_id (Integer - loop header block ID)
+    Offset 8:  preheader_id (Integer - preheader block ID, 0 if none)
+    Offset 16: body_blocks (Integer - Set pointer to block IDs in loop)
+    Offset 24: exit_blocks (Integer - Set pointer to exit block IDs)
+    Offset 32: back_edges (Integer - List pointer to (source, target) pairs)
+    Offset 40: nesting_level (Integer - 0 = outermost)
+    Offset 48: parent_loop (Integer - parent LoopInfo pointer, 0 if outermost)
+    Offset 56: invariant_count (Integer - number of invariant instructions)
+    ```
+    @End Reasoning
+
+    header_id as Integer
+    preheader_id as Integer
+    body_blocks as Integer
+    exit_blocks as Integer
+    back_edges as Integer
+    nesting_level as Integer
+    parent_loop as Integer
+    invariant_count as Integer
+End Type
+
+Type called "LICMContext":
+    @Reasoning
+    Context for Loop-Invariant Code Motion optimization.
+
+    **LICM ALGORITHM:**
+    1. Detect natural loops (back-edge identification)
+    2. Build loop nesting structure
+    3. Insert preheaders for loops with multiple entries
+    4. Detect loop-invariant instructions (fixed-point)
+    5. Check hoisting safety (no side effects, dominates exits)
+    6. Hoist invariant instructions to preheader
+
+    **MEMORY LAYOUT** (96 bytes):
+    ```
+    Offset 0:  cfg (Integer - MIRCFG pointer)
+    Offset 8:  loops (Integer - List of LoopInfo pointers)
+    Offset 16: invariant_insts (Integer - Set of invariant instruction pointers)
+    Offset 24: hoisted_count (Integer - number of instructions hoisted)
+    Offset 32: loops_processed (Integer - number of loops processed)
+    Offset 40: preheaders_inserted (Integer - number of preheaders created)
+    Offset 48: dominance_ptr (Integer - DominanceInfo pointer)
+    Offset 56: ssa_ptr (Integer - SSA info pointer)
+    Offset 64: use_def_chains (Integer - Dictionary pointer)
+    Offset 72: def_use_chains (Integer - Dictionary pointer)
+    Offset 80: block_to_loop (Integer - Dictionary: block_id → LoopInfo)
+    Offset 88: iteration_count (Integer - invariant detection iterations)
+    ```
+    @End Reasoning
+
+    cfg as Integer
+    loops as Integer
+    invariant_insts as Integer
+    hoisted_count as Integer
+    loops_processed as Integer
+    preheaders_inserted as Integer
+    dominance_ptr as Integer
+    ssa_ptr as Integer
+    use_def_chains as Integer
+    def_use_chains as Integer
+    block_to_loop as Integer
+    iteration_count as Integer
+End Type
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_licm_context" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Creates a new LICM context.
+
+    **INITIALIZATION:**
+    - Allocates 96 bytes for context
+    - Initializes all dictionaries and sets
+    - Computes dominance information (required for loop detection)
+    - Creates empty loop list
+
+    Returns context pointer, or 0 on failure.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Display "create_licm_context: null CFG"
+        Return 0
+    End If
+
+    Note: Allocate context (96 bytes)
+    Let context_ptr be Layout.allocate(96)
+    If context_ptr equals 0:
+        Display "create_licm_context: allocation failed"
+        Return 0
+    End If
+
+    Note: Set CFG
+    Layout.memory_set_int64(context_ptr, 0, cfg_ptr)
+
+    Note: Create loops list
+    Let loops_list be proc create from List
+    Layout.memory_set_int64(context_ptr, 8, loops_list)
+
+    Note: Create invariant instructions set
+    Let invariant_set be proc create from Set
+    Layout.memory_set_int64(context_ptr, 16, invariant_set)
+
+    Note: Initialize counters to 0
+    Layout.memory_set_int64(context_ptr, 24, 0)  Note: hoisted_count
+    Layout.memory_set_int64(context_ptr, 32, 0)  Note: loops_processed
+    Layout.memory_set_int64(context_ptr, 40, 0)  Note: preheaders_inserted
+
+    Note: Compute dominance information
+    Display "create_licm_context: computing dominance information"
+    Let dom_info be Dominance.compute_dominance_tree(cfg_ptr)
+    Layout.memory_set_int64(context_ptr, 48, dom_info)
+
+    Note: Get SSA info
+    Let ssa_ptr be SSA.get_ssa_info(cfg_ptr)
+    Layout.memory_set_int64(context_ptr, 56, ssa_ptr)
+
+    Note: Build use-def and def-use chains
+    Let use_def be SSA.build_use_def_chains(cfg_ptr)
+    Let def_use be SSA.build_def_use_chains(cfg_ptr)
+    Layout.memory_set_int64(context_ptr, 64, use_def)
+    Layout.memory_set_int64(context_ptr, 72, def_use)
+
+    Note: Create block_to_loop mapping
+    Let block_to_loop be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 80, block_to_loop)
+
+    Note: Initialize iteration count
+    Layout.memory_set_int64(context_ptr, 88, 0)
+
+    Display "create_licm_context: context created successfully"
+    Return context_ptr
+End Process
+
+Process called "destroy_licm_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys LICM context and frees all allocated memory.
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Free loops list and LoopInfo structures
+    Let loops_list be Layout.memory_get_int64(context_ptr, 8)
+    If loops_list is not equal to 0:
+        Let loop_count be List.length(loops_list)
+        Let i be 0
+        While i is less than loop_count:
+            Let loop_info be List.get(loops_list, i)
+            If loop_info is not equal to 0:
+                Note: Free loop's body_blocks set
+                Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+                If body_blocks is not equal to 0:
+                    proc destroy from Set with body_blocks
+                End If
+
+                Note: Free loop's exit_blocks set
+                Let exit_blocks be Layout.memory_get_int64(loop_info, 24)
+                If exit_blocks is not equal to 0:
+                    proc destroy from Set with exit_blocks
+                End If
+
+                Note: Free loop's back_edges list
+                Let back_edges be Layout.memory_get_int64(loop_info, 32)
+                If back_edges is not equal to 0:
+                    proc destroy from List with back_edges
+                End If
+
+                Note: Free LoopInfo structure
+                Layout.deallocate(loop_info)
+            End If
+            Set i to i plus 1
+        End While
+
+        proc destroy from List with loops_list
+    End If
+
+    Note: Free invariant_insts set
+    Let invariant_set be Layout.memory_get_int64(context_ptr, 16)
+    If invariant_set is not equal to 0:
+        proc destroy from Set with invariant_set
+    End If
+
+    Note: Free block_to_loop dictionary
+    Let block_to_loop be Layout.memory_get_int64(context_ptr, 80)
+    If block_to_loop is not equal to 0:
+        proc destroy from Dictionary with block_to_loop
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr)
+
+    Return 1
+End Process
+
+Process called "print_licm_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints LICM statistics.
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "LICM STATISTICS"
+    Display "============================================"
+
+    Let loops_processed be Layout.memory_get_int64(context_ptr, 32)
+    Display "Loops processed: " joined with loops_processed
+
+    Let preheaders_inserted be Layout.memory_get_int64(context_ptr, 40)
+    Display "Preheaders inserted: " joined with preheaders_inserted
+
+    Let hoisted_count be Layout.memory_get_int64(context_ptr, 24)
+    Display "Instructions hoisted: " joined with hoisted_count
+
+    Let iteration_count be Layout.memory_get_int64(context_ptr, 88)
+    Display "Invariant detection iterations: " joined with iteration_count
+
+    Display "============================================"
+    Display ""
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LOOP DETECTION - Natural Loop Identification
+Note: ============================================================================
+
+Process called "is_back_edge" that takes source_id as Integer, target_id as Integer, dominance_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if edge (source → target) is a back edge.
+
+    **BACK EDGE DEFINITION:**
+    Edge (B → H) is a back edge if H dominates B.
+
+    Returns 1 if back edge, 0 otherwise.
+    @End Reasoning
+
+    If dominance_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check if target dominates source
+    Let dominates be Dominance.does_dominate(dominance_ptr, target_id, source_id)
+
+    Return dominates
+End Process
+
+Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as Integer returns Integer:
+    @Reasoning
+    Finds all back edges in the CFG.
+
+    **ALGORITHM:**
+    For each edge (B → S) in CFG:
+        If S dominates B:
+            Add (B, S) to back_edges list
+
+    Returns list of (source, target) pairs representing back edges.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+    If dominance_ptr equals 0:
+        Return 0
+    End If
+
+    Display "find_back_edges: scanning CFG for back edges"
+
+    Let back_edges be proc create from List
+
+    Note: Get all blocks
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        Return back_edges
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+        Let block_id be CFG.get_block_id(block_ptr)
+
+        Note: Get successors
+        Let successors be CFG.get_block_successors(block_ptr)
+        If successors is not equal to 0:
+            Let succ_count be List.length(successors)
+            Let j be 0
+
+            While j is less than succ_count:
+                Let succ_ptr be List.get(successors, j)
+                Let succ_id be CFG.get_block_id(succ_ptr)
+
+                Note: Check if this is a back edge
+                Let is_back be is_back_edge(block_id, succ_id, dominance_ptr)
+
+                If is_back equals 1:
+                    Note: Create (source, target) pair (16 bytes)
+                    Let edge_pair be Layout.allocate(16)
+                    Layout.memory_set_int64(edge_pair, 0, block_id)
+                    Layout.memory_set_int64(edge_pair, 8, succ_id)
+
+                    List.append(back_edges, edge_pair)
+
+                    Display "find_back_edges: found back edge " joined with block_id joined with " → " joined with succ_id
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Let edge_count be List.length(back_edges)
+    Display "find_back_edges: found " joined with edge_count joined with " back edges"
+
+    Return back_edges
+End Process
+
+Process called "compute_loop_body" that takes header_id as Integer, back_edge_source as Integer, cfg_ptr as Integer, dominance_ptr as Integer returns Integer:
+    @Reasoning
+    Computes the natural loop body for a back edge.
+
+    **NATURAL LOOP BODY:**
+    For back edge (B → H):
+    Loop body = {B} ∪ {nodes that can reach B without going through H}
+
+    **ALGORITHM:**
+    1. Start with worklist = {B}
+    2. Add all predecessors of nodes in worklist that aren't H
+    3. Continue until worklist is empty
+
+    Returns Set of block IDs in loop body.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "compute_loop_body: computing body for loop header " joined with header_id
+
+    Let body_blocks be proc create from Set
+    Let worklist be proc create from List
+
+    Note: Add back-edge source and header to body
+    Let source_str be proc integer_to_string from String with back_edge_source
+    proc add from Set with body_blocks, source_str
+
+    Let header_str be proc integer_to_string from String with header_id
+    proc add from Set with body_blocks, header_str
+
+    Note: Add back-edge source to worklist
+    List.append(worklist, back_edge_source)
+
+    Note: Process worklist
+    While List.length(worklist) is greater than 0:
+        Note: Pop from worklist
+        Let current_id be List.get(worklist, 0)
+        proc remove_at from List with worklist, 0
+
+        Note: Get current block
+        Let current_block be CFG.get_block_by_id(cfg_ptr, current_id)
+        If current_block equals 0:
+            Display "compute_loop_body: warning - block " joined with current_id joined with " not found"
+        Otherwise:
+            Note: Process predecessors
+            Let predecessors be CFG.get_block_predecessors(current_block)
+            If predecessors is not equal to 0:
+                Let pred_count be List.length(predecessors)
+                Let i be 0
+
+                While i is less than pred_count:
+                    Let pred_ptr be List.get(predecessors, i)
+                    Let pred_id be CFG.get_block_id(pred_ptr)
+
+                    Note: Don't go past header
+                    If pred_id is not equal to header_id:
+                        Let pred_str be proc integer_to_string from String with pred_id
+                        Let already_in_body be proc contains from Set with body_blocks, pred_str
+
+                        If already_in_body equals 0:
+                            Note: Add to body and worklist
+                            proc add from Set with body_blocks, pred_str
+                            List.append(worklist, pred_id)
+                        End If
+                    End If
+
+                    Set i to i plus 1
+                End While
+            End If
+        End If
+    End While
+
+    proc destroy from List with worklist
+
+    Let body_size be proc size from Set with body_blocks
+    Display "compute_loop_body: loop body contains " joined with body_size joined with " blocks"
+
+    Return body_blocks
+End Process
+
+Process called "compute_loop_exits" that takes loop_info as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Computes exit blocks for a loop.
+
+    **EXIT BLOCK:**
+    Block outside loop with edge from block inside loop.
+
+    Returns Set of exit block IDs.
+    @End Reasoning
+
+    If loop_info equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let exit_blocks be proc create from Set
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+
+    Note: Get body block members
+    Let body_members be proc members from Set with body_blocks
+    Let body_count be List.length(body_members)
+
+    Let i be 0
+    While i is less than body_count:
+        Let block_id_str be List.get(body_members, i)
+        Let block_id be proc string_to_integer from String with block_id_str
+
+        Let block_ptr be CFG.get_block_by_id(cfg_ptr, block_id)
+        If block_ptr is not equal to 0:
+            Note: Check successors
+            Let successors be CFG.get_block_successors(block_ptr)
+            If successors is not equal to 0:
+                Let succ_count be List.length(successors)
+                Let j be 0
+
+                While j is less than succ_count:
+                    Let succ_ptr be List.get(successors, j)
+                    Let succ_id be CFG.get_block_id(succ_ptr)
+                    Let succ_str be proc integer_to_string from String with succ_id
+
+                    Note: If successor not in loop body, it's an exit
+                    Let in_body be proc contains from Set with body_blocks, succ_str
+                    If in_body equals 0:
+                        proc add from Set with exit_blocks, succ_str
+                    End If
+
+                    Set j to j plus 1
+                End While
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return exit_blocks
+End Process
+
+Process called "detect_natural_loops" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Detects all natural loops in the CFG.
+
+    **ALGORITHM:**
+    1. Find all back edges
+    2. For each back edge (B → H):
+       - Create LoopInfo with header H
+       - Compute loop body
+       - Compute exit blocks
+    3. Build nesting structure
+
+    Returns number of loops detected.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "LOOP DETECTION"
+    Display "============================================"
+    Display ""
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let dominance_ptr be Layout.memory_get_int64(context_ptr, 48)
+    Let loops_list be Layout.memory_get_int64(context_ptr, 8)
+    Let block_to_loop be Layout.memory_get_int64(context_ptr, 80)
+
+    Note: Find all back edges
+    Let back_edges be find_back_edges(cfg_ptr, dominance_ptr)
+    If back_edges equals 0:
+        Display "detect_natural_loops: no back edges found"
+        Return 0
+    End If
+
+    Let edge_count be List.length(back_edges)
+    Display "detect_natural_loops: processing " joined with edge_count joined with " back edges"
+
+    Note: Create LoopInfo for each back edge
+    Let i be 0
+    While i is less than edge_count:
+        Let edge_pair be List.get(back_edges, i)
+        Let source_id be Layout.memory_get_int64(edge_pair, 0)
+        Let target_id be Layout.memory_get_int64(edge_pair, 8)
+
+        Display "detect_natural_loops: creating loop for back edge " joined with source_id joined with " → " joined with target_id
+
+        Note: Allocate LoopInfo (64 bytes)
+        Let loop_info be Layout.allocate(64)
+
+        Note: Set header_id
+        Layout.memory_set_int64(loop_info, 0, target_id)
+
+        Note: No preheader yet
+        Layout.memory_set_int64(loop_info, 8, 0)
+
+        Note: Compute loop body
+        Let body_blocks be compute_loop_body(target_id, source_id, cfg_ptr, dominance_ptr)
+        Layout.memory_set_int64(loop_info, 16, body_blocks)
+
+        Note: Compute exit blocks
+        Let exit_blocks be compute_loop_exits(loop_info, cfg_ptr)
+        Layout.memory_set_int64(loop_info, 24, exit_blocks)
+
+        Note: Create back_edges list for this loop
+        Let loop_back_edges be proc create from List
+        List.append(loop_back_edges, edge_pair)
+        Layout.memory_set_int64(loop_info, 32, loop_back_edges)
+
+        Note: Initialize nesting level and parent (will be computed later)
+        Layout.memory_set_int64(loop_info, 40, 0)
+        Layout.memory_set_int64(loop_info, 48, 0)
+
+        Note: Initialize invariant count
+        Layout.memory_set_int64(loop_info, 56, 0)
+
+        Note: Add to loops list
+        List.append(loops_list, loop_info)
+
+        Note: Map all body blocks to this loop
+        Let body_members be proc members from Set with body_blocks
+        Let body_count be List.length(body_members)
+        Let j be 0
+        While j is less than body_count:
+            Let block_id_str be List.get(body_members, j)
+            proc set from Dictionary with block_to_loop, block_id_str, loop_info
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Free back_edges list
+    proc destroy from List with back_edges
+
+    Let loop_count be List.length(loops_list)
+    Display "detect_natural_loops: detected " joined with loop_count joined with " natural loops"
+    Display ""
+
+    Return loop_count
+End Process
+
+Note: ============================================================================
+Note: PREHEADER INSERTION
+Note: ============================================================================
+
+Process called "needs_preheader" that takes loop_info as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if loop needs a preheader.
+
+    **NEEDS PREHEADER IF:**
+    - Loop header has multiple predecessors from outside loop
+    - OR loop header has instructions we want to hoist to
+
+    Returns 1 if needs preheader, 0 otherwise.
+    @End Reasoning
+
+    If loop_info equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+
+    Note: Get header block
+    Let header_block be CFG.get_block_by_id(cfg_ptr, header_id)
+    If header_block equals 0:
+        Return 0
+    End If
+
+    Note: Count non-back-edge predecessors
+    Let predecessors be CFG.get_block_predecessors(header_block)
+    If predecessors equals 0:
+        Return 0
+    End If
+
+    Let pred_count be List.length(predecessors)
+    Let non_back_edge_preds be 0
+
+    Let i be 0
+    While i is less than pred_count:
+        Let pred_ptr be List.get(predecessors, i)
+        Let pred_id be CFG.get_block_id(pred_ptr)
+        Let pred_str be proc integer_to_string from String with pred_id
+
+        Note: Check if predecessor is in loop body (back edge)
+        Let in_body be proc contains from Set with body_blocks, pred_str
+        If in_body equals 0:
+            Note: Non-back-edge predecessor
+            Set non_back_edge_preds to non_back_edge_preds plus 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Need preheader if multiple external entries
+    If non_back_edge_preds is greater than 1:
+        Return 1
+    End If
+
+    Note: Also useful to have preheader for single entry for hoisting
+    Return 1
+End Process
+
+Process called "insert_preheader" that takes loop_info as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Inserts a preheader block for the loop.
+
+    **PREHEADER:**
+    Single entry point to loop from outside.
+    All non-back-edge predecessors redirect to preheader.
+    Preheader has single successor: loop header.
+
+    Returns preheader block ID, or 0 on failure.
+    @End Reasoning
+
+    If loop_info equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+
+    Display "insert_preheader: inserting preheader for loop header " joined with header_id
+
+    Note: Create new preheader block
+    Let preheader_id be CFG.create_basic_block(cfg_ptr)
+    If preheader_id equals 0:
+        Display "insert_preheader: failed to create preheader block"
+        Return 0
+    End If
+
+    Let preheader_block be CFG.get_block_by_id(cfg_ptr, preheader_id)
+    If preheader_block equals 0:
+        Display "insert_preheader: failed to get preheader block"
+        Return 0
+    End If
+
+    Let header_block be CFG.get_block_by_id(cfg_ptr, header_id)
+    If header_block equals 0:
+        Display "insert_preheader: failed to get header block"
+        Return 0
+    End If
+
+    Note: Add unconditional branch from preheader to header
+    Let branch_inst be MIR.create_branch_instruction(header_id)
+    CFG.add_instruction_to_block(preheader_block, branch_inst)
+
+    Note: Redirect non-back-edge predecessors to preheader
+    Let predecessors be CFG.get_block_predecessors(header_block)
+    If predecessors is not equal to 0:
+        Let pred_count be List.length(predecessors)
+        Let i be 0
+
+        While i is less than pred_count:
+            Let pred_ptr be List.get(predecessors, i)
+            Let pred_id be CFG.get_block_id(pred_ptr)
+            Let pred_str be proc integer_to_string from String with pred_id
+
+            Note: Check if predecessor is outside loop
+            Let in_body be proc contains from Set with body_blocks, pred_str
+            If in_body equals 0:
+                Note: Redirect edge from pred to header → pred to preheader
+                CFG.redirect_edge(cfg_ptr, pred_id, header_id, preheader_id)
+                Display "insert_preheader: redirected edge " joined with pred_id joined with " → " joined with header_id joined with " to preheader"
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Update loop info with preheader ID
+    Layout.memory_set_int64(loop_info, 8, preheader_id)
+
+    Display "insert_preheader: preheader block " joined with preheader_id joined with " created"
+
+    Return preheader_id
+End Process
+
+Process called "insert_preheaders" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Inserts preheaders for all loops that need them.
+
+    Returns number of preheaders inserted.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "PREHEADER INSERTION"
+    Display "============================================"
+    Display ""
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let loops_list be Layout.memory_get_int64(context_ptr, 8)
+
+    Let loop_count be List.length(loops_list)
+    Let preheaders_created be 0
+
+    Let i be 0
+    While i is less than loop_count:
+        Let loop_info be List.get(loops_list, i)
+
+        Note: Check if preheader needed
+        Let needs_ph be needs_preheader(loop_info, cfg_ptr)
+
+        If needs_ph equals 1:
+            Let preheader_id be insert_preheader(loop_info, cfg_ptr)
+            If preheader_id is not equal to 0:
+                Set preheaders_created to preheaders_created plus 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update context counter
+    Layout.memory_set_int64(context_ptr, 40, preheaders_created)
+
+    Display "insert_preheaders: inserted " joined with preheaders_created joined with " preheaders"
+    Display ""
+
+    Return preheaders_created
+End Process
+
+Note: ============================================================================
+Note: INVARIANT DETECTION - Fixed-Point Analysis
+Note: ============================================================================
+
+Process called "is_loop_invariant_operand" that takes operand_id as Integer, loop_info as Integer, invariant_set as Integer, ssa_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if an operand is loop-invariant.
+
+    **INVARIANT OPERAND:**
+    - Defined outside loop, OR
+    - Is itself a loop-invariant instruction, OR
+    - Is a constant value
+
+    Returns 1 if invariant, 0 otherwise.
+    @End Reasoning
+
+    If loop_info equals 0:
+        Return 0
+    End If
+
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+    Let operand_str be proc integer_to_string from String with operand_id
+
+    Note: Check if operand is in invariant set (already marked as invariant)
+    Let is_in_invariant_set be proc contains from Set with invariant_set, operand_str
+    If is_in_invariant_set equals 1:
+        Return 1
+    End If
+
+    Note: Check if operand is a constant (constants are always invariant)
+    Let operand_node be MIR.get_mir_value(operand_id)
+    If operand_node is not equal to 0:
+        Let node_type be MIR.get_mir_node_type(operand_node)
+        If node_type equals MIR.MIR_CONSTANT:
+            Return 1
+        End If
+    End If
+
+    Note: Check if operand is defined outside loop
+    If ssa_ptr is not equal to 0:
+        Let defining_inst be SSA.get_defining_instruction(ssa_ptr, operand_id)
+        If defining_inst is not equal to 0:
+            Note: Get block containing defining instruction
+            Let defining_block_id be MIR.get_instruction_block_id(defining_inst)
+            Let defining_block_str be proc integer_to_string from String with defining_block_id
+
+            Note: Check if defining block is in loop body
+            Let is_in_loop be proc contains from Set with body_blocks, defining_block_str
+            If is_in_loop equals 0:
+                Note: Defined outside loop - invariant
+                Return 1
+            End If
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "can_hoist_instruction" that takes inst_ptr as Integer, loop_info as Integer, dominance_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if instruction can be safely hoisted out of loop.
+
+    **SAFETY CONDITIONS:**
+    1. No side effects (no stores, calls, volatile ops)
+    2. Dominates all loop exits (or is exception-safe)
+    3. Defining block dominates all uses
+
+    Returns 1 if safe to hoist, 0 otherwise.
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+    If loop_info equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+    Note: Check for side effects
+    If opcode equals MIR.MIR_STORE:
+        Return 0
+    End If
+    If opcode equals MIR.MIR_CALL:
+        Return 0
+    End If
+    If opcode equals MIR.MIR_LOAD:
+        Note: Loads can trap - be conservative
+        Return 0
+    End If
+
+    Note: Check dominance of all loop exits
+    Let exit_blocks be Layout.memory_get_int64(loop_info, 24)
+    Let exit_members be proc members from Set with exit_blocks
+    Let exit_count be List.length(exit_members)
+
+    Note: Instruction must dominate ALL loop exits to be safe to hoist
+    If dominance_ptr is not equal to 0 and exit_count is greater than 0:
+        Let inst_block_id be MIR.get_instruction_block_id(inst_ptr)
+        Let exit_idx be 0
+
+        While exit_idx is less than exit_count:
+            Let exit_block_str be List.get(exit_members, exit_idx)
+            Let exit_block_id be proc string_to_integer from String with exit_block_str
+
+            Note: Check if instruction's block dominates this exit
+            Let dominates be Dominance.does_dominate(dominance_ptr, inst_block_id, exit_block_id)
+            If dominates equals 0:
+                Note: Instruction does not dominate this exit - unsafe to hoist
+                Return 0
+            End If
+
+            Set exit_idx to exit_idx plus 1
+        End While
+    End If
+
+    Return 1
+End Process
+
+Process called "mark_invariant_instructions" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Marks all loop-invariant instructions using fixed-point iteration.
+
+    **FIXED-POINT ALGORITHM:**
+    ```
+    invariant = {}
+    changed = true
+    while changed:
+        changed = false
+        for each instruction I in loop:
+            if all operands of I are invariant:
+                if I not in invariant:
+                    invariant.add(I)
+                    changed = true
+    ```
+
+    Returns number of invariant instructions found.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If loop_info equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let invariant_set be Layout.memory_get_int64(context_ptr, 16)
+    Let dominance_ptr be Layout.memory_get_int64(context_ptr, 48)
+    Let ssa_ptr be Layout.memory_get_int64(context_ptr, 56)
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+
+    Display "mark_invariant_instructions: starting fixed-point analysis"
+
+    Let iteration be 0
+    Let max_iterations be 50
+    Let changed be 1
+
+    While changed equals 1 and iteration is less than max_iterations:
+        Set changed to 0
+        Set iteration to iteration plus 1
+
+        Display "mark_invariant_instructions: iteration " joined with iteration
+
+        Note: Process all instructions in loop body
+        Let body_members be proc members from Set with body_blocks
+        Let body_count be List.length(body_members)
+
+        Let i be 0
+        While i is less than body_count:
+            Let block_id_str be List.get(body_members, i)
+            Let block_id be proc string_to_integer from String with block_id_str
+
+            Let block_ptr be CFG.get_block_by_id(cfg_ptr, block_id)
+            If block_ptr is not equal to 0:
+                Let inst_list be CFG.get_block_instructions(block_ptr)
+                If inst_list is not equal to 0:
+                    Let inst_count be List.length(inst_list)
+                    Let j be 0
+
+                    While j is less than inst_count:
+                        Let inst_ptr be List.get(inst_list, j)
+                        Let inst_str be proc integer_to_string from String with inst_ptr
+
+                        Note: Check if already marked invariant
+                        Let already_invariant be proc contains from Set with invariant_set, inst_str
+
+                        If already_invariant equals 0:
+                            Note: Check if all operands are invariant
+                            Let op1 be Layout.memory_get_int64(inst_ptr, 16)
+                            Let op2 be Layout.memory_get_int64(inst_ptr, 24)
+
+                            Let op1_invariant be 1
+                            Let op2_invariant be 1
+
+                            If op1 is not equal to 0:
+                                Set op1_invariant to is_loop_invariant_operand(op1, loop_info, invariant_set, ssa_ptr, cfg_ptr)
+                            End If
+
+                            If op2 is not equal to 0:
+                                Set op2_invariant to is_loop_invariant_operand(op2, loop_info, invariant_set, ssa_ptr, cfg_ptr)
+                            End If
+
+                            Note: If all operands invariant and safe to hoist
+                            If op1_invariant equals 1 and op2_invariant equals 1:
+                                Let can_hoist be can_hoist_instruction(inst_ptr, loop_info, dominance_ptr, cfg_ptr)
+
+                                If can_hoist equals 1:
+                                    Note: Mark as invariant
+                                    proc add from Set with invariant_set, inst_str
+                                    Set changed to 1
+
+                                    Display "mark_invariant_instructions: marked instruction " joined with inst_ptr joined with " as invariant"
+                                End If
+                            End If
+                        End If
+
+                        Set j to j plus 1
+                    End While
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+    End While
+
+    Let invariant_count be proc size from Set with invariant_set
+    Display "mark_invariant_instructions: found " joined with invariant_count joined with " invariant instructions in " joined with iteration joined with " iterations"
+
+    Note: Update loop info
+    Layout.memory_set_int64(loop_info, 56, invariant_count)
+
+    Note: Update context iteration count
+    Let total_iterations be Layout.memory_get_int64(context_ptr, 88)
+    Set total_iterations to total_iterations plus iteration
+    Layout.memory_set_int64(context_ptr, 88, total_iterations)
+
+    Return invariant_count
+End Process
+
+Note: ============================================================================
+Note: HOISTING TRANSFORMATION
+Note: ============================================================================
+
+Process called "hoist_instruction" that takes inst_ptr as Integer, loop_info as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Hoists an instruction to the loop preheader.
+
+    **HOISTING:**
+    1. Remove instruction from current block
+    2. Insert at end of preheader (before branch)
+    3. Update SSA form (phi nodes if needed)
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+    If loop_info equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let preheader_id be Layout.memory_get_int64(loop_info, 8)
+    If preheader_id equals 0:
+        Display "hoist_instruction: no preheader for loop"
+        Return 0
+    End If
+
+    Let preheader_block be CFG.get_block_by_id(cfg_ptr, preheader_id)
+    If preheader_block equals 0:
+        Display "hoist_instruction: preheader block not found"
+        Return 0
+    End If
+
+    Display "hoist_instruction: hoisting instruction " joined with inst_ptr joined with " to preheader " joined with preheader_id
+
+    Note: Get original block containing instruction
+    Let original_block_id be MIR.get_instruction_block_id(inst_ptr)
+    Let original_block be CFG.get_block_by_id(cfg_ptr, original_block_id)
+
+    If original_block is not equal to 0:
+        Note: Remove instruction from original block
+        Let removal_result be CFG.remove_instruction_from_block(original_block, inst_ptr)
+        If removal_result equals 0:
+            Display "hoist_instruction: WARNING - failed to remove instruction from original block"
+        End If
+    End If
+
+    Note: Add instruction to preheader (before terminator)
+    Let add_result be CFG.add_instruction_to_block(preheader_block, inst_ptr)
+    If add_result equals 0:
+        Display "hoist_instruction: ERROR - failed to add instruction to preheader"
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "hoist_invariant_instructions" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Hoists all marked invariant instructions to preheader.
+
+    Returns number of instructions hoisted.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If loop_info equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let invariant_set be Layout.memory_get_int64(context_ptr, 16)
+
+    Display "hoist_invariant_instructions: hoisting invariant instructions"
+
+    Let hoisted be 0
+
+    Note: Get all invariant instructions
+    Let invariant_members be proc members from Set with invariant_set
+    Let invariant_count be List.length(invariant_members)
+
+    Let i be 0
+    While i is less than invariant_count:
+        Let inst_str be List.get(invariant_members, i)
+        Let inst_ptr be proc string_to_integer from String with inst_str
+
+        Note: Hoist instruction
+        Let result be hoist_instruction(inst_ptr, loop_info, cfg_ptr)
+        If result equals 1:
+            Set hoisted to hoisted plus 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "hoist_invariant_instructions: hoisted " joined with hoisted joined with " instructions"
+
+    Return hoisted
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS AND PIPELINE INTEGRATION
+Note: ============================================================================
+
+Process called "optimize_function_with_licm" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    **MAIN LICM ENTRY POINT**
+
+    Runs complete LICM optimization on a function.
+
+    **ALGORITHM:**
+    1. Create LICM context
+    2. Detect natural loops
+    3. Insert preheaders
+    4. Mark invariant instructions (fixed-point)
+    5. Hoist invariant instructions
+    6. Print statistics
+    7. Destroy context
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Display "optimize_function_with_licm: null CFG"
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "LOOP-INVARIANT CODE MOTION"
+    Display "============================================"
+    Display ""
+
+    Note: Step 1: Create context
+    Display "Step 1: Creating LICM context..."
+    Let context_ptr be create_licm_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "optimize_function_with_licm: failed to create context"
+        Return 0
+    End If
+
+    Note: Step 2: Detect natural loops
+    Display "Step 2: Detecting natural loops..."
+    Let loop_count be detect_natural_loops(context_ptr)
+
+    If loop_count equals 0:
+        Display "optimize_function_with_licm: no loops found"
+        destroy_licm_context(context_ptr)
+        Return 1
+    End If
+
+    Note: Step 3: Insert preheaders
+    Display "Step 3: Inserting preheaders..."
+    insert_preheaders(context_ptr)
+
+    Note: Step 4: Process each loop
+    Display "Step 4: Processing loops for invariant code motion..."
+    Let loops_list be Layout.memory_get_int64(context_ptr, 8)
+    Let total_hoisted be 0
+
+    Let i be 0
+    While i is less than loop_count:
+        Let loop_info be List.get(loops_list, i)
+        Let header_id be Layout.memory_get_int64(loop_info, 0)
+
+        Display ""
+        Display "Processing loop with header " joined with header_id joined with "..."
+
+        Note: Mark invariant instructions
+        mark_invariant_instructions(context_ptr, loop_info)
+
+        Note: Hoist invariant instructions
+        Let hoisted be hoist_invariant_instructions(context_ptr, loop_info)
+        Set total_hoisted to total_hoisted plus hoisted
+
+        Note: Update loops processed counter
+        Let loops_processed be Layout.memory_get_int64(context_ptr, 32)
+        Set loops_processed to loops_processed plus 1
+        Layout.memory_set_int64(context_ptr, 32, loops_processed)
+
+        Set i to i plus 1
+    End While
+
+    Note: Update total hoisted count
+    Layout.memory_set_int64(context_ptr, 24, total_hoisted)
+
+    Note: Step 5: Print statistics
+    print_licm_stats(context_ptr)
+
+    Note: Step 6: Destroy context
+    destroy_licm_context(context_ptr)
+
+    Display ""
+    Display "LOOP-INVARIANT CODE MOTION COMPLETE"
+    Display ""
+
+    Return 1
+End Process
+
+Process called "run_licm_pass" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Convenience wrapper for running LICM as an optimization pass.
+
+    Returns 1 if CFG was modified, 0 if no changes.
+    @End Reasoning
+
+    Return optimize_function_with_licm(cfg_ptr)
+End Process
+
+Process called "should_run_licm" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Determines if LICM should be run.
+
+    **PROFITABILITY:**
+    LICM is profitable if:
+    - Function contains loops (has back edges)
+    - Function is non-trivial (>= 3 blocks)
+
+    Returns 1 if should run, 0 otherwise.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get block count
+    Let block_count be CFG.get_block_count(cfg_ptr)
+
+    Note: Skip trivial functions
+    If block_count is less than 3:
+        Display "should_run_licm: skipping trivial function"
+        Return 0
+    End If
+
+    Note: Should run on non-trivial functions
+    Note: (Actual loop detection happens in optimization pass)
+    Return 1
+End Process
+
+Process called "get_licm_pass_name" returns Integer:
+    @Reasoning
+    Returns the name of this optimization pass.
+    @End Reasoning
+
+    Return "Loop-Invariant Code Motion"
+End Process
+
+Process called "get_licm_pass_description" returns Integer:
+    @Reasoning
+    Returns a description of this optimization pass.
+    @End Reasoning
+
+    Return "Hoists loop-invariant computations out of loops using fixed-point analysis"
+End Process
+
+Note: ============================================================================
+Note: END OF LICM IMPLEMENTATION
+Note: ============================================================================

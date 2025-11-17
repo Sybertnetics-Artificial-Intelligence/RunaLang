@@ -35,4 +35,1294 @@ This file consists of the following functions/features/operation types:
 - Virtual table bypass for known concrete types
 :End Note
 
-Note: TODO - Implement devirtualization optimization functionality
+Note: ========== IMPORTS ==========
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================
+Note: TYPE DEFINITIONS
+Note: ============================================================
+
+@Reasoning
+DevirtualizationContext stores all state needed for devirtualization optimization.
+It tracks type information for SSA values, maintains statistics about
+devirtualized calls, and caches results for efficiency.
+
+The context includes type propagation information and virtual call site data
+to enable effective devirtualization analysis.
+
+Size calculation (64-bit pointers, 8 bytes each):
+- 13 fields * 8 bytes = 104 bytes per context
+@End Reasoning
+
+Type called "DevirtualizationContext":
+    cfg as Integer                          Note: CFG pointer for current function
+    ssa_ptr as Integer                      Note: SSA information pointer
+    dominance_ptr as Integer                Note: Dominance tree pointer
+    current_function_ptr as Integer         Note: Pointer to function being optimized
+    devirtualized_calls as Integer          Note: Counter for devirtualized calls
+    speculative_devirt as Integer           Note: Counter for speculative devirt
+    total_virtual_calls as Integer          Note: Total virtual calls found
+    virtual_call_sites as Integer           Note: List of VirtualCallSite structures
+    type_info_map as Integer                Note: Dictionary: value_id -> TypePropagationInfo
+    receiver_types as Integer               Note: Dictionary: call_site -> concrete_type
+    blocks_processed as Integer             Note: Number of blocks analyzed
+    single_impl_cache as Integer            Note: Dictionary: protocol_ptr -> impl_ptr
+    guard_threshold as Integer              Note: Confidence threshold for guards (0-100)
+End Type
+
+@Reasoning
+VirtualCallSite represents a single virtual call that may be devirtualized.
+It captures all information needed to determine the concrete type of the
+receiver and perform the devirtualization transformation.
+
+We track the receiver value ID to query type information and determine
+if we have a concrete type available.
+
+Size calculation:
+- 9 fields * 8 bytes = 72 bytes per virtual call site
+@End Reasoning
+
+Type called "VirtualCallSite":
+    call_instruction_ptr as Integer         Note: Pointer to MIR_CALL_INDIRECT instruction
+    call_block_ptr as Integer               Note: Pointer to containing basic block
+    receiver_value_id as Integer            Note: SSA value ID of receiver object
+    method_selector as Integer              Note: Method identifier (offset/name)
+    protocol_ptr as Integer                 Note: Protocol/trait type
+    concrete_type_ptr as Integer            Note: Known concrete type (if determined)
+    confidence as Integer                   Note: Confidence level (0-100)
+    can_devirtualize as Integer             Note: Boolean: 1 if eligible, 0 otherwise
+    devirtualized as Integer                Note: Boolean: 1 if transformed, 0 otherwise
+End Type
+
+@Reasoning
+TypePropagationInfo tracks the concrete type information for an SSA value.
+Used during type propagation analysis to determine receiver types.
+
+Confidence levels:
+- 0-25: Unknown/weak
+- 26-50: Likely (from heuristics)
+- 51-75: Probable (from casts)
+- 76-100: Certain (from allocation)
+
+Size calculation:
+- 6 fields * 8 bytes = 48 bytes per type info
+@End Reasoning
+
+Type called "TypePropagationInfo":
+    value_id as Integer                     Note: SSA value ID being tracked
+    concrete_type_ptr as Integer            Note: Pointer to concrete type
+    confidence as Integer                   Note: Confidence level (0-100)
+    source_instruction as Integer           Note: Instruction that provides type info
+    propagated as Integer                   Note: Boolean: 1 if propagated, 0 if source
+    block_ptr as Integer                    Note: Block containing source
+End Type
+
+Note: ============================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================
+
+@Implementation
+Creates and initializes a DevirtualizationContext structure for a given CFG.
+All counters start at zero, caches are initialized as empty collections,
+and thresholds are set to safe defaults.
+
+Memory allocation:
+- Context structure: 104 bytes
+- virtual_call_sites: List structure
+- type_info_map: Dictionary structure
+- receiver_types: Dictionary structure
+- single_impl_cache: Dictionary structure
+
+Returns pointer to initialized context, or 0 on allocation failure.
+@End Implementation
+
+Process called "create_devirtualization_context" that takes cfg_ptr as Integer returns Integer:
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let context_size be 104
+    Let context be proc allocate from Layout with context_size
+
+    If context equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG pointer
+    proc memory_set_int64 from Layout with context, 0, cfg_ptr
+
+    Note: Initialize SSA pointer
+    Let ssa_ptr be 0
+    proc memory_set_int64 from Layout with context, 8, ssa_ptr
+
+    Note: Initialize dominance pointer
+    Let dominance_ptr be 0
+    proc memory_set_int64 from Layout with context, 16, dominance_ptr
+
+    Note: Initialize current_function_ptr
+    proc memory_set_int64 from Layout with context, 24, 0
+
+    Note: Initialize counters
+    proc memory_set_int64 from Layout with context, 32, 0  Note: devirtualized_calls
+    proc memory_set_int64 from Layout with context, 40, 0  Note: speculative_devirt
+    proc memory_set_int64 from Layout with context, 48, 0  Note: total_virtual_calls
+
+    Note: Create virtual call sites list
+    Let sites be proc create from List
+    proc memory_set_int64 from Layout with context, 56, sites
+
+    Note: Create type info map
+    Let type_map be proc create from Dictionary
+    proc memory_set_int64 from Layout with context, 64, type_map
+
+    Note: Create receiver types map
+    Let receiver_map be proc create from Dictionary
+    proc memory_set_int64 from Layout with context, 72, receiver_map
+
+    Note: Initialize blocks_processed counter
+    proc memory_set_int64 from Layout with context, 80, 0
+
+    Note: Create single implementation cache
+    Let impl_cache be proc create from Dictionary
+    proc memory_set_int64 from Layout with context, 88, impl_cache
+
+    Note: Set guard threshold (75% confidence required for speculative devirt)
+    proc memory_set_int64 from Layout with context, 96, 75
+
+    Return context
+End Process
+
+@Implementation
+Destroys a DevirtualizationContext and frees all associated memory.
+This includes freeing all virtual call site structures, type info structures,
+caches, and the context itself.
+
+Proper cleanup prevents memory leaks in the optimization pipeline.
+@End Implementation
+
+Process called "destroy_devirtualization_context" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Note: Free virtual call sites list (including individual structures)
+    Let sites be the Integer at (context_ptr plus 56)
+    If sites is not equal to 0:
+        Let count be proc length from List with sites
+        Let i be 0
+        While i is less than count:
+            Let site_ptr be proc get from List with sites and i
+            If site_ptr is not equal to 0:
+                proc deallocate from Layout with site_ptr
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with sites
+    End If
+
+    Note: Free type info map
+    Let type_map be the Integer at (context_ptr plus 64)
+    If type_map is not equal to 0:
+        proc destroy from Dictionary with type_map
+    End If
+
+    Note: Free receiver types map
+    Let receiver_map be the Integer at (context_ptr plus 72)
+    If receiver_map is not equal to 0:
+        proc destroy from Dictionary with receiver_map
+    End If
+
+    Note: Free single implementation cache
+    Let impl_cache be the Integer at (context_ptr plus 88)
+    If impl_cache is not equal to 0:
+        proc destroy from Dictionary with impl_cache
+    End If
+
+    Note: Free dominance pointer if allocated
+    Let dominance_ptr be the Integer at (context_ptr plus 16)
+    If dominance_ptr is not equal to 0:
+        proc destroy_dominance_tree from Dominance with dominance_ptr
+    End If
+
+    Note: Free context structure
+    proc deallocate from Layout with context_ptr
+End Process
+
+@Implementation
+Prints statistics about devirtualization optimization transformations.
+This provides visibility into the effectiveness of the devirtualization pass.
+@End Implementation
+
+Process called "print_devirtualization_stats" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Display "========== Devirtualization Statistics =========="
+
+    Let devirt_count be the Integer at (context_ptr plus 32)
+    Display "Direct devirtualizations: " joined with devirt_count
+
+    Let spec_count be the Integer at (context_ptr plus 40)
+    Display "Speculative devirtualizations: " joined with spec_count
+
+    Let total_virtual be the Integer at (context_ptr plus 48)
+    Display "Total virtual calls found: " joined with total_virtual
+
+    Let blocks_processed be the Integer at (context_ptr plus 80)
+    Display "Basic blocks analyzed: " joined with blocks_processed
+
+    Display "================================================="
+End Process
+
+Note: ============================================================
+Note: TYPE PROPAGATION ANALYSIS
+Note: ============================================================
+
+@Reasoning
+Type propagation determines the concrete type of SSA values by tracking
+type information through the program.
+
+Type sources:
+1. Allocations (NEW instruction) - 100% confidence
+2. Type casts (CAST instruction) - 90% confidence
+3. Type guards (TYPECHECK instruction) - 85% confidence
+4. Function parameters - analyze call sites
+5. Phi nodes - merge type information
+
+Propagation:
+- Forward through dominators
+- Track through assignments
+- Merge at phi nodes (minimum confidence)
+
+This enables identifying receiver types for virtual calls.
+@End Reasoning
+
+@Implementation
+Analyzes allocation and cast instructions to build initial type information.
+
+Algorithm:
+1. Iterate through all blocks in dominator tree order
+2. For each instruction:
+   - NEW: Record allocation type (100% confidence)
+   - CAST: Record target type (90% confidence)
+   - TYPECHECK: Record checked type (85% confidence)
+3. Create TypePropagationInfo for each typed value
+4. Add to type_info_map
+
+Returns number of values with type information collected.
+@End Implementation
+
+Process called "collect_type_information" that takes context_ptr as Integer returns Integer:
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be the Integer at (context_ptr plus 0)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let type_info_map be the Integer at (context_ptr plus 64)
+    Let type_count be 0
+
+    Note: Get all blocks from CFG
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    If blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be proc length from List with blocks
+    Let block_idx be 0
+
+    While block_idx is less than block_count:
+        Let block_ptr be proc get from List with blocks and block_idx
+
+        If block_ptr is not equal to 0:
+            Note: Get instructions in this block
+            Let instructions be CFG.get_block_instructions(block_ptr)
+            If instructions is not equal to 0:
+                Let inst_count be proc length from List with instructions
+                Let inst_idx be 0
+
+                While inst_idx is less than inst_count:
+                    Let inst_ptr be proc get from List with instructions and inst_idx
+
+                    If inst_ptr is not equal to 0:
+                        Let opcode be MIR.get_opcode(inst_ptr)
+
+                        Note: Check for allocation (MIR_NEW = 20400)
+                        If opcode equals 20400:
+                            Note: Get result value ID
+                            Let value_id be the Integer at (inst_ptr plus 8)
+
+                            Note: Get allocated type (operand 0)
+                            Let type_ptr be the Integer at (inst_ptr plus 16)
+
+                            If value_id is not equal to 0 and type_ptr is not equal to 0:
+                                Note: Create TypePropagationInfo
+                                Let info_size be 48
+                                Let info_ptr be proc allocate from Layout with info_size
+
+                                If info_ptr is not equal to 0:
+                                    proc memory_set_int64 from Layout with info_ptr, 0, value_id
+                                    proc memory_set_int64 from Layout with info_ptr, 8, type_ptr
+                                    proc memory_set_int64 from Layout with info_ptr, 16, 100  Note: 100% confidence
+                                    proc memory_set_int64 from Layout with info_ptr, 24, inst_ptr
+                                    proc memory_set_int64 from Layout with info_ptr, 32, 0  Note: Not propagated
+                                    proc memory_set_int64 from Layout with info_ptr, 40, block_ptr
+
+                                    proc set from Dictionary with type_info_map, value_id, and info_ptr
+                                    Set type_count to type_count plus 1
+                                End If
+                            End If
+                        End If
+
+                        Note: Check for type cast (MIR_CAST = 20401)
+                        If opcode equals 20401:
+                            Let value_id be the Integer at (inst_ptr plus 8)
+                            Let target_type be the Integer at (inst_ptr plus 24)
+
+                            If value_id is not equal to 0 and target_type is not equal to 0:
+                                Let info_size be 48
+                                Let info_ptr be proc allocate from Layout with info_size
+
+                                If info_ptr is not equal to 0:
+                                    proc memory_set_int64 from Layout with info_ptr, 0, value_id
+                                    proc memory_set_int64 from Layout with info_ptr, 8, target_type
+                                    proc memory_set_int64 from Layout with info_ptr, 16, 90  Note: 90% confidence
+                                    proc memory_set_int64 from Layout with info_ptr, 24, inst_ptr
+                                    proc memory_set_int64 from Layout with info_ptr, 32, 0
+                                    proc memory_set_int64 from Layout with info_ptr, 40, block_ptr
+
+                                    proc set from Dictionary with type_info_map, value_id, and info_ptr
+                                    Set type_count to type_count plus 1
+                                End If
+                            End If
+                        End If
+
+                        Note: Check for type check (MIR_TYPECHECK = 20402)
+                        If opcode equals 20402:
+                            Let value_id be the Integer at (inst_ptr plus 8)
+                            Let checked_type be the Integer at (inst_ptr plus 24)
+
+                            If value_id is not equal to 0 and checked_type is not equal to 0:
+                                Let info_size be 48
+                                Let info_ptr be proc allocate from Layout with info_size
+
+                                If info_ptr is not equal to 0:
+                                    proc memory_set_int64 from Layout with info_ptr, 0, value_id
+                                    proc memory_set_int64 from Layout with info_ptr, 8, checked_type
+                                    proc memory_set_int64 from Layout with info_ptr, 16, 85  Note: 85% confidence
+                                    proc memory_set_int64 from Layout with info_ptr, 24, inst_ptr
+                                    proc memory_set_int64 from Layout with info_ptr, 32, 0
+                                    proc memory_set_int64 from Layout with info_ptr, 40, block_ptr
+
+                                    proc set from Dictionary with type_info_map, value_id, and info_ptr
+                                    Set type_count to type_count plus 1
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Set inst_idx to inst_idx plus 1
+                End While
+            End If
+
+            Note: Update blocks_processed counter
+            Let blocks_processed be the Integer at (context_ptr plus 80)
+            Set blocks_processed to blocks_processed plus 1
+            proc memory_set_int64 from Layout with context_ptr, 80, blocks_processed
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Return type_count
+End Process
+
+@Implementation
+Propagates type information through SSA use-def chains.
+
+Algorithm:
+1. For each value with type information
+2. Find all uses of that value
+3. If use is an assignment (MOV), propagate type to destination
+4. Lower confidence by 5% at each propagation step
+5. Continue until no more propagations possible
+
+This enables tracking types through assignments.
+
+Returns number of propagations performed.
+@End Implementation
+
+Process called "propagate_type_information" that takes context_ptr as Integer returns Integer:
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let type_info_map be the Integer at (context_ptr plus 64)
+    Let cfg be the Integer at (context_ptr plus 0)
+    Let ssa_ptr be the Integer at (context_ptr plus 8)
+    Let propagation_count be 0
+
+    Note: Iterative propagation until fixed point
+    Let changed be 1
+    Let iteration be 0
+    Let max_iterations be 20  Note: Prevent infinite loops
+
+    While changed equals 1 and iteration is less than max_iterations:
+        Set changed to 0
+        Set iteration to iteration plus 1
+
+        Note: Get all blocks in CFG
+        Let blocks_ptr be CFG.get_all_blocks(cfg)
+        Let block_count be the Integer at (blocks_ptr plus 0)
+        Let block_idx be 0
+
+        While block_idx is less than block_count:
+            Let block_ptr be the Integer at (blocks_ptr plus 8 plus (block_idx times 8))
+
+            Note: Get block instructions
+            Let insts_ptr be the Integer at (block_ptr plus 16)
+            Let inst_count be the Integer at (block_ptr plus 24)
+            Let inst_idx be 0
+
+            While inst_idx is less than inst_count:
+                Let inst_ptr be the Integer at (insts_ptr plus (inst_idx times 8))
+                Let opcode be the Integer at (inst_ptr plus 0)
+
+                Note: Check for MOV instruction (20000)
+                If opcode equals 20000:
+                    Note: Get source and destination
+                    Let dest_value be the Integer at (inst_ptr plus 8)
+                    Let src_value be the Integer at (inst_ptr plus 16)
+
+                    Note: Check if source has type information
+                    Let src_type_info_ptr be the Integer at (type_info_map plus (src_value times 8))
+
+                    If src_type_info_ptr is not equal to 0:
+                        Note: Get source type details
+                        Let src_type_ptr be the Integer at (src_type_info_ptr plus 8)
+                        Let src_confidence be the Integer at (src_type_info_ptr plus 16)
+
+                        Note: Check if destination already has type information
+                        Let dest_type_info_ptr be the Integer at (type_info_map plus (dest_value times 8))
+
+                        If dest_type_info_ptr equals 0:
+                            Note: Create new type information for destination
+                            Let new_type_info be Layout.allocate(48)
+
+                            Note: Copy type but reduce confidence by 5%
+                            Let new_confidence be src_confidence minus 5
+                            If new_confidence is less than 0:
+                                Set new_confidence to 0
+                            End If
+
+                            Note: Set fields
+                            proc memory_set_int64 from Layout with new_type_info, 0, dest_value
+                            proc memory_set_int64 from Layout with new_type_info, 8, src_type_ptr
+                            proc memory_set_int64 from Layout with new_type_info, 16, new_confidence
+                            proc memory_set_int64 from Layout with new_type_info, 24, inst_ptr
+                            proc memory_set_int64 from Layout with new_type_info, 32, 1  Note: propagated flag
+                            proc memory_set_int64 from Layout with new_type_info, 40, block_ptr
+
+                            Note: Add to type_info_map
+                            proc memory_set_int64 from Layout with type_info_map, (dest_value times 8), new_type_info
+
+                            Set changed to 1
+                            Set propagation_count to propagation_count plus 1
+                        End If
+                    End If
+                End If
+
+                Note: Check for PHI instruction (20001)
+                If opcode equals 20001:
+                    Note: Get phi destination
+                    Let phi_dest be the Integer at (inst_ptr plus 8)
+
+                    Note: Get phi operands
+                    Let phi_op_count be the Integer at (inst_ptr plus 24)
+                    Let phi_ops_ptr be the Integer at (inst_ptr plus 32)
+
+                    Note: Find common type among all operands
+                    Let common_type_ptr be 0
+                    Let min_confidence be 100
+                    Let all_same_type be 1
+                    Let op_idx be 0
+
+                    While op_idx is less than phi_op_count:
+                        Let op_value be the Integer at (phi_ops_ptr plus (op_idx times 16))
+                        Let op_type_info_ptr be the Integer at (type_info_map plus (op_value times 8))
+
+                        If op_type_info_ptr is not equal to 0:
+                            Let op_type_ptr be the Integer at (op_type_info_ptr plus 8)
+                            Let op_confidence be the Integer at (op_type_info_ptr plus 16)
+
+                            If common_type_ptr equals 0:
+                                Set common_type_ptr to op_type_ptr
+                                Set min_confidence to op_confidence
+                            Otherwise:
+                                If op_type_ptr is not equal to common_type_ptr:
+                                    Set all_same_type to 0  Note: Different types
+                                End If
+                                If op_confidence is less than min_confidence:
+                                    Set min_confidence to op_confidence
+                                End If
+                            End If
+                        Otherwise:
+                            Set all_same_type to 0  Note: Unknown type
+                        End If
+
+                        Set op_idx to op_idx plus 1
+                    End While
+
+                    Note: If all operands have same type, propagate to phi result
+                    If all_same_type equals 1 and common_type_ptr is not equal to 0:
+                        Let phi_type_info_ptr be the Integer at (type_info_map plus (phi_dest times 8))
+
+                        If phi_type_info_ptr equals 0:
+                            Note: Create type information for phi
+                            Let phi_type_info be Layout.allocate(48)
+
+                            Note: Use minimum confidence minus 10% (phi uncertainty)
+                            Let phi_confidence be min_confidence minus 10
+                            If phi_confidence is less than 0:
+                                Set phi_confidence to 0
+                            End If
+
+                            proc memory_set_int64 from Layout with phi_type_info, 0, phi_dest
+                            proc memory_set_int64 from Layout with phi_type_info, 8, common_type_ptr
+                            proc memory_set_int64 from Layout with phi_type_info, 16, phi_confidence
+                            proc memory_set_int64 from Layout with phi_type_info, 24, inst_ptr
+                            proc memory_set_int64 from Layout with phi_type_info, 32, 1
+                            proc memory_set_int64 from Layout with phi_type_info, 40, block_ptr
+
+                            proc memory_set_int64 from Layout with type_info_map, (phi_dest times 8), phi_type_info
+
+                            Set changed to 1
+                            Set propagation_count to propagation_count plus 1
+                        End If
+                    End If
+                End If
+
+                Set inst_idx to inst_idx plus 1
+            End While
+
+            Set block_idx to block_idx plus 1
+        End While
+    End While
+
+    Return propagation_count
+End Process
+
+Note: ============================================================
+Note: VIRTUAL CALL ANALYSIS
+Note: ============================================================
+
+@Reasoning
+Virtual call analysis identifies indirect calls through vtables and
+determines if we have enough type information to devirtualize them.
+
+Virtual calls in MIR:
+- MIR_CALL_INDIRECT with protocol/trait receiver
+- Receiver value must have type information
+- Method selector identifies which method to resolve
+
+We analyze each virtual call to determine:
+1. Receiver type (concrete or unknown)
+2. Method implementation for that type
+3. Confidence level for devirtualization
+@End Reasoning
+
+@Implementation
+Scans all basic blocks and identifies virtual call instructions.
+
+Algorithm:
+1. Iterate through all basic blocks
+2. Examine all instructions looking for MIR_CALL_INDIRECT
+3. Extract receiver value ID and method selector
+4. Query type information for receiver
+5. Create VirtualCallSite structure
+6. Add to virtual_call_sites list
+
+Returns number of virtual call sites found.
+@End Implementation
+
+Process called "collect_virtual_call_sites" that takes context_ptr as Integer returns Integer:
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be the Integer at (context_ptr plus 0)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let virtual_sites be the Integer at (context_ptr plus 56)
+    Let type_info_map be the Integer at (context_ptr plus 64)
+    Let site_count be 0
+
+    Note: Get all blocks from CFG
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    If blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be proc length from List with blocks
+    Let block_idx be 0
+
+    While block_idx is less than block_count:
+        Let block_ptr be proc get from List with blocks and block_idx
+
+        If block_ptr is not equal to 0:
+            Note: Get instructions in this block
+            Let instructions be CFG.get_block_instructions(block_ptr)
+            If instructions is not equal to 0:
+                Let inst_count be proc length from List with instructions
+                Let inst_idx be 0
+
+                While inst_idx is less than inst_count:
+                    Let inst_ptr be proc get from List with instructions and inst_idx
+
+                    If inst_ptr is not equal to 0:
+                        Let opcode be MIR.get_opcode(inst_ptr)
+
+                        Note: Check for indirect call (MIR_CALL_INDIRECT = 20305)
+                        If opcode equals 20305:
+                            Note: Get receiver value ID (operand 0)
+                            Let receiver_id be the Integer at (inst_ptr plus 16)
+
+                            Note: Get method selector (operand 1)
+                            Let method_selector be the Integer at (inst_ptr plus 24)
+
+                            If receiver_id is not equal to 0:
+                                Note: Query type information for receiver
+                                Let type_info be proc get from Dictionary with type_info_map and receiver_id
+
+                                Let concrete_type be 0
+                                Let confidence be 0
+
+                                If type_info is not equal to 0:
+                                    Set concrete_type to the Integer at (type_info plus 8)
+                                    Set confidence to the Integer at (type_info plus 16)
+                                End If
+
+                                Note: Create VirtualCallSite structure
+                                Let site_size be 72
+                                Let site_ptr be proc allocate from Layout with site_size
+
+                                If site_ptr is not equal to 0:
+                                    proc memory_set_int64 from Layout with site_ptr, 0, inst_ptr
+                                    proc memory_set_int64 from Layout with site_ptr, 8, block_ptr
+                                    proc memory_set_int64 from Layout with site_ptr, 16, receiver_id
+                                    proc memory_set_int64 from Layout with site_ptr, 24, method_selector
+                                    proc memory_set_int64 from Layout with site_ptr, 32, 0  Note: protocol_ptr
+                                    proc memory_set_int64 from Layout with site_ptr, 40, concrete_type
+                                    proc memory_set_int64 from Layout with site_ptr, 48, confidence
+
+                                    Note: Can devirtualize if confidence high enough
+                                    Let can_devirt be 0
+                                    If confidence is greater than or equal to 75:
+                                        Set can_devirt to 1
+                                    End If
+                                    proc memory_set_int64 from Layout with site_ptr, 56, can_devirt
+
+                                    proc memory_set_int64 from Layout with site_ptr, 64, 0  Note: Not devirtualized yet
+
+                                    proc append from List with virtual_sites and site_ptr
+                                    Set site_count to site_count plus 1
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Set inst_idx to inst_idx plus 1
+                End While
+            End If
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Update total_virtual_calls counter
+    proc memory_set_int64 from Layout with context_ptr, 48, site_count
+
+    Return site_count
+End Process
+
+@Implementation
+Resolves the concrete implementation of a method for a given type.
+
+Algorithm:
+1. Look up type's method table
+2. Find method implementation for selector
+3. Verify method is callable
+4. Return function pointer to implementation
+
+Returns function pointer to implementation, or 0 if not found.
+@End Implementation
+
+Process called "resolve_method_implementation" that takes concrete_type as Integer, method_selector as Integer, context_ptr as Integer returns Integer:
+    If concrete_type equals 0 or method_selector equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get type's vtable (offset 64 in type structure)
+    Let vtable_ptr be the Integer at (concrete_type plus 64)
+    If vtable_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Vtable structure:
+    Note: Offset 0: entry count (Integer)
+    Note: Offset 8: entries array (each entry 16 bytes: selector + function_ptr)
+
+    Let entry_count be the Integer at (vtable_ptr plus 0)
+    Let entries_ptr be vtable_ptr plus 8
+
+    Note: Linear search through vtable entries
+    Let entry_idx be 0
+    While entry_idx is less than entry_count:
+        Let entry_offset be entry_idx times 16
+        Let entry_selector be the Integer at (entries_ptr plus entry_offset plus 0)
+        Let entry_function be the Integer at (entries_ptr plus entry_offset plus 8)
+
+        Note: Check if selector matches
+        If entry_selector equals method_selector:
+            Note: Verify function pointer is valid
+            If entry_function is not equal to 0:
+                Return entry_function
+            End If
+        End If
+
+        Set entry_idx to entry_idx plus 1
+    End While
+
+    Note: Method not found in vtable - check single implementation cache
+    Let single_impl_cache be the Integer at (context_ptr plus 88)
+    Let cached_impl be the Integer at (single_impl_cache plus (method_selector times 8))
+    If cached_impl is not equal to 0:
+        Return cached_impl
+    End If
+
+    Note: Try to resolve from type's protocol/trait information
+    Note: Type structure offset 72: protocol list pointer
+    Let protocol_list_ptr be the Integer at (concrete_type plus 72)
+    If protocol_list_ptr is not equal to 0:
+        Note: Search protocols for method implementation
+        Let protocol_count be the Integer at (protocol_list_ptr plus 0)
+        Let protocols_ptr be protocol_list_ptr plus 8
+        Let protocol_idx be 0
+
+        While protocol_idx is less than protocol_count:
+            Let protocol_ptr be the Integer at (protocols_ptr plus (protocol_idx times 8))
+
+            Note: Get protocol's method table
+            Let protocol_vtable_ptr be the Integer at (protocol_ptr plus 64)
+            If protocol_vtable_ptr is not equal to 0:
+                Let protocol_entry_count be the Integer at (protocol_vtable_ptr plus 0)
+                Let protocol_entries_ptr be protocol_vtable_ptr plus 8
+                Let protocol_entry_idx be 0
+
+                While protocol_entry_idx is less than protocol_entry_count:
+                    Let pentry_offset be protocol_entry_idx times 16
+                    Let pentry_selector be the Integer at (protocol_entries_ptr plus pentry_offset plus 0)
+                    Let pentry_function be the Integer at (protocol_entries_ptr plus pentry_offset plus 8)
+
+                    If pentry_selector equals method_selector:
+                        If pentry_function is not equal to 0:
+                            Note: Cache for future lookups
+                            proc memory_set_int64 from Layout with single_impl_cache, (method_selector times 8), pentry_function
+                            Return pentry_function
+                        End If
+                    End If
+
+                    Set protocol_entry_idx to protocol_entry_idx plus 1
+                End While
+            End If
+
+            Set protocol_idx to protocol_idx plus 1
+        End While
+    End If
+
+    Note: Method not found
+    Return 0
+End Process
+
+Note: ============================================================
+Note: DEVIRTUALIZATION TRANSFORMATION
+Note: ============================================================
+
+@Reasoning
+Devirtualization transformation converts virtual calls into direct calls.
+
+Two strategies:
+1. Direct devirtualization: Known concrete type → replace with direct call
+2. Speculative devirtualization: Likely type → add type guard + fast path
+
+Direct devirtualization:
+- Simple replacement of CALL_INDIRECT with CALL
+- No control flow changes
+- Only when confidence = 100%
+
+Speculative devirtualization:
+- Insert type guard before call
+- Split block: fast path (direct) vs slow path (virtual)
+- Merge results with phi node
+- Used when confidence >= threshold (75%)
+@End Reasoning
+
+@Implementation
+Performs direct devirtualization transformation.
+
+Algorithm:
+1. Get concrete implementation for receiver type
+2. Replace MIR_CALL_INDIRECT with MIR_CALL
+3. Update callee to point to concrete implementation
+4. Update SSA use-def chains
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "perform_direct_devirtualization" that takes site_ptr as Integer, context_ptr as Integer returns Integer:
+    If site_ptr equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get call instruction and concrete type
+    Let call_inst be the Integer at (site_ptr plus 0)
+    Let concrete_type be the Integer at (site_ptr plus 40)
+    Let method_selector be the Integer at (site_ptr plus 24)
+
+    If call_inst equals 0 or concrete_type equals 0:
+        Return 0
+    End If
+
+    Note: Resolve method implementation
+    Let impl_ptr be resolve_method_implementation(concrete_type, method_selector, context_ptr)
+    If impl_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Replace CALL_INDIRECT (20305) with CALL (20304)
+    proc memory_set_int64 from Layout with call_inst, 0, 20304
+
+    Note: Set callee to concrete implementation (operand 0)
+    proc memory_set_int64 from Layout with call_inst, 16, impl_ptr
+
+    Note: Mark as devirtualized
+    proc memory_set_int64 from Layout with site_ptr, 64, 1
+
+    Return 1
+End Process
+
+@Implementation
+Performs speculative devirtualization transformation with type guard.
+
+Algorithm:
+1. Get likely concrete implementation
+2. Split call block before call instruction
+3. Insert type guard checking receiver type
+4. Create fast path (direct call) and slow path (virtual call)
+5. Merge paths with phi node for result
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "perform_speculative_devirtualization" that takes site_ptr as Integer, context_ptr as Integer returns Integer:
+    If site_ptr equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get call information
+    Let call_inst be the Integer at (site_ptr plus 0)
+    Let call_block be the Integer at (site_ptr plus 8)
+    Let receiver_id be the Integer at (site_ptr plus 16)
+    Let method_selector be the Integer at (site_ptr plus 24)
+    Let concrete_type be the Integer at (site_ptr plus 40)
+    Let confidence be the Integer at (site_ptr plus 48)
+
+    If call_inst equals 0 or concrete_type equals 0:
+        Return 0
+    End If
+
+    Note: Check confidence threshold
+    Let threshold be the Integer at (context_ptr plus 96)
+    If confidence is less than threshold:
+        Return 0  Note: Not confident enough
+    End If
+
+    Note: Resolve concrete implementation
+    Let impl_ptr be resolve_method_implementation(concrete_type, method_selector, context_ptr)
+    If impl_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get CFG for block manipulation
+    Let cfg be the Integer at (context_ptr plus 0)
+
+    Note: Create type guard block
+    Let guard_block be CFG.create_basic_block(cfg)
+    If guard_block equals 0:
+        Return 0
+    End If
+
+    Note: Create fast path block (direct call)
+    Let fast_path_block be CFG.create_basic_block(cfg)
+    If fast_path_block equals 0:
+        Return 0
+    End If
+
+    Note: Create slow path block (virtual call)
+    Let slow_path_block be CFG.create_basic_block(cfg)
+    If slow_path_block equals 0:
+        Return 0
+    End If
+
+    Note: Create merge block
+    Let merge_block be CFG.create_basic_block(cfg)
+    If merge_block equals 0:
+        Return 0
+    End If
+
+    Note: Find call instruction index in call block
+    Let call_block_insts be the Integer at (call_block plus 16)
+    Let inst_count be the Integer at (call_block plus 24)
+    Let call_inst_idx be 0
+    Let found_call be 0
+
+    While call_inst_idx is less than inst_count:
+        Let current_inst be the Integer at (call_block_insts plus (call_inst_idx times 8))
+        If current_inst equals call_inst:
+            Set found_call to 1
+            Exit While
+        End If
+        Set call_inst_idx to call_inst_idx plus 1
+    End While
+
+    If found_call equals 0:
+        Return 0
+    End If
+
+    Note: Move instructions after call to merge block
+    Let move_idx be call_inst_idx plus 1
+    While move_idx is less than inst_count:
+        Let inst_to_move be the Integer at (call_block_insts plus (move_idx times 8))
+        CFG.add_instruction_to_block(merge_block, inst_to_move)
+        Set move_idx to move_idx plus 1
+    End While
+
+    Note: Truncate call block at call (guard will be added)
+    proc memory_set_int64 from Layout with call_block, 24, call_inst_idx
+
+    Note: Build type guard: TYPECHECK receiver against concrete_type
+    Let guard_inst be Layout.allocate(64)
+    proc memory_set_int64 from Layout with guard_inst, 0, 20402  Note: MIR_TYPECHECK
+    Let guard_result be receiver_id plus 5000000  Note: Unique value ID for guard result
+    proc memory_set_int64 from Layout with guard_inst, 8, guard_result
+    proc memory_set_int64 from Layout with guard_inst, 16, receiver_id
+    proc memory_set_int64 from Layout with guard_inst, 24, concrete_type
+    CFG.add_instruction_to_block(guard_block, guard_inst)
+
+    Note: Add conditional branch on guard result
+    Let guard_branch be Layout.allocate(64)
+    proc memory_set_int64 from Layout with guard_branch, 0, 20302  Note: MIR_BR (conditional branch)
+    proc memory_set_int64 from Layout with guard_branch, 8, guard_result
+    proc memory_set_int64 from Layout with guard_branch, 16, fast_path_block
+    proc memory_set_int64 from Layout with guard_branch, 24, slow_path_block
+    CFG.add_instruction_to_block(guard_block, guard_branch)
+
+    Note: Wire call block -> guard block
+    CFG.add_edge(call_block, guard_block)
+
+    Note: Build fast path: direct call to concrete implementation
+    Let fast_call be Layout.allocate(64)
+    proc memory_set_int64 from Layout with fast_call, 0, 20304  Note: MIR_CALL (direct)
+    Let fast_result be receiver_id plus 6000000  Note: Unique value ID for fast result
+    proc memory_set_int64 from Layout with fast_call, 8, fast_result
+    proc memory_set_int64 from Layout with fast_call, 16, impl_ptr
+
+    Note: Copy arguments from original call
+    Let arg_count be the Integer at (call_inst plus 24)
+    Let args_ptr be the Integer at (call_inst plus 32)
+    proc memory_set_int64 from Layout with fast_call, 24, arg_count
+    proc memory_set_int64 from Layout with fast_call, 32, args_ptr
+    CFG.add_instruction_to_block(fast_path_block, fast_call)
+
+    Note: Jump from fast path to merge
+    Let fast_jump be Layout.allocate(64)
+    proc memory_set_int64 from Layout with fast_jump, 0, 20301  Note: MIR_JMP
+    proc memory_set_int64 from Layout with fast_jump, 8, merge_block
+    CFG.add_instruction_to_block(fast_path_block, fast_jump)
+    CFG.add_edge(fast_path_block, merge_block)
+
+    Note: Build slow path: keep original virtual call
+    Let slow_call be Layout.allocate(64)
+    proc memory_set_int64 from Layout with slow_call, 0, 20305  Note: MIR_CALL_INDIRECT (virtual)
+    Let slow_result be receiver_id plus 7000000  Note: Unique value ID for slow result
+
+    Note: Copy all fields from original call
+    Let call_opcode be the Integer at (call_inst plus 0)
+    Let call_result be the Integer at (call_inst plus 8)
+    Let call_target be the Integer at (call_inst plus 16)
+    proc memory_set_int64 from Layout with slow_call, 8, slow_result
+    proc memory_set_int64 from Layout with slow_call, 16, call_target
+    proc memory_set_int64 from Layout with slow_call, 24, arg_count
+    proc memory_set_int64 from Layout with slow_call, 32, args_ptr
+    CFG.add_instruction_to_block(slow_path_block, slow_call)
+
+    Note: Jump from slow path to merge
+    Let slow_jump be Layout.allocate(64)
+    proc memory_set_int64 from Layout with slow_jump, 0, 20301  Note: MIR_JMP
+    proc memory_set_int64 from Layout with slow_jump, 8, merge_block
+    CFG.add_instruction_to_block(slow_path_block, slow_jump)
+    CFG.add_edge(slow_path_block, merge_block)
+
+    Note: Build phi node in merge block to select result
+    Let phi_inst be Layout.allocate(64)
+    proc memory_set_int64 from Layout with phi_inst, 0, 20001  Note: MIR_PHI
+    Let call_result_id be the Integer at (call_inst plus 8)
+    proc memory_set_int64 from Layout with phi_inst, 8, call_result_id  Note: Use original result ID
+    proc memory_set_int64 from Layout with phi_inst, 16, 2  Note: Two operands
+
+    Note: Build phi operands array: [fast_result, fast_path_block, slow_result, slow_path_block]
+    Let phi_ops be Layout.allocate(64)
+    proc memory_set_int64 from Layout with phi_ops, 0, fast_result
+    proc memory_set_int64 from Layout with phi_ops, 8, fast_path_block
+    proc memory_set_int64 from Layout with phi_ops, 16, slow_result
+    proc memory_set_int64 from Layout with phi_ops, 24, slow_path_block
+    proc memory_set_int64 from Layout with phi_inst, 24, 2
+    proc memory_set_int64 from Layout with phi_inst, 32, phi_ops
+    CFG.add_instruction_to_block(merge_block, phi_inst)
+
+    Note: Add all new blocks to CFG
+    CFG.add_block_to_function(cfg, guard_block)
+    CFG.add_block_to_function(cfg, fast_path_block)
+    CFG.add_block_to_function(cfg, slow_path_block)
+    CFG.add_block_to_function(cfg, merge_block)
+
+    Note: Update SSA form
+    Let ssa_ptr be the Integer at (context_ptr plus 8)
+    If ssa_ptr is not equal to 0:
+        SSA.recompute_ssa(cfg, ssa_ptr)
+    End If
+
+    Note: Mark as devirtualized (speculative)
+    proc memory_set_int64 from Layout with site_ptr, 64, 1
+
+    Note: Increment speculative counter
+    Let speculative_count be the Integer at (context_ptr plus 40)
+    proc memory_set_int64 from Layout with context_ptr, 40, (speculative_count plus 1)
+
+    Return 1
+End Process
+
+Note: ============================================================
+Note: MAIN ENTRY POINTS
+Note: ============================================================
+
+@Implementation
+Main entry point for devirtualization optimization.
+
+Algorithm:
+1. Create context
+2. Collect type information
+3. Propagate type information
+4. Collect virtual call sites
+5. Perform direct devirtualization
+6. Perform speculative devirtualization
+7. Print statistics
+8. Clean up
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "optimize_function_with_devirtualization" that takes function_ptr as Integer returns Integer:
+    If function_ptr equals 0:
+        Return 0
+    End If
+
+    Display "Starting devirtualization optimization"
+
+    Note: Get CFG from function
+    Let cfg_ptr be the Integer at (function_ptr plus 8)
+    If cfg_ptr equals 0:
+        Display "Function has no CFG, skipping devirtualization"
+        Return 0
+    End If
+
+    Note: Create context
+    Let context_ptr be create_devirtualization_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "Failed to create devirtualization context"
+        Return 0
+    End If
+
+    Note: Set current function
+    proc memory_set_int64 from Layout with context_ptr, 24, function_ptr
+
+    Note: Collect type information
+    Let type_count be collect_type_information(context_ptr)
+    Display "Collected type information for " joined with type_count joined with " values"
+
+    Note: Propagate type information
+    Let prop_count be propagate_type_information(context_ptr)
+    Display "Propagated " joined with prop_count joined with " type assignments"
+
+    Note: Collect virtual call sites
+    Let virtual_count be collect_virtual_call_sites(context_ptr)
+    Display "Found " joined with virtual_count joined with " virtual call sites"
+
+    If virtual_count equals 0:
+        Display "No virtual calls found, skipping devirtualization"
+        destroy_devirtualization_context(context_ptr)
+        Return 1
+    End If
+
+    Note: Devirtualize calls
+    Let sites be the Integer at (context_ptr plus 56)
+    Let direct_count be 0
+    Let spec_count be 0
+    Let i be 0
+
+    While i is less than virtual_count:
+        Let site_ptr be proc get from List with sites and i
+
+        If site_ptr is not equal to 0:
+            Let can_devirt be the Integer at (site_ptr plus 56)
+            Let confidence be the Integer at (site_ptr plus 48)
+
+            If can_devirt equals 1:
+                Note: Try direct devirtualization for 100% confidence
+                If confidence equals 100:
+                    Let success be perform_direct_devirtualization(site_ptr, context_ptr)
+                    If success equals 1:
+                        Set direct_count to direct_count plus 1
+                    End If
+                Otherwise:
+                    Note: Try speculative devirtualization for high confidence
+                    Let success be perform_speculative_devirtualization(site_ptr, context_ptr)
+                    If success equals 1:
+                        Set spec_count to spec_count plus 1
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update statistics
+    proc memory_set_int64 from Layout with context_ptr, 32, direct_count
+    proc memory_set_int64 from Layout with context_ptr, 40, spec_count
+
+    Note: Print statistics
+    print_devirtualization_stats(context_ptr)
+
+    Note: Clean up
+    destroy_devirtualization_context(context_ptr)
+
+    Display "Devirtualization optimization complete"
+
+    Return 1
+End Process
+
+@Implementation
+Entry point for running devirtualization pass on entire program.
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "run_devirtualization_pass" that takes program_ptr as Integer returns Integer:
+    If program_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get all functions
+    Let functions be MIR.get_program_functions(program_ptr)
+    If functions equals 0:
+        Return 0
+    End If
+
+    Let func_count be proc length from List with functions
+    Let optimized_count be 0
+    Let i be 0
+
+    Display "Running devirtualization pass on " joined with func_count joined with " functions"
+
+    While i is less than func_count:
+        Let func_ptr be proc get from List with functions and i
+
+        If func_ptr is not equal to 0:
+            Let is_external be the Integer at (func_ptr plus 80)
+            If is_external equals 0:
+                Let success be optimize_function_with_devirtualization(func_ptr)
+                If success equals 1:
+                    Set optimized_count to optimized_count plus 1
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "Devirtualization completed for " joined with optimized_count joined with " functions"
+
+    Return 1
+End Process
+
+@Implementation
+Profitability check for devirtualization optimization.
+
+Devirtualization is beneficial when:
+1. Function contains indirect calls (has opportunities)
+2. Optimization level >= 2 (devirt at -O2 and above)
+3. Not a tiny function (overhead not worth it)
+
+Returns 1 if should run, 0 otherwise.
+@End Implementation
+
+Process called "should_run_devirtualization" that takes function_ptr as Integer, optimization_level as Integer returns Integer:
+    Note: Devirtualization at -O2 and above
+    If optimization_level is less than 2:
+        Return 0
+    End If
+
+    Note: Check if function has indirect calls
+    If function_ptr is not equal to 0:
+        Let indirect_count be MIR.count_instructions_of_type(function_ptr, 20305)
+        If indirect_count is greater than 0:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================
+Note: PASS METADATA
+Note: ============================================================
+
+@Implementation
+Returns the name of this optimization pass.
+@End Implementation
+
+Process called "get_devirtualization_pass_name" that takes nothing returns Integer:
+    Return StringCore.create_from_literal("Devirtualization")
+End Process
+
+@Implementation
+Returns a description of this optimization pass.
+@End Implementation
+
+Process called "get_devirtualization_pass_description" that takes nothing returns Integer:
+    Return StringCore.create_from_literal("Converts virtual calls to direct calls using type propagation analysis to eliminate indirect call overhead")
+End Process

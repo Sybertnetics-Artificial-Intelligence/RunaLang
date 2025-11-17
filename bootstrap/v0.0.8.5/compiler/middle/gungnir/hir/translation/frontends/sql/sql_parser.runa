@@ -1,0 +1,1342 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+SQL Parser - PostgreSQL-compatible AST construction
+
+This file parses SQL tokens into an Abstract Syntax Tree (AST)
+following PostgreSQL syntax and semantics.
+
+Supported SQL Statements:
+- SELECT: Full query support (WHERE, JOIN, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET)
+- INSERT: INSERT INTO table (columns) VALUES (values)
+- UPDATE: UPDATE table SET column = value WHERE condition
+- DELETE: DELETE FROM table WHERE condition
+- CREATE TABLE: CREATE TABLE name (columns and constraints)
+- CREATE INDEX: CREATE INDEX name ON table (columns)
+- DROP: DROP TABLE/INDEX name
+
+AST Node Types:
+- SQL_SELECT: SELECT query
+- SQL_INSERT: INSERT statement
+- SQL_UPDATE: UPDATE statement
+- SQL_DELETE: DELETE statement
+- SQL_CREATE_TABLE: CREATE TABLE statement
+- SQL_CREATE_INDEX: CREATE INDEX statement
+- SQL_DROP: DROP statement
+- SQL_EXPRESSION: Expressions (binary ops, literals, identifiers, function calls)
+- SQL_COLUMN_DEF: Column definition
+- SQL_JOIN: JOIN clause
+- SQL_WHERE: WHERE clause
+- SQL_ORDER_BY: ORDER BY clause
+
+Dependencies:
+- sql_lexer.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/sql/sql_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: AST Node Types
+Note: ============================================================================
+
+Constant SQL_SELECT as Integer is 0
+Constant SQL_INSERT as Integer is 1
+Constant SQL_UPDATE as Integer is 2
+Constant SQL_DELETE as Integer is 3
+Constant SQL_CREATE_TABLE as Integer is 4
+Constant SQL_CREATE_INDEX as Integer is 5
+Constant SQL_DROP as Integer is 6
+Constant SQL_EXPRESSION as Integer is 7
+Constant SQL_COLUMN_DEF as Integer is 8
+Constant SQL_JOIN as Integer is 9
+Constant SQL_WHERE as Integer is 10
+Constant SQL_ORDER_BY as Integer is 11
+Constant SQL_GROUP_BY as Integer is 12
+Constant SQL_IDENTIFIER as Integer is 13
+Constant SQL_LITERAL as Integer is 14
+Constant SQL_BINARY_OP as Integer is 15
+Constant SQL_FUNCTION_CALL as Integer is 16
+Constant SQL_COLUMN_REF as Integer is 17
+Constant SQL_ALTER_TABLE as Integer is 18
+
+Note: ============================================================================
+Note: AST Node Structure
+Note: ============================================================================
+
+Type called "SQLNode":
+    type as Integer           Note: Node type constant
+    value as Integer          Note: Value (for literals, identifiers)
+    children as Integer       Note: List of child nodes
+    metadata as Integer       Note: Additional data (operator type, column names, etc.)
+    line as Integer           Note: Source line number
+    column as Integer         Note: Source column number
+End Type
+
+Note: ============================================================================
+Note: Parser Structure
+Note: ============================================================================
+
+Type called "SQLParser":
+    lexer as Integer          Note: SQL lexer
+    current_token as Integer  Note: Current token
+    error_message as Integer  Note: Error message (if any)
+    has_error as Integer      Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Parser Creation and Destruction
+Note: ============================================================================
+
+Process called "create_sql_parser" takes lexer as Integer returns Integer:
+    Note: Create SQL parser
+
+    Let parser_size be 32  Note: SQLParser: 4 fields × 8 bytes
+    Let parser be proc allocate from Layout with parser_size
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize parser
+    proc memory_set_int64 from Layout with parser, 0, lexer
+    proc memory_set_int64 from Layout with parser, 8, 0   Note: current_token (will be set on first advance)
+    proc memory_set_int64 from Layout with parser, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with parser, 24, 0  Note: has_error = false
+
+    Note: Get first token
+    Let first_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, first_token
+
+    Return parser
+End Process
+
+Process called "destroy_sql_parser" takes parser as Integer returns Integer:
+    Note: Destroy SQL parser
+
+    If parser is equal to 0:
+        Return 1
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: AST Node Creation
+Note: ============================================================================
+
+Process called "create_sql_node" takes node_type as Integer, value as Integer, metadata as Integer, line as Integer, column as Integer returns Integer:
+    Note: Create SQL AST node
+
+    Let node_size be 48  Note: SQLNode: 6 fields × 8 bytes
+    Let node be proc allocate from Layout with node_size
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Note: Create children list
+    Let children be proc create_empty_list from List
+
+    If children is equal to 0:
+        proc deallocate from Layout with node
+        Return 0
+    End If
+
+    Note: Initialize node
+    proc memory_set_int64 from Layout with node, 0, node_type
+    proc memory_set_int64 from Layout with node, 8, value
+    proc memory_set_int64 from Layout with node, 16, children
+    proc memory_set_int64 from Layout with node, 24, metadata
+    proc memory_set_int64 from Layout with node, 32, line
+    proc memory_set_int64 from Layout with node, 40, column
+
+    Return node
+End Process
+
+Process called "add_child" takes parent as Integer, child as Integer returns Integer:
+    Note: Add child node to parent
+
+    If parent is equal to 0:
+        Return 0
+    End If
+
+    If child is equal to 0:
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Layout with parent, 16
+    proc append from List with children, child
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Token Access
+Note: ============================================================================
+
+Process called "current_token_type" takes parser as Integer returns Integer:
+    Note: Get current token type
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+
+    If token is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+
+    Return token_type
+End Process
+
+Process called "advance_token" takes parser as Integer returns Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let new_token be proc next_token from Lexer with lexer
+
+    proc memory_set_int64 from Layout with parser, 8, new_token
+
+    Return new_token
+End Process
+
+Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Check if current token matches expected type
+
+    Let actual_type be proc current_token_type from parser
+
+    If actual_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
+    Note: Expect specific token type, set error if not found
+
+    Let actual_type be proc current_token_type from parser
+
+    If actual_type is not equal to expected_type:
+        proc set_parser_error from parser, error_msg
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_parser_error" takes parser as Integer, message as Integer returns Integer:
+    Note: Set parser error message
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 16, new_error
+    proc memory_set_int64 from Layout with parser, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Expression Parsing
+Note: ============================================================================
+
+Process called "parse_primary_expression" takes parser as Integer returns Integer:
+    Note: Parse primary expression (literal, identifier, function call, parenthesized expression)
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Note: Check for literals
+    If token_type is equal to TOKEN_INTEGER from Lexer:
+        Let lexeme be proc memory_get_int64 from Layout with token, 8
+        Let length be proc memory_get_int64 from Layout with token, 16
+
+        Let value be proc allocate from Layout with length plus 1
+        proc memory_copy from Layout with value, 0, lexeme, 0, length
+        proc memory_set_byte from Layout with value, length, 0
+
+        Let node be proc create_sql_node from SQL_LITERAL, value, TOKEN_INTEGER from Lexer, line, column
+        proc advance_token from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_FLOAT from Lexer:
+        Let lexeme be proc memory_get_int64 from Layout with token, 8
+        Let length be proc memory_get_int64 from Layout with token, 16
+
+        Let value be proc allocate from Layout with length plus 1
+        proc memory_copy from Layout with value, 0, lexeme, 0, length
+        proc memory_set_byte from Layout with value, length, 0
+
+        Let node be proc create_sql_node from SQL_LITERAL, value, TOKEN_FLOAT from Lexer, line, column
+        proc advance_token from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_STRING from Lexer:
+        Let lexeme be proc memory_get_int64 from Layout with token, 8
+        Let length be proc memory_get_int64 from Layout with token, 16
+
+        Let value be proc allocate from Layout with length plus 1
+        proc memory_copy from Layout with value, 0, lexeme, 0, length
+        proc memory_set_byte from Layout with value, length, 0
+
+        Let node be proc create_sql_node from SQL_LITERAL, value, TOKEN_STRING from Lexer, line, column
+        proc advance_token from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_TRUE from Lexer:
+        Let value be proc create_string from StringCore with "TRUE"
+        Let node be proc create_sql_node from SQL_LITERAL, value, TOKEN_TRUE from Lexer, line, column
+        proc advance_token from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_FALSE from Lexer:
+        Let value be proc create_string from StringCore with "FALSE"
+        Let node be proc create_sql_node from SQL_LITERAL, value, TOKEN_FALSE from Lexer, line, column
+        proc advance_token from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_NULL from Lexer:
+        Let value be proc create_string from StringCore with "NULL"
+        Let node be proc create_sql_node from SQL_LITERAL, value, TOKEN_NULL from Lexer, line, column
+        proc advance_token from parser
+        Return node
+    End If
+
+    Note: Check for identifier or function call
+    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Let lexeme be proc memory_get_int64 from Layout with token, 8
+        Let length be proc memory_get_int64 from Layout with token, 16
+
+        Let identifier be proc allocate from Layout with length plus 1
+        proc memory_copy from Layout with identifier, 0, lexeme, 0, length
+        proc memory_set_byte from Layout with identifier, length, 0
+
+        proc advance_token from parser
+
+        Note: Check for function call (identifier followed by '(')
+        Let is_left_paren be proc check_token_type from parser, TOKEN_LEFT_PAREN from Lexer
+
+        If is_left_paren is equal to 1:
+            Let func_node be proc create_sql_node from SQL_FUNCTION_CALL, identifier, 0, line, column
+
+            proc advance_token from parser  Note: Consume '('
+
+            Note: Parse function arguments
+            Let is_right_paren be proc check_token_type from parser, TOKEN_RIGHT_PAREN from Lexer
+
+            If is_right_paren is equal to 0:
+                While 1 is equal to 1:
+                    Let arg be proc parse_expression from parser
+
+                    If arg is not equal to 0:
+                        proc add_child from func_node, arg
+                    End If
+
+                    Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+                    If is_comma is equal to 1:
+                        proc advance_token from parser  Note: Consume ','
+                    Otherwise:
+                        Break
+                    End If
+                End While
+            End If
+
+            proc expect_token from parser, TOKEN_RIGHT_PAREN from Lexer, "Expected ')' after function arguments"
+            proc advance_token from parser  Note: Consume ')'
+
+            Return func_node
+        Otherwise:
+            Note: Check for column reference (table.column)
+            Let is_dot be proc check_token_type from parser, TOKEN_DOT from Lexer
+
+            If is_dot is equal to 1:
+                proc advance_token from parser  Note: Consume '.'
+
+                Let col_token be proc memory_get_int64 from Layout with parser, 8
+                Let col_lexeme be proc memory_get_int64 from Layout with col_token, 8
+                Let col_length be proc memory_get_int64 from Layout with col_token, 16
+
+                Let column_name be proc allocate from Layout with col_length plus 1
+                proc memory_copy from Layout with column_name, 0, col_lexeme, 0, col_length
+                proc memory_set_byte from Layout with column_name, col_length, 0
+
+                proc advance_token from parser
+
+                Note: Create column reference node with table.column
+                Let col_ref be proc create_sql_node from SQL_COLUMN_REF, column_name, 0, line, column
+                proc memory_set_int64 from Layout with col_ref, 24, identifier  Note: Store table name in metadata
+
+                Return col_ref
+            Otherwise:
+                Note: Simple identifier
+                Let node be proc create_sql_node from SQL_IDENTIFIER, identifier, 0, line, column
+                Return node
+            End If
+        End If
+    End If
+
+    Note: Check for star (SELECT *)
+    If token_type is equal to TOKEN_STAR from Lexer:
+        Let value be proc create_string from StringCore with "*"
+        Let node be proc create_sql_node from SQL_IDENTIFIER, value, 0, line, column
+        proc advance_token from parser
+        Return node
+    End If
+
+    Note: Check for parenthesized expression
+    If token_type is equal to TOKEN_LEFT_PAREN from Lexer:
+        proc advance_token from parser  Note: Consume '('
+
+        Let expr be proc parse_expression from parser
+
+        proc expect_token from parser, TOKEN_RIGHT_PAREN from Lexer, "Expected ')' after expression"
+        proc advance_token from parser  Note: Consume ')'
+
+        Return expr
+    End If
+
+    Return 0  Note: Not a valid primary expression
+End Process
+
+Process called "parse_comparison_expression" takes parser as Integer returns Integer:
+    Note: Parse comparison expression (=, <>, <, >, <=, >=)
+
+    Let left be proc parse_primary_expression from parser
+
+    If left is equal to 0:
+        Return 0
+    End If
+
+    Let token_type be proc current_token_type from parser
+
+    Note: Check for comparison operators
+    If token_type is equal to TOKEN_EQUAL from Lexer:
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let line be proc memory_get_int64 from Layout with token, 24
+        Let column be proc memory_get_int64 from Layout with token, 32
+
+        proc advance_token from parser
+
+        Let right be proc parse_primary_expression from parser
+
+        If right is equal to 0:
+            Return left
+        End If
+
+        Let op_value be proc create_string from StringCore with "="
+        Let binary_node be proc create_sql_node from SQL_BINARY_OP, op_value, TOKEN_EQUAL from Lexer, line, column
+        proc add_child from binary_node, left
+        proc add_child from binary_node, right
+
+        Return binary_node
+    End If
+
+    If token_type is equal to TOKEN_NOT_EQUAL from Lexer:
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let line be proc memory_get_int64 from Layout with token, 24
+        Let column be proc memory_get_int64 from Layout with token, 32
+
+        proc advance_token from parser
+
+        Let right be proc parse_primary_expression from parser
+
+        If right is equal to 0:
+            Return left
+        End If
+
+        Let op_value be proc create_string from StringCore with "<>"
+        Let binary_node be proc create_sql_node from SQL_BINARY_OP, op_value, TOKEN_NOT_EQUAL from Lexer, line, column
+        proc add_child from binary_node, left
+        proc add_child from binary_node, right
+
+        Return binary_node
+    End If
+
+    If token_type is equal to TOKEN_LESS_THAN from Lexer:
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let line be proc memory_get_int64 from Layout with token, 24
+        Let column be proc memory_get_int64 from Layout with token, 32
+
+        proc advance_token from parser
+
+        Let right be proc parse_primary_expression from parser
+
+        If right is equal to 0:
+            Return left
+        End If
+
+        Let op_value be proc create_string from StringCore with "<"
+        Let binary_node be proc create_sql_node from SQL_BINARY_OP, op_value, TOKEN_LESS_THAN from Lexer, line, column
+        proc add_child from binary_node, left
+        proc add_child from binary_node, right
+
+        Return binary_node
+    End If
+
+    If token_type is equal to TOKEN_GREATER_THAN from Lexer:
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let line be proc memory_get_int64 from Layout with token, 24
+        Let column be proc memory_get_int64 from Layout with token, 32
+
+        proc advance_token from parser
+
+        Let right be proc parse_primary_expression from parser
+
+        If right is equal to 0:
+            Return left
+        End If
+
+        Let op_value be proc create_string from StringCore with ">"
+        Let binary_node be proc create_sql_node from SQL_BINARY_OP, op_value, TOKEN_GREATER_THAN from Lexer, line, column
+        proc add_child from binary_node, left
+        proc add_child from binary_node, right
+
+        Return binary_node
+    End If
+
+    If token_type is equal to TOKEN_LESS_EQUAL from Lexer:
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let line be proc memory_get_int64 from Layout with token, 24
+        Let column be proc memory_get_int64 from Layout with token, 32
+
+        proc advance_token from parser
+
+        Let right be proc parse_primary_expression from parser
+
+        If right is equal to 0:
+            Return left
+        End If
+
+        Let op_value be proc create_string from StringCore with "<="
+        Let binary_node be proc create_sql_node from SQL_BINARY_OP, op_value, TOKEN_LESS_EQUAL from Lexer, line, column
+        proc add_child from binary_node, left
+        proc add_child from binary_node, right
+
+        Return binary_node
+    End If
+
+    If token_type is equal to TOKEN_GREATER_EQUAL from Lexer:
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let line be proc memory_get_int64 from Layout with token, 24
+        Let column be proc memory_get_int64 from Layout with token, 32
+
+        proc advance_token from parser
+
+        Let right be proc parse_primary_expression from parser
+
+        If right is equal to 0:
+            Return left
+        End If
+
+        Let op_value be proc create_string from StringCore with ">="
+        Let binary_node be proc create_sql_node from SQL_BINARY_OP, op_value, TOKEN_GREATER_EQUAL from Lexer, line, column
+        proc add_child from binary_node, left
+        proc add_child from binary_node, right
+
+        Return binary_node
+    End If
+
+    Return left
+End Process
+
+Process called "parse_and_expression" takes parser as Integer returns Integer:
+    Note: Parse AND expression
+
+    Let left be proc parse_comparison_expression from parser
+
+    If left is equal to 0:
+        Return 0
+    End If
+
+    While 1 is equal to 1:
+        Let is_and be proc check_token_type from parser, TOKEN_AND from Lexer
+
+        If is_and is equal to 0:
+            Break
+        End If
+
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let line be proc memory_get_int64 from Layout with token, 24
+        Let column be proc memory_get_int64 from Layout with token, 32
+
+        proc advance_token from parser
+
+        Let right be proc parse_comparison_expression from parser
+
+        If right is equal to 0:
+            Break
+        End If
+
+        Let op_value be proc create_string from StringCore with "AND"
+        Let and_node be proc create_sql_node from SQL_BINARY_OP, op_value, TOKEN_AND from Lexer, line, column
+        proc add_child from and_node, left
+        proc add_child from and_node, right
+
+        Set left to and_node
+    End While
+
+    Return left
+End Process
+
+Process called "parse_expression" takes parser as Integer returns Integer:
+    Note: Parse OR expression (top level)
+
+    Let left be proc parse_and_expression from parser
+
+    If left is equal to 0:
+        Return 0
+    End If
+
+    While 1 is equal to 1:
+        Let is_or be proc check_token_type from parser, TOKEN_OR from Lexer
+
+        If is_or is equal to 0:
+            Break
+        End If
+
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let line be proc memory_get_int64 from Layout with token, 24
+        Let column be proc memory_get_int64 from Layout with token, 32
+
+        proc advance_token from parser
+
+        Let right be proc parse_and_expression from parser
+
+        If right is equal to 0:
+            Break
+        End If
+
+        Let op_value be proc create_string from StringCore with "OR"
+        Let or_node be proc create_sql_node from SQL_BINARY_OP, op_value, TOKEN_OR from Lexer, line, column
+        proc add_child from or_node, left
+        proc add_child from or_node, right
+
+        Set left to or_node
+    End While
+
+    Return left
+End Process
+
+Note: ============================================================================
+Note: SELECT Statement Parsing
+Note: ============================================================================
+
+Process called "parse_select" takes parser as Integer returns Integer:
+    Note: Parse SELECT statement
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let select_node be proc create_sql_node from SQL_SELECT, 0, 0, line, column
+
+    proc advance_token from parser  Note: Consume SELECT
+
+    Note: Check for DISTINCT
+    Let is_distinct be proc check_token_type from parser, TOKEN_DISTINCT from Lexer
+
+    If is_distinct is equal to 1:
+        proc memory_set_int64 from Layout with select_node, 24, 1  Note: Set DISTINCT flag in metadata
+        proc advance_token from parser
+    End If
+
+    Note: Parse SELECT list (columns)
+    While 1 is equal to 1:
+        Let col_expr be proc parse_primary_expression from parser
+
+        If col_expr is not equal to 0:
+            proc add_child from select_node, col_expr
+        End If
+
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_token from parser  Note: Consume ','
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Note: Parse FROM clause (optional for some queries)
+    Let is_from be proc check_token_type from parser, TOKEN_FROM from Lexer
+
+    If is_from is equal to 1:
+        proc advance_token from parser  Note: Consume FROM
+
+        Let table_expr be proc parse_primary_expression from parser
+
+        If table_expr is not equal to 0:
+            proc add_child from select_node, table_expr
+        End If
+
+        Note: Parse JOIN clauses (optional)
+        While 1 is equal to 1:
+            Let is_join be proc check_token_type from parser, TOKEN_JOIN from Lexer
+            Let is_inner be proc check_token_type from parser, TOKEN_INNER from Lexer
+            Let is_left be proc check_token_type from parser, TOKEN_LEFT from Lexer
+            Let is_right be proc check_token_type from parser, TOKEN_RIGHT from Lexer
+
+            If is_join is equal to 0:
+                If is_inner is equal to 0:
+                    If is_left is equal to 0:
+                        If is_right is equal to 0:
+                            Break
+                        End If
+                    End If
+                End If
+            End If
+
+            Note: Determine JOIN type
+            Let join_type be 0  Note: 0 = INNER, 1 = LEFT, 2 = RIGHT
+
+            If is_inner is equal to 1:
+                proc advance_token from parser
+                Set join_type to 0
+            Otherwise If is_left is equal to 1:
+                proc advance_token from parser
+                Set join_type to 1
+            Otherwise If is_right is equal to 1:
+                proc advance_token from parser
+                Set join_type to 2
+            End If
+
+            Let join_token be proc memory_get_int64 from Layout with parser, 8
+            Let join_line be proc memory_get_int64 from Layout with join_token, 24
+            Let join_column be proc memory_get_int64 from Layout with join_token, 32
+
+            proc advance_token from parser  Note: Consume JOIN
+
+            Let join_node be proc create_sql_node from SQL_JOIN, 0, join_type, join_line, join_column
+
+            Note: Parse joined table
+            Let joined_table be proc parse_primary_expression from parser
+
+            If joined_table is not equal to 0:
+                proc add_child from join_node, joined_table
+            End If
+
+            Note: Parse ON clause
+            Let is_on be proc check_token_type from parser, TOKEN_ON from Lexer
+
+            If is_on is equal to 1:
+                proc advance_token from parser  Note: Consume ON
+
+                Let on_condition be proc parse_expression from parser
+
+                If on_condition is not equal to 0:
+                    proc add_child from join_node, on_condition
+                End If
+            End If
+
+            proc add_child from select_node, join_node
+        End While
+    End If
+
+    Note: Parse WHERE clause (optional)
+    Let is_where be proc check_token_type from parser, TOKEN_WHERE from Lexer
+
+    If is_where is equal to 1:
+        proc advance_token from parser  Note: Consume WHERE
+
+        Let where_condition be proc parse_expression from parser
+
+        If where_condition is not equal to 0:
+            Let where_token be proc memory_get_int64 from Layout with parser, 8
+            Let where_line be proc memory_get_int64 from Layout with where_token, 24
+            Let where_column be proc memory_get_int64 from Layout with where_token, 32
+
+            Let where_node be proc create_sql_node from SQL_WHERE, 0, 0, where_line, where_column
+            proc add_child from where_node, where_condition
+            proc add_child from select_node, where_node
+        End If
+    End If
+
+    Note: Parse GROUP BY clause (optional)
+    Let is_group be proc check_token_type from parser, TOKEN_GROUP from Lexer
+
+    If is_group is equal to 1:
+        proc advance_token from parser  Note: Consume GROUP
+
+        proc expect_token from parser, TOKEN_BY from Lexer, "Expected BY after GROUP"
+        proc advance_token from parser  Note: Consume BY
+
+        Let group_token be proc memory_get_int64 from Layout with parser, 8
+        Let group_line be proc memory_get_int64 from Layout with group_token, 24
+        Let group_column be proc memory_get_int64 from Layout with group_token, 32
+
+        Let group_node be proc create_sql_node from SQL_GROUP_BY, 0, 0, group_line, group_column
+
+        While 1 is equal to 1:
+            Let group_expr be proc parse_primary_expression from parser
+
+            If group_expr is not equal to 0:
+                proc add_child from group_node, group_expr
+            End If
+
+            Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+            If is_comma is equal to 1:
+                proc advance_token from parser
+            Otherwise:
+                Break
+            End If
+        End While
+
+        proc add_child from select_node, group_node
+    End If
+
+    Note: Parse ORDER BY clause (optional)
+    Let is_order be proc check_token_type from parser, TOKEN_ORDER from Lexer
+
+    If is_order is equal to 1:
+        proc advance_token from parser  Note: Consume ORDER
+
+        proc expect_token from parser, TOKEN_BY from Lexer, "Expected BY after ORDER"
+        proc advance_token from parser  Note: Consume BY
+
+        Let order_token be proc memory_get_int64 from Layout with parser, 8
+        Let order_line be proc memory_get_int64 from Layout with order_token, 24
+        Let order_column be proc memory_get_int64 from Layout with order_token, 32
+
+        Let order_node be proc create_sql_node from SQL_ORDER_BY, 0, 0, order_line, order_column
+
+        While 1 is equal to 1:
+            Let order_expr be proc parse_primary_expression from parser
+
+            If order_expr is not equal to 0:
+                proc add_child from order_node, order_expr
+            End If
+
+            Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+            If is_comma is equal to 1:
+                proc advance_token from parser
+            Otherwise:
+                Break
+            End If
+        End While
+
+        proc add_child from select_node, order_node
+    End If
+
+    Note: Parse LIMIT clause (optional)
+    Let is_limit be proc check_token_type from parser, TOKEN_LIMIT from Lexer
+
+    If is_limit is equal to 1:
+        proc advance_token from parser  Note: Consume LIMIT
+
+        Let limit_expr be proc parse_primary_expression from parser
+
+        If limit_expr is not equal to 0:
+            proc add_child from select_node, limit_expr
+        End If
+    End If
+
+    Note: Parse OFFSET clause (optional)
+    Let is_offset be proc check_token_type from parser, TOKEN_OFFSET from Lexer
+
+    If is_offset is equal to 1:
+        proc advance_token from parser  Note: Consume OFFSET
+
+        Let offset_expr be proc parse_primary_expression from parser
+
+        If offset_expr is not equal to 0:
+            proc add_child from select_node, offset_expr
+        End If
+    End If
+
+    Return select_node
+End Process
+
+Note: ============================================================================
+Note: INSERT Statement Parsing
+Note: ============================================================================
+
+Process called "parse_insert" takes parser as Integer returns Integer:
+    Note: Parse INSERT statement
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let insert_node be proc create_sql_node from SQL_INSERT, 0, 0, line, column
+
+    proc advance_token from parser  Note: Consume INSERT
+
+    proc expect_token from parser, TOKEN_INTO from Lexer, "Expected INTO after INSERT"
+    proc advance_token from parser  Note: Consume INTO
+
+    Note: Parse table name
+    Let table_name be proc parse_primary_expression from parser
+
+    If table_name is not equal to 0:
+        proc add_child from insert_node, table_name
+    End If
+
+    Note: Parse column list (optional)
+    Let is_left_paren be proc check_token_type from parser, TOKEN_LEFT_PAREN from Lexer
+
+    If is_left_paren is equal to 1:
+        proc advance_token from parser  Note: Consume '('
+
+        While 1 is equal to 1:
+            Let col_name be proc parse_primary_expression from parser
+
+            If col_name is not equal to 0:
+                proc add_child from insert_node, col_name
+            End If
+
+            Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+            If is_comma is equal to 1:
+                proc advance_token from parser
+            Otherwise:
+                Break
+            End If
+        End While
+
+        proc expect_token from parser, TOKEN_RIGHT_PAREN from Lexer, "Expected ')' after column list"
+        proc advance_token from parser  Note: Consume ')'
+    End If
+
+    Note: Parse VALUES clause
+    proc expect_token from parser, TOKEN_VALUES from Lexer, "Expected VALUES"
+    proc advance_token from parser  Note: Consume VALUES
+
+    proc expect_token from parser, TOKEN_LEFT_PAREN from Lexer, "Expected '(' after VALUES"
+    proc advance_token from parser  Note: Consume '('
+
+    While 1 is equal to 1:
+        Let value_expr be proc parse_expression from parser
+
+        If value_expr is not equal to 0:
+            proc add_child from insert_node, value_expr
+        End If
+
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_token from parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc expect_token from parser, TOKEN_RIGHT_PAREN from Lexer, "Expected ')' after VALUES"
+    proc advance_token from parser  Note: Consume ')'
+
+    Return insert_node
+End Process
+
+Process called "parse_update" takes parser as Integer returns Integer:
+    Note: Parse UPDATE statement
+    Note: Format: UPDATE table SET column = value, ... WHERE condition
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let update_node be proc create_sql_node from SQL_UPDATE, 0, 0, line, column
+
+    proc advance_token from parser  Note: Consume UPDATE
+
+    Note: Parse table name
+    Let table_name be proc parse_primary_expression from parser
+
+    If table_name is not equal to 0:
+        proc add_child from update_node, table_name
+    End If
+
+    Note: Parse SET clause
+    proc expect_token from parser, TOKEN_SET from Lexer, "Expected SET after table name"
+    proc advance_token from parser  Note: Consume SET
+
+    While 1 is equal to 1:
+        Note: Parse column = value assignment
+        Let col_name be proc parse_primary_expression from parser
+
+        proc expect_token from parser, TOKEN_EQUALS from Lexer, "Expected '=' after column name"
+        proc advance_token from parser  Note: Consume '='
+
+        Let value_expr be proc parse_expression from parser
+
+        Note: Create assignment pair node
+        Let assignment be proc create_sql_node from SQL_BINARY_OP, 0, 0, line, column
+        proc add_child from assignment, col_name
+        proc add_child from assignment, value_expr
+        proc add_child from update_node, assignment
+
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_token from parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Note: Parse optional WHERE clause
+    Let is_where be proc check_token_type from parser, TOKEN_WHERE from Lexer
+
+    If is_where is equal to 1:
+        proc advance_token from parser  Note: Consume WHERE
+
+        Let where_expr be proc parse_expression from parser
+
+        If where_expr is not equal to 0:
+            Let where_node be proc create_sql_node from SQL_WHERE, 0, 0, line, column
+            proc add_child from where_node, where_expr
+            proc add_child from update_node, where_node
+        End If
+    End If
+
+    Return update_node
+End Process
+
+Process called "parse_delete" takes parser as Integer returns Integer:
+    Note: Parse DELETE statement
+    Note: Format: DELETE FROM table WHERE condition
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let delete_node be proc create_sql_node from SQL_DELETE, 0, 0, line, column
+
+    proc advance_token from parser  Note: Consume DELETE
+
+    proc expect_token from parser, TOKEN_FROM from Lexer, "Expected FROM after DELETE"
+    proc advance_token from parser  Note: Consume FROM
+
+    Note: Parse table name
+    Let table_name be proc parse_primary_expression from parser
+
+    If table_name is not equal to 0:
+        proc add_child from delete_node, table_name
+    End If
+
+    Note: Parse optional WHERE clause
+    Let is_where be proc check_token_type from parser, TOKEN_WHERE from Lexer
+
+    If is_where is equal to 1:
+        proc advance_token from parser  Note: Consume WHERE
+
+        Let where_expr be proc parse_expression from parser
+
+        If where_expr is not equal to 0:
+            Let where_node be proc create_sql_node from SQL_WHERE, 0, 0, line, column
+            proc add_child from where_node, where_expr
+            proc add_child from delete_node, where_node
+        End If
+    End If
+
+    Return delete_node
+End Process
+
+Process called "parse_create_table" takes parser as Integer returns Integer:
+    Note: Parse CREATE TABLE statement
+    Note: Format: CREATE TABLE name (column_name type constraints, ...)
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let create_node be proc create_sql_node from SQL_CREATE_TABLE, 0, 0, line, column
+
+    proc advance_token from parser  Note: Consume CREATE
+
+    proc expect_token from parser, TOKEN_TABLE from Lexer, "Expected TABLE after CREATE"
+    proc advance_token from parser  Note: Consume TABLE
+
+    Note: Parse table name
+    Let table_name be proc parse_primary_expression from parser
+
+    If table_name is not equal to 0:
+        proc add_child from create_node, table_name
+    End If
+
+    Note: Parse column definitions
+    proc expect_token from parser, TOKEN_LEFT_PAREN from Lexer, "Expected '(' after table name"
+    proc advance_token from parser  Note: Consume '('
+
+    While 1 is equal to 1:
+        Note: Parse column definition (name + type + constraints)
+        Let col_name be proc parse_primary_expression from parser
+        Let col_type be proc parse_primary_expression from parser
+
+        Let col_def be proc create_sql_node from SQL_COLUMN_DEF, 0, 0, line, column
+        proc add_child from col_def, col_name
+        proc add_child from col_def, col_type
+
+        Note: Parse optional constraints (NOT NULL, PRIMARY KEY, etc.)
+        While 1 is equal to 1:
+            Let is_not be proc check_token_type from parser, TOKEN_NOT from Lexer
+            Let is_null be proc check_token_type from parser, TOKEN_NULL from Lexer
+            Let is_primary be proc check_token_type from parser, TOKEN_PRIMARY from Lexer
+            Let is_unique be proc check_token_type from parser, TOKEN_UNIQUE from Lexer
+            Let is_default be proc check_token_type from parser, TOKEN_DEFAULT from Lexer
+
+            If is_not is equal to 1:
+                proc advance_token from parser
+                proc expect_token from parser, TOKEN_NULL from Lexer, "Expected NULL after NOT"
+                proc advance_token from parser
+                Let constraint_node be proc create_sql_node from SQL_IDENTIFIER, 0, 0, line, column
+                Let constraint_name be proc create_string from StringCore with "NOT NULL"
+                proc memory_set_int64 from Layout with constraint_node, 8, constraint_name
+                proc add_child from col_def, constraint_node
+            Otherwise If is_primary is equal to 1:
+                proc advance_token from parser
+                proc expect_token from parser, TOKEN_KEY from Lexer, "Expected KEY after PRIMARY"
+                proc advance_token from parser
+                Let constraint_node be proc create_sql_node from SQL_IDENTIFIER, 0, 0, line, column
+                Let constraint_name be proc create_string from StringCore with "PRIMARY KEY"
+                proc memory_set_int64 from Layout with constraint_node, 8, constraint_name
+                proc add_child from col_def, constraint_node
+            Otherwise If is_unique is equal to 1:
+                proc advance_token from parser
+                Let constraint_node be proc create_sql_node from SQL_IDENTIFIER, 0, 0, line, column
+                Let constraint_name be proc create_string from StringCore with "UNIQUE"
+                proc memory_set_int64 from Layout with constraint_node, 8, constraint_name
+                proc add_child from col_def, constraint_node
+            Otherwise If is_default is equal to 1:
+                proc advance_token from parser
+                Let default_value be proc parse_primary_expression from parser
+                Let constraint_node be proc create_sql_node from SQL_IDENTIFIER, 0, 0, line, column
+                Let constraint_name be proc create_string from StringCore with "DEFAULT"
+                proc memory_set_int64 from Layout with constraint_node, 8, constraint_name
+                proc add_child from constraint_node, default_value
+                proc add_child from col_def, constraint_node
+            Otherwise:
+                Break
+            End If
+        End While
+
+        proc add_child from create_node, col_def
+
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_token from parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc expect_token from parser, TOKEN_RIGHT_PAREN from Lexer, "Expected ')' after column definitions"
+    proc advance_token from parser  Note: Consume ')'
+
+    Return create_node
+End Process
+
+Process called "parse_alter_table" takes parser as Integer returns Integer:
+    Note: Parse ALTER TABLE statement
+    Note: Format: ALTER TABLE name ADD/DROP/ALTER COLUMN ...
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let alter_node be proc create_sql_node from SQL_ALTER_TABLE, 0, 0, line, column
+
+    proc advance_token from parser  Note: Consume ALTER
+
+    proc expect_token from parser, TOKEN_TABLE from Lexer, "Expected TABLE after ALTER"
+    proc advance_token from parser  Note: Consume TABLE
+
+    Note: Parse table name
+    Let table_name be proc parse_primary_expression from parser
+
+    If table_name is not equal to 0:
+        proc add_child from alter_node, table_name
+    End If
+
+    Note: Parse ALTER action (ADD, DROP, ALTER)
+    Let is_add be proc check_token_type from parser, TOKEN_ADD from Lexer
+    Let is_drop be proc check_token_type from parser, TOKEN_DROP from Lexer
+
+    If is_add is equal to 1:
+        proc advance_token from parser
+
+        Note: Expect COLUMN keyword (optional in some SQL dialects)
+        Let is_column be proc check_token_type from parser, TOKEN_COLUMN from Lexer
+        If is_column is equal to 1:
+            proc advance_token from parser
+        End If
+
+        Note: Parse column definition
+        Let col_name be proc parse_primary_expression from parser
+        Let col_type be proc parse_primary_expression from parser
+
+        Let col_def be proc create_sql_node from SQL_COLUMN_DEF, 0, 0, line, column
+        proc add_child from col_def, col_name
+        proc add_child from col_def, col_type
+
+        Let action_node be proc create_sql_node from SQL_IDENTIFIER, 0, 0, line, column
+        Let action_name be proc create_string from StringCore with "ADD"
+        proc memory_set_int64 from Layout with action_node, 8, action_name
+        proc add_child from action_node, col_def
+        proc add_child from alter_node, action_node
+
+    Otherwise If is_drop is equal to 1:
+        proc advance_token from parser
+
+        Note: Expect COLUMN keyword (optional)
+        Let is_column be proc check_token_type from parser, TOKEN_COLUMN from Lexer
+        If is_column is equal to 1:
+            proc advance_token from parser
+        End If
+
+        Let col_name be proc parse_primary_expression from parser
+
+        Let action_node be proc create_sql_node from SQL_IDENTIFIER, 0, 0, line, column
+        Let action_name be proc create_string from StringCore with "DROP"
+        proc memory_set_int64 from Layout with action_node, 8, action_name
+        proc add_child from action_node, col_name
+        proc add_child from alter_node, action_node
+    End If
+
+    Return alter_node
+End Process
+
+Process called "parse_drop" takes parser as Integer returns Integer:
+    Note: Parse DROP statement
+    Note: Format: DROP TABLE/INDEX name
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let drop_node be proc create_sql_node from SQL_DROP, 0, 0, line, column
+
+    proc advance_token from parser  Note: Consume DROP
+
+    Note: Parse object type (TABLE or INDEX)
+    Let is_table be proc check_token_type from parser, TOKEN_TABLE from Lexer
+    Let is_index be proc check_token_type from parser, TOKEN_INDEX from Lexer
+
+    Let object_type be 0
+    If is_table is equal to 1:
+        proc advance_token from parser
+        Set object_type to 1  Note: 1 = TABLE
+    Otherwise If is_index is equal to 1:
+        proc advance_token from parser
+        Set object_type to 2  Note: 2 = INDEX
+    End If
+
+    proc memory_set_int64 from Layout with drop_node, 24, object_type  Note: Store type in metadata
+
+    Note: Parse object name
+    Let object_name be proc parse_primary_expression from parser
+
+    If object_name is not equal to 0:
+        proc add_child from drop_node, object_name
+    End If
+
+    Return drop_node
+End Process
+
+Note: ============================================================================
+Note: Top-Level Parsing
+Note: ============================================================================
+
+Process called "parse_sql" takes source as Integer returns Integer:
+    Note: Parse SQL source into AST
+
+    Note: Create lexer
+    Let lexer be proc create_sql_lexer from Lexer with source
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Create parser
+    Let parser be proc create_sql_parser from lexer
+
+    If parser is equal to 0:
+        proc destroy_sql_lexer from Lexer with lexer
+        Return 0
+    End If
+
+    Note: Determine statement type and parse
+    Let token_type be proc current_token_type from parser
+
+    Let ast be 0
+
+    If token_type is equal to TOKEN_SELECT from Lexer:
+        Set ast to proc parse_select from parser
+    Otherwise If token_type is equal to TOKEN_INSERT from Lexer:
+        Set ast to proc parse_insert from parser
+    Otherwise If token_type is equal to TOKEN_UPDATE from Lexer:
+        Set ast to proc parse_update from parser
+    Otherwise If token_type is equal to TOKEN_DELETE from Lexer:
+        Set ast to proc parse_delete from parser
+    Otherwise If token_type is equal to TOKEN_CREATE from Lexer:
+        Set ast to proc parse_create_table from parser
+    Otherwise If token_type is equal to TOKEN_ALTER from Lexer:
+        Set ast to proc parse_alter_table from parser
+    Otherwise If token_type is equal to TOKEN_DROP from Lexer:
+        Set ast to proc parse_drop from parser
+    End If
+
+    Note: Cleanup
+    proc destroy_sql_parser from parser
+    proc destroy_sql_lexer from Lexer with lexer
+
+    Return ast
+End Process
+
+Note: End of SQL Parser

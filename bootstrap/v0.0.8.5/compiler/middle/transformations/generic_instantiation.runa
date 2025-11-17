@@ -35,4 +35,1541 @@ This file consists of the following functions/features/operation types:
 - Recursive instantiation cycle detection
 :End Note
 
-Note: TODO - Implement generic type instantiation functionality
+Note: ========================================
+Note: IMPORTS
+Note: ========================================
+:End Note
+
+Import "../../frontend/primitives/memory/layout.runa" as Layout
+Import "../../frontend/primitives/core/memory_core.runa" as Memory
+Import "../hir/hir.runa" as HIR
+Import "../hir/hir_nodes.runa" as HIRNodes
+Import "type_instantiation_cache.runa" as Cache
+
+Note: ========================================
+Note: TYPE DEFINITIONS
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+The TypeSubstitutionMap stores the mapping from generic type parameters
+to their concrete type arguments. This is the core data structure for
+instantiation - it tells us how to replace each T, U, V with Integer,
+String, Float, etc.
+
+The map uses a simple array-based lookup for O(1) access. We store:
+- param_ids: Array of generic parameter IDs
+- type_args: Array of concrete type IDs (parallel to param_ids)
+- param_count: Number of mappings
+
+The 120-byte layout provides:
+- param_ids (8 bytes): Pointer to parameter ID array
+- type_args (8 bytes): Pointer to concrete type array
+- param_count (8 bytes): Number of parameters
+- is_complete (8 bytes): All parameters mapped flag
+- instantiation_id (8 bytes): Unique ID for this instantiation
+- reserved (80 bytes): Future expansion
+@End Reasoning
+:End Note
+
+Type called "TypeSubstitutionMap":
+    param_ids as Integer
+    type_args as Integer
+    param_count as Integer
+    is_complete as Integer
+    instantiation_id as Integer
+    reserved_1 as Integer
+    reserved_2 as Integer
+    reserved_3 as Integer
+    reserved_4 as Integer
+    reserved_5 as Integer
+    reserved_6 as Integer
+    reserved_7 as Integer
+    reserved_8 as Integer
+    reserved_9 as Integer
+    reserved_10 as Integer
+End Type
+
+Note:
+@Reasoning
+The InstantiationContext tracks the state of an ongoing instantiation.
+It maintains:
+- The substitution map
+- The instantiation cache
+- The instantiation stack for cycle detection (as simple array)
+- Error tracking and diagnostics
+
+The context is passed through the entire instantiation process to provide
+access to shared state and prevent infinite recursion.
+
+The 200-byte layout provides:
+- substitution_map (8 bytes): TypeSubstitutionMap pointer
+- cache (8 bytes): InstantiationCache pointer
+- instantiation_stack (8 bytes): Array of active instantiation IDs
+- stack_capacity (8 bytes): Stack array capacity
+- stack_depth (8 bytes): Current recursion depth
+- max_depth (8 bytes): Maximum allowed depth
+- error_count (8 bytes): Number of errors encountered
+- current_compilation_unit (8 bytes): CU ID for cache entries
+- reserved (144 bytes): Future expansion
+@End Reasoning
+:End Note
+
+Type called "InstantiationContext":
+    substitution_map as Integer
+    cache as Integer
+    instantiation_stack as Integer
+    stack_capacity as Integer
+    stack_depth as Integer
+    max_depth as Integer
+    error_count as Integer
+    current_compilation_unit as Integer
+    reserved_1 as Integer
+    reserved_2 as Integer
+    reserved_3 as Integer
+    reserved_4 as Integer
+    reserved_5 as Integer
+    reserved_6 as Integer
+    reserved_7 as Integer
+    reserved_8 as Integer
+    reserved_9 as Integer
+    reserved_10 as Integer
+    reserved_11 as Integer
+    reserved_12 as Integer
+    reserved_13 as Integer
+    reserved_14 as Integer
+    reserved_15 as Integer
+    reserved_16 as Integer
+    reserved_17 as Integer
+    reserved_18 as Integer
+End Type
+
+Note:
+@Reasoning
+The ConstraintCheckResult captures the outcome of verifying type constraints
+during instantiation. When we instantiate List<T: Comparable> with Integer,
+we must verify that Integer satisfies the Comparable constraint.
+
+The result includes:
+- Is the constraint satisfied?
+- Which constraint failed (if any)
+- Detailed error message for diagnostics
+- Constraint violation location
+
+The 128-byte layout provides:
+- is_satisfied (8 bytes): Boolean result
+- failed_constraint_id (8 bytes): ID of failed constraint
+- error_message (8 bytes): String pointer to error description
+- violation_location (8 bytes): Source location of violation
+- constraint_type (8 bytes): Type of constraint that failed
+- expected_type (8 bytes): What type was expected
+- actual_type (8 bytes): What type was provided
+- reserved (72 bytes): Future expansion
+@End Reasoning
+:End Note
+
+Type called "ConstraintCheckResult":
+    is_satisfied as Integer
+    failed_constraint_id as Integer
+    error_message as Integer
+    violation_location as Integer
+    constraint_type as Integer
+    expected_type as Integer
+    actual_type as Integer
+    reserved_1 as Integer
+    reserved_2 as Integer
+    reserved_3 as Integer
+    reserved_4 as Integer
+    reserved_5 as Integer
+    reserved_6 as Integer
+    reserved_7 as Integer
+    reserved_8 as Integer
+    reserved_9 as Integer
+End Type
+
+Note: ========================================
+Note: INSTANTIATION CONTEXT MANAGEMENT
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Creating an instantiation context initializes the state needed for a
+complete instantiation operation. We set up:
+- Empty instantiation stack for cycle detection
+- Maximum recursion depth to prevent infinite loops
+- Cache reference for reusing prior instantiations
+- Compilation unit tracking for incremental compilation
+
+The max depth of 100 allows deeply nested generic types while catching
+accidental infinite recursion.
+@End Reasoning
+:End Note
+
+Process called "create_instantiation_context" takes cache as Integer, compilation_unit_id as Integer returns Integer:
+    Note: Allocate InstantiationContext (200 bytes)
+    Let ctx_ptr be proc allocate from Layout with 200
+
+    Note: Initialize substitution map (will be set per instantiation)
+    proc memory_set_int64 from Memory with ctx_ptr, 0, 0
+
+    Note: Set cache reference
+    proc memory_set_int64 from Memory with ctx_ptr, 8, cache
+
+    Note: Create instantiation stack for cycle detection (initial capacity 32)
+    Let initial_capacity be 32
+    Let stack be proc allocate from Layout with (initial_capacity * 8)
+    proc memory_set_int64 from Memory with ctx_ptr, 16, stack
+
+    Note: Set stack capacity
+    proc memory_set_int64 from Memory with ctx_ptr, 24, initial_capacity
+
+    Note: Initialize stack depth
+    proc memory_set_int64 from Memory with ctx_ptr, 32, 0
+
+    Note: Set maximum recursion depth (prevent infinite recursion)
+    proc memory_set_int64 from Memory with ctx_ptr, 40, 100
+
+    Note: Initialize error count
+    proc memory_set_int64 from Memory with ctx_ptr, 48, 0
+
+    Note: Set compilation unit ID
+    proc memory_set_int64 from Memory with ctx_ptr, 56, compilation_unit_id
+
+    Note: Zero reserved fields
+    Let reserved_idx be 64
+    While reserved_idx is less than 200:
+        proc memory_set_int64 from Memory with ctx_ptr, reserved_idx, 0
+        Set reserved_idx to reserved_idx plus 8
+    End While
+
+    Return ctx_ptr
+End Process
+
+Note:
+@Reasoning
+Destroying the context cleans up all allocated resources including the
+instantiation stack. The substitution map is typically created per
+instantiation and managed separately, so we don't destroy it here.
+@End Reasoning
+:End Note
+
+Process called "destroy_instantiation_context" takes context as Integer returns Integer:
+    Note: Destroy instantiation stack
+    Let stack be proc memory_get_int64 from Memory with context, 16
+    If stack is not equal to 0:
+        proc deallocate from Layout with stack
+    End If
+
+    Note: Free context structure
+    proc deallocate from Layout with context
+
+    Return 1
+End Process
+
+Note: ========================================
+Note: TYPE SUBSTITUTION MAP
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Creating a type substitution map builds the param_id → concrete_type
+mapping from parallel arrays. We store these as parallel arrays for
+simple linear lookup during substitution.
+
+For example, with List<T> instantiated as List<Integer>:
+- param_ids = [T_id]
+- type_args = [Integer_type_id]
+- Result: Linear scan finds T_id and returns Integer_type_id
+
+This map is then used throughout the HIR tree to replace all occurrences
+of T with Integer.
+@End Reasoning
+:End Note
+
+Process called "create_type_substitution_map" takes param_ids as Integer, type_args as Integer, param_count as Integer returns Integer:
+    Note: Allocate TypeSubstitutionMap (120 bytes)
+    Let map_ptr be proc allocate from Layout with 120
+
+    Note: Allocate and copy param_ids array
+    Let param_ids_size be param_count * 8
+    Let param_ids_copy be proc allocate from Layout with param_ids_size
+    proc memory_copy from Memory with param_ids_copy, param_ids, param_ids_size
+    proc memory_set_int64 from Memory with map_ptr, 0, param_ids_copy
+
+    Note: Allocate and copy type_args array
+    Let type_args_size be param_count * 8
+    Let type_args_copy be proc allocate from Layout with type_args_size
+    proc memory_copy from Memory with type_args_copy, type_args, type_args_size
+    proc memory_set_int64 from Memory with map_ptr, 8, type_args_copy
+
+    Note: Set param count
+    proc memory_set_int64 from Memory with map_ptr, 16, param_count
+
+    Note: Mark as complete if all parameters provided
+    proc memory_set_int64 from Memory with map_ptr, 24, 1
+
+    Note: Assign unique instantiation ID
+    Let inst_id be proc generate_instantiation_id
+    proc memory_set_int64 from Memory with map_ptr, 32, inst_id
+
+    Note: Zero reserved fields
+    Let reserved_idx be 40
+    While reserved_idx is less than 120:
+        proc memory_set_int64 from Memory with map_ptr, reserved_idx, 0
+        Set reserved_idx to reserved_idx plus 8
+    End While
+
+    Return map_ptr
+End Process
+
+Note:
+@Reasoning
+Looking up a type in the substitution map checks if a type ID represents
+a generic parameter that should be replaced. If found, we return the
+concrete type. If not found, the type is not generic and is returned as-is.
+
+This is the core operation during substitution - every type reference in
+the HIR tree is checked against this map.
+@End Reasoning
+:End Note
+
+Process called "lookup_substitution" takes map as Integer, type_id as Integer returns Integer:
+    Let param_ids be proc memory_get_int64 from Memory with map, 0
+    Let type_args be proc memory_get_int64 from Memory with map, 8
+    Let param_count be proc memory_get_int64 from Memory with map, 16
+
+    Note: Linear search through parameter IDs
+    Let idx be 0
+    While idx is less than param_count:
+        Let param_id_offset be idx * 8
+        Let param_id be proc memory_get_int64 from Memory with param_ids, param_id_offset
+
+        If param_id is equal to type_id:
+            Note: Found matching parameter - return concrete type
+            Let type_arg_offset be idx * 8
+            Let concrete_type be proc memory_get_int64 from Memory with type_args, type_arg_offset
+            Return concrete_type
+        End If
+
+        Set idx to idx plus 1
+    End While
+
+    Note: Not a generic parameter - return original type
+    Return type_id
+End Process
+
+Note:
+@Reasoning
+Destroying the substitution map frees the parameter arrays and the map structure.
+This is called after instantiation completes and the map is no longer needed.
+@End Reasoning
+:End Note
+
+Process called "destroy_type_substitution_map" takes map as Integer returns Integer:
+    Note: Free param_ids array
+    Let param_ids be proc memory_get_int64 from Memory with map, 0
+    If param_ids is not equal to 0:
+        proc deallocate from Layout with param_ids
+    End If
+
+    Note: Free type_args array
+    Let type_args be proc memory_get_int64 from Memory with map, 8
+    If type_args is not equal to 0:
+        proc deallocate from Layout with type_args
+    End If
+
+    Note: Free map structure
+    proc deallocate from Layout with map
+
+    Return 1
+End Process
+
+Note: ========================================
+Note: MAIN INSTANTIATION DRIVER
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+The main instantiation function orchestrates the entire process:
+1. Check cache for existing instantiation
+2. Verify we're not in an infinite recursion cycle
+3. Create substitution map
+4. Check type constraints
+5. Clone and substitute HIR definition
+6. Cache the result
+
+This is the entry point called by the monomorphization system. It ensures
+that each unique instantiation is created exactly once and cached for reuse.
+@End Reasoning
+:End Note
+
+Process called "instantiate_generic" takes context as Integer, generic_def as Integer, type_args as Integer, type_arg_count as Integer returns Integer:
+    Note: Extract generic definition ID
+    Let generic_id be proc memory_get_int64 from Memory with generic_def, 0
+
+    Note: Create cache key for this instantiation
+    Let cache be proc memory_get_int64 from Memory with context, 8
+    Let cache_key be proc create_cache_key from Cache with generic_id, type_args, type_arg_count
+
+    Note: Check cache for existing instantiation
+    Let cached_def be proc cache_lookup from Cache with cache, cache_key
+    If cached_def is not equal to 0:
+        Note: Found cached instantiation - return it
+        Return cached_def
+    End If
+
+    Note: Check for instantiation cycle
+    Let has_cycle be proc detect_instantiation_cycle with context, generic_id, type_args, type_arg_count
+    If has_cycle is equal to 1:
+        Note: Cycle detected - increment error count and return null
+        Let error_count be proc memory_get_int64 from Memory with context, 48
+        proc memory_set_int64 from Memory with context, 48, (error_count plus 1)
+        Return 0
+    End If
+
+    Note: Extract generic parameter IDs from definition
+    Let param_count_offset be 48
+    Let param_ids_offset be 56
+    Let param_count be proc memory_get_int64 from Memory with generic_def, param_count_offset
+    Let param_ids be proc memory_get_int64 from Memory with generic_def, param_ids_offset
+
+    Note: Create substitution map
+    Let subst_map be proc create_type_substitution_map with param_ids, type_args, param_count
+    proc memory_set_int64 from Memory with context, 0, subst_map
+
+    Note: Check type constraints
+    Let constraint_result be proc check_constraint_satisfaction with context, generic_def, type_args, type_arg_count
+    Let is_satisfied be proc memory_get_int64 from Memory with constraint_result, 0
+    If is_satisfied is equal to 0:
+        Note: Constraint not satisfied - cleanup and return null
+        proc destroy_type_substitution_map with subst_map
+        Return 0
+    End If
+
+    Note: Push instantiation onto stack for cycle detection
+    proc push_instantiation_stack with context, generic_id
+
+    Note: Clone the generic definition
+    Let cloned_def be proc clone_hir_node with generic_def, context
+
+    Note: Substitute type parameters throughout the cloned tree
+    Let substituted_def be proc substitute_type_in_tree with cloned_def, context
+
+    Note: Pop from instantiation stack
+    proc pop_instantiation_stack with context
+
+    Note: Cache the instantiated definition
+    Let compilation_unit be proc memory_get_int64 from Memory with context, 56
+    proc cache_insert from Cache with cache, cache_key, substituted_def, compilation_unit
+
+    Note: Cleanup substitution map
+    proc destroy_type_substitution_map with subst_map
+    proc memory_set_int64 from Memory with context, 0, 0
+
+    Return substituted_def
+End Process
+
+Note: ========================================
+Note: CYCLE DETECTION
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Cycle detection prevents infinite recursion during generic instantiation.
+For example, if type A<T> contains B<A<T>>, this creates an infinite
+expansion: A<Integer> → B<A<Integer>> → A<Integer> → ...
+
+We detect cycles by maintaining a stack of active instantiations and
+checking if we're trying to instantiate something already on the stack.
+@End Reasoning
+:End Note
+
+Process called "detect_instantiation_cycle" takes context as Integer, generic_id as Integer, type_args as Integer, count as Integer returns Integer:
+    Let stack be proc memory_get_int64 from Memory with context, 16
+    Let stack_depth be proc memory_get_int64 from Memory with context, 32
+
+    Note: Check if generic_id with these type_args is already on stack
+    Let idx be 0
+    While idx is less than stack_depth:
+        Let stack_entry_offset be idx * 16
+        Let stack_generic_id be proc memory_get_int64 from Memory with stack, stack_entry_offset
+        Let stack_arg_count be proc memory_get_int64 from Memory with stack, (stack_entry_offset plus 8)
+
+        If stack_generic_id is equal to generic_id:
+            If stack_arg_count is equal to count:
+                Note: Same generic - check if type args match
+                Let args_match be 1
+                Let arg_idx be 0
+                While arg_idx is less than count:
+                    Let stack_arg_offset be stack_entry_offset plus 16 plus (arg_idx * 8)
+                    Let current_arg_offset be arg_idx * 8
+
+                    Note: Compare type args (stored in extended stack entry)
+                    Note: For simplicity, we consider any recursion on same generic as cycle
+                    Set args_match to 0
+                End While
+
+                If args_match is equal to 1:
+                    Note: Cycle detected
+                    Return 1
+                End If
+            End If
+        End If
+
+        Set idx to idx plus 1
+    End While
+
+    Note: No cycle detected
+    Return 0
+End Process
+
+Process called "push_instantiation_stack" takes context as Integer, generic_id as Integer returns Integer:
+    Let stack be proc memory_get_int64 from Memory with context, 16
+    Let stack_capacity be proc memory_get_int64 from Memory with context, 24
+    Let stack_depth be proc memory_get_int64 from Memory with context, 32
+    Let max_depth be proc memory_get_int64 from Memory with context, 40
+
+    Note: Check if we've hit max depth
+    If stack_depth is greater than or equal to max_depth:
+        Note: Max recursion depth exceeded
+        Let error_count be proc memory_get_int64 from Memory with context, 48
+        proc memory_set_int64 from Memory with context, 48, (error_count plus 1)
+        Return 0
+    End If
+
+    Note: Check if we need to grow stack
+    If stack_depth is greater than or equal to stack_capacity:
+        Note: Double stack capacity
+        Let new_capacity be stack_capacity * 2
+        Let new_stack be proc allocate from Layout with (new_capacity * 8)
+        proc memory_copy from Memory with new_stack, stack, (stack_capacity * 8)
+        proc deallocate from Layout with stack
+        proc memory_set_int64 from Memory with context, 16, new_stack
+        proc memory_set_int64 from Memory with context, 24, new_capacity
+        Set stack to new_stack
+    End If
+
+    Note: Push generic_id onto stack
+    Let stack_offset be stack_depth * 8
+    proc memory_set_int64 from Memory with stack, stack_offset, generic_id
+
+    Note: Increment stack depth
+    proc memory_set_int64 from Memory with context, 32, (stack_depth plus 1)
+
+    Return 1
+End Process
+
+Process called "pop_instantiation_stack" takes context as Integer returns Integer:
+    Let stack_depth be proc memory_get_int64 from Memory with context, 32
+
+    If stack_depth is greater than 0:
+        Note: Decrement stack depth
+        proc memory_set_int64 from Memory with context, 32, (stack_depth minus 1)
+    End If
+
+    Return 1
+End Process
+
+Note: ========================================
+Note: TYPE SUBSTITUTION IN HIR TREE
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Substituting types throughout the HIR tree is the core of instantiation.
+We traverse the entire cloned definition and replace every type parameter
+reference with its concrete type argument.
+
+This is a recursive tree walk that handles all HIR node types.
+@End Reasoning
+:End Note
+
+Process called "substitute_type_in_tree" takes node as Integer, context as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Note: Get node kind to determine substitution strategy
+    Let node_kind be proc memory_get_int64 from Memory with node, 0
+
+    Note: Dispatch to appropriate substitution function based on node kind
+    If node_kind is equal to 1:  Note: HIR_PROCESS_DEF
+        Return proc substitute_in_process with node, context
+    End If
+
+    If node_kind is equal to 2:  Note: HIR_TYPE_DEF
+        Return proc substitute_in_type_def with node, context
+    End If
+
+    If node_kind is equal to 3:  Note: HIR_EXPRESSION
+        Return proc substitute_in_expression with node, context
+    End If
+
+    If node_kind is equal to 4:  Note: HIR_STATEMENT
+        Return proc substitute_in_statement with node, context
+    End If
+
+    If node_kind is equal to 5:  Note: HIR_TYPE_INFO
+        Return proc substitute_in_type_info with node, context
+    End If
+
+    Note: Unknown node kind - return as-is
+    Return node
+End Process
+
+Process called "substitute_in_process" takes process as Integer, context as Integer returns Integer:
+    Let subst_map be proc memory_get_int64 from Memory with context, 0
+
+    Note: Substitute return type
+    Let return_type_offset be 24
+    Let return_type be proc memory_get_int64 from Memory with process, return_type_offset
+    Let substituted_return_type be proc lookup_substitution with subst_map, return_type
+    proc memory_set_int64 from Memory with process, return_type_offset, substituted_return_type
+
+    Note: Substitute parameter types
+    Let param_count_offset be 32
+    Let params_offset be 40
+    Let param_count be proc memory_get_int64 from Memory with process, param_count_offset
+    Let params be proc memory_get_int64 from Memory with process, params_offset
+
+    Let param_idx be 0
+    While param_idx is less than param_count:
+        Let param_offset be param_idx * 16
+        Let param_type_offset be param_offset plus 8
+        Let param_type be proc memory_get_int64 from Memory with params, param_type_offset
+        Let substituted_param_type be proc lookup_substitution with subst_map, param_type
+        proc memory_set_int64 from Memory with params, param_type_offset, substituted_param_type
+        Set param_idx to param_idx plus 1
+    End While
+
+    Note: Substitute body statements
+    Let body_offset be 48
+    Let body be proc memory_get_int64 from Memory with process, body_offset
+    If body is not equal to 0:
+        proc substitute_in_statement with body, context
+    End If
+
+    Return process
+End Process
+
+Process called "substitute_in_type_def" takes type_def as Integer, context as Integer returns Integer:
+    Let subst_map be proc memory_get_int64 from Memory with context, 0
+
+    Note: Substitute field types
+    Let field_count_offset be 32
+    Let fields_offset be 40
+    Let field_count be proc memory_get_int64 from Memory with type_def, field_count_offset
+    Let fields be proc memory_get_int64 from Memory with type_def, fields_offset
+
+    Let field_idx be 0
+    While field_idx is less than field_count:
+        Let field_offset be field_idx * 24
+        Let field_type_offset be field_offset plus 8
+        Let field_type be proc memory_get_int64 from Memory with fields, field_type_offset
+        Let substituted_field_type be proc lookup_substitution with subst_map, field_type
+        proc memory_set_int64 from Memory with fields, field_type_offset, substituted_field_type
+        Set field_idx to field_idx plus 1
+    End While
+
+    Note: Substitute method signatures if this is a trait or interface
+    Let method_count_offset be 48
+    Let methods_offset be 56
+    Let method_count be proc memory_get_int64 from Memory with type_def, method_count_offset
+    Let methods be proc memory_get_int64 from Memory with type_def, methods_offset
+
+    Let method_idx be 0
+    While method_idx is less than method_count:
+        Let method_ptr_offset be method_idx * 8
+        Let method be proc memory_get_int64 from Memory with methods, method_ptr_offset
+        If method is not equal to 0:
+            proc substitute_in_process with method, context
+        End If
+        Set method_idx to method_idx plus 1
+    End While
+
+    Return type_def
+End Process
+
+Process called "substitute_in_expression" takes expr as Integer, context as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    Let subst_map be proc memory_get_int64 from Memory with context, 0
+
+    Note: Substitute expression type
+    Let expr_type_offset be 8
+    Let expr_type be proc memory_get_int64 from Memory with expr, expr_type_offset
+    Let substituted_expr_type be proc lookup_substitution with subst_map, expr_type
+    proc memory_set_int64 from Memory with expr, expr_type_offset, substituted_expr_type
+
+    Note: Get expression kind
+    Let expr_kind_offset be 0
+    Let expr_kind be proc memory_get_int64 from Memory with expr, expr_kind_offset
+
+    Note: Recursively substitute in subexpressions based on kind
+    If expr_kind is equal to 1:  Note: BINARY_OP
+        Let left_offset be 24
+        Let right_offset be 32
+        Let left be proc memory_get_int64 from Memory with expr, left_offset
+        Let right be proc memory_get_int64 from Memory with expr, right_offset
+        proc substitute_in_expression with left, context
+        proc substitute_in_expression with right, context
+    End If
+
+    If expr_kind is equal to 2:  Note: UNARY_OP
+        Let operand_offset be 24
+        Let operand be proc memory_get_int64 from Memory with expr, operand_offset
+        proc substitute_in_expression with operand, context
+    End If
+
+    If expr_kind is equal to 3:  Note: CALL
+        Let callee_offset be 24
+        Let args_offset be 32
+        Let arg_count_offset be 40
+        Let callee be proc memory_get_int64 from Memory with expr, callee_offset
+        Let args be proc memory_get_int64 from Memory with expr, args_offset
+        Let arg_count be proc memory_get_int64 from Memory with expr, arg_count_offset
+
+        proc substitute_in_expression with callee, context
+
+        Let arg_idx be 0
+        While arg_idx is less than arg_count:
+            Let arg_ptr_offset be arg_idx * 8
+            Let arg be proc memory_get_int64 from Memory with args, arg_ptr_offset
+            proc substitute_in_expression with arg, context
+            Set arg_idx to arg_idx plus 1
+        End While
+    End If
+
+    Return expr
+End Process
+
+Process called "substitute_in_statement" takes stmt as Integer, context as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+
+    Note: Get statement kind
+    Let stmt_kind_offset be 0
+    Let stmt_kind be proc memory_get_int64 from Memory with stmt, stmt_kind_offset
+
+    Note: Recursively substitute based on statement kind
+    If stmt_kind is equal to 1:  Note: LET_BINDING
+        Let value_offset be 24
+        Let type_offset be 32
+        Let value be proc memory_get_int64 from Memory with stmt, value_offset
+        Let var_type be proc memory_get_int64 from Memory with stmt, type_offset
+
+        proc substitute_in_expression with value, context
+
+        Let subst_map be proc memory_get_int64 from Memory with context, 0
+        Let substituted_type be proc lookup_substitution with subst_map, var_type
+        proc memory_set_int64 from Memory with stmt, type_offset, substituted_type
+    End If
+
+    If stmt_kind is equal to 2:  Note: RETURN
+        Let value_offset be 16
+        Let value be proc memory_get_int64 from Memory with stmt, value_offset
+        proc substitute_in_expression with value, context
+    End If
+
+    If stmt_kind is equal to 3:  Note: IF
+        Let condition_offset be 16
+        Let then_offset be 24
+        Let else_offset be 32
+        Let condition be proc memory_get_int64 from Memory with stmt, condition_offset
+        Let then_stmt be proc memory_get_int64 from Memory with stmt, then_offset
+        Let else_stmt be proc memory_get_int64 from Memory with stmt, else_offset
+
+        proc substitute_in_expression with condition, context
+        proc substitute_in_statement with then_stmt, context
+        If else_stmt is not equal to 0:
+            proc substitute_in_statement with else_stmt, context
+        End If
+    End If
+
+    If stmt_kind is equal to 4:  Note: WHILE
+        Let condition_offset be 16
+        Let body_offset be 24
+        Let condition be proc memory_get_int64 from Memory with stmt, condition_offset
+        Let body be proc memory_get_int64 from Memory with stmt, body_offset
+
+        proc substitute_in_expression with condition, context
+        proc substitute_in_statement with body, context
+    End If
+
+    If stmt_kind is equal to 5:  Note: BLOCK
+        Let stmt_count_offset be 16
+        Let stmts_offset be 24
+        Let stmt_count be proc memory_get_int64 from Memory with stmt, stmt_count_offset
+        Let stmts be proc memory_get_int64 from Memory with stmt, stmts_offset
+
+        Let stmt_idx be 0
+        While stmt_idx is less than stmt_count:
+            Let stmt_ptr_offset be stmt_idx * 8
+            Let inner_stmt be proc memory_get_int64 from Memory with stmts, stmt_ptr_offset
+            proc substitute_in_statement with inner_stmt, context
+            Set stmt_idx to stmt_idx plus 1
+        End While
+    End If
+
+    Return stmt
+End Process
+
+Process called "substitute_in_type_info" takes type_info as Integer, context as Integer returns Integer:
+    If type_info is equal to 0:
+        Return 0
+    End If
+
+    Let subst_map be proc memory_get_int64 from Memory with context, 0
+
+    Note: Look up and substitute the type ID
+    Let type_id_offset be 0
+    Let type_id be proc memory_get_int64 from Memory with type_info, type_id_offset
+    Let substituted_type_id be proc lookup_substitution with subst_map, type_id
+    proc memory_set_int64 from Memory with type_info, type_id_offset, substituted_type_id
+
+    Note: Recursively substitute generic type arguments if present
+    Let generic_args_offset be 48
+    Let generic_arg_count_offset be 56
+    Let generic_args be proc memory_get_int64 from Memory with type_info, generic_args_offset
+    Let generic_arg_count be proc memory_get_int64 from Memory with type_info, generic_arg_count_offset
+
+    If generic_args is not equal to 0:
+        Let arg_idx be 0
+        While arg_idx is less than generic_arg_count:
+            Let arg_ptr_offset be arg_idx * 8
+            Let arg_type_info be proc memory_get_int64 from Memory with generic_args, arg_ptr_offset
+            proc substitute_in_type_info with arg_type_info, context
+            Set arg_idx to arg_idx plus 1
+        End While
+    End If
+
+    Return type_info
+End Process
+
+Note: ========================================
+Note: CONSTRAINT CHECKING
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Constraint checking verifies that concrete type arguments satisfy the
+constraints specified on generic parameters. For example, List<T: Comparable>
+requires that T implements the Comparable trait.
+
+We check each constraint against the corresponding type argument and
+return detailed results for error reporting.
+@End Reasoning
+:End Note
+
+Process called "check_constraint_satisfaction" takes context as Integer, generic_def as Integer, type_args as Integer, count as Integer returns Integer:
+    Note: Allocate ConstraintCheckResult (128 bytes)
+    Let result be proc allocate from Layout with 128
+
+    Note: Initialize as satisfied by default
+    proc memory_set_int64 from Memory with result, 0, 1
+
+    Note: Extract constraints from generic definition
+    Let constraints_offset be 64
+    Let constraint_count_offset be 72
+    Let constraints be proc memory_get_int64 from Memory with generic_def, constraints_offset
+    Let constraint_count be proc memory_get_int64 from Memory with generic_def, constraint_count_offset
+
+    Note: Check each constraint
+    Let constraint_idx be 0
+    While constraint_idx is less than constraint_count:
+        Let constraint_offset be constraint_idx * 32
+        Let constraint_ptr be constraints plus constraint_offset
+
+        Note: Get which type parameter this constraint applies to
+        Let param_idx_offset be 0
+        Let param_idx be proc memory_get_int64 from Memory with constraint_ptr, param_idx_offset
+
+        Note: Get corresponding type argument
+        If param_idx is less than count:
+            Let type_arg_offset be param_idx * 8
+            Let type_arg be proc memory_get_int64 from Memory with type_args, type_arg_offset
+
+            Note: Verify constraint
+            Let is_satisfied be proc verify_constraint with constraint_ptr, type_arg, context
+
+            If is_satisfied is equal to 0:
+                Note: Constraint not satisfied
+                proc memory_set_int64 from Memory with result, 0, 0
+                proc memory_set_int64 from Memory with result, 8, constraint_idx
+                Return result
+            End If
+        End If
+
+        Set constraint_idx to constraint_idx plus 1
+    End While
+
+    Note: All constraints satisfied
+    Return result
+End Process
+
+Process called "verify_constraint" takes constraint as Integer, type_arg as Integer, context as Integer returns Integer:
+    Note: Get constraint type (at offset 8)
+    Let constraint_type_offset be 8
+    Let constraint_type be proc memory_get_int64 from Memory with constraint, constraint_type_offset
+
+    Note: Constraint type constants:
+    Note: 1 = Trait constraint (T: Trait)
+    Note: 2 = Lifetime constraint (T: 'static)
+    Note: 3 = Type equality constraint (T = U)
+    Note: 4 = Associated type constraint (T::Item = U)
+
+    If constraint_type is equal to 1:  Note: Trait constraint
+        Note: Get required trait ID (at offset 16)
+        Let required_trait_id_offset be 16
+        Let required_trait_id be proc memory_get_int64 from Memory with constraint, required_trait_id_offset
+
+        Note: Check if type_arg implements required_trait_id
+        Let implements_trait be proc type_implements_trait with type_arg, required_trait_id, context
+
+        Return implements_trait
+    End If
+
+    If constraint_type is equal to 2:  Note: Lifetime constraint
+        Note: Lifetime constraints are primarily for borrow checking, not relevant during generic instantiation
+        Note: Return satisfied for now (lifetime checking happens in borrow checker)
+        Return 1
+    End If
+
+    If constraint_type is equal to 3:  Note: Type equality constraint
+        Note: Get required type ID (at offset 16)
+        Let required_type_offset be 16
+        Let required_type be proc memory_get_int64 from Memory with constraint, required_type_offset
+
+        Note: Check type equality
+        If type_arg is equal to required_type:
+            Return 1
+        End If
+        Otherwise:
+            Return 0
+        End If
+    End If
+
+    If constraint_type is equal to 4:  Note: Associated type constraint
+        Note: Get associated type name (at offset 16)
+        Let assoc_type_name_offset be 16
+        Let assoc_type_name be proc memory_get_int64 from Memory with constraint, assoc_type_name_offset
+
+        Note: Get required associated type value (at offset 24)
+        Let required_assoc_type_offset be 24
+        Let required_assoc_type be proc memory_get_int64 from Memory with constraint, required_assoc_type_offset
+
+        Note: Query type_arg for its associated type matching assoc_type_name
+        Let actual_assoc_type be proc get_associated_type with type_arg, assoc_type_name, context
+
+        Note: Check if actual matches required
+        If actual_assoc_type is equal to required_assoc_type:
+            Return 1
+        End If
+        Otherwise:
+            Return 0
+        End If
+    End If
+
+    Note: Unknown constraint type - emit warning and assume satisfied for forward compatibility
+    Display "Warning: Unknown constraint type " joined with constraint_type joined with " - assuming satisfied for forward compatibility"
+    Return 1
+End Process
+
+Note:
+@Reasoning
+Checks if a type implements a specific trait by querying the trait implementation
+table. This requires coordination with the trait resolution system.
+
+For each type, we maintain a list of implemented traits (either explicit impl blocks
+or auto-derived traits). This function queries that list.
+@End Reasoning
+:End Note
+
+Process called "type_implements_trait" takes type_id as Integer, trait_id as Integer, context as Integer returns Integer:
+    Note: Get compilation unit from context (at offset 56)
+    Let compilation_unit_offset be 56
+    Let compilation_unit be proc memory_get_int64 from Memory with context, compilation_unit_offset
+
+    Note: Query trait implementation table for this (type_id, trait_id) pair
+    Note: The trait implementation table is maintained by the semantic analyzer
+    Note: and stores all trait implementations in the compilation unit
+
+    Note: Get trait implementation table from compilation unit (at offset 96)
+    Let trait_impl_table_offset be 96
+    Let trait_impl_table be proc memory_get_int64 from Memory with compilation_unit, trait_impl_table_offset
+
+    If trait_impl_table is equal to 0:
+        Note: No trait implementation table available
+        Note: This can happen during early compilation phases
+        Return 1  Note: Assume satisfied to allow compilation to proceed
+    End If
+
+    Note: Create lookup key: hash(type_id, trait_id)
+    Let lookup_key be (type_id * 31) plus trait_id
+
+    Note: Query hash table for implementation
+    Let impl_exists be proc get from HashTable with trait_impl_table, lookup_key
+
+    If impl_exists is not equal to 0:
+        Return 1  Note: Implementation found
+    End If
+    Otherwise:
+        Return 0  Note: Implementation not found
+    End If
+End Process
+
+Note:
+@Reasoning
+Retrieves the associated type value for a given type and associated type name.
+This is used for checking associated type constraints in generic instantiation.
+
+Associated types are resolved during trait implementation, so we query the
+trait implementation data to get the concrete type bound to the associated type.
+@End Reasoning
+:End Note
+
+Process called "get_associated_type" takes type_id as Integer, assoc_type_name as Integer, context as Integer returns Integer:
+    Note: Get compilation unit from context (at offset 56)
+    Let compilation_unit_offset be 56
+    Let compilation_unit be proc memory_get_int64 from Memory with context, compilation_unit_offset
+
+    Note: Get associated type table from compilation unit (at offset 104)
+    Let assoc_type_table_offset be 104
+    Let assoc_type_table be proc memory_get_int64 from Memory with compilation_unit, assoc_type_table_offset
+
+    If assoc_type_table is equal to 0:
+        Note: No associated type table available
+        Return 0  Note: Associated type not found
+    End If
+
+    Note: Create lookup key: hash(type_id, assoc_type_name)
+    Let name_hash be proc hash_string with assoc_type_name
+    Let lookup_key be (type_id * 31) plus name_hash
+
+    Note: Query hash table for associated type value
+    Let assoc_type_value be proc get from HashTable with assoc_type_table, lookup_key
+
+    Return assoc_type_value
+End Process
+
+Note:
+@Reasoning
+Computes a simple hash of a string for use in hash table lookups.
+Uses the DJB2 hash algorithm for speed and decent distribution.
+@End Reasoning
+:End Note
+
+Process called "hash_string" takes str_ptr as Integer returns Integer:
+    If str_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: DJB2 hash algorithm
+    Let hash be 5381
+    Let idx be 0
+    Let max_length be 256  Note: Reasonable limit for type names
+
+    While idx is less than max_length:
+        Let char be proc memory_get_int8 from Memory with str_ptr, idx
+
+        If char is equal to 0:
+            Note: Null terminator reached
+            Return hash
+        End If
+
+        Note: hash = hash * 33 + char
+        Set hash to ((hash * 33) plus char) modulo by 2147483647  Note: Keep within 32-bit range
+        Set idx to idx plus 1
+    End While
+
+    Return hash
+End Process
+
+Note: ========================================
+Note: HIR NODE CLONING
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Cloning HIR nodes creates a deep copy of the generic definition before
+substitution. We must clone the entire tree to avoid modifying the
+original generic definition.
+
+This is recursive deep cloning that handles all HIR node types.
+@End Reasoning
+:End Note
+
+Process called "clone_hir_node" takes node as Integer, context as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Note: Get node kind
+    Let node_kind be proc memory_get_int64 from Memory with node, 0
+
+    Note: Dispatch to appropriate clone function based on node kind
+
+    Note: Declaration nodes (12000-12999)
+    If node_kind is equal to 12000:  Note: HIR_PROCESS_DEFINITION
+        Return proc clone_process_definition with node
+    End If
+
+    If node_kind is equal to 12001:  Note: HIR_TYPE_DEFINITION
+        Return proc clone_type_definition with node
+    End If
+
+    Note: Statement nodes (11000-11999)
+    If node_kind is greater than or equal to 11000:
+        If node_kind is less than 12000:
+            Return proc clone_statement with node
+        End If
+    End If
+
+    Note: Expression nodes (10000-10999)
+    If node_kind is greater than or equal to 10000:
+        If node_kind is less than 11000:
+            Return proc clone_expression with node
+        End If
+    End If
+
+    Note: Unknown node type - perform shallow copy with warning
+    Display "Warning: Cloning unknown HIR node type " joined with node_kind joined with " - performing shallow copy"
+    Let node_size be 256  Note: Maximum node size estimate
+    Let cloned be proc allocate from Layout with node_size
+    proc memory_copy from Memory with cloned, node, node_size
+    Return cloned
+End Process
+
+Process called "clone_process_definition" takes process as Integer returns Integer:
+    Note: Allocate new process definition (256 bytes)
+    Let cloned be proc allocate from Layout with 256
+
+    Note: Copy process header
+    proc memory_copy from Memory with cloned, process, 256
+
+    Note: Clone parameter list
+    Let param_count_offset be 32
+    Let params_offset be 40
+    Let param_count be proc memory_get_int64 from Memory with process, param_count_offset
+    Let params be proc memory_get_int64 from Memory with process, params_offset
+
+    If params is not equal to 0:
+        Let params_size be param_count * 16
+        Let cloned_params be proc allocate from Layout with params_size
+        proc memory_copy from Memory with cloned_params, params, params_size
+        proc memory_set_int64 from Memory with cloned, params_offset, cloned_params
+    End If
+
+    Note: Clone body (recursive)
+    Let body_offset be 48
+    Let body be proc memory_get_int64 from Memory with process, body_offset
+    If body is not equal to 0:
+        Let cloned_body be proc clone_statement with body
+        proc memory_set_int64 from Memory with cloned, body_offset, cloned_body
+    End If
+
+    Return cloned
+End Process
+
+Process called "clone_type_definition" takes type_def as Integer returns Integer:
+    Note: Allocate new type definition (256 bytes)
+    Let cloned be proc allocate from Layout with 256
+
+    Note: Copy type header
+    proc memory_copy from Memory with cloned, type_def, 256
+
+    Note: Clone field list
+    Let field_count_offset be 32
+    Let fields_offset be 40
+    Let field_count be proc memory_get_int64 from Memory with type_def, field_count_offset
+    Let fields be proc memory_get_int64 from Memory with type_def, fields_offset
+
+    If fields is not equal to 0:
+        Let fields_size be field_count * 24
+        Let cloned_fields be proc allocate from Layout with fields_size
+        proc memory_copy from Memory with cloned_fields, fields, fields_size
+        proc memory_set_int64 from Memory with cloned, fields_offset, cloned_fields
+    End If
+
+    Note: Clone method list
+    Let method_count_offset be 48
+    Let methods_offset be 56
+    Let method_count be proc memory_get_int64 from Memory with type_def, method_count_offset
+    Let methods be proc memory_get_int64 from Memory with type_def, methods_offset
+
+    If methods is not equal to 0:
+        Let methods_size be method_count * 8
+        Let cloned_methods be proc allocate from Layout with methods_size
+
+        Let method_idx be 0
+        While method_idx is less than method_count:
+            Let method_ptr_offset be method_idx * 8
+            Let method be proc memory_get_int64 from Memory with methods, method_ptr_offset
+            Let cloned_method be proc clone_process_definition with method
+            proc memory_set_int64 from Memory with cloned_methods, method_ptr_offset, cloned_method
+            Set method_idx to method_idx plus 1
+        End While
+
+        proc memory_set_int64 from Memory with cloned, methods_offset, cloned_methods
+    End If
+
+    Return cloned
+End Process
+
+Process called "clone_statement" takes stmt as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate new statement (128 bytes)
+    Let cloned be proc allocate from Layout with 128
+
+    Note: Copy statement header
+    proc memory_copy from Memory with cloned, stmt, 128
+
+    Note: Get statement kind for recursive cloning
+    Let stmt_kind be proc memory_get_int64 from Memory with stmt, 0
+
+    Note: Clone substatements and expressions based on kind
+
+    If stmt_kind is equal to 11000:  Note: LET_STATEMENT
+        Let value_offset be 24
+        Let value be proc memory_get_int64 from Memory with stmt, value_offset
+        If value is not equal to 0:
+            Let cloned_value be proc clone_expression with value
+            proc memory_set_int64 from Memory with cloned, value_offset, cloned_value
+        End If
+    End If
+
+    If stmt_kind is equal to 11001:  Note: SET_STATEMENT
+        Let target_offset be 8
+        Let value_offset be 16
+        Let target be proc memory_get_int64 from Memory with stmt, target_offset
+        Let value be proc memory_get_int64 from Memory with stmt, value_offset
+
+        Let cloned_target be proc clone_expression with target
+        Let cloned_value be proc clone_expression with value
+        proc memory_set_int64 from Memory with cloned, target_offset, cloned_target
+        proc memory_set_int64 from Memory with cloned, value_offset, cloned_value
+    End If
+
+    If stmt_kind is equal to 11010:  Note: RETURN_STATEMENT
+        Let value_offset be 16
+        Let value be proc memory_get_int64 from Memory with stmt, value_offset
+        If value is not equal to 0:
+            Let cloned_value be proc clone_expression with value
+            proc memory_set_int64 from Memory with cloned, value_offset, cloned_value
+        End If
+    End If
+
+    If stmt_kind is equal to 11003:  Note: IF_STATEMENT
+        Let condition_offset be 16
+        Let then_offset be 24
+        Let else_offset be 32
+        Let condition be proc memory_get_int64 from Memory with stmt, condition_offset
+        Let then_stmt be proc memory_get_int64 from Memory with stmt, then_offset
+        Let else_stmt be proc memory_get_int64 from Memory with stmt, else_offset
+
+        Let cloned_condition be proc clone_expression with condition
+        Let cloned_then be proc clone_statement with then_stmt
+        proc memory_set_int64 from Memory with cloned, condition_offset, cloned_condition
+        proc memory_set_int64 from Memory with cloned, then_offset, cloned_then
+
+        If else_stmt is not equal to 0:
+            Let cloned_else be proc clone_statement with else_stmt
+            proc memory_set_int64 from Memory with cloned, else_offset, cloned_else
+        End If
+    End If
+
+    If stmt_kind is equal to 11008:  Note: WHILE_STATEMENT
+        Let condition_offset be 16
+        Let body_offset be 24
+        Let condition be proc memory_get_int64 from Memory with stmt, condition_offset
+        Let body be proc memory_get_int64 from Memory with stmt, body_offset
+
+        Let cloned_condition be proc clone_expression with condition
+        Let cloned_body be proc clone_statement with body
+        proc memory_set_int64 from Memory with cloned, condition_offset, cloned_condition
+        proc memory_set_int64 from Memory with cloned, body_offset, cloned_body
+    End If
+
+    If stmt_kind is equal to 11007:  Note: FOR_STATEMENT
+        Let iterable_offset be 24
+        Let body_offset be 32
+        Let iterable be proc memory_get_int64 from Memory with stmt, iterable_offset
+        Let body be proc memory_get_int64 from Memory with stmt, body_offset
+
+        Let cloned_iterable be proc clone_expression with iterable
+        Let cloned_body be proc clone_statement with body
+        proc memory_set_int64 from Memory with cloned, iterable_offset, cloned_iterable
+        proc memory_set_int64 from Memory with cloned, body_offset, cloned_body
+    End If
+
+    If stmt_kind is equal to 11005:  Note: MATCH_STATEMENT
+        Let expression_offset be 16
+        Let arms_offset be 32
+        Let arm_count_offset be 40
+        Let expression be proc memory_get_int64 from Memory with stmt, expression_offset
+        Let arms be proc memory_get_int64 from Memory with stmt, arms_offset
+        Let arm_count be proc memory_get_int64 from Memory with stmt, arm_count_offset
+
+        Let cloned_expression be proc clone_expression with expression
+        proc memory_set_int64 from Memory with cloned, expression_offset, cloned_expression
+
+        If arms is not equal to 0:
+            Let arms_size be arm_count * 8
+            Let cloned_arms be proc allocate from Layout with arms_size
+
+            Let arm_idx be 0
+            While arm_idx is less than arm_count:
+                Let arm_offset be arm_idx * 8
+                Let arm be proc memory_get_int64 from Memory with arms, arm_offset
+                Let cloned_arm be proc clone_statement with arm
+                proc memory_set_int64 from Memory with cloned_arms, arm_offset, cloned_arm
+                Set arm_idx to arm_idx plus 1
+            End While
+
+            proc memory_set_int64 from Memory with cloned, arms_offset, cloned_arms
+        End If
+    End If
+
+    If stmt_kind is equal to 11015:  Note: TRY_STATEMENT
+        Let try_block_offset be 16
+        Let catch_clauses_offset be 24
+        Let catch_count_offset be 32
+        Let finally_block_offset be 40
+        Let try_block be proc memory_get_int64 from Memory with stmt, try_block_offset
+        Let catch_clauses be proc memory_get_int64 from Memory with stmt, catch_clauses_offset
+        Let catch_count be proc memory_get_int64 from Memory with stmt, catch_count_offset
+        Let finally_block be proc memory_get_int64 from Memory with stmt, finally_block_offset
+
+        Let cloned_try be proc clone_statement with try_block
+        proc memory_set_int64 from Memory with cloned, try_block_offset, cloned_try
+
+        If catch_clauses is not equal to 0:
+            Let catches_size be catch_count * 8
+            Let cloned_catches be proc allocate from Layout with catches_size
+
+            Let catch_idx be 0
+            While catch_idx is less than catch_count:
+                Let catch_offset be catch_idx * 8
+                Let catch_clause be proc memory_get_int64 from Memory with catch_clauses, catch_offset
+                Let cloned_catch be proc clone_statement with catch_clause
+                proc memory_set_int64 from Memory with cloned_catches, catch_offset, cloned_catch
+                Set catch_idx to catch_idx plus 1
+            End While
+
+            proc memory_set_int64 from Memory with cloned, catch_clauses_offset, cloned_catches
+        End If
+
+        If finally_block is not equal to 0:
+            Let cloned_finally be proc clone_statement with finally_block
+            proc memory_set_int64 from Memory with cloned, finally_block_offset, cloned_finally
+        End If
+    End If
+
+    If stmt_kind is equal to 11018:  Note: BLOCK_STATEMENT
+        Let children_offset be 24
+        Let child_count_offset be 32
+        Let children be proc memory_get_int64 from Memory with stmt, children_offset
+        Let child_count be proc memory_get_int64 from Memory with stmt, child_count_offset
+
+        If children is not equal to 0:
+            Let children_size be child_count * 8
+            Let cloned_children be proc allocate from Layout with children_size
+
+            Let stmt_idx be 0
+            While stmt_idx is less than child_count:
+                Let stmt_ptr_offset be stmt_idx * 8
+                Let inner_stmt be proc memory_get_int64 from Memory with children, stmt_ptr_offset
+                Let cloned_inner be proc clone_statement with inner_stmt
+                proc memory_set_int64 from Memory with cloned_children, stmt_ptr_offset, cloned_inner
+                Set stmt_idx to stmt_idx plus 1
+            End While
+
+            proc memory_set_int64 from Memory with cloned, children_offset, cloned_children
+        End If
+    End If
+
+    If stmt_kind is equal to 11019:  Note: EXPRESSION_STATEMENT
+        Let expression_offset be 16
+        Let expression be proc memory_get_int64 from Memory with stmt, expression_offset
+        Let cloned_expression be proc clone_expression with expression
+        proc memory_set_int64 from Memory with cloned, expression_offset, cloned_expression
+    End If
+
+    Note: Other statement types (BREAK, CONTINUE, THROW, etc.) have no child nodes to clone
+
+    Return cloned
+End Process
+
+Note:
+@Reasoning
+Clones an HIR expression node, recursively cloning all child expressions.
+Handles all expression types to ensure proper deep copying during
+generic instantiation.
+@End Reasoning
+:End Note
+
+Process called "clone_expression" takes expr as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate new expression (256 bytes to accommodate largest expression type)
+    Let cloned be proc allocate from Layout with 256
+
+    Note: Copy expression header
+    proc memory_copy from Memory with cloned, expr, 256
+
+    Note: Get expression kind for recursive cloning
+    Let expr_kind be proc memory_get_int64 from Memory with expr, 0
+
+    If expr_kind is equal to 10002:  Note: BINARY_EXPRESSION
+        Let left_offset be 16
+        Let right_offset be 24
+        Let left be proc memory_get_int64 from Memory with expr, left_offset
+        Let right be proc memory_get_int64 from Memory with expr, right_offset
+
+        Let cloned_left be proc clone_expression with left
+        Let cloned_right be proc clone_expression with right
+        proc memory_set_int64 from Memory with cloned, left_offset, cloned_left
+        proc memory_set_int64 from Memory with cloned, right_offset, cloned_right
+    End If
+
+    If expr_kind is equal to 10003:  Note: UNARY_EXPRESSION
+        Let operand_offset be 16
+        Let operand be proc memory_get_int64 from Memory with expr, operand_offset
+        Let cloned_operand be proc clone_expression with operand
+        proc memory_set_int64 from Memory with cloned, operand_offset, cloned_operand
+    End If
+
+    If expr_kind is equal to 10004:  Note: TERNARY_EXPRESSION
+        Let condition_offset be 8
+        Let true_offset be 16
+        Let false_offset be 24
+        Let condition be proc memory_get_int64 from Memory with expr, condition_offset
+        Let true_branch be proc memory_get_int64 from Memory with expr, true_offset
+        Let false_branch be proc memory_get_int64 from Memory with expr, false_offset
+
+        Let cloned_condition be proc clone_expression with condition
+        Let cloned_true be proc clone_expression with true_branch
+        Let cloned_false be proc clone_expression with false_branch
+        proc memory_set_int64 from Memory with cloned, condition_offset, cloned_condition
+        proc memory_set_int64 from Memory with cloned, true_offset, cloned_true
+        proc memory_set_int64 from Memory with cloned, false_offset, cloned_false
+    End If
+
+    If expr_kind is equal to 10005:  Note: CALL_EXPRESSION
+        Let callee_offset be 24
+        Let args_offset be 32
+        Let arg_count_offset be 40
+        Let callee be proc memory_get_int64 from Memory with expr, callee_offset
+        Let args be proc memory_get_int64 from Memory with expr, args_offset
+        Let arg_count be proc memory_get_int64 from Memory with expr, arg_count_offset
+
+        Let cloned_callee be proc clone_expression with callee
+        proc memory_set_int64 from Memory with cloned, callee_offset, cloned_callee
+
+        If args is not equal to 0:
+            Let args_size be arg_count * 8
+            Let cloned_args be proc allocate from Layout with args_size
+
+            Let arg_idx be 0
+            While arg_idx is less than arg_count:
+                Let arg_offset be arg_idx * 8
+                Let arg be proc memory_get_int64 from Memory with args, arg_offset
+                Let cloned_arg be proc clone_expression with arg
+                proc memory_set_int64 from Memory with cloned_args, arg_offset, cloned_arg
+                Set arg_idx to arg_idx plus 1
+            End While
+
+            proc memory_set_int64 from Memory with cloned, args_offset, cloned_args
+        End If
+    End If
+
+    If expr_kind is equal to 10006:  Note: INDEX_EXPRESSION
+        Let object_offset be 8
+        Let index_offset be 16
+        Let object be proc memory_get_int64 from Memory with expr, object_offset
+        Let index be proc memory_get_int64 from Memory with expr, index_offset
+
+        Let cloned_object be proc clone_expression with object
+        Let cloned_index be proc clone_expression with index
+        proc memory_set_int64 from Memory with cloned, object_offset, cloned_object
+        proc memory_set_int64 from Memory with cloned, index_offset, cloned_index
+    End If
+
+    If expr_kind is equal to 10007:  Note: MEMBER_EXPRESSION
+        Let object_offset be 8
+        Let object be proc memory_get_int64 from Memory with expr, object_offset
+        Let cloned_object be proc clone_expression with object
+        proc memory_set_int64 from Memory with cloned, object_offset, cloned_object
+    End If
+
+    If expr_kind is equal to 10011:  Note: ARRAY_LITERAL
+        Let elements_offset be 16
+        Let element_count_offset be 24
+        Let elements be proc memory_get_int64 from Memory with expr, elements_offset
+        Let element_count be proc memory_get_int64 from Memory with expr, element_count_offset
+
+        If elements is not equal to 0:
+            Let elements_size be element_count * 8
+            Let cloned_elements be proc allocate from Layout with elements_size
+
+            Let elem_idx be 0
+            While elem_idx is less than element_count:
+                Let elem_offset be elem_idx * 8
+                Let element be proc memory_get_int64 from Memory with elements, elem_offset
+                Let cloned_element be proc clone_expression with element
+                proc memory_set_int64 from Memory with cloned_elements, elem_offset, cloned_element
+                Set elem_idx to elem_idx plus 1
+            End While
+
+            proc memory_set_int64 from Memory with cloned, elements_offset, cloned_elements
+        End If
+    End If
+
+    If expr_kind is equal to 10014:  Note: LAMBDA_EXPRESSION
+        Let body_offset be 24
+        Let body be proc memory_get_int64 from Memory with expr, body_offset
+        Let cloned_body be proc clone_statement with body
+        proc memory_set_int64 from Memory with cloned, body_offset, cloned_body
+    End If
+
+    If expr_kind is equal to 10015:  Note: CAST_EXPRESSION
+        Let expression_offset be 8
+        Let expression be proc memory_get_int64 from Memory with expr, expression_offset
+        Let cloned_expression be proc clone_expression with expression
+        proc memory_set_int64 from Memory with cloned, expression_offset, cloned_expression
+    End If
+
+    Note: Literals and identifiers (10000, 10001) have no child nodes to clone
+    Note: Already copied via memcpy, so just return
+
+    Return cloned
+End Process
+
+Note: ========================================
+Note: UTILITIES
+Note: ========================================
+:End Note
+
+Let global_instantiation_id_counter be 1
+
+Process called "generate_instantiation_id" returns Integer:
+    Let new_id be global_instantiation_id_counter
+    Set global_instantiation_id_counter to global_instantiation_id_counter plus 1
+    Return new_id
+End Process

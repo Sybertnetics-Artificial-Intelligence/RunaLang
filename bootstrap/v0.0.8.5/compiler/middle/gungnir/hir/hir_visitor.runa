@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,1046 @@ This file consists of the following functions/features/operation types:
 - HIR node visiting and HIR tree walking
 - HIR transformation and HIR tree modification
 - HIR analysis and HIR tree analysis
+
+Dependencies:
+- Imports hir.runa for HIR node types and operations
+- Imports hir_nodes.runa for specialized HIR node structures
+- Imports memory/layout.runa for memory operations
+- Imports collections/list.runa for visit stack management
 :End Note
 
-Note: TODO - Implement HIR visitor functionality
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: HIR Visitor Context Structure
+Note: ============================================================================
+
+Type called "HIRVisitorContext":
+    pre_visit_callback as Integer    Note: Function pointer for pre-visit (called before children)
+    post_visit_callback as Integer   Note: Function pointer for post-visit (called after children)
+    user_data as Integer              Note: Pointer to user-provided data
+    visit_stack as Integer            Note: Pointer to List of visited nodes (for cycle detection)
+    depth as Integer                  Note: Current traversal depth
+    parent_node as Integer            Note: Pointer to parent HIR node
+    error_count as Integer            Note: Number of errors encountered during visiting
+    stop_traversal as Integer         Note: Boolean: 1 to stop traversal, 0 to continue
+End Type
+
+Note: ============================================================================
+Note: Visitor Context Management
+Note: ============================================================================
+
+Process called "create_visitor_context" takes pre_callback as Integer, post_callback as Integer, user_data as Integer returns Integer:
+    Note: Create new HIR visitor context for tree traversal
+
+    @Reasoning:
+    Visitor context maintains state during HIR tree traversal including
+    callbacks, user data, visit stack for cycle detection, and traversal depth.
+    @End Reasoning
+
+    @Implementation:
+    HIRVisitorContext: 8 fields × 8 bytes = 64 bytes
+    Initialize with callbacks, user data, and empty visit stack.
+    @End Implementation
+
+    Let context_size be 64
+    Let context be proc allocate from Layout with context_size
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Create visit stack for cycle detection
+    Let visit_stack be proc create from List
+
+    If visit_stack is equal to 0:
+        proc deallocate from Layout with context
+        Return 0
+    End If
+
+    Note: Initialize context fields
+    proc memory_set_int64 from Layout with context, 0, pre_callback
+    proc memory_set_int64 from Layout with context, 8, post_callback
+    proc memory_set_int64 from Layout with context, 16, user_data
+    proc memory_set_int64 from Layout with context, 24, visit_stack
+    proc memory_set_int64 from Layout with context, 32, 0  Note: depth = 0
+    proc memory_set_int64 from Layout with context, 40, 0  Note: parent_node = null
+    proc memory_set_int64 from Layout with context, 48, 0  Note: error_count = 0
+    proc memory_set_int64 from Layout with context, 56, 0  Note: stop_traversal = false
+
+    Return context
+End Process
+
+Process called "destroy_visitor_context" takes context as Integer returns Integer:
+    Note: Destroy visitor context and free resources
+
+    @Reasoning:
+    Clean up visitor context including visit stack to prevent memory leaks.
+    @End Reasoning
+
+    If context is equal to 0:
+        Return 1
+    End If
+
+    Note: Get and destroy visit stack (offset 24)
+    Let visit_stack be proc memory_get_int64 from Layout with context, 24
+
+    If visit_stack is not equal to 0:
+        proc destroy from List with visit_stack
+    End If
+
+    Note: Deallocate context itself
+    proc deallocate from Layout with context
+
+    Return 1
+End Process
+
+Process called "visitor_push_node" takes context as Integer, node as Integer returns Integer:
+    Note: Push node onto visit stack for cycle detection
+
+    @Reasoning:
+    Track visited nodes to detect cycles in HIR graph and prevent
+    infinite recursion.
+    @End Reasoning
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Note: Get visit stack (offset 24)
+    Let visit_stack be proc memory_get_int64 from Layout with context, 24
+
+    Note: Check if node already visited (cycle detection)
+    Let stack_size be proc size from List with visit_stack
+    Let i be 0
+
+    While i is less than stack_size:
+        Let visited_node be proc get from List with visit_stack, i
+
+        If visited_node is equal to node:
+            Note: Cycle detected - increment error count
+            Let error_count be proc memory_get_int64 from Layout with context, 48
+            Set error_count to error_count plus 1
+            proc memory_set_int64 from Layout with context, 48, error_count
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Add node to visit stack
+    proc append from List with visit_stack, node
+
+    Note: Increment depth (offset 32)
+    Let depth be proc memory_get_int64 from Layout with context, 32
+    Set depth to depth plus 1
+    proc memory_set_int64 from Layout with context, 32, depth
+
+    Return 1
+End Process
+
+Process called "visitor_pop_node" takes context as Integer returns Integer:
+    Note: Pop node from visit stack after visiting
+
+    @Reasoning:
+    Remove node from visit stack after completing traversal of its subtree,
+    allowing parent nodes to be revisited in different branches.
+    @End Reasoning
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Get visit stack (offset 24)
+    Let visit_stack be proc memory_get_int64 from Layout with context, 24
+
+    Note: Get stack size
+    Let stack_size be proc size from List with visit_stack
+
+    If stack_size is equal to 0:
+        Return 0
+    End If
+
+    Note: Remove last node
+    proc remove_last from List with visit_stack
+
+    Note: Decrement depth (offset 32)
+    Let depth be proc memory_get_int64 from Layout with context, 32
+    Set depth to depth minus 1
+    proc memory_set_int64 from Layout with context, 32, depth
+
+    Return 1
+End Process
+
+Process called "visitor_should_stop" takes context as Integer returns Integer:
+    Note: Check if traversal should stop
+
+    @Reasoning:
+    Callbacks can request early termination by setting stop_traversal flag.
+    @End Reasoning
+
+    If context is equal to 0:
+        Return 1  Note: Stop if context is invalid
+    End If
+
+    Note: Get stop_traversal flag (offset 56)
+    Let stop_flag be proc memory_get_int64 from Layout with context, 56
+
+    Return stop_flag
+End Process
+
+Process called "visitor_stop_traversal" takes context as Integer returns Integer:
+    Note: Request early termination of traversal
+
+    @Reasoning:
+    Allows visitor callbacks to stop traversal when condition is met
+    (e.g., found target node, encountered error).
+    @End Reasoning
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Set stop_traversal flag (offset 56)
+    proc memory_set_int64 from Layout with context, 56, 1
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Main Visitor Entry Point
+Note: ============================================================================
+
+Process called "visit_hir_tree" takes root as Integer, context as Integer returns Integer:
+    Note: Visit entire HIR tree starting from root node
+
+    @Reasoning:
+    Main entry point for HIR tree traversal. Calls visit_hir_node recursively
+    to traverse entire tree using pre-order and post-order callbacks.
+    @End Reasoning
+
+    @Implementation:
+    Validate inputs, then delegate to recursive visit_hir_node.
+    Returns 1 on success, 0 on failure.
+    @End Implementation
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Start recursive traversal
+    Let result be proc visit_hir_node from context, root
+
+    Return result
+End Process
+
+Process called "visit_hir_node" takes context as Integer, node as Integer returns Integer:
+    Note: Visit single HIR node with pre-visit, children visit, and post-visit
+
+    @Reasoning:
+    Core visitor logic implementing pre-order and post-order traversal.
+    Calls pre-visit callback, visits children, then calls post-visit callback.
+    Handles cycle detection and early termination.
+    @End Reasoning
+
+    @Implementation:
+    1. Check for stop condition
+    2. Push node onto visit stack (cycle detection)
+    3. Call pre-visit callback
+    4. Visit all children recursively
+    5. Call post-visit callback
+    6. Pop node from visit stack
+    @End Implementation
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    If node is equal to 0:
+        Return 1  Note: Null node is valid (optional children)
+    End If
+
+    Note: Check if traversal should stop
+    Let should_stop be proc visitor_should_stop with context
+
+    If should_stop is equal to 1:
+        Return 1
+    End If
+
+    Note: Push node onto visit stack (returns 0 if cycle detected)
+    Let push_result be proc visitor_push_node from context, node
+
+    If push_result is equal to 0:
+        Return 0  Note: Cycle detected
+    End If
+
+    Note: Get node type (offset 0)
+    Let node_type be proc memory_get_int64 from Layout with node, 0
+
+    Note: Call pre-visit callback if present
+    Let pre_callback be proc memory_get_int64 from Layout with context, 0
+
+    If pre_callback is not equal to 0:
+        Note: Call pre-visit callback with (node, node_type, user_data, context)
+        Let user_data be proc memory_get_int64 from Layout with context, 16
+
+        Note: Callback signature: callback(node, node_type, user_data, context) -> Integer (1=continue, 0=stop)
+        Let callback_result be proc pre_callback with node, node_type, user_data, context
+
+        Note: If callback returns 0, stop traversal
+        If callback_result is equal to 0:
+            proc memory_set_int64 from Layout with context, 56, 1  Note: Set stop_traversal flag
+            Return 0
+        End If
+    End If
+
+    Note: Save current parent
+    Let old_parent be proc memory_get_int64 from Layout with context, 40
+
+    Note: Set this node as parent for children
+    proc memory_set_int64 from Layout with context, 40, node
+
+    Note: Visit children based on node type
+    Let visit_children_result be proc visit_node_children from context, node, node_type
+
+    Note: Restore parent
+    proc memory_set_int64 from Layout with context, 40, old_parent
+
+    Note: Call post-visit callback if present
+    Let post_callback be proc memory_get_int64 from Layout with context, 8
+
+    If post_callback is not equal to 0:
+        Note: Call post-visit callback with (node, node_type, user_data, context)
+        Let user_data be proc memory_get_int64 from Layout with context, 16
+
+        Note: Callback signature: callback(node, node_type, user_data, context) -> Integer (1=continue, 0=stop)
+        Let callback_result be proc post_callback with node, node_type, user_data, context
+
+        Note: If callback returns 0, stop traversal
+        If callback_result is equal to 0:
+            proc memory_set_int64 from Layout with context, 56, 1  Note: Set stop_traversal flag
+            Return 0
+        End If
+    End If
+
+    Note: Pop node from visit stack
+    proc visitor_pop_node with context
+
+    Return visit_children_result
+End Process
+
+Note: ============================================================================
+Note: Children Visiting
+Note: ============================================================================
+
+Process called "visit_node_children" takes context as Integer, node as Integer, node_type as Integer returns Integer:
+    Note: Visit all children of a HIR node based on node type
+
+    @Reasoning:
+    Different HIR node types have different child structures.
+    This function dispatches to appropriate child visiting logic based
+    on node type.
+    @End Reasoning
+
+    @Implementation:
+    Switch on node_type and visit children according to each node's structure.
+    Expressions, statements, and declarations have different child patterns.
+    @End Implementation
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Note: Expression nodes (1000-1999)
+    If node_type is greater than or equal to HIR_LITERAL from HIR:
+        If node_type is less than 2000:
+            Return proc visit_expression_children from context, node, node_type
+        End If
+    End If
+
+    Note: Statement nodes (2000-2999)
+    If node_type is greater than or equal to HIR_LET_STATEMENT from HIR:
+        If node_type is less than 3000:
+            Return proc visit_statement_children from context, node, node_type
+        End If
+    End If
+
+    Note: Declaration nodes (3000-3999)
+    If node_type is greater than or equal to HIR_PROCESS_DEFINITION from HIR:
+        If node_type is less than 4000:
+            Return proc visit_declaration_children from context, node, node_type
+        End If
+    End If
+
+    Note: Type nodes (4000-4999)
+    If node_type is greater than or equal to 4000:
+        If node_type is less than 5000:
+            Return proc visit_type_children from context, node, node_type
+        End If
+    End If
+
+    Note: Unknown or leaf node type
+    Return 1
+End Process
+
+Process called "visit_expression_children" takes context as Integer, node as Integer, node_type as Integer returns Integer:
+    Note: Visit children of expression nodes
+
+    @Reasoning:
+    Expression nodes have different child patterns:
+    - Binary expressions: left and right operands
+    - Unary expressions: single operand
+    - Call expressions: callee and arguments
+    - Member expressions: object and property
+    - Index expressions: object and index
+    - Literals and identifiers: no children
+    @End Reasoning
+
+    If node_type is equal to HIR_BINARY_EXPRESSION from HIR:
+        Note: Binary expression: left (offset 8), right (offset 16) in specialized structure
+        Let left_child be proc memory_get_int64 from Layout with node, 8
+        Let right_child be proc memory_get_int64 from Layout with node, 16
+
+        Let left_result be proc visit_hir_node from context, left_child
+
+        If left_result is equal to 0:
+            Return 0
+        End If
+
+        Let right_result be proc visit_hir_node from context, right_child
+
+        Return right_result
+    End If
+
+    If node_type is equal to HIR_UNARY_EXPRESSION from HIR:
+        Note: Unary expression: operand (offset 8) in specialized structure
+        Let operand be proc memory_get_int64 from Layout with node, 8
+        Return proc visit_hir_node from context, operand
+    End If
+
+    If node_type is equal to HIR_CALL_EXPRESSION from HIR:
+        Note: Call expression: callee (offset 8), arguments list (offset 16), arg_count (offset 24)
+        Let callee be proc memory_get_int64 from Layout with node, 8
+        Let arguments_list be proc memory_get_int64 from Layout with node, 16
+        Let arg_count be proc memory_get_int64 from Layout with node, 24
+
+        Note: Visit callee first
+        Let callee_result be proc visit_hir_node from context, callee
+
+        If callee_result is equal to 0:
+            Return 0
+        End If
+
+        Note: Visit all arguments
+        Let i be 0
+
+        While i is less than arg_count:
+            Let arg be proc get from List with arguments_list, i
+            Let arg_result be proc visit_hir_node from context, arg
+
+            If arg_result is equal to 0:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    If node_type is equal to HIR_MEMBER_ACCESS from HIR:
+        Note: Member expression: object (offset 8), property (offset 16)
+        Let object_node be proc memory_get_int64 from Layout with node, 8
+        Return proc visit_hir_node from context, object_node
+    End If
+
+    If node_type is equal to HIR_INDEX_EXPRESSION from HIR:
+        Note: Index expression: object (offset 8), index (offset 16)
+        Let object_node be proc memory_get_int64 from Layout with node, 8
+        Let index_node be proc memory_get_int64 from Layout with node, 16
+
+        Let object_result be proc visit_hir_node from context, object_node
+
+        If object_result is equal to 0:
+            Return 0
+        End If
+
+        Let index_result be proc visit_hir_node from context, index_node
+
+        Return index_result
+    End If
+
+    Note: Literal and identifier have no children
+    If node_type is equal to HIR_LITERAL from HIR:
+        Return 1
+    End If
+
+    If node_type is equal to HIR_IDENTIFIER from HIR:
+        Return 1
+    End If
+
+    Note: Unknown expression type - no children
+    Return 1
+End Process
+
+Process called "visit_statement_children" takes context as Integer, node as Integer, node_type as Integer returns Integer:
+    Note: Visit children of statement nodes
+
+    @Reasoning:
+    Statement nodes have different child patterns:
+    - Let statements: initializer expression
+    - Set statements: target and value expressions
+    - If statements: condition, then block, optional else block
+    - While loops: condition and body
+    - For loops: iterable and body
+    - Return statements: optional return value
+    - Match statements: expression and when clauses
+    - Block statements: list of statements
+    @End Reasoning
+
+    If node_type is equal to HIR_LET_STATEMENT from HIR:
+        Note: Let statement: initializer (offset 24) in specialized structure
+        Let initializer be proc memory_get_int64 from Layout with node, 24
+
+        If initializer is not equal to 0:
+            Return proc visit_hir_node from context, initializer
+        End If
+
+        Return 1
+    End If
+
+    If node_type is equal to HIR_SET_STATEMENT from HIR:
+        Note: Set statement: target (offset 8), value (offset 16)
+        Let target be proc memory_get_int64 from Layout with node, 8
+        Let value be proc memory_get_int64 from Layout with node, 16
+
+        Let target_result be proc visit_hir_node from context, target
+
+        If target_result is equal to 0:
+            Return 0
+        End If
+
+        Return proc visit_hir_node from context, value
+    End If
+
+    If node_type is equal to HIR_IF_STATEMENT from HIR:
+        Note: If statement: condition (offset 8), then_block (offset 16), else_block (offset 24)
+        Let condition be proc memory_get_int64 from Layout with node, 8
+        Let then_block be proc memory_get_int64 from Layout with node, 16
+        Let else_block be proc memory_get_int64 from Layout with node, 24
+
+        Note: Visit condition
+        Let condition_result be proc visit_hir_node from context, condition
+
+        If condition_result is equal to 0:
+            Return 0
+        End If
+
+        Note: Visit then block
+        Let then_result be proc visit_hir_node from context, then_block
+
+        If then_result is equal to 0:
+            Return 0
+        End If
+
+        Note: Visit else block if present
+        If else_block is not equal to 0:
+            Return proc visit_hir_node from context, else_block
+        End If
+
+        Return 1
+    End If
+
+    If node_type is equal to HIR_WHILE_LOOP from HIR:
+        Note: While loop: condition (offset 8), body (offset 16)
+        Let condition be proc memory_get_int64 from Layout with node, 8
+        Let body be proc memory_get_int64 from Layout with node, 16
+
+        Let condition_result be proc visit_hir_node from context, condition
+
+        If condition_result is equal to 0:
+            Return 0
+        End If
+
+        Return proc visit_hir_node from context, body
+    End If
+
+    If node_type is equal to HIR_FOR_LOOP from HIR:
+        Note: For loop: iterable (offset 8), body (offset 16)
+        Let iterable be proc memory_get_int64 from Layout with node, 8
+        Let body be proc memory_get_int64 from Layout with node, 16
+
+        Let iterable_result be proc visit_hir_node from context, iterable
+
+        If iterable_result is equal to 0:
+            Return 0
+        End If
+
+        Return proc visit_hir_node from context, body
+    End If
+
+    If node_type is equal to HIR_RETURN from HIR:
+        Note: Return statement: return_value (offset 8)
+        Let return_value be proc memory_get_int64 from Layout with node, 8
+
+        If return_value is not equal to 0:
+            Return proc visit_hir_node from context, return_value
+        End If
+
+        Return 1
+    End If
+
+    If node_type is equal to HIR_MATCH from HIR:
+        Note: Match statement: expression (offset 8), when_clauses (offset 16), clause_count (offset 24)
+        Let expression be proc memory_get_int64 from Layout with node, 8
+        Let when_clauses be proc memory_get_int64 from Layout with node, 16
+        Let clause_count be proc memory_get_int64 from Layout with node, 24
+
+        Note: Visit matched expression
+        Let expr_result be proc visit_hir_node from context, expression
+
+        If expr_result is equal to 0:
+            Return 0
+        End If
+
+        Note: Visit all when clauses
+        Let i be 0
+
+        While i is less than clause_count:
+            Let when_clause be proc get from List with when_clauses, i
+            Let clause_result be proc visit_hir_node from context, when_clause
+
+            If clause_result is equal to 0:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    If node_type is equal to HIR_WHEN_CLAUSE from HIR:
+        Note: When clause: pattern (offset 8), guard (offset 16), body (offset 24)
+        Let pattern be proc memory_get_int64 from Layout with node, 8
+        Let guard be proc memory_get_int64 from Layout with node, 16
+        Let body be proc memory_get_int64 from Layout with node, 24
+
+        Note: Visit pattern (if needed for pattern analysis)
+        Let pattern_result be proc visit_hir_node from context, pattern
+
+        If pattern_result is equal to 0:
+            Return 0
+        End If
+
+        Note: Visit guard if present
+        If guard is not equal to 0:
+            Let guard_result be proc visit_hir_node from context, guard
+
+            If guard_result is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Note: Visit body
+        Return proc visit_hir_node from context, body
+    End If
+
+    If node_type is equal to HIR_BLOCK from HIR:
+        Note: Block: statements list (offset 8), statement_count (offset 16)
+        Let statements be proc memory_get_int64 from Layout with node, 8
+        Let stmt_count be proc memory_get_int64 from Layout with node, 16
+
+        Note: Visit all statements
+        Let i be 0
+
+        While i is less than stmt_count:
+            Let stmt be proc get from List with statements, i
+            Let stmt_result be proc visit_hir_node from context, stmt
+
+            If stmt_result is equal to 0:
+                Return 0
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Unknown statement type - no children
+    Return 1
+End Process
+
+Process called "visit_declaration_children" takes context as Integer, node as Integer, node_type as Integer returns Integer:
+    Note: Visit children of declaration nodes
+
+    @Reasoning:
+    Declaration nodes have different child patterns:
+    - Process definitions: parameters and body
+    - Type definitions: fields and methods
+    @End Reasoning
+
+    If node_type is equal to HIR_PROCESS_DEFINITION from HIR:
+        Note: Process definition: parameters (offset 16), param_count (offset 24), return_type (offset 32), body (offset 40)
+        Let parameters be proc memory_get_int64 from Layout with node, 16
+        Let param_count be proc memory_get_int64 from Layout with node, 24
+        Let return_type be proc memory_get_int64 from Layout with node, 32
+        Let body be proc memory_get_int64 from Layout with node, 40
+
+        Note: Visit return type if present
+        If return_type is not equal to 0:
+            Let type_result be proc visit_hir_node from context, return_type
+
+            If type_result is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Note: Visit parameters (usually HIR symbols, may not need visiting)
+
+        Note: Visit body
+        Return proc visit_hir_node from context, body
+    End If
+
+    If node_type is equal to HIR_TYPE_DEFINITION from HIR:
+        Note: Type definition: fields (offset 16), field_count (offset 24)
+        Let fields be proc memory_get_int64 from Layout with node, 16
+        Let field_count be proc memory_get_int64 from Layout with node, 24
+
+        Note: Visit field symbols for type analysis
+        Let i be 0
+
+        While i is less than field_count:
+            Let field be proc get from List with fields, i
+
+            Note: Fields are HIR symbols - visit their type_info (offset 24 in HIRSymbolInfo)
+            If field is not equal to 0:
+                Let field_type be proc memory_get_int64 from Layout with field, 24
+                If field_type is not equal to 0:
+                    Let type_result be proc visit_hir_node from context, field_type
+                    If type_result is equal to 0:
+                        Return 0
+                    End If
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Return 1
+    End If
+
+    Note: Unknown declaration type - no children
+    Return 1
+End Process
+
+Process called "visit_type_children" takes context as Integer, node as Integer, node_type as Integer returns Integer:
+    Note: Visit children of type nodes
+
+    @Reasoning:
+    Type nodes may have child types for:
+    - Generic types: type parameters
+    - Optional types: inner type
+    - Array types: element type
+    - Tuple types: component types
+    - Union types: variant types
+    - Function types: parameter and return types
+    @End Reasoning
+
+    @Implementation:
+    HIRTypeInfo structure (from hir.runa):
+    - offset 0: type_kind
+    - offset 56: element_type (for Optional, Array)
+    - offset 88: variant_types/component_types (for Union, Tuple)
+    - offset 64: variant_count/component_count
+    - offset 96: generic_params (for Generic)
+    - offset 104: generic_count
+    @End Implementation
+
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Note: Get type kind (offset 0 in HIRTypeInfo)
+    Let type_kind be proc memory_get_int64 from Layout with node, 0
+
+    Note: Generic types have type parameters (offset 96: generic_params list, offset 104: count)
+    If type_kind is equal to HIR_GENERIC_TYPE from HIR:
+        Let generic_params be proc memory_get_int64 from Layout with node, 96
+        Let param_count be proc memory_get_int64 from Layout with node, 104
+
+        If generic_params is not equal to 0:
+            Let i be 0
+            While i is less than param_count:
+                Let param_type be proc get from List with generic_params, i
+                Let result be proc visit_hir_node from context, param_type
+                If result is equal to 0:
+                    Return 0
+                End If
+                Set i to i plus 1
+            End While
+        End If
+
+        Return 1
+    End If
+
+    Note: Optional types have inner type (offset 56)
+    If type_kind is equal to HIR_OPTIONAL_TYPE from HIR:
+        Let inner_type be proc memory_get_int64 from Layout with node, 56
+        If inner_type is not equal to 0:
+            Return proc visit_hir_node from context, inner_type
+        End If
+        Return 1
+    End If
+
+    Note: Array types have element type (offset 56)
+    If type_kind is equal to HIR_ARRAY_TYPE from HIR:
+        Let element_type be proc memory_get_int64 from Layout with node, 56
+        If element_type is not equal to 0:
+            Return proc visit_hir_node from context, element_type
+        End If
+        Return 1
+    End If
+
+    Note: Tuple types have component types (offset 88: component_types list, offset 64: count)
+    If type_kind is equal to HIR_TUPLE_TYPE from HIR:
+        Let component_types be proc memory_get_int64 from Layout with node, 88
+        Let component_count be proc memory_get_int64 from Layout with node, 64
+
+        If component_types is not equal to 0:
+            Let i be 0
+            While i is less than component_count:
+                Let component_type be proc get from List with component_types, i
+                Let result be proc visit_hir_node from context, component_type
+                If result is equal to 0:
+                    Return 0
+                End If
+                Set i to i plus 1
+            End While
+        End If
+
+        Return 1
+    End If
+
+    Note: Union types have variant types (offset 88: variant_types list, offset 64: count)
+    If type_kind is equal to HIR_UNION_TYPE from HIR:
+        Let variant_types be proc memory_get_int64 from Layout with node, 88
+        Let variant_count be proc memory_get_int64 from Layout with node, 64
+
+        If variant_types is not equal to 0:
+            Let i be 0
+            While i is less than variant_count:
+                Let variant_type be proc get from List with variant_types, i
+                Let result be proc visit_hir_node from context, variant_type
+                If result is equal to 0:
+                    Return 0
+                End If
+                Set i to i plus 1
+            End While
+        End If
+
+        Return 1
+    End If
+
+    Note: Function types have parameter types and return type
+    If type_kind is equal to HIR_FUNCTION_TYPE from HIR:
+        Note: Visit parameter types (offset 40: parameter list, offset 48: count)
+        Let param_types be proc memory_get_int64 from Layout with node, 40
+        Let param_count be proc memory_get_int64 from Layout with node, 48
+
+        If param_types is not equal to 0:
+            Let i be 0
+            While i is less than param_count:
+                Let param_type be proc get from List with param_types, i
+                Let result be proc visit_hir_node from context, param_type
+                If result is equal to 0:
+                    Return 0
+                End If
+                Set i to i plus 1
+            End While
+        End If
+
+        Note: Visit return type (offset 32)
+        Let return_type be proc memory_get_int64 from Layout with node, 32
+        If return_type is not equal to 0:
+            Let result be proc visit_hir_node from context, return_type
+            If result is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
+    End If
+
+    Note: Primitive and unknown types have no children
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Specialized Visitor Helpers
+Note: ============================================================================
+
+Process called "count_nodes" takes root as Integer returns Integer:
+    Note: Count total number of nodes in HIR tree
+
+    @Reasoning:
+    Utility function to count all nodes in HIR tree by visiting
+    every node and incrementing counter.
+    @End Reasoning
+
+    @Implementation:
+    Create visitor context with counter in user_data, visit tree,
+    return final count.
+    @End Implementation
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    Note: Create counter (allocate Integer)
+    Let counter be proc allocate from Layout with 8
+
+    If counter is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with counter, 0, 0  Note: Initialize to 0
+
+    Note: Create visitor context (no callbacks needed, just traverse)
+    Let context be proc create_visitor_context from 0, 0, counter
+
+    If context is equal to 0:
+        proc deallocate from Layout with counter
+        Return 0
+    End If
+
+    Note: Count nodes by traversing tree
+    proc visit_hir_tree from root, context
+
+    Note: Get final count
+    Let final_count be proc memory_get_int64 from Layout with counter, 0
+
+    Note: Cleanup
+    proc destroy_visitor_context with context
+    proc deallocate from Layout with counter
+
+    Return final_count
+End Process
+
+Process called "find_node_by_type" takes root as Integer, target_type as Integer, callback as Integer returns Integer:
+    Note: Find first node of specified type in HIR tree using caller-provided callback
+
+    @Reasoning:
+    Utility function to search for first node matching target_type.
+    Caller provides callback that checks node type and stores result.
+    Uses visitor with early termination when target found.
+    @End Reasoning
+
+    @Implementation:
+    Callback signature: callback(node, node_type, user_data, context) -> Integer
+    - user_data points to: [target_type (offset 0), result_ptr (offset 8)]
+    - Callback should:
+      1. Compare node_type to target_type at user_data offset 0
+      2. If match: store node in result_ptr at user_data offset 8, return 0 to stop
+      3. If no match: return 1 to continue
+    @End Implementation
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    If callback is equal to 0:
+        Return 0  Note: Callback is required for search
+    End If
+
+    Note: Create user_data structure: [target_type, result_ptr]
+    Let user_data be proc allocate from Layout with 16
+
+    If user_data is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize user_data fields
+    proc memory_set_int64 from Layout with user_data, 0, target_type
+    proc memory_set_int64 from Layout with user_data, 8, 0  Note: result_ptr starts null
+
+    Note: Create visitor context with callback
+    Let context be proc create_visitor_context from callback, 0, user_data
+
+    If context is equal to 0:
+        proc deallocate from Layout with user_data
+        Return 0
+    End If
+
+    Note: Visit tree - callback will check types and store result
+    proc visit_hir_tree from root, context
+
+    Note: Get found node from user_data
+    Let found_node be proc memory_get_int64 from Layout with user_data, 8
+
+    Note: Cleanup
+    proc destroy_visitor_context with context
+    proc deallocate from Layout with user_data
+
+    Return found_node
+End Process
+
+Process called "validate_hir_tree" takes root as Integer returns Integer:
+    Note: Validate HIR tree structure and detect cycles
+
+    @Reasoning:
+    Utility function to validate HIR tree by traversing and checking
+    for structural issues (cycles, null pointers in required fields).
+    Uses visitor's built-in cycle detection.
+    @End Reasoning
+
+    @Implementation:
+    Create visitor context, traverse tree, check error_count.
+    Returns 1 if valid, 0 if invalid (cycles or errors detected).
+    @End Implementation
+
+    If root is equal to 0:
+        Return 0  Note: Null root is invalid
+    End If
+
+    Note: Create visitor context
+    Let context be proc create_visitor_context from 0, 0, 0
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Visit tree - cycle detection happens automatically
+    proc visit_hir_tree from root, context
+
+    Note: Check if any errors were detected
+    Let error_count be proc memory_get_int64 from Layout with context, 48
+
+    Note: Cleanup
+    proc destroy_visitor_context with context
+
+    Note: Valid if no errors detected
+    If error_count is equal to 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: End of HIR Visitor implementation

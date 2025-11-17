@@ -1,0 +1,756 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+XML Parser - Builds AST from XML tokens
+
+This file implements recursive descent parsing for XML 1.0/1.1, handling:
+- Element trees with proper nesting
+- Attributes
+- Text content
+- Mixed content (text and elements)
+- Self-closing tags
+- Comments
+- CDATA sections
+- Processing instructions
+- Namespace-qualified names
+
+XML AST Node Types:
+- XML_DOCUMENT - Root document node
+- XML_ELEMENT - Element node with name, attributes, children
+- XML_TEXT - Text content node
+- XML_COMMENT - Comment node
+- XML_CDATA - CDATA section node
+- XML_PROCESSING_INSTRUCTION - Processing instruction node
+
+Features:
+- Complete XML 1.0 grammar support
+- Proper nesting validation
+- Attribute parsing and storage
+- Mixed content support
+- Error reporting with position information
+- Memory-safe AST construction
+
+Dependencies:
+- xml_lexer.runa (for tokenization)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/xml/xml_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Note: ============================================================================
+Note: XML AST Node Types
+Note: ============================================================================
+
+Constant XML_DOCUMENT as Integer is 200
+Constant XML_ELEMENT as Integer is 201
+Constant XML_TEXT as Integer is 202
+Constant XML_COMMENT as Integer is 203
+Constant XML_CDATA as Integer is 204
+Constant XML_PROCESSING_INSTRUCTION as Integer is 205
+
+Note: ============================================================================
+Note: XML AST Node Structure
+Note: ============================================================================
+
+Type called "XMLNode":
+    node_type as Integer        Note: XML_* constant
+    name as Integer             Note: Element/PI name (null for text/comment/cdata)
+    value as Integer            Note: Text/comment/cdata/PI content
+    attributes as Integer       Note: Dictionary of attributes (for elements)
+    children as Integer         Note: List of child nodes
+    line as Integer             Note: Line number in source
+    column as Integer           Note: Column number in source
+End Type
+
+Note: ============================================================================
+Note: XML Parser Structure
+Note: ============================================================================
+
+Type called "XMLParser":
+    lexer as Integer            Note: XML lexer
+    current_token as Integer    Note: Current token
+    error_message as Integer    Note: Error message (if any)
+    has_error as Integer        Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Parser Creation and Destruction
+Note: ============================================================================
+
+Process called "create_xml_parser" takes lexer as Integer returns Integer:
+    Note: Create XML parser with lexer
+
+    Let parser_size be 32  Note: XMLParser: 4 fields × 8 bytes
+    Let parser be proc allocate from Layout with parser_size
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize parser state
+    proc memory_set_int64 from Layout with parser, 0, lexer
+    proc memory_set_int64 from Layout with parser, 8, 0   Note: current_token = null
+    proc memory_set_int64 from Layout with parser, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with parser, 24, 0  Note: has_error = false
+
+    Note: Advance to first token
+    Let first_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, first_token
+
+    Return parser
+End Process
+
+Process called "destroy_xml_parser" takes parser as Integer returns Integer:
+    Note: Destroy XML parser
+
+    If parser is equal to 0:
+        Return 1
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Token Management
+Note: ============================================================================
+
+Process called "advance_token" takes parser as Integer returns Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let token be proc next_token from Lexer with lexer
+
+    proc memory_set_int64 from Layout with parser, 8, token
+
+    Return token
+End Process
+
+Process called "peek_token_type" takes parser as Integer returns Integer:
+    Note: Peek at current token type
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+
+    If token is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+
+    Return token_type
+End Process
+
+Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Check if current token matches expected type
+
+    Let actual_type be proc peek_token_type from parser
+
+    If actual_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
+    Note: Expect token of specific type, set error if mismatch
+
+    Let actual_type be proc peek_token_type from parser
+
+    If actual_type is not equal to expected_type:
+        proc set_parse_error from parser, error_msg
+        Return 0
+    End If
+
+    proc advance_token from parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
+    Note: Set parser error message
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 16, new_error
+    proc memory_set_int64 from Layout with parser, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Node Creation
+Note: ============================================================================
+
+Process called "create_xml_node" takes node_type as Integer returns Integer:
+    Note: Create XML AST node
+
+    Let node_size be 56  Note: XMLNode: 7 fields × 8 bytes
+    Let node be proc allocate from Layout with node_size
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 0, node_type
+    proc memory_set_int64 from Layout with node, 8, 0   Note: name = null
+    proc memory_set_int64 from Layout with node, 16, 0  Note: value = null
+    proc memory_set_int64 from Layout with node, 24, 0  Note: attributes = null
+    proc memory_set_int64 from Layout with node, 32, 0  Note: children = null
+    proc memory_set_int64 from Layout with node, 40, 0  Note: line = 0
+    proc memory_set_int64 from Layout with node, 48, 0  Note: column = 0
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Attribute Parsing
+Note: ============================================================================
+
+Process called "parse_attributes" takes parser as Integer returns Integer:
+    Note: Parse element attributes
+
+    @Reasoning:
+    Attributes are name="value" or name='value' pairs.
+    We parse them into a dictionary for easy access.
+    @End Reasoning
+
+    Let attributes be proc create from Dict
+
+    If attributes is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    While 1 is equal to 1:
+        Note: Check if we have a name (attribute name)
+        Let is_name be proc check_token_type from parser, TOKEN_NAME from Lexer
+
+        If is_name is equal to 0:
+            Break
+        End If
+
+        Note: Get attribute name
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let lexeme be proc memory_get_int64 from Layout with token, 8
+        Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+
+        Let attr_name be proc allocate from Layout with lexeme_length plus 1
+        proc memory_copy from Layout with attr_name, 0, lexeme, 0, lexeme_length
+        proc memory_set_byte from Layout with attr_name, lexeme_length, 0
+
+        proc advance_token from parser
+
+        Note: Expect equals
+        proc expect_token from parser, TOKEN_EQUALS from Lexer, "Expected '=' after attribute name"
+
+        Note: Expect attribute value (quoted string)
+        Let is_string be proc check_token_type from parser, TOKEN_STRING from Lexer
+
+        If is_string is equal to 0:
+            proc set_parse_error from parser, "Expected quoted attribute value"
+            Return 0
+        End If
+
+        Note: Get attribute value
+        Let value_token be proc memory_get_int64 from Layout with parser, 8
+        Let value_lexeme be proc memory_get_int64 from Layout with value_token, 8
+        Let value_length be proc memory_get_int64 from Layout with value_token, 16
+
+        Let attr_value be proc allocate from Layout with value_length plus 1
+        proc memory_copy from Layout with attr_value, 0, value_lexeme, 0, value_length
+        proc memory_set_byte from Layout with attr_value, value_length, 0
+
+        proc advance_token from parser
+
+        Note: Add to attributes dictionary
+        proc put from Dict with attributes, attr_name, attr_value
+    End While
+
+    Return attributes
+End Process
+
+Note: ============================================================================
+Note: Element Parsing
+Note: ============================================================================
+
+Process called "parse_element" takes parser as Integer returns Integer:
+    Note: Parse XML element: <name attr="value">content</name> or <name />
+
+    @Reasoning:
+    Elements can be:
+    - Self-closing: <element />
+    - With content: <element>...</element>
+    - With mixed content: <element>text<child/>more text</element>
+    @End Reasoning
+
+    Note: Expect <
+    proc expect_token from parser, TOKEN_TAG_OPEN from Lexer, "Expected '<'"
+
+    Note: Get element name
+    Let is_name be proc check_token_type from parser, TOKEN_NAME from Lexer
+
+    If is_name is equal to 0:
+        proc set_parse_error from parser, "Expected element name"
+        Return 0
+    End If
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let element_name be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with element_name, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with element_name, lexeme_length, 0
+
+    proc advance_token from parser
+
+    Note: Create element node
+    Let node be proc create_xml_node from XML_ELEMENT
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 8, element_name
+    proc memory_set_int64 from Layout with node, 40, line
+    proc memory_set_int64 from Layout with node, 48, column
+
+    Note: Parse attributes
+    Let attributes be proc parse_attributes from parser
+
+    If attributes is not equal to 0:
+        proc memory_set_int64 from Layout with node, 24, attributes
+    End If
+
+    Note: Check for self-closing tag />
+    Let is_self_close be proc check_token_type from parser, TOKEN_TAG_SELF_CLOSE from Lexer
+
+    If is_self_close is equal to 1:
+        proc advance_token from parser
+        Return node  Note: Self-closing element, no children
+    End If
+
+    Note: Expect >
+    proc expect_token from parser, TOKEN_TAG_CLOSE from Lexer, "Expected '>'"
+
+    Note: Parse children (text, elements, comments, CDATA)
+    Let children be proc create from List
+    proc memory_set_int64 from Layout with node, 32, children
+
+    While 1 is equal to 1:
+        Note: Check for closing tag </
+        Let is_close_tag be proc check_token_type from parser, TOKEN_TAG_CLOSE_OPEN from Lexer
+
+        If is_close_tag is equal to 1:
+            Break
+        End If
+
+        Note: Check for EOF
+        Let is_eof be proc check_token_type from parser, TOKEN_EOF from Lexer
+
+        If is_eof is equal to 1:
+            proc set_parse_error from parser, "Unexpected EOF in element"
+            Return 0
+        End If
+
+        Note: Parse child node
+        Let child be proc parse_content from parser
+
+        If child is equal to 0:
+            Return 0
+        End If
+
+        proc append from List with children, child
+    End While
+
+    Note: Expect closing tag
+    proc advance_token from parser  Note: consume </
+
+    Note: Verify closing tag name matches opening tag
+    Let is_closing_name be proc check_token_type from parser, TOKEN_NAME from Lexer
+
+    If is_closing_name is equal to 0:
+        proc set_parse_error from parser, "Expected closing tag name"
+        Return 0
+    End If
+
+    Let closing_token be proc memory_get_int64 from Layout with parser, 8
+    Let closing_lexeme be proc memory_get_int64 from Layout with closing_token, 8
+    Let closing_length be proc memory_get_int64 from Layout with closing_token, 16
+
+    Note: Compare element_name with closing tag name
+    Let names_match be proc strings_equal from element_name, lexeme_length, closing_lexeme, closing_length
+
+    If names_match is equal to 0:
+        proc set_parse_error from parser, "Closing tag name does not match opening tag"
+        Return 0
+    End If
+
+    proc advance_token from parser
+
+    Note: Expect >
+    proc expect_token from parser, TOKEN_TAG_CLOSE from Lexer, "Expected '>' after closing tag"
+
+    Return node
+End Process
+
+Process called "strings_equal" takes str1 as Integer, len1 as Integer, str2 as Integer, len2 as Integer returns Integer:
+    Note: Check if two strings are equal
+
+    If len1 is not equal to len2:
+        Return 0
+    End If
+
+    Let index be 0
+
+    While index is less than len1:
+        Let char1 be proc memory_get_byte from Layout with str1, index
+        Let char2 be proc memory_get_byte from Layout with str2, index
+
+        If char1 is not equal to char2:
+            Return 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Content Parsing
+Note: ============================================================================
+
+Process called "parse_content" takes parser as Integer returns Integer:
+    Note: Parse content node (text, element, comment, CDATA, PI)
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: Element
+    If token_type is equal to TOKEN_TAG_OPEN from Lexer:
+        Return proc parse_element from parser
+    End If
+
+    Note: Text content
+    If token_type is equal to TOKEN_TEXT from Lexer:
+        Return proc parse_text from parser
+    End If
+
+    Note: Comment
+    If token_type is equal to TOKEN_COMMENT from Lexer:
+        Return proc parse_comment from parser
+    End If
+
+    Note: CDATA
+    If token_type is equal to TOKEN_CDATA from Lexer:
+        Return proc parse_cdata from parser
+    End If
+
+    Note: Processing instruction
+    If token_type is equal to TOKEN_PROCESSING_INSTRUCTION from Lexer:
+        Return proc parse_processing_instruction from parser
+    End If
+
+    proc set_parse_error from parser, "Unexpected token in content"
+    Return 0
+End Process
+
+Process called "parse_text" takes parser as Integer returns Integer:
+    Note: Parse text content node
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let text_value be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with text_value, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with text_value, lexeme_length, 0
+
+    proc advance_token from parser
+
+    Let node be proc create_xml_node from XML_TEXT
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 16, text_value
+    proc memory_set_int64 from Layout with node, 40, line
+    proc memory_set_int64 from Layout with node, 48, column
+
+    Return node
+End Process
+
+Process called "parse_comment" takes parser as Integer returns Integer:
+    Note: Parse comment node
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let comment_value be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with comment_value, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with comment_value, lexeme_length, 0
+
+    proc advance_token from parser
+
+    Let node be proc create_xml_node from XML_COMMENT
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 16, comment_value
+    proc memory_set_int64 from Layout with node, 40, line
+    proc memory_set_int64 from Layout with node, 48, column
+
+    Return node
+End Process
+
+Process called "parse_cdata" takes parser as Integer returns Integer:
+    Note: Parse CDATA section node
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let cdata_value be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with cdata_value, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with cdata_value, lexeme_length, 0
+
+    proc advance_token from parser
+
+    Let node be proc create_xml_node from XML_CDATA
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 16, cdata_value
+    proc memory_set_int64 from Layout with node, 40, line
+    proc memory_set_int64 from Layout with node, 48, column
+
+    Return node
+End Process
+
+Process called "parse_processing_instruction" takes parser as Integer returns Integer:
+    Note: Parse processing instruction node
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let pi_value be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with pi_value, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with pi_value, lexeme_length, 0
+
+    proc advance_token from parser
+
+    Let node be proc create_xml_node from XML_PROCESSING_INSTRUCTION
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 16, pi_value
+    proc memory_set_int64 from Layout with node, 40, line
+    proc memory_set_int64 from Layout with node, 48, column
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Document Parsing
+Note: ============================================================================
+
+Process called "parse_document" takes parser as Integer returns Integer:
+    Note: Parse XML document
+
+    @Reasoning:
+    An XML document consists of:
+    - Optional processing instruction (<?xml version="1.0"?>)
+    - Optional comments
+    - Single root element
+    - Optional trailing comments
+    @End Reasoning
+
+    Note: Create document node
+    Let doc be proc create_xml_node from XML_DOCUMENT
+
+    If doc is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Let children be proc create from List
+    proc memory_set_int64 from Layout with doc, 32, children
+
+    Note: Skip processing instructions and comments before root
+    While 1 is equal to 1:
+        Let token_type be proc peek_token_type from parser
+
+        If token_type is equal to TOKEN_PROCESSING_INSTRUCTION from Lexer:
+            Let pi be proc parse_processing_instruction from parser
+            proc append from List with children, pi
+        Otherwise If token_type is equal to TOKEN_COMMENT from Lexer:
+            Let comment be proc parse_comment from parser
+            proc append from List with children, comment
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Note: Parse root element
+    Let is_element be proc check_token_type from parser, TOKEN_TAG_OPEN from Lexer
+
+    If is_element is equal to 0:
+        proc set_parse_error from parser, "Expected root element"
+        Return 0
+    End If
+
+    Let root be proc parse_element from parser
+
+    If root is equal to 0:
+        Return 0
+    End If
+
+    proc append from List with children, root
+
+    Note: Parse any trailing content (comments, PIs)
+    While 1 is equal to 1:
+        Let token_type be proc peek_token_type from parser
+
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_PROCESSING_INSTRUCTION from Lexer:
+            Let pi be proc parse_processing_instruction from parser
+            proc append from List with children, pi
+        Otherwise If token_type is equal to TOKEN_COMMENT from Lexer:
+            Let comment be proc parse_comment from parser
+            proc append from List with children, comment
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Return doc
+End Process
+
+Note: ============================================================================
+Note: Top-Level Parsing Entry Point
+Note: ============================================================================
+
+Process called "parse_xml" takes source as Integer returns Integer:
+    Note: Parse XML source code to AST
+
+    @Reasoning:
+    Top-level entry point for XML parsing.
+    Creates lexer and parser, parses document, handles errors.
+    @End Reasoning
+
+    If source is equal to 0:
+        Return 0
+    End If
+
+    Note: Create lexer
+    Let lexer be proc create_xml_lexer from Lexer with source
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Create parser
+    Let parser be proc create_xml_parser from lexer
+
+    If parser is equal to 0:
+        proc destroy_xml_lexer from Lexer with lexer
+        Return 0
+    End If
+
+    Note: Parse document
+    Let document be proc parse_document from parser
+
+    Note: Check for errors
+    Let has_error be proc memory_get_int64 from Layout with parser, 24
+
+    If has_error is equal to 1:
+        Let error_msg be proc memory_get_int64 from Layout with parser, 16
+        proc print from "XML parse error:", error_msg
+        proc destroy_xml_parser from parser
+        proc destroy_xml_lexer from Lexer with lexer
+        Return 0
+    End If
+
+    Note: Cleanup
+    proc destroy_xml_parser from parser
+    proc destroy_xml_lexer from Lexer with lexer
+
+    Return document
+End Process
+
+Note: End of XML Parser

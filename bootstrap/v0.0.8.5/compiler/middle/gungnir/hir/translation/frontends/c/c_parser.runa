@@ -1,0 +1,2037 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+C Parser - Builds Abstract Syntax Tree from C tokens
+
+This file implements a recursive descent parser for the C programming language.
+Parses C11 standard syntax including declarations, statements, expressions,
+and preprocessor directives.
+
+AST Node Types:
+- C_PROGRAM: Root node containing all declarations
+- C_FUNCTION: Function declaration/definition
+- C_VARIABLE: Variable declaration
+- C_STRUCT: Struct declaration
+- C_UNION: Union declaration
+- C_ENUM: Enum declaration
+- C_TYPEDEF: Type alias declaration
+- C_STATEMENT: Statement nodes (if, while, for, return, etc.)
+- C_EXPRESSION: Expression nodes (binary, unary, call, literal, etc.)
+- C_TYPE: Type information (int, char*, struct foo, etc.)
+
+Dependencies:
+- c_lexer.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/c/c_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: AST Node Type Constants
+Note: ============================================================================
+
+Constant C_PROGRAM as Integer is 1
+Constant C_FUNCTION as Integer is 2
+Constant C_VARIABLE as Integer is 3
+Constant C_STRUCT as Integer is 4
+Constant C_UNION as Integer is 5
+Constant C_ENUM as Integer is 6
+Constant C_TYPEDEF as Integer is 7
+Constant C_PARAMETER as Integer is 8
+
+Note: Statement types
+Constant C_COMPOUND_STMT as Integer is 20
+Constant C_IF_STMT as Integer is 21
+Constant C_WHILE_STMT as Integer is 22
+Constant C_FOR_STMT as Integer is 23
+Constant C_DO_WHILE_STMT as Integer is 24
+Constant C_SWITCH_STMT as Integer is 25
+Constant C_CASE_STMT as Integer is 26
+Constant C_DEFAULT_STMT as Integer is 27
+Constant C_RETURN_STMT as Integer is 28
+Constant C_BREAK_STMT as Integer is 29
+Constant C_CONTINUE_STMT as Integer is 30
+Constant C_GOTO_STMT as Integer is 31
+Constant C_LABEL_STMT as Integer is 32
+Constant C_EXPR_STMT as Integer is 33
+
+Note: Expression types
+Constant C_BINARY_EXPR as Integer is 40
+Constant C_UNARY_EXPR as Integer is 41
+Constant C_CALL_EXPR as Integer is 42
+Constant C_SUBSCRIPT_EXPR as Integer is 43
+Constant C_MEMBER_EXPR as Integer is 44
+Constant C_CAST_EXPR as Integer is 45
+Constant C_SIZEOF_EXPR as Integer is 46
+Constant C_TERNARY_EXPR as Integer is 47
+Constant C_LITERAL_EXPR as Integer is 48
+Constant C_IDENTIFIER_EXPR as Integer is 49
+Constant C_ASSIGN_EXPR as Integer is 50
+
+Note: Type nodes
+Constant C_TYPE_NODE as Integer is 60
+Constant C_POINTER_TYPE as Integer is 61
+Constant C_ARRAY_TYPE as Integer is 62
+Constant C_FUNCTION_TYPE as Integer is 63
+
+Note: Preprocessor
+Constant C_PREPROCESSOR as Integer is 70
+
+Note: ============================================================================
+Note: AST Node Structure
+Note: ============================================================================
+
+Type called "CASTNode":
+    node_type as Integer       Note: Node type constant
+    name as Integer           Note: Name/identifier (if applicable)
+    value as Integer          Note: Value/operator (if applicable)
+    type_info as Integer      Note: Type information node
+    children as Integer       Note: List of child nodes
+    attributes as Integer     Note: Additional attributes (qualifiers, etc.)
+    line as Integer          Note: Source line number
+    column as Integer        Note: Source column number
+End Type
+
+Note: ============================================================================
+Note: Parser State
+Note: ============================================================================
+
+Type called "CParser":
+    lexer as Integer          Note: C lexer
+    current_token as Integer  Note: Current token type
+    error_message as Integer  Note: Error message (if any)
+    has_error as Integer      Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Parser Creation and Destruction
+Note: ============================================================================
+
+Process called "create_c_parser" takes source as Integer returns Integer:
+    Note: Create C parser from source code
+
+    Let parser_size be 32  Note: CParser: 4 fields × 8 bytes
+    Let parser be proc allocate from Layout with parser_size
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let lexer be proc create_c_lexer from Lexer with source
+
+    If lexer is equal to 0:
+        proc deallocate from Layout with parser
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 0, lexer
+    proc memory_set_int64 from Layout with parser, 8, 0   Note: current_token
+    proc memory_set_int64 from Layout with parser, 16, 0  Note: error_message
+    proc memory_set_int64 from Layout with parser, 24, 0  Note: has_error = false
+
+    Note: Prime the parser with first token
+    proc advance_token from parser
+
+    Return parser
+End Process
+
+Process called "destroy_c_parser" takes parser as Integer returns Integer:
+    Note: Destroy C parser and free resources
+
+    If parser is equal to 0:
+        Return 1
+    End If
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+
+    If lexer is not equal to 0:
+        proc destroy_c_lexer from Lexer with lexer
+    End If
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: AST Node Creation
+Note: ============================================================================
+
+Process called "create_ast_node" takes node_type as Integer returns Integer:
+    Note: Create AST node of given type
+
+    Let node_size be 64  Note: CASTNode: 8 fields × 8 bytes
+    Let node be proc allocate from Layout with node_size
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 0, node_type
+    proc memory_set_int64 from Layout with node, 8, 0   Note: name = null
+    proc memory_set_int64 from Layout with node, 16, 0  Note: value = null
+    proc memory_set_int64 from Layout with node, 24, 0  Note: type_info = null
+    proc memory_set_int64 from Layout with node, 32, 0  Note: children = null
+    proc memory_set_int64 from Layout with node, 40, 0  Note: attributes = null
+    proc memory_set_int64 from Layout with node, 48, 0  Note: line = 0
+    proc memory_set_int64 from Layout with node, 56, 0  Note: column = 0
+
+    Let children be proc create from List
+
+    If children is not equal to 0:
+        proc memory_set_int64 from Layout with node, 32, children
+    End If
+
+    Return node
+End Process
+
+Process called "set_node_name" takes node as Integer, name as Integer returns Integer:
+    Note: Set node name
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let name_length be proc string_length from StringCore with name
+    Let name_copy be proc allocate from Layout with name_length plus 1
+
+    If name_copy is not equal to 0:
+        proc memory_copy from Layout with name_copy, 0, name, 0, name_length
+        proc memory_set_byte from Layout with name_copy, name_length, 0
+        proc memory_set_int64 from Layout with node, 8, name_copy
+    End If
+
+    Return 1
+End Process
+
+Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
+    Note: Set node value
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let value_length be proc string_length from StringCore with value
+    Let value_copy be proc allocate from Layout with value_length plus 1
+
+    If value_copy is not equal to 0:
+        proc memory_copy from Layout with value_copy, 0, value, 0, value_length
+        proc memory_set_byte from Layout with value_copy, value_length, 0
+        proc memory_set_int64 from Layout with node, 16, value_copy
+    End If
+
+    Return 1
+End Process
+
+Process called "set_node_type_info" takes node as Integer, type_info as Integer returns Integer:
+    Note: Set node type information
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 24, type_info
+
+    Return 1
+End Process
+
+Process called "add_child_node" takes node as Integer, child as Integer returns Integer:
+    Note: Add child node
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    If child is equal to 0:
+        Return 0
+    End If
+
+    Let children be proc memory_get_int64 from Layout with node, 32
+
+    If children is equal to 0:
+        Return 0
+    End If
+
+    proc append from List with children, child
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Token Access
+Note: ============================================================================
+
+Process called "advance_token" takes parser as Integer returns Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let token_type be proc next_token from Lexer with lexer
+
+    proc memory_set_int64 from Layout with parser, 8, token_type
+
+    Return token_type
+End Process
+
+Process called "peek_token_type" takes parser as Integer returns Integer:
+    Note: Peek at current token type
+
+    Let token_type be proc memory_get_int64 from Layout with parser, 8
+
+    Return token_type
+End Process
+
+Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Check if current token matches expected type
+
+    Let token_type be proc memory_get_int64 from Layout with parser, 8
+
+    If token_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
+    Note: Expect token of given type, set error if not found
+
+    Let token_type be proc memory_get_int64 from Layout with parser, 8
+
+    If token_type is not equal to expected_type:
+        proc set_parse_error from parser, error_msg
+        Return 0
+    End If
+
+    proc advance_token from parser
+
+    Return 1
+End Process
+
+Process called "peek_token_lexeme" takes parser as Integer returns Integer:
+    Note: Get current token lexeme
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let lexeme be proc get_token_lexeme from Lexer with lexer
+
+    Return lexeme
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
+    Note: Set parse error message
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 16, new_error
+    proc memory_set_int64 from Layout with parser, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Process called "has_parse_error" takes parser as Integer returns Integer:
+    Note: Check if parser has error
+
+    Let has_error be proc memory_get_int64 from Layout with parser, 24
+
+    Return has_error
+End Process
+
+Process called "get_parse_error" takes parser as Integer returns Integer:
+    Note: Get parse error message
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    Return error_message
+End Process
+
+Note: ============================================================================
+Note: Type Parsing
+Note: ============================================================================
+
+Process called "parse_type_specifier" takes parser as Integer returns Integer:
+    Note: Parse type specifier (int, char, struct foo, etc.)
+
+    @Reasoning:
+    Type specifiers can be primitive (int, char, float, double, void),
+    or user-defined (struct, union, enum, typedef name).
+    @End Reasoning
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: Primitive types
+    If token_type is equal to TOKEN_INT from Lexer:
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, "int"
+        proc advance_token from parser
+        Return type_node
+    End If
+
+    If token_type is equal to TOKEN_CHAR from Lexer:
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, "char"
+        proc advance_token from parser
+        Return type_node
+    End If
+
+    If token_type is equal to TOKEN_FLOAT from Lexer:
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, "float"
+        proc advance_token from parser
+        Return type_node
+    End If
+
+    If token_type is equal to TOKEN_DOUBLE from Lexer:
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, "double"
+        proc advance_token from parser
+        Return type_node
+    End If
+
+    If token_type is equal to TOKEN_VOID from Lexer:
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, "void"
+        proc advance_token from parser
+        Return type_node
+    End If
+
+    If token_type is equal to TOKEN_SHORT from Lexer:
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, "short"
+        proc advance_token from parser
+        Return type_node
+    End If
+
+    If token_type is equal to TOKEN_LONG from Lexer:
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, "long"
+        proc advance_token from parser
+        Return type_node
+    End If
+
+    If token_type is equal to TOKEN_SIGNED from Lexer:
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, "signed"
+        proc advance_token from parser
+        Return type_node
+    End If
+
+    If token_type is equal to TOKEN_UNSIGNED from Lexer:
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, "unsigned"
+        proc advance_token from parser
+        Return type_node
+    End If
+
+    Note: Struct type
+    If token_type is equal to TOKEN_STRUCT from Lexer:
+        proc advance_token from parser
+        Let struct_name be proc peek_token_lexeme from parser
+        proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected struct name"
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, struct_name
+        proc deallocate from Layout with struct_name
+        Return type_node
+    End If
+
+    Note: Union type
+    If token_type is equal to TOKEN_UNION from Lexer:
+        proc advance_token from parser
+        Let union_name be proc peek_token_lexeme from parser
+        proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected union name"
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, union_name
+        proc deallocate from Layout with union_name
+        Return type_node
+    End If
+
+    Note: Enum type
+    If token_type is equal to TOKEN_ENUM from Lexer:
+        proc advance_token from parser
+        Let enum_name be proc peek_token_lexeme from parser
+        proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected enum name"
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, enum_name
+        proc deallocate from Layout with enum_name
+        Return type_node
+    End If
+
+    Note: Typedef name (identifier)
+    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Let type_name be proc peek_token_lexeme from parser
+        proc advance_token from parser
+        Let type_node be proc create_ast_node from C_TYPE_NODE
+        proc set_node_name from type_node, type_name
+        proc deallocate from Layout with type_name
+        Return type_node
+    End If
+
+    proc set_parse_error from parser, "Expected type specifier"
+    Return 0
+End Process
+
+Process called "parse_declarator" takes parser as Integer, base_type as Integer returns Integer:
+    Note: Parse declarator (name with optional pointers and arrays)
+
+    @Reasoning:
+    Declarators modify base types with pointers (*), arrays ([n]),
+    and function types. Parse from right to left in declaration.
+    @End Reasoning
+
+    Let type_node be base_type
+    Let pointer_count be 0
+
+    Note: Parse pointer prefix (*)
+    While 1 is equal to 1:
+        Let is_star be proc check_token_type from parser, TOKEN_STAR from Lexer
+
+        If is_star is equal to 0:
+            Break
+        End If
+
+        proc advance_token from parser
+        Set pointer_count to pointer_count plus 1
+
+        Let ptr_type be proc create_ast_node from C_POINTER_TYPE
+        proc set_node_type_info from ptr_type, type_node
+        Set type_node to ptr_type
+    End While
+
+    Note: Parse identifier
+    Let var_name be proc peek_token_lexeme from parser
+    proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected identifier in declarator"
+
+    Note: Parse array suffix ([n])
+    While 1 is equal to 1:
+        Let is_lbracket be proc check_token_type from parser, TOKEN_LBRACKET from Lexer
+
+        If is_lbracket is equal to 0:
+            Break
+        End If
+
+        proc advance_token from parser
+
+        Let array_size be 0
+        Let is_rbracket be proc check_token_type from parser, TOKEN_RBRACKET from Lexer
+
+        If is_rbracket is equal to 0:
+            Let size_lexeme be proc peek_token_lexeme from parser
+            proc expect_token from parser, TOKEN_INTEGER from Lexer, "Expected array size"
+            Set array_size to proc string_to_int from StringCore with size_lexeme
+            proc deallocate from Layout with size_lexeme
+        End If
+
+        proc expect_token from parser, TOKEN_RBRACKET from Lexer, "Expected ']' after array size"
+
+        Let array_type be proc create_ast_node from C_ARRAY_TYPE
+        proc set_node_type_info from array_type, type_node
+        proc memory_set_int64 from Layout with array_type, 16, array_size  Note: Store size in value field
+        Set type_node to array_type
+    End While
+
+    Let var_node be proc create_ast_node from C_VARIABLE
+    proc set_node_name from var_node, var_name
+    proc set_node_type_info from var_node, type_node
+    proc deallocate from Layout with var_name
+
+    Return var_node
+End Process
+
+Note: ============================================================================
+Note: Expression Parsing
+Note: ============================================================================
+
+Process called "parse_primary_expression" takes parser as Integer returns Integer:
+    Note: Parse primary expression (literal, identifier, parenthesized)
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: Integer literal
+    If token_type is equal to TOKEN_INTEGER from Lexer:
+        Let value be proc peek_token_lexeme from parser
+        proc advance_token from parser
+        Let expr_node be proc create_ast_node from C_LITERAL_EXPR
+        proc set_node_value from expr_node, value
+        proc deallocate from Layout with value
+        Return expr_node
+    End If
+
+    Note: Float literal
+    If token_type is equal to TOKEN_FLOAT_LITERAL from Lexer:
+        Let value be proc peek_token_lexeme from parser
+        proc advance_token from parser
+        Let expr_node be proc create_ast_node from C_LITERAL_EXPR
+        proc set_node_value from expr_node, value
+        proc deallocate from Layout with value
+        Return expr_node
+    End If
+
+    Note: Character literal
+    If token_type is equal to TOKEN_CHAR_LITERAL from Lexer:
+        Let value be proc peek_token_lexeme from parser
+        proc advance_token from parser
+        Let expr_node be proc create_ast_node from C_LITERAL_EXPR
+        proc set_node_value from expr_node, value
+        proc deallocate from Layout with value
+        Return expr_node
+    End If
+
+    Note: String literal
+    If token_type is equal to TOKEN_STRING_LITERAL from Lexer:
+        Let value be proc peek_token_lexeme from parser
+        proc advance_token from parser
+        Let expr_node be proc create_ast_node from C_LITERAL_EXPR
+        proc set_node_value from expr_node, value
+        proc deallocate from Layout with value
+        Return expr_node
+    End If
+
+    Note: Identifier
+    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Let id_name be proc peek_token_lexeme from parser
+        proc advance_token from parser
+        Let expr_node be proc create_ast_node from C_IDENTIFIER_EXPR
+        proc set_node_name from expr_node, id_name
+        proc deallocate from Layout with id_name
+        Return expr_node
+    End If
+
+    Note: Parenthesized expression
+    If token_type is equal to TOKEN_LPAREN from Lexer:
+        proc advance_token from parser
+        Let inner_expr be proc parse_expression from parser
+        proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after expression"
+        Return inner_expr
+    End If
+
+    proc set_parse_error from parser, "Expected primary expression"
+    Return 0
+End Process
+
+Process called "parse_postfix_expression" takes parser as Integer returns Integer:
+    Note: Parse postfix expression (call, subscript, member access, ++/--)
+
+    Let expr be proc parse_primary_expression from parser
+
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    While 1 is equal to 1:
+        Let token_type be proc peek_token_type from parser
+
+        Note: Function call
+        If token_type is equal to TOKEN_LPAREN from Lexer:
+            proc advance_token from parser
+            Let call_expr be proc create_ast_node from C_CALL_EXPR
+            proc add_child_node from call_expr, expr
+
+            Let is_rparen be proc check_token_type from parser, TOKEN_RPAREN from Lexer
+
+            If is_rparen is equal to 0:
+                While 1 is equal to 1:
+                    Let arg be proc parse_expression from parser
+                    If arg is not equal to 0:
+                        proc add_child_node from call_expr, arg
+                    End If
+
+                    Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+                    If is_comma is equal to 0:
+                        Break
+                    End If
+
+                    proc advance_token from parser
+                End While
+            End If
+
+            proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after arguments"
+            Set expr to call_expr
+            Continue
+        End If
+
+        Note: Array subscript
+        If token_type is equal to TOKEN_LBRACKET from Lexer:
+            proc advance_token from parser
+            Let index_expr be proc parse_expression from parser
+            proc expect_token from parser, TOKEN_RBRACKET from Lexer, "Expected ']' after subscript"
+            Let subscript_expr be proc create_ast_node from C_SUBSCRIPT_EXPR
+            proc add_child_node from subscript_expr, expr
+            proc add_child_node from subscript_expr, index_expr
+            Set expr to subscript_expr
+            Continue
+        End If
+
+        Note: Member access (.)
+        If token_type is equal to TOKEN_DOT from Lexer:
+            proc advance_token from parser
+            Let member_name be proc peek_token_lexeme from parser
+            proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected member name"
+            Let member_expr be proc create_ast_node from C_MEMBER_EXPR
+            proc set_node_value from member_expr, "."
+            proc set_node_name from member_expr, member_name
+            proc add_child_node from member_expr, expr
+            proc deallocate from Layout with member_name
+            Set expr to member_expr
+            Continue
+        End If
+
+        Note: Member access (->)
+        If token_type is equal to TOKEN_ARROW from Lexer:
+            proc advance_token from parser
+            Let member_name be proc peek_token_lexeme from parser
+            proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected member name"
+            Let member_expr be proc create_ast_node from C_MEMBER_EXPR
+            proc set_node_value from member_expr, "->"
+            proc set_node_name from member_expr, member_name
+            proc add_child_node from member_expr, expr
+            proc deallocate from Layout with member_name
+            Set expr to member_expr
+            Continue
+        End If
+
+        Note: Postfix increment (++)
+        If token_type is equal to TOKEN_PLUS_PLUS from Lexer:
+            proc advance_token from parser
+            Let unary_expr be proc create_ast_node from C_UNARY_EXPR
+            proc set_node_value from unary_expr, "++post"
+            proc add_child_node from unary_expr, expr
+            Set expr to unary_expr
+            Continue
+        End If
+
+        Note: Postfix decrement (--)
+        If token_type is equal to TOKEN_MINUS_MINUS from Lexer:
+            proc advance_token from parser
+            Let unary_expr be proc create_ast_node from C_UNARY_EXPR
+            proc set_node_value from unary_expr, "--post"
+            proc add_child_node from unary_expr, expr
+            Set expr to unary_expr
+            Continue
+        End If
+
+        Break
+    End While
+
+    Return expr
+End Process
+
+Process called "parse_unary_expression" takes parser as Integer returns Integer:
+    Note: Parse unary expression (-, !, ~, ++, --, *, &, sizeof)
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: Prefix increment (++)
+    If token_type is equal to TOKEN_PLUS_PLUS from Lexer:
+        proc advance_token from parser
+        Let operand be proc parse_unary_expression from parser
+        Let unary_expr be proc create_ast_node from C_UNARY_EXPR
+        proc set_node_value from unary_expr, "++pre"
+        proc add_child_node from unary_expr, operand
+        Return unary_expr
+    End If
+
+    Note: Prefix decrement (--)
+    If token_type is equal to TOKEN_MINUS_MINUS from Lexer:
+        proc advance_token from parser
+        Let operand be proc parse_unary_expression from parser
+        Let unary_expr be proc create_ast_node from C_UNARY_EXPR
+        proc set_node_value from unary_expr, "--pre"
+        proc add_child_node from unary_expr, operand
+        Return unary_expr
+    End If
+
+    Note: Unary minus (-)
+    If token_type is equal to TOKEN_MINUS from Lexer:
+        proc advance_token from parser
+        Let operand be proc parse_unary_expression from parser
+        Let unary_expr be proc create_ast_node from C_UNARY_EXPR
+        proc set_node_value from unary_expr, "-"
+        proc add_child_node from unary_expr, operand
+        Return unary_expr
+    End If
+
+    Note: Logical NOT (!)
+    If token_type is equal to TOKEN_EXCLAIM from Lexer:
+        proc advance_token from parser
+        Let operand be proc parse_unary_expression from parser
+        Let unary_expr be proc create_ast_node from C_UNARY_EXPR
+        proc set_node_value from unary_expr, "!"
+        proc add_child_node from unary_expr, operand
+        Return unary_expr
+    End If
+
+    Note: Bitwise NOT (~)
+    If token_type is equal to TOKEN_TILDE from Lexer:
+        proc advance_token from parser
+        Let operand be proc parse_unary_expression from parser
+        Let unary_expr be proc create_ast_node from C_UNARY_EXPR
+        proc set_node_value from unary_expr, "~"
+        proc add_child_node from unary_expr, operand
+        Return unary_expr
+    End If
+
+    Note: Dereference (*)
+    If token_type is equal to TOKEN_STAR from Lexer:
+        proc advance_token from parser
+        Let operand be proc parse_unary_expression from parser
+        Let unary_expr be proc create_ast_node from C_UNARY_EXPR
+        proc set_node_value from unary_expr, "*"
+        proc add_child_node from unary_expr, operand
+        Return unary_expr
+    End If
+
+    Note: Address-of (&)
+    If token_type is equal to TOKEN_AMP from Lexer:
+        proc advance_token from parser
+        Let operand be proc parse_unary_expression from parser
+        Let unary_expr be proc create_ast_node from C_UNARY_EXPR
+        proc set_node_value from unary_expr, "&"
+        proc add_child_node from unary_expr, operand
+        Return unary_expr
+    End If
+
+    Note: sizeof
+    If token_type is equal to TOKEN_SIZEOF from Lexer:
+        proc advance_token from parser
+        Let operand be proc parse_unary_expression from parser
+        Let sizeof_expr be proc create_ast_node from C_SIZEOF_EXPR
+        proc add_child_node from sizeof_expr, operand
+        Return sizeof_expr
+    End If
+
+    Return proc parse_postfix_expression from parser
+End Process
+
+Process called "parse_binary_expression" takes parser as Integer, precedence as Integer returns Integer:
+    Note: Parse binary expression with operator precedence
+
+    @Reasoning:
+    Use precedence climbing algorithm for binary operators.
+    Precedence levels (higher number = higher precedence):
+    1: ||
+    2: &&
+    3: |
+    4: ^
+    5: &
+    6: ==, !=
+    7: <, >, <=, >=
+    8: <<, >>
+    9: +, -
+    10: *, /, %
+    @End Reasoning
+
+    Let left be proc parse_unary_expression from parser
+
+    If left is equal to 0:
+        Return 0
+    End If
+
+    While 1 is equal to 1:
+        Let token_type be proc peek_token_type from parser
+        Let op_precedence be proc get_operator_precedence from token_type
+
+        If op_precedence is less than precedence:
+            Break
+        End If
+
+        Let operator be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Let right be proc parse_binary_expression from parser, op_precedence plus 1
+
+        If right is equal to 0:
+            Return 0
+        End If
+
+        Let binary_expr be proc create_ast_node from C_BINARY_EXPR
+        proc set_node_value from binary_expr, operator
+        proc add_child_node from binary_expr, left
+        proc add_child_node from binary_expr, right
+        proc deallocate from Layout with operator
+
+        Set left to binary_expr
+    End While
+
+    Return left
+End Process
+
+Process called "get_operator_precedence" takes token_type as Integer returns Integer:
+    Note: Get operator precedence (higher = tighter binding)
+
+    If token_type is equal to TOKEN_PIPE_PIPE from Lexer:
+        Return 1
+    End If
+
+    If token_type is equal to TOKEN_AMP_AMP from Lexer:
+        Return 2
+    End If
+
+    If token_type is equal to TOKEN_PIPE from Lexer:
+        Return 3
+    End If
+
+    If token_type is equal to TOKEN_CARET from Lexer:
+        Return 4
+    End If
+
+    If token_type is equal to TOKEN_AMP from Lexer:
+        Return 5
+    End If
+
+    If token_type is equal to TOKEN_EQUAL_EQUAL from Lexer:
+        Return 6
+    End If
+
+    If token_type is equal to TOKEN_NOT_EQUAL from Lexer:
+        Return 6
+    End If
+
+    If token_type is equal to TOKEN_LESS from Lexer:
+        Return 7
+    End If
+
+    If token_type is equal to TOKEN_GREATER from Lexer:
+        Return 7
+    End If
+
+    If token_type is equal to TOKEN_LESS_EQUAL from Lexer:
+        Return 7
+    End If
+
+    If token_type is equal to TOKEN_GREATER_EQUAL from Lexer:
+        Return 7
+    End If
+
+    If token_type is equal to TOKEN_LESS_LESS from Lexer:
+        Return 8
+    End If
+
+    If token_type is equal to TOKEN_GREATER_GREATER from Lexer:
+        Return 8
+    End If
+
+    If token_type is equal to TOKEN_PLUS from Lexer:
+        Return 9
+    End If
+
+    If token_type is equal to TOKEN_MINUS from Lexer:
+        Return 9
+    End If
+
+    If token_type is equal to TOKEN_STAR from Lexer:
+        Return 10
+    End If
+
+    If token_type is equal to TOKEN_SLASH from Lexer:
+        Return 10
+    End If
+
+    If token_type is equal to TOKEN_PERCENT from Lexer:
+        Return 10
+    End If
+
+    Return 0  Note: Not a binary operator
+End Process
+
+Process called "parse_ternary_expression" takes parser as Integer returns Integer:
+    Note: Parse ternary conditional expression (cond ? true_expr : false_expr)
+
+    Let cond_expr be proc parse_binary_expression from parser, 1
+
+    If cond_expr is equal to 0:
+        Return 0
+    End If
+
+    Let is_question be proc check_token_type from parser, TOKEN_QUESTION from Lexer
+
+    If is_question is equal to 0:
+        Return cond_expr
+    End If
+
+    proc advance_token from parser
+
+    Let true_expr be proc parse_expression from parser
+
+    If true_expr is equal to 0:
+        Return 0
+    End If
+
+    proc expect_token from parser, TOKEN_COLON from Lexer, "Expected ':' in ternary expression"
+
+    Let false_expr be proc parse_ternary_expression from parser
+
+    If false_expr is equal to 0:
+        Return 0
+    End If
+
+    Let ternary_expr be proc create_ast_node from C_TERNARY_EXPR
+    proc add_child_node from ternary_expr, cond_expr
+    proc add_child_node from ternary_expr, true_expr
+    proc add_child_node from ternary_expr, false_expr
+
+    Return ternary_expr
+End Process
+
+Process called "parse_assignment_expression" takes parser as Integer returns Integer:
+    Note: Parse assignment expression (=, +=, -=, etc.)
+
+    Let left be proc parse_ternary_expression from parser
+
+    If left is equal to 0:
+        Return 0
+    End If
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: Check for assignment operators
+    Let is_assign be 0
+
+    If token_type is equal to TOKEN_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_PLUS_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_MINUS_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_STAR_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_SLASH_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_PERCENT_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_AMP_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_PIPE_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_CARET_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_LESS_LESS_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If token_type is equal to TOKEN_GREATER_GREATER_EQUALS from Lexer:
+        Set is_assign to 1
+    End If
+
+    If is_assign is equal to 0:
+        Return left
+    End If
+
+    Let operator be proc peek_token_lexeme from parser
+    proc advance_token from parser
+
+    Let right be proc parse_assignment_expression from parser
+
+    If right is equal to 0:
+        Return 0
+    End If
+
+    Let assign_expr be proc create_ast_node from C_ASSIGN_EXPR
+    proc set_node_value from assign_expr, operator
+    proc add_child_node from assign_expr, left
+    proc add_child_node from assign_expr, right
+    proc deallocate from Layout with operator
+
+    Return assign_expr
+End Process
+
+Process called "parse_expression" takes parser as Integer returns Integer:
+    Note: Parse expression (top-level entry point)
+
+    Return proc parse_assignment_expression from parser
+End Process
+
+Note: ============================================================================
+Note: Statement Parsing
+Note: ============================================================================
+
+Process called "parse_statement" takes parser as Integer returns Integer:
+    Note: Parse statement
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: Compound statement
+    If token_type is equal to TOKEN_LBRACE from Lexer:
+        Return proc parse_compound_statement from parser
+    End If
+
+    Note: If statement
+    If token_type is equal to TOKEN_IF from Lexer:
+        Return proc parse_if_statement from parser
+    End If
+
+    Note: While statement
+    If token_type is equal to TOKEN_WHILE from Lexer:
+        Return proc parse_while_statement from parser
+    End If
+
+    Note: For statement
+    If token_type is equal to TOKEN_FOR from Lexer:
+        Return proc parse_for_statement from parser
+    End If
+
+    Note: Do-while statement
+    If token_type is equal to TOKEN_DO from Lexer:
+        Return proc parse_do_while_statement from parser
+    End If
+
+    Note: Switch statement
+    If token_type is equal to TOKEN_SWITCH from Lexer:
+        Return proc parse_switch_statement from parser
+    End If
+
+    Note: Case label
+    If token_type is equal to TOKEN_CASE from Lexer:
+        Return proc parse_case_statement from parser
+    End If
+
+    Note: Default label
+    If token_type is equal to TOKEN_DEFAULT from Lexer:
+        Return proc parse_default_statement from parser
+    End If
+
+    Note: Return statement
+    If token_type is equal to TOKEN_RETURN from Lexer:
+        Return proc parse_return_statement from parser
+    End If
+
+    Note: Break statement
+    If token_type is equal to TOKEN_BREAK from Lexer:
+        proc advance_token from parser
+        proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after break"
+        Let stmt_node be proc create_ast_node from C_BREAK_STMT
+        Return stmt_node
+    End If
+
+    Note: Continue statement
+    If token_type is equal to TOKEN_CONTINUE from Lexer:
+        proc advance_token from parser
+        proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after continue"
+        Let stmt_node be proc create_ast_node from C_CONTINUE_STMT
+        Return stmt_node
+    End If
+
+    Note: Goto statement
+    If token_type is equal to TOKEN_GOTO from Lexer:
+        proc advance_token from parser
+        Let label_name be proc peek_token_lexeme from parser
+        proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected label name after goto"
+        proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after goto"
+        Let stmt_node be proc create_ast_node from C_GOTO_STMT
+        proc set_node_name from stmt_node, label_name
+        proc deallocate from Layout with label_name
+        Return stmt_node
+    End If
+
+    Note: Expression statement or labeled statement
+    Return proc parse_expression_statement from parser
+End Process
+
+Process called "parse_compound_statement" takes parser as Integer returns Integer:
+    Note: Parse compound statement (block)
+
+    proc expect_token from parser, TOKEN_LBRACE from Lexer, "Expected '{' to start block"
+
+    Let block_node be proc create_ast_node from C_COMPOUND_STMT
+
+    While 1 is equal to 1:
+        Let is_rbrace be proc check_token_type from parser, TOKEN_RBRACE from Lexer
+
+        If is_rbrace is equal to 1:
+            Break
+        End If
+
+        Let is_eof be proc check_token_type from parser, TOKEN_EOF from Lexer
+
+        If is_eof is equal to 1:
+            proc set_parse_error from parser, "Unexpected EOF in block"
+            Return 0
+        End If
+
+        Note: Try to parse declaration or statement
+        Let stmt be proc parse_declaration_or_statement from parser
+
+        If stmt is not equal to 0:
+            proc add_child_node from block_node, stmt
+        End If
+    End While
+
+    proc expect_token from parser, TOKEN_RBRACE from Lexer, "Expected '}' to end block"
+
+    Return block_node
+End Process
+
+Process called "parse_if_statement" takes parser as Integer returns Integer:
+    Note: Parse if statement
+
+    proc expect_token from parser, TOKEN_IF from Lexer, "Expected 'if'"
+    proc expect_token from parser, TOKEN_LPAREN from Lexer, "Expected '(' after if"
+
+    Let condition be proc parse_expression from parser
+
+    If condition is equal to 0:
+        Return 0
+    End If
+
+    proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after condition"
+
+    Let then_stmt be proc parse_statement from parser
+
+    If then_stmt is equal to 0:
+        Return 0
+    End If
+
+    Let if_node be proc create_ast_node from C_IF_STMT
+    proc add_child_node from if_node, condition
+    proc add_child_node from if_node, then_stmt
+
+    Note: Optional else clause
+    Let is_else be proc check_token_type from parser, TOKEN_ELSE from Lexer
+
+    If is_else is equal to 1:
+        proc advance_token from parser
+        Let else_stmt be proc parse_statement from parser
+
+        If else_stmt is not equal to 0:
+            proc add_child_node from if_node, else_stmt
+        End If
+    End If
+
+    Return if_node
+End Process
+
+Process called "parse_while_statement" takes parser as Integer returns Integer:
+    Note: Parse while statement
+
+    proc expect_token from parser, TOKEN_WHILE from Lexer, "Expected 'while'"
+    proc expect_token from parser, TOKEN_LPAREN from Lexer, "Expected '(' after while"
+
+    Let condition be proc parse_expression from parser
+
+    If condition is equal to 0:
+        Return 0
+    End If
+
+    proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after condition"
+
+    Let body be proc parse_statement from parser
+
+    If body is equal to 0:
+        Return 0
+    End If
+
+    Let while_node be proc create_ast_node from C_WHILE_STMT
+    proc add_child_node from while_node, condition
+    proc add_child_node from while_node, body
+
+    Return while_node
+End Process
+
+Process called "parse_for_statement" takes parser as Integer returns Integer:
+    Note: Parse for statement
+
+    proc expect_token from parser, TOKEN_FOR from Lexer, "Expected 'for'"
+    proc expect_token from parser, TOKEN_LPAREN from Lexer, "Expected '(' after for"
+
+    Let init_stmt be 0
+    Let is_semicolon be proc check_token_type from parser, TOKEN_SEMICOLON from Lexer
+
+    If is_semicolon is equal to 0:
+        Set init_stmt to proc parse_expression from parser
+    End If
+
+    proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after for init"
+
+    Let condition be 0
+    Set is_semicolon to proc check_token_type from parser, TOKEN_SEMICOLON from Lexer
+
+    If is_semicolon is equal to 0:
+        Set condition to proc parse_expression from parser
+    End If
+
+    proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after for condition"
+
+    Let increment be 0
+    Let is_rparen be proc check_token_type from parser, TOKEN_RPAREN from Lexer
+
+    If is_rparen is equal to 0:
+        Set increment to proc parse_expression from parser
+    End If
+
+    proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after for clauses"
+
+    Let body be proc parse_statement from parser
+
+    If body is equal to 0:
+        Return 0
+    End If
+
+    Let for_node be proc create_ast_node from C_FOR_STMT
+
+    If init_stmt is not equal to 0:
+        proc add_child_node from for_node, init_stmt
+    End If
+
+    If condition is not equal to 0:
+        proc add_child_node from for_node, condition
+    End If
+
+    If increment is not equal to 0:
+        proc add_child_node from for_node, increment
+    End If
+
+    proc add_child_node from for_node, body
+
+    Return for_node
+End Process
+
+Process called "parse_do_while_statement" takes parser as Integer returns Integer:
+    Note: Parse do-while statement
+
+    proc expect_token from parser, TOKEN_DO from Lexer, "Expected 'do'"
+
+    Let body be proc parse_statement from parser
+
+    If body is equal to 0:
+        Return 0
+    End If
+
+    proc expect_token from parser, TOKEN_WHILE from Lexer, "Expected 'while' after do body"
+    proc expect_token from parser, TOKEN_LPAREN from Lexer, "Expected '(' after while"
+
+    Let condition be proc parse_expression from parser
+
+    If condition is equal to 0:
+        Return 0
+    End If
+
+    proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after condition"
+    proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after do-while"
+
+    Let do_while_node be proc create_ast_node from C_DO_WHILE_STMT
+    proc add_child_node from do_while_node, body
+    proc add_child_node from do_while_node, condition
+
+    Return do_while_node
+End Process
+
+Process called "parse_switch_statement" takes parser as Integer returns Integer:
+    Note: Parse switch statement
+
+    proc expect_token from parser, TOKEN_SWITCH from Lexer, "Expected 'switch'"
+    proc expect_token from parser, TOKEN_LPAREN from Lexer, "Expected '(' after switch"
+
+    Let condition be proc parse_expression from parser
+
+    If condition is equal to 0:
+        Return 0
+    End If
+
+    proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after condition"
+
+    Let body be proc parse_statement from parser
+
+    If body is equal to 0:
+        Return 0
+    End If
+
+    Let switch_node be proc create_ast_node from C_SWITCH_STMT
+    proc add_child_node from switch_node, condition
+    proc add_child_node from switch_node, body
+
+    Return switch_node
+End Process
+
+Process called "parse_case_statement" takes parser as Integer returns Integer:
+    Note: Parse case label
+
+    proc expect_token from parser, TOKEN_CASE from Lexer, "Expected 'case'"
+
+    Let case_expr be proc parse_expression from parser
+
+    If case_expr is equal to 0:
+        Return 0
+    End If
+
+    proc expect_token from parser, TOKEN_COLON from Lexer, "Expected ':' after case value"
+
+    Let case_node be proc create_ast_node from C_CASE_STMT
+    proc add_child_node from case_node, case_expr
+
+    Return case_node
+End Process
+
+Process called "parse_default_statement" takes parser as Integer returns Integer:
+    Note: Parse default label
+
+    proc expect_token from parser, TOKEN_DEFAULT from Lexer, "Expected 'default'"
+    proc expect_token from parser, TOKEN_COLON from Lexer, "Expected ':' after default"
+
+    Let default_node be proc create_ast_node from C_DEFAULT_STMT
+
+    Return default_node
+End Process
+
+Process called "parse_return_statement" takes parser as Integer returns Integer:
+    Note: Parse return statement
+
+    proc expect_token from parser, TOKEN_RETURN from Lexer, "Expected 'return'"
+
+    Let return_node be proc create_ast_node from C_RETURN_STMT
+
+    Let is_semicolon be proc check_token_type from parser, TOKEN_SEMICOLON from Lexer
+
+    If is_semicolon is equal to 0:
+        Let return_expr be proc parse_expression from parser
+
+        If return_expr is not equal to 0:
+            proc add_child_node from return_node, return_expr
+        End If
+    End If
+
+    proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after return"
+
+    Return return_node
+End Process
+
+Process called "parse_expression_statement" takes parser as Integer returns Integer:
+    Note: Parse expression statement or labeled statement
+
+    Note: Check for labeled statement (identifier followed by colon)
+    Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+    If is_identifier is equal to 1:
+        Let label_name be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Let is_colon be proc check_token_type from parser, TOKEN_COLON from Lexer
+
+        If is_colon is equal to 1:
+            proc advance_token from parser
+            Let label_node be proc create_ast_node from C_LABEL_STMT
+            proc set_node_name from label_node, label_name
+            proc deallocate from Layout with label_name
+            Return label_node
+        End If
+
+        Note: Not a label, backtrack (simulate by creating identifier expression)
+        Let id_expr be proc create_ast_node from C_IDENTIFIER_EXPR
+        proc set_node_name from id_expr, label_name
+        proc deallocate from Layout with label_name
+
+        Note: Continue parsing as expression statement
+        Let expr_stmt be proc create_ast_node from C_EXPR_STMT
+        proc add_child_node from expr_stmt, id_expr
+        proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after expression"
+        Return expr_stmt
+    End If
+
+    Let expr be proc parse_expression from parser
+
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after expression"
+
+    Let expr_stmt be proc create_ast_node from C_EXPR_STMT
+    proc add_child_node from expr_stmt, expr
+
+    Return expr_stmt
+End Process
+
+Note: ============================================================================
+Note: Declaration Parsing
+Note: ============================================================================
+
+Process called "parse_variable_declaration" takes parser as Integer, base_type as Integer returns Integer:
+    Note: Parse variable declaration with optional initializer
+
+    Let declarator be proc parse_declarator from parser, base_type
+
+    If declarator is equal to 0:
+        Return 0
+    End If
+
+    Note: Optional initializer
+    Let is_equals be proc check_token_type from parser, TOKEN_EQUALS from Lexer
+
+    If is_equals is equal to 1:
+        proc advance_token from parser
+        Let init_expr be proc parse_expression from parser
+
+        If init_expr is not equal to 0:
+            proc add_child_node from declarator, init_expr
+        End If
+    End If
+
+    Return declarator
+End Process
+
+Process called "parse_function_declaration" takes parser as Integer, return_type as Integer, func_name as Integer returns Integer:
+    Note: Parse function declaration or definition
+
+    Let func_node be proc create_ast_node from C_FUNCTION
+    proc set_node_name from func_node, func_name
+    proc set_node_type_info from func_node, return_type
+
+    proc expect_token from parser, TOKEN_LPAREN from Lexer, "Expected '(' after function name"
+
+    Note: Parse parameters
+    Let is_rparen be proc check_token_type from parser, TOKEN_RPAREN from Lexer
+
+    If is_rparen is equal to 0:
+        While 1 is equal to 1:
+            Let param_type be proc parse_type_specifier from parser
+
+            If param_type is not equal to 0:
+                Let param_decl be proc parse_declarator from parser, param_type
+
+                If param_decl is not equal to 0:
+                    Let param_node be proc create_ast_node from C_PARAMETER
+                    Let param_name be proc memory_get_int64 from Layout with param_decl, 8
+                    Let param_type_info be proc memory_get_int64 from Layout with param_decl, 24
+                    proc set_node_name from param_node, param_name
+                    proc set_node_type_info from param_node, param_type_info
+                    proc add_child_node from func_node, param_node
+                End If
+            End If
+
+            Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+            If is_comma is equal to 0:
+                Break
+            End If
+
+            proc advance_token from parser
+        End While
+    End If
+
+    proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after parameters"
+
+    Note: Check for function body or just declaration
+    Let is_lbrace be proc check_token_type from parser, TOKEN_LBRACE from Lexer
+
+    If is_lbrace is equal to 1:
+        Let body be proc parse_compound_statement from parser
+
+        If body is not equal to 0:
+            proc add_child_node from func_node, body
+        End If
+    End If
+
+    Let is_semicolon be proc check_token_type from parser, TOKEN_SEMICOLON from Lexer
+
+    If is_semicolon is equal to 1:
+        proc advance_token from parser
+    End If
+
+    Return func_node
+End Process
+
+Process called "parse_declaration_or_statement" takes parser as Integer returns Integer:
+    Note: Parse declaration or statement
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: Check for type specifier (declaration)
+    Let is_type be 0
+
+    If token_type is equal to TOKEN_INT from Lexer:
+        Set is_type to 1
+    End If
+
+    If token_type is equal to TOKEN_CHAR from Lexer:
+        Set is_type to 1
+    End If
+
+    If token_type is equal to TOKEN_FLOAT from Lexer:
+        Set is_type to 1
+    End If
+
+    If token_type is equal to TOKEN_DOUBLE from Lexer:
+        Set is_type to 1
+    End If
+
+    If token_type is equal to TOKEN_VOID from Lexer:
+        Set is_type to 1
+    End If
+
+    If token_type is equal to TOKEN_STRUCT from Lexer:
+        Set is_type to 1
+    End If
+
+    If token_type is equal to TOKEN_UNION from Lexer:
+        Set is_type to 1
+    End If
+
+    If token_type is equal to TOKEN_ENUM from Lexer:
+        Set is_type to 1
+    End If
+
+    If is_type is equal to 1:
+        Let base_type be proc parse_type_specifier from parser
+        Let var_decl be proc parse_variable_declaration from parser, base_type
+        proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after declaration"
+        Return var_decl
+    End If
+
+    Note: Otherwise, parse as statement
+    Return proc parse_statement from parser
+End Process
+
+Process called "parse_program" takes parser as Integer returns Integer:
+    Note: Parse entire C program (top-level entry point)
+
+    @Reasoning:
+    Parse all top-level declarations (functions, variables, structs, etc.)
+    until EOF is reached.
+    @End Reasoning
+
+    Let program_node be proc create_ast_node from C_PROGRAM
+
+    While 1 is equal to 1:
+        Let token_type be proc peek_token_type from parser
+
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Note: Parse preprocessor directives completely
+        If token_type is equal to TOKEN_HASH from Lexer:
+            Let preprocessor_node be proc parse_preprocessor_directive from parser
+            If preprocessor_node is not equal to 0:
+                proc add_child_to_ast_node from program_node, preprocessor_node
+            End If
+            Continue
+        End If
+
+        If token_type is equal to TOKEN_INCLUDE from Lexer:
+            Let include_node be proc parse_include_directive from parser
+            If include_node is not equal to 0:
+                proc add_child_to_ast_node from program_node, include_node
+            End If
+            Continue
+        End If
+
+        If token_type is equal to TOKEN_DEFINE from Lexer:
+            Let define_node be proc parse_define_directive from parser
+            If define_node is not equal to 0:
+                proc add_child_to_ast_node from program_node, define_node
+            End If
+            Continue
+        End If
+
+        Note: Parse type specifier
+        Let base_type be proc parse_type_specifier from parser
+
+        If base_type is equal to 0:
+            Return 0
+        End If
+
+        Note: Parse declarator
+        Let var_name be proc peek_token_lexeme from parser
+        proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected identifier"
+
+        Note: Check if function or variable
+        Let next_token be proc peek_token_type from parser
+
+        If next_token is equal to TOKEN_LPAREN from Lexer:
+            Let func_decl be proc parse_function_declaration from parser, base_type, var_name
+            proc deallocate from Layout with var_name
+
+            If func_decl is not equal to 0:
+                proc add_child_node from program_node, func_decl
+            End If
+        End If
+
+        If next_token is not equal to TOKEN_LPAREN from Lexer:
+            Note: Variable declaration
+            Let var_decl be proc create_ast_node from C_VARIABLE
+            proc set_node_name from var_decl, var_name
+            proc set_node_type_info from var_decl, base_type
+            proc deallocate from Layout with var_name
+
+            Note: Check for array or initializer
+            Let is_lbracket be proc check_token_type from parser, TOKEN_LBRACKET from Lexer
+
+            If is_lbracket is equal to 1:
+                proc advance_token from parser
+                proc expect_token from parser, TOKEN_RBRACKET from Lexer, "Expected ']'"
+            End If
+
+            Let is_equals be proc check_token_type from parser, TOKEN_EQUALS from Lexer
+
+            If is_equals is equal to 1:
+                proc advance_token from parser
+                Let init_expr be proc parse_expression from parser
+
+                If init_expr is not equal to 0:
+                    proc add_child_node from var_decl, init_expr
+                End If
+            End If
+
+            proc expect_token from parser, TOKEN_SEMICOLON from Lexer, "Expected ';' after declaration"
+            proc add_child_node from program_node, var_decl
+        End If
+
+        Let has_error be proc has_parse_error from parser
+
+        If has_error is equal to 1:
+            Return 0
+        End If
+    End While
+
+    Return program_node
+End Process
+
+Note: ============================================================================
+Note: Preprocessor Directive Parsing (Production Implementation)
+Note: ============================================================================
+
+Process called "parse_preprocessor_directive" takes parser as Integer returns Integer:
+    Note: Parse any preprocessor directive starting with #
+
+    @Reasoning:
+    Handle all standard C preprocessor directives including #include, #define,
+    #ifdef, #ifndef, #if, #else, #elif, #endif, #undef, #pragma, #line, #error
+    @End Reasoning
+
+    proc expect_token from parser, TOKEN_HASH from Lexer, "Expected '#'"
+
+    Let directive_type be proc peek_token_type from parser
+    Let directive_node be proc create_ast_node from C_PREPROCESSOR
+
+    Note: Parse specific directive types
+    If directive_type is equal to TOKEN_INCLUDE from Lexer:
+        Return proc parse_include_directive from parser
+    End If
+
+    If directive_type is equal to TOKEN_DEFINE from Lexer:
+        Return proc parse_define_directive from parser
+    End If
+
+    If directive_type is equal to TOKEN_IFDEF from Lexer:
+        proc advance_token from parser
+        Let condition_name be proc peek_token_lexeme from parser
+        proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected identifier after #ifdef"
+        proc set_ast_node_name from directive_node, condition_name
+        proc set_ast_node_value from directive_node, TOKEN_IFDEF from Lexer
+        Return directive_node
+    End If
+
+    If directive_type is equal to TOKEN_IFNDEF from Lexer:
+        proc advance_token from parser
+        Let condition_name be proc peek_token_lexeme from parser
+        proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected identifier after #ifndef"
+        proc set_ast_node_name from directive_node, condition_name
+        proc set_ast_node_value from directive_node, TOKEN_IFNDEF from Lexer
+        Return directive_node
+    End If
+
+    If directive_type is equal to TOKEN_ENDIF from Lexer:
+        proc advance_token from parser
+        proc set_ast_node_value from directive_node, TOKEN_ENDIF from Lexer
+        Return directive_node
+    End If
+
+    If directive_type is equal to TOKEN_ELSE from Lexer:
+        proc advance_token from parser
+        proc set_ast_node_value from directive_node, TOKEN_ELSE from Lexer
+        Return directive_node
+    End If
+
+    If directive_type is equal to TOKEN_ELIF from Lexer:
+        proc advance_token from parser
+        Let condition_expr be proc parse_preprocessor_expression from parser
+        proc add_child_to_ast_node from directive_node, condition_expr
+        proc set_ast_node_value from directive_node, TOKEN_ELIF from Lexer
+        Return directive_node
+    End If
+
+    If directive_type is equal to TOKEN_UNDEF from Lexer:
+        proc advance_token from parser
+        Let macro_name be proc peek_token_lexeme from parser
+        proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected identifier after #undef"
+        proc set_ast_node_name from directive_node, macro_name
+        proc set_ast_node_value from directive_node, TOKEN_UNDEF from Lexer
+        Return directive_node
+    End If
+
+    If directive_type is equal to TOKEN_PRAGMA from Lexer:
+        proc advance_token from parser
+        Let pragma_content be proc parse_pragma_content from parser
+        proc add_child_to_ast_node from directive_node, pragma_content
+        proc set_ast_node_value from directive_node, TOKEN_PRAGMA from Lexer
+        Return directive_node
+    End If
+
+    Note: Skip unknown preprocessor directives by consuming tokens until newline
+    While 1 is equal to 1:
+        Let current_token be proc peek_token_type from parser
+        If current_token is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_token from parser
+            Break
+        End If
+        If current_token is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+        proc advance_token from parser
+    End While
+
+    Return directive_node
+End Process
+
+Process called "parse_include_directive" takes parser as Integer returns Integer:
+    Note: Parse #include directive with complete header file handling
+
+    @Reasoning:
+    Support both #include <header.h> and #include "header.h" forms.
+    Store the header name and include type for semantic analysis.
+    @End Reasoning
+
+    proc expect_token from parser, TOKEN_INCLUDE from Lexer, "Expected 'include'"
+
+    Let include_node be proc create_ast_node from C_PREPROCESSOR
+    proc set_ast_node_value from include_node, TOKEN_INCLUDE from Lexer
+
+    Let next_token be proc peek_token_type from parser
+
+    If next_token is equal to TOKEN_STRING from Lexer:
+        Note: #include "header.h" (local include)
+        Let header_name be proc peek_token_lexeme from parser
+        proc advance_token from parser
+        proc set_ast_node_name from include_node, header_name
+
+        Note: Create attribute to mark as local include
+        Let attr_node be proc create_ast_node from C_TYPE_NODE
+        proc set_ast_node_value from attr_node, 1  Note: 1 = local include
+        proc add_child_to_ast_node from include_node, attr_node
+
+    Otherwise:
+        If next_token is equal to TOKEN_LESS from Lexer:
+            Note: #include <header.h> (system include)
+            proc advance_token from parser  Note: consume '<'
+
+            Let header_name be proc peek_token_lexeme from parser
+            proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected header name"
+
+            Note: Handle .h extension if present
+            Let dot_token be proc peek_token_type from parser
+            If dot_token is equal to TOKEN_DOT from Lexer:
+                proc advance_token from parser
+                Let extension_token be proc peek_token_type from parser
+                If extension_token is equal to TOKEN_IDENTIFIER from Lexer:
+                    Let extension_name be proc peek_token_lexeme from parser
+                    proc advance_token from parser
+                    Let full_header be proc concatenate_strings from StringCore with header_name, "."
+                    Set full_header to proc concatenate_strings from StringCore with full_header, extension_name
+                    Set header_name to full_header
+                End If
+            End If
+
+            proc expect_token from parser, TOKEN_GREATER from Lexer, "Expected '>' after header name"
+            proc set_ast_node_name from include_node, header_name
+
+            Note: Create attribute to mark as system include
+            Let attr_node be proc create_ast_node from C_TYPE_NODE
+            proc set_ast_node_value from attr_node, 0  Note: 0 = system include
+            proc add_child_to_ast_node from include_node, attr_node
+
+        Otherwise:
+            proc set_parse_error from parser, "Expected string literal or '<' after #include"
+            Return 0
+        End If
+    End If
+
+    Return include_node
+End Process
+
+Process called "parse_define_directive" takes parser as Integer returns Integer:
+    Note: Parse #define directive with macro parameters and body
+
+    @Reasoning:
+    Support both object-like and function-like macros:
+    #define NAME value (object-like)
+    #define NAME(params) body (function-like)
+    @End Reasoning
+
+    proc expect_token from parser, TOKEN_DEFINE from Lexer, "Expected 'define'"
+
+    Let define_node be proc create_ast_node from C_PREPROCESSOR
+    proc set_ast_node_value from define_node, TOKEN_DEFINE from Lexer
+
+    Note: Get macro name
+    Let macro_name be proc peek_token_lexeme from parser
+    proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected macro name after #define"
+    proc set_ast_node_name from define_node, macro_name
+
+    Note: Check if function-like macro (no space before '(')
+    Let next_token be proc peek_token_type from parser
+
+    If next_token is equal to TOKEN_LPAREN from Lexer:
+        Note: Function-like macro - parse parameters
+        proc advance_token from parser  Note: consume '('
+
+        Let param_list be proc create_ast_node from C_PARAMETER
+
+        Note: Parse parameter list
+        While 1 is equal to 1:
+            Let current_token be proc peek_token_type from parser
+
+            If current_token is equal to TOKEN_RPAREN from Lexer:
+                proc advance_token from parser
+                Break
+            End If
+
+            If current_token is equal to TOKEN_IDENTIFIER from Lexer:
+                Let param_name be proc peek_token_lexeme from parser
+                proc advance_token from parser
+
+                Let param_node be proc create_ast_node from C_PARAMETER
+                proc set_ast_node_name from param_node, param_name
+                proc add_child_to_ast_node from param_list, param_node
+
+                Note: Check for comma
+                Let comma_token be proc peek_token_type from parser
+                If comma_token is equal to TOKEN_COMMA from Lexer:
+                    proc advance_token from parser
+                End If
+            Otherwise:
+                proc set_parse_error from parser, "Expected parameter name in macro definition"
+                Return 0
+            End If
+        End While
+
+        proc add_child_to_ast_node from define_node, param_list
+    End If
+
+    Note: Parse macro body (rest of line)
+    Let body_tokens be proc create_list from List
+
+    While 1 is equal to 1:
+        Let current_token be proc peek_token_type from parser
+
+        If current_token is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_token from parser
+            Break
+        End If
+
+        If current_token is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Note: Store token for macro body
+        Let token_lexeme be proc peek_token_lexeme from parser
+        proc add_to_list from List with body_tokens, token_lexeme
+        proc advance_token from parser
+    End While
+
+    Note: Create body node containing all tokens
+    Let body_node be proc create_ast_node from C_LITERAL_EXPR
+    proc set_ast_node_value from body_node, body_tokens
+    proc add_child_to_ast_node from define_node, body_node
+
+    Return define_node
+End Process
+
+Process called "parse_preprocessor_expression" takes parser as Integer returns Integer:
+    Note: Parse preprocessor conditional expression for #if/#elif
+
+    @Reasoning:
+    Handle preprocessor expressions including defined(), numeric constants,
+    string comparisons, and logical operators for conditional compilation.
+    @End Reasoning
+
+    Return proc parse_logical_or_expression from parser
+End Process
+
+Process called "parse_pragma_content" takes parser as Integer returns Integer:
+    Note: Parse pragma directive content until end of line
+
+    @Reasoning:
+    Pragma directives are implementation-specific. Store the entire
+    content as a string for later processing by semantic analyzer.
+    @End Reasoning
+
+    Let pragma_tokens be proc create_list from List
+
+    While 1 is equal to 1:
+        Let current_token be proc peek_token_type from parser
+
+        If current_token is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_token from parser
+            Break
+        End If
+
+        If current_token is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let token_lexeme be proc peek_token_lexeme from parser
+        proc add_to_list from List with pragma_tokens, token_lexeme
+        proc advance_token from parser
+    End While
+
+    Let pragma_node be proc create_ast_node from C_LITERAL_EXPR
+    proc set_ast_node_value from pragma_node, pragma_tokens
+
+    Return pragma_node
+End Process

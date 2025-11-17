@@ -1,0 +1,1047 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HIR to Protocol Buffers Code Generator
+
+This file generates Protocol Buffers (.proto) files from Runa HIR.
+
+Supports:
+- Proto3 syntax by default
+- Package declarations
+- Import statements
+- Message definitions with typed fields
+- Enum definitions
+- Field numbers and types
+- Repeated fields
+- Proper indentation and formatting
+
+Dependencies:
+- protobuf_emitter.runa
+- compiler/middle/gungnir/hir/hir.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/backends/protobuf/protobuf_emitter.runa" as Emitter
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: Generation Context
+Note: ============================================================================
+
+Type called "ProtobufGenerationContext":
+    emitter as Integer        Note: Protocol Buffers emitter
+    indent_level as Integer   Note: Current indentation level
+    error_message as Integer  Note: Error message (if any)
+    has_error as Integer      Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Context Creation and Destruction
+Note: ============================================================================
+
+Process called "create_generation_context" returns Integer:
+    Note: Create Protocol Buffers generation context
+
+    Let context_size be 32  Note: ProtobufGenerationContext: 4 fields × 8 bytes
+    Let context be proc allocate from Layout with context_size
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Create emitter
+    Let emitter be proc create_protobuf_emitter from Emitter
+
+    If emitter is equal to 0:
+        proc deallocate from Layout with context
+        Return 0
+    End If
+
+    Note: Initialize context
+    proc memory_set_int64 from Layout with context, 0, emitter
+    proc memory_set_int64 from Layout with context, 8, 0   Note: indent_level = 0
+    proc memory_set_int64 from Layout with context, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with context, 24, 0  Note: has_error = false
+
+    Return context
+End Process
+
+Process called "destroy_generation_context" takes context as Integer returns Integer:
+    Note: Destroy generation context
+
+    If context is equal to 0:
+        Return 1
+    End If
+
+    Note: Destroy emitter
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    If emitter is not equal to 0:
+        proc destroy_protobuf_emitter from Emitter with emitter
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with context
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
+    Note: Set generation error message
+
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with context, 16, new_error
+    proc memory_set_int64 from Layout with context, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Indentation Helpers
+Note: ============================================================================
+
+Process called "emit_indent" takes context as Integer returns Integer:
+    Note: Emit indentation (2 spaces per level)
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+
+    Let count be 0
+
+    While count is less than indent_level:
+        proc emit_char from Emitter with emitter, 32  Note: space
+        proc emit_char from Emitter with emitter, 32  Note: space
+        Set count to count plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "increase_indent" takes context as Integer returns Integer:
+    Note: Increase indentation level
+
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+    Set indent_level to indent_level plus 1
+    proc memory_set_int64 from Layout with context, 8, indent_level
+
+    Return 1
+End Process
+
+Process called "decrease_indent" takes context as Integer returns Integer:
+    Note: Decrease indentation level
+
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+
+    If indent_level is greater than 0:
+        Set indent_level to indent_level minus 1
+        proc memory_set_int64 from Layout with context, 8, indent_level
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Helper Functions
+Note: ============================================================================
+
+Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get string value from HIR dictionary
+
+    Let keys be proc get_dictionary_keys from HIR with hir_dict
+    Let values be proc get_dictionary_values from HIR with hir_dict
+
+    Let count be proc size from List with keys
+    Let index be 0
+
+    While index is less than count:
+        Let current_key be proc get_at from List with keys, index
+
+        Note: Compare keys
+        Let is_match be proc strings_equal from StringCore with key, current_key
+
+        If is_match is equal to 1:
+            Let value_node be proc get_at from List with values, index
+            Return proc get_string_value from HIR with value_node
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Process called "get_dict_integer_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get integer value from HIR dictionary
+
+    Let keys be proc get_dictionary_keys from HIR with hir_dict
+    Let values be proc get_dictionary_values from HIR with hir_dict
+
+    Let count be proc size from List with keys
+    Let index be 0
+
+    While index is less than count:
+        Let current_key be proc get_at from List with keys, index
+
+        Note: Compare keys
+        Let is_match be proc strings_equal from StringCore with key, current_key
+
+        If is_match is equal to 1:
+            Let value_node be proc get_at from List with values, index
+            Return proc get_integer_value from HIR with value_node
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Process called "get_dict_boolean_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get boolean value from HIR dictionary
+
+    Let keys be proc get_dictionary_keys from HIR with hir_dict
+    Let values be proc get_dictionary_values from HIR with hir_dict
+
+    Let count be proc size from List with keys
+    Let index be 0
+
+    While index is less than count:
+        Let current_key be proc get_at from List with keys, index
+
+        Note: Compare keys
+        Let is_match be proc strings_equal from StringCore with key, current_key
+
+        If is_match is equal to 1:
+            Let value_node be proc get_at from List with values, index
+            Return proc get_boolean_value from HIR with value_node
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Process called "get_dict_list_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get list value from HIR dictionary
+
+    Let keys be proc get_dictionary_keys from HIR with hir_dict
+    Let values be proc get_dictionary_values from HIR with hir_dict
+
+    Let count be proc size from List with keys
+    Let index be 0
+
+    While index is less than count:
+        Let current_key be proc get_at from List with keys, index
+
+        Note: Compare keys
+        Let is_match be proc strings_equal from StringCore with key, current_key
+
+        If is_match is equal to 1:
+            Let value_node be proc get_at from List with values, index
+            Return value_node  Note: Return HIR list node
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Note: ============================================================================
+Note: Protocol Buffers Generation Functions
+Note: ============================================================================
+
+Process called "generate_protobuf_field" takes context as Integer, hir_dict as Integer returns Integer:
+    Note: Generate Protocol Buffers field
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get field data
+    Let name_key be proc create_string from StringCore with "name"
+    Let name be proc get_dict_string_value from hir_dict, name_key
+    proc deallocate from Layout with name_key
+
+    Let type_key be proc create_string from StringCore with "field_type"
+    Let field_type be proc get_dict_string_value from hir_dict, type_key
+    proc deallocate from Layout with type_key
+
+    Let number_key be proc create_string from StringCore with "field_number"
+    Let field_number be proc get_dict_integer_value from hir_dict, number_key
+    proc deallocate from Layout with number_key
+
+    Let repeated_key be proc create_string from StringCore with "repeated"
+    Let is_repeated be proc get_dict_boolean_value from hir_dict, repeated_key
+    proc deallocate from Layout with repeated_key
+
+    Note: Emit indentation
+    proc emit_indent from context
+
+    Note: Emit "repeated" if needed
+    If is_repeated is equal to 1:
+        Let repeated_str be proc create_string from StringCore with "repeated "
+        proc emit_string from Emitter with emitter, repeated_str
+        proc deallocate from Layout with repeated_str
+    End If
+
+    Note: Emit field type
+    If field_type is not equal to 0:
+        proc emit_string from Emitter with emitter, field_type
+        proc emit_char from Emitter with emitter, 32  Note: space
+    End If
+
+    Note: Emit field name
+    If name is not equal to 0:
+        proc emit_string from Emitter with emitter, name
+    End If
+
+    Note: Emit " = "
+    proc emit_char from Emitter with emitter, 32   Note: space
+    proc emit_char from Emitter with emitter, 61   Note: =
+    proc emit_char from Emitter with emitter, 32   Note: space
+
+    Note: Emit field number
+    proc emit_integer from Emitter with emitter, field_number
+
+    Note: Emit ";"
+    proc emit_char from Emitter with emitter, 59   Note: ;
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Return 1
+End Process
+
+Process called "generate_protobuf_message" takes context as Integer, hir_dict as Integer returns Integer:
+    Note: Generate Protocol Buffers message
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get message data
+    Let name_key be proc create_string from StringCore with "name"
+    Let name be proc get_dict_string_value from hir_dict, name_key
+    proc deallocate from Layout with name_key
+
+    Note: Emit indentation
+    proc emit_indent from context
+
+    Note: Emit "message "
+    Let message_str be proc create_string from StringCore with "message "
+    proc emit_string from Emitter with emitter, message_str
+    proc deallocate from Layout with message_str
+
+    Note: Emit message name
+    If name is not equal to 0:
+        proc emit_string from Emitter with emitter, name
+    End If
+
+    Note: Emit " {"
+    proc emit_char from Emitter with emitter, 32   Note: space
+    proc emit_char from Emitter with emitter, 123  Note: {
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Note: Increase indentation
+    proc increase_indent from context
+
+    Note: Get fields
+    Let fields_key be proc create_string from StringCore with "fields"
+    Let fields_list be proc get_dict_list_value from hir_dict, fields_key
+    proc deallocate from Layout with fields_key
+
+    Note: Generate fields
+    If fields_list is not equal to 0:
+        Let fields be proc get_list_elements from HIR with fields_list
+        Let count be proc size from List with fields
+        Let index be 0
+
+        While index is less than count:
+            Let field be proc get_at from List with fields, index
+            proc generate_hir_node from context, field
+            Set index to index plus 1
+        End While
+    End If
+
+    Note: Decrease indentation
+    proc decrease_indent from context
+
+    Note: Emit "}"
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 125  Note: }
+    proc emit_char from Emitter with emitter, 10   Note: newline
+    proc emit_char from Emitter with emitter, 10   Note: blank line
+
+    Return 1
+End Process
+
+Process called "generate_protobuf_enum" takes context as Integer, hir_dict as Integer returns Integer:
+    Note: Generate Protocol Buffers enum
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get enum data
+    Let name_key be proc create_string from StringCore with "name"
+    Let name be proc get_dict_string_value from hir_dict, name_key
+    proc deallocate from Layout with name_key
+
+    Note: Emit indentation
+    proc emit_indent from context
+
+    Note: Emit "enum "
+    Let enum_str be proc create_string from StringCore with "enum "
+    proc emit_string from Emitter with emitter, enum_str
+    proc deallocate from Layout with enum_str
+
+    Note: Emit enum name
+    If name is not equal to 0:
+        proc emit_string from Emitter with emitter, name
+    End If
+
+    Note: Emit " {"
+    proc emit_char from Emitter with emitter, 32   Note: space
+    proc emit_char from Emitter with emitter, 123  Note: {
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Note: Increase indentation
+    proc increase_indent from context
+
+    Note: Get values
+    Let values_key be proc create_string from StringCore with "values"
+    Let values_list be proc get_dict_list_value from hir_dict, values_key
+    proc deallocate from Layout with values_key
+
+    Note: Generate enum values
+    If values_list is not equal to 0:
+        Let values be proc get_list_elements from HIR with values_list
+        Let count be proc size from List with values
+        Let index be 0
+
+        While index is less than count:
+            Let value be proc get_at from List with values, index
+
+            Note: Get value name and number
+            Let value_name_key be proc create_string from StringCore with "name"
+            Let value_name be proc get_dict_string_value from value, value_name_key
+            proc deallocate from Layout with value_name_key
+
+            Let value_number_key be proc create_string from StringCore with "number"
+            Let value_number be proc get_dict_integer_value from value, value_number_key
+            proc deallocate from Layout with value_number_key
+
+            Note: Emit indentation
+            proc emit_indent from context
+
+            Note: Emit value name
+            If value_name is not equal to 0:
+                proc emit_string from Emitter with emitter, value_name
+            End If
+
+            Note: Emit " = "
+            proc emit_char from Emitter with emitter, 32   Note: space
+            proc emit_char from Emitter with emitter, 61   Note: =
+            proc emit_char from Emitter with emitter, 32   Note: space
+
+            Note: Emit value number
+            proc emit_integer from Emitter with emitter, value_number
+
+            Note: Emit ";"
+            proc emit_char from Emitter with emitter, 59   Note: ;
+            proc emit_char from Emitter with emitter, 10   Note: newline
+
+            Set index to index plus 1
+        End While
+    End If
+
+    Note: Decrease indentation
+    proc decrease_indent from context
+
+    Note: Emit "}"
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 125  Note: }
+    proc emit_char from Emitter with emitter, 10   Note: newline
+    proc emit_char from Emitter with emitter, 10   Note: blank line
+
+    Return 1
+End Process
+
+Process called "generate_protobuf_service" takes context as Integer, hir_dict as Integer returns Integer:
+    Note: Generate Protocol Buffers service definition
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get service name
+    Let name_key be proc create_string from StringCore with "name"
+    Let name be proc get_dict_string_value from hir_dict, name_key
+    proc deallocate from Layout with name_key
+
+    Note: Emit indentation
+    proc emit_indent from context
+
+    Note: Emit "service "
+    Let service_str be proc create_string from StringCore with "service "
+    proc emit_string from Emitter with emitter, service_str
+    proc deallocate from Layout with service_str
+
+    Note: Emit service name
+    If name is not equal to 0:
+        proc emit_string from Emitter with emitter, name
+    End If
+
+    Note: Emit " {"
+    proc emit_char from Emitter with emitter, 32   Note: space
+    proc emit_char from Emitter with emitter, 123  Note: {
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Note: Increase indentation
+    proc increase_indent from context
+
+    Note: Get RPCs
+    Let rpcs_key be proc create_string from StringCore with "rpcs"
+    Let rpcs_list be proc get_dict_list_value from hir_dict, rpcs_key
+    proc deallocate from Layout with rpcs_key
+
+    Note: Generate RPC methods
+    If rpcs_list is not equal to 0:
+        Let rpcs be proc get_list_elements from HIR with rpcs_list
+        Let count be proc size from List with rpcs
+        Let index be 0
+
+        While index is less than count:
+            Let rpc be proc get_at from List with rpcs, index
+            proc generate_hir_node from context, rpc
+            Set index to index plus 1
+        End While
+    End If
+
+    Note: Decrease indentation
+    proc decrease_indent from context
+
+    Note: Emit "}"
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 125  Note: }
+    proc emit_char from Emitter with emitter, 10   Note: newline
+    proc emit_char from Emitter with emitter, 10   Note: blank line
+
+    Return 1
+End Process
+
+Process called "generate_protobuf_rpc" takes context as Integer, hir_dict as Integer returns Integer:
+    Note: Generate Protocol Buffers RPC method
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get RPC data
+    Let name_key be proc create_string from StringCore with "name"
+    Let name be proc get_dict_string_value from hir_dict, name_key
+    proc deallocate from Layout with name_key
+
+    Let request_key be proc create_string from StringCore with "request_type"
+    Let request_type be proc get_dict_string_value from hir_dict, request_key
+    proc deallocate from Layout with request_key
+
+    Let response_key be proc create_string from StringCore with "response_type"
+    Let response_type be proc get_dict_string_value from hir_dict, response_key
+    proc deallocate from Layout with response_key
+
+    Let request_stream_key be proc create_string from StringCore with "request_stream"
+    Let request_stream be proc get_dict_boolean_value from hir_dict, request_stream_key
+    proc deallocate from Layout with request_stream_key
+
+    Let response_stream_key be proc create_string from StringCore with "response_stream"
+    Let response_stream be proc get_dict_boolean_value from hir_dict, response_stream_key
+    proc deallocate from Layout with response_stream_key
+
+    Note: Emit indentation
+    proc emit_indent from context
+
+    Note: Emit "rpc "
+    Let rpc_str be proc create_string from StringCore with "rpc "
+    proc emit_string from Emitter with emitter, rpc_str
+    proc deallocate from Layout with rpc_str
+
+    Note: Emit RPC name
+    If name is not equal to 0:
+        proc emit_string from Emitter with emitter, name
+    End If
+
+    Note: Emit " ("
+    proc emit_char from Emitter with emitter, 32   Note: space
+    proc emit_char from Emitter with emitter, 40   Note: (
+
+    Note: Emit "stream " if request is streaming
+    If request_stream is equal to 1:
+        Let stream_str be proc create_string from StringCore with "stream "
+        proc emit_string from Emitter with emitter, stream_str
+        proc deallocate from Layout with stream_str
+    End If
+
+    Note: Emit request type
+    If request_type is not equal to 0:
+        proc emit_string from Emitter with emitter, request_type
+    End If
+
+    Note: Emit ") returns ("
+    proc emit_char from Emitter with emitter, 41   Note: )
+    Let returns_str be proc create_string from StringCore with " returns ("
+    proc emit_string from Emitter with emitter, returns_str
+    proc deallocate from Layout with returns_str
+
+    Note: Emit "stream " if response is streaming
+    If response_stream is equal to 1:
+        Let stream_str be proc create_string from StringCore with "stream "
+        proc emit_string from Emitter with emitter, stream_str
+        proc deallocate from Layout with stream_str
+    End If
+
+    Note: Emit response type
+    If response_type is not equal to 0:
+        proc emit_string from Emitter with emitter, response_type
+    End If
+
+    Note: Emit ");"
+    proc emit_char from Emitter with emitter, 41   Note: )
+    proc emit_char from Emitter with emitter, 59   Note: ;
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Return 1
+End Process
+
+Process called "generate_protobuf_oneof" takes context as Integer, hir_dict as Integer returns Integer:
+    Note: Generate Protocol Buffers oneof
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get oneof name
+    Let name_key be proc create_string from StringCore with "name"
+    Let name be proc get_dict_string_value from hir_dict, name_key
+    proc deallocate from Layout with name_key
+
+    Note: Emit indentation
+    proc emit_indent from context
+
+    Note: Emit "oneof "
+    Let oneof_str be proc create_string from StringCore with "oneof "
+    proc emit_string from Emitter with emitter, oneof_str
+    proc deallocate from Layout with oneof_str
+
+    Note: Emit oneof name
+    If name is not equal to 0:
+        proc emit_string from Emitter with emitter, name
+    End If
+
+    Note: Emit " {"
+    proc emit_char from Emitter with emitter, 32   Note: space
+    proc emit_char from Emitter with emitter, 123  Note: {
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Note: Increase indentation
+    proc increase_indent from context
+
+    Note: Get fields
+    Let fields_key be proc create_string from StringCore with "fields"
+    Let fields_list be proc get_dict_list_value from hir_dict, fields_key
+    proc deallocate from Layout with fields_key
+
+    Note: Generate oneof fields
+    If fields_list is not equal to 0:
+        Let fields be proc get_list_elements from HIR with fields_list
+        Let count be proc size from List with fields
+        Let index be 0
+
+        While index is less than count:
+            Let field be proc get_at from List with fields, index
+            proc generate_hir_node from context, field
+            Set index to index plus 1
+        End While
+    End If
+
+    Note: Decrease indentation
+    proc decrease_indent from context
+
+    Note: Emit "}"
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 125  Note: }
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Return 1
+End Process
+
+Process called "generate_protobuf_map_field" takes context as Integer, hir_dict as Integer returns Integer:
+    Note: Generate Protocol Buffers map field
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get map field data
+    Let name_key be proc create_string from StringCore with "name"
+    Let name be proc get_dict_string_value from hir_dict, name_key
+    proc deallocate from Layout with name_key
+
+    Let key_type_key be proc create_string from StringCore with "key_type"
+    Let key_type be proc get_dict_string_value from hir_dict, key_type_key
+    proc deallocate from Layout with key_type_key
+
+    Let value_type_key be proc create_string from StringCore with "value_type"
+    Let value_type be proc get_dict_string_value from hir_dict, value_type_key
+    proc deallocate from Layout with value_type_key
+
+    Let field_number_key be proc create_string from StringCore with "field_number"
+    Let field_number be proc get_dict_integer_value from hir_dict, field_number_key
+    proc deallocate from Layout with field_number_key
+
+    Note: Emit indentation
+    proc emit_indent from context
+
+    Note: Emit "map<"
+    Let map_str be proc create_string from StringCore with "map<"
+    proc emit_string from Emitter with emitter, map_str
+    proc deallocate from Layout with map_str
+
+    Note: Emit key type
+    If key_type is not equal to 0:
+        proc emit_string from Emitter with emitter, key_type
+    End If
+
+    Note: Emit ", "
+    proc emit_char from Emitter with emitter, 44   Note: ,
+    proc emit_char from Emitter with emitter, 32   Note: space
+
+    Note: Emit value type
+    If value_type is not equal to 0:
+        proc emit_string from Emitter with emitter, value_type
+    End If
+
+    Note: Emit "> "
+    proc emit_char from Emitter with emitter, 62   Note: >
+    proc emit_char from Emitter with emitter, 32   Note: space
+
+    Note: Emit field name
+    If name is not equal to 0:
+        proc emit_string from Emitter with emitter, name
+    End If
+
+    Note: Emit " = "
+    proc emit_char from Emitter with emitter, 32   Note: space
+    proc emit_char from Emitter with emitter, 61   Note: =
+    proc emit_char from Emitter with emitter, 32   Note: space
+
+    Note: Emit field number
+    proc emit_integer from Emitter with emitter, field_number
+
+    Note: Emit ";"
+    proc emit_char from Emitter with emitter, 59   Note: ;
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Return 1
+End Process
+
+Process called "generate_protobuf_file" takes context as Integer, hir_dict as Integer returns Integer:
+    Note: Generate Protocol Buffers file
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get syntax version
+    Let syntax_key be proc create_string from StringCore with "syntax"
+    Let syntax_value be proc get_dict_string_value from hir_dict, syntax_key
+    proc deallocate from Layout with syntax_key
+
+    Note: Emit syntax declaration (default to proto3)
+    Let syntax_str be proc create_string from StringCore with "syntax = \""
+
+    proc emit_string from Emitter with emitter, syntax_str
+    proc deallocate from Layout with syntax_str
+
+    If syntax_value is not equal to 0:
+        proc emit_string from Emitter with emitter, syntax_value
+    Otherwise:
+        Let proto3_str be proc create_string from StringCore with "proto3"
+        proc emit_string from Emitter with emitter, proto3_str
+        proc deallocate from Layout with proto3_str
+    End If
+
+    proc emit_char from Emitter with emitter, 34  Note: "
+    proc emit_char from Emitter with emitter, 59  Note: ;
+    proc emit_char from Emitter with emitter, 10  Note: newline
+    proc emit_char from Emitter with emitter, 10  Note: blank line
+
+    Note: Get package name
+    Let package_key be proc create_string from StringCore with "package"
+    Let package_value be proc get_dict_string_value from hir_dict, package_key
+    proc deallocate from Layout with package_key
+
+    Note: Emit package declaration (if present)
+    If package_value is not equal to 0:
+        Let package_str be proc create_string from StringCore with "package "
+        proc emit_string from Emitter with emitter, package_str
+        proc deallocate from Layout with package_str
+
+        proc emit_string from Emitter with emitter, package_value
+
+        proc emit_char from Emitter with emitter, 59  Note: ;
+        proc emit_char from Emitter with emitter, 10  Note: newline
+        proc emit_char from Emitter with emitter, 10  Note: blank line
+    End If
+
+    Note: Get imports
+    Let imports_key be proc create_string from StringCore with "imports"
+    Let imports_list be proc get_dict_list_value from hir_dict, imports_key
+    proc deallocate from Layout with imports_key
+
+    Note: Emit imports (if present)
+    If imports_list is not equal to 0:
+        Let imports be proc get_list_elements from HIR with imports_list
+        Let count be proc size from List with imports
+        Let index be 0
+
+        While index is less than count:
+            Let import_value be proc get_at from List with imports, index
+            Let import_str be proc get_string_value from HIR with import_value
+
+            Let import_prefix be proc create_string from StringCore with "import \""
+            proc emit_string from Emitter with emitter, import_prefix
+            proc deallocate from Layout with import_prefix
+
+            If import_str is not equal to 0:
+                proc emit_string from Emitter with emitter, import_str
+            End If
+
+            proc emit_char from Emitter with emitter, 34  Note: "
+            proc emit_char from Emitter with emitter, 59  Note: ;
+            proc emit_char from Emitter with emitter, 10  Note: newline
+
+            Set index to index plus 1
+        End While
+
+        If count is greater than 0:
+            proc emit_char from Emitter with emitter, 10  Note: blank line after imports
+        End If
+    End If
+
+    Note: Get messages
+    Let messages_key be proc create_string from StringCore with "messages"
+    Let messages_list be proc get_dict_list_value from hir_dict, messages_key
+    proc deallocate from Layout with messages_key
+
+    Note: Generate messages
+    If messages_list is not equal to 0:
+        Let messages be proc get_list_elements from HIR with messages_list
+        Let count be proc size from List with messages
+        Let index be 0
+
+        While index is less than count:
+            Let message be proc get_at from List with messages, index
+            proc generate_hir_node from context, message
+            Set index to index plus 1
+        End While
+    End If
+
+    Note: Get enums
+    Let enums_key be proc create_string from StringCore with "enums"
+    Let enums_list be proc get_dict_list_value from hir_dict, enums_key
+    proc deallocate from Layout with enums_key
+
+    Note: Generate enums
+    If enums_list is not equal to 0:
+        Let enums be proc get_list_elements from HIR with enums_list
+        Let count be proc size from List with enums
+        Let index be 0
+
+        While index is less than count:
+            Let enum be proc get_at from List with enums, index
+            proc generate_hir_node from context, enum
+            Set index to index plus 1
+        End While
+    End If
+
+    Note: Get services
+    Let services_key be proc create_string from StringCore with "services"
+    Let services_list be proc get_dict_list_value from hir_dict, services_key
+    proc deallocate from Layout with services_key
+
+    Note: Generate services
+    If services_list is not equal to 0:
+        Let services be proc get_list_elements from HIR with services_list
+        Let count be proc size from List with services
+        Let index be 0
+
+        While index is less than count:
+            Let service be proc get_at from List with services, index
+            proc generate_hir_node from context, service
+            Set index to index plus 1
+        End While
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HIR Node Dispatch
+Note: ============================================================================
+
+Process called "generate_hir_node" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate Protocol Buffers from HIR node (dispatch to specific generator)
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if node is dictionary (protobuf nodes are dictionaries)
+    Let node_type be proc get_hir_node_type from HIR with hir_node
+
+    If node_type is equal to HIR_DICTIONARY_LITERAL from HIR:
+        Note: Get "type" field to determine protobuf element type
+        Let type_key be proc create_string from StringCore with "type"
+        Let type_value_str be proc get_dict_string_value from hir_node, type_key
+        proc deallocate from Layout with type_key
+
+        If type_value_str is equal to 0:
+            Return 0  Note: No type field
+        End If
+
+        Note: Dispatch based on type
+        Let file_type be proc create_string from StringCore with "proto_file"
+        Let is_file be proc strings_equal from StringCore with type_value_str, file_type
+        proc deallocate from Layout with file_type
+
+        If is_file is equal to 1:
+            Return proc generate_protobuf_file from context, hir_node
+        End If
+
+        Let message_type be proc create_string from StringCore with "message"
+        Let is_message be proc strings_equal from StringCore with type_value_str, message_type
+        proc deallocate from Layout with message_type
+
+        If is_message is equal to 1:
+            Return proc generate_protobuf_message from context, hir_node
+        End If
+
+        Let field_type be proc create_string from StringCore with "field"
+        Let is_field be proc strings_equal from StringCore with type_value_str, field_type
+        proc deallocate from Layout with field_type
+
+        If is_field is equal to 1:
+            Return proc generate_protobuf_field from context, hir_node
+        End If
+
+        Let enum_type be proc create_string from StringCore with "enum"
+        Let is_enum be proc strings_equal from StringCore with type_value_str, enum_type
+        proc deallocate from Layout with enum_type
+
+        If is_enum is equal to 1:
+            Return proc generate_protobuf_enum from context, hir_node
+        End If
+
+        Let service_type be proc create_string from StringCore with "service"
+        Let is_service be proc strings_equal from StringCore with type_value_str, service_type
+        proc deallocate from Layout with service_type
+
+        If is_service is equal to 1:
+            Return proc generate_protobuf_service from context, hir_node
+        End If
+
+        Let rpc_type be proc create_string from StringCore with "rpc"
+        Let is_rpc be proc strings_equal from StringCore with type_value_str, rpc_type
+        proc deallocate from Layout with rpc_type
+
+        If is_rpc is equal to 1:
+            Return proc generate_protobuf_rpc from context, hir_node
+        End If
+
+        Let oneof_type be proc create_string from StringCore with "oneof"
+        Let is_oneof be proc strings_equal from StringCore with type_value_str, oneof_type
+        proc deallocate from Layout with oneof_type
+
+        If is_oneof is equal to 1:
+            Return proc generate_protobuf_oneof from context, hir_node
+        End If
+
+        Let map_field_type be proc create_string from StringCore with "map_field"
+        Let is_map_field be proc strings_equal from StringCore with type_value_str, map_field_type
+        proc deallocate from Layout with map_field_type
+
+        If is_map_field is equal to 1:
+            Return proc generate_protobuf_map_field from context, hir_node
+        End If
+    End If
+
+    Return 1  Note: Unknown node type, skip
+End Process
+
+Note: ============================================================================
+Note: Top-Level Generation
+Note: ============================================================================
+
+Process called "generate_protobuf" takes context as Integer, hir_root as Integer returns Integer:
+    Note: Generate Protocol Buffers from HIR root
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    If hir_root is equal to 0:
+        proc set_generation_error from context, "Null HIR root"
+        Return 0
+    End If
+
+    Let result be proc generate_hir_node from context, hir_root
+
+    Return result
+End Process
+
+Process called "get_output" takes context as Integer returns Integer:
+    Note: Get generated Protocol Buffers output
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    Return proc get_output from Emitter with emitter
+End Process
+
+Note: End of HIR to Protocol Buffers Generator

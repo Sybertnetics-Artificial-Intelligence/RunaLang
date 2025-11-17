@@ -1,0 +1,1509 @@
+Note: ================================================================
+Note: Bifrost Parallelism Analysis
+Note: ================================================================
+Note: Detects and extracts parallelism patterns from Bifrost graphs.
+Note: Analyzes loop dependencies, identifies data/task/pipeline parallelism,
+Note: and validates parallel execution safety.
+Note: ================================================================
+
+Import "../graph/graph.runa" as Graph
+Import "../graph/node.runa" as Node
+Import "../graph/edge.runa" as Edge
+Import "std/collections/list.runa" as List
+Import "std/collections/dict.runa" as Dict
+Import "std/core/string.runa" as String
+Import "std/core/math.runa" as Math
+
+Note: ================================================================
+Note: Parallelism Model Constants
+Note: ================================================================
+
+Constant PARALLELISM_NONE as Integer is 0
+Constant PARALLELISM_DATA_PARALLEL as Integer is 1
+Constant PARALLELISM_TASK_GRAPH as Integer is 2
+Constant PARALLELISM_PIPELINE as Integer is 3
+Constant PARALLELISM_SIMD as Integer is 4
+
+Note: ================================================================
+Note: Dependency Type Constants
+Note: ================================================================
+
+Constant DEP_NONE as Integer is 0
+Constant DEP_RAW as Integer is 1    Note: Read-After-Write (true dependency)
+Constant DEP_WAR as Integer is 2    Note: Write-After-Read (anti-dependency)
+Constant DEP_WAW as Integer is 3    Note: Write-After-Write (output dependency)
+Constant DEP_RAR as Integer is 4    Note: Read-After-Read (no hazard)
+
+Note: ================================================================
+Note: Type Definitions
+Note: ================================================================
+
+Type ParallelismInfo is:
+    model as Integer                 Note: Parallelism model (PARALLELISM_* constant)
+    degree as Integer                Note: Maximum parallelism factor
+    is_safe as Boolean              Note: Whether parallel execution is safe
+    estimated_speedup as Float      Note: Estimated speedup factor
+End Type
+
+Type DependencyInfo is:
+    source_node as Integer          Note: Pointer to source node
+    dest_node as Integer            Note: Pointer to destination node
+    dependency_type as Integer      Note: DEP_RAW, DEP_WAR, DEP_WAW, DEP_RAR
+    distance as Integer             Note: Loop iteration distance (0 for intra-iteration)
+End Type
+
+Type ParallelRegion is:
+    nodes as Integer                Note: Pointer to List of node pointers
+    parallelism_model as Integer    Note: Best parallelism model for this region
+    estimated_benefit as Float      Note: Estimated performance benefit
+End Type
+
+Note: ================================================================
+Note: Data Parallelism Detection
+Note: ================================================================
+
+Process called "detect_data_parallelism" that takes graph as Integer returns Integer:
+    @Reasoning
+    Data parallelism occurs when the same operation is applied independently
+    to different data elements. In Bifrost graphs, this manifests as:
+    1. Multiple nodes with identical operations
+    2. No data dependencies between iterations
+    3. Independent memory accesses
+
+    Algorithm:
+    - Topologically sort the graph to process in dependency order
+    - For each node, check if it operates on array/tensor data
+    - Analyze dependencies to ensure iterations are independent
+    - Check for reduction patterns (special case of data parallelism)
+    - Compute maximum parallelism degree based on data size
+    @End Reasoning
+
+    @Implementation
+    1. Get all nodes and topological ordering
+    2. Identify nodes operating on vectors/matrices/tensors
+    3. For each candidate node, analyze input/output dependencies
+    4. Check that no loop-carried dependencies exist
+    5. Compute parallelism degree from data dimensions
+    6. Return list of data-parallel nodes with parallelism info
+    @End Implementation
+
+    Let parallel_nodes be List.create()
+
+    Note: Get topological ordering
+    Let sorted_nodes be Graph.topological_sort(graph)
+    If sorted_nodes equals 0:
+        Return parallel_nodes
+    End If
+
+    Let node_count be List.length(sorted_nodes)
+    Let i be 0
+
+    While i is less than node_count:
+        Let node be List.get(sorted_nodes, i)
+
+        Note: Check if node operates on array data
+        Let output_type be Node.get_node_output_type(node)
+        Let is_array_op be is_array_type(output_type)
+
+        If is_array_op equals true:
+            Note: Analyze dependencies for this node
+            Let deps be analyze_node_dependencies(graph, node)
+            Let has_loop_carried_deps be check_loop_carried_dependencies(deps)
+
+            If has_loop_carried_deps equals false:
+                Note: Node is data-parallel - compute parallelism degree
+                Let degree be compute_data_parallelism_degree(node, output_type)
+
+                Note: Create parallelism info
+                Let info be a value of type ParallelismInfo with
+                    model as PARALLELISM_DATA_PARALLEL,
+                    degree as degree,
+                    is_safe as true,
+                    estimated_speedup as compute_parallelism_speedup(degree)
+
+                Note: Add to parallel nodes list (store node + info as tuple)
+                Let entry be List.create()
+                List.append(entry, node)
+                List.append(entry, info)
+                List.append(parallel_nodes, entry)
+            End If
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return parallel_nodes
+End Process
+
+Process called "detect_task_parallelism" that takes graph as Integer returns Integer:
+    @Reasoning
+    Task parallelism occurs when independent tasks can execute concurrently.
+    In Bifrost graphs:
+    1. Nodes with no data dependencies can run in parallel
+    2. Different branches of the DAG can execute simultaneously
+    3. Tasks may perform different operations on different data
+
+    Algorithm:
+    - Identify nodes at the same depth level (can potentially run in parallel)
+    - Check for data dependencies between nodes
+    - Group independent nodes into parallel task sets
+    - Estimate task granularity and scheduling overhead
+    @End Reasoning
+
+    @Implementation
+    1. Compute depth for each node in the graph
+    2. Group nodes by depth level
+    3. Within each level, find independent node sets
+    4. Check that no dependencies exist within each set
+    5. Estimate parallelism benefit considering overhead
+    6. Return list of task-parallel regions
+    @End Implementation
+
+    Let parallel_regions be List.create()
+
+    Note: Compute depths for all nodes
+    Let depths be Graph.compute_depths(graph)
+    If depths equals 0:
+        Return parallel_regions
+    End If
+
+    Note: Group nodes by depth level
+    Let levels be Dict.create()
+    Let all_nodes be Graph.get_all_nodes(graph)
+    Let node_count be List.length(all_nodes)
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(all_nodes, i)
+        Let depth be Dict.get(depths, node)
+
+        Note: Get or create list for this depth
+        Let level_nodes be Dict.get(levels, depth)
+        If level_nodes equals 0:
+            Let level_nodes be List.create()
+            Dict.set(levels, depth, level_nodes)
+        End If
+
+        List.append(level_nodes, node)
+        Let i be i + 1
+    End While
+
+    Note: For each level, find independent node sets
+    Let level_count be Dict.size(levels)
+    Let level_keys be Dict.keys(levels)
+
+    Let j be 0
+    While j is less than level_count:
+        Let depth be List.get(level_keys, j)
+        Let level_nodes be Dict.get(levels, depth)
+        Let level_size be List.length(level_nodes)
+
+        Note: Only worthwhile if multiple nodes at this level
+        If level_size is greater than 1:
+            Note: Find maximal independent sets
+            Let independent_sets be find_independent_node_sets(graph, level_nodes)
+            Let set_count be List.length(independent_sets)
+
+            Let k be 0
+            While k is less than set_count:
+                Let node_set be List.get(independent_sets, k)
+                Let set_size be List.length(node_set)
+
+                Note: Only create region if multiple independent nodes
+                If set_size is greater than 1:
+                    Let region be a value of type ParallelRegion with
+                        nodes as node_set,
+                        parallelism_model as PARALLELISM_TASK_GRAPH,
+                        estimated_benefit as estimate_task_parallelism_benefit(node_set)
+
+                    List.append(parallel_regions, region)
+                End If
+
+                Let k be k + 1
+            End While
+        End If
+
+        Let j be j + 1
+    End While
+
+    Return parallel_regions
+End Process
+
+Process called "detect_pipeline_parallelism" that takes graph as Integer returns Integer:
+    @Reasoning
+    Pipeline parallelism occurs when data flows through multiple stages,
+    with each stage processing different data. Common in:
+    1. Streaming applications (signal processing, video)
+    2. Multi-stage computations (convolution → pooling → activation)
+    3. Producer-consumer patterns
+
+    Algorithm:
+    - Identify linear chains in the graph (sequences of dependent operations)
+    - Check for streaming data patterns (continuous data flow)
+    - Verify stages have balanced computation time
+    - Ensure sufficient buffer space between stages
+    @End Reasoning
+
+    @Implementation
+    1. Find all paths from roots to leaves
+    2. Identify linear chains (single producer → single consumer)
+    3. Check for streaming patterns (large data batches)
+    4. Analyze stage balance (avoid pipeline bubbles)
+    5. Estimate pipeline throughput and latency
+    6. Return list of pipeline regions
+    @End Implementation
+
+    Let pipeline_regions be List.create()
+
+    Note: Find all roots (entry points)
+    Let roots be Graph.find_roots(graph)
+    If roots equals 0:
+        Return pipeline_regions
+    End If
+
+    Let root_count be List.length(roots)
+    Let i be 0
+
+    While i is less than root_count:
+        Let root be List.get(roots, i)
+
+        Note: Find all paths from this root to leaves
+        Let paths be find_all_paths_from_node(graph, root)
+        Let path_count be List.length(paths)
+
+        Let j be 0
+        While j is less than path_count:
+            Let path be List.get(paths, j)
+            Let path_length be List.length(path)
+
+            Note: Pipeline requires at least 2 stages
+            If path_length is greater than or equal to 2:
+                Note: Check if path is a linear chain
+                Let is_linear be is_linear_chain(graph, path)
+
+                If is_linear equals true:
+                    Note: Check for streaming pattern
+                    Let is_streaming be check_streaming_pattern(path)
+
+                    If is_streaming equals true:
+                        Note: Analyze stage balance
+                        Let is_balanced be check_pipeline_balance(path)
+
+                        If is_balanced equals true:
+                            Let region be a value of type ParallelRegion with
+                                nodes as path,
+                                parallelism_model as PARALLELISM_PIPELINE,
+                                estimated_benefit as estimate_pipeline_benefit(path)
+
+                            List.append(pipeline_regions, region)
+                        End If
+                    End If
+                End If
+            End If
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Return pipeline_regions
+End Process
+
+Note: ================================================================
+Note: Loop Dependency Analysis
+Note: ================================================================
+
+Process called "analyze_loop_dependencies" that takes graph as Integer, loop_nodes as Integer returns Integer:
+    @Reasoning
+    Loop dependency analysis identifies RAW (Read-After-Write), WAR (Write-After-Read),
+    and WAW (Write-After-Write) dependencies that prevent parallelization.
+
+    Algorithm:
+    - For each pair of operations in the loop
+    - Check memory access patterns
+    - Determine dependency type and distance
+    - RAW dependencies are true dependencies (must preserve)
+    - WAR and WAW can sometimes be eliminated via renaming
+    @End Reasoning
+
+    @Implementation
+    1. Extract all memory operations (loads/stores) from loop nodes
+    2. For each pair of memory operations, check for conflicts
+    3. Determine dependency type (RAW/WAR/WAW/RAR)
+    4. Compute iteration distance (intra vs inter-iteration)
+    5. Return list of dependencies with types and distances
+    @End Implementation
+
+    Let dependencies be List.create()
+
+    Note: Extract memory operations
+    Let memory_ops be extract_memory_operations(loop_nodes)
+    Let op_count be List.length(memory_ops)
+
+    Note: Check each pair of operations
+    Let i be 0
+    While i is less than op_count:
+        Let op1 be List.get(memory_ops, i)
+
+        Let j be i + 1
+        While j is less than op_count:
+            Let op2 be List.get(memory_ops, j)
+
+            Note: Check for memory conflict
+            Let conflict be check_memory_conflict(op1, op2)
+
+            If conflict is greater than 0:
+                Note: Determine dependency type
+                Let dep_type be determine_dependency_type(op1, op2)
+
+                Note: Compute iteration distance
+                Let distance be compute_iteration_distance(op1, op2)
+
+                Note: Create dependency info
+                Let dep_info be a value of type DependencyInfo with
+                    source_node as op1,
+                    dest_node as op2,
+                    dependency_type as dep_type,
+                    distance as distance
+
+                List.append(dependencies, dep_info)
+            End If
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Return dependencies
+End Process
+
+Process called "check_loop_carried_dependencies" that takes dependencies as Integer returns Boolean:
+    @Reasoning
+    Loop-carried dependencies are dependencies between different iterations
+    of a loop. They prevent full parallelization of the loop.
+
+    A dependency is loop-carried if:
+    - Distance > 0 (crosses iteration boundaries)
+    - Type is RAW (true dependency that must be preserved)
+
+    If all dependencies are distance=0 (intra-iteration), the loop is
+    fully parallel. If only WAR/WAW dependencies cross iterations,
+    they may be eliminated via privatization/expansion.
+    @End Reasoning
+
+    @Implementation
+    1. Iterate through all dependencies
+    2. Check if any RAW dependency has distance > 0
+    3. Return true if loop-carried RAW dependency found
+    4. Return false if all RAW dependencies are intra-iteration
+    @End Implementation
+
+    If dependencies equals 0:
+        Return false
+    End If
+
+    Let dep_count be List.length(dependencies)
+    Let i be 0
+
+    While i is less than dep_count:
+        Let dep_info be List.get(dependencies, i)
+
+        Note: Extract dependency type and distance
+        Let dep_type be Layout.memory_get_int64(dep_info, 16)
+        Let distance be Layout.memory_get_int64(dep_info, 24)
+
+        Note: Check for loop-carried RAW dependency
+        If dep_type equals DEP_RAW:
+            If distance is greater than 0:
+                Return true
+            End If
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return false
+End Process
+
+Note: ================================================================
+Note: Reduction Pattern Detection
+Note: ================================================================
+
+Process called "check_reduction_pattern" that takes graph as Integer, node as Integer returns Boolean:
+    @Reasoning
+    Reductions are special patterns where a loop computes a single value
+    by combining all elements (sum, product, max, min). Common patterns:
+    - sum += array[i]
+    - product *= array[i]
+    - max = maximum(max, array[i])
+
+    Reductions are parallelizable using special reduction operations
+    (requires associative and commutative operators).
+
+    Detection criteria:
+    1. Accumulation variable (scalar updated in each iteration)
+    2. Associative and commutative operator (Add, Multiply, Max, Min)
+    3. No other uses of accumulation variable in loop body
+    @End Reasoning
+
+    @Implementation
+    1. Check if node is accumulation operation (Add, Multiply, Max, Min)
+    2. Verify one input is loop-invariant (accumulator)
+    3. Verify other input depends on loop iteration
+    4. Check operator is associative and commutative
+    5. Return true if all criteria met
+    @End Implementation
+
+    Note: Get node operation kind
+    Let op_kind be Node.get_node_opkind(node)
+
+    Note: Check if operation is a reduction operator
+    Let is_reduction_op be is_reduction_operator(op_kind)
+    If is_reduction_op equals false:
+        Return false
+    End If
+
+    Note: Get node inputs
+    Let inputs be Node.get_node_inputs(node)
+    Let input_count be List.length(inputs)
+
+    Note: Reduction requires exactly 2 inputs (accumulator + new value)
+    If input_count is not equal to 2:
+        Return false
+    End If
+
+    Let input0 be List.get(inputs, 0)
+    Let input1 be List.get(inputs, 1)
+
+    Note: Check if one input is loop-invariant (accumulator)
+    Let input0_invariant be is_loop_invariant(graph, input0)
+    Let input1_invariant be is_loop_invariant(graph, input1)
+
+    Note: Exactly one input should be loop-invariant
+    If input0_invariant equals true:
+        If input1_invariant equals true:
+            Return false
+        End If
+        Return true
+    End If
+
+    If input1_invariant equals true:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Note: ================================================================
+Note: Parallelism Extraction
+Note: ================================================================
+
+Process called "extract_parallel_regions" that takes graph as Integer returns Integer:
+    @Reasoning
+    Extracts all parallelizable regions from the graph by combining
+    results from data, task, and pipeline parallelism detection.
+
+    Algorithm:
+    - Run all three parallelism detection analyses
+    - Combine results into unified list
+    - Rank regions by estimated benefit
+    - Handle overlapping regions (choose best parallelism model)
+    @End Reasoning
+
+    @Implementation
+    1. Detect data parallelism
+    2. Detect task parallelism
+    3. Detect pipeline parallelism
+    4. Merge results and resolve conflicts
+    5. Sort by estimated benefit
+    6. Return ranked list of parallel regions
+    @End Implementation
+
+    Let all_regions be List.create()
+
+    Note: Detect data parallelism
+    Let data_parallel be detect_data_parallelism(graph)
+    Let data_count be List.length(data_parallel)
+
+    Let i be 0
+    While i is less than data_count:
+        Let entry be List.get(data_parallel, i)
+        List.append(all_regions, entry)
+        Let i be i + 1
+    End While
+
+    Note: Detect task parallelism
+    Let task_parallel be detect_task_parallelism(graph)
+    Let task_count be List.length(task_parallel)
+
+    Let j be 0
+    While j is less than task_count:
+        Let region be List.get(task_parallel, j)
+        List.append(all_regions, region)
+        Let j be j + 1
+    End While
+
+    Note: Detect pipeline parallelism
+    Let pipeline_parallel be detect_pipeline_parallelism(graph)
+    Let pipeline_count be List.length(pipeline_parallel)
+
+    Let k be 0
+    While k is less than pipeline_count:
+        Let region be List.get(pipeline_parallel, k)
+        List.append(all_regions, region)
+        Let k be k + 1
+    End While
+
+    Note: Resolve conflicts and rank regions
+    Let ranked_regions be resolve_and_rank_regions(all_regions)
+
+    Return ranked_regions
+End Process
+
+Process called "compute_parallelism_degree" that takes graph as Integer, region as Integer returns Integer:
+    @Reasoning
+    Computes the maximum degree of parallelism for a region.
+
+    For data parallelism: Number of independent data elements
+    For task parallelism: Number of independent tasks
+    For pipeline parallelism: Number of pipeline stages
+
+    Limited by:
+    - Available hardware resources (cores, threads)
+    - Memory bandwidth
+    - Synchronization overhead
+    @End Reasoning
+
+    @Implementation
+    1. Determine parallelism model for region
+    2. Compute theoretical maximum parallelism
+    3. Apply hardware constraints
+    4. Consider overhead factors
+    5. Return practical parallelism degree
+    @End Implementation
+
+    Note: Get parallelism model from region
+    Let model be Layout.memory_get_int64(region, 8)
+
+    If model equals PARALLELISM_DATA_PARALLEL:
+        Note: For data parallelism, degree = data size
+        Let nodes be Layout.memory_get_int64(region, 0)
+        If nodes is not equal to 0:
+            Let node_count be List.length(nodes)
+            If node_count is greater than 0:
+                Let first_node be List.get(nodes, 0)
+                Let output_type be Node.get_node_output_type(first_node)
+                Return compute_data_parallelism_degree(first_node, output_type)
+            End If
+        End If
+        Return 1
+    End If
+
+    If model equals PARALLELISM_TASK_GRAPH:
+        Note: For task parallelism, degree = number of independent tasks
+        Let nodes be Layout.memory_get_int64(region, 0)
+        If nodes is not equal to 0:
+            Return List.length(nodes)
+        End If
+        Return 1
+    End If
+
+    If model equals PARALLELISM_PIPELINE:
+        Note: For pipeline parallelism, degree = number of stages
+        Let nodes be Layout.memory_get_int64(region, 0)
+        If nodes is not equal to 0:
+            Return List.length(nodes)
+        End If
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+Note: ================================================================
+Note: Parallelism Model Inference
+Note: ================================================================
+
+Process called "infer_parallelism_model" that takes graph as Integer, node as Integer returns Integer:
+    @Reasoning
+    Automatically infers the best parallelism model for a node based on:
+    - Operation type (SIMD-friendly, memory-bound, compute-bound)
+    - Data access patterns (contiguous, strided, random)
+    - Dependencies (independent iterations, task dependencies)
+
+    Priority:
+    1. SIMD for vector operations with contiguous access
+    2. Data-parallel for independent array operations
+    3. Task-parallel for independent computations
+    4. Pipeline for sequential stages with streaming data
+    @End Reasoning
+
+    @Implementation
+    1. Get operation kind and data type
+    2. Check for SIMD opportunities (vector ops)
+    3. Check for data parallelism (array ops)
+    4. Check for task parallelism (independent computations)
+    5. Check for pipeline parallelism (streaming pattern)
+    6. Return best parallelism model
+    @End Implementation
+
+    Note: Get operation kind
+    Let op_kind be Node.get_node_opkind(node)
+
+    Note: Get output type
+    Let output_type be Node.get_node_output_type(node)
+
+    Note: Check for SIMD (vector operations)
+    Let is_vector_op be Node.opkind_is_vector(op_kind)
+    If is_vector_op equals true:
+        Let is_vector_type be Node.is_vector_type(output_type)
+        If is_vector_type equals true:
+            Return PARALLELISM_SIMD
+        End If
+    End If
+
+    Note: Check for data parallelism (array operations)
+    Let is_array_type be is_array_type(output_type)
+    If is_array_type equals true:
+        Let deps be analyze_node_dependencies(graph, node)
+        Let has_loop_carried be check_loop_carried_dependencies(deps)
+        If has_loop_carried equals false:
+            Return PARALLELISM_DATA_PARALLEL
+        End If
+    End If
+
+    Note: Check for task parallelism (independent node)
+    Let predecessors be Graph.get_node_predecessors(graph, node)
+    Let successors be Graph.get_node_successors(graph, node)
+
+    Let pred_count be List.length(predecessors)
+    Let succ_count be List.length(successors)
+
+    Note: If node has multiple independent predecessors, likely task-parallel
+    If pred_count is greater than 1:
+        Let are_independent be check_nodes_independent(graph, predecessors)
+        If are_independent equals true:
+            Return PARALLELISM_TASK_GRAPH
+        End If
+    End If
+
+    Note: Check for pipeline (part of linear chain)
+    If pred_count equals 1:
+        If succ_count equals 1:
+            Return PARALLELISM_PIPELINE
+        End If
+    End If
+
+    Return PARALLELISM_NONE
+End Process
+
+Note: ================================================================
+Note: Performance Estimation
+Note: ================================================================
+
+Process called "estimate_parallelism_benefit" that takes region as Integer returns Float:
+    @Reasoning
+    Estimates the performance benefit of parallelizing a region.
+
+    Factors:
+    - Parallelism degree (higher = better speedup)
+    - Amdahl's Law (serial fraction limits speedup)
+    - Overhead (synchronization, communication)
+    - Load balance (uneven work distribution)
+
+    Formula: Speedup = 1 / (serial_fraction + (parallel_fraction / degree))
+    Adjusted for overhead and load imbalance.
+    @End Reasoning
+
+    @Implementation
+    1. Compute parallelism degree
+    2. Analyze serial fraction from dependency graph
+    3. Calculate ideal speedup
+    4. Apply overhead penalty
+    5. Apply load balance penalty
+    6. Return estimated speedup
+    @End Implementation
+
+    Note: Get parallelism degree
+    Let degree be compute_parallelism_degree(0, region)
+
+    Note: Compute serial fraction by analyzing dependencies
+    Let serial_fraction be compute_serial_fraction_from_dependencies(region)
+    Let parallel_fraction be 1.0 - serial_fraction
+
+    Note: Compute ideal speedup using Amdahl's Law
+    Let ideal_speedup be 1.0 / (serial_fraction + (parallel_fraction / Math.int_to_float(degree)))
+
+    Note: Apply overhead penalty (synchronization, communication)
+    Let overhead_factor be compute_overhead_factor(region)
+    Let adjusted_speedup be ideal_speedup * overhead_factor
+
+    Note: Apply load balance penalty
+    Let load_balance_factor be compute_load_balance_factor(region)
+    Let final_speedup be adjusted_speedup * load_balance_factor
+
+    Return final_speedup
+End Process
+
+Process called "compute_serial_fraction_from_dependencies" that takes region as Integer returns Float:
+    @Reasoning
+    Computes the serial fraction by analyzing the dependency graph.
+
+    Algorithm:
+    1. Extract all nodes in the region
+    2. Build dependency graph (def-use chains)
+    3. Compute critical path length (longest dependency chain)
+    4. Compute total work (sum of all operation costs)
+    5. Serial fraction = critical_path_cost / total_work
+
+    A higher critical path relative to total work means more serial code.
+    A lower critical path means more parallelizable code.
+    @End Reasoning
+
+    @Implementation
+    1. Get nodes in region
+    2. Build dependency graph
+    3. Find critical path using topological sort + longest path
+    4. Compute total work (sum of operation costs)
+    5. Serial fraction = critical_path / total_work
+    6. Clamp to [0.0, 1.0]
+    @End Implementation
+
+    Let nodes be Layout.memory_get_int64(region, 0)
+    If nodes equals 0:
+        Return 0.1
+    End If
+
+    Let node_count be List.length(nodes)
+    If node_count equals 0:
+        Return 0.1
+    End If
+
+    Note: Compute operation cost for each node
+    Let node_costs be Dict.create()
+    Let total_work be 0.0
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(nodes, i)
+        Let cost be estimate_node_cost(node)
+        Dict.set(node_costs, node, cost)
+        Let total_work be total_work + cost
+        Let i be i + 1
+    End While
+
+    Note: Compute critical path using dynamic programming
+    Note: critical_path[node] = max(critical_path[pred]) + cost[node]
+    Let critical_path_costs be Dict.create()
+
+    Note: Initialize all nodes to their own cost
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(nodes, i)
+        Let cost be Dict.get(node_costs, node)
+        Dict.set(critical_path_costs, node, cost)
+        Let i be i + 1
+    End While
+
+    Note: Iterate until convergence (dynamic programming)
+    Let changed be true
+    Let iteration_count be 0
+    While changed equals true:
+        Let changed be false
+        Let iteration_count be iteration_count + 1
+
+        If iteration_count is greater than 100:
+            Note: Prevent infinite loop
+            Let changed be false
+        End If
+
+        Let i be 0
+        While i is less than node_count:
+            Let node be List.get(nodes, i)
+            Let node_cost be Dict.get(node_costs, node)
+            Let current_critical be Dict.get(critical_path_costs, node)
+
+            Note: Find max critical path from predecessors
+            Let predecessors be Graph.get_node_predecessors(0, node)
+            Let pred_count be List.length(predecessors)
+
+            Let max_pred_critical be 0.0
+            Let p be 0
+            While p is less than pred_count:
+                Let pred be List.get(predecessors, p)
+                Let pred_critical be Dict.get(critical_path_costs, pred)
+                If pred_critical is greater than max_pred_critical:
+                    Let max_pred_critical be pred_critical
+                End If
+                Let p be p + 1
+            End While
+
+            Note: Update critical path: max(pred_critical) + node_cost
+            Let new_critical be max_pred_critical + node_cost
+
+            If new_critical is greater than current_critical:
+                Dict.set(critical_path_costs, node, new_critical)
+                Let changed be true
+            End If
+
+            Let i be i + 1
+        End While
+    End While
+
+    Note: Find maximum critical path across all nodes
+    Let max_critical_path be 0.0
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(nodes, i)
+        Let critical be Dict.get(critical_path_costs, node)
+        If critical is greater than max_critical_path:
+            Let max_critical_path be critical
+        End If
+        Let i be i + 1
+    End While
+
+    Note: Serial fraction = critical_path / total_work
+    Let serial_fraction be max_critical_path / total_work
+
+    Note: Clamp to reasonable range [0.01, 0.95]
+    If serial_fraction is less than 0.01:
+        Let serial_fraction be 0.01
+    End If
+    If serial_fraction is greater than 0.95:
+        Let serial_fraction be 0.95
+    End If
+
+    Return serial_fraction
+End Process
+
+Process called "estimate_node_cost" that takes node as Integer returns Float:
+    @Reasoning
+    Estimates the computational cost of a single node.
+    Based on operation type complexity.
+    @End Reasoning
+
+    Let op_kind be Node.get_node_opkind(node)
+
+    Note: Arithmetic ops: ~1 cycle
+    If op_kind is greater than or equal to 0:
+        If op_kind is less than or equal to 5:
+            Return 1.0
+        End If
+    End If
+
+    Note: Matrix ops: O(n^3) complexity, high cost
+    If op_kind is greater than or equal to 6:
+        If op_kind is less than or equal to 9:
+            Return 100.0
+        End If
+    End If
+
+    Note: Vector ops: ~10 cycles
+    If op_kind is greater than or equal to 10:
+        If op_kind is less than or equal to 12:
+            Return 10.0
+        End If
+    End If
+
+    Note: Convolution, FFT: very expensive
+    If op_kind is greater than or equal to 13:
+        If op_kind is less than or equal to 18:
+            Return 500.0
+        End If
+    End If
+
+    Note: Memory ops: ~50 cycles (memory latency)
+    If op_kind is greater than or equal to 34:
+        If op_kind is less than or equal to 37:
+            Return 50.0
+        End If
+    End If
+
+    Note: Default: moderate cost
+    Return 10.0
+End Process
+
+Note: ================================================================
+Note: Race Condition Detection
+Note: ================================================================
+
+Process called "detect_race_conditions" that takes graph as Integer, parallel_region as Integer returns Integer:
+    @Reasoning
+    Detects potential race conditions in parallel regions.
+
+    Race condition occurs when:
+    1. Multiple threads access the same memory location
+    2. At least one access is a write
+    3. No synchronization between accesses
+
+    Detection algorithm:
+    - Extract all memory operations in the region
+    - Find pairs with overlapping memory accesses
+    - Check if any pair has a write operation
+    - Verify no synchronization edges exist between them
+    @End Reasoning
+
+    @Implementation
+    1. Extract memory operations from parallel region
+    2. For each pair of operations, check for conflicts
+    3. Determine if conflict involves a write
+    4. Check for synchronization (control edges)
+    5. Report race conditions with source locations
+    6. Return list of detected races
+    @End Implementation
+
+    Let race_conditions be List.create()
+
+    Note: Get nodes in parallel region
+    Let nodes be Layout.memory_get_int64(parallel_region, 0)
+    If nodes equals 0:
+        Return race_conditions
+    End If
+
+    Note: Extract memory operations
+    Let memory_ops be extract_memory_operations(nodes)
+    Let op_count be List.length(memory_ops)
+
+    Note: Check each pair for races
+    Let i be 0
+    While i is less than op_count:
+        Let op1 be List.get(memory_ops, i)
+
+        Let j be i + 1
+        While j is less than op_count:
+            Let op2 be List.get(memory_ops, j)
+
+            Note: Check for memory conflict
+            Let conflict be check_memory_conflict(op1, op2)
+
+            If conflict is greater than 0:
+                Note: Check if conflict involves write
+                Let has_write be has_write_operation(op1, op2)
+
+                If has_write equals true:
+                    Note: Check for synchronization
+                    Let is_synchronized be check_synchronization(graph, op1, op2)
+
+                    If is_synchronized equals false:
+                        Note: Race condition detected
+                        Let race_info be create_race_info(op1, op2)
+                        List.append(race_conditions, race_info)
+                    End If
+                End If
+            End If
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Return race_conditions
+End Process
+
+Process called "validate_parallel_safety" that takes graph as Integer, parallel_region as Integer returns Boolean:
+    @Reasoning
+    Validates that a parallel region is safe for parallel execution.
+
+    Safety criteria:
+    1. No race conditions
+    2. No deadlocks
+    3. Proper synchronization
+    4. Memory safety (no buffer overflows)
+    5. Resource constraints satisfied
+    @End Reasoning
+
+    @Implementation
+    1. Check for race conditions
+    2. Check for circular dependencies (deadlock potential)
+    3. Validate synchronization primitives
+    4. Verify memory bounds
+    5. Check resource limits (memory, registers)
+    6. Return true if all checks pass
+    @End Implementation
+
+    Note: Check for race conditions
+    Let races be detect_race_conditions(graph, parallel_region)
+    Let race_count be List.length(races)
+
+    If race_count is greater than 0:
+        Return false
+    End If
+
+    Note: Check for circular dependencies (deadlock)
+    Let nodes be Layout.memory_get_int64(parallel_region, 0)
+    If nodes is not equal to 0:
+        Let subgraph be Graph.get_subgraph(graph, nodes)
+        Let has_cycle be Graph.has_cycle(subgraph)
+
+        If has_cycle equals true:
+            Return false
+        End If
+    End If
+
+    Note: Validate synchronization (check for control edges)
+    Let has_proper_sync be validate_synchronization(graph, parallel_region)
+    If has_proper_sync equals false:
+        Return false
+    End If
+
+    Note: Verify memory safety
+    Let is_memory_safe be check_memory_safety(parallel_region)
+    If is_memory_safe equals false:
+        Return false
+    End If
+
+    Return true
+End Process
+
+Note: ================================================================
+Note: Helper Functions
+Note: ================================================================
+
+Process called "is_array_type" that takes type_ptr as Integer returns Boolean:
+    If type_ptr equals 0:
+        Return false
+    End If
+
+    Let discriminant be Layout.memory_get_int64(type_ptr, 0)
+
+    Note: Vector, Matrix, Tensor are array types
+    If discriminant equals 2:
+        Return true
+    End If
+    If discriminant equals 3:
+        Return true
+    End If
+    If discriminant equals 5:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "compute_data_parallelism_degree" that takes node as Integer, output_type as Integer returns Integer:
+    If output_type equals 0:
+        Return 1
+    End If
+
+    Let discriminant be Layout.memory_get_int64(output_type, 0)
+
+    Note: Vector - degree is vector size
+    If discriminant equals 2:
+        Let size be Layout.memory_get_int64(output_type, 16)
+        Return size
+    End If
+
+    Note: Matrix - degree is total elements (rows * cols)
+    If discriminant equals 3:
+        Let rows be Layout.memory_get_int64(output_type, 16)
+        Let cols be Layout.memory_get_int64(output_type, 24)
+        Return rows * cols
+    End If
+
+    Note: Tensor - degree is product of all dimensions
+    If discriminant equals 5:
+        Let shape_ptr be Layout.memory_get_int64(output_type, 16)
+        If shape_ptr is not equal to 0:
+            Let dim_count be List.length(shape_ptr)
+            Let total_elements be 1
+
+            Let i be 0
+            While i is less than dim_count:
+                Let dim be List.get(shape_ptr, i)
+                Let total_elements be total_elements * dim
+                Let i be i + 1
+            End While
+
+            Return total_elements
+        End If
+    End If
+
+    Return 1
+End Process
+
+Process called "analyze_node_dependencies" that takes graph as Integer, node as Integer returns Integer:
+    Let dependencies be List.create()
+
+    Note: Get all edges connected to this node
+    Let inputs be Graph.get_node_inputs(graph, node)
+    Let input_count be List.length(inputs)
+
+    Let i be 0
+    While i is less than input_count:
+        Let edge be List.get(inputs, i)
+        Let source be Edge.get_edge_source(edge)
+
+        Note: Create dependency info
+        Let dep_info be a value of type DependencyInfo with
+            source_node as source,
+            dest_node as node,
+            dependency_type as DEP_RAW,
+            distance as 0
+
+        List.append(dependencies, dep_info)
+        Let i be i + 1
+    End While
+
+    Return dependencies
+End Process
+
+Process called "find_independent_node_sets" that takes graph as Integer, nodes as Integer returns Integer:
+    Let independent_sets be List.create()
+
+    Note: Simple greedy algorithm: find maximal independent set
+    Let remaining be List.clone(nodes)
+
+    While List.length(remaining) is greater than 0:
+        Let current_set be List.create()
+        Let to_remove be List.create()
+
+        Let i be 0
+        While i is less than List.length(remaining):
+            Let node be List.get(remaining, i)
+
+            Note: Check if independent from all nodes in current set
+            Let is_independent be true
+
+            Let j be 0
+            While j is less than List.length(current_set):
+                Let other_node be List.get(current_set, j)
+                Let are_independent be check_nodes_independent(graph, node, other_node)
+
+                If are_independent equals false:
+                    Let is_independent be false
+                End If
+
+                Let j be j + 1
+            End While
+
+            If is_independent equals true:
+                List.append(current_set, node)
+                List.append(to_remove, node)
+            End If
+
+            Let i be i + 1
+        End While
+
+        Note: Remove nodes added to current set
+        Let k be 0
+        While k is less than List.length(to_remove):
+            Let node be List.get(to_remove, k)
+            List.remove(remaining, node)
+            Let k be k + 1
+        End While
+
+        If List.length(current_set) is greater than 0:
+            List.append(independent_sets, current_set)
+        End If
+    End While
+
+    Return independent_sets
+End Process
+
+Process called "check_nodes_independent" that takes graph as Integer, node1 as Integer, node2 as Integer returns Boolean:
+    Note: Nodes are independent if no data flow edge between them
+    Let edges1 be Graph.get_node_outputs(graph, node1)
+
+    Let i be 0
+    While i is less than List.length(edges1):
+        Let edge be List.get(edges1, i)
+        Let dest be Edge.get_edge_dest(edge)
+
+        If dest equals node2:
+            Return false
+        End If
+
+        Let i be i + 1
+    End While
+
+    Let edges2 be Graph.get_node_outputs(graph, node2)
+
+    Let j be 0
+    While j is less than List.length(edges2):
+        Let edge be List.get(edges2, j)
+        Let dest be Edge.get_edge_dest(edge)
+
+        If dest equals node1:
+            Return false
+        End If
+
+        Let j be j + 1
+    End While
+
+    Return true
+End Process
+
+Process called "find_all_paths_from_node" that takes graph as Integer, start_node as Integer returns Integer:
+    Let all_paths be List.create()
+    Let current_path be List.create()
+    List.append(current_path, start_node)
+
+    find_paths_dfs(graph, start_node, current_path, all_paths)
+
+    Return all_paths
+End Process
+
+Process called "find_paths_dfs" that takes graph as Integer, current as Integer, path as Integer, all_paths as Integer returns Nothing:
+    Let successors be Graph.get_node_successors(graph, current)
+    Let succ_count be List.length(successors)
+
+    Note: If no successors, this is a leaf - add path
+    If succ_count equals 0:
+        Let path_copy be List.clone(path)
+        List.append(all_paths, path_copy)
+        Return
+    End If
+
+    Note: Recursively explore each successor
+    Let i be 0
+    While i is less than succ_count:
+        Let succ be List.get(successors, i)
+        List.append(path, succ)
+        find_paths_dfs(graph, succ, path, all_paths)
+        List.remove_at(path, List.length(path) - 1)
+        Let i be i + 1
+    End While
+End Process
+
+Process called "is_linear_chain" that takes graph as Integer, path as Integer returns Boolean:
+    Let path_length be List.length(path)
+
+    Let i be 0
+    While i is less than path_length - 1:
+        Let node be List.get(path, i)
+        Let successors be Graph.get_node_successors(graph, node)
+
+        Note: Linear chain means exactly one successor
+        If List.length(successors) is not equal to 1:
+            Return false
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return true
+End Process
+
+Process called "check_streaming_pattern" that takes path as Integer returns Boolean:
+    Note: Check if nodes operate on large data batches (streaming pattern)
+    Let path_length be List.length(path)
+
+    Let i be 0
+    While i is less than path_length:
+        Let node be List.get(path, i)
+        Let output_type be Node.get_node_output_type(node)
+
+        Note: Streaming requires array/tensor data
+        Let is_array be is_array_type(output_type)
+        If is_array equals false:
+            Return false
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return true
+End Process
+
+Process called "check_pipeline_balance" that takes path as Integer returns Boolean:
+    Note: Simplified check - assume balanced if all stages present
+    Note: Real implementation would estimate execution time per stage
+    Return true
+End Process
+
+Process called "estimate_task_parallelism_benefit" that takes node_set as Integer returns Float:
+    Let set_size be List.length(node_set)
+    Let degree_float be Math.int_to_float(set_size)
+
+    Note: Task parallelism has higher overhead than data parallelism
+    Let overhead_factor be 0.8
+    Let ideal_speedup be degree_float * overhead_factor
+
+    Return ideal_speedup
+End Process
+
+Process called "estimate_pipeline_benefit" that takes path as Integer returns Float:
+    Let stage_count be List.length(path)
+
+    Note: Pipeline throughput improves with more stages
+    Note: But latency increases (startup cost)
+    Let throughput_improvement be Math.int_to_float(stage_count) * 0.7
+
+    Return throughput_improvement
+End Process
+
+Process called "resolve_and_rank_regions" that takes regions as Integer returns Integer:
+    Note: Simple ranking by estimated benefit
+    Note: Real implementation would resolve overlaps and conflicts
+    Return regions
+End Process
+
+Process called "extract_memory_operations" that takes nodes as Integer returns Integer:
+    Let memory_ops be List.create()
+
+    Let node_count be List.length(nodes)
+    Let i be 0
+
+    While i is less than node_count:
+        Let node be List.get(nodes, i)
+        Let op_kind be Node.get_node_opkind(node)
+
+        Note: Check if operation involves memory access
+        Note: OpKind Load=40, Store=41 (from node.runa)
+        If op_kind equals 40:
+            List.append(memory_ops, node)
+        End If
+        If op_kind equals 41:
+            List.append(memory_ops, node)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return memory_ops
+End Process
+
+Process called "check_memory_conflict" that takes op1 as Integer, op2 as Integer returns Integer:
+    Note: Simplified conflict detection
+    Note: Real implementation would analyze address expressions
+    Note: Return 0 for no conflict, 1 for potential conflict
+    Return 1
+End Process
+
+Process called "determine_dependency_type" that takes op1 as Integer, op2 as Integer returns Integer:
+    Let op1_kind be Node.get_node_opkind(op1)
+    Let op2_kind be Node.get_node_opkind(op2)
+
+    Note: Load=40, Store=41
+    If op1_kind equals 41:
+        If op2_kind equals 40:
+            Return DEP_RAW
+        End If
+        If op2_kind equals 41:
+            Return DEP_WAW
+        End If
+    End If
+
+    If op1_kind equals 40:
+        If op2_kind equals 41:
+            Return DEP_WAR
+        End If
+        If op2_kind equals 40:
+            Return DEP_RAR
+        End If
+    End If
+
+    Return DEP_NONE
+End Process
+
+Process called "compute_iteration_distance" that takes op1 as Integer, op2 as Integer returns Integer:
+    Note: Simplified - assume intra-iteration (distance 0)
+    Note: Real implementation would analyze loop induction variables
+    Return 0
+End Process
+
+Process called "is_reduction_operator" that takes op_kind as Integer returns Boolean:
+    Note: Add=0, Multiply=2, Max (not in basic set, assume 50), Min (assume 51)
+    If op_kind equals 0:
+        Return true
+    End If
+    If op_kind equals 2:
+        Return true
+    End If
+    If op_kind equals 50:
+        Return true
+    End If
+    If op_kind equals 51:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "is_loop_invariant" that takes graph as Integer, node as Integer returns Boolean:
+    Note: Simplified - check if node is constant or input
+    Let node_type be Node.get_node_type(node)
+
+    Note: NodeType: Constant=0, Input=1
+    If node_type equals 0:
+        Return true
+    End If
+    If node_type equals 1:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "compute_overhead_factor" that takes region as Integer returns Float:
+    Note: Simplified overhead model
+    Note: Real implementation would consider synchronization costs
+    Return 0.9
+End Process
+
+Process called "compute_load_balance_factor" that takes region as Integer returns Float:
+    Note: Simplified load balance model
+    Note: Real implementation would analyze work distribution
+    Return 0.95
+End Process
+
+Process called "has_write_operation" that takes op1 as Integer, op2 as Integer returns Boolean:
+    Let op1_kind be Node.get_node_opkind(op1)
+    Let op2_kind be Node.get_node_opkind(op2)
+
+    Note: Store=41
+    If op1_kind equals 41:
+        Return true
+    End If
+    If op2_kind equals 41:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "check_synchronization" that takes graph as Integer, op1 as Integer, op2 as Integer returns Boolean:
+    Note: Check for control edge between operations
+    Let edges be Graph.get_node_outputs(graph, op1)
+
+    Let i be 0
+    While i is less than List.length(edges):
+        Let edge be List.get(edges, i)
+        Let dest be Edge.get_edge_dest(edge)
+        Let kind be Edge.get_edge_kind(edge)
+
+        Note: EdgeKind Control=1
+        If dest equals op2:
+            If kind equals 1:
+                Return true
+            End If
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return false
+End Process
+
+Process called "create_race_info" that takes op1 as Integer, op2 as Integer returns Integer:
+    Note: Create simple race info structure
+    Let info be List.create()
+    List.append(info, op1)
+    List.append(info, op2)
+    Return info
+End Process
+
+Process called "validate_synchronization" that takes graph as Integer, region as Integer returns Boolean:
+    Note: Simplified - assume proper synchronization
+    Note: Real implementation would verify barrier placement
+    Return true
+End Process
+
+Process called "check_memory_safety" that takes region as Integer returns Boolean:
+    Note: Simplified - assume memory safe
+    Note: Real implementation would perform bounds checking
+    Return true
+End Process

@@ -1,0 +1,1269 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HIR to C Generator - Generates C code from Runa HIR
+
+This file generates properly formatted C source code from Runa's High-level
+Intermediate Representation (HIR). Produces idiomatic C code with correct
+syntax, indentation, and structure.
+
+HIR to C Mapping:
+- HIR dictionary with "_type": "c_program" → C program with declarations
+- HIR dictionary with "_type": "c_function" → C function definition
+- HIR dictionary with "_type": "c_variable" → C variable declaration
+- HIR dictionary with "_type": statement type → C statement
+- HIR dictionary with "_type": expression type → C expression
+- HIR string or dictionary with type info → C type specifier
+
+Dependencies:
+- c_emitter.runa
+- compiler/middle/gungnir/hir/hir.runa
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/backends/c/c_emitter.runa" as Emitter
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: Code Generation Context
+Note: ============================================================================
+
+Type called "CGenContext":
+    emitter as Integer           Note: C code emitter
+    indent_level as Integer      Note: Current indentation level
+    error_message as Integer     Note: Error message (if any)
+    has_error as Integer         Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Context Creation and Destruction
+Note: ============================================================================
+
+Process called "create_codegen_context" returns Integer:
+    Note: Create code generation context
+
+    Let context_size be 32  Note: CGenContext: 4 fields × 8 bytes
+    Let context be proc allocate from Layout with context_size
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Let emitter be proc create_c_emitter from Emitter
+
+    If emitter is equal to 0:
+        proc deallocate from Layout with context
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with context, 0, emitter
+    proc memory_set_int64 from Layout with context, 8, 0   Note: indent_level = 0
+    proc memory_set_int64 from Layout with context, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with context, 24, 0  Note: has_error = false
+
+    Return context
+End Process
+
+Process called "destroy_codegen_context" takes context as Integer returns Integer:
+    Note: Destroy code generation context
+
+    If context is equal to 0:
+        Return 1
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    If emitter is not equal to 0:
+        proc destroy_c_emitter from Emitter with emitter
+    End If
+
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with context
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_codegen_error" takes context as Integer, message as Integer returns Integer:
+    Note: Set code generation error message
+
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with context, 16, new_error
+    proc memory_set_int64 from Layout with context, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Process called "has_codegen_error" takes context as Integer returns Integer:
+    Note: Check if code generation has error
+
+    Let has_error be proc memory_get_int64 from Layout with context, 24
+
+    Return has_error
+End Process
+
+Process called "get_codegen_error" takes context as Integer returns Integer:
+    Note: Get code generation error message
+
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+
+    Return error_message
+End Process
+
+Note: ============================================================================
+Note: Indentation Management
+Note: ============================================================================
+
+Process called "emit_indent" takes context as Integer returns Integer:
+    Note: Emit indentation at current level
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+
+    proc emit_indent from Emitter with emitter, indent_level
+
+    Return 1
+End Process
+
+Process called "increase_indent" takes context as Integer returns Integer:
+    Note: Increase indentation level
+
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+    proc memory_set_int64 from Layout with context, 8, indent_level plus 1
+
+    Return 1
+End Process
+
+Process called "decrease_indent" takes context as Integer returns Integer:
+    Note: Decrease indentation level
+
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+
+    If indent_level is greater than 0:
+        proc memory_set_int64 from Layout with context, 8, indent_level minus 1
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HIR Dictionary Access Helpers
+Note: ============================================================================
+
+Process called "get_dict_string_value" takes hir_node as Integer, key as Integer returns Integer:
+    Note: Get string value from HIR dictionary
+
+    Let value_hir be proc get_dictionary_value from HIR with hir_node, key
+
+    If value_hir is equal to 0:
+        Return 0
+    End If
+
+    Let is_string be proc is_string_hir from value_hir
+
+    If is_string is equal to 0:
+        Return 0
+    End If
+
+    Let value_str be proc get_string_literal_value from HIR with value_hir
+
+    Return value_str
+End Process
+
+Process called "get_dict_hir_value" takes hir_node as Integer, key as Integer returns Integer:
+    Note: Get HIR value from dictionary
+
+    Let value_hir be proc get_dictionary_value from HIR with hir_node, key
+
+    Return value_hir
+End Process
+
+Note: ============================================================================
+Note: Type Generation
+Note: ============================================================================
+
+Process called "generate_type" takes context as Integer, type_hir as Integer returns Integer:
+    Note: Generate C type from HIR
+
+    @Reasoning:
+    Types can be simple strings (int, char, float) or dictionaries
+    (pointer, array). Generate appropriate C type syntax.
+    @End Reasoning
+
+    If type_hir is equal to 0:
+        Return 1
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let is_string be proc is_string_hir from type_hir
+
+    If is_string is equal to 1:
+        Let type_str be proc get_string_literal_value from HIR with type_hir
+        proc emit_string from Emitter with emitter, type_str
+        Return 1
+    End If
+
+    Let is_dict be proc is_dictionary_hir from type_hir
+
+    If is_dict is equal to 0:
+        Return 1
+    End If
+
+    Let type_name be proc get_dict_string_value from type_hir, "_type"
+
+    If type_name is equal to 0:
+        Return 1
+    End If
+
+    Let is_pointer be proc strings_equal from StringCore with type_name, "pointer"
+
+    If is_pointer is equal to 1:
+        Let base_type be proc get_dict_hir_value from type_hir, "base_type"
+        proc generate_type from context, base_type
+        proc emit_char from Emitter with emitter, 42  Note: *
+        Return 1
+    End If
+
+    Let is_array be proc strings_equal from StringCore with type_name, "array"
+
+    If is_array is equal to 1:
+        Let element_type be proc get_dict_hir_value from type_hir, "element_type"
+        proc generate_type from context, element_type
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Expression Generation
+Note: ============================================================================
+
+Process called "generate_expression" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate C expression from HIR
+
+    If expr_hir is equal to 0:
+        Return 1
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let is_string be proc is_string_hir from expr_hir
+
+    If is_string is equal to 1:
+        Let value_str be proc get_string_literal_value from HIR with expr_hir
+        proc emit_string from Emitter with emitter, value_str
+        Return 1
+    End If
+
+    Let is_dict be proc is_dictionary_hir from expr_hir
+
+    If is_dict is equal to 0:
+        Return 1
+    End If
+
+    Let expr_type be proc get_dict_string_value from expr_hir, "_type"
+
+    If expr_type is equal to 0:
+        Return 1
+    End If
+
+    Note: Literal expression
+    Let is_literal be proc strings_equal from StringCore with expr_type, "literal"
+
+    If is_literal is equal to 1:
+        Let value be proc get_dict_string_value from expr_hir, "value"
+
+        If value is not equal to 0:
+            proc emit_string from Emitter with emitter, value
+        End If
+
+        Return 1
+    End If
+
+    Note: Identifier expression
+    Let is_identifier be proc strings_equal from StringCore with expr_type, "identifier"
+
+    If is_identifier is equal to 1:
+        Let name be proc get_dict_string_value from expr_hir, "name"
+
+        If name is not equal to 0:
+            proc emit_string from Emitter with emitter, name
+        End If
+
+        Return 1
+    End If
+
+    Note: Binary expression
+    Let is_binary be proc strings_equal from StringCore with expr_type, "binary"
+
+    If is_binary is equal to 1:
+        Return proc generate_binary_expr from context, expr_hir
+    End If
+
+    Note: Unary expression
+    Let is_unary be proc strings_equal from StringCore with expr_type, "unary"
+
+    If is_unary is equal to 1:
+        Return proc generate_unary_expr from context, expr_hir
+    End If
+
+    Note: Call expression
+    Let is_call be proc strings_equal from StringCore with expr_type, "call"
+
+    If is_call is equal to 1:
+        Return proc generate_call_expr from context, expr_hir
+    End If
+
+    Note: Subscript expression
+    Let is_subscript be proc strings_equal from StringCore with expr_type, "subscript"
+
+    If is_subscript is equal to 1:
+        Return proc generate_subscript_expr from context, expr_hir
+    End If
+
+    Note: Member expression
+    Let is_member be proc strings_equal from StringCore with expr_type, "member"
+
+    If is_member is equal to 1:
+        Return proc generate_member_expr from context, expr_hir
+    End If
+
+    Note: Assignment expression
+    Let is_assignment be proc strings_equal from StringCore with expr_type, "assignment"
+
+    If is_assignment is equal to 1:
+        Return proc generate_assignment_expr from context, expr_hir
+    End If
+
+    Note: Ternary expression
+    Let is_ternary be proc strings_equal from StringCore with expr_type, "ternary"
+
+    If is_ternary is equal to 1:
+        Return proc generate_ternary_expr from context, expr_hir
+    End If
+
+    Note: Sizeof expression
+    Let is_sizeof be proc strings_equal from StringCore with expr_type, "sizeof"
+
+    If is_sizeof is equal to 1:
+        Return proc generate_sizeof_expr from context, expr_hir
+    End If
+
+    Note: Cast expression
+    Let is_cast be proc strings_equal from StringCore with expr_type, "cast"
+
+    If is_cast is equal to 1:
+        Return proc generate_cast_expr from context, expr_hir
+    End If
+
+    Return 1
+End Process
+
+Process called "generate_binary_expr" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate binary expression
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let left be proc get_dict_hir_value from expr_hir, "left"
+    Let operator be proc get_dict_string_value from expr_hir, "operator"
+    Let right be proc get_dict_hir_value from expr_hir, "right"
+
+    proc generate_expression from context, left
+
+    If operator is not equal to 0:
+        proc emit_space from Emitter with emitter
+        proc emit_string from Emitter with emitter, operator
+        proc emit_space from Emitter with emitter
+    End If
+
+    proc generate_expression from context, right
+
+    Return 1
+End Process
+
+Process called "generate_unary_expr" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate unary expression
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let operator be proc get_dict_string_value from expr_hir, "operator"
+    Let operand be proc get_dict_hir_value from expr_hir, "operand"
+
+    Note: Check for postfix operators (++post, --post)
+    If operator is not equal to 0:
+        Let is_postinc be proc strings_equal from StringCore with operator, "++post"
+
+        If is_postinc is equal to 1:
+            proc generate_expression from context, operand
+            proc emit_string from Emitter with emitter, "++"
+            Return 1
+        End If
+
+        Let is_postdec be proc strings_equal from StringCore with operator, "--post"
+
+        If is_postdec is equal to 1:
+            proc generate_expression from context, operand
+            proc emit_string from Emitter with emitter, "--"
+            Return 1
+        End If
+
+        Note: Prefix operators (++pre, --pre, -, !, ~, *, &)
+        Let is_preinc be proc strings_equal from StringCore with operator, "++pre"
+
+        If is_preinc is equal to 1:
+            proc emit_string from Emitter with emitter, "++"
+            proc generate_expression from context, operand
+            Return 1
+        End If
+
+        Let is_predec be proc strings_equal from StringCore with operator, "--pre"
+
+        If is_predec is equal to 1:
+            proc emit_string from Emitter with emitter, "--"
+            proc generate_expression from context, operand
+            Return 1
+        End If
+
+        Note: Other prefix operators
+        proc emit_string from Emitter with emitter, operator
+        proc generate_expression from context, operand
+    End If
+
+    Return 1
+End Process
+
+Process called "generate_call_expr" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate function call expression
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let func_expr be proc get_dict_hir_value from expr_hir, "function"
+    proc generate_expression from context, func_expr
+
+    proc emit_char from Emitter with emitter, 40  Note: (
+
+    Let arguments be proc get_dict_hir_value from expr_hir, "arguments"
+
+    If arguments is not equal to 0:
+        Let is_list be proc is_list_hir from arguments
+
+        If is_list is equal to 1:
+            Let arg_items be proc get_list_elements from HIR with arguments
+            Let count be proc size from List with arg_items
+            Let index be 0
+
+            While index is less than count:
+                Let arg_hir be proc get_at from List with arg_items, index
+                proc generate_expression from context, arg_hir
+
+                If index plus 1 is less than count:
+                    proc emit_string from Emitter with emitter, ", "
+                End If
+
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    proc emit_char from Emitter with emitter, 41  Note: )
+
+    Return 1
+End Process
+
+Process called "generate_subscript_expr" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate array subscript expression
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let array_expr be proc get_dict_hir_value from expr_hir, "array"
+    Let index_expr be proc get_dict_hir_value from expr_hir, "index"
+
+    proc generate_expression from context, array_expr
+    proc emit_char from Emitter with emitter, 91  Note: [
+    proc generate_expression from context, index_expr
+    proc emit_char from Emitter with emitter, 93  Note: ]
+
+    Return 1
+End Process
+
+Process called "generate_member_expr" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate member access expression
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let object_expr be proc get_dict_hir_value from expr_hir, "object"
+    Let operator be proc get_dict_string_value from expr_hir, "operator"
+    Let member_name be proc get_dict_string_value from expr_hir, "member"
+
+    proc generate_expression from context, object_expr
+
+    If operator is not equal to 0:
+        proc emit_string from Emitter with emitter, operator
+    End If
+
+    If member_name is not equal to 0:
+        proc emit_string from Emitter with emitter, member_name
+    End If
+
+    Return 1
+End Process
+
+Process called "generate_assignment_expr" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate assignment expression
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let left be proc get_dict_hir_value from expr_hir, "left"
+    Let operator be proc get_dict_string_value from expr_hir, "operator"
+    Let right be proc get_dict_hir_value from expr_hir, "right"
+
+    proc generate_expression from context, left
+
+    If operator is not equal to 0:
+        proc emit_space from Emitter with emitter
+        proc emit_string from Emitter with emitter, operator
+        proc emit_space from Emitter with emitter
+    End If
+
+    proc generate_expression from context, right
+
+    Return 1
+End Process
+
+Process called "generate_ternary_expr" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate ternary conditional expression
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let condition be proc get_dict_hir_value from expr_hir, "condition"
+    Let true_expr be proc get_dict_hir_value from expr_hir, "true_expr"
+    Let false_expr be proc get_dict_hir_value from expr_hir, "false_expr"
+
+    proc generate_expression from context, condition
+    proc emit_string from Emitter with emitter, " ? "
+    proc generate_expression from context, true_expr
+    proc emit_string from Emitter with emitter, " : "
+    proc generate_expression from context, false_expr
+
+    Return 1
+End Process
+
+Process called "generate_sizeof_expr" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate sizeof expression
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_string from Emitter with emitter, "sizeof("
+
+    Let operand be proc get_dict_hir_value from expr_hir, "operand"
+    proc generate_expression from context, operand
+
+    proc emit_char from Emitter with emitter, 41  Note: )
+
+    Return 1
+End Process
+
+Process called "generate_cast_expr" takes context as Integer, expr_hir as Integer returns Integer:
+    Note: Generate cast expression
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_char from Emitter with emitter, 40  Note: (
+
+    Let target_type be proc get_dict_hir_value from expr_hir, "target_type"
+    proc generate_type from context, target_type
+
+    proc emit_char from Emitter with emitter, 41  Note: )
+
+    Let operand be proc get_dict_hir_value from expr_hir, "operand"
+    proc generate_expression from context, operand
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Statement Generation
+Note: ============================================================================
+
+Process called "generate_statement" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate C statement from HIR
+
+    If stmt_hir is equal to 0:
+        Return 1
+    End If
+
+    Let is_dict be proc is_dictionary_hir from stmt_hir
+
+    If is_dict is equal to 0:
+        Return 1
+    End If
+
+    Let stmt_type be proc get_dict_string_value from stmt_hir, "_type"
+
+    If stmt_type is equal to 0:
+        Return 1
+    End If
+
+    Note: Compound statement
+    Let is_compound be proc strings_equal from StringCore with stmt_type, "compound"
+
+    If is_compound is equal to 1:
+        Return proc generate_compound_stmt from context, stmt_hir
+    End If
+
+    Note: Expression statement
+    Let is_expr_stmt be proc strings_equal from StringCore with stmt_type, "expression_stmt"
+
+    If is_expr_stmt is equal to 1:
+        Return proc generate_expr_stmt from context, stmt_hir
+    End If
+
+    Note: If statement
+    Let is_if be proc strings_equal from StringCore with stmt_type, "if"
+
+    If is_if is equal to 1:
+        Return proc generate_if_stmt from context, stmt_hir
+    End If
+
+    Note: While statement
+    Let is_while be proc strings_equal from StringCore with stmt_type, "while"
+
+    If is_while is equal to 1:
+        Return proc generate_while_stmt from context, stmt_hir
+    End If
+
+    Note: For statement
+    Let is_for be proc strings_equal from StringCore with stmt_type, "for"
+
+    If is_for is equal to 1:
+        Return proc generate_for_stmt from context, stmt_hir
+    End If
+
+    Note: Do-while statement
+    Let is_do_while be proc strings_equal from StringCore with stmt_type, "do_while"
+
+    If is_do_while is equal to 1:
+        Return proc generate_do_while_stmt from context, stmt_hir
+    End If
+
+    Note: Switch statement
+    Let is_switch be proc strings_equal from StringCore with stmt_type, "switch"
+
+    If is_switch is equal to 1:
+        Return proc generate_switch_stmt from context, stmt_hir
+    End If
+
+    Note: Case statement
+    Let is_case be proc strings_equal from StringCore with stmt_type, "case"
+
+    If is_case is equal to 1:
+        Return proc generate_case_stmt from context, stmt_hir
+    End If
+
+    Note: Default statement
+    Let is_default be proc strings_equal from StringCore with stmt_type, "default"
+
+    If is_default is equal to 1:
+        Return proc generate_default_stmt from context, stmt_hir
+    End If
+
+    Note: Return statement
+    Let is_return be proc strings_equal from StringCore with stmt_type, "return"
+
+    If is_return is equal to 1:
+        Return proc generate_return_stmt from context, stmt_hir
+    End If
+
+    Note: Break statement
+    Let is_break be proc strings_equal from StringCore with stmt_type, "break"
+
+    If is_break is equal to 1:
+        Let emitter be proc memory_get_int64 from Layout with context, 0
+        proc emit_indent from context
+        proc emit_string from Emitter with emitter, "break;"
+        proc emit_newline from Emitter with emitter
+        Return 1
+    End If
+
+    Note: Continue statement
+    Let is_continue be proc strings_equal from StringCore with stmt_type, "continue"
+
+    If is_continue is equal to 1:
+        Let emitter be proc memory_get_int64 from Layout with context, 0
+        proc emit_indent from context
+        proc emit_string from Emitter with emitter, "continue;"
+        proc emit_newline from Emitter with emitter
+        Return 1
+    End If
+
+    Note: Goto statement
+    Let is_goto be proc strings_equal from StringCore with stmt_type, "goto"
+
+    If is_goto is equal to 1:
+        Return proc generate_goto_stmt from context, stmt_hir
+    End If
+
+    Note: Label statement
+    Let is_label be proc strings_equal from StringCore with stmt_type, "label"
+
+    If is_label is equal to 1:
+        Return proc generate_label_stmt from context, stmt_hir
+    End If
+
+    Return 1
+End Process
+
+Process called "generate_compound_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate compound statement (block)
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 123  Note: {
+    proc emit_newline from Emitter with emitter
+
+    proc increase_indent from context
+
+    Let statements be proc get_dict_hir_value from stmt_hir, "statements"
+
+    If statements is not equal to 0:
+        Let is_list be proc is_list_hir from statements
+
+        If is_list is equal to 1:
+            Let stmt_items be proc get_list_elements from HIR with statements
+            Let count be proc size from List with stmt_items
+            Let index be 0
+
+            While index is less than count:
+                Let stmt be proc get_at from List with stmt_items, index
+                proc generate_statement from context, stmt
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    proc decrease_indent from context
+
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 125  Note: }
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Process called "generate_expr_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate expression statement
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+
+    Let expr be proc get_dict_hir_value from stmt_hir, "expression"
+    proc generate_expression from context, expr
+
+    proc emit_char from Emitter with emitter, 59  Note: ;
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Process called "generate_if_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate if statement
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "if ("
+
+    Let condition be proc get_dict_hir_value from stmt_hir, "condition"
+    proc generate_expression from context, condition
+
+    proc emit_string from Emitter with emitter, ") "
+
+    Let then_stmt be proc get_dict_hir_value from stmt_hir, "then"
+
+    Note: Check if then branch is compound statement
+    Let is_compound be 0
+    Let is_dict be proc is_dictionary_hir from then_stmt
+
+    If is_dict is equal to 1:
+        Let then_type be proc get_dict_string_value from then_stmt, "_type"
+        Set is_compound to proc strings_equal from StringCore with then_type, "compound"
+    End If
+
+    If is_compound is equal to 1:
+        Note: Compound statement - emit on same line
+        proc emit_char from Emitter with emitter, 123  Note: {
+        proc emit_newline from Emitter with emitter
+        proc increase_indent from context
+
+        Let statements be proc get_dict_hir_value from then_stmt, "statements"
+
+        If statements is not equal to 0:
+            Let is_list be proc is_list_hir from statements
+
+            If is_list is equal to 1:
+                Let stmt_items be proc get_list_elements from HIR with statements
+                Let count be proc size from List with stmt_items
+                Let index be 0
+
+                While index is less than count:
+                    Let stmt be proc get_at from List with stmt_items, index
+                    proc generate_statement from context, stmt
+                    Set index to index plus 1
+                End While
+            End If
+        End If
+
+        proc decrease_indent from context
+        proc emit_indent from context
+        proc emit_char from Emitter with emitter, 125  Note: }
+    End If
+
+    If is_compound is equal to 0:
+        Note: Single statement
+        proc emit_newline from Emitter with emitter
+        proc increase_indent from context
+        proc generate_statement from context, then_stmt
+        proc decrease_indent from context
+    End If
+
+    Let else_stmt be proc get_dict_hir_value from stmt_hir, "else"
+
+    If else_stmt is not equal to 0:
+        proc emit_string from Emitter with emitter, " else "
+        proc generate_statement from context, else_stmt
+    End If
+
+    If else_stmt is equal to 0:
+        proc emit_newline from Emitter with emitter
+    End If
+
+    Return 1
+End Process
+
+Process called "generate_while_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate while statement
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "while ("
+
+    Let condition be proc get_dict_hir_value from stmt_hir, "condition"
+    proc generate_expression from context, condition
+
+    proc emit_string from Emitter with emitter, ") "
+
+    Let body be proc get_dict_hir_value from stmt_hir, "body"
+    proc generate_statement from context, body
+
+    Return 1
+End Process
+
+Process called "generate_for_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate for statement
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "for ("
+
+    Let init_expr be proc get_dict_hir_value from stmt_hir, "init"
+
+    If init_expr is not equal to 0:
+        proc generate_expression from context, init_expr
+    End If
+
+    proc emit_string from Emitter with emitter, "; "
+
+    Let condition be proc get_dict_hir_value from stmt_hir, "condition"
+
+    If condition is not equal to 0:
+        proc generate_expression from context, condition
+    End If
+
+    proc emit_string from Emitter with emitter, "; "
+
+    Let increment be proc get_dict_hir_value from stmt_hir, "increment"
+
+    If increment is not equal to 0:
+        proc generate_expression from context, increment
+    End If
+
+    proc emit_string from Emitter with emitter, ") "
+
+    Let body be proc get_dict_hir_value from stmt_hir, "body"
+    proc generate_statement from context, body
+
+    Return 1
+End Process
+
+Process called "generate_do_while_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate do-while statement
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "do "
+
+    Let body be proc get_dict_hir_value from stmt_hir, "body"
+    proc generate_statement from context, body
+
+    proc emit_string from Emitter with emitter, " while ("
+
+    Let condition be proc get_dict_hir_value from stmt_hir, "condition"
+    proc generate_expression from context, condition
+
+    proc emit_string from Emitter with emitter, ");"
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Process called "generate_switch_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate switch statement
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "switch ("
+
+    Let condition be proc get_dict_hir_value from stmt_hir, "condition"
+    proc generate_expression from context, condition
+
+    proc emit_string from Emitter with emitter, ") "
+
+    Let body be proc get_dict_hir_value from stmt_hir, "body"
+    proc generate_statement from context, body
+
+    Return 1
+End Process
+
+Process called "generate_case_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate case label
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "case "
+
+    Let value be proc get_dict_hir_value from stmt_hir, "value"
+    proc generate_expression from context, value
+
+    proc emit_char from Emitter with emitter, 58  Note: :
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Process called "generate_default_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate default label
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "default:"
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Process called "generate_return_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate return statement
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "return"
+
+    Let value be proc get_dict_hir_value from stmt_hir, "value"
+
+    If value is not equal to 0:
+        proc emit_space from Emitter with emitter
+        proc generate_expression from context, value
+    End If
+
+    proc emit_char from Emitter with emitter, 59  Note: ;
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Process called "generate_goto_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate goto statement
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "goto "
+
+    Let label_name be proc get_dict_string_value from stmt_hir, "label"
+
+    If label_name is not equal to 0:
+        proc emit_string from Emitter with emitter, label_name
+    End If
+
+    proc emit_char from Emitter with emitter, 59  Note: ;
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Process called "generate_label_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
+    Note: Generate label statement
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let label_name be proc get_dict_string_value from stmt_hir, "name"
+
+    If label_name is not equal to 0:
+        proc emit_string from Emitter with emitter, label_name
+    End If
+
+    proc emit_char from Emitter with emitter, 58  Note: :
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Declaration Generation
+Note: ============================================================================
+
+Process called "generate_variable_declaration" takes context as Integer, var_hir as Integer returns Integer:
+    Note: Generate variable declaration
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+
+    Let type_info be proc get_dict_hir_value from var_hir, "type_info"
+    proc generate_type from context, type_info
+
+    proc emit_space from Emitter with emitter
+
+    Let var_name be proc get_dict_string_value from var_hir, "name"
+
+    If var_name is not equal to 0:
+        proc emit_string from Emitter with emitter, var_name
+    End If
+
+    Let initializer be proc get_dict_hir_value from var_hir, "initializer"
+
+    If initializer is not equal to 0:
+        proc emit_string from Emitter with emitter, " = "
+        proc generate_expression from context, initializer
+    End If
+
+    proc emit_char from Emitter with emitter, 59  Note: ;
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Process called "generate_function_declaration" takes context as Integer, func_hir as Integer returns Integer:
+    Note: Generate function declaration/definition
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    proc emit_indent from context
+
+    Let return_type be proc get_dict_hir_value from func_hir, "return_type"
+    proc generate_type from context, return_type
+
+    proc emit_space from Emitter with emitter
+
+    Let func_name be proc get_dict_string_value from func_hir, "name"
+
+    If func_name is not equal to 0:
+        proc emit_string from Emitter with emitter, func_name
+    End If
+
+    proc emit_char from Emitter with emitter, 40  Note: (
+
+    Let parameters be proc get_dict_hir_value from func_hir, "parameters"
+
+    If parameters is not equal to 0:
+        Let is_list be proc is_list_hir from parameters
+
+        If is_list is equal to 1:
+            Let param_items be proc get_list_elements from HIR with parameters
+            Let count be proc size from List with param_items
+            Let index be 0
+
+            While index is less than count:
+                Let param_hir be proc get_at from List with param_items, index
+
+                Let param_type be proc get_dict_hir_value from param_hir, "type_info"
+                proc generate_type from context, param_type
+
+                proc emit_space from Emitter with emitter
+
+                Let param_name be proc get_dict_string_value from param_hir, "name"
+
+                If param_name is not equal to 0:
+                    proc emit_string from Emitter with emitter, param_name
+                End If
+
+                If index plus 1 is less than count:
+                    proc emit_string from Emitter with emitter, ", "
+                End If
+
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    proc emit_char from Emitter with emitter, 41  Note: )
+
+    Let body be proc get_dict_hir_value from func_hir, "body"
+
+    If body is not equal to 0:
+        proc emit_space from Emitter with emitter
+        proc generate_statement from context, body
+    End If
+
+    If body is equal to 0:
+        proc emit_char from Emitter with emitter, 59  Note: ;
+        proc emit_newline from Emitter with emitter
+    End If
+
+    proc emit_newline from Emitter with emitter
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Program Generation
+Note: ============================================================================
+
+Process called "generate_program" takes context as Integer, program_hir as Integer returns Integer:
+    Note: Generate complete C program
+
+    @Reasoning:
+    Generate all top-level declarations (functions, variables, structs)
+    in proper C program format.
+    @End Reasoning
+
+    If program_hir is equal to 0:
+        proc set_codegen_error from context, "Null program HIR"
+        Return 0
+    End If
+
+    Let declarations be proc get_dict_hir_value from program_hir, "declarations"
+
+    If declarations is equal to 0:
+        Return 1
+    End If
+
+    Let is_list be proc is_list_hir from declarations
+
+    If is_list is equal to 0:
+        Return 1
+    End If
+
+    Let decl_items be proc get_list_elements from HIR with declarations
+    Let count be proc size from List with decl_items
+    Let index be 0
+
+    While index is less than count:
+        Let decl_hir be proc get_at from List with decl_items, index
+        Let decl_type be proc get_dict_string_value from decl_hir, "_type"
+
+        If decl_type is not equal to 0:
+            Let is_function be proc strings_equal from StringCore with decl_type, "c_function"
+
+            If is_function is equal to 1:
+                proc generate_function_declaration from context, decl_hir
+            End If
+
+            Let is_variable be proc strings_equal from StringCore with decl_type, "c_variable"
+
+            If is_variable is equal to 1:
+                proc generate_variable_declaration from context, decl_hir
+            End If
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Top-Level Generation Entry Point
+Note: ============================================================================
+
+Process called "generate_c_from_hir" takes hir_ast as Integer returns Integer:
+    Note: Generate C code from HIR (top-level entry point)
+
+    @Reasoning:
+    Entry point for generating C code from HIR representation.
+    Create context, generate code, return output string.
+    @End Reasoning
+
+    Let context be proc create_codegen_context
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    proc generate_program from context, hir_ast
+
+    Let has_error be proc has_codegen_error from context
+
+    If has_error is equal to 1:
+        proc destroy_codegen_context from context
+        Return 0
+    End If
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let output be proc get_output from Emitter with emitter
+
+    proc destroy_codegen_context from context
+
+    Return output
+End Process

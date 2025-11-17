@@ -1,0 +1,929 @@
+Note: ================================================================
+Note: Bifrost Operation Reordering Optimization
+Note: ================================================================
+Note: Reorders operations for instruction-level parallelism and latency hiding.
+Note: Typical speedup: 5-15% from better instruction scheduling.
+Note: Techniques: List scheduling, software pipelining, critical path prioritization.
+Note: ================================================================
+
+Import "../graph/graph.runa" as Graph
+Import "../graph/node.runa" as Node
+Import "../graph/edge.runa" as Edge
+Import "std/collections/list.runa" as List
+Import "std/collections/dict.runa" as Dict
+Import "std/core/string.runa" as String
+Import "std/core/math.runa" as Math
+
+Note: ================================================================
+Note: Scheduling Priority Constants
+Note: ================================================================
+
+Constant PRIORITY_CRITICAL_PATH as Integer is 0    Note: Highest priority
+Constant PRIORITY_REGISTER_PRESSURE as Integer is 1 Note: Minimize live values
+Constant PRIORITY_LATENCY_HIDING as Integer is 2    Note: Overlap long-latency ops
+Constant PRIORITY_RESOURCE_USAGE as Integer is 3    Note: Balance resource usage
+
+Note: ================================================================
+Note: Type Definitions
+Note: ================================================================
+
+Type ScheduleEntry is:
+    node as Integer                 Note: Operation to schedule
+    cycle as Integer                Note: Cycle when operation executes
+    priority as Float               Note: Scheduling priority
+    earliest_cycle as Integer       Note: Earliest legal cycle (dependencies)
+    latest_cycle as Integer         Note: Latest cycle without extending schedule
+End Type
+
+Type ResourceConstraints is:
+    max_memory_ops as Integer       Note: Max memory ops per cycle
+    max_arithmetic_ops as Integer   Note: Max arithmetic ops per cycle
+    max_control_ops as Integer      Note: Max control ops per cycle
+    instruction_latencies as Integer Note: Dict of OpKind → latency cycles
+End Type
+
+Type PipelineStage is:
+    stage_number as Integer         Note: Pipeline stage index
+    operations as Integer           Note: List of operations in this stage
+    iteration_offset as Integer     Note: Which loop iteration (for software pipelining)
+End Type
+
+Note: ================================================================
+Note: List Scheduling
+Note: ================================================================
+
+Process called "list_schedule" that takes graph as Integer, constraints as Integer returns Integer:
+    @Reasoning
+    Classic list scheduling algorithm.
+
+    Algorithm:
+    1. Compute priorities (critical path, register pressure, etc.)
+    2. Initialize ready list (operations with no pending dependencies)
+    3. While ready list non-empty:
+       - Select highest-priority ready operation
+       - Schedule operation to earliest available cycle
+       - Update ready list (add newly-ready operations)
+    4. Return schedule
+
+    Priority function:
+    - Critical path length (operations on longest path first)
+    - Register pressure (minimize live values)
+    - Latency hiding (schedule long-latency ops early)
+    @End Reasoning
+
+    @Implementation
+    1. Compute operation priorities
+    2. Initialize ready list
+    3. Initialize current cycle = 0
+    4. While unscheduled operations exist:
+       - Select ready operation with highest priority
+       - Determine earliest legal cycle (dependencies + resources)
+       - Schedule operation
+       - Update dependencies
+       - Update ready list
+    5. Return schedule
+    @End Implementation
+
+    Let schedule be List.create()
+
+    Note: Compute priorities for all nodes
+    Let priorities be compute_scheduling_priorities(graph, PRIORITY_CRITICAL_PATH)
+
+    Note: Get all nodes in topological order
+    Let sorted_nodes be Graph.topological_sort(graph)
+    Let node_count be List.length(sorted_nodes)
+
+    Note: Track scheduled nodes
+    Let scheduled be Dict.create()
+
+    Note: Track cycle when each node can start (after dependencies)
+    Let earliest_start be Dict.create()
+
+    Note: Initialize all nodes with earliest_start = 0
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(sorted_nodes, i)
+        Dict.set(earliest_start, node, 0)
+        Let i be i + 1
+    End While
+
+    Note: Initialize ready list (nodes with no predecessors)
+    Let ready_list be List.create()
+
+    Let j be 0
+    While j is less than node_count:
+        Let node be List.get(sorted_nodes, j)
+        Let predecessors be Graph.get_node_predecessors(graph, node)
+
+        If List.length(predecessors) equals 0:
+            List.append(ready_list, node)
+        End If
+
+        Let j be j + 1
+    End While
+
+    Note: Schedule operations
+    Let current_cycle be 0
+
+    While Dict.size(scheduled) is less than node_count:
+        Note: Select highest-priority ready operation
+        If List.length(ready_list) equals 0:
+            Note: No ready operations, advance cycle
+            Let current_cycle be current_cycle + 1
+        End If
+
+        If List.length(ready_list) is greater than 0:
+            Let best_node be select_highest_priority(ready_list, priorities)
+
+            Note: Determine earliest legal cycle
+            Let earliest be Dict.get(earliest_start, best_node)
+            Let legal_cycle be Math.max(current_cycle, earliest)
+
+            Note: Create schedule entry
+            Let entry be a value of type ScheduleEntry with
+                node as best_node,
+                cycle as legal_cycle,
+                priority as Dict.get(priorities, best_node),
+                earliest_cycle as earliest,
+                latest_cycle as 0
+
+            List.append(schedule, entry)
+
+            Note: Mark as scheduled
+            Dict.set(scheduled, best_node, legal_cycle)
+
+            Note: Remove from ready list
+            List.remove(ready_list, best_node)
+
+            Note: Update successors' earliest start times
+            Let successors be Graph.get_node_successors(graph, best_node)
+
+            Let k be 0
+            While k is less than List.length(successors):
+                Let succ be List.get(successors, k)
+
+                Note: Compute latency of best_node
+                Let latency be get_operation_latency(best_node, constraints)
+                Let succ_earliest be legal_cycle + latency
+
+                Note: Update earliest start if later
+                Let current_earliest be Dict.get(earliest_start, succ)
+                If succ_earliest is greater than current_earliest:
+                    Dict.set(earliest_start, succ, succ_earliest)
+                End If
+
+                Note: Check if succ is now ready (all predecessors scheduled)
+                Let preds be Graph.get_node_predecessors(graph, succ)
+                Let all_scheduled be true
+
+                Let m be 0
+                While m is less than List.length(preds):
+                    Let pred be List.get(preds, m)
+                    Let is_scheduled be Dict.get(scheduled, pred)
+                    If is_scheduled equals 0:
+                        Let all_scheduled be false
+                    End If
+                    Let m be m + 1
+                End While
+
+                If all_scheduled equals true:
+                    Note: Add to ready list
+                    List.append(ready_list, succ)
+                End If
+
+                Let k be k + 1
+            End While
+
+            Note: Advance cycle for next iteration
+            Let current_cycle be legal_cycle + 1
+        End If
+    End While
+
+    Return schedule
+End Process
+
+Note: ================================================================
+Note: Software Pipelining
+Note: ================================================================
+
+Process called "software_pipeline" that takes graph as Integer, loop_nodes as Integer, constraints as Integer returns Integer:
+    @Reasoning
+    Software pipelining overlaps loop iterations for latency hiding.
+
+    Algorithm (Modulo Scheduling):
+    1. Compute Initiation Interval (II) - cycles between iteration starts
+    2. Compute stage count - iterations in flight simultaneously
+    3. Schedule operations modulo II
+    4. Build prologue, steady state, epilogue
+
+    Key metrics:
+    - MII (Minimum II) = max(RecMII, ResMII)
+    - RecMII = Recurrence-constrained II (loop-carried dependencies)
+    - ResMII = Resource-constrained II (hardware limits)
+    @End Reasoning
+
+    @Implementation
+    1. Compute RecMII from loop-carried dependencies
+    2. Compute ResMII from resource constraints
+    3. Set II = max(RecMII, ResMII)
+    4. Schedule operations modulo II
+    5. Build pipeline stages
+    6. Return pipelined schedule
+    @End Implementation
+
+    Let pipeline_stages be List.create()
+
+    Note: Compute Recurrence-constrained II
+    Let rec_mii be compute_recurrence_mii(graph, loop_nodes, constraints)
+
+    Note: Compute Resource-constrained II
+    Let res_mii be compute_resource_mii(graph, loop_nodes, constraints)
+
+    Note: Set Initiation Interval
+    Let ii be Math.max(rec_mii, res_mii)
+
+    Note: Schedule operations modulo II
+    Let modulo_schedule be modulo_schedule_operations(graph, loop_nodes, ii, constraints)
+
+    Note: Compute stage count
+    Let stage_count be compute_stage_count(modulo_schedule, ii)
+
+    Note: Build pipeline stages
+    Let i be 0
+    While i is less than stage_count:
+        Let stage_ops be extract_stage_operations(modulo_schedule, i, ii)
+
+        Let stage be a value of type PipelineStage with
+            stage_number as i,
+            operations as stage_ops,
+            iteration_offset as i
+
+        List.append(pipeline_stages, stage)
+
+        Let i be i + 1
+    End While
+
+    Return pipeline_stages
+End Process
+
+Process called "compute_recurrence_mii" that takes graph as Integer, loop_nodes as Integer, constraints as Integer returns Integer:
+    @Reasoning
+    Computes recurrence-constrained Minimum Initiation Interval.
+
+    RecMII = max over all recurrences (cycle_latency / recurrence_distance)
+
+    Algorithm:
+    - Find all recurrences (cycles) in loop body
+    - For each recurrence, sum operation latencies
+    - Divide by recurrence distance (iterations between uses)
+    - Return maximum
+    @End Reasoning
+
+    @Implementation
+    1. Create subgraph from loop nodes
+    2. Find all cycles (recurrences)
+    3. For each cycle:
+       - Sum operation latencies
+       - Determine recurrence distance
+       - Compute MII = latency / distance
+    4. Return maximum MII
+    @End Implementation
+
+    Note: Create subgraph
+    Let subgraph be Graph.get_subgraph(graph, loop_nodes)
+
+    Note: Find cycles
+    Let has_cycles be Graph.has_cycle(subgraph)
+
+    If has_cycles equals false:
+        Note: No recurrences, RecMII = 1
+        Return 1
+    End If
+
+    Note: Find cycle path
+    Let cycle be Graph.find_cycle(subgraph)
+    If cycle equals 0:
+        Return 1
+    End If
+
+    Note: Sum latencies in cycle
+    Let cycle_latency be 0
+    Let cycle_length be List.length(cycle)
+
+    Let i be 0
+    While i is less than cycle_length:
+        Let node be List.get(cycle, i)
+        Let latency be get_operation_latency(node, constraints)
+        Let cycle_latency be cycle_latency + latency
+        Let i be i + 1
+    End While
+
+    Note: Recurrence distance (simplified: assume 1)
+    Let recurrence_distance be 1
+
+    Note: RecMII = ceil(cycle_latency / distance)
+    Let rec_mii be cycle_latency / recurrence_distance
+
+    Return rec_mii
+End Process
+
+Process called "compute_resource_mii" that takes graph as Integer, loop_nodes as Integer, constraints as Integer returns Integer:
+    @Reasoning
+    Computes resource-constrained Minimum Initiation Interval.
+
+    ResMII = max over all resources (resource_usage / resource_capacity)
+
+    Algorithm:
+    - Count operations of each type
+    - Divide by hardware capacity
+    - Return maximum
+    @End Reasoning
+
+    @Implementation
+    1. Count memory, arithmetic, control operations
+    2. Get resource limits from constraints
+    3. Compute MII for each resource type
+    4. Return maximum MII
+    @End Implementation
+
+    Let memory_ops be 0
+    Let arithmetic_ops be 0
+    Let control_ops be 0
+
+    Note: Count operations by type
+    Let node_count be List.length(loop_nodes)
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(loop_nodes, i)
+        Let op_kind be Node.get_node_opkind(node)
+
+        Note: Classify operation
+        If is_memory_op(op_kind) equals true:
+            Let memory_ops be memory_ops + 1
+        End If
+
+        If is_arithmetic_op(op_kind) equals true:
+            Let arithmetic_ops be arithmetic_ops + 1
+        End If
+
+        If is_control_op(op_kind) equals true:
+            Let control_ops be control_ops + 1
+        End If
+
+        Let i be i + 1
+    End While
+
+    Note: Get resource limits
+    Let max_memory be Layout.memory_get_int64(constraints, 0)
+    Let max_arithmetic be Layout.memory_get_int64(constraints, 8)
+    Let max_control be Layout.memory_get_int64(constraints, 16)
+
+    Note: Compute MII for each resource
+    Let memory_mii be 1
+    If max_memory is greater than 0:
+        Let memory_mii be memory_ops / max_memory
+        If memory_ops % max_memory is greater than 0:
+            Let memory_mii be memory_mii + 1
+        End If
+    End If
+
+    Let arithmetic_mii be 1
+    If max_arithmetic is greater than 0:
+        Let arithmetic_mii be arithmetic_ops / max_arithmetic
+        If arithmetic_ops % max_arithmetic is greater than 0:
+            Let arithmetic_mii be arithmetic_mii + 1
+        End If
+    End If
+
+    Let control_mii be 1
+    If max_control is greater than 0:
+        Let control_mii be control_ops / max_control
+        If control_ops % max_control is greater than 0:
+            Let control_mii be control_mii + 1
+        End If
+    End If
+
+    Note: Return maximum
+    Let res_mii be Math.max(memory_mii, arithmetic_mii)
+    Let res_mii be Math.max(res_mii, control_mii)
+
+    Return res_mii
+End Process
+
+Note: ================================================================
+Note: Critical Path Optimization
+Note: ================================================================
+
+Process called "prioritize_critical_path" that takes graph as Integer returns Integer:
+    @Reasoning
+    Computes scheduling priorities based on critical path.
+
+    Critical path = longest path from node to leaf in DAG.
+    Operations on critical path have highest priority.
+
+    Algorithm:
+    - Use find_critical_path from graph.runa
+    - Assign priority = path length to leaf
+    - Operations with longer paths have higher priority
+    @End Reasoning
+
+    @Implementation
+    1. Compute heights (distance to leaves) for all nodes
+    2. Use height as priority
+    3. Return priority map
+    @End Implementation
+
+    Note: Compute heights (longest path to leaves)
+    Let heights be Graph.compute_heights(graph)
+
+    Note: Heights are already priorities (higher = more critical)
+    Return heights
+End Process
+
+Process called "compute_scheduling_priorities" that takes graph as Integer, priority_type as Integer returns Integer:
+    @Reasoning
+    Computes scheduling priorities based on specified strategy.
+
+    Priority types:
+    - CRITICAL_PATH: Longest path to leaf
+    - REGISTER_PRESSURE: Minimize live values
+    - LATENCY_HIDING: Schedule long-latency ops early
+    - RESOURCE_USAGE: Balance resource utilization
+    @End Reasoning
+
+    @Implementation
+    1. Based on priority_type, compute appropriate priorities
+    2. Return priority map (node → priority value)
+    @End Implementation
+
+    If priority_type equals PRIORITY_CRITICAL_PATH:
+        Return prioritize_critical_path(graph)
+    End If
+
+    If priority_type equals PRIORITY_REGISTER_PRESSURE:
+        Return prioritize_register_pressure(graph)
+    End If
+
+    If priority_type equals PRIORITY_LATENCY_HIDING:
+        Return prioritize_latency_hiding(graph)
+    End If
+
+    Note: Default to critical path
+    Return prioritize_critical_path(graph)
+End Process
+
+Process called "prioritize_register_pressure" that takes graph as Integer returns Integer:
+    @Reasoning
+    Prioritizes operations to minimize register pressure.
+
+    Strategy:
+    - Schedule operations with many successors first (free up values)
+    - Delay operations that produce long-lived values
+    - Balance live value count
+
+    Priority = -(number of successors)
+    @End Reasoning
+
+    @Implementation
+    1. For each node, count successors
+    2. Priority = -successor_count (more successors = higher priority)
+    3. Return priority map
+    @End Implementation
+
+    Let priorities be Dict.create()
+
+    Let all_nodes be Graph.get_all_nodes(graph)
+    Let node_count be List.length(all_nodes)
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(all_nodes, i)
+
+        Let successors be Graph.get_node_successors(graph, node)
+        Let succ_count be List.length(successors)
+
+        Note: Negate so more successors = higher priority
+        Let priority be 0 - succ_count
+
+        Dict.set(priorities, node, priority)
+
+        Let i be i + 1
+    End While
+
+    Return priorities
+End Process
+
+Process called "prioritize_latency_hiding" that takes graph as Integer returns Integer:
+    @Reasoning
+    Prioritizes long-latency operations to schedule them early.
+
+    Strategy:
+    - Estimate operation latency
+    - Schedule high-latency ops first
+    - Allows other ops to execute during long-latency wait
+
+    Priority = operation_latency
+    @End Reasoning
+
+    @Implementation
+    1. For each node, estimate latency
+    2. Priority = latency (higher latency = higher priority)
+    3. Return priority map
+    @End Implementation
+
+    Let priorities be Dict.create()
+
+    Let all_nodes be Graph.get_all_nodes(graph)
+    Let node_count be List.length(all_nodes)
+
+    Note: Create dummy constraints for latency lookup
+    Let constraints be create_default_constraints()
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(all_nodes, i)
+
+        Let latency be get_operation_latency(node, constraints)
+
+        Dict.set(priorities, node, latency)
+
+        Let i be i + 1
+    End While
+
+    Return priorities
+End Process
+
+Note: ================================================================
+Note: Schedule Validation and Application
+Note: ================================================================
+
+Process called "validate_schedule" that takes graph as Integer, schedule as Integer returns Boolean:
+    @Reasoning
+    Validates schedule respects dependencies and resource constraints.
+
+    Validation checks:
+    1. All dependencies satisfied (predecessors before successors)
+    2. No resource oversubscription
+    3. Latencies respected
+    @End Reasoning
+
+    @Implementation
+    1. For each schedule entry:
+       - Check all predecessors scheduled earlier
+       - Verify latency constraints
+    2. Check resource usage per cycle
+    3. Return true if valid
+    @End Implementation
+
+    Let entry_count be List.length(schedule)
+
+    Note: Track scheduled nodes and cycles
+    Let scheduled_cycles be Dict.create()
+
+    Let i be 0
+    While i is less than entry_count:
+        Let entry be List.get(schedule, i)
+        Let node be Layout.memory_get_int64(entry, 0)
+        Let cycle be Layout.memory_get_int64(entry, 8)
+
+        Note: Check all predecessors scheduled earlier
+        Let predecessors be Graph.get_node_predecessors(graph, node)
+
+        Let j be 0
+        While j is less than List.length(predecessors):
+            Let pred be List.get(predecessors, j)
+            Let pred_cycle be Dict.get(scheduled_cycles, pred)
+
+            Note: Predecessor must be scheduled before successor
+            If pred_cycle is greater than or equal to cycle:
+                Return false
+            End If
+
+            Let j be j + 1
+        End While
+
+        Note: Record this node's cycle
+        Dict.set(scheduled_cycles, node, cycle)
+
+        Let i be i + 1
+    End While
+
+    Return true
+End Process
+
+Process called "apply_schedule_to_graph" that takes graph as Integer, schedule as Integer returns Nothing:
+    @Reasoning
+    Applies computed schedule to graph by reordering operations.
+
+    Application:
+    - Update graph traversal order
+    - Add metadata with cycle information
+    - Preserve dependencies
+    @End Reasoning
+
+    @Implementation
+    1. For each schedule entry:
+       - Update node metadata with cycle
+    2. Reorder graph nodes by cycle
+    3. Validate graph remains DAG
+    @End Implementation
+
+    Let entry_count be List.length(schedule)
+
+    Let i be 0
+    While i is less than entry_count:
+        Let entry be List.get(schedule, i)
+        Let node be Layout.memory_get_int64(entry, 0)
+        Let cycle be Layout.memory_get_int64(entry, 8)
+
+        Note: Update metadata with cycle
+        Let metadata be Node.get_node_metadata(node)
+        If metadata equals 0:
+            Let metadata be Dict.create()
+        End If
+
+        Dict.set(metadata, "scheduled_cycle", cycle)
+        Node.set_node_metadata(node, metadata)
+
+        Let i be i + 1
+    End While
+
+    Note: Validate graph
+    Graph.validate_graph(graph)
+End Process
+
+Note: ================================================================
+Note: Optimization Orchestration
+Note: ================================================================
+
+Process called "optimize_operation_ordering" that takes graph as Integer returns Integer:
+    @Reasoning
+    Top-level operation reordering optimization.
+
+    Algorithm:
+    1. Create resource constraints model
+    2. Perform list scheduling
+    3. Validate schedule
+    4. Apply schedule to graph
+    5. Return schedule length (makespan)
+    @End Reasoning
+
+    @Implementation
+    1. Create default resource constraints
+    2. Perform list scheduling
+    3. Validate schedule
+    4. Apply to graph
+    5. Return makespan
+    @End Implementation
+
+    Note: Create resource constraints
+    Let constraints be create_default_constraints()
+
+    Note: Perform list scheduling
+    Let schedule be list_schedule(graph, constraints)
+
+    Note: Validate schedule
+    Let is_valid be validate_schedule(graph, schedule)
+
+    If is_valid equals false:
+        Note: Schedule invalid, return 0
+        Return 0
+    End If
+
+    Note: Apply schedule to graph
+    apply_schedule_to_graph(graph, schedule)
+
+    Note: Compute makespan (max cycle in schedule)
+    Let makespan be 0
+    Let entry_count be List.length(schedule)
+
+    Let i be 0
+    While i is less than entry_count:
+        Let entry be List.get(schedule, i)
+        Let cycle be Layout.memory_get_int64(entry, 8)
+
+        If cycle is greater than makespan:
+            Let makespan be cycle
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return makespan
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Operation Classification
+Note: ================================================================
+
+Process called "is_memory_op" that takes op_kind as Integer returns Boolean:
+    Note: Load=40, Store=41
+    If op_kind equals 40:
+        Return true
+    End If
+    If op_kind equals 41:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "is_arithmetic_op" that takes op_kind as Integer returns Boolean:
+    Note: Add=0, Subtract=1, Multiply=2, Divide=3
+    If op_kind equals 0:
+        Return true
+    End If
+    If op_kind equals 1:
+        Return true
+    End If
+    If op_kind equals 2:
+        Return true
+    End If
+    If op_kind equals 3:
+        Return true
+    End If
+
+    Note: MatrixMultiply=6, VectorDot=12, etc.
+    If op_kind equals 6:
+        Return true
+    End If
+    If op_kind equals 12:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "is_control_op" that takes op_kind as Integer returns Boolean:
+    Note: Branch, Jump, Return (not in basic OpKind set)
+    Note: Simplified: no control ops in basic set
+    Return false
+End Process
+
+Process called "get_operation_latency" that takes node as Integer, constraints as Integer returns Integer:
+    @Reasoning
+    Estimates operation latency in cycles.
+
+    Latencies (typical):
+    - Arithmetic: 1-4 cycles
+    - Memory load: 100-400 cycles (cache miss)
+    - Memory store: 1 cycle (write-through)
+    - Matrix multiply: 10-100 cycles (size-dependent)
+    @End Reasoning
+
+    @Implementation
+    1. Get operation kind
+    2. Look up latency in constraints
+    3. Return latency
+    @End Implementation
+
+    Let op_kind be Node.get_node_opkind(node)
+
+    Note: Get latency map from constraints
+    Let latencies be Layout.memory_get_int64(constraints, 24)
+
+    If latencies is not equal to 0:
+        Let latency be Dict.get(latencies, op_kind)
+        If latency is not equal to 0:
+            Return latency
+        End If
+    End If
+
+    Note: Default latencies
+    If is_memory_op(op_kind) equals true:
+        Return 100    Note: Memory latency
+    End If
+
+    If is_arithmetic_op(op_kind) equals true:
+        Note: Check if multiply/divide (higher latency)
+        If op_kind equals 2:
+            Return 4    Note: Multiply latency
+        End If
+        If op_kind equals 3:
+            Return 8    Note: Divide latency
+        End If
+
+        Return 1    Note: Add/subtract latency
+    End If
+
+    Return 1
+End Process
+
+Note: ================================================================
+Note: Helper Functions - Scheduling Utilities
+Note: ================================================================
+
+Process called "select_highest_priority" that takes ready_list as Integer, priorities as Integer returns Integer:
+    Note: Select node with highest priority from ready list
+    Let best_node be List.get(ready_list, 0)
+    Let best_priority be Dict.get(priorities, best_node)
+
+    Let i be 1
+    While i is less than List.length(ready_list):
+        Let node be List.get(ready_list, i)
+        Let priority be Dict.get(priorities, node)
+
+        If priority is greater than best_priority:
+            Let best_node be node
+            Let best_priority be priority
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return best_node
+End Process
+
+Process called "modulo_schedule_operations" that takes graph as Integer, loop_nodes as Integer, ii as Integer, constraints as Integer returns Integer:
+    Note: Schedule operations modulo II
+    Note: Simplified: use regular list scheduling
+
+    Let subgraph be Graph.get_subgraph(graph, loop_nodes)
+    Let schedule be list_schedule(subgraph, constraints)
+
+    Return schedule
+End Process
+
+Process called "compute_stage_count" that takes schedule as Integer, ii as Integer returns Integer:
+    Note: Stage count = max_cycle / II
+
+    Let max_cycle be 0
+    Let entry_count be List.length(schedule)
+
+    Let i be 0
+    While i is less than entry_count:
+        Let entry be List.get(schedule, i)
+        Let cycle be Layout.memory_get_int64(entry, 8)
+
+        If cycle is greater than max_cycle:
+            Let max_cycle be cycle
+        End If
+
+        Let i be i + 1
+    End While
+
+    Let stage_count be max_cycle / ii
+
+    If max_cycle % ii is greater than 0:
+        Let stage_count be stage_count + 1
+    End If
+
+    Return stage_count
+End Process
+
+Process called "extract_stage_operations" that takes schedule as Integer, stage_number as Integer, ii as Integer returns Integer:
+    Note: Extract operations in specified stage
+    Let stage_ops be List.create()
+
+    Let entry_count be List.length(schedule)
+
+    Let i be 0
+    While i is less than entry_count:
+        Let entry be List.get(schedule, i)
+        Let cycle be Layout.memory_get_int64(entry, 8)
+
+        Note: Check if operation belongs to this stage
+        Let op_stage be cycle / ii
+
+        If op_stage equals stage_number:
+            Let node be Layout.memory_get_int64(entry, 0)
+            List.append(stage_ops, node)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return stage_ops
+End Process
+
+Process called "create_default_constraints" that takes nothing returns Integer:
+    Note: Create default resource constraints
+
+    Let constraints be a value of type ResourceConstraints with
+        max_memory_ops as 2,
+        max_arithmetic_ops as 4,
+        max_control_ops as 1,
+        instruction_latencies as 0
+
+    Note: Create latency map
+    Let latencies be Dict.create()
+
+    Note: Memory ops
+    Dict.set(latencies, 40, 100)    Note: Load = 100 cycles
+    Dict.set(latencies, 41, 1)      Note: Store = 1 cycle
+
+    Note: Arithmetic ops
+    Dict.set(latencies, 0, 1)       Note: Add = 1 cycle
+    Dict.set(latencies, 1, 1)       Note: Subtract = 1 cycle
+    Dict.set(latencies, 2, 4)       Note: Multiply = 4 cycles
+    Dict.set(latencies, 3, 8)       Note: Divide = 8 cycles
+
+    Note: Linear algebra ops
+    Dict.set(latencies, 6, 50)      Note: MatrixMultiply = 50 cycles
+    Dict.set(latencies, 12, 10)     Note: VectorDot = 10 cycles
+
+    Set constraints.instruction_latencies to latencies
+
+    Return constraints
+End Process

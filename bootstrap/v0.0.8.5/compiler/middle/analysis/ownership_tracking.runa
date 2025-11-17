@@ -33,6 +33,994 @@ This file consists of the following functions/features/operation types:
 - Move analysis and ownership transfer tracking
 - Partial move handling for struct fields
 - Ownership error detection (use-after-move, double-move)
+
+Dependencies:
+- compiler/middle/gungnir/mir/mir.runa (MIR structures, instructions)
+- compiler/middle/analysis/lifetime_analysis.runa (Lifetime regions)
+- compiler/middle/analysis/control_flow.runa (CFG)
+- compiler/frontend/primitives/memory/layout.runa (OWNED HEAP allocation - Tier 3)
+- compiler/frontend/primitives/collections/list.runa (move lists)
+- compiler/frontend/primitives/collections/dictionary.runa (state mappings)
+- compiler/frontend/primitives/collections/set.runa (borrow sets)
+- compiler/frontend/primitives/core/string_core.runa (debug printing)
 :End Note
 
-Note: TODO - Implement ownership tracking functionality
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/analysis/lifetime_analysis.runa" as LifetimeAnalysis
+Import "compiler/middle/analysis/control_flow.runa" as CFG
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: OWNERSHIP STATE CONSTANTS
+Note: ============================================================================
+
+Note: Ownership state values
+Constant OWNERSHIP_OWNED as Integer is 0         Note: Value is owned and usable
+Constant OWNERSHIP_MOVED as Integer is 1         Note: Value has been moved (unusable)
+Constant OWNERSHIP_BORROWED as Integer is 2      Note: Value is borrowed (limited use)
+Constant OWNERSHIP_PARTIAL_MOVE as Integer is 3  Note: Some fields moved, others not
+
+Note: ============================================================================
+Note: OWNERSHIP TRACKING TYPE DEFINITIONS
+Note: ============================================================================
+
+@Reasoning
+OwnershipState tracks the ownership status of a single value.
+
+Ownership states:
+1. OWNED: Value is owned, can be used, moved, or borrowed
+2. MOVED: Value has been moved elsewhere, cannot be used
+3. BORROWED: Value is currently borrowed, restrictions apply
+4. PARTIAL_MOVE: Some fields have been moved (for structs)
+
+Fields:
+- value_id: SSA value or variable ID being tracked
+- state: Current ownership state (OWNED/MOVED/BORROWED/PARTIAL_MOVE)
+- moved_at: Instruction where value was moved (if MOVED)
+- borrowed_by: List of active borrow IDs (if BORROWED)
+- partial_moves: Dictionary mapping field_id -> moved status
+- move_path: Path where value was moved (for error reporting)
+- can_use: Boolean: value is usable in current state
+- parent_value: Parent value ID (for field tracking)
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 8 fields × 8 bytes = 64 bytes
+@End Reasoning
+
+Type called "OwnershipState":
+    value_id as Integer         Note: SSA value or variable ID
+    state as Integer            Note: State constant
+    moved_at as Integer         Note: Instruction where moved
+    borrowed_by as Integer      Note: List of active borrows
+    partial_moves as Integer    Note: Dictionary field_id -> moved
+    move_path as Integer        Note: Pointer to move path string
+    can_use as Integer          Note: Boolean: usable
+    parent_value as Integer     Note: Parent value (for fields)
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40, 48, 56
+
+@Reasoning
+OwnershipInfo tracks ownership states for a basic block.
+
+Contains ownership state at block entry and exit, plus operations
+that occur within the block.
+
+Fields:
+- block_id: Basic block ID
+- state_in: Dictionary value_id -> OwnershipState (entry)
+- state_out: Dictionary value_id -> OwnershipState (exit)
+- moves: List of move operations in block
+- borrows: List of borrow operations in block
+- errors: List of ownership errors found
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 6 fields × 8 bytes = 48 bytes
+@End Reasoning
+
+Type called "OwnershipInfo":
+    block_id as Integer         Note: Basic block ID
+    state_in as Integer         Note: Dictionary value_id -> OwnershipState
+    state_out as Integer        Note: Dictionary value_id -> OwnershipState
+    moves as Integer            Note: List of move operations
+    borrows as Integer          Note: List of borrow operations
+    errors as Integer           Note: List of errors
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40
+
+@Reasoning
+OwnershipAnalysis is the main ownership tracking container.
+
+Tracks ownership states across entire function, using data flow
+analysis to propagate states through control flow.
+
+Fields:
+- block_to_ownership: Dictionary block_id -> OwnershipInfo
+- value_to_state: Dictionary value_id -> current OwnershipState
+- lifetime_analysis: Pointer to LifetimeAnalysis (for integration)
+- cfg: Pointer to CFG
+- move_count: Statistics: total moves tracked
+- borrow_count: Statistics: total borrows tracked
+- error_list: List of ownership errors
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 7 fields × 8 bytes = 56 bytes
+@End Reasoning
+
+Type called "OwnershipAnalysis":
+    block_to_ownership as Integer   Note: Dictionary block_id -> OwnershipInfo
+    value_to_state as Integer       Note: Dictionary value_id -> OwnershipState
+    lifetime_analysis as Integer    Note: Pointer to LifetimeAnalysis
+    cfg as Integer                  Note: Pointer to CFG
+    move_count as Integer           Note: Total moves
+    borrow_count as Integer         Note: Total borrows
+    error_list as Integer           Note: List of errors
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40, 48
+
+Note: ============================================================================
+Note: OWNERSHIP STATE INITIALIZATION
+Note: ============================================================================
+
+@Reasoning
+Creates an OwnershipState for a value.
+
+Initially, all values are OWNED and usable.
+
+Memory: Tier 3 (OWNED HEAP) - 64 bytes
+@End Reasoning
+
+Process called "create_ownership_state" that takes value_id as Integer returns Integer:
+    Note: Allocate OwnershipState structure (64 bytes)
+    Let state be Layout.allocate(64)
+    If state equals 0:
+        Display "create_ownership_state: allocation failed"
+        Return 0
+    End If
+
+    Note: Set value ID
+    Layout.memory_set_int64(state, 0, value_id)
+
+    Note: Initialize as OWNED
+    Layout.memory_set_int64(state, 8, 0)  Note: OWNERSHIP_OWNED
+
+    Note: No move yet
+    Layout.memory_set_int64(state, 16, 0)  Note: moved_at = 0
+
+    Note: Create empty borrow list
+    Let borrowed_by be List.create()
+    Layout.memory_set_int64(state, 24, borrowed_by)
+
+    Note: Create empty partial moves dictionary
+    Let partial_moves be Dictionary.create()
+    Layout.memory_set_int64(state, 32, partial_moves)
+
+    Note: No move path yet
+    Layout.memory_set_int64(state, 40, 0)
+
+    Note: Can use (OWNED state)
+    Layout.memory_set_int64(state, 48, 1)
+
+    Note: No parent initially
+    Layout.memory_set_int64(state, 56, 0)
+
+    Return state
+End Process
+
+@Reasoning
+Creates OwnershipInfo for a basic block.
+
+Memory: Tier 3 (OWNED HEAP) - 48 bytes
+@End Reasoning
+
+Process called "create_ownership_info" that takes block_id as Integer returns Integer:
+    Note: Allocate OwnershipInfo structure (48 bytes)
+    Let info be Layout.allocate(48)
+    If info equals 0:
+        Display "create_ownership_info: allocation failed"
+        Return 0
+    End If
+
+    Note: Set block ID
+    Layout.memory_set_int64(info, 0, block_id)
+
+    Note: Create state dictionaries
+    Let state_in be Dictionary.create()
+    Let state_out be Dictionary.create()
+    Layout.memory_set_int64(info, 8, state_in)
+    Layout.memory_set_int64(info, 16, state_out)
+
+    Note: Create operation lists
+    Let moves be List.create()
+    Let borrows be List.create()
+    Let errors be List.create()
+    Layout.memory_set_int64(info, 24, moves)
+    Layout.memory_set_int64(info, 32, borrows)
+    Layout.memory_set_int64(info, 40, errors)
+
+    Return info
+End Process
+
+@Reasoning
+Creates the main OwnershipAnalysis structure.
+
+Memory: Tier 3 (OWNED HEAP) - 56 bytes
+@End Reasoning
+
+Process called "create_ownership_analysis" that takes cfg as Integer, lifetime_analysis as Integer returns Integer:
+    Note: Allocate OwnershipAnalysis structure (56 bytes)
+    Let oa be Layout.allocate(56)
+    If oa equals 0:
+        Display "create_ownership_analysis: allocation failed"
+        Return 0
+    End If
+
+    Note: Create block ownership mapping
+    Let block_to_ownership be Dictionary.create()
+    Layout.memory_set_int64(oa, 0, block_to_ownership)
+
+    Note: Create value state mapping
+    Let value_to_state be Dictionary.create()
+    Layout.memory_set_int64(oa, 8, value_to_state)
+
+    Note: Set lifetime analysis
+    Layout.memory_set_int64(oa, 16, lifetime_analysis)
+
+    Note: Set CFG
+    Layout.memory_set_int64(oa, 24, cfg)
+
+    Note: Initialize statistics
+    Layout.memory_set_int64(oa, 32, 0)  Note: move_count = 0
+    Layout.memory_set_int64(oa, 40, 0)  Note: borrow_count = 0
+
+    Note: Create error list
+    Let error_list be List.create()
+    Layout.memory_set_int64(oa, 48, error_list)
+
+    Return oa
+End Process
+
+Note: ============================================================================
+Note: OWNERSHIP STATE COMPUTATION
+Note: ============================================================================
+
+@Reasoning
+Main entry point for ownership analysis.
+
+Computes ownership states across entire function using data flow:
+1. Initialize all values as OWNED
+2. Scan instructions for moves and borrows
+3. Propagate states through CFG
+4. Detect errors (use-after-move, double-move)
+
+Returns: 1 if successful, 0 if error
+@End Reasoning
+
+Process called "compute_ownership_states" that takes oa as Integer, mir_function as Integer returns Integer:
+    If oa equals 0 or mir_function equals 0:
+        Display "compute_ownership_states: null inputs"
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let mir_cfg be Layout.memory_get_int64(mir_function, 8)
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Note: Get ownership structures
+    Let block_to_ownership be Layout.memory_get_int64(oa, 0)
+    Let value_to_state be Layout.memory_get_int64(oa, 8)
+
+    Note: Phase 1: Create OwnershipInfo for each block
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Let ownership_info be create_ownership_info(block_id)
+        Dictionary.set(block_to_ownership, block_id, ownership_info)
+
+        Let b be b + 1
+    End While
+
+    Note: Phase 2: Initialize all SSA values as OWNED
+    Let local_values be Layout.memory_get_int64(mir_function, 40)
+    Let value_count be Layout.memory_get_int64(mir_function, 48)
+
+    Let v be 0
+    While v is less than value_count:
+        Let value_id be List.get(local_values, v)
+        Let state be create_ownership_state(value_id)
+        Dictionary.set(value_to_state, value_id, state)
+        Let v be v + 1
+    End While
+
+    Note: Phase 3: Scan instructions for moves and borrows
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be Layout.memory_get_int64(block, 24)
+
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(instructions, i)
+            Let opcode be Layout.memory_get_int64(inst, 0)
+
+            Note: Check for move operations (ASSIGN, MOVE opcodes)
+            If opcode equals 20001 or opcode equals 20002:
+                Let dest be Layout.memory_get_int64(inst, 8)
+                Let src be Layout.memory_get_int64(inst, 16)
+
+                Note: Check if source type is Copy
+                Let src_type be get_value_type(mir_function, src)
+                Let is_copy be is_copy_type(src_type)
+
+                If is_copy equals 0:
+                    Note: Not Copy type, this is a move
+                    track_move_operation(oa, src, dest, inst, block_id)
+                End If
+            End If
+
+            Note: ADDRESS_OF creates borrow
+            If opcode equals 20205:
+                Let operand1 be Layout.memory_get_int64(inst, 16)
+                track_borrow_operation(oa, operand1, inst, block_id)
+            End If
+
+            Note: CALL may move arguments
+            If opcode equals 20304:
+                Note: Arguments passed by value are moved into function
+                Note: Arguments passed by reference are borrowed
+
+                Note: Get all operands (arguments) for this call
+                Note: Operand1 (offset 16) = callee
+                Note: Operand2 (offset 24) = first argument
+                Note: Operand3 (offset 32) = second argument
+
+                Note: Process first argument
+                Let arg1 be Layout.memory_get_int64(inst, 24)
+                If arg1 is not equal to 0:
+                    Note: Conservative move tracking for function arguments
+                    Note: Arguments passed by value are moved into the function
+                    Note: This conservative approach assumes all non-primitive arguments are moved
+                    Note: Primitive types (integers, floats, bools) are copied by value, not moved
+                    Note: For precise tracking, type metadata would distinguish Copy vs Move types
+                    track_move_operation(oa, arg1, inst, block_id)
+                End If
+
+                Note: Process second argument
+                Let arg2 be Layout.memory_get_int64(inst, 32)
+                If arg2 is not equal to 0:
+                    track_move_operation(oa, arg2, inst, block_id)
+                End If
+
+                Note: For calls with more than 2 arguments, they are stored in an argument list
+                Note: This would require accessing the extended operand list structure
+                Note: Currently handling the most common case (0-2 arguments)
+            End If
+
+            Note: RETURN moves returned value
+            If opcode equals 20303:
+                Let operand1 be Layout.memory_get_int64(inst, 16)
+                If operand1 is not equal to 0:
+                    track_move_operation(oa, operand1, inst, block_id)
+                End If
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Note: Phase 4: Propagate ownership states through CFG
+    propagate_ownership_states(oa, mir_function)
+
+    Note: Phase 5: Detect ownership errors
+    detect_use_after_move(oa, mir_function)
+    detect_double_move(oa, mir_function)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MOVE AND BORROW TRACKING
+Note: ============================================================================
+
+@Reasoning
+Tracks a move operation for a value.
+
+When a value is moved:
+1. State changes from OWNED to MOVED
+2. Record the instruction where move occurred
+3. Mark value as unusable
+4. Add to move list for block
+
+Returns: 1 if successful
+@End Reasoning
+
+Process called "track_move_operation" that takes oa as Integer, value_id as Integer, inst as Integer, block_id as Integer returns Integer:
+    If oa equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Note: Get value state
+    Let value_to_state be Layout.memory_get_int64(oa, 8)
+    Let state be Dictionary.get(value_to_state, value_id)
+
+    If state equals 0:
+        Note: Create state if doesn't exist
+        Let state be create_ownership_state(value_id)
+        Dictionary.set(value_to_state, value_id, state)
+    End If
+
+    Note: Update state to MOVED
+    Layout.memory_set_int64(state, 8, 1)  Note: OWNERSHIP_MOVED
+
+    Note: Record where moved
+    Layout.memory_set_int64(state, 16, inst)
+
+    Note: Mark as unusable
+    Layout.memory_set_int64(state, 48, 0)
+
+    Note: Add to block's move list
+    Let block_to_ownership be Layout.memory_get_int64(oa, 0)
+    Let ownership_info be Dictionary.get(block_to_ownership, block_id)
+
+    If ownership_info is not equal to 0:
+        Let moves be Layout.memory_get_int64(ownership_info, 24)
+        List.append(moves, inst)
+    End If
+
+    Note: Increment move count
+    Let move_count be Layout.memory_get_int64(oa, 32)
+    Layout.memory_set_int64(oa, 32, move_count + 1)
+
+    Return 1
+End Process
+
+@Reasoning
+Tracks a borrow operation for a value.
+
+When a value is borrowed:
+1. State changes to BORROWED (or stays OWNED if shared borrow)
+2. Add borrow ID to borrowed_by list
+3. Value remains usable but with restrictions
+
+Returns: 1 if successful
+@End Reasoning
+
+Process called "track_borrow_operation" that takes oa as Integer, value_id as Integer, inst as Integer, block_id as Integer returns Integer:
+    If oa equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Note: Get value state
+    Let value_to_state be Layout.memory_get_int64(oa, 8)
+    Let state be Dictionary.get(value_to_state, value_id)
+
+    If state equals 0:
+        Let state be create_ownership_state(value_id)
+        Dictionary.set(value_to_state, value_id, state)
+    End If
+
+    Note: Add to borrowed_by list
+    Let borrowed_by be Layout.memory_get_int64(state, 24)
+    List.append(borrowed_by, inst)
+
+    Note: Update state to BORROWED
+    Layout.memory_set_int64(state, 8, 2)  Note: OWNERSHIP_BORROWED
+
+    Note: Still usable (with restrictions)
+    Layout.memory_set_int64(state, 48, 1)
+
+    Note: Add to block's borrow list
+    Let block_to_ownership be Layout.memory_get_int64(oa, 0)
+    Let ownership_info be Dictionary.get(block_to_ownership, block_id)
+
+    If ownership_info is not equal to 0:
+        Let borrows be Layout.memory_get_int64(ownership_info, 32)
+        List.append(borrows, inst)
+    End If
+
+    Note: Increment borrow count
+    Let borrow_count be Layout.memory_get_int64(oa, 40)
+    Layout.memory_set_int64(oa, 40, borrow_count + 1)
+
+    Return 1
+End Process
+
+@Reasoning
+Handles partial moves for struct fields.
+
+When a field is moved from a struct:
+1. Parent struct becomes PARTIAL_MOVE
+2. Track which fields are moved
+3. Other fields remain usable
+4. Parent struct itself unusable
+
+Returns: 1 if successful
+@End Reasoning
+
+Process called "check_partial_move" that takes oa as Integer, parent_value as Integer, field_id as Integer, inst as Integer returns Integer:
+    If oa equals 0 or parent_value equals 0:
+        Return 0
+    End If
+
+    Note: Get parent state
+    Let value_to_state be Layout.memory_get_int64(oa, 8)
+    Let parent_state be Dictionary.get(value_to_state, parent_value)
+
+    If parent_state equals 0:
+        Let parent_state be create_ownership_state(parent_value)
+        Dictionary.set(value_to_state, parent_value, parent_state)
+    End If
+
+    Note: Get partial moves dictionary
+    Let partial_moves be Layout.memory_get_int64(parent_state, 32)
+
+    Note: Mark field as moved
+    Dictionary.set(partial_moves, field_id, 1)
+
+    Note: Update parent state to PARTIAL_MOVE
+    Layout.memory_set_int64(parent_state, 8, 3)  Note: OWNERSHIP_PARTIAL_MOVE
+
+    Note: Parent itself is unusable
+    Layout.memory_set_int64(parent_state, 48, 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: OWNERSHIP STATE PROPAGATION
+Note: ============================================================================
+
+@Reasoning
+Propagates ownership states through control flow graph.
+
+Uses data flow analysis:
+- state_out[B] = transfer(state_in[B], B)
+- state_in[B] = merge(state_out[P] for P in predecessors[B])
+
+Fixed-point iteration until convergence.
+
+Returns: 1 if successful
+@End Reasoning
+
+Process called "propagate_ownership_states" that takes oa as Integer, mir_function as Integer returns Integer:
+    If oa equals 0 or mir_function equals 0:
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let mir_cfg be Layout.memory_get_int64(mir_function, 8)
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Let block_to_ownership be Layout.memory_get_int64(oa, 0)
+
+    Note: Fixed-point iteration
+    Let changed be 1
+    Let iteration be 0
+    Let max_iterations be 100
+
+    While changed equals 1 and iteration is less than max_iterations:
+        Let changed be 0
+        Let iteration be iteration + 1
+
+        Note: For each block
+        Let b be 0
+        While b is less than block_count:
+            Let block be List.get(blocks, b)
+            Let block_id be Layout.memory_get_int64(block, 0)
+
+            Let ownership_info be Dictionary.get(block_to_ownership, block_id)
+            If ownership_info equals 0:
+                Let b be b + 1
+                Continue
+            End If
+
+            Note: Merge states from predecessors
+            Let state_in be Layout.memory_get_int64(ownership_info, 8)
+            Let predecessors be Layout.memory_get_int64(block, 32)
+            Let pred_count be Layout.memory_get_int64(block, 40)
+
+            Note: If no predecessors, skip merging
+            If pred_count equals 0:
+                Let b be b + 1
+                Continue
+            End If
+
+            Note: Merge all predecessor state_out into our state_in
+            Let p be 0
+            While p is less than pred_count:
+                Let pred_id be List.get(predecessors, p)
+                Let pred_info be Dictionary.get(block_to_ownership, pred_id)
+
+                If pred_info is not equal to 0:
+                    Let pred_state_out be Layout.memory_get_int64(pred_info, 16)
+
+                    Note: Merge states (conservative: if moved in any path, mark as moved)
+                    Note: Iterate through all values in predecessor's state_out
+                    Let pred_keys be Dictionary.keys(pred_state_out)
+                    Let key_count be List.length(pred_keys)
+
+                    Let k be 0
+                    While k is less than key_count:
+                        Let value_id be List.get(pred_keys, k)
+                        Let pred_value_state be Dictionary.get(pred_state_out, value_id)
+
+                        If pred_value_state is not equal to 0:
+                            Note: Check if value already has state in state_in
+                            Let current_state be Dictionary.get(state_in, value_id)
+
+                            If current_state equals 0:
+                                Note: First predecessor - copy state
+                                Note: Clone OwnershipState
+                                Let new_state be create_ownership_state(value_id)
+                                Let pred_state_value be Layout.memory_get_int64(pred_value_state, 8)
+                                Layout.memory_set_int64(new_state, 8, pred_state_value)
+                                Let pred_moved_at be Layout.memory_get_int64(pred_value_state, 16)
+                                Layout.memory_set_int64(new_state, 16, pred_moved_at)
+                                Dictionary.set(state_in, value_id, new_state)
+                                Let changed be 1
+                            Otherwise:
+                                Note: Merge with existing state (conservative)
+                                Let current_state_value be Layout.memory_get_int64(current_state, 8)
+                                Let pred_state_value be Layout.memory_get_int64(pred_value_state, 8)
+
+                                Note: Conservative merge: MOVED takes precedence
+                                Note: State values: OWNED=0, MOVED=1, BORROWED=2, PARTIAL_MOVE=3
+                                Let merged_state be current_state_value
+
+                                Note: If either path has MOVED, result is MOVED
+                                If pred_state_value equals 1 or current_state_value equals 1:
+                                    Let merged_state be 1
+                                Otherwise:
+                                    Note: If either has PARTIAL_MOVE, result is PARTIAL_MOVE
+                                    If pred_state_value equals 3 or current_state_value equals 3:
+                                        Let merged_state be 3
+                                    Otherwise:
+                                        Note: If either has BORROWED, result is BORROWED
+                                        If pred_state_value equals 2 or current_state_value equals 2:
+                                            Let merged_state be 2
+                                        End If
+                                    End If
+                                End If
+
+                                Note: Update state if changed
+                                If merged_state is not equal to current_state_value:
+                                    Layout.memory_set_int64(current_state, 8, merged_state)
+                                    Let changed be 1
+                                End If
+                            End If
+                        End If
+
+                        Let k be k + 1
+                    End While
+                End If
+
+                Let p be p + 1
+            End While
+
+            Note: Transfer function: apply block's effects
+            Note: state_out = state_in after applying moves/borrows
+
+            Let b be b + 1
+        End While
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: OWNERSHIP ERROR DETECTION
+Note: ============================================================================
+
+@Reasoning
+Detects use-after-move errors.
+
+Scans all instructions for uses of moved values.
+
+Returns: Number of errors found
+@End Reasoning
+
+Process called "detect_use_after_move" that takes oa as Integer, mir_function as Integer returns Integer:
+    If oa equals 0 or mir_function equals 0:
+        Return 0
+    End If
+
+    Let error_count be 0
+
+    Note: Get CFG
+    Let mir_cfg be Layout.memory_get_int64(mir_function, 8)
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Let value_to_state be Layout.memory_get_int64(oa, 8)
+    Let error_list be Layout.memory_get_int64(oa, 48)
+
+    Note: Scan all instructions
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be Layout.memory_get_int64(block, 24)
+
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(instructions, i)
+
+            Note: Check operands for moved values
+            Let operand1 be Layout.memory_get_int64(inst, 16)
+            If operand1 is not equal to 0:
+                Let state be Dictionary.get(value_to_state, operand1)
+                If state is not equal to 0:
+                    Let state_value be Layout.memory_get_int64(state, 8)
+                    Let can_use be Layout.memory_get_int64(state, 48)
+
+                    Note: If MOVED and trying to use
+                    If state_value equals 1 and can_use equals 0:
+                        Let error_msg be StringCore.from_c_string("Use-after-move error: value used after being moved")
+                        List.append(error_list, error_msg)
+                        Let error_count be error_count + 1
+                    End If
+
+                    Note: Check PARTIAL_MOVE
+                    If state_value equals 3:
+                        Let error_msg be StringCore.from_c_string("Use of partially moved value")
+                        List.append(error_list, error_msg)
+                        Let error_count be error_count + 1
+                    End If
+                End If
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Return error_count
+End Process
+
+@Reasoning
+Detects double-move errors.
+
+Attempting to move a value that's already moved is an error.
+
+Returns: Number of errors found
+@End Reasoning
+
+Process called "detect_double_move" that takes oa as Integer, mir_function as Integer returns Integer:
+    If oa equals 0 or mir_function equals 0:
+        Return 0
+    End If
+
+    Let error_count be 0
+
+    Note: Get block ownership info
+    Let block_to_ownership be Layout.memory_get_int64(oa, 0)
+    Let value_to_state be Layout.memory_get_int64(oa, 8)
+    Let error_list be Layout.memory_get_int64(oa, 48)
+
+    Note: Check each move
+    Let block_keys be Dictionary.keys(block_to_ownership)
+    Let block_key_count be List.length(block_keys)
+
+    Let bk be 0
+    While bk is less than block_key_count:
+        Let block_id be List.get(block_keys, bk)
+        Let ownership_info be Dictionary.get(block_to_ownership, block_id)
+
+        If ownership_info is not equal to 0:
+            Let moves be Layout.memory_get_int64(ownership_info, 24)
+            Let move_count be List.length(moves)
+
+            Let m be 0
+            While m is less than move_count:
+                Let move_inst be List.get(moves, m)
+                Let operand1 be Layout.memory_get_int64(move_inst, 16)
+
+                If operand1 is not equal to 0:
+                    Let state be Dictionary.get(value_to_state, operand1)
+                    If state is not equal to 0:
+                        Let state_value be Layout.memory_get_int64(state, 8)
+
+                        Note: If already moved, this is double-move
+                        If state_value equals 1:
+                            Let error_msg be StringCore.from_c_string("Double-move error: value moved twice")
+                            List.append(error_list, error_msg)
+                            Let error_count be error_count + 1
+                        End If
+                    End If
+                End If
+
+                Let m be m + 1
+            End While
+        End If
+
+        Let bk be bk + 1
+    End While
+
+    Return error_count
+End Process
+
+@Reasoning
+Verifies ownership invariants.
+
+Checks:
+1. All values have valid ownership states
+2. No invalid state transitions
+3. Partial moves are consistent
+
+Returns: 1 if valid, 0 if errors
+@End Reasoning
+
+Process called "verify_ownership_invariants" that takes oa as Integer returns Integer:
+    If oa equals 0:
+        Return 0
+    End If
+
+    Display "=== Verifying Ownership Invariants ==="
+
+    Note: Get value states
+    Let value_to_state be Layout.memory_get_int64(oa, 8)
+    Let error_list be Layout.memory_get_int64(oa, 48)
+
+    Let value_keys be Dictionary.keys(value_to_state)
+    Let value_count be List.length(value_keys)
+
+    Let v be 0
+    While v is less than value_count:
+        Let value_id be List.get(value_keys, v)
+        Let state be Dictionary.get(value_to_state, value_id)
+
+        If state is not equal to 0:
+            Let state_value be Layout.memory_get_int64(state, 8)
+
+            Note: Check state is valid
+            If state_value is less than 0 or state_value is greater than 3:
+                Let error_msg be StringCore.from_c_string("Invalid ownership state")
+                List.append(error_list, error_msg)
+                Return 0
+            End If
+
+            Note: If MOVED, must have moved_at location
+            If state_value equals 1:
+                Let moved_at be Layout.memory_get_int64(state, 16)
+                If moved_at equals 0:
+                    Let error_msg be StringCore.from_c_string("Moved state without move location")
+                    List.append(error_list, error_msg)
+                    Return 0
+                End If
+            End If
+
+            Note: If PARTIAL_MOVE, must have partial_moves entries
+            If state_value equals 3:
+                Let partial_moves be Layout.memory_get_int64(state, 32)
+                Let pm_keys be Dictionary.keys(partial_moves)
+                Let pm_count be List.length(pm_keys)
+
+                If pm_count equals 0:
+                    Let error_msg be StringCore.from_c_string("Partial move state without moved fields")
+                    List.append(error_list, error_msg)
+                    Return 0
+                End If
+            End If
+        End If
+
+        Let v be v + 1
+    End While
+
+    Display "Ownership invariants satisfied"
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DEBUG AND PRINTING
+Note: ============================================================================
+
+@Reasoning
+Prints ownership analysis results for debugging.
+
+Displays:
+- Total values tracked
+- Values by ownership state
+- Move and borrow statistics
+- Errors found
+@End Reasoning
+
+Process called "print_ownership_analysis" that takes oa as Integer returns Integer:
+    If oa equals 0:
+        Display "print_ownership_analysis: null analysis"
+        Return 0
+    End If
+
+    Display "=== Ownership Analysis Results ==="
+
+    Note: Print statistics
+    Let move_count be Layout.memory_get_int64(oa, 32)
+    Let borrow_count be Layout.memory_get_int64(oa, 40)
+
+    Display "Total Moves: "
+    Display move_count
+
+    Display "Total Borrows: "
+    Display borrow_count
+
+    Note: Count by ownership state
+    Let owned_count be 0
+    Let moved_count be 0
+    Let borrowed_count be 0
+    Let partial_move_count be 0
+
+    Let value_to_state be Layout.memory_get_int64(oa, 8)
+    Let value_keys be Dictionary.keys(value_to_state)
+    Let value_count be List.length(value_keys)
+
+    Let v be 0
+    While v is less than value_count:
+        Let value_id be List.get(value_keys, v)
+        Let state be Dictionary.get(value_to_state, value_id)
+
+        If state is not equal to 0:
+            Let state_value be Layout.memory_get_int64(state, 8)
+
+            If state_value equals 0:
+                Let owned_count be owned_count + 1
+            Otherwise If state_value equals 1:
+                Let moved_count be moved_count + 1
+            Otherwise If state_value equals 2:
+                Let borrowed_count be borrowed_count + 1
+            Otherwise If state_value equals 3:
+                Let partial_move_count be partial_move_count + 1
+            End If
+        End If
+
+        Let v be v + 1
+    End While
+
+    Display ""
+    Display "Values by State:"
+    Display "  OWNED: "
+    Display owned_count
+    Display "  MOVED: "
+    Display moved_count
+    Display "  BORROWED: "
+    Display borrowed_count
+    Display "  PARTIAL_MOVE: "
+    Display partial_move_count
+
+    Note: Print errors
+    Let error_list be Layout.memory_get_int64(oa, 48)
+    Let error_count be List.length(error_list)
+
+    If error_count is greater than 0:
+        Display ""
+        Display "Ownership Errors: "
+        Display error_count
+
+        Let e be 0
+        While e is less than error_count:
+            Let error_msg be List.get(error_list, e)
+            Display "  - "
+            Display error_msg
+            Let e be e + 1
+        End While
+    Otherwise:
+        Display ""
+        Display "No ownership errors detected"
+    End If
+
+    Return 1
+End Process

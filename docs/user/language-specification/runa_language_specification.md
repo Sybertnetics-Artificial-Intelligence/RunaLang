@@ -455,9 +455,13 @@ if_statement          ::= "If" expression ":" block
 
 unless_statement      ::= "Unless" expression ":" block "End" "Unless"
 
-when_statement        ::= "When" expression ":" block "End" "When"
+when_statement        ::= "When" expression ":" when_cases "End" "When"
 
-match_statement       ::= "Match" expression ":" INDENT match_cases DEDENT "End" "Match"
+when_cases            ::= when_case+
+when_case             ::= ("is" expression | "is not" expression | "does equal" expression | "does not equal" expression) ":" block
+                         | "Otherwise" ":" block
+
+match_statement       ::= "Match" expression ":" match_cases "End" "Match"
 
 match_cases           ::= match_case+
 match_case            ::= "When" pattern guard? ":" block
@@ -473,6 +477,89 @@ do_while_loop         ::= "Do" ":" block "While" expression "End" "Do"
 repeat_loop           ::= "Repeat" expression "times" ":" block "End" "Repeat"
 infinite_loop         ::= "Loop" "forever" ":" block "End" "Loop"
 ```
+
+#### Control Flow Examples
+
+**If Statement (Sequential Condition Evaluation):**
+Use `If` when evaluating different conditions or expressions in sequence.
+
+```runa
+If user is authenticated and user.role is "admin":
+    Display "Access granted"
+Otherwise If user is authenticated and user.role is "moderator":
+    Display "Limited access"
+Otherwise If not user is authenticated:
+    Display "Please log in"
+Otherwise:
+    Display "Access denied"
+End If
+```
+
+**When Statement (Multi-Way Value Branching):**
+Use `When` when evaluating the state of a single expression against multiple values. This is semantically asking "which state is X in?" rather than "is this condition true?"
+
+```runa
+When status:
+    is "active":
+        Display "System is active"
+        Set last_active_time to proc current_timestamp
+    is "inactive":
+        Display "System is inactive"
+        Set last_inactive_time to proc current_timestamp
+    is "pending":
+        Display "System is pending activation"
+    is "error":
+        Display "System error occurred"
+        Throw SystemError with message "Status is error"
+    Otherwise:
+        Display "Unknown status: " joined with status to string
+End When
+```
+
+**Match Statement (Pattern Matching with Destructuring):**
+Use `Match` when you need pattern matching, destructuring, type checking, or guards. `Match` supports complex patterns beyond simple value equality.
+
+```runa
+Match result:
+    When Ok(value) where length of value is greater than 0:
+        Display "Success: " joined with value
+    When Ok(value):
+        Display "Success but empty"
+    When Error(code) where code is less than 100:
+        Display "Minor error: " joined with code to string
+    When Error(code):
+        Display "Major error: " joined with code to string
+    When _:
+        Display "Unknown result type"
+End Match
+```
+
+**Semantic Distinction:**
+
+| Construct | Purpose | Question It Answers |
+|-----------|---------|---------------------|
+| `If` | Sequential condition evaluation | "Is this condition true?" |
+| `When` | Multi-way value branching | "Which state is X in?" |
+| `Match` | Pattern matching with destructuring | "Which pattern does X match?" |
+
+**When to Use Each:**
+
+- **Use `If`** for:
+  - Different boolean conditions: `If x is greater than 0 and y is less than 10:`
+  - Complex logical expressions: `If user exists and user.is_active and not user.is_banned:`
+  - Sequential evaluation of unrelated conditions
+
+- **Use `When`** for:
+  - Status code handling: `When http_status: is 200: ... is 404: ... is 500: ...`
+  - Enum/value matching: `When user_role: is "admin": ... is "user": ...`
+  - String constant branching: `When command: is "start": ... is "stop": ...`
+  - Any scenario where you're asking "what state/value is this variable?"
+
+- **Use `Match`** for:
+  - Destructuring structured data: `When {type: "user", name: n}:`
+  - Type-based pattern matching: `When Circle with radius as r:`
+  - Guarded patterns: `When x where x is greater than 5:`
+  - Complex pattern matching beyond simple equality
 
 ### Function Definitions
 
@@ -597,16 +684,36 @@ not_expression        ::= "not" not_expression | comparison_expression
 
 comparison_expression ::= additive_expression (comparison_op additive_expression)*
 
-comparison_op         ::= "is" "equal" "to"
-                        | "does" "not" "equal"
-                        | "is" "not" "equal" "to"
-                        | "is" "greater" "than"
-                        | "is" "less" "than"
+comparison_op         ::= "is" "equal" "to"                           # Full form (explicit)
+                        | "is"                                        # Alias for "is equal to" (natural, concise)
+                        | "does" "equal"                              # Alternative form: "x does equal y"
+                        | "does" "not" "equal"                        # Alias for "is not equal to" (alternative phrasing)
+                        | "is" "not" "equal" "to"                     # Full form (explicit)
+                        | "is" "not" "greater" "than" "or" "equal" "to"  # Negated compound: NOT (>=)
+                        | "is" "not" "less" "than" "or" "equal" "to"     # Negated compound: NOT (<=)
+                        | "is" "not" "greater" "than"                 # Negated: NOT (>)
+                        | "is" "not" "less" "than"                    # Negated: NOT (<)
+                        | "is" "not"                                  # Alias for "is not equal to" (when not part of compound)
                         | "is" "greater" "than" "or" "equal" "to"
                         | "is" "less" "than" "or" "equal" "to"
+                        | "is" "greater" "than"
+                        | "is" "less" "than"
                         | "contains"
                         | "is" "in"
+                        | "is" "within"                               # Range/membership check (date ranges, numeric ranges)
+                        | "is" "not" "within"                         # Negated range check
                         | "is" "of" "type"
+
+Note: Parser disambiguation uses longest-match precedence. Examples:
+      - `x is "value"` → equality (not `is in`, `is within`, or `is of type`)
+      - `x is in list` → membership check (longer pattern matches first)
+      - `x is within range` → range check (longer pattern matches first)
+      - `x is of type String` → type check (longest pattern)
+      - `x is not greater than or equal to 5` → NOT (x >= 5) (compound negation)
+      - `x is not 5` → NOT (x == 5) (simple inequality, when not part of compound)
+      - `x does equal 5` → equality check (alternative phrasing)
+      - `x does not equal 5` → inequality check (alternative phrasing, equivalent to `is not equal to`)
+      - `x is not within range` → NOT (x is within range) (negated range check)
 
 additive_expression   ::= multiplicative_expression (additive_op multiplicative_expression)*
 
@@ -631,12 +738,39 @@ primary_expression    ::= literal
                         | "(" expression ")"
                         | lambda_expression
                         | list_comprehension
+                        | filter_expression
+                        | aggregation_expression
+                        | sort_expression
+                        | first_last_expression
+                        | field_extraction_expression
                         | new_expression
                         | await_expression
                         | receive_expression
                         | spawn_expression
                         | typeof_expression
                         | sizeof_expression
+
+filter_expression     ::= "Filter" expression "where" ":" filter_conditions
+                         | "Filter" expression "where" filter_condition
+filter_conditions     ::= filter_condition ("," filter_condition)*
+                          Note: Comma-separated conditions are implicitly combined with AND
+filter_condition       ::= expression
+                          Note: Expression has implicit element context
+                          Note: Field names (e.g., "last activity") refer to properties of the current element
+                          Note: Use "the <field> of <element>" for explicit element reference
+
+aggregation_expression ::= aggregation_function "of" field_reference "from" expression
+                          | aggregation_function "of" expression
+aggregation_function   ::= "average" | "sum" | "count" | "minimum" | "maximum"
+
+sort_expression        ::= expression ("sorted" "by" field_reference)?
+
+first_last_expression ::= ("first" | "last") (integer | "item")? ("sorted" "by" field_reference)?
+                          | ("first" | "last") integer "items" ("sorted" "by" field_reference)?
+                          Note: "first item" = "first 1 item", "last item" = "last 1 item"
+
+field_extraction_expression ::= field_reference "from" expression
+field_reference        ::= identifier | encased_identifier
 ```
 
 ### Field and Method Access (Mode-Scoped)
@@ -1174,7 +1308,161 @@ Note: Dictionary comprehension
 word_lengths = {word: len(word) for word in words if len(word) > 3}
 ```
 
+### Filter Expression (Language-Level)
+
+The `Filter` construct is a language-level syntax for filtering collections with implicit element references, providing natural language clarity similar to SQL `WHERE` clauses.
+
+#### Syntax
+
+```ebnf
+filter_expression     ::= "Filter" expression "where" ":" filter_conditions
+                         | "Filter" expression "where" filter_condition
+filter_conditions     ::= filter_condition ("," filter_condition)*
+                          Note: Comma-separated conditions are implicitly combined with AND
+filter_condition       ::= expression
+                          Note: Expression has implicit element context
+                          Note: Field names refer to properties of the current element
+```
+
+#### Implicit Element References
+
+In a `Filter collection where condition` expression:
+- The `condition` expression has an implicit element context
+- Bare field names (e.g., `last activity`, `age`, `name`) refer to properties of the current element
+- These are automatically expanded to `the <field> of <element>`
+- Explicit variables from outer scope still work and take precedence
+
+#### Examples
+
+```runa
+Note: Implicit element references (recommended for natural language clarity)
+Let active_users be Filter users where last_activity is within date_range
+Let adults be Filter people where age is greater than or equal to 18
+Let valid_items be Filter items where status is "active" and quantity is greater than 0
+
+Note: Multiple conditions (comma-separated, implicit AND)
+Let premium_users be Filter users where:
+    subscription_tier is "premium",
+    account_balance is greater than 100,
+    last_login is within (start_date, end_date)
+
+Note: Single-line conditions (no colon needed)
+Let active_users be Filter users where last_activity is within date_range
+
+Note: Using explicit lambda (alternative syntax)
+Let evens be Filter numbers where lambda x: x modulo by 2 is equal to 0
+
+Note: Both syntaxes are equivalent - choose based on readability
+Let filtered_users_v1 be Filter users where last_activity is within date_range
+Let filtered_users_v2 be Filter users where lambda user: last_activity of user is within date_range
+Note: filtered_users_v1 and filtered_users_v2 are equivalent
+```
+
+#### Scope Resolution
+
+1. **Field names** in the condition are resolved against the current element
+2. **Explicit variables** from outer scope take precedence
+3. **Ambiguous cases** require explicit qualification
+
+```runa
+Note: Field names resolve to element properties
+Let filtered be Filter users where age is greater than 18
+Note: "age" refers to "the age of user" (implicit)
+
+Note: Outer scope variables take precedence
+Let threshold be 18
+Let filtered be Filter users where age is greater than threshold
+Note: "threshold" refers to the outer variable, "age" refers to the element property
+
+Note: Explicit qualification for clarity
+Let filtered be Filter users where the age of user is greater than 18
+Note: Explicit form is always valid
+```
+
 ## Collection Methods and Operations
+
+### Aggregation Functions
+
+Aggregation functions compute summary statistics over collections, extracting field values and computing results.
+
+#### Syntax
+
+```ebnf
+aggregation_expression ::= aggregation_function "of" field_reference "from" expression
+                          | aggregation_function "of" expression
+
+aggregation_function   ::= "average" | "sum" | "count" | "minimum" | "maximum"
+field_reference        ::= identifier | encased_identifier
+```
+
+#### Field Extraction
+
+When extracting fields from collections: `<field> from <collection>` extracts the specified field from each element in the collection.
+
+```runa
+Note: Extract field from collection
+Let sessions be sessions from active_users
+Note: Extracts "sessions" field from each user in active_users collection
+```
+
+#### Aggregation Examples
+
+```runa
+Note: Aggregation with field extraction
+Let average_sessions be average of sessions from active_users
+Let total_revenue be sum of price from purchases
+Let user_count be count of active_users
+Let min_score be minimum of score from players
+Let max_value be maximum of value from results
+
+Note: Aggregation without field extraction (works on numeric collections)
+Let average_age be average of ages
+Let total be sum of numbers
+Let count be count of items
+```
+
+### Sorting and Selection
+
+Collections can be sorted by fields and filtered to first/last N items.
+
+#### Syntax
+
+```ebnf
+sort_expression        ::= expression ("sorted" "by" field_reference)?
+
+first_last_expression ::= ("first" | "last") (integer | "item")? ("sorted" "by" field_reference)?
+                          | ("first" | "last") integer "items" ("sorted" "by" field_reference)?
+```
+
+#### Sorting
+
+Sorting is optional and can be combined with first/last selection:
+
+```runa
+Note: Sort entire collection
+Let sorted_users be users sorted by engagement_score
+Let ordered_items be items sorted by price
+
+Note: First N items (positional - no sorting)
+Let first_10_tickets be first 10 tickets
+Let first_purchaser be first item from purchased_tickets
+
+Note: First N items (ranked - with sorting)
+Let top_10_users be first 10 users sorted by engagement_score
+Let top_performer be first item sorted by engagement_score from users
+
+Note: Last N items (positional - no sorting)
+Let last_5_entries be last 5 entries
+Let most_recent be last item from logs
+
+Note: Last N items (ranked - with sorting)
+Let bottom_10_scores be last 10 scores sorted by score
+Let worst_performer be last item sorted by engagement_score from users
+
+Note: Singular shorthand (first item = first 1 item, last item = last 1 item)
+Let winner be first item sorted by score from contestants
+Let loser be last item sorted by score from contestants
+```
 
 ### Common Operations
 
@@ -2502,18 +2790,19 @@ Process called "reload_module" that takes module_name as String and system as Mo
 ```runa
 Note: Conditional module loading
 Note: File: platform_specific.runa
-When target_platform is "windows":
-    Import "windows_implementation" as impl
-When target_platform is "linux":
-    Import "linux_implementation" as impl
-When target_platform is "macos":
-    Import "macos_implementation" as impl
-Otherwise:
-    Import "generic_implementation" as impl
+When target_platform:
+    is "windows":
+        Import "windows_implementation" as impl
+    is "linux":
+        Import "linux_implementation" as impl
+    is "macos":
+        Import "macos_implementation" as impl
+    Otherwise:
+        Import "generic_implementation" as impl
 
 
 Note: Feature-gated modules
-When feature_enabled("advanced_crypto"):
+If feature_enabled("advanced_crypto") is equal to true:
     Import "advanced_crypto" as crypto
 Otherwise:
     Import "basic_crypto" as crypto
@@ -2588,13 +2877,16 @@ Export external_function                 Note: Re-export imported function
 Export ExternalType as LocalType         Note: Re-export with alias
 
 Note: Conditional exports
-When feature_enabled("debugging"):
+If feature_enabled("debugging") is equal to true:
     Export debug_utilities
     Export internal_state_inspector
 
-When build_mode is "development":
-    Export test_helpers
-    Export mock_implementations
+When build_mode:
+    is "development":
+        Export test_helpers
+        Export mock_implementations
+    Otherwise:
+        Note: Production build - no test helpers
 ```
 
 ---
@@ -3613,7 +3905,18 @@ This tool:
 Note: List operations
 Let numbers be list containing 1, 2, 3, 4, 5
 Let doubled be Map over numbers using lambda x: x multiplied by 2
+
+Note: Filter with lambda (explicit element reference)
 Let evens be Filter numbers where lambda x: x modulo by 2 is equal to 0
+
+Note: Filter with implicit element reference (language-level syntax)
+Let active_users be Filter users where last_activity is within date_range
+Let adults be Filter people where age is greater than or equal to 18
+
+Note: Both syntaxes are equivalent - use implicit references for natural language clarity
+Let filtered_evens be Filter numbers where modulo by 2 is equal to 0
+Note: "modulo by 2" implicitly refers to "modulo by 2 of <element>"
+
 Let sum be Reduce numbers using lambda acc and x: acc plus x
 
 Note: Dictionary operations
@@ -3669,15 +3972,94 @@ Both forms supported (symbols restricted to mathematical contexts):
 #### Equality Operators
 
 **Canon Mode:**
-- `is equal to` - The primary operator for equality comparisons
-- Example: `If name is equal to "Admin"` or `If the day is equal to "Monday"`
+- `is equal to` / `is` / `does equal` - Value equality comparison (all forms are equivalent)
+  - `is` is a natural, concise alias for `is equal to` when used for equality
+  - `does equal` provides alternative phrasing for natural language variety
+  - All perform **value equality** checks (not identity/reference equality)
+  - Examples: 
+    - `If name is "Admin"` or `If name is equal to "Admin"` or `If name does equal "Admin"`
+    - `If day is "Monday"` or `If day is equal to "Monday"` or `If day does equal "Monday"`
+- `is not equal to` / `is not` / `does not equal` - Value inequality comparison (all forms are equivalent)
+  - Examples: 
+    - `If x is not 5` or `If x is not equal to 5` or `If x does not equal 5`
+
+#### Negated Comparison Operators
+
+**Canon Mode:**
+- `is not greater than` - Negated greater-than comparison: `NOT (x > y)`
+  - Example: `If age is not greater than 18` (equivalent to `age <= 18`)
+- `is not less than` - Negated less-than comparison: `NOT (x < y)`
+  - Example: `If score is not less than 60` (equivalent to `score >= 60`)
+- `is not greater than or equal to` - Negated greater-than-or-equal: `NOT (x >= y)`
+  - Example: `If price is not greater than or equal to 100` (equivalent to `price < 100`)
+- `is not less than or equal to` - Negated less-than-or-equal: `NOT (x <= y)`
+  - Example: `If count is not less than or equal to 10` (equivalent to `count > 10`)
+
+**Note:** The parser uses longest-match precedence to distinguish compound negations from simple inequality:
+- `x is not greater than or equal to 5` → matches the compound operator `is not greater than or equal to`
+- `x is not 5` → matches the simple inequality operator `is not`
+
+#### Range and Membership Operators
+
+**Canon Mode:**
+- `is within` - Check if a value falls within a range or period (type-polymorphic)
+  - **Numeric Ranges:** `x is within (lower, upper)` or `x is within range from lower to upper`
+    - Behavior: Returns `true` if `lower <= x <= upper` (inclusive bounds)
+    - Type requirement: All operands must be numeric (Integer or Float)
+    - Example: `If age is within (18, 65)`
+    - Example: `If score is within range from 0 to 100`
+  - **Date/Time Ranges:** `date is within date_range` or `date is within (start_date, end_date)`
+    - Behavior: Returns `true` if `start_date <= date <= end_date` (inclusive bounds)
+    - Type requirement: All operands must be Date, DateTime, or TimeStamp types
+    - Example: `If event_time is within (start_date, end_date)`
+    - Example: `If last_activity is within date_range` (where `date_range` is a record with `start` and `end` Date fields)
+  - **Time Periods:** `timestamp is within period`
+    - Behavior: Checks if timestamp falls within a defined period (record with start/end or predefined period)
+    - Example: `If login_time is within business_hours`
+- `is not within` - Negated range check: `NOT (x is within range)`
+  - Example: `If age is not within (18, 100)` (equivalent to `age < 18 or age > 100`)
+
+**Examples:**
+```runa
+Note: Date range checking
+Let active_users be Filter users where last_activity is within date_range
+
+Note: Numeric range checking
+Let valid_ages be Filter ages where age is within (18, 100)
+
+Note: Time period checking
+Let recent_events be Filter events where event_time is within (start_date, end_date)
+
+Note: Negated range check
+Let outliers be Filter scores where score is not within (0, 100)
+```
+
+**Developer Mode:**
+- No symbolic equivalent for `is within` (use explicit comparisons: `lower <= x && x <= upper`)
+
+#### Equality Operators
+
+**Canon Mode:**
+- `is equal to` / `is` / `does equal` - Value equality comparison (all forms are equivalent)
+  - `is` is a natural, concise alias for `is equal to` when used for equality
+  - `does equal` provides alternative phrasing for natural language variety
+  - All perform **value equality** checks (not identity/reference equality)
+  - Examples: 
+    - `If name is "Admin"` or `If name is equal to "Admin"` or `If name does equal "Admin"`
+    - `If day is "Monday"` or `If day is equal to "Monday"` or `If day does equal "Monday"`
+- `is not equal to` / `is not` / `does not equal` - Value inequality comparison (all forms are equivalent)
+  - Examples: 
+    - `If x is not 5` or `If x is not equal to 5` or `If x does not equal 5`
 
 **Developer Mode:**
 - `==` - Symbol for equality comparison
+- `!=` - Symbol for inequality comparison
 - Example: `If name == "Admin"` or `If day == "Monday"`
 
 #### Identity and Type Operators
-The `is` keyword is reserved exclusively for identity, type, and state checks. It does **not** perform general value equality comparisons.
+The `is` keyword serves multiple purposes in Runa. The parser disambiguates based on context using longest-match precedence:
+1. **Identity/State checks** (longer patterns match first): `is None`, `is empty`, `is of type TypeName`, `is in collection`
+2. **Value equality** (when not part of a longer pattern): `is "value"`, `is 5`, `is true`
 
 **Identity Checks:**
 - `is None` - Check if a value is the null reference
@@ -4221,18 +4603,25 @@ Debug Commands:
 
 ```runa
 Note: Platform-specific code
-When running on "windows":
-    Let path_separator be "\\"
-    Let executable_extension be ".exe"
-    Let library_extension be ".dll"
-When running on "unix":
-    Let path_separator be "/"
-    Let executable_extension be ""
-    Let library_extension be ".so"
-When running on "macos":
-    Let path_separator be "/"
-    Let executable_extension be ""
-    Let library_extension be ".dylib"
+When running_on():
+    is "windows":
+        Let path_separator be "\\"
+        Let executable_extension be ".exe"
+        Let library_extension be ".dll"
+    is "unix":
+        Let path_separator be "/"
+        Let executable_extension be ""
+        Let library_extension be ".so"
+    is "macos":
+        Let path_separator be "/"
+        Let executable_extension be ""
+        Let library_extension be ".dylib"
+    Otherwise:
+        Note: Default to Unix-like paths
+        Let path_separator be "/"
+        Let executable_extension be ""
+        Let library_extension be ".so"
+End When
 
 Note: Environment variables
 Let home_directory be environment variable "HOME"

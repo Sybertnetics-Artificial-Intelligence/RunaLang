@@ -1,0 +1,808 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+MongoDB Query Parser
+
+Parses MongoDB queries, updates, and aggregation pipelines into an Abstract Syntax Tree (AST).
+
+Supports:
+- Query documents: {field: value, $operator: {...}}
+- Update documents: {$set: {...}, $inc: {...}, $push: {...}}
+- Aggregation pipelines: [{$match: {...}}, {$group: {...}}, {$project: {...}}]
+- Arrays and nested documents
+- BSON types (ObjectId, ISODate, NumberLong, etc.)
+
+AST Node Types:
+- MONGO_DOCUMENT - Root document or sub-document
+- MONGO_ARRAY - Array value
+- MONGO_FIELD - Field with value
+- MONGO_OPERATOR - Operator expression ($eq, $set, etc.)
+- MONGO_VALUE - Literal value (string, number, boolean, null)
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/mongodb/mongodb_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: AST Node Type Constants
+Note: ============================================================================
+
+Constant MONGO_DOCUMENT as Integer is 200
+Constant MONGO_ARRAY as Integer is 201
+Constant MONGO_FIELD as Integer is 202
+Constant MONGO_OPERATOR as Integer is 203
+Constant MONGO_VALUE as Integer is 204
+Constant MONGO_QUERY_OPERATION as Integer is 205
+Constant MONGO_UPDATE_OPERATION as Integer is 206
+Constant MONGO_INSERT_OPERATION as Integer is 207
+Constant MONGO_DELETE_OPERATION as Integer is 208
+Constant MONGO_AGGREGATE_OPERATION as Integer is 209
+Constant MONGO_PIPELINE_STAGE as Integer is 210
+Constant MONGO_QUERY_OPERATOR as Integer is 211
+Constant MONGO_UPDATE_OPERATOR as Integer is 212
+
+Note: ============================================================================
+Note: Parser State Structure
+Note: ============================================================================
+
+Type called "Parser":
+    lexer as Integer
+    current_token as Integer
+    error_message as Integer
+End Type
+
+Note: ============================================================================
+Note: AST Node Structure
+Note: ============================================================================
+
+Type called "ASTNode":
+    node_type as Integer
+    name as Integer
+    value as Integer
+    children as Integer
+    child_count as Integer
+    metadata as Integer
+End Type
+
+Note: ============================================================================
+Note: Parser Creation
+Note: ============================================================================
+
+Process called "create_parser" takes source as Integer returns Integer:
+    Note: Create a new parser for MongoDB query source
+
+    Let lexer be proc create_lexer from Lexer with source
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser_size be 24  Note: Parser: 3 fields × 8 bytes
+    Let parser be proc allocate from Layout with parser_size
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 0, lexer
+    proc memory_set_int64 from Layout with parser, 8, 0  Note: current_token
+    proc memory_set_int64 from Layout with parser, 16, 0  Note: error_message
+
+    Note: Get first token
+    Let first_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, first_token
+
+    Return parser
+End Process
+
+Note: ============================================================================
+Note: Token Management
+Note: ============================================================================
+
+Process called "current_token_type" takes parser as Integer returns Integer:
+    Note: Get current token type
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+    Return token_type
+End Process
+
+Process called "advance_token" takes parser as Integer returns Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let next_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, next_token
+
+    Return 1
+End Process
+
+Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Check if current token matches expected type
+
+    Let current_type be proc current_token_type from parser
+
+    If current_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
+    Note: Expect a specific token type
+
+    Let is_match be proc check_token_type from parser, expected_type
+
+    If is_match is equal to 0:
+        proc memory_set_int64 from Layout with parser, 16, error_msg
+        Return 0
+    End If
+
+    proc advance_token from parser
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: AST Node Creation
+Note: ============================================================================
+
+Process called "create_ast_node" takes node_type as Integer returns Integer:
+    Note: Create a new AST node
+
+    Let node_size be 48  Note: ASTNode: 6 fields × 8 bytes
+    Let node be proc allocate from Layout with node_size
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 0, node_type
+    proc memory_set_int64 from Layout with node, 8, 0   Note: name
+    proc memory_set_int64 from Layout with node, 16, 0  Note: value
+    proc memory_set_int64 from Layout with node, 24, 0  Note: children
+    proc memory_set_int64 from Layout with node, 32, 0  Note: child_count
+    proc memory_set_int64 from Layout with node, 40, 0  Note: metadata
+
+    Return node
+End Process
+
+Process called "add_child" takes parent as Integer, child as Integer returns Integer:
+    Note: Add child node to parent
+
+    Let child_count be proc memory_get_int64 from Layout with parent, 32
+    Let children be proc memory_get_int64 from Layout with parent, 24
+
+    Note: Allocate or resize children array
+    If children is equal to 0:
+        Let children_size be 160  Note: Initial capacity: 20 children × 8 bytes
+        Set children to proc allocate from Layout with children_size
+        proc memory_set_int64 from Layout with parent, 24, children
+    End If
+
+    Note: Add child
+    proc memory_set_int64 from Layout with children, child_count times 8, child
+
+    Set child_count to child_count plus 1
+    proc memory_set_int64 from Layout with parent, 32, child_count
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Document Parsing
+Note: ============================================================================
+
+Process called "parse_mongodb" takes source as Integer returns Integer:
+    Note: Parse MongoDB operation or query document
+
+    Let parser be proc create_parser from source
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if this is an operation call (identifier followed by operation)
+    Let token_type be proc current_token_type from parser
+
+    If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+        Note: Get operation name to determine which parser to use
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let op_name_ptr be proc memory_get_int64 from Layout with token, 8
+        Let op_name_len be proc memory_get_int64 from Layout with token, 16
+
+        Note: Check for "find" or "findOne"
+        If op_name_len is equal to 4:
+            Let f1 be proc memory_get_byte from Layout with op_name_ptr, 0
+            Let f2 be proc memory_get_byte from Layout with op_name_ptr, 1
+            Let f3 be proc memory_get_byte from Layout with op_name_ptr, 2
+            Let f4 be proc memory_get_byte from Layout with op_name_ptr, 3
+
+            If f1 is equal to 102:  Note: 'f'
+                If f2 is equal to 105:  Note: 'i'
+                    If f3 is equal to 110:  Note: 'n'
+                        If f4 is equal to 100:  Note: 'd'
+                            Return proc parse_query_operation from parser
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Note: Check for "findOne" (7 chars)
+        If op_name_len is equal to 7:
+            Let result be proc parse_query_operation from parser
+            Return result
+        End If
+
+        Note: Check for "aggregate" (9 chars)
+        If op_name_len is equal to 9:
+            Let result be proc parse_aggregate_operation from parser
+            Return result
+        End If
+
+        Note: Check for "updateOne" (9 chars), "updateMany" (10 chars), "replaceOne" (10 chars)
+        If op_name_len is equal to 9:
+            Let u1 be proc memory_get_byte from Layout with op_name_ptr, 0
+            If u1 is equal to 117:  Note: 'u'
+                Let result be proc parse_update_operation from parser
+                Return result
+            End If
+        End If
+
+        If op_name_len is equal to 10:
+            Let u1 be proc memory_get_byte from Layout with op_name_ptr, 0
+            If u1 is equal to 117:  Note: 'u' (updateMany)
+                Let result be proc parse_update_operation from parser
+                Return result
+            End If
+            If u1 is equal to 114:  Note: 'r' (replaceOne)
+                Let result be proc parse_update_operation from parser
+                Return result
+            End If
+        End If
+
+        Note: Check for "insertOne" (9 chars), "insertMany" (10 chars)
+        If op_name_len is equal to 9:
+            Let i1 be proc memory_get_byte from Layout with op_name_ptr, 0
+            If i1 is equal to 105:  Note: 'i'
+                Let result be proc parse_insert_operation from parser
+                Return result
+            End If
+        End If
+
+        If op_name_len is equal to 10:
+            Let i1 be proc memory_get_byte from Layout with op_name_ptr, 0
+            If i1 is equal to 105:  Note: 'i' (insertMany)
+                Let result be proc parse_insert_operation from parser
+                Return result
+            End If
+        End If
+
+        Note: Check for "deleteOne" (9 chars), "deleteMany" (10 chars)
+        If op_name_len is equal to 9:
+            Let d1 be proc memory_get_byte from Layout with op_name_ptr, 0
+            If d1 is equal to 100:  Note: 'd'
+                Let result be proc parse_delete_operation from parser
+                Return result
+            End If
+        End If
+
+        If op_name_len is equal to 10:
+            Let d1 be proc memory_get_byte from Layout with op_name_ptr, 0
+            If d1 is equal to 100:  Note: 'd' (deleteMany)
+                Let result be proc parse_delete_operation from parser
+                Return result
+            End If
+        End If
+    End If
+
+    Note: Not an operation - parse as document/value
+    Let document be proc parse_value from parser
+
+    Return document
+End Process
+
+Process called "parse_value" takes parser as Integer returns Integer:
+    Note: Parse any MongoDB value (document, array, literal)
+
+    Let token_type be proc current_token_type from parser
+
+    Note: Document {
+    If token_type is equal to 10:  Note: TOKEN_LBRACE
+        Return proc parse_document from parser
+    End If
+
+    Note: Array [
+    If token_type is equal to 12:  Note: TOKEN_LBRACKET
+        Return proc parse_array from parser
+    End If
+
+    Note: String
+    If token_type is equal to 2:  Note: TOKEN_STRING
+        Return proc parse_string_value from parser
+    End If
+
+    Note: Number
+    If token_type is equal to 3:  Note: TOKEN_NUMBER
+        Return proc parse_number_value from parser
+    End If
+
+    Note: Boolean
+    If token_type is equal to 4:  Note: TOKEN_BOOLEAN
+        Return proc parse_boolean_value from parser
+    End If
+
+    Note: Null
+    If token_type is equal to 5:  Note: TOKEN_NULL
+        Return proc parse_null_value from parser
+    End If
+
+    Note: BSON constructors (ObjectId, ISODate, etc.)
+    If token_type is equal to 30:  Note: TOKEN_OBJECTID
+        Return proc parse_bson_constructor from parser
+    End If
+
+    If token_type is equal to 31:  Note: TOKEN_ISODATE
+        Return proc parse_bson_constructor from parser
+    End If
+
+    If token_type is equal to 32:  Note: TOKEN_NUMBERLONG
+        Return proc parse_bson_constructor from parser
+    End If
+
+    Return 0
+End Process
+
+Process called "parse_document" takes parser as Integer returns Integer:
+    Note: Parse document: { field: value, ... }
+
+    Let document be proc create_ast_node from MONGO_DOCUMENT
+
+    proc expect_token from parser, 10, "Expected '{'"  Note: TOKEN_LBRACE
+
+    Note: Parse fields
+    While 1 is equal to 1:
+        Let token_type be proc current_token_type from parser
+
+        If token_type is equal to 11:  Note: TOKEN_RBRACE
+            Break
+        End If
+
+        Let field be proc parse_field from parser
+
+        If field is not equal to 0:
+            proc add_child from document, field
+        End If
+
+        Note: Optional comma
+        Set token_type to proc current_token_type from parser
+        If token_type is equal to 15:  Note: TOKEN_COMMA
+            proc advance_token from parser
+        End If
+    End While
+
+    proc expect_token from parser, 11, "Expected '}'"  Note: TOKEN_RBRACE
+
+    Return document
+End Process
+
+Process called "parse_field" takes parser as Integer returns Integer:
+    Note: Parse field: name: value or $operator: value
+
+    Let field be proc create_ast_node from MONGO_FIELD
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+
+    Note: Check for operator ($-prefixed)
+    If token_type is equal to 20:  Note: TOKEN_OPERATOR
+        Set field be proc create_ast_node from MONGO_OPERATOR
+
+        Let name_ptr be proc memory_get_int64 from Layout with token, 8
+        Let name_len be proc memory_get_int64 from Layout with token, 16
+        Let name be proc create_string_from_bytes from StringCore with name_ptr, name_len
+        proc memory_set_int64 from Layout with field, 8, name
+
+        proc advance_token from parser
+    Otherwise:
+        Note: Regular field name (identifier or string)
+        Let name_ptr be proc memory_get_int64 from Layout with token, 8
+        Let name_len be proc memory_get_int64 from Layout with token, 16
+        Let name be proc create_string_from_bytes from StringCore with name_ptr, name_len
+        proc memory_set_int64 from Layout with field, 8, name
+
+        proc advance_token from parser
+    End If
+
+    proc expect_token from parser, 14, "Expected ':'"  Note: TOKEN_COLON
+
+    Note: Parse field value
+    Let value be proc parse_value from parser
+
+    If value is not equal to 0:
+        proc add_child from field, value
+    End If
+
+    Return field
+End Process
+
+Process called "parse_array" takes parser as Integer returns Integer:
+    Note: Parse array: [ value, ... ]
+
+    Let array be proc create_ast_node from MONGO_ARRAY
+
+    proc expect_token from parser, 12, "Expected '['"  Note: TOKEN_LBRACKET
+
+    Note: Parse array elements
+    While 1 is equal to 1:
+        Let token_type be proc current_token_type from parser
+
+        If token_type is equal to 13:  Note: TOKEN_RBRACKET
+            Break
+        End If
+
+        Let value be proc parse_value from parser
+
+        If value is not equal to 0:
+            proc add_child from array, value
+        End If
+
+        Note: Optional comma
+        Set token_type to proc current_token_type from parser
+        If token_type is equal to 15:  Note: TOKEN_COMMA
+            proc advance_token from parser
+        End If
+    End While
+
+    proc expect_token from parser, 13, "Expected ']'"  Note: TOKEN_RBRACKET
+
+    Return array
+End Process
+
+Note: ============================================================================
+Note: Literal Value Parsing
+Note: ============================================================================
+
+Process called "parse_string_value" takes parser as Integer returns Integer:
+    Note: Parse string literal
+
+    Let value_node be proc create_ast_node from MONGO_VALUE
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let value_ptr be proc memory_get_int64 from Layout with token, 8
+    Let value_len be proc memory_get_int64 from Layout with token, 16
+    Let value be proc create_string_from_bytes from StringCore with value_ptr, value_len
+    proc memory_set_int64 from Layout with value_node, 16, value
+
+    proc advance_token from parser
+
+    Return value_node
+End Process
+
+Process called "parse_number_value" takes parser as Integer returns Integer:
+    Note: Parse number literal
+
+    Let value_node be proc create_ast_node from MONGO_VALUE
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let value_ptr be proc memory_get_int64 from Layout with token, 8
+    Let value_len be proc memory_get_int64 from Layout with token, 16
+    Let value be proc create_string_from_bytes from StringCore with value_ptr, value_len
+    proc memory_set_int64 from Layout with value_node, 16, value
+
+    proc advance_token from parser
+
+    Return value_node
+End Process
+
+Process called "parse_boolean_value" takes parser as Integer returns Integer:
+    Note: Parse boolean literal
+
+    Let value_node be proc create_ast_node from MONGO_VALUE
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let value_ptr be proc memory_get_int64 from Layout with token, 8
+    Let value_len be proc memory_get_int64 from Layout with token, 16
+    Let value be proc create_string_from_bytes from StringCore with value_ptr, value_len
+    proc memory_set_int64 from Layout with value_node, 16, value
+
+    proc advance_token from parser
+
+    Return value_node
+End Process
+
+Process called "parse_null_value" takes parser as Integer returns Integer:
+    Note: Parse null literal
+
+    Let value_node be proc create_ast_node from MONGO_VALUE
+
+    Let null_str be proc create_string from StringCore with "null"
+    proc memory_set_int64 from Layout with value_node, 16, null_str
+
+    proc advance_token from parser
+
+    Return value_node
+End Process
+
+Process called "parse_bson_constructor" takes parser as Integer returns Integer:
+    Note: Parse BSON constructor: ObjectId("..."), ISODate("..."), etc.
+
+    Let value_node be proc create_ast_node from MONGO_VALUE
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let constructor_ptr be proc memory_get_int64 from Layout with token, 8
+    Let constructor_len be proc memory_get_int64 from Layout with token, 16
+    Let constructor_name be proc create_string_from_bytes from StringCore with constructor_ptr, constructor_len
+    proc memory_set_int64 from Layout with value_node, 8, constructor_name
+
+    proc advance_token from parser
+
+    Note: Parse constructor argument (usually in parentheses with string)
+    Let token_type be proc current_token_type from parser
+    If token_type is equal to 32:  Note: TOKEN_LPAREN (if lexer supported it)
+        proc advance_token from parser
+        Let arg be proc parse_value from parser
+        proc add_child from value_node, arg
+        Note: Skip closing paren
+        proc advance_token from parser
+    End If
+
+    Return value_node
+End Process
+
+Process called "create_string_from_bytes" takes bytes as Integer, length as Integer returns Integer:
+    Note: Create string from byte range
+
+    Let str be proc allocate from Layout with length plus 1
+
+    If str is equal to 0:
+        Return 0
+    End If
+
+    proc memory_copy from Layout with str, 0, bytes, 0, length
+    proc memory_set_byte from Layout with str, length, 0  Note: Null terminator
+
+    Return str
+End Process
+
+Note: ============================================================================
+Note: MongoDB Operation Parsing
+Note: ============================================================================
+
+Process called "parse_query_operation" takes parser as Integer returns Integer:
+    Note: Parse find() or findOne() operation
+    Note: Syntax: db.collection.find(query, projection) or db.collection.findOne(query, projection)
+
+    Let operation_node be proc create_ast_node from MONGO_QUERY_OPERATION
+
+    Note: Get operation name (find or findOne)
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let op_name_ptr be proc memory_get_int64 from Layout with token, 8
+    Let op_name_len be proc memory_get_int64 from Layout with token, 16
+    Let op_name be proc create_string_from_bytes from StringCore with op_name_ptr, op_name_len
+    proc memory_set_int64 from Layout with operation_node, 8, op_name
+
+    proc advance_token from parser
+
+    Note: Expect opening parenthesis (TOKEN_LBRACE used for function call)
+    Let token_type be proc current_token_type from parser
+
+    If token_type is equal to TOKEN_LBRACE from Lexer:
+        proc advance_token from parser
+
+        Note: Parse query document (first argument)
+        Let query_doc be proc parse_document from parser
+        proc add_child from operation_node, query_doc
+
+        Note: Check for projection (second argument)
+        Let comma_check be proc current_token_type from parser
+
+        If comma_check is equal to TOKEN_COMMA from Lexer:
+            proc advance_token from parser
+            Let projection_doc be proc parse_document from parser
+            proc add_child from operation_node, projection_doc
+        End If
+
+        Note: Expect closing brace
+        Let close_check be proc current_token_type from parser
+
+        If close_check is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token from parser
+        End If
+    End If
+
+    Return operation_node
+End Process
+
+Process called "parse_aggregate_operation" takes parser as Integer returns Integer:
+    Note: Parse aggregate() operation
+    Note: Syntax: db.collection.aggregate([{$match: ...}, {$group: ...}, ...])
+
+    Let operation_node be proc create_ast_node from MONGO_AGGREGATE_OPERATION
+
+    Note: Store operation name
+    Let agg_name be proc create_string from StringCore with "aggregate"
+    proc memory_set_int64 from Layout with operation_node, 8, agg_name
+
+    proc advance_token from parser
+
+    Note: Expect opening brace for function call
+    Let token_type be proc current_token_type from parser
+
+    If token_type is equal to TOKEN_LBRACE from Lexer:
+        proc advance_token from parser
+
+        Note: Parse pipeline array
+        Let pipeline_array be proc parse_array from parser
+        proc add_child from operation_node, pipeline_array
+
+        Note: Expect closing brace
+        Let close_check be proc current_token_type from parser
+
+        If close_check is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token from parser
+        End If
+    End If
+
+    Return operation_node
+End Process
+
+Process called "parse_update_operation" takes parser as Integer returns Integer:
+    Note: Parse updateOne(), updateMany(), or replaceOne() operation
+    Note: Syntax: db.collection.updateOne(filter, update, options)
+
+    Let operation_node be proc create_ast_node from MONGO_UPDATE_OPERATION
+
+    Note: Get operation name (updateOne, updateMany, replaceOne)
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let op_name_ptr be proc memory_get_int64 from Layout with token, 8
+    Let op_name_len be proc memory_get_int64 from Layout with token, 16
+    Let op_name be proc create_string_from_bytes from StringCore with op_name_ptr, op_name_len
+    proc memory_set_int64 from Layout with operation_node, 8, op_name
+
+    proc advance_token from parser
+
+    Note: Expect opening brace for function call
+    Let token_type be proc current_token_type from parser
+
+    If token_type is equal to TOKEN_LBRACE from Lexer:
+        proc advance_token from parser
+
+        Note: Parse filter document (first argument)
+        Let filter_doc be proc parse_document from parser
+        proc add_child from operation_node, filter_doc
+
+        Note: Expect comma before update document
+        Let comma_check be proc current_token_type from parser
+
+        If comma_check is equal to TOKEN_COMMA from Lexer:
+            proc advance_token from parser
+
+            Note: Parse update document (second argument)
+            Let update_doc be proc parse_document from parser
+            proc add_child from operation_node, update_doc
+
+            Note: Check for options (third argument, optional)
+            Let comma_check2 be proc current_token_type from parser
+
+            If comma_check2 is equal to TOKEN_COMMA from Lexer:
+                proc advance_token from parser
+                Let options_doc be proc parse_document from parser
+                proc add_child from operation_node, options_doc
+            End If
+        End If
+
+        Note: Expect closing brace
+        Let close_check be proc current_token_type from parser
+
+        If close_check is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token from parser
+        End If
+    End If
+
+    Return operation_node
+End Process
+
+Process called "parse_insert_operation" takes parser as Integer returns Integer:
+    Note: Parse insertOne() or insertMany() operation
+    Note: Syntax: db.collection.insertOne(document) or db.collection.insertMany([documents])
+
+    Let operation_node be proc create_ast_node from MONGO_INSERT_OPERATION
+
+    Note: Get operation name (insertOne, insertMany)
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let op_name_ptr be proc memory_get_int64 from Layout with token, 8
+    Let op_name_len be proc memory_get_int64 from Layout with token, 16
+    Let op_name be proc create_string_from_bytes from StringCore with op_name_ptr, op_name_len
+    proc memory_set_int64 from Layout with operation_node, 8, op_name
+
+    proc advance_token from parser
+
+    Note: Expect opening brace for function call
+    Let token_type be proc current_token_type from parser
+
+    If token_type is equal to TOKEN_LBRACE from Lexer:
+        proc advance_token from parser
+
+        Note: Parse document or array of documents
+        Let next_type be proc current_token_type from parser
+
+        If next_type is equal to TOKEN_LBRACKET from Lexer:
+            Note: insertMany - array of documents
+            Let docs_array be proc parse_array from parser
+            proc add_child from operation_node, docs_array
+        Otherwise:
+            Note: insertOne - single document
+            Let doc be proc parse_document from parser
+            proc add_child from operation_node, doc
+        End If
+
+        Note: Expect closing brace
+        Let close_check be proc current_token_type from parser
+
+        If close_check is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token from parser
+        End If
+    End If
+
+    Return operation_node
+End Process
+
+Process called "parse_delete_operation" takes parser as Integer returns Integer:
+    Note: Parse deleteOne() or deleteMany() operation
+    Note: Syntax: db.collection.deleteOne(filter) or db.collection.deleteMany(filter)
+
+    Let operation_node be proc create_ast_node from MONGO_DELETE_OPERATION
+
+    Note: Get operation name (deleteOne, deleteMany)
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let op_name_ptr be proc memory_get_int64 from Layout with token, 8
+    Let op_name_len be proc memory_get_int64 from Layout with token, 16
+    Let op_name be proc create_string_from_bytes from StringCore with op_name_ptr, op_name_len
+    proc memory_set_int64 from Layout with operation_node, 8, op_name
+
+    proc advance_token from parser
+
+    Note: Expect opening brace for function call
+    Let token_type be proc current_token_type from parser
+
+    If token_type is equal to TOKEN_LBRACE from Lexer:
+        proc advance_token from parser
+
+        Note: Parse filter document (first argument)
+        Let filter_doc be proc parse_document from parser
+        proc add_child from operation_node, filter_doc
+
+        Note: Expect closing brace
+        Let close_check be proc current_token_type from parser
+
+        If close_check is equal to TOKEN_RBRACE from Lexer:
+            proc advance_token from parser
+        End If
+    End If
+
+    Return operation_node
+End Process
+
+Note: End of MongoDB Query Parser

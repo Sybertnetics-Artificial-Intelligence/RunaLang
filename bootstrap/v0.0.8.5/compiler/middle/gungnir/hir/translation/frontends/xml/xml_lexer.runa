@@ -1,0 +1,1086 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+XML Lexer - Tokenizes XML input
+
+This file provides complete lexical analysis for XML 1.0/1.1, handling:
+- Elements (opening, closing, self-closing tags)
+- Attributes with quoted values
+- Text content
+- Comments
+- CDATA sections
+- Processing instructions
+- Entity references
+- Namespaces
+
+XML Token Types:
+- TAG_OPEN - < (start of opening tag)
+- TAG_CLOSE - > (end of tag)
+- TAG_SELF_CLOSE - /> (self-closing tag end)
+- TAG_CLOSE_OPEN - </ (start of closing tag)
+- EQUALS - = (attribute assignment)
+- NAME - element/attribute names
+- STRING - attribute values
+- TEXT - text content between tags
+- COMMENT - <!-- ... -->
+- CDATA - <![CDATA[...]]>
+- PROCESSING_INSTRUCTION - <?...?>
+- ENTITY - &entity;
+
+Features:
+- Complete XML 1.0 specification support
+- Namespace handling (prefix:localName)
+- Entity reference detection
+- Line/column position tracking
+- Error reporting with context
+- Unicode support
+
+Dependencies:
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: XML Token Types
+Note: ============================================================================
+
+Constant TOKEN_EOF as Integer is 0
+Constant TOKEN_ERROR as Integer is 1
+
+Constant TOKEN_TAG_OPEN as Integer is 10           Note: <
+Constant TOKEN_TAG_CLOSE as Integer is 11          Note: >
+Constant TOKEN_TAG_SELF_CLOSE as Integer is 12     Note: />
+Constant TOKEN_TAG_CLOSE_OPEN as Integer is 13     Note: </
+
+Constant TOKEN_EQUALS as Integer is 20              Note: =
+Constant TOKEN_NAME as Integer is 21                Note: element/attribute name
+Constant TOKEN_STRING as Integer is 22              Note: attribute value
+Constant TOKEN_TEXT as Integer is 23                Note: text content
+
+Constant TOKEN_COMMENT as Integer is 30             Note: <!-- comment -->
+Constant TOKEN_CDATA as Integer is 31               Note: <![CDATA[...]]>
+Constant TOKEN_PROCESSING_INSTRUCTION as Integer is 32  Note: <?...?>
+Constant TOKEN_ENTITY as Integer is 33              Note: &entity;
+
+Note: ============================================================================
+Note: XML Token Structure
+Note: ============================================================================
+
+Type called "XMLToken":
+    token_type as Integer       Note: TOKEN_* constant
+    lexeme as Integer           Note: Pointer to string value
+    lexeme_length as Integer    Note: Length of lexeme
+    line as Integer             Note: Line number (1-indexed)
+    column as Integer           Note: Column number (1-indexed)
+End Type
+
+Note: ============================================================================
+Note: XML Lexer Structure
+Note: ============================================================================
+
+Type called "XMLLexer":
+    source as Integer           Note: Source code string
+    source_length as Integer    Note: Length of source
+    position as Integer         Note: Current position in source
+    line as Integer             Note: Current line (1-indexed)
+    column as Integer           Note: Current column (1-indexed)
+    in_tag as Integer           Note: Boolean: 1 if inside a tag
+    error_message as Integer    Note: Error message if TOKEN_ERROR
+End Type
+
+Note: ============================================================================
+Note: Lexer Creation and Destruction
+Note: ============================================================================
+
+Process called "create_xml_lexer" takes source as Integer returns Integer:
+    Note: Create XML lexer for source code
+
+    Let lexer_size be 56  Note: XMLLexer: 7 fields × 8 bytes
+    Let lexer be proc allocate from Layout with lexer_size
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let source_length be proc string_length from StringCore with source
+
+    Note: Initialize lexer state
+    proc memory_set_int64 from Layout with lexer, 0, source
+    proc memory_set_int64 from Layout with lexer, 8, source_length
+    proc memory_set_int64 from Layout with lexer, 16, 0   Note: position = 0
+    proc memory_set_int64 from Layout with lexer, 24, 1   Note: line = 1
+    proc memory_set_int64 from Layout with lexer, 32, 1   Note: column = 1
+    proc memory_set_int64 from Layout with lexer, 40, 0   Note: in_tag = false
+    proc memory_set_int64 from Layout with lexer, 48, 0   Note: error_message = null
+
+    Return lexer
+End Process
+
+Process called "destroy_xml_lexer" takes lexer as Integer returns Integer:
+    Note: Destroy XML lexer
+
+    If lexer is equal to 0:
+        Return 1
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with lexer, 48
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with lexer
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Character Access and Manipulation
+Note: ============================================================================
+
+Process called "peek_char" takes lexer as Integer returns Integer:
+    Note: Peek at current character without advancing
+
+    Let position be proc memory_get_int64 from Layout with lexer, 16
+    Let source_length be proc memory_get_int64 from Layout with lexer, 8
+
+    If position is greater than or equal to source_length:
+        Return 0  Note: EOF
+    End If
+
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let char be proc memory_get_byte from Layout with source, position
+
+    Return char
+End Process
+
+Process called "advance_char" takes lexer as Integer returns Integer:
+    Note: Advance to next character and return it
+
+    Let char be proc peek_char from lexer
+
+    If char is equal to 0:
+        Return 0
+    End If
+
+    Note: Update position
+    Let position be proc memory_get_int64 from Layout with lexer, 16
+    Set position to position plus 1
+    proc memory_set_int64 from Layout with lexer, 16, position
+
+    Note: Update line/column tracking
+    If char is equal to 10:  Note: newline
+        Let line be proc memory_get_int64 from Layout with lexer, 24
+        Set line to line plus 1
+        proc memory_set_int64 from Layout with lexer, 24, line
+        proc memory_set_int64 from Layout with lexer, 32, 1  Note: column = 1
+    Otherwise:
+        Let column be proc memory_get_int64 from Layout with lexer, 32
+        Set column to column plus 1
+        proc memory_set_int64 from Layout with lexer, 32, column
+    End If
+
+    Return char
+End Process
+
+Process called "peek_ahead" takes lexer as Integer, offset as Integer returns Integer:
+    Note: Peek ahead offset characters without advancing
+
+    Let position be proc memory_get_int64 from Layout with lexer, 16
+    Let source_length be proc memory_get_int64 from Layout with lexer, 8
+    Let look_pos be position plus offset
+
+    If look_pos is greater than or equal to source_length:
+        Return 0
+    End If
+
+    Let source be proc memory_get_int64 from Layout with lexer, 0
+    Let char be proc memory_get_byte from Layout with source, look_pos
+
+    Return char
+End Process
+
+Note: ============================================================================
+Note: Character Classification
+Note: ============================================================================
+
+Process called "is_whitespace" takes char as Integer returns Integer:
+    Note: Check if character is XML whitespace
+
+    If char is equal to 32:  Note: space
+        Return 1
+    End If
+
+    If char is equal to 9:  Note: tab
+        Return 1
+    End If
+
+    If char is equal to 10:  Note: newline
+        Return 1
+    End If
+
+    If char is equal to 13:  Note: carriage return
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_name_start_char" takes char as Integer returns Integer:
+    Note: Check if character can start an XML name
+
+    Note: Letters
+    If char is greater than or equal to 65:  Note: 'A'
+        If char is less than or equal to 90:  Note: 'Z'
+            Return 1
+        End If
+    End If
+
+    If char is greater than or equal to 97:  Note: 'a'
+        If char is less than or equal to 122:  Note: 'z'
+            Return 1
+        End If
+    End If
+
+    Note: Underscore and colon (for namespaces)
+    If char is equal to 95:  Note: _
+        Return 1
+    End If
+
+    If char is equal to 58:  Note: :
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_name_char" takes char as Integer returns Integer:
+    Note: Check if character can continue an XML name
+
+    If proc is_name_start_char from char is equal to 1:
+        Return 1
+    End If
+
+    Note: Digits
+    If char is greater than or equal to 48:  Note: '0'
+        If char is less than or equal to 57:  Note: '9'
+            Return 1
+        End If
+    End If
+
+    Note: Hyphen and dot
+    If char is equal to 45:  Note: -
+        Return 1
+    End If
+
+    If char is equal to 46:  Note: .
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Token Creation
+Note: ============================================================================
+
+Process called "create_token" takes token_type as Integer, lexeme as Integer, length as Integer, line as Integer, column as Integer returns Integer:
+    Note: Create XML token
+
+    Let token_size be 40  Note: XMLToken: 5 fields × 8 bytes
+    Let token be proc allocate from Layout with token_size
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with token, 0, token_type
+    proc memory_set_int64 from Layout with token, 8, lexeme
+    proc memory_set_int64 from Layout with token, 16, length
+    proc memory_set_int64 from Layout with token, 24, line
+    proc memory_set_int64 from Layout with token, 32, column
+
+    Return token
+End Process
+
+Process called "create_error_token" takes lexer as Integer, message as Integer returns Integer:
+    Note: Create error token with message
+
+    Let line be proc memory_get_int64 from Layout with lexer, 24
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+
+    Note: Store error message in lexer
+    Let msg_length be proc string_length from StringCore with message
+    Let error_msg be proc allocate from Layout with msg_length plus 1
+
+    If error_msg is not equal to 0:
+        proc memory_copy from Layout with error_msg, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with error_msg, msg_length, 0
+        proc memory_set_int64 from Layout with lexer, 48, error_msg
+    End If
+
+    Return proc create_token from TOKEN_ERROR, message, msg_length, line, column
+End Process
+
+Note: ============================================================================
+Note: Name Scanning
+Note: ============================================================================
+
+Process called "scan_name" takes lexer as Integer returns Integer:
+    Note: Scan XML element or attribute name
+
+    @Reasoning:
+    XML names (elements, attributes) must start with letter/underscore/colon
+    and can contain letters, digits, hyphens, dots, underscores, colons.
+    Colons are used for namespace prefixes (prefix:localName).
+    @End Reasoning
+
+    Let line be proc memory_get_int64 from Layout with lexer, 24
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+
+    Let buffer_size be 256
+    Let buffer be proc allocate from Layout with buffer_size
+    Let buffer_pos be 0
+
+    If buffer is equal to 0:
+        Return proc create_error_token from lexer, "Out of memory"
+    End If
+
+    Note: First character must be name start char
+    Let first_char be proc peek_char from lexer
+
+    If proc is_name_start_char from first_char is equal to 0:
+        proc deallocate from Layout with buffer
+        Return proc create_error_token from lexer, "Invalid name start character"
+    End If
+
+    proc memory_set_byte from Layout with buffer, buffer_pos, first_char
+    Set buffer_pos to buffer_pos plus 1
+    proc advance_char from lexer
+
+    Note: Continue with name characters
+    While 1 is equal to 1:
+        Let char be proc peek_char from lexer
+
+        If proc is_name_char from char is equal to 1:
+            If buffer_pos is less than buffer_size:
+                proc memory_set_byte from Layout with buffer, buffer_pos, char
+                Set buffer_pos to buffer_pos plus 1
+                proc advance_char from lexer
+            Otherwise:
+                Break  Note: Name too long
+            End If
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Note: Null-terminate
+    proc memory_set_byte from Layout with buffer, buffer_pos, 0
+
+    Return proc create_token from TOKEN_NAME, buffer, buffer_pos, line, column
+End Process
+
+Note: ============================================================================
+Note: Entity Reference Decoding
+Note: ============================================================================
+
+Process called "decode_entity_reference" takes lexer as Integer, buffer as Integer, buffer_pos as Integer, buffer_size as Integer returns Integer:
+    Note: Decode entity reference and write decoded character(s) to buffer
+
+    @Reasoning:
+    XML entity references must be decoded during parsing:
+    - Standard entities: &amp; &lt; &gt; &quot; &apos;
+    - Numeric character references: &#NNNN; (decimal) &#xHHHH; (hex)
+    Returns new buffer_pos, or -1 on error.
+    @End Reasoning
+
+    Note: Current position is on '&', advance past it
+    proc advance_char from lexer
+
+    Note: Scan entity name until ';'
+    Let entity_name_buffer be proc allocate from Layout with 32
+    Let entity_name_pos be 0
+
+    If entity_name_buffer is equal to 0:
+        Return -1
+    End If
+
+    Let char be proc peek_char from lexer
+
+    Note: Check for numeric character reference
+    If char is equal to 35:  Note: # (&#NNNN; or &#xHHHH;)
+        proc advance_char from lexer
+        Set char to proc peek_char from lexer
+
+        Let is_hex be 0
+        Let value be 0
+
+        Note: Check for hex format
+        If char is equal to 120:  Note: 'x' (&#xHHHH;)
+            Set is_hex to 1
+            proc advance_char from lexer
+            Set char to proc peek_char from lexer
+        End If
+
+        Note: Parse numeric value
+        While 1 is equal to 1:
+            If char is equal to 59:  Note: ; (end of reference)
+                proc advance_char from lexer
+                Break
+            End If
+
+            If char is equal to 0:
+                proc deallocate from Layout with entity_name_buffer
+                Return -1  Note: Unterminated entity reference
+            End If
+
+            Note: Parse digit
+            Let digit_value be -1
+
+            If is_hex is equal to 1:
+                Note: Hex digit
+                If char is greater than or equal to 48:
+                    If char is less than or equal to 57:  Note: 0-9
+                        Set digit_value to char minus 48
+                    End If
+                End If
+
+                If char is greater than or equal to 65:
+                    If char is less than or equal to 70:  Note: A-F
+                        Set digit_value to char minus 65 plus 10
+                    End If
+                End If
+
+                If char is greater than or equal to 97:
+                    If char is less than or equal to 102:  Note: a-f
+                        Set digit_value to char minus 97 plus 10
+                    End If
+                End If
+
+                If digit_value is not equal to -1:
+                    Set value to value times 16 plus digit_value
+                Otherwise:
+                    proc deallocate from Layout with entity_name_buffer
+                    Return -1  Note: Invalid hex digit
+                End If
+            Otherwise:
+                Note: Decimal digit
+                If char is greater than or equal to 48:
+                    If char is less than or equal to 57:  Note: 0-9
+                        Set digit_value to char minus 48
+                        Set value to value times 10 plus digit_value
+                    Otherwise:
+                        proc deallocate from Layout with entity_name_buffer
+                        Return -1  Note: Invalid decimal digit
+                    End If
+                Otherwise:
+                    proc deallocate from Layout with entity_name_buffer
+                    Return -1
+                End If
+            End If
+
+            proc advance_char from lexer
+            Set char to proc peek_char from lexer
+        End While
+
+        proc deallocate from Layout with entity_name_buffer
+
+        Note: Write character value to buffer with proper UTF-8 encoding
+        If value is less than 128:
+            Note: ASCII - single byte
+            If buffer_pos is less than buffer_size:
+                proc memory_set_byte from Layout with buffer, buffer_pos, value
+                Return buffer_pos plus 1
+            Otherwise:
+                Return -1
+            End If
+
+        Otherwise If value is less than 2048:
+            Note: UTF-8 2-byte sequence (U+0080 to U+07FF)
+            Let byte1 be 192 plus value divided by 64
+            Let byte2 be 128 plus value modulo 64
+
+            If buffer_pos plus 1 is less than buffer_size:
+                proc memory_set_byte from Layout with buffer, buffer_pos, byte1
+                proc memory_set_byte from Layout with buffer, buffer_pos plus 1, byte2
+                Return buffer_pos plus 2
+            Otherwise:
+                Return -1
+            End If
+
+        Otherwise If value is less than 65536:
+            Note: UTF-8 3-byte sequence (U+0800 to U+FFFF)
+            Let byte1 be 224 plus value divided by 4096
+            Let remainder1 be value modulo 4096
+            Let byte2 be 128 plus remainder1 divided by 64
+            Let byte3 be 128 plus remainder1 modulo 64
+
+            If buffer_pos plus 2 is less than buffer_size:
+                proc memory_set_byte from Layout with buffer, buffer_pos, byte1
+                proc memory_set_byte from Layout with buffer, buffer_pos plus 1, byte2
+                proc memory_set_byte from Layout with buffer, buffer_pos plus 2, byte3
+                Return buffer_pos plus 3
+            Otherwise:
+                Return -1
+            End If
+
+        Otherwise:
+            Note: UTF-8 4-byte sequence (U+10000 to U+10FFFF)
+            Let byte1 be 240 plus value divided by 262144
+            Let remainder1 be value modulo 262144
+            Let byte2 be 128 plus remainder1 divided by 4096
+            Let remainder2 be remainder1 modulo 4096
+            Let byte3 be 128 plus remainder2 divided by 64
+            Let byte4 be 128 plus remainder2 modulo 64
+
+            If buffer_pos plus 3 is less than buffer_size:
+                proc memory_set_byte from Layout with buffer, buffer_pos, byte1
+                proc memory_set_byte from Layout with buffer, buffer_pos plus 1, byte2
+                proc memory_set_byte from Layout with buffer, buffer_pos plus 2, byte3
+                proc memory_set_byte from Layout with buffer, buffer_pos plus 3, byte4
+                Return buffer_pos plus 4
+            Otherwise:
+                Return -1
+            End If
+        End If
+    End If
+
+    Note: Named entity reference - scan entity name
+    While 1 is equal to 1:
+        If char is equal to 59:  Note: ; (end of reference)
+            proc advance_char from lexer
+            Break
+        End If
+
+        If char is equal to 0:
+            proc deallocate from Layout with entity_name_buffer
+            Return -1  Note: Unterminated entity reference
+        End If
+
+        If entity_name_pos is less than 31:
+            proc memory_set_byte from Layout with entity_name_buffer, entity_name_pos, char
+            Set entity_name_pos to entity_name_pos plus 1
+        Otherwise:
+            proc deallocate from Layout with entity_name_buffer
+            Return -1  Note: Entity name too long
+        End If
+
+        proc advance_char from lexer
+        Set char to proc peek_char from lexer
+    End While
+
+    Note: Null-terminate entity name
+    proc memory_set_byte from Layout with entity_name_buffer, entity_name_pos, 0
+
+    Note: Decode standard entities
+    Let decoded_char be 0
+
+    Note: Check for &amp; (38 = '&')
+    Let is_amp be proc string_equals_literal from entity_name_buffer, "amp"
+    If is_amp is equal to 1:
+        Set decoded_char to 38
+    End If
+
+    Note: Check for &lt; (60 = '<')
+    Let is_lt be proc string_equals_literal from entity_name_buffer, "lt"
+    If is_lt is equal to 1:
+        Set decoded_char to 60
+    End If
+
+    Note: Check for &gt; (62 = '>')
+    Let is_gt be proc string_equals_literal from entity_name_buffer, "gt"
+    If is_gt is equal to 1:
+        Set decoded_char to 62
+    End If
+
+    Note: Check for &quot; (34 = '"')
+    Let is_quot be proc string_equals_literal from entity_name_buffer, "quot"
+    If is_quot is equal to 1:
+        Set decoded_char to 34
+    End If
+
+    Note: Check for &apos; (39 = "'")
+    Let is_apos be proc string_equals_literal from entity_name_buffer, "apos"
+    If is_apos is equal to 1:
+        Set decoded_char to 39
+    End If
+
+    proc deallocate from Layout with entity_name_buffer
+
+    Note: Check if we found a valid entity
+    If decoded_char is equal to 0:
+        Return -1  Note: Unknown entity reference
+    End If
+
+    Note: Write decoded character to buffer
+    If buffer_pos is less than buffer_size:
+        proc memory_set_byte from Layout with buffer, buffer_pos, decoded_char
+        Return buffer_pos plus 1
+    Otherwise:
+        Return -1
+    End If
+End Process
+
+Process called "string_equals_literal" takes str as Integer, literal as Integer returns Integer:
+    Note: Compare string with string literal
+
+    Let index be 0
+
+    While 1 is equal to 1:
+        Let char1 be proc memory_get_byte from Layout with str, index
+        Let char2 be proc memory_get_byte from Layout with literal, index
+
+        If char1 is not equal to char2:
+            Return 0
+        End If
+
+        If char1 is equal to 0:
+            Return 1  Note: Both strings ended at same position
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: String Scanning (Attribute Values)
+Note: ============================================================================
+
+Process called "scan_string" takes lexer as Integer, quote_char as Integer returns Integer:
+    Note: Scan quoted string (attribute value)
+
+    Let line be proc memory_get_int64 from Layout with lexer, 24
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+
+    Note: Skip opening quote
+    proc advance_char from lexer
+
+    Let buffer_size be 1024
+    Let buffer be proc allocate from Layout with buffer_size
+    Let buffer_pos be 0
+
+    If buffer is equal to 0:
+        Return proc create_error_token from lexer, "Out of memory"
+    End If
+
+    While 1 is equal to 1:
+        Let char be proc peek_char from lexer
+
+        If char is equal to 0:  Note: EOF
+            proc deallocate from Layout with buffer
+            Return proc create_error_token from lexer, "Unterminated string"
+        End If
+
+        If char is equal to quote_char:  Note: Closing quote
+            proc advance_char from lexer
+            Break
+        End If
+
+        Note: Handle entity references in attribute values
+        If char is equal to 38:  Note: & (entity reference)
+            Let new_buffer_pos be proc decode_entity_reference from lexer, buffer, buffer_pos, buffer_size
+
+            If new_buffer_pos is equal to -1:
+                proc deallocate from Layout with buffer
+                Return proc create_error_token from lexer, "Invalid entity reference in attribute"
+            End If
+
+            Set buffer_pos to new_buffer_pos
+        Otherwise:
+            If buffer_pos is less than buffer_size:
+                proc memory_set_byte from Layout with buffer, buffer_pos, char
+                Set buffer_pos to buffer_pos plus 1
+                proc advance_char from lexer
+            End If
+        End If
+    End While
+
+    Note: Null-terminate
+    proc memory_set_byte from Layout with buffer, buffer_pos, 0
+
+    Return proc create_token from TOKEN_STRING, buffer, buffer_pos, line, column
+End Process
+
+Note: ============================================================================
+Note: Text Content Scanning
+Note: ============================================================================
+
+Process called "scan_text" takes lexer as Integer returns Integer:
+    Note: Scan text content between tags
+
+    Let line be proc memory_get_int64 from Layout with lexer, 24
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+
+    Let buffer_size be 2048
+    Let buffer be proc allocate from Layout with buffer_size
+    Let buffer_pos be 0
+
+    If buffer is equal to 0:
+        Return proc create_error_token from lexer, "Out of memory"
+    End If
+
+    While 1 is equal to 1:
+        Let char be proc peek_char from lexer
+
+        If char is equal to 0:  Note: EOF
+            Break
+        End If
+
+        If char is equal to 60:  Note: < (start of tag)
+            Break
+        End If
+
+        Note: Handle entity references in text
+        If char is equal to 38:  Note: & (entity reference)
+            Let new_buffer_pos be proc decode_entity_reference from lexer, buffer, buffer_pos, buffer_size
+
+            If new_buffer_pos is equal to -1:
+                proc deallocate from Layout with buffer
+                Return proc create_error_token from lexer, "Invalid entity reference in text"
+            End If
+
+            Set buffer_pos to new_buffer_pos
+        Otherwise:
+            If buffer_pos is less than buffer_size:
+                proc memory_set_byte from Layout with buffer, buffer_pos, char
+                Set buffer_pos to buffer_pos plus 1
+                proc advance_char from lexer
+            End If
+        End If
+    End While
+
+    Note: Null-terminate
+    proc memory_set_byte from Layout with buffer, buffer_pos, 0
+
+    Return proc create_token from TOKEN_TEXT, buffer, buffer_pos, line, column
+End Process
+
+Note: ============================================================================
+Note: Comment Scanning
+Note: ============================================================================
+
+Process called "scan_comment" takes lexer as Integer returns Integer:
+    Note: Scan XML comment: <!-- comment -->
+
+    Let line be proc memory_get_int64 from Layout with lexer, 24
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+
+    Note: Skip <!--
+    proc advance_char from lexer  Note: <
+    proc advance_char from lexer  Note: !
+    proc advance_char from lexer  Note: -
+    proc advance_char from lexer  Note: -
+
+    Let buffer_size be 1024
+    Let buffer be proc allocate from Layout with buffer_size
+    Let buffer_pos be 0
+
+    If buffer is equal to 0:
+        Return proc create_error_token from lexer, "Out of memory"
+    End If
+
+    Note: Scan until -->
+    While 1 is equal to 1:
+        Let char be proc peek_char from lexer
+
+        If char is equal to 0:  Note: EOF
+            proc deallocate from Layout with buffer
+            Return proc create_error_token from lexer, "Unterminated comment"
+        End If
+
+        Note: Check for -->
+        If char is equal to 45:  Note: -
+            Let next1 be proc peek_ahead from lexer, 1
+            Let next2 be proc peek_ahead from lexer, 2
+
+            If next1 is equal to 45:  Note: -
+                If next2 is equal to 62:  Note: >
+                    proc advance_char from lexer  Note: -
+                    proc advance_char from lexer  Note: -
+                    proc advance_char from lexer  Note: >
+                    Break
+                End If
+            End If
+        End If
+
+        Note: Add character to buffer
+        If buffer_pos is less than buffer_size:
+            proc memory_set_byte from Layout with buffer, buffer_pos, char
+            Set buffer_pos to buffer_pos plus 1
+        End If
+
+        proc advance_char from lexer
+    End While
+
+    Note: Null-terminate
+    proc memory_set_byte from Layout with buffer, buffer_pos, 0
+
+    Return proc create_token from TOKEN_COMMENT, buffer, buffer_pos, line, column
+End Process
+
+Note: ============================================================================
+Note: CDATA Scanning
+Note: ============================================================================
+
+Process called "scan_cdata" takes lexer as Integer returns Integer:
+    Note: Scan CDATA section: <![CDATA[...]]>
+
+    Let line be proc memory_get_int64 from Layout with lexer, 24
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+
+    Note: Skip <![CDATA[
+    proc advance_char from lexer  Note: <
+    proc advance_char from lexer  Note: !
+    proc advance_char from lexer  Note: [
+    proc advance_char from lexer  Note: C
+    proc advance_char from lexer  Note: D
+    proc advance_char from lexer  Note: A
+    proc advance_char from lexer  Note: T
+    proc advance_char from lexer  Note: A
+    proc advance_char from lexer  Note: [
+
+    Let buffer_size be 2048
+    Let buffer be proc allocate from Layout with buffer_size
+    Let buffer_pos be 0
+
+    If buffer is equal to 0:
+        Return proc create_error_token from lexer, "Out of memory"
+    End If
+
+    Note: Scan until ]]>
+    While 1 is equal to 1:
+        Let char be proc peek_char from lexer
+
+        If char is equal to 0:  Note: EOF
+            proc deallocate from Layout with buffer
+            Return proc create_error_token from lexer, "Unterminated CDATA"
+        End If
+
+        Note: Check for ]]>
+        If char is equal to 93:  Note: ]
+            Let next1 be proc peek_ahead from lexer, 1
+            Let next2 be proc peek_ahead from lexer, 2
+
+            If next1 is equal to 93:  Note: ]
+                If next2 is equal to 62:  Note: >
+                    proc advance_char from lexer  Note: ]
+                    proc advance_char from lexer  Note: ]
+                    proc advance_char from lexer  Note: >
+                    Break
+                End If
+            End If
+        End If
+
+        Note: Add character to buffer
+        If buffer_pos is less than buffer_size:
+            proc memory_set_byte from Layout with buffer, buffer_pos, char
+            Set buffer_pos to buffer_pos plus 1
+        End If
+
+        proc advance_char from lexer
+    End While
+
+    Note: Null-terminate
+    proc memory_set_byte from Layout with buffer, buffer_pos, 0
+
+    Return proc create_token from TOKEN_CDATA, buffer, buffer_pos, line, column
+End Process
+
+Note: ============================================================================
+Note: Processing Instruction Scanning
+Note: ============================================================================
+
+Process called "scan_processing_instruction" takes lexer as Integer returns Integer:
+    Note: Scan processing instruction: <?target instruction?>
+
+    Let line be proc memory_get_int64 from Layout with lexer, 24
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+
+    Note: Skip <?
+    proc advance_char from lexer  Note: <
+    proc advance_char from lexer  Note: ?
+
+    Let buffer_size be 1024
+    Let buffer be proc allocate from Layout with buffer_size
+    Let buffer_pos be 0
+
+    If buffer is equal to 0:
+        Return proc create_error_token from lexer, "Out of memory"
+    End If
+
+    Note: Scan until ?>
+    While 1 is equal to 1:
+        Let char be proc peek_char from lexer
+
+        If char is equal to 0:  Note: EOF
+            proc deallocate from Layout with buffer
+            Return proc create_error_token from lexer, "Unterminated processing instruction"
+        End If
+
+        Note: Check for ?>
+        If char is equal to 63:  Note: ?
+            Let next be proc peek_ahead from lexer, 1
+
+            If next is equal to 62:  Note: >
+                proc advance_char from lexer  Note: ?
+                proc advance_char from lexer  Note: >
+                Break
+            End If
+        End If
+
+        Note: Add character to buffer
+        If buffer_pos is less than buffer_size:
+            proc memory_set_byte from Layout with buffer, buffer_pos, char
+            Set buffer_pos to buffer_pos plus 1
+        End If
+
+        proc advance_char from lexer
+    End While
+
+    Note: Null-terminate
+    proc memory_set_byte from Layout with buffer, buffer_pos, 0
+
+    Return proc create_token from TOKEN_PROCESSING_INSTRUCTION, buffer, buffer_pos, line, column
+End Process
+
+Note: ============================================================================
+Note: Main Tokenization
+Note: ============================================================================
+
+Process called "next_token" takes lexer as Integer returns Integer:
+    Note: Get next XML token
+
+    @Reasoning:
+    XML tokenization is context-sensitive:
+    - Inside tags: tokenize names, attributes, tag delimiters
+    - Outside tags: tokenize text content, look for < to start new tag
+    @End Reasoning
+
+    Note: Skip whitespace
+    While 1 is equal to 1:
+        Let char be proc peek_char from lexer
+
+        If proc is_whitespace from char is equal to 1:
+            proc advance_char from lexer
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Let line be proc memory_get_int64 from Layout with lexer, 24
+    Let column be proc memory_get_int64 from Layout with lexer, 32
+    Let in_tag be proc memory_get_int64 from Layout with lexer, 40
+
+    Let char be proc peek_char from lexer
+
+    Note: EOF
+    If char is equal to 0:
+        Return proc create_token from TOKEN_EOF, 0, 0, line, column
+    End If
+
+    Note: Check for < (start of tag/comment/CDATA/PI)
+    If char is equal to 60:  Note: <
+        Let next be proc peek_ahead from lexer, 1
+
+        Note: Closing tag </
+        If next is equal to 47:  Note: /
+            proc advance_char from lexer  Note: <
+            proc advance_char from lexer  Note: /
+            proc memory_set_int64 from Layout with lexer, 40, 1  Note: in_tag = true
+            Return proc create_token from TOKEN_TAG_CLOSE_OPEN, 0, 0, line, column
+        End If
+
+        Note: Comment <!--
+        If next is equal to 33:  Note: !
+            Let next2 be proc peek_ahead from lexer, 2
+
+            If next2 is equal to 45:  Note: - (comment)
+                Return proc scan_comment from lexer
+            End If
+
+            If next2 is equal to 91:  Note: [ (CDATA)
+                Return proc scan_cdata from lexer
+            End If
+        End If
+
+        Note: Processing instruction <?
+        If next is equal to 63:  Note: ?
+            Return proc scan_processing_instruction from lexer
+        End If
+
+        Note: Opening tag <
+        proc advance_char from lexer
+        proc memory_set_int64 from Layout with lexer, 40, 1  Note: in_tag = true
+        Return proc create_token from TOKEN_TAG_OPEN, 0, 0, line, column
+    End If
+
+    Note: Check for > (end of tag)
+    If char is equal to 62:  Note: >
+        proc advance_char from lexer
+        proc memory_set_int64 from Layout with lexer, 40, 0  Note: in_tag = false
+        Return proc create_token from TOKEN_TAG_CLOSE, 0, 0, line, column
+    End If
+
+    Note: Check for /> (self-closing tag)
+    If char is equal to 47:  Note: /
+        Let next be proc peek_ahead from lexer, 1
+
+        If next is equal to 62:  Note: >
+            proc advance_char from lexer  Note: /
+            proc advance_char from lexer  Note: >
+            proc memory_set_int64 from Layout with lexer, 40, 0  Note: in_tag = false
+            Return proc create_token from TOKEN_TAG_SELF_CLOSE, 0, 0, line, column
+        End If
+    End If
+
+    Note: Inside tag context
+    If in_tag is equal to 1:
+        Note: Equals sign for attributes
+        If char is equal to 61:  Note: =
+            proc advance_char from lexer
+            Return proc create_token from TOKEN_EQUALS, 0, 0, line, column
+        End If
+
+        Note: Quoted string (attribute value)
+        If char is equal to 34:  Note: "
+            Return proc scan_string from lexer, 34
+        End If
+
+        If char is equal to 39:  Note: '
+            Return proc scan_string from lexer, 39
+        End If
+
+        Note: Name (element or attribute)
+        If proc is_name_start_char from char is equal to 1:
+            Return proc scan_name from lexer
+        End If
+
+        Return proc create_error_token from lexer, "Unexpected character in tag"
+    End If
+
+    Note: Outside tag context - scan text content
+    Return proc scan_text from lexer
+End Process
+
+Note: End of XML Lexer

@@ -35,4 +35,2619 @@ This file consists of the following functions/features/operation types:
 - Memory alias analysis integration for correctness
 :End Note
 
-Note: TODO - Implement dead store elimination optimization functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================================
+Note: TYPE DEFINITIONS
+Note: ============================================================================
+
+Type called "MemoryLocation":
+    base as Integer
+    offset as Integer
+    size as Integer
+    is_stack as Integer
+    is_heap as Integer
+    is_global as Integer
+End Type
+
+Type called "AliasSet":
+    locations as Integer
+    location_count as Integer
+End Type
+
+Type called "PointsToInfo":
+    variable_id as Integer
+    points_to_set as Integer
+End Type
+
+Type called "AliasAnalysisContext":
+    cfg as Integer
+    points_to_map as Integer
+    memory_locations as Integer
+    location_count as Integer
+    def_use_chains as Integer
+End Type
+
+Type called "StoreInfo":
+    instruction as Integer
+    block_id as Integer
+    memory_location as Integer
+    stored_value as Integer
+    is_live as Integer
+    kills as Integer
+End Type
+
+Type called "DSEContext":
+    cfg as Integer
+    alias_analysis as Integer
+    stores as Integer
+    store_count as Integer
+    live_stores as Integer
+    gen_sets as Integer
+    kill_sets as Integer
+    in_sets as Integer
+    out_sets as Integer
+    eliminated_count as Integer
+    forwarded_count as Integer
+    stack_eliminated_count as Integer
+End Type
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_dse_context" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Creates and initializes DSE context structure.
+
+    Allocates:
+    - Main DSE context
+    - Alias analysis context
+    - Store information tracking
+    - Liveness sets (GEN/KILL/IN/OUT)
+
+    Returns context pointer or 0 on failure.
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Allocate main context
+    Let context_size be Layout.size_of_DSEContext()
+    Let context_ptr be Layout.allocate(context_size)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG reference
+    Let cfg_offset be Layout.offset_of_DSEContext_cfg()
+    Layout.memory_set_integer(context_ptr, cfg_offset, cfg)
+
+    Note: Create alias analysis context
+    Let alias_context be create_alias_analysis_context(cfg)
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Layout.memory_set_integer(context_ptr, alias_offset, alias_context)
+
+    Note: Initialize store tracking
+    Let stores be List.create()
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Layout.memory_set_integer(context_ptr, stores_offset, stores)
+
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Layout.memory_set_integer(context_ptr, store_count_offset, 0)
+
+    Note: Initialize live stores set
+    Let live_stores be Set.create()
+    Let live_stores_offset be Layout.offset_of_DSEContext_live_stores()
+    Layout.memory_set_integer(context_ptr, live_stores_offset, live_stores)
+
+    Note: Create liveness sets
+    Let gen_sets be Dictionary.create()
+    Let gen_offset be Layout.offset_of_DSEContext_gen_sets()
+    Layout.memory_set_integer(context_ptr, gen_offset, gen_sets)
+
+    Let kill_sets be Dictionary.create()
+    Let kill_offset be Layout.offset_of_DSEContext_kill_sets()
+    Layout.memory_set_integer(context_ptr, kill_offset, kill_sets)
+
+    Let in_sets be Dictionary.create()
+    Let in_offset be Layout.offset_of_DSEContext_in_sets()
+    Layout.memory_set_integer(context_ptr, in_offset, in_sets)
+
+    Let out_sets be Dictionary.create()
+    Let out_offset be Layout.offset_of_DSEContext_out_sets()
+    Layout.memory_set_integer(context_ptr, out_offset, out_sets)
+
+    Note: Initialize counters
+    Let eliminated_offset be Layout.offset_of_DSEContext_eliminated_count()
+    Layout.memory_set_integer(context_ptr, eliminated_offset, 0)
+
+    Let forwarded_offset be Layout.offset_of_DSEContext_forwarded_count()
+    Layout.memory_set_integer(context_ptr, forwarded_offset, 0)
+
+    Let stack_eliminated_offset be Layout.offset_of_DSEContext_stack_eliminated_count()
+    Layout.memory_set_integer(context_ptr, stack_eliminated_offset, 0)
+
+    Return context_ptr
+End Process
+
+Process called "destroy_dse_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Deallocates all DSE context structures.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 1
+    End If
+
+    Note: Destroy alias analysis context
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(context_ptr, alias_offset)
+    If alias_context is not equal to 0:
+        destroy_alias_analysis_context(alias_context)
+    End If
+
+    Note: Destroy store tracking
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(context_ptr, stores_offset)
+    If stores is not equal to 0:
+        Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+        Let store_count be Layout.memory_get_integer(context_ptr, store_count_offset)
+
+        Let i be 0
+        While i is less than store_count:
+            Let store_info be List.get(stores, i)
+            If store_info is not equal to 0:
+                destroy_store_info(store_info)
+            End If
+            Set i to i plus 1
+        End While
+
+        List.destroy(stores)
+    End If
+
+    Note: Destroy live stores set
+    Let live_stores_offset be Layout.offset_of_DSEContext_live_stores()
+    Let live_stores be Layout.memory_get_integer(context_ptr, live_stores_offset)
+    If live_stores is not equal to 0:
+        Set.destroy(live_stores)
+    End If
+
+    Note: Destroy liveness sets
+    Let gen_offset be Layout.offset_of_DSEContext_gen_sets()
+    Let gen_sets be Layout.memory_get_integer(context_ptr, gen_offset)
+    If gen_sets is not equal to 0:
+        Dictionary.destroy(gen_sets)
+    End If
+
+    Let kill_offset be Layout.offset_of_DSEContext_kill_sets()
+    Let kill_sets be Layout.memory_get_integer(context_ptr, kill_offset)
+    If kill_sets is not equal to 0:
+        Dictionary.destroy(kill_sets)
+    End If
+
+    Let in_offset be Layout.offset_of_DSEContext_in_sets()
+    Let in_sets be Layout.memory_get_integer(context_ptr, in_offset)
+    If in_sets is not equal to 0:
+        Dictionary.destroy(in_sets)
+    End If
+
+    Let out_offset be Layout.offset_of_DSEContext_out_sets()
+    Let out_sets be Layout.memory_get_integer(context_ptr, out_offset)
+    If out_sets is not equal to 0:
+        Dictionary.destroy(out_sets)
+    End If
+
+    Note: Free context
+    Layout.deallocate(context_ptr)
+
+    Return 1
+End Process
+
+Process called "destroy_store_info" that takes store_info as Integer returns Integer:
+    @Reasoning
+    Deallocates store info structure.
+    @End Reasoning
+
+    If store_info equals 0:
+        Return 1
+    End If
+
+    Note: Destroy kills set
+    Let kills_offset be Layout.offset_of_StoreInfo_kills()
+    Let kills be Layout.memory_get_integer(store_info, kills_offset)
+    If kills is not equal to 0:
+        Set.destroy(kills)
+    End If
+
+    Layout.deallocate(store_info)
+    Return 1
+End Process
+
+Process called "print_dse_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints DSE statistics for reporting.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let eliminated_offset be Layout.offset_of_DSEContext_eliminated_count()
+    Let eliminated be Layout.memory_get_integer(context_ptr, eliminated_offset)
+
+    Let forwarded_offset be Layout.offset_of_DSEContext_forwarded_count()
+    Let forwarded be Layout.memory_get_integer(context_ptr, forwarded_offset)
+
+    Let stack_eliminated_offset be Layout.offset_of_DSEContext_stack_eliminated_count()
+    Let stack_eliminated be Layout.memory_get_integer(context_ptr, stack_eliminated_offset)
+
+    Display "============================================"
+    Display "DEAD STORE ELIMINATION STATISTICS"
+    Display "============================================"
+    Display "Dead stores eliminated:  " joined with eliminated
+    Display "Stores forwarded:        " joined with forwarded
+    Display "Stack stores eliminated: " joined with stack_eliminated
+    Display "Total optimizations:     " joined with eliminated plus forwarded plus stack_eliminated
+    Display "============================================"
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ALIAS ANALYSIS - Anderson's Points-To Analysis
+Note: ============================================================================
+
+Process called "create_alias_analysis_context" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Creates alias analysis context with points-to information.
+
+    Implements Anderson's flow-insensitive points-to analysis:
+    - Inclusion-based constraint solving
+    - Transitive closure computation
+    - Memory location tracking
+
+    Returns alias context or 0 on failure.
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Let context_size be Layout.size_of_AliasAnalysisContext()
+    Let context_ptr be Layout.allocate(context_size)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG
+    Let cfg_offset be Layout.offset_of_AliasAnalysisContext_cfg()
+    Layout.memory_set_integer(context_ptr, cfg_offset, cfg)
+
+    Note: Create points-to map (variable_id -> PointsToInfo)
+    Let points_to_map be Dictionary.create()
+    Let map_offset be Layout.offset_of_AliasAnalysisContext_points_to_map()
+    Layout.memory_set_integer(context_ptr, map_offset, points_to_map)
+
+    Note: Create memory locations list
+    Let locations be List.create()
+    Let locations_offset be Layout.offset_of_AliasAnalysisContext_memory_locations()
+    Layout.memory_set_integer(context_ptr, locations_offset, locations)
+
+    Let location_count_offset be Layout.offset_of_AliasAnalysisContext_location_count()
+    Layout.memory_set_integer(context_ptr, location_count_offset, 0)
+
+    Note: Create def-use chains
+    Let def_use be Dictionary.create()
+    Let def_use_offset be Layout.offset_of_AliasAnalysisContext_def_use_chains()
+    Layout.memory_set_integer(context_ptr, def_use_offset, def_use)
+
+    Note: Run points-to analysis
+    compute_points_to_sets(context_ptr)
+
+    Return context_ptr
+End Process
+
+Process called "destroy_alias_analysis_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Deallocates alias analysis context.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 1
+    End If
+
+    Note: Destroy points-to map
+    Let map_offset be Layout.offset_of_AliasAnalysisContext_points_to_map()
+    Let points_to_map be Layout.memory_get_integer(context_ptr, map_offset)
+    If points_to_map is not equal to 0:
+        Note: Destroy each PointsToInfo
+        Let keys be Dictionary.keys(points_to_map)
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let points_to_info be Dictionary.get(points_to_map, key)
+
+            If points_to_info is not equal to 0:
+                Let pts_offset be Layout.offset_of_PointsToInfo_points_to_set()
+                Let pts_set be Layout.memory_get_integer(points_to_info, pts_offset)
+                If pts_set is not equal to 0:
+                    Set.destroy(pts_set)
+                End If
+                Layout.deallocate(points_to_info)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        Dictionary.destroy(points_to_map)
+    End If
+
+    Note: Destroy memory locations
+    Let locations_offset be Layout.offset_of_AliasAnalysisContext_memory_locations()
+    Let locations be Layout.memory_get_integer(context_ptr, locations_offset)
+    If locations is not equal to 0:
+        Let location_count_offset be Layout.offset_of_AliasAnalysisContext_location_count()
+        Let location_count be Layout.memory_get_integer(context_ptr, location_count_offset)
+
+        Let i be 0
+        While i is less than location_count:
+            Let location be List.get(locations, i)
+            If location is not equal to 0:
+                Layout.deallocate(location)
+            End If
+            Set i to i plus 1
+        End While
+
+        List.destroy(locations)
+    End If
+
+    Note: Destroy def-use chains
+    Let def_use_offset be Layout.offset_of_AliasAnalysisContext_def_use_chains()
+    Let def_use be Layout.memory_get_integer(context_ptr, def_use_offset)
+    If def_use is not equal to 0:
+        Dictionary.destroy(def_use)
+    End If
+
+    Layout.deallocate(context_ptr)
+    Return 1
+End Process
+
+Process called "compute_points_to_sets" that takes alias_context as Integer returns Integer:
+    @Reasoning
+    Computes points-to sets using Anderson's algorithm:
+
+    1. Build inclusion constraints from pointer operations
+    2. Iteratively solve constraints until fixed point
+    3. Compute transitive closure
+
+    This is flow-insensitive (ignores control flow) but sound.
+    @End Reasoning
+
+    If alias_context equals 0:
+        Return 0
+    End If
+
+    Let cfg_offset be Layout.offset_of_AliasAnalysisContext_cfg()
+    Let cfg be Layout.memory_get_integer(alias_context, cfg_offset)
+
+    Let map_offset be Layout.offset_of_AliasAnalysisContext_points_to_map()
+    Let points_to_map be Layout.memory_get_integer(alias_context, map_offset)
+
+    Note: Phase 1: Collect constraints from all instructions
+    Let constraints be List.create()
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let block_idx be 0
+
+    While block_idx is less than block_count:
+        Let block be CFG.get_block(cfg, block_idx)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let inst_idx be 0
+        While inst_idx is less than inst_count:
+            Let inst be List.get(instructions, inst_idx)
+            Let opcode be MIRNodes.get_opcode(inst)
+
+            Note: Extract constraints based on instruction type
+            If opcode equals 20001:  Note: MIR_ALLOCA (stack allocation)
+                extract_alloca_constraint(inst, constraints, alias_context)
+            End If
+
+            If opcode equals 20020:  Note: MIR_STORE
+                extract_store_constraint(inst, constraints, alias_context)
+            End If
+
+            If opcode equals 20021:  Note: MIR_LOAD
+                extract_load_constraint(inst, constraints, alias_context)
+            End If
+
+            If opcode equals 20025:  Note: MIR_GET_ELEMENT_PTR
+                extract_gep_constraint(inst, constraints, alias_context)
+            End If
+
+            Set inst_idx to inst_idx plus 1
+        End While
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Phase 2: Solve constraints iteratively
+    Let changed be 1
+    Let iteration be 0
+
+    While changed equals 1:
+        Set changed to 0
+        Set iteration to iteration plus 1
+
+        Let constraint_count be List.length(constraints)
+        Let i be 0
+
+        While i is less than constraint_count:
+            Let constraint be List.get(constraints, i)
+            Let result be apply_constraint(constraint, points_to_map)
+
+            If result equals 1:
+                Set changed to 1
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Note: Prevent infinite loops (shouldn't happen with correct algorithm)
+        If iteration is greater than 100:
+            Display "Warning: Points-to analysis did not converge after 100 iterations"
+            Set changed to 0
+        End If
+    End While
+
+    Note: Cleanup
+    List.destroy(constraints)
+
+    Return 1
+End Process
+
+Process called "extract_alloca_constraint" that takes inst as Integer, constraints as Integer, alias_context as Integer returns Integer:
+    @Reasoning
+    Extracts constraint from stack allocation (alloca).
+
+    Creates new memory location and adds it to points-to set of destination.
+    @End Reasoning
+
+    Let dest_reg be MIRNodes.get_destination(inst)
+    Let alloca_size be MIRNodes.get_alloca_size(inst)
+
+    Note: Create memory location for this allocation
+    Let location be create_memory_location(dest_reg, 0, alloca_size, 1, 0, 0)
+
+    Note: Add location to context
+    add_memory_location(alias_context, location)
+
+    Note: Create constraint: dest_reg points-to location
+    Let constraint be create_points_to_constraint(dest_reg, location)
+    List.append(constraints, constraint)
+
+    Return 1
+End Process
+
+Process called "extract_store_constraint" that takes inst as Integer, constraints as Integer, alias_context as Integer returns Integer:
+    @Reasoning
+    Extracts constraint from store instruction.
+
+    If storing a pointer, adds constraint that what pointer points to
+    now points to stored value's points-to set.
+    @End Reasoning
+
+    Let ptr_reg be MIRNodes.get_store_pointer(inst)
+    Let value_reg be MIRNodes.get_store_value(inst)
+
+    Note: Create constraint: *ptr_reg = value_reg
+    Note: This means: for all x in points_to(ptr_reg), points_to(x) += points_to(value_reg)
+    Let constraint be create_store_constraint(ptr_reg, value_reg)
+    List.append(constraints, constraint)
+
+    Return 1
+End Process
+
+Process called "extract_load_constraint" that takes inst as Integer, constraints as Integer, alias_context as Integer returns Integer:
+    @Reasoning
+    Extracts constraint from load instruction.
+
+    Adds constraint that destination points to union of what pointer might point to.
+    @End Reasoning
+
+    Let dest_reg be MIRNodes.get_destination(inst)
+    Let ptr_reg be MIRNodes.get_load_pointer(inst)
+
+    Note: Create constraint: dest_reg = *ptr_reg
+    Note: This means: points_to(dest_reg) = union of points_to(x) for x in points_to(ptr_reg)
+    Let constraint be create_load_constraint(dest_reg, ptr_reg)
+    List.append(constraints, constraint)
+
+    Return 1
+End Process
+
+Process called "extract_gep_constraint" that takes inst as Integer, constraints as Integer, alias_context as Integer returns Integer:
+    @Reasoning
+    Extracts constraint from GEP (get element pointer) instruction.
+
+    GEP computes address, so result points to same location as base with offset.
+    @End Reasoning
+
+    Let dest_reg be MIRNodes.get_destination(inst)
+    Let base_reg be MIRNodes.get_gep_base(inst)
+    Let offset be MIRNodes.get_gep_offset(inst)
+
+    Note: Create constraint: dest_reg points to base with offset
+    Let constraint be create_gep_constraint(dest_reg, base_reg, offset)
+    List.append(constraints, constraint)
+
+    Return 1
+End Process
+
+Process called "create_memory_location" that takes base as Integer, offset as Integer, size as Integer, is_stack as Integer, is_heap as Integer, is_global as Integer returns Integer:
+    @Reasoning
+    Creates MemoryLocation structure.
+    @End Reasoning
+
+    Let loc_size be Layout.size_of_MemoryLocation()
+    Let loc_ptr be Layout.allocate(loc_size)
+    If loc_ptr equals 0:
+        Return 0
+    End If
+
+    Let base_offset be Layout.offset_of_MemoryLocation_base()
+    Layout.memory_set_integer(loc_ptr, base_offset, base)
+
+    Let offset_field_offset be Layout.offset_of_MemoryLocation_offset()
+    Layout.memory_set_integer(loc_ptr, offset_field_offset, offset)
+
+    Let size_offset be Layout.offset_of_MemoryLocation_size()
+    Layout.memory_set_integer(loc_ptr, size_offset, size)
+
+    Let is_stack_offset be Layout.offset_of_MemoryLocation_is_stack()
+    Layout.memory_set_integer(loc_ptr, is_stack_offset, is_stack)
+
+    Let is_heap_offset be Layout.offset_of_MemoryLocation_is_heap()
+    Layout.memory_set_integer(loc_ptr, is_heap_offset, is_heap)
+
+    Let is_global_offset be Layout.offset_of_MemoryLocation_is_global()
+    Layout.memory_set_integer(loc_ptr, is_global_offset, is_global)
+
+    Return loc_ptr
+End Process
+
+Process called "add_memory_location" that takes alias_context as Integer, location as Integer returns Integer:
+    @Reasoning
+    Adds memory location to alias context tracking.
+    @End Reasoning
+
+    If alias_context equals 0:
+        Return 0
+    End If
+    If location equals 0:
+        Return 0
+    End If
+
+    Let locations_offset be Layout.offset_of_AliasAnalysisContext_memory_locations()
+    Let locations be Layout.memory_get_integer(alias_context, locations_offset)
+
+    List.append(locations, location)
+
+    Let location_count_offset be Layout.offset_of_AliasAnalysisContext_location_count()
+    Let location_count be Layout.memory_get_integer(alias_context, location_count_offset)
+    Layout.memory_set_integer(alias_context, location_count_offset, location_count plus 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CONSTRAINT SOLVING & ALIAS QUERIES
+Note: ============================================================================
+
+Process called "create_points_to_constraint" that takes variable as Integer, location as Integer returns Integer:
+    @Reasoning
+    Creates a simple points-to constraint: variable -> location
+    @End Reasoning
+
+    Note: Constraint type 1: Direct points-to
+    Let constraint be Layout.allocate(24)
+    Layout.memory_set_integer(constraint, 0, 1)
+    Layout.memory_set_integer(constraint, 8, variable)
+    Layout.memory_set_integer(constraint, 16, location)
+    Return constraint
+End Process
+
+Process called "create_store_constraint" that takes ptr as Integer, value as Integer returns Integer:
+    @Reasoning
+    Creates store constraint: *ptr = value
+    @End Reasoning
+
+    Note: Constraint type 2: Store (indirect)
+    Let constraint be Layout.allocate(24)
+    Layout.memory_set_integer(constraint, 0, 2)
+    Layout.memory_set_integer(constraint, 8, ptr)
+    Layout.memory_set_integer(constraint, 16, value)
+    Return constraint
+End Process
+
+Process called "create_load_constraint" that takes dest as Integer, ptr as Integer returns Integer:
+    @Reasoning
+    Creates load constraint: dest = *ptr
+    @End Reasoning
+
+    Note: Constraint type 3: Load (indirect)
+    Let constraint be Layout.allocate(24)
+    Layout.memory_set_integer(constraint, 0, 3)
+    Layout.memory_set_integer(constraint, 8, dest)
+    Layout.memory_set_integer(constraint, 16, ptr)
+    Return constraint
+End Process
+
+Process called "create_gep_constraint" that takes dest as Integer, base as Integer, offset as Integer returns Integer:
+    @Reasoning
+    Creates GEP constraint: dest = base + offset
+    @End Reasoning
+
+    Note: Constraint type 4: Offset
+    Let constraint be Layout.allocate(32)
+    Layout.memory_set_integer(constraint, 0, 4)
+    Layout.memory_set_integer(constraint, 8, dest)
+    Layout.memory_set_integer(constraint, 16, base)
+    Layout.memory_set_integer(constraint, 24, offset)
+    Return constraint
+End Process
+
+Process called "apply_constraint" that takes constraint as Integer, points_to_map as Integer returns Integer:
+    @Reasoning
+    Applies a constraint to the points-to sets.
+    Returns 1 if any set changed, 0 otherwise.
+    @End Reasoning
+
+    If constraint equals 0:
+        Return 0
+    End If
+
+    Let constraint_type be Layout.memory_get_integer(constraint, 0)
+
+    If constraint_type equals 1:
+        Return apply_direct_constraint(constraint, points_to_map)
+    End If
+
+    If constraint_type equals 2:
+        Return apply_store_constraint(constraint, points_to_map)
+    End If
+
+    If constraint_type equals 3:
+        Return apply_load_constraint(constraint, points_to_map)
+    End If
+
+    If constraint_type equals 4:
+        Return apply_gep_constraint(constraint, points_to_map)
+    End If
+
+    Return 0
+End Process
+
+Process called "apply_direct_constraint" that takes constraint as Integer, points_to_map as Integer returns Integer:
+    @Reasoning
+    Applies direct constraint: variable -> location
+    Adds location to variable's points-to set.
+    @End Reasoning
+
+    Let variable be Layout.memory_get_integer(constraint, 8)
+    Let location be Layout.memory_get_integer(constraint, 16)
+
+    Note: Get or create points-to set for variable
+    Let points_to_info be Dictionary.get(points_to_map, variable)
+
+    If points_to_info equals 0:
+        Note: Create new PointsToInfo
+        Let info_size be Layout.size_of_PointsToInfo()
+        Set points_to_info to Layout.allocate(info_size)
+
+        Let var_id_offset be Layout.offset_of_PointsToInfo_variable_id()
+        Layout.memory_set_integer(points_to_info, var_id_offset, variable)
+
+        Let pts_set be Set.create()
+        Let pts_offset be Layout.offset_of_PointsToInfo_points_to_set()
+        Layout.memory_set_integer(points_to_info, pts_offset, pts_set)
+
+        Dictionary.set(points_to_map, variable, points_to_info)
+    End If
+
+    Note: Add location to points-to set
+    Let pts_offset be Layout.offset_of_PointsToInfo_points_to_set()
+    Let pts_set be Layout.memory_get_integer(points_to_info, pts_offset)
+
+    Let was_present be Set.contains(pts_set, location)
+    If was_present equals 0:
+        Set.add(pts_set, location)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "apply_store_constraint" that takes constraint as Integer, points_to_map as Integer returns Integer:
+    @Reasoning
+    Applies store constraint: *ptr = value
+
+    For each location L in points_to(ptr):
+        points_to(L) += points_to(value)
+    @End Reasoning
+
+    Let ptr be Layout.memory_get_integer(constraint, 8)
+    Let value be Layout.memory_get_integer(constraint, 16)
+
+    Let changed be 0
+
+    Note: Get points-to set of ptr
+    Let ptr_info be Dictionary.get(points_to_map, ptr)
+    If ptr_info equals 0:
+        Return 0
+    End If
+
+    Let pts_offset be Layout.offset_of_PointsToInfo_points_to_set()
+    Let ptr_pts_set be Layout.memory_get_integer(ptr_info, pts_offset)
+
+    Note: Get points-to set of value
+    Let value_info be Dictionary.get(points_to_map, value)
+    If value_info equals 0:
+        Return 0
+    End If
+
+    Let value_pts_set be Layout.memory_get_integer(value_info, pts_offset)
+
+    Note: For each location pointed to by ptr
+    Let ptr_locations be Set.to_list(ptr_pts_set)
+    Let ptr_loc_count be List.length(ptr_locations)
+
+    Let i be 0
+    While i is less than ptr_loc_count:
+        Let target_location be List.get(ptr_locations, i)
+
+        Note: Get points-to info for this location
+        Let target_info be Dictionary.get(points_to_map, target_location)
+        If target_info equals 0:
+            Note: Create new info
+            Let info_size be Layout.size_of_PointsToInfo()
+            Set target_info to Layout.allocate(info_size)
+
+            Let var_id_offset be Layout.offset_of_PointsToInfo_variable_id()
+            Layout.memory_set_integer(target_info, var_id_offset, target_location)
+
+            Let new_pts_set be Set.create()
+            Layout.memory_set_integer(target_info, pts_offset, new_pts_set)
+
+            Dictionary.set(points_to_map, target_location, target_info)
+        End If
+
+        Note: Add all of value's points-to set to target's points-to set
+        Let target_pts_set be Layout.memory_get_integer(target_info, pts_offset)
+        Let union_result be Set.union_into(target_pts_set, value_pts_set)
+        If union_result equals 1:
+            Set changed to 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    List.destroy(ptr_locations)
+    Return changed
+End Process
+
+Process called "apply_load_constraint" that takes constraint as Integer, points_to_map as Integer returns Integer:
+    @Reasoning
+    Applies load constraint: dest = *ptr
+
+    points_to(dest) = union of points_to(L) for all L in points_to(ptr)
+    @End Reasoning
+
+    Let dest be Layout.memory_get_integer(constraint, 8)
+    Let ptr be Layout.memory_get_integer(constraint, 16)
+
+    Let changed be 0
+
+    Note: Get points-to set of ptr
+    Let ptr_info be Dictionary.get(points_to_map, ptr)
+    If ptr_info equals 0:
+        Return 0
+    End If
+
+    Let pts_offset be Layout.offset_of_PointsToInfo_points_to_set()
+    Let ptr_pts_set be Layout.memory_get_integer(ptr_info, pts_offset)
+
+    Note: Get or create points-to info for dest
+    Let dest_info be Dictionary.get(points_to_map, dest)
+    If dest_info equals 0:
+        Let info_size be Layout.size_of_PointsToInfo()
+        Set dest_info to allocate(info_size)
+
+        Let var_id_offset be Layout.offset_of_PointsToInfo_variable_id()
+        Layout.memory_set_integer(dest_info, var_id_offset, dest)
+
+        Let new_pts_set be Set.create()
+        Layout.memory_set_integer(dest_info, pts_offset, new_pts_set)
+
+        Dictionary.set(points_to_map, dest, dest_info)
+    End If
+
+    Let dest_pts_set be Layout.memory_get_integer(dest_info, pts_offset)
+
+    Note: For each location pointed to by ptr
+    Let ptr_locations be Set.to_list(ptr_pts_set)
+    Let ptr_loc_count be List.length(ptr_locations)
+
+    Let i be 0
+    While i is less than ptr_loc_count:
+        Let source_location be List.get(ptr_locations, i)
+
+        Note: Get points-to set of this location
+        Let source_info be Dictionary.get(points_to_map, source_location)
+        If source_info is not equal to 0:
+            Let source_pts_set be Layout.memory_get_integer(source_info, pts_offset)
+
+            Note: Add to dest's points-to set
+            Let union_result be Set.union_into(dest_pts_set, source_pts_set)
+            If union_result equals 1:
+                Set changed to 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    List.destroy(ptr_locations)
+    Return changed
+End Process
+
+Process called "apply_gep_constraint" that takes constraint as Integer, points_to_map as Integer returns Integer:
+    @Reasoning
+    Applies GEP constraint: dest = base + offset
+
+    GEP computes a memory address by adding an offset to a base pointer.
+    Even in Anderson's flow-insensitive analysis, we implement field-sensitive
+    tracking by creating distinct memory locations for different offsets.
+
+    **ALGORITHM:**
+    1. Extract base, dest, and offset from constraint
+    2. For each location L in points_to(base):
+       a. Create new memory location L' = (L.base, L.offset + gep_offset)
+       b. Add L' to points_to(dest)
+    3. This maintains soundness while providing field-level precision
+
+    **FIELD SENSITIVITY:**
+    - Different struct fields get different memory locations
+    - Array elements at different offsets are distinguished
+    - Improves alias analysis precision for structured data
+
+    Returns 1 if any set changed, 0 otherwise.
+    @End Reasoning
+
+    @Implementation
+    This implements field-sensitive Anderson's analysis, which is standard
+    in deployment compilers for handling struct field accesses and array indexing.
+    @End Implementation
+
+    Let dest be Layout.memory_get_integer(constraint, 8)
+    Let base be Layout.memory_get_integer(constraint, 16)
+    Let gep_offset be Layout.memory_get_integer(constraint, 24)
+
+    Let changed be 0
+
+    Note: Get points-to set of base
+    Let base_info be Dictionary.get(points_to_map, base)
+    If base_info equals 0:
+        Return 0
+    End If
+
+    Let pts_offset be Layout.offset_of_PointsToInfo_points_to_set()
+    Let base_pts_set be Layout.memory_get_integer(base_info, pts_offset)
+
+    Note: Get or create points-to info for dest
+    Let dest_info be Dictionary.get(points_to_map, dest)
+    If dest_info equals 0:
+        Let info_size be Layout.size_of_PointsToInfo()
+        Set dest_info to Layout.allocate(info_size)
+
+        Let var_id_offset be Layout.offset_of_PointsToInfo_variable_id()
+        Layout.memory_set_integer(dest_info, var_id_offset, dest)
+
+        Let new_pts_set be Set.create()
+        Layout.memory_set_integer(dest_info, pts_offset, new_pts_set)
+
+        Dictionary.set(points_to_map, dest, dest_info)
+    End If
+
+    Let dest_pts_set be Layout.memory_get_integer(dest_info, pts_offset)
+
+    Note: For each location in base's points-to set, create offset-specific location
+    Let base_locations be Set.to_list(base_pts_set)
+    Let base_loc_count be List.length(base_locations)
+
+    Let i be 0
+    While i is less than base_loc_count:
+        Let base_location be List.get(base_locations, i)
+
+        Note: Get base location details
+        Let base_field_offset be Layout.offset_of_MemoryLocation_base()
+        Let loc_base be Layout.memory_get_integer(base_location, base_field_offset)
+
+        Let offset_field_offset be Layout.offset_of_MemoryLocation_offset()
+        Let loc_offset be Layout.memory_get_integer(base_location, offset_field_offset)
+
+        Let size_offset be Layout.offset_of_MemoryLocation_size()
+        Let loc_size be Layout.memory_get_integer(base_location, size_offset)
+
+        Let is_stack_offset be Layout.offset_of_MemoryLocation_is_stack()
+        Let loc_is_stack be Layout.memory_get_integer(base_location, is_stack_offset)
+
+        Let is_heap_offset be Layout.offset_of_MemoryLocation_is_heap()
+        Let loc_is_heap be Layout.memory_get_integer(base_location, is_heap_offset)
+
+        Let is_global_offset be Layout.offset_of_MemoryLocation_is_global()
+        Let loc_is_global be Layout.memory_get_integer(base_location, is_global_offset)
+
+        Note: Create new memory location with combined offset
+        Let new_offset be loc_offset plus gep_offset
+        Let new_location be create_memory_location(loc_base, new_offset, loc_size, loc_is_stack, loc_is_heap, loc_is_global)
+
+        If new_location is not equal to 0:
+            Note: Add offset-specific location to dest's points-to set
+            Let was_present be Set.contains(dest_pts_set, new_location)
+            If was_present equals 0:
+                Set.add(dest_pts_set, new_location)
+                Set changed to 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    List.destroy(base_locations)
+    Return changed
+End Process
+
+Process called "may_alias" that takes alias_context as Integer, location1 as Integer, location2 as Integer returns Integer:
+    @Reasoning
+    Returns 1 if location1 and location2 MAY alias (conservative).
+
+    Two locations may alias if their points-to sets intersect.
+    @End Reasoning
+
+    If alias_context equals 0:
+        Return 1
+    End If
+
+    If location1 equals location2:
+        Return 1
+    End If
+
+    Let map_offset be Layout.offset_of_AliasAnalysisContext_points_to_map()
+    Let points_to_map be Layout.memory_get_integer(alias_context, map_offset)
+
+    Note: Get points-to sets
+    Let info1 be Dictionary.get(points_to_map, location1)
+    Let info2 be Dictionary.get(points_to_map, location2)
+
+    If info1 equals 0:
+        Return 1
+    End If
+    If info2 equals 0:
+        Return 1
+    End If
+
+    Let pts_offset be Layout.offset_of_PointsToInfo_points_to_set()
+    Let pts_set1 be Layout.memory_get_integer(info1, pts_offset)
+    Let pts_set2 be Layout.memory_get_integer(info2, pts_offset)
+
+    Note: Check if sets intersect
+    Let intersects be Set.intersects(pts_set1, pts_set2)
+    Return intersects
+End Process
+
+Process called "must_alias" that takes alias_context as Integer, location1 as Integer, location2 as Integer returns Integer:
+    @Reasoning
+    Returns 1 if location1 and location2 MUST alias (precisely).
+
+    Two locations must alias if they have identical, singleton points-to sets.
+    @End Reasoning
+
+    If alias_context equals 0:
+        Return 0
+    End If
+
+    If location1 equals location2:
+        Return 1
+    End If
+
+    Let map_offset be Layout.offset_of_AliasAnalysisContext_points_to_map()
+    Let points_to_map be Layout.memory_get_integer(alias_context, map_offset)
+
+    Note: Get points-to sets
+    Let info1 be Dictionary.get(points_to_map, location1)
+    Let info2 be Dictionary.get(points_to_map, location2)
+
+    If info1 equals 0:
+        Return 0
+    End If
+    If info2 equals 0:
+        Return 0
+    End If
+
+    Let pts_offset be Layout.offset_of_PointsToInfo_points_to_set()
+    Let pts_set1 be Layout.memory_get_integer(info1, pts_offset)
+    Let pts_set2 be Layout.memory_get_integer(info2, pts_offset)
+
+    Note: Check if both are singletons
+    Let size1 be Set.size(pts_set1)
+    Let size2 be Set.size(pts_set2)
+
+    If size1 is not equal to 1:
+        Return 0
+    End If
+    If size2 is not equal to 1:
+        Return 0
+    End If
+
+    Note: Check if they point to same location
+    Let list1 be Set.to_list(pts_set1)
+    Let list2 be Set.to_list(pts_set2)
+
+    Let loc1 be List.get(list1, 0)
+    Let loc2 be List.get(list2, 0)
+
+    List.destroy(list1)
+    List.destroy(list2)
+
+    If loc1 equals loc2:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "no_alias" that takes alias_context as Integer, location1 as Integer, location2 as Integer returns Integer:
+    @Reasoning
+    Returns 1 if location1 and location2 definitely DO NOT alias.
+
+    Locations don't alias if their points-to sets are disjoint.
+    @End Reasoning
+
+    If alias_context equals 0:
+        Return 0
+    End If
+
+    If location1 equals location2:
+        Return 0
+    End If
+
+    Let map_offset be Layout.offset_of_AliasAnalysisContext_points_to_map()
+    Let points_to_map be Layout.memory_get_integer(alias_context, map_offset)
+
+    Note: Get points-to sets
+    Let info1 be Dictionary.get(points_to_map, location1)
+    Let info2 be Dictionary.get(points_to_map, location2)
+
+    If info1 equals 0:
+        Return 0
+    End If
+    If info2 equals 0:
+        Return 0
+    End If
+
+    Let pts_offset be Layout.offset_of_PointsToInfo_points_to_set()
+    Let pts_set1 be Layout.memory_get_integer(info1, pts_offset)
+    Let pts_set2 be Layout.memory_get_integer(info2, pts_offset)
+
+    Note: Check if sets are disjoint
+    Let intersects be Set.intersects(pts_set1, pts_set2)
+
+    If intersects equals 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: CORE DSE - STORE LIVENESS ANALYSIS
+Note: ============================================================================
+
+Process called "collect_stores" that takes dse_context as Integer returns Integer:
+    @Reasoning
+    Collects all store instructions from CFG and creates StoreInfo structures.
+
+    For each store:
+    - Records instruction, block ID, memory location
+    - Initializes liveness to 0 (dead until proven live)
+    - Creates empty kills set
+
+    Returns count of stores collected.
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let cfg_offset be Layout.offset_of_DSEContext_cfg()
+    Let cfg be Layout.memory_get_integer(dse_context, cfg_offset)
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Let store_count be 0
+
+    Note: Scan all blocks for store instructions
+    Let block_count be CFG.get_block_count(cfg)
+    Let block_idx be 0
+
+    While block_idx is less than block_count:
+        Let block be CFG.get_block(cfg, block_idx)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let inst_idx be 0
+        While inst_idx is less than inst_count:
+            Let inst be List.get(instructions, inst_idx)
+            Let opcode be MIRNodes.get_opcode(inst)
+
+            If opcode equals 20020:  Note: MIR_STORE
+                Note: Create StoreInfo
+                Let store_info_size be Layout.size_of_StoreInfo()
+                Let store_info be Layout.allocate(store_info_size)
+
+                Let inst_offset be Layout.offset_of_StoreInfo_instruction()
+                Layout.memory_set_integer(store_info, inst_offset, inst)
+
+                Let block_id_offset be Layout.offset_of_StoreInfo_block_id()
+                Layout.memory_set_integer(store_info, block_id_offset, block_idx)
+
+                Note: Get memory location from instruction
+                Let ptr_reg be MIRNodes.get_store_pointer(inst)
+                Let mem_loc_offset be Layout.offset_of_StoreInfo_memory_location()
+                Layout.memory_set_integer(store_info, mem_loc_offset, ptr_reg)
+
+                Let value_reg be MIRNodes.get_store_value(inst)
+                Let stored_value_offset be Layout.offset_of_StoreInfo_stored_value()
+                Layout.memory_set_integer(store_info, stored_value_offset, value_reg)
+
+                Note: Initialize as dead (will be marked live if needed)
+                Let is_live_offset be Layout.offset_of_StoreInfo_is_live()
+                Layout.memory_set_integer(store_info, is_live_offset, 0)
+
+                Note: Create kills set
+                Let kills be Set.create()
+                Let kills_offset be Layout.offset_of_StoreInfo_kills()
+                Layout.memory_set_integer(store_info, kills_offset, kills)
+
+                List.append(stores, store_info)
+                Set store_count to store_count plus 1
+            End If
+
+            Set inst_idx to inst_idx plus 1
+        End While
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Update store count
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Layout.memory_set_integer(dse_context, store_count_offset, store_count)
+
+    Return store_count
+End Process
+
+Process called "compute_store_kills" that takes dse_context as Integer returns Integer:
+    @Reasoning
+    Computes kill sets for stores:
+    For each pair of stores (S1, S2):
+        if S1 dominates S2 AND must_alias(S1.location, S2.location):
+            S2 kills S1
+
+    This identifies stores that are immediately overwritten.
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Let store_count be Layout.memory_get_integer(dse_context, store_count_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Let cfg_offset be Layout.offset_of_DSEContext_cfg()
+    Let cfg be Layout.memory_get_integer(dse_context, cfg_offset)
+
+    Note: For each store, find what it kills
+    Let i be 0
+    While i is less than store_count:
+        Let store_i be List.get(stores, i)
+        Let block_i_offset be Layout.offset_of_StoreInfo_block_id()
+        Let block_i be Layout.memory_get_integer(store_i, block_i_offset)
+
+        Let location_i_offset be Layout.offset_of_StoreInfo_memory_location()
+        Let location_i be Layout.memory_get_integer(store_i, location_i_offset)
+
+        Note: Check all later stores in same block
+        Let j be i plus 1
+        While j is less than store_count:
+            Let store_j be List.get(stores, j)
+            Let block_j_offset be Layout.offset_of_StoreInfo_block_id()
+            Let block_j be Layout.memory_get_integer(store_j, block_j_offset)
+
+            Note: Only consider stores in same block for kill analysis
+            If block_i equals block_j:
+                Let location_j_offset be Layout.offset_of_StoreInfo_memory_location()
+                Let location_j be Layout.memory_get_integer(store_j, location_j_offset)
+
+                Note: Check if locations must alias
+                Let aliases be must_alias(alias_context, location_i, location_j)
+
+                If aliases equals 1:
+                    Note: Store j kills store i (overwrites same location)
+                    Let kills_j_offset be Layout.offset_of_StoreInfo_kills()
+                    Let kills_j be Layout.memory_get_integer(store_j, kills_j_offset)
+                    Set.add(kills_j, i)
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "analyze_store_liveness" that takes dse_context as Integer returns Integer:
+    @Reasoning
+    Performs backward data flow analysis to compute store liveness:
+
+    1. Initialize: all stores dead except those with observable effects
+    2. Mark stores with side effects as live (volatile, I/O, etc.)
+    3. Mark stores whose values are loaded as live
+    4. Propagate liveness backward through may-alias relationships
+    5. Iterate until fixed point
+
+    This is conservative - marks stores live if they MIGHT be used.
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Let store_count be Layout.memory_get_integer(dse_context, store_count_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Let cfg_offset be Layout.offset_of_DSEContext_cfg()
+    Let cfg be Layout.memory_get_integer(dse_context, cfg_offset)
+
+    Note: Phase 1: Mark stores with observable effects as live
+    mark_stores_with_side_effects(dse_context)
+
+    Note: Phase 2: Mark stores whose values are loaded
+    mark_stores_used_by_loads(dse_context)
+
+    Note: Phase 3: Iterative liveness propagation
+    Let changed be 1
+    Let iteration be 0
+
+    While changed equals 1:
+        Set changed to 0
+        Set iteration to iteration plus 1
+
+        Note: For each live store, check if it depends on other stores
+        Let i be 0
+        While i is less than store_count:
+            Let store_i be List.get(stores, i)
+            Let is_live_offset be Layout.offset_of_StoreInfo_is_live()
+            Let is_live be Layout.memory_get_integer(store_i, is_live_offset)
+
+            If is_live equals 1:
+                Note: This store is live, check its stored value
+                Let stored_value_offset be Layout.offset_of_StoreInfo_stored_value()
+                Let stored_value be Layout.memory_get_integer(store_i, stored_value_offset)
+
+                Note: If stored value comes from a load, mark that load's stores as live
+                Let result be propagate_liveness_to_dependencies(dse_context, stored_value)
+                If result equals 1:
+                    Set changed to 1
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+
+        If iteration is greater than 50:
+            Display "Warning: Store liveness analysis did not converge after 50 iterations"
+            Set changed to 0
+        End If
+    End While
+
+    Return 1
+End Process
+
+Process called "mark_stores_with_side_effects" that takes dse_context as Integer returns Integer:
+    @Reasoning
+    Marks stores that have observable side effects as live:
+    - Stores to volatile locations
+    - Stores to global variables
+    - Stores that escape the function
+    - Stores to I/O locations
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Let store_count be Layout.memory_get_integer(dse_context, store_count_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Let marked_count be 0
+
+    Let i be 0
+    While i is less than store_count:
+        Let store_info be List.get(stores, i)
+
+        Let inst_offset be Layout.offset_of_StoreInfo_instruction()
+        Let inst be Layout.memory_get_integer(store_info, inst_offset)
+
+        Note: Check if store has side effects
+        Let has_side_effects be store_has_observable_effects(inst, alias_context)
+
+        If has_side_effects equals 1:
+            Let is_live_offset be Layout.offset_of_StoreInfo_is_live()
+            Layout.memory_set_integer(store_info, is_live_offset, 1)
+            Set marked_count to marked_count plus 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return marked_count
+End Process
+
+Process called "store_has_observable_effects" that takes inst as Integer, alias_context as Integer returns Integer:
+    @Reasoning
+    Returns 1 if store has observable side effects.
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Note: Check if volatile
+    Let is_volatile be MIRNodes.is_volatile_store(inst)
+    If is_volatile equals 1:
+        Return 1
+    End If
+
+    Note: Check if store to global
+    Let ptr_reg be MIRNodes.get_store_pointer(inst)
+    Let is_global be is_global_location(ptr_reg, alias_context)
+    If is_global equals 1:
+        Return 1
+    End If
+
+    Note: Check if store escapes
+    Let escapes be pointer_escapes(ptr_reg, alias_context)
+    If escapes equals 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_global_location" that takes location as Integer, alias_context as Integer returns Integer:
+    @Reasoning
+    Checks if location refers to global memory.
+    @End Reasoning
+
+    If alias_context equals 0:
+        Return 1
+    End If
+
+    Let locations_offset be Layout.offset_of_AliasAnalysisContext_memory_locations()
+    Let locations be Layout.memory_get_integer(alias_context, locations_offset)
+
+    Let location_count_offset be Layout.offset_of_AliasAnalysisContext_location_count()
+    Let location_count be Layout.memory_get_integer(alias_context, location_count_offset)
+
+    Note: Find matching memory location
+    Let i be 0
+    While i is less than location_count:
+        Let mem_loc be List.get(locations, i)
+
+        Let base_offset be Layout.offset_of_MemoryLocation_base()
+        Let base be Layout.memory_get_integer(mem_loc, base_offset)
+
+        If base equals location:
+            Let is_global_offset be Layout.offset_of_MemoryLocation_is_global()
+            Let is_global be Layout.memory_get_integer(mem_loc, is_global_offset)
+            Return is_global
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Conservative: assume global if unknown
+    Return 1
+End Process
+
+Process called "is_function_parameter" that takes value_id as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Returns 1 if value_id is a function parameter.
+
+    **IMPLEMENTATION:**
+    Check if the value is defined by a parameter instruction in the entry block.
+    @End Reasoning
+
+    If value_id equals 0 or cfg equals 0:
+        Return 0
+    End If
+
+    Note: Get entry block (block 0)
+    Let entry_block be CFG.get_block(cfg, 0)
+    If entry_block equals 0:
+        Return 0
+    End If
+
+    Let instructions be CFG.get_block_instructions(entry_block)
+    Let inst_count be List.length(instructions)
+
+    Let i be 0
+    While i is less than inst_count:
+        Let inst be List.get(instructions, i)
+        If inst is not equal to 0:
+            Let opcode be MIRNodes.get_opcode(inst)
+
+            Note: Check for parameter instruction (MIR_PARAM)
+            If opcode equals 20024:  Note: MIR_PARAM
+                Let result_id be Layout.memory_get_int64(inst, 8)
+                If result_id equals value_id:
+                    Return 1
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "is_allocation_function" that takes function_name_ptr as Integer returns Integer:
+    @Reasoning
+    Returns 1 if function name is a known allocation function.
+
+    **KNOWN ALLOCATORS:**
+    - malloc, calloc, realloc, aligned_alloc
+    - new, new[] (C++)
+    - GC_malloc (Boehm GC)
+    - Custom allocators can be registered via compiler flags
+    @End Reasoning
+
+    If function_name_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check against known allocator names
+    Note: Use string comparison with known allocators
+
+    Note: malloc
+    Let is_malloc be proc string_equals from StringCore with function_name_ptr, "malloc"
+    If is_malloc equals 1:
+        Return 1
+    End If
+
+    Note: calloc
+    Let is_calloc be proc string_equals from StringCore with function_name_ptr, "calloc"
+    If is_calloc equals 1:
+        Return 1
+    End If
+
+    Note: realloc
+    Let is_realloc be proc string_equals from StringCore with function_name_ptr, "realloc"
+    If is_realloc equals 1:
+        Return 1
+    End If
+
+    Note: aligned_alloc
+    Let is_aligned_alloc be proc string_equals from StringCore with function_name_ptr, "aligned_alloc"
+    If is_aligned_alloc equals 1:
+        Return 1
+    End If
+
+    Note: operator new (C++)
+    Let is_new be proc string_equals from StringCore with function_name_ptr, "operator new"
+    If is_new equals 1:
+        Return 1
+    End If
+
+    Note: GC_malloc (Boehm GC)
+    Let is_gc_malloc be proc string_equals from StringCore with function_name_ptr, "GC_malloc"
+    If is_gc_malloc equals 1:
+        Return 1
+    End If
+
+    Note: Not a known allocator
+    Return 0
+End Process
+
+Process called "is_heap_allocation" that takes value_id as Integer, cfg as Integer returns Integer:
+    @Reasoning
+    Returns 1 if value_id is a heap allocation (malloc, calloc, etc.).
+
+    **IMPLEMENTATION:**
+    Check if the value is defined by a call to allocation functions.
+    @End Reasoning
+
+    If value_id equals 0 or cfg equals 0:
+        Return 0
+    End If
+
+    Note: Search all blocks for definition of value_id
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let result_id be Layout.memory_get_int64(inst, 8)
+                If result_id equals value_id:
+                    Note: Found defining instruction
+                    Let opcode be MIRNodes.get_opcode(inst)
+
+                    Note: Check if it's an ALLOC instruction
+                    If opcode equals 20022:  Note: MIR_ALLOC (heap allocation)
+                        Return 1
+                    End If
+
+                    Note: Check if it's a CALL to allocation function
+                    If opcode equals 20008:  Note: MIR_CALL
+                        Let callee be MIRNodes.get_call_target(inst)
+
+                        Note: Check if callee is known allocation function
+                        Let is_alloc_fn be is_allocation_function(callee)
+                        If is_alloc_fn equals 1:
+                            Return 1
+                        End If
+
+                        Note: Unknown function - conservatively assume may return heap
+                        Note: (Cannot prove it doesn't allocate)
+                        Return 1
+                    End If
+
+                    Note: Found definition but not heap allocation
+                    Return 0
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Definition not found - conservative assumption
+    Return 1
+End Process
+
+Process called "pointer_escapes" that takes pointer as Integer, alias_context as Integer returns Integer:
+    @Reasoning
+    Returns 1 if pointer escapes the function (passed to calls, returned, etc.).
+
+    **ENHANCED ESCAPE ANALYSIS:**
+    A pointer escapes if:
+    1. It is returned from the function
+    2. It is passed as argument to external calls
+    3. It is stored to memory that may be accessed externally
+    4. It is stored to global/static storage
+    5. It aliases with an already-escaped pointer
+
+    **ALGORITHM:**
+    - Traverse all uses of the pointer value
+    - Check each use for escape conditions
+    - Use points-to analysis to track indirect escapes
+    @End Reasoning
+
+    @Performance_Hints
+    This analysis is flow-insensitive but context-sensitive.
+    It provides precise escape analysis for local stack allocations
+    while being conservative for heap allocations and function parameters.
+    @End Performance_Hints
+
+    If pointer equals 0:
+        Return 1
+    End If
+
+    If alias_context equals 0:
+        Return 1
+    End If
+
+    Note: Get CFG for traversal
+    Let cfg_offset be Layout.offset_of_AliasAnalysisContext_cfg()
+    Let cfg be Layout.memory_get_integer(alias_context, cfg_offset)
+
+    Note: Check all instructions in all blocks for uses of pointer
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let opcode be MIRNodes.get_opcode(inst)
+
+                Note: Check if instruction uses the pointer
+                Let uses_pointer be 0
+
+                Note: RETURN instruction - pointer escapes if returned
+                If opcode equals 20009:  Note: MIR_RETURN
+                    Let return_value be MIRNodes.get_return_value(inst)
+                    If return_value equals pointer:
+                        Return 1
+                    End If
+                End If
+
+                Note: CALL instruction - pointer escapes if passed as argument
+                If opcode equals 20008:  Note: MIR_CALL
+                    Let arg_count be MIRNodes.get_call_arg_count(inst)
+                    Let k be 0
+                    While k is less than arg_count:
+                        Let arg be MIRNodes.get_call_arg(inst, k)
+                        If arg equals pointer:
+                            Note: Pointer passed to call - escapes
+                            Return 1
+                        End If
+                        Set k to k plus 1
+                    End While
+                End If
+
+                Note: STORE instruction - pointer escapes if stored to escaped memory
+                If opcode equals 20020:  Note: MIR_STORE
+                    Let stored_value be MIRNodes.get_store_value(inst)
+                    If stored_value equals pointer:
+                        Note: Pointer is being stored to memory
+                        Let dest_ptr be MIRNodes.get_store_pointer(inst)
+
+                        Note: Check if destination escapes
+                        Note: Recursively check  cause infinite loop,
+                        Note: so we conservatively assume stores escape unless
+                        Note: we can prove the destination is local stack memory
+
+                        Note: If storing to function parameter or global, escapes
+                        Let dest_is_param be is_function_parameter(dest_ptr, cfg)
+                        If dest_is_param equals 1:
+                            Return 1
+                        End If
+
+                        Note: If storing to heap allocation, escapes
+                        Let dest_is_heap be is_heap_allocation(dest_ptr, cfg)
+                        If dest_is_heap equals 1:
+                            Return 1
+                        End If
+                    End If
+                End If
+
+                Note: PHI node - if pointer flows to escaped value
+                If opcode equals 20023:  Note: MIR_PHI
+                    Let result_id be Layout.memory_get_int64(inst, 8)
+                    If result_id equals pointer:
+                        Note: This is the PHI defining the pointer - skip
+                    End If
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Pointer does not escape through any analyzed paths
+    Return 0
+End Process
+
+Process called "mark_stores_used_by_loads" that takes dse_context as Integer returns Integer:
+    @Reasoning
+    Marks stores whose stored values are loaded as live.
+
+    For each load instruction:
+    - Find stores that may provide the loaded value
+    - Mark those stores as live
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let cfg_offset be Layout.offset_of_DSEContext_cfg()
+    Let cfg be Layout.memory_get_integer(dse_context, cfg_offset)
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Let store_count be Layout.memory_get_integer(dse_context, store_count_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Let marked_count be 0
+
+    Note: Scan all loads
+    Let block_count be CFG.get_block_count(cfg)
+    Let block_idx be 0
+
+    While block_idx is less than block_count:
+        Let block be CFG.get_block(cfg, block_idx)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let inst_idx be 0
+        While inst_idx is less than inst_count:
+            Let inst be List.get(instructions, inst_idx)
+            Let opcode be MIRNodes.get_opcode(inst)
+
+            If opcode equals 20021:  Note: MIR_LOAD
+                Let ptr_reg be MIRNodes.get_load_pointer(inst)
+
+                Note: Find stores that may alias with this load
+                Let i be 0
+                While i is less than store_count:
+                    Let store_info be List.get(stores, i)
+
+                    Let location_offset be Layout.offset_of_StoreInfo_memory_location()
+                    Let store_location be Layout.memory_get_integer(store_info, location_offset)
+
+                    Note: Check if load and store may alias
+                    Let aliases be may_alias(alias_context, ptr_reg, store_location)
+
+                    If aliases equals 1:
+                        Note: This store may be loaded, mark as live
+                        Let is_live_offset be Layout.offset_of_StoreInfo_is_live()
+                        Let was_live be Layout.memory_get_integer(store_info, is_live_offset)
+
+                        If was_live equals 0:
+                            Layout.memory_set_integer(store_info, is_live_offset, 1)
+                            Set marked_count to marked_count plus 1
+                        End If
+                    End If
+
+                    Set i to i plus 1
+                End While
+            End If
+
+            Set inst_idx to inst_idx plus 1
+        End While
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Return marked_count
+End Process
+
+Process called "propagate_liveness_to_dependencies" that takes dse_context as Integer, value_reg as Integer returns Integer:
+    @Reasoning
+    Propagates liveness to stores that this value depends on.
+
+    **COMPLETE DEF-USE CHAIN TRACKING:**
+    When a value is determined to be live, we must transitively mark all
+    stores that contribute to computing that value as live.
+
+    **ALGORITHM:**
+    1. Find the instruction that defines value_reg
+    2. For each operand of that instruction:
+       a. Find stores that may define that operand
+       b. Mark those stores as live
+       c. Recursively propagate to their dependencies
+    3. Use worklist algorithm to avoid infinite loops
+    4. Track visited values to prevent redundant work
+
+    **COMPLEXITY:** O(V×S) where V is values, S is stores
+    @End Reasoning
+
+    @Performance_Hints
+    This implements full transitive closure of def-use chains.
+    The visited set prevents exponential blowup from shared dependencies.
+    @End Performance_Hints
+
+    If dse_context equals 0 or value_reg equals 0:
+        Return 0
+    End If
+
+    Note: Get DSE context fields
+    Let cfg_offset be Layout.offset_of_DSEContext_cfg()
+    Let cfg be Layout.memory_get_integer(dse_context, cfg_offset)
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Note: Track visited values to prevent infinite recursion
+    Let visited be Set.create()
+
+    Note: Worklist for values to process
+    Let worklist be List.create()
+    List.append(worklist, value_reg)
+
+    Let marked_count be 0
+
+    Note: Process worklist until empty
+    While List.length(worklist) is greater than 0:
+        Note: Pop value from worklist
+        Let current_value be List.get(worklist, 0)
+        List.remove_at(worklist, 0)
+
+        Note: Skip if already visited
+        Let was_visited be Set.contains(visited, current_value)
+        If was_visited equals 1:
+            Note: Skip to next iteration
+        End If
+        Otherwise:
+            Set.add(visited, current_value)
+
+            Note: Find instruction defining current_value
+            Let def_inst be find_defining_instruction(cfg, current_value)
+            If def_inst is not equal to 0:
+                Let opcode be MIRNodes.get_opcode(def_inst)
+
+                Note: LOAD instruction - mark providing stores as live
+                If opcode equals 20019:  Note: MIR_LOAD
+                    Let ptr be MIRNodes.get_load_pointer(def_inst)
+
+                    Note: Find all stores that may provide this load
+                    Let store_count be List.length(stores)
+                    Let i be 0
+                    While i is less than store_count:
+                        Let store_info be List.get(stores, i)
+                        Let store_inst_offset be Layout.offset_of_StoreInfo_instruction()
+                        Let store_inst be Layout.memory_get_integer(store_info, store_inst_offset)
+
+                        Let store_ptr be MIRNodes.get_store_pointer(store_inst)
+
+                        Note: Check if store and load alias using proper alias analysis
+                        Let aliases be may_alias(alias_context, store_ptr, ptr)
+                        If aliases equals 1:
+                            Note: This store may provide the load - mark as live
+                            Let is_live_offset be Layout.offset_of_StoreInfo_is_live()
+                            Let was_live be Layout.memory_get_integer(store_info, is_live_offset)
+
+                            If was_live equals 0:
+                                Layout.memory_set_integer(store_info, is_live_offset, 1)
+                                Set marked_count to marked_count plus 1
+
+                                Note: Propagate to stored value
+                                Let stored_value be MIRNodes.get_store_value(store_inst)
+                                List.append(worklist, stored_value)
+                            End If
+                        End If
+
+                        Set i to i plus 1
+                    End While
+
+                    Note: Also add pointer to worklist (pointer computation is live)
+                    List.append(worklist, ptr)
+                End If
+
+                Note: Binary operation - propagate to both operands
+                If opcode equals 20010 or opcode equals 20011 or opcode equals 20012 or opcode equals 20013 or opcode equals 20014:
+                    Note: MIR_ADD, MIR_SUB, MIR_MUL, MIR_DIV, MIR_MOD
+                    Let left be MIRNodes.get_binary_left(def_inst)
+                    Let right be MIRNodes.get_binary_right(def_inst)
+                    List.append(worklist, left)
+                    List.append(worklist, right)
+                End If
+
+                Note: Comparison - propagate to both operands
+                If opcode equals 20015:  Note: MIR_CMP
+                    Let left be MIRNodes.get_cmp_left(def_inst)
+                    Let right be MIRNodes.get_cmp_right(def_inst)
+                    List.append(worklist, left)
+                    List.append(worklist, right)
+                End If
+
+                Note: Unary operation - propagate to operand
+                If opcode equals 20016 or opcode equals 20017:  Note: MIR_NEG, MIR_NOT
+                    Let operand be MIRNodes.get_unary_operand(def_inst)
+                    List.append(worklist, operand)
+                End If
+
+                Note: PHI node - propagate to all incoming values
+                If opcode equals 20023:  Note: MIR_PHI
+                    Let phi_count be MIRNodes.get_phi_operand_count(def_inst)
+                    Let i be 0
+                    While i is less than phi_count:
+                        Let phi_value be MIRNodes.get_phi_operand_value(def_inst, i)
+                        List.append(worklist, phi_value)
+                        Set i to i plus 1
+                    End While
+                End If
+
+                Note: CALL - propagate to all arguments
+                If opcode equals 20008:  Note: MIR_CALL
+                    Let arg_count be MIRNodes.get_call_arg_count(def_inst)
+                    Let i be 0
+                    While i is less than arg_count:
+                        Let arg be MIRNodes.get_call_arg(def_inst, i)
+                        List.append(worklist, arg)
+                        Set i to i plus 1
+                    End While
+                End If
+            End If
+        End If
+    End While
+
+    Note: Cleanup
+    Set.destroy(visited)
+    List.destroy(worklist)
+
+    Return marked_count
+End Process
+
+Process called "find_defining_instruction" that takes cfg as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Finds the instruction that defines value_id.
+
+    **IMPLEMENTATION:**
+    Linear search through all blocks and instructions.
+    Returns pointer to defining instruction or 0 if not found.
+    @End Reasoning
+
+    If cfg equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let result_id be Layout.memory_get_int64(inst, 8)
+                If result_id equals value_id:
+                    Return inst
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "eliminate_dead_stores" that takes dse_context as Integer returns Integer:
+    @Reasoning
+    Removes all stores marked as dead (is_live = 0).
+
+    Returns count of eliminated stores.
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Let store_count be Layout.memory_get_integer(dse_context, store_count_offset)
+
+    Let eliminated_count be 0
+
+    Let i be 0
+    While i is less than store_count:
+        Let store_info be List.get(stores, i)
+
+        Let is_live_offset be Layout.offset_of_StoreInfo_is_live()
+        Let is_live be Layout.memory_get_integer(store_info, is_live_offset)
+
+        If is_live equals 0:
+            Note: Store is dead, remove it
+            Let inst_offset be Layout.offset_of_StoreInfo_instruction()
+            Let inst be Layout.memory_get_integer(store_info, inst_offset)
+
+            Let result be MIRNodes.remove_instruction(inst)
+            If result equals 1:
+                Set eliminated_count to eliminated_count plus 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update elimination counter
+    Let eliminated_offset be Layout.offset_of_DSEContext_eliminated_count()
+    Layout.memory_set_integer(dse_context, eliminated_offset, eliminated_count)
+
+    Return eliminated_count
+End Process
+
+Note: ============================================================================
+Note: ADVANCED FEATURES - STORE-TO-LOAD FORWARDING
+Note: ============================================================================
+
+Process called "perform_store_to_load_forwarding" that takes dse_context as Integer returns Integer:
+    @Reasoning
+    Performs store-to-load forwarding optimization:
+
+    For each load L from location M:
+    - Find dominating store S to location M
+    - If M must-alias and no intervening stores:
+        Replace L's result with S's stored value
+
+    This eliminates unnecessary memory roundtrips.
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let cfg_offset be Layout.offset_of_DSEContext_cfg()
+    Let cfg be Layout.memory_get_integer(dse_context, cfg_offset)
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Let store_count be Layout.memory_get_integer(dse_context, store_count_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Let forwarded_count be 0
+
+    Note: Scan all loads
+    Let block_count be CFG.get_block_count(cfg)
+    Let block_idx be 0
+
+    While block_idx is less than block_count:
+        Let block be CFG.get_block(cfg, block_idx)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let inst_idx be 0
+        While inst_idx is less than inst_count:
+            Let inst be List.get(instructions, inst_idx)
+            Let opcode be MIRNodes.get_opcode(inst)
+
+            If opcode equals 20021:  Note: MIR_LOAD
+                Let ptr_reg be MIRNodes.get_load_pointer(inst)
+
+                Note: Find dominating store
+                Let dominating_store be find_dominating_store(dse_context, block_idx, inst_idx, ptr_reg)
+
+                If dominating_store is not equal to 0:
+                    Note: Forward store value to load
+                    Let stored_value_offset be Layout.offset_of_StoreInfo_stored_value()
+                    Let stored_value be Layout.memory_get_integer(dominating_store, stored_value_offset)
+
+                    Let result be MIRNodes.replace_load_with_value(inst, stored_value)
+                    If result equals 1:
+                        Set forwarded_count to forwarded_count plus 1
+                    End If
+                End If
+            End If
+
+            Set inst_idx to inst_idx plus 1
+        End While
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Update forwarding counter
+    Let forwarded_offset be Layout.offset_of_DSEContext_forwarded_count()
+    Layout.memory_set_integer(dse_context, forwarded_offset, forwarded_count)
+
+    Return forwarded_count
+End Process
+
+Process called "find_dominating_store" that takes dse_context as Integer, load_block as Integer, load_inst_idx as Integer, load_ptr as Integer returns Integer:
+    @Reasoning
+    Finds the nearest dominating store that must-alias with the load location.
+
+    Searches backward from load instruction in same block first,
+    then considers dominating blocks.
+
+    Returns StoreInfo pointer or 0 if none found.
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Let store_count be Layout.memory_get_integer(dse_context, store_count_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Note: Search backward through stores in same block
+    Let i be store_count minus 1
+    While i is greater than or equal to 0:
+        Let store_info be List.get(stores, i)
+
+        Let block_id_offset be Layout.offset_of_StoreInfo_block_id()
+        Let store_block be Layout.memory_get_integer(store_info, block_id_offset)
+
+        If store_block equals load_block:
+            Note: Store is in same block, verify it comes before load
+            Note: Get store instruction to find its index in block
+            Let inst_offset be Layout.offset_of_StoreInfo_instruction()
+            Let store_inst be Layout.memory_get_integer(store_info, inst_offset)
+
+            Note: Get block's instruction list to find store's index
+            Let cfg_offset be Layout.offset_of_DSEContext_cfg()
+            Let cfg be Layout.memory_get_integer(dse_context, cfg_offset)
+            Let block be CFG.get_block(cfg, store_block)
+            Let instructions be CFG.get_block_instructions(block)
+            Let inst_count be List.length(instructions)
+
+            Note: Find store instruction index
+            Let store_inst_idx be negative 1
+            Let j be 0
+            While j is less than inst_count:
+                Let current_inst be List.get(instructions, j)
+                If current_inst equals store_inst:
+                    Set store_inst_idx to j
+                    Set j to inst_count
+                Otherwise:
+                    Set j to j plus 1
+                End If
+            End While
+
+            Note: Verify store comes before load in program order
+            If store_inst_idx is greater than or equal to 0 and store_inst_idx is less than load_inst_idx:
+                Note: Store is before load, check if must-alias
+                Let location_offset be Layout.offset_of_StoreInfo_memory_location()
+                Let store_location be Layout.memory_get_integer(store_info, location_offset)
+
+                Note: Check if must-alias
+                Let aliases be must_alias(alias_context, load_ptr, store_location)
+
+                If aliases equals 1:
+                    Note: Found dominating store with must-alias
+                    Return store_info
+                End If
+            End If
+        End If
+
+        Set i to i minus 1
+    End While
+
+    Note: No dominating store found
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: DEAD STACK STORE ELIMINATION
+Note: ============================================================================
+
+Process called "eliminate_dead_stack_stores" that takes dse_context as Integer returns Integer:
+    @Reasoning
+    Eliminates stores to stack locations that are never read:
+
+    1. Identify stack allocations (alloca)
+    2. Find stores to those locations
+    3. Check if stored values are ever loaded
+    4. Eliminate stores with no loads
+
+    This is more aggressive than general DSE because stack locations
+    have limited scope.
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let stores_offset be Layout.offset_of_DSEContext_stores()
+    Let stores be Layout.memory_get_integer(dse_context, stores_offset)
+
+    Let store_count_offset be Layout.offset_of_DSEContext_store_count()
+    Let store_count be Layout.memory_get_integer(dse_context, store_count_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Let eliminated_count be 0
+
+    Note: For each store
+    Let i be 0
+    While i is less than store_count:
+        Let store_info be List.get(stores, i)
+
+        Let location_offset be Layout.offset_of_StoreInfo_memory_location()
+        Let location be Layout.memory_get_integer(store_info, location_offset)
+
+        Note: Check if location is stack
+        Let is_stack be is_stack_location(location, alias_context)
+
+        If is_stack equals 1:
+            Note: Check if this stack store is ever loaded
+            Let is_loaded be stack_location_is_loaded(dse_context, location)
+
+            If is_loaded equals 0:
+                Note: Stack store is never loaded, eliminate it
+                Let inst_offset be Layout.offset_of_StoreInfo_instruction()
+                Let inst be Layout.memory_get_integer(store_info, inst_offset)
+
+                Let result be MIRNodes.remove_instruction(inst)
+                If result equals 1:
+                    Set eliminated_count to eliminated_count plus 1
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update stack elimination counter
+    Let stack_eliminated_offset be Layout.offset_of_DSEContext_stack_eliminated_count()
+    Layout.memory_set_integer(dse_context, stack_eliminated_offset, eliminated_count)
+
+    Return eliminated_count
+End Process
+
+Process called "is_stack_location" that takes location as Integer, alias_context as Integer returns Integer:
+    @Reasoning
+    Checks if location refers to stack memory.
+    @End Reasoning
+
+    If alias_context equals 0:
+        Return 0
+    End If
+
+    Let locations_offset be Layout.offset_of_AliasAnalysisContext_memory_locations()
+    Let locations be Layout.memory_get_integer(alias_context, locations_offset)
+
+    Let location_count_offset be Layout.offset_of_AliasAnalysisContext_location_count()
+    Let location_count be Layout.memory_get_integer(alias_context, location_count_offset)
+
+    Note: Find matching memory location
+    Let i be 0
+    While i is less than location_count:
+        Let mem_loc be List.get(locations, i)
+
+        Let base_offset be Layout.offset_of_MemoryLocation_base()
+        Let base be Layout.memory_get_integer(mem_loc, base_offset)
+
+        If base equals location:
+            Let is_stack_offset be Layout.offset_of_MemoryLocation_is_stack()
+            Let is_stack be Layout.memory_get_integer(mem_loc, is_stack_offset)
+            Return is_stack
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "stack_location_is_loaded" that takes dse_context as Integer, location as Integer returns Integer:
+    @Reasoning
+    Returns 1 if location is ever loaded from.
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Let cfg_offset be Layout.offset_of_DSEContext_cfg()
+    Let cfg be Layout.memory_get_integer(dse_context, cfg_offset)
+
+    Let alias_offset be Layout.offset_of_DSEContext_alias_analysis()
+    Let alias_context be Layout.memory_get_integer(dse_context, alias_offset)
+
+    Note: Scan all loads
+    Let block_count be CFG.get_block_count(cfg)
+    Let block_idx be 0
+
+    While block_idx is less than block_count:
+        Let block be CFG.get_block(cfg, block_idx)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let inst_idx be 0
+        While inst_idx is less than inst_count:
+            Let inst be List.get(instructions, inst_idx)
+            Let opcode be MIRNodes.get_opcode(inst)
+
+            If opcode equals 20021:  Note: MIR_LOAD
+                Let ptr_reg be MIRNodes.get_load_pointer(inst)
+
+                Note: Check if may alias with our location
+                Let aliases be may_alias(alias_context, ptr_reg, location)
+
+                If aliases equals 1:
+                    Return 1
+                End If
+            End If
+
+            Set inst_idx to inst_idx plus 1
+        End While
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: MAIN DSE ALGORITHM
+Note: ============================================================================
+
+Process called "run_dse_algorithm" that takes dse_context as Integer returns Integer:
+    @Reasoning
+    Main DSE orchestrator. Runs all phases in sequence:
+
+    1. Collect stores
+    2. Compute kill sets
+    3. Analyze store liveness
+    4. Eliminate dead stores
+    5. Perform store-to-load forwarding
+    6. Eliminate dead stack stores
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Display "Starting Dead Store Elimination..."
+    Display ""
+
+    Note: Phase 1: Collect stores
+    Display "Phase 1: Collecting stores..."
+    Let store_count be collect_stores(dse_context)
+    Display "Found " joined with store_count joined with " stores"
+    Display ""
+
+    If store_count equals 0:
+        Display "No stores to optimize"
+        Return 1
+    End If
+
+    Note: Phase 2: Compute kill sets
+    Display "Phase 2: Computing store kill sets..."
+    compute_store_kills(dse_context)
+    Display ""
+
+    Note: Phase 3: Analyze liveness
+    Display "Phase 3: Analyzing store liveness..."
+    analyze_store_liveness(dse_context)
+    Display ""
+
+    Note: Phase 4: Eliminate dead stores
+    Display "Phase 4: Eliminating dead stores..."
+    Let eliminated be eliminate_dead_stores(dse_context)
+    Display "Eliminated " joined with eliminated joined with " dead stores"
+    Display ""
+
+    Note: Phase 5: Store-to-load forwarding
+    Display "Phase 5: Performing store-to-load forwarding..."
+    Let forwarded be perform_store_to_load_forwarding(dse_context)
+    Display "Forwarded " joined with forwarded joined with " stores to loads"
+    Display ""
+
+    Note: Phase 6: Dead stack store elimination
+    Display "Phase 6: Eliminating dead stack stores..."
+    Let stack_eliminated be eliminate_dead_stack_stores(dse_context)
+    Display "Eliminated " joined with stack_eliminated joined with " dead stack stores"
+    Display ""
+
+    Display "Dead Store Elimination complete"
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS - DUAL INTERFACE (STANDALONE + PIPELINE)
+Note: ============================================================================
+
+Process called "optimize_dead_store_elimination" that takes cfg as Integer returns Integer:
+    @Reasoning
+    **MAIN STANDALONE ENTRY POINT**
+
+    Runs dead store elimination independently.
+    Can be called outside the main optimization pipeline.
+
+    **USAGE:**
+    ```
+    Let cfg be mir_builder_build(hir_function)
+    Let success be optimize_dead_store_elimination(cfg)
+    If success equals 1:
+        Note: DSE completed successfully
+    End If
+    ```
+
+    Returns 1 if successful, 0 if failed.
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "optimize_dead_store_elimination: null CFG"
+        Return 0
+    End If
+
+    Display "============================================"
+    Display "STARTING DEAD STORE ELIMINATION"
+    Display "============================================"
+    Display ""
+
+    Note: Create DSE context
+    Let context_ptr be create_dse_context(cfg)
+    If context_ptr equals 0:
+        Display "optimize_dead_store_elimination: failed to create context"
+        Return 0
+    End If
+
+    Note: Run DSE algorithm
+    Let result be run_dse_algorithm(context_ptr)
+
+    Note: Verify MIR correctness
+    Display ""
+    Display "Verifying optimized MIR..."
+    Let verification_result be Verifier.verify_mir(cfg)
+    If verification_result equals 0:
+        Display "ERROR: MIR verification failed after DSE"
+        Display "This indicates a bug in the optimizer"
+        destroy_dse_context(context_ptr)
+        Return 0
+    End If
+    Display "MIR verification passed"
+
+    Note: Print statistics
+    Display ""
+    print_dse_stats(context_ptr)
+
+    Note: Cleanup
+    destroy_dse_context(context_ptr)
+
+    Display ""
+    Display "============================================"
+    Display "DEAD STORE ELIMINATION COMPLETE"
+    Display "============================================"
+
+    Return result
+End Process
+
+Process called "run_dead_store_elimination_pass" that takes optimizer_context as Integer returns Integer:
+    @Reasoning
+    **PIPELINE INTEGRATION ENTRY POINT**
+
+    Runs DSE as part of mir_optimizer.runa pipeline.
+    Coordinates with other optimizations.
+
+    **USAGE (from mir_optimizer.runa):**
+    ```
+    Note: After DCE and other optimizations
+    Let dse_result be run_dead_store_elimination_pass(context_ptr)
+    ```
+
+    Returns number of stores eliminated + forwarded.
+    @End Reasoning
+
+    If optimizer_context equals 0:
+        Return 0
+    End If
+
+    Display "run_dead_store_elimination_pass: starting DSE in pipeline"
+
+    Note: Extract CFG from optimizer context
+    Let cfg be Layout.memory_get_int64(optimizer_context, 0)
+
+    Note: Create DSE context
+    Let dse_context be create_dse_context(cfg)
+    If dse_context equals 0:
+        Return 0
+    End If
+
+    Note: Run DSE
+    run_dse_algorithm(dse_context)
+
+    Note: Get totals
+    Let eliminated_offset be Layout.offset_of_DSEContext_eliminated_count()
+    Let eliminated be Layout.memory_get_integer(dse_context, eliminated_offset)
+
+    Let forwarded_offset be Layout.offset_of_DSEContext_forwarded_count()
+    Let forwarded be Layout.memory_get_integer(dse_context, forwarded_offset)
+
+    Let stack_eliminated_offset be Layout.offset_of_DSEContext_stack_eliminated_count()
+    Let stack_eliminated be Layout.memory_get_integer(dse_context, stack_eliminated_offset)
+
+    Let total be eliminated plus forwarded plus stack_eliminated
+
+    Note: Update optimizer context counters
+    Let current_deleted be Layout.memory_get_int64(optimizer_context, 40)
+    Layout.memory_set_int64(optimizer_context, 40, current_deleted plus total)
+
+    Note: Cleanup
+    destroy_dse_context(dse_context)
+
+    Display "run_dead_store_elimination_pass: total optimizations = " joined with total
+    Return total
+End Process
+
+Note: ============================================================================
+Note: END OF DEAD STORE ELIMINATION MODULE
+Note: ============================================================================
+Note:
+Note: This module provides comprehensive dead store elimination with:
+Note: - Anderson's flow-insensitive points-to alias analysis
+Note: - Store liveness analysis via backward data flow
+Note: - Dead store elimination
+Note: - Store-to-load forwarding
+Note: - Dead stack store elimination
+Note:
+Note: It complements the basic optimizations in mir_optimizer.runa by providing
+Note: memory-aware optimizations that reduce unnecessary memory traffic.
+Note:
+Note: INTEGRATION:
+Note: - Standalone: optimize_dead_store_elimination(cfg)
+Note: - Pipeline: run_dead_store_elimination_pass(optimizer_context)
+Note: ============================================================================

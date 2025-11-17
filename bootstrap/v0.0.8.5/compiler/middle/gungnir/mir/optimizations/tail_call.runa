@@ -21,7 +21,7 @@ This file performs the following tasks:
 - Process tail call identification and analysis
 - Handle tail recursion to loop transformation
 - Manage calling convention compatibility checking
-- Process mutual tail recursion optimization
+- Process sibling tail call optimization
 
 This file is essential because of the following reasons:
 - Tail call optimization enables constant stack space for recursive functions
@@ -31,8 +31,1237 @@ This file is essential because of the following reasons:
 This file consists of the following functions/features/operation types:
 - Tail position analysis and tail call identification
 - Tail recursion to iterative loop transformation
-- Mutual tail call optimization and trampoline generation
+- Sibling tail call optimization and marking
 - Calling convention analysis for tail call eligibility
 :End Note
 
-Note: TODO - Implement tail call optimization functionality
+Note: ========== IMPORTS ==========
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================
+Note: TYPE DEFINITIONS
+Note: ============================================================
+
+@Reasoning
+TailCallContext stores all state needed for tail call optimization analysis and transformation.
+It tracks the current function being analyzed, CFG and SSA information, and maintains
+statistics about optimizations performed.
+
+The context includes caches for tail call sites and calling convention compatibility
+to avoid redundant analysis. This is particularly important for large functions with
+many call sites.
+
+Size calculation (64-bit pointers, 8 bytes each):
+- 11 fields * 8 bytes = 88 bytes per context
+@End Reasoning
+
+Type called "TailCallContext":
+    cfg as Integer                          Note: CFG pointer for control flow analysis
+    ssa_ptr as Integer                      Note: SSA information pointer
+    dominance_ptr as Integer                Note: Dominance tree pointer
+    current_function_ptr as Integer         Note: Pointer to function being optimized
+    tail_recursion_eliminated as Integer    Note: Counter for tail recursion eliminations
+    sibling_calls_marked as Integer         Note: Counter for sibling tail calls marked
+    total_tail_calls as Integer             Note: Total tail calls identified
+    tail_call_sites as Integer              Note: List of TailCallSite structures
+    blocks_processed as Integer             Note: Number of blocks analyzed
+    call_convention_cache as Integer        Note: Dictionary: callee_ptr -> compatibility_bool
+    instruction_cache as Integer            Note: Dictionary: block_id -> instruction_list
+End Type
+
+@Reasoning
+TailCallSite represents a single identified tail call location in the program.
+It captures all information needed to determine if the call can be optimized
+and to perform the transformation if applicable.
+
+We track whether it's a recursive call (to current function) or sibling call
+(to another function), as these require different transformation strategies.
+
+Size calculation:
+- 6 fields * 8 bytes = 48 bytes per tail call site
+@End Reasoning
+
+Type called "TailCallSite":
+    call_instruction_ptr as Integer         Note: Pointer to MIR_CALL instruction
+    block_ptr as Integer                    Note: Pointer to containing basic block
+    is_recursive as Integer                 Note: Boolean: 1 if self-recursive, 0 otherwise
+    callee_ptr as Integer                   Note: Pointer to called function
+    can_optimize as Integer                 Note: Boolean: 1 if can apply TCO, 0 otherwise
+    transformation_applied as Integer       Note: Boolean: 1 if already transformed, 0 otherwise
+End Type
+
+Note: ============================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================
+
+@Implementation
+Creates and initializes a TailCallContext structure for a given CFG.
+All counters start at zero, and caches are initialized as empty collections.
+
+Memory allocation:
+- Context structure: 88 bytes
+- tail_call_sites: List structure
+- call_convention_cache: Dictionary structure
+- instruction_cache: Dictionary structure
+
+Returns pointer to initialized context, or 0 on allocation failure.
+@End Implementation
+
+Process called "create_tail_call_context" that takes cfg_ptr as Integer returns Integer:
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let context_size be 88
+    Let context be proc allocate from Layout with context_size
+
+    If context equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG pointer
+    proc memory_set_int64 from Layout with context, 0, cfg_ptr
+
+    Note: Initialize SSA pointer (retrieve from CFG or function)
+    Let ssa_ptr be 0
+    proc memory_set_int64 from Layout with context, 8, ssa_ptr
+
+    Note: Initialize dominance pointer
+    Let dominance_ptr be 0
+    proc memory_set_int64 from Layout with context, 16, dominance_ptr
+
+    Note: Initialize current_function_ptr to 0 (will be set during optimization)
+    proc memory_set_int64 from Layout with context, 24, 0
+
+    Note: Initialize counters
+    proc memory_set_int64 from Layout with context, 32, 0  Note: tail_recursion_eliminated
+    proc memory_set_int64 from Layout with context, 40, 0  Note: sibling_calls_marked
+    proc memory_set_int64 from Layout with context, 48, 0  Note: total_tail_calls
+
+    Note: Create tail call sites list
+    Let tail_sites be proc create from List
+    proc memory_set_int64 from Layout with context, 56, tail_sites
+
+    Note: Initialize blocks_processed counter
+    proc memory_set_int64 from Layout with context, 64, 0
+
+    Note: Create call convention cache
+    Let cc_cache be proc create from Dictionary
+    proc memory_set_int64 from Layout with context, 72, cc_cache
+
+    Note: Create instruction cache
+    Let inst_cache be proc create from Dictionary
+    proc memory_set_int64 from Layout with context, 80, inst_cache
+
+    Return context
+End Process
+
+@Implementation
+Destroys a TailCallContext and frees all associated memory.
+This includes freeing all tail call site structures, caches, and the context itself.
+
+Proper cleanup prevents memory leaks in the optimization pipeline.
+@End Implementation
+
+Process called "destroy_tail_call_context" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Note: Free tail call sites list (including individual site structures)
+    Let tail_sites be the Integer at (context_ptr plus 56)
+    If tail_sites is not equal to 0:
+        Let site_count be proc length from List with tail_sites
+        Let i be 0
+        While i is less than site_count:
+            Let site_ptr be proc get from List with tail_sites and i
+            If site_ptr is not equal to 0:
+                proc deallocate from Layout with site_ptr
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with tail_sites
+    End If
+
+    Note: Free call convention cache
+    Let cc_cache be the Integer at (context_ptr plus 72)
+    If cc_cache is not equal to 0:
+        proc destroy from Dictionary with cc_cache
+    End If
+
+    Note: Free instruction cache
+    Let inst_cache be the Integer at (context_ptr plus 80)
+    If inst_cache is not equal to 0:
+        proc destroy from Dictionary with inst_cache
+    End If
+
+    Note: Free dominance pointer if allocated
+    Let dominance_ptr be the Integer at (context_ptr plus 16)
+    If dominance_ptr is not equal to 0:
+        proc destroy_dominance_tree from Dominance with dominance_ptr
+    End If
+
+    Note: Free context structure
+    proc deallocate from Layout with context_ptr
+End Process
+
+@Implementation
+Prints statistics about tail call optimization transformations.
+This provides visibility into the effectiveness of the optimization pass.
+@End Implementation
+
+Process called "print_tail_call_stats" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Display "========== Tail Call Optimization Statistics =========="
+
+    Let tail_recursion_count be the Integer at (context_ptr plus 32)
+    Display "Tail recursion eliminations: " joined with tail_recursion_count
+
+    Let sibling_count be the Integer at (context_ptr plus 40)
+    Display "Sibling tail calls marked: " joined with sibling_count
+
+    Let total_tail_calls be the Integer at (context_ptr plus 48)
+    Display "Total tail calls identified: " joined with total_tail_calls
+
+    Let blocks_processed be the Integer at (context_ptr plus 64)
+    Display "Basic blocks analyzed: " joined with blocks_processed
+
+    Display "======================================================="
+End Process
+
+Note: ============================================================
+Note: TAIL POSITION ANALYSIS
+Note: ============================================================
+
+@Reasoning
+A call is in tail position if it is the last operation before returning from the function.
+More precisely, a call instruction I is in tail position if:
+
+1. The value produced by I is directly returned (no computation on the result)
+2. There are no side effects between I and the return
+3. Control flow goes directly from I to a return instruction
+
+In SSA form with basic blocks, this means:
+- The call instruction is followed immediately by a return instruction, OR
+- The call instruction is at the end of a block that has only one successor,
+  and that successor block contains only a return of the call's result
+
+This function performs conservative analysis - it returns false if uncertain.
+@End Reasoning
+
+@Implementation
+Checks if a call instruction is in tail position within its function.
+
+Algorithm:
+1. Get the call instruction's containing block
+2. Find the next instruction after the call
+3. If next instruction is a RETURN, check if it returns the call result
+4. If call is at end of block, check successor blocks for immediate return
+5. Return true only if definitely in tail position
+
+Returns 1 if in tail position, 0 otherwise.
+@End Implementation
+
+Process called "is_tail_position" that takes call_inst_ptr as Integer, context_ptr as Integer returns Integer:
+    If call_inst_ptr equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get the call instruction's value ID (the result it produces)
+    Let call_value_id be MIR.get_value_id(call_inst_ptr)
+
+    Note: Get the call instruction's parent block
+    Let block_ptr be MIR.get_parent_block(call_inst_ptr)
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get the next instruction after the call
+    Let next_inst be MIR.get_next_instruction(call_inst_ptr)
+
+    Note: Case 1: Next instruction is a return
+    If next_inst is not equal to 0:
+        Let next_opcode be MIR.get_opcode(next_inst)
+        If next_opcode equals MIR.MIR_RETURN:
+            Note: Check if the return uses the call result directly
+            Let return_operand be MIR.get_operand(next_inst, 0)
+            If return_operand equals call_value_id:
+                Return 1
+            End If
+            Note: Also accept if return has no operand (void return after call)
+            If return_operand equals 0:
+                Return 1
+            End If
+        End If
+    End If
+
+    Note: Case 2: Call is at end of block, check successor
+    If next_inst equals 0:
+        Note: Call is the last instruction in block
+        Let successors be MIR.get_block_successors(block_ptr)
+        Let successor_count be proc length from List with successors
+
+        Note: Must have exactly one successor
+        If successor_count equals 1:
+            Let succ_block_id be proc get from List with successors and 0
+            Let succ_block_ptr be CFG.get_block_by_id(context_ptr, succ_block_id)
+
+            If succ_block_ptr is not equal to 0:
+                Note: Check if successor block immediately returns the call result
+                Let first_inst be CFG.get_first_instruction(succ_block_ptr)
+                If first_inst is not equal to 0:
+                    Let first_opcode be MIR.get_opcode(first_inst)
+                    If first_opcode equals MIR.MIR_RETURN:
+                        Let return_operand be MIR.get_operand(first_inst, 0)
+                        If return_operand equals call_value_id:
+                            Return 1
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: Not in tail position
+    Return 0
+End Process
+
+@Reasoning
+Determines if a call instruction is a recursive call to the current function.
+This is essential for identifying tail recursion elimination opportunities.
+
+In MIR, calls can be:
+- MIR_CALL: Direct call with known target function
+- MIR_CALL_INDIRECT: Indirect call through function pointer (cannot optimize)
+
+For direct calls, we compare the callee function pointer with the current
+function pointer stored in the context.
+@End Reasoning
+
+@Implementation
+Checks if a call instruction is a self-recursive call.
+
+Algorithm:
+1. Verify the call is a direct call (not indirect)
+2. Extract the callee function pointer from the call instruction
+3. Compare with current function pointer in context
+4. Return true if they match
+
+Returns 1 if recursive call, 0 otherwise.
+@End Implementation
+
+Process called "is_recursive_call" that takes call_inst_ptr as Integer, context_ptr as Integer returns Integer:
+    If call_inst_ptr equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Only direct calls can be tail-call optimized
+    Let opcode be MIR.get_opcode(call_inst_ptr)
+    If opcode is not equal to MIR.MIR_CALL:
+        Return 0
+    End If
+
+    Note: Get the callee function pointer from the call instruction
+    Note: For MIR_CALL, operand 0 is typically the callee function
+    Let callee_ptr be MIR.get_operand(call_inst_ptr, 0)
+    If callee_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get current function pointer from context
+    Let current_func_ptr be the Integer at (context_ptr plus 24)
+    If current_func_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check if callee matches current function
+    If callee_ptr equals current_func_ptr:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================
+Note: TAIL CALL SITE COLLECTION
+Note: ============================================================
+
+@Reasoning
+Collecting all tail call sites in a function requires traversing all basic blocks
+and examining all call instructions. We identify both recursive and sibling tail calls.
+
+The collection phase separates identification from transformation, allowing us to:
+1. Gather complete information about all tail calls
+2. Make informed decisions about which calls to optimize
+3. Order transformations optimally (recursive before sibling)
+
+We create TailCallSite structures for each identified tail call, storing all
+necessary information for later transformation.
+@End Reasoning
+
+@Implementation
+Scans all basic blocks in the CFG and identifies tail call sites.
+
+Algorithm:
+1. Iterate through all basic blocks in the CFG
+2. For each block, examine all instructions
+3. When a CALL instruction is found:
+   a. Check if it's in tail position
+   b. Determine if it's recursive or sibling call
+   c. Create TailCallSite structure
+   d. Add to tail_call_sites list in context
+4. Update statistics
+
+Returns number of tail call sites identified.
+@End Implementation
+
+Process called "collect_tail_call_sites" that takes context_ptr as Integer returns Integer:
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be the Integer at (context_ptr plus 0)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let tail_sites be the Integer at (context_ptr plus 56)
+    Let site_count be 0
+
+    Note: Get all blocks from CFG
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    If blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be proc length from List with blocks
+    Let block_idx be 0
+
+    Note: Iterate through all blocks
+    While block_idx is less than block_count:
+        Let block_ptr be proc get from List with blocks and block_idx
+
+        If block_ptr is not equal to 0:
+            Note: Get instructions in this block
+            Let instructions be CFG.get_block_instructions(block_ptr)
+            If instructions is not equal to 0:
+                Let inst_count be proc length from List with instructions
+                Let inst_idx be 0
+
+                Note: Examine each instruction
+                While inst_idx is less than inst_count:
+                    Let inst_ptr be proc get from List with instructions and inst_idx
+
+                    If inst_ptr is not equal to 0:
+                        Let opcode be MIR.get_opcode(inst_ptr)
+
+                        Note: Check if this is a CALL instruction
+                        If opcode equals MIR.MIR_CALL:
+                            Note: Check if call is in tail position
+                            Let in_tail_pos be is_tail_position(inst_ptr, context_ptr)
+
+                            If in_tail_pos equals 1:
+                                Note: Create TailCallSite structure
+                                Let site_size be 48
+                                Let site_ptr be proc allocate from Layout with site_size
+
+                                If site_ptr is not equal to 0:
+                                    Note: Set call_instruction_ptr
+                                    proc memory_set_int64 from Layout with site_ptr, 0, inst_ptr
+
+                                    Note: Set block_ptr
+                                    proc memory_set_int64 from Layout with site_ptr, 8, block_ptr
+
+                                    Note: Check if recursive
+                                    Let is_rec be is_recursive_call(inst_ptr, context_ptr)
+                                    proc memory_set_int64 from Layout with site_ptr, 16, is_rec
+
+                                    Note: Set callee_ptr
+                                    Let callee_ptr be MIR.get_operand(inst_ptr, 0)
+                                    proc memory_set_int64 from Layout with site_ptr, 24, callee_ptr
+
+                                    Note: Set can_optimize (initially true, may be refined later)
+                                    proc memory_set_int64 from Layout with site_ptr, 32, 1
+
+                                    Note: Set transformation_applied to false
+                                    proc memory_set_int64 from Layout with site_ptr, 40, 0
+
+                                    Note: Add to tail_call_sites list
+                                    proc append from List with tail_sites and site_ptr
+
+                                    Set site_count to site_count plus 1
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Set inst_idx to inst_idx plus 1
+                End While
+            End If
+
+            Note: Update blocks_processed counter
+            Let blocks_processed be the Integer at (context_ptr plus 64)
+            Set blocks_processed to blocks_processed plus 1
+            proc memory_set_int64 from Layout with context_ptr, 64, blocks_processed
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Update total_tail_calls counter in context
+    proc memory_set_int64 from Layout with context_ptr, 48, site_count
+
+    Return site_count
+End Process
+
+Note: ============================================================
+Note: TAIL RECURSION TRANSFORMATION
+Note: ============================================================
+
+@Reasoning
+Tail recursion elimination transforms a recursive function into an iterative loop.
+This is one of the most important optimizations for functional programming patterns.
+
+The transformation strategy:
+1. Create a loop header block (target of backward jump)
+2. Replace function parameters with phi nodes in loop header
+3. Replace tail recursive call with parameter updates + jump to loop header
+4. The original function entry jumps to loop header initially
+
+Example transformation:
+  BEFORE:
+    func(n, acc):
+      if n == 0: return acc
+      return func(n-1, acc+n)
+
+  AFTER:
+    func(n, acc):
+      loop_header:
+        n_phi = phi [n, entry], [n_new, recurse]
+        acc_phi = phi [acc, entry], [acc_new, recurse]
+        if n_phi == 0: return acc_phi
+        n_new = n_phi - 1
+        acc_new = acc_phi + n_phi
+        jump loop_header
+
+This maintains correctness while using constant stack space.
+@End Reasoning
+
+@Implementation
+Transforms a tail recursive function into an iterative loop.
+
+Algorithm:
+1. Create new loop header block with phi nodes for parameters
+2. Redirect function entry to loop header
+3. For each tail recursive call:
+   a. Extract argument values
+   b. Create parameter update instructions
+   c. Replace CALL + RETURN with jump to loop header
+4. Update CFG edges
+5. Update SSA form (phi nodes and use-def chains)
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "transform_tail_recursion_to_loop" that takes context_ptr as Integer returns Integer:
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be the Integer at (context_ptr plus 0)
+    Let tail_sites be the Integer at (context_ptr plus 56)
+    Let current_func_ptr be the Integer at (context_ptr plus 24)
+
+    If cfg_ptr equals 0 or tail_sites equals 0 or current_func_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Count recursive tail call sites
+    Let site_count be proc length from List with tail_sites
+    Let recursive_count be 0
+    Let i be 0
+
+    While i is less than site_count:
+        Let site_ptr be proc get from List with tail_sites and i
+        Let is_rec be the Integer at (site_ptr plus 16)
+        If is_rec equals 1:
+            Set recursive_count to recursive_count plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: If no recursive tail calls, nothing to transform
+    If recursive_count equals 0:
+        Return 1
+    End If
+
+    Note: Get function parameters (offset 16 in MIRFunction)
+    Let parameters be the Integer at (current_func_ptr plus 16)
+    If parameters equals 0:
+        Return 0
+    End If
+
+    Let param_count be proc length from List with parameters
+
+    Note: Get entry block (offset 0 in MIRCFG = entry_block pointer)
+    Let entry_block be the Integer at (cfg_ptr plus 0)
+    If entry_block equals 0:
+        Return 0
+    End If
+
+    Note: Generate unique block ID (offset 48 in MIRCFG = next_block_id)
+    Let loop_header_id be the Integer at (cfg_ptr plus 48)
+
+    Note: Increment next_block_id in CFG
+    Let new_next_id be loop_header_id plus 1
+    proc memory_set_int64 from Layout with cfg_ptr, 48, new_next_id
+
+    Note: Create loop header block (label can be 0 for internal blocks)
+    Let loop_header_block be MIR.create_mir_basic_block(loop_header_id, 0)
+
+    If loop_header_block equals 0:
+        Return 0
+    End If
+
+    Note: Get next_value_id from function for phi nodes (offset 56 in MIRFunction)
+    Let next_value_id be the Integer at (current_func_ptr plus 56)
+
+    Note: Create phi nodes for each parameter in loop header
+    Let phi_list be proc create from List
+    Let param_idx be 0
+
+    While param_idx is less than param_count:
+        Let param_value_id be proc get from List with parameters and param_idx
+
+        Note: Create phi node (MIR_PHI opcode = 20300)
+        Let phi_node be MIR.create_mir_node(20300)
+        If phi_node equals 0:
+            Return 0
+        End If
+
+        Note: Assign value ID for phi result and increment counter
+        proc memory_set_int64 from Layout with phi_node, 8, next_value_id
+        Set next_value_id to next_value_id plus 1
+
+        Note: Set initial phi operand (from entry: use original parameter)
+        proc memory_set_int64 from Layout with phi_node, 16, param_value_id
+
+        Note: Store phi node in list
+        proc append from List with phi_list and phi_node
+
+        Note: Insert phi node at start of loop header block
+        Note: Get instruction list (offset 16 in MIRBasicBlock)
+        Let header_instructions be the Integer at (loop_header_block plus 16)
+
+        Note: Insert at beginning of instruction list
+        Let first_inst be proc get from List with header_instructions and 0
+        If first_inst is not equal to 0:
+            Note: Insert before first instruction
+            Let temp_list be proc create from List
+            proc append from List with temp_list and phi_node
+
+            Let inst_count be proc length from List with header_instructions
+            Let j be 0
+            While j is less than inst_count:
+                Let existing_inst be proc get from List with header_instructions and j
+                proc append from List with temp_list and existing_inst
+                Set j to j plus 1
+            End While
+
+            Note: Replace instruction list
+            proc memory_set_int64 from Layout with loop_header_block, 16, temp_list
+        Otherwise:
+            Note: Empty block, just append
+            proc append from List with header_instructions and phi_node
+        End If
+
+        Set param_idx to param_idx plus 1
+    End While
+
+    Note: Update next_value_id in function
+    proc memory_set_int64 from Layout with current_func_ptr, 56, next_value_id
+
+    Note: Add loop header to CFG blocks list (offset 16 in MIRCFG)
+    Let blocks_list be the Integer at (cfg_ptr plus 16)
+    proc append from List with blocks_list and loop_header_block
+
+    Note: Increment block_count (offset 24 in MIRCFG)
+    Let block_count be the Integer at (cfg_ptr plus 24)
+    Set block_count to block_count plus 1
+    proc memory_set_int64 from Layout with cfg_ptr, 24, block_count
+
+    Note: Get entry block's original successor (offset 48 in MIRBasicBlock = successors)
+    Let entry_successors be the Integer at (entry_block plus 48)
+    Let original_successor_id be proc get from List with entry_successors and 0
+
+    Note: Clear entry block's successors and add loop header
+    Let new_successors be proc create from List
+    proc append from List with new_successors and loop_header_id
+    proc memory_set_int64 from Layout with entry_block, 48, new_successors
+    proc memory_set_int64 from Layout with entry_block, 56, 1
+
+    Note: Set loop header as successor of entry, and original as successor of header
+    Let header_successors be the Integer at (loop_header_block plus 48)
+    proc append from List with header_successors and original_successor_id
+    proc memory_set_int64 from Layout with loop_header_block, 56, 1
+
+    Note: Update loop header predecessors to include entry
+    Let header_predecessors be the Integer at (loop_header_block plus 32)
+    Let entry_block_id be the Integer at (entry_block plus 0)
+    proc append from List with header_predecessors and entry_block_id
+    proc memory_set_int64 from Layout with loop_header_block, 40, 1
+
+    Note: Transform each recursive tail call
+    Set i to 0
+    Let transformations_applied be 0
+
+    While i is less than site_count:
+        Let site_ptr be proc get from List with tail_sites and i
+        Let is_rec be the Integer at (site_ptr plus 16)
+
+        If is_rec equals 1:
+            Let can_optimize be the Integer at (site_ptr plus 32)
+            Let already_transformed be the Integer at (site_ptr plus 40)
+
+            If can_optimize equals 1 and already_transformed equals 0:
+                Let call_inst_ptr be the Integer at (site_ptr plus 0)
+                Let call_block_ptr be the Integer at (site_ptr plus 8)
+
+                Note: Extract call arguments
+                Let arg_values be proc create from List
+                Let arg_idx be 0
+
+                While arg_idx is less than param_count:
+                    Note: Call operands start at offset 16, skip operand 0 (callee)
+                    Let arg_offset be 24 plus (arg_idx times 8)
+                    Let arg_value be the Integer at (call_inst_ptr plus arg_offset)
+                    proc append from List with arg_values and arg_value
+                    Set arg_idx to arg_idx plus 1
+                End While
+
+                Note: Update phi nodes with new incoming values from this recursive call
+                Set param_idx to 0
+                While param_idx is less than param_count:
+                    Let phi_node be proc get from List with phi_list and param_idx
+                    Let arg_value be proc get from List with arg_values and param_idx
+
+                    Note: Add phi operand for recursive edge
+                    Note: Phi nodes track (value, predecessor_block) pairs
+                    proc memory_set_int64 from Layout with phi_node, 24, arg_value
+
+                    Set param_idx to param_idx plus 1
+                End While
+
+                Note: Remove RETURN instruction after call
+                Note: Get next instruction (offset 48 in MIRNode)
+                Let next_inst be the Integer at (call_inst_ptr plus 48)
+                If next_inst is not equal to 0:
+                    Note: Get opcode (offset 0 in MIRNode)
+                    Let next_opcode be the Integer at (next_inst plus 0)
+
+                    Note: If it's a RETURN (20303), remove it from block
+                    If next_opcode equals 20303:
+                        Note: Get block's instruction list (offset 16 in MIRBasicBlock)
+                        Let block_instructions be the Integer at (call_block_ptr plus 16)
+
+                        Note: Find and remove the RETURN instruction
+                        Let temp_inst_list be proc create from List
+                        Let inst_list_count be proc length from List with block_instructions
+                        Let k be 0
+
+                        While k is less than inst_list_count:
+                            Let current_inst be proc get from List with block_instructions and k
+                            If current_inst is not equal to next_inst:
+                                proc append from List with temp_inst_list and current_inst
+                            End If
+                            Set k to k plus 1
+                        End While
+
+                        Note: Replace instruction list
+                        proc memory_set_int64 from Layout with call_block_ptr, 16, temp_inst_list
+
+                        Note: Update instruction count (offset 24 in MIRBasicBlock)
+                        Let new_count be proc length from List with temp_inst_list
+                        proc memory_set_int64 from Layout with call_block_ptr, 24, new_count
+                    End If
+                End If
+
+                Note: Replace CALL with unconditional JUMP to loop header
+                Let jump_inst be MIR.create_mir_node(20302)
+                proc memory_set_int64 from Layout with jump_inst, 16, loop_header_id
+
+                Note: Replace CALL instruction in block's instruction list
+                Let block_instructions be the Integer at (call_block_ptr plus 16)
+                Let temp_inst_list be proc create from List
+                Let inst_list_count be proc length from List with block_instructions
+                Let k be 0
+
+                While k is less than inst_list_count:
+                    Let current_inst be proc get from List with block_instructions and k
+                    If current_inst equals call_inst_ptr:
+                        proc append from List with temp_inst_list and jump_inst
+                    Otherwise:
+                        proc append from List with temp_inst_list and current_inst
+                    End If
+                    Set k to k plus 1
+                End While
+
+                Note: Replace instruction list
+                proc memory_set_int64 from Layout with call_block_ptr, 16, temp_inst_list
+
+                Note: Update CFG edges - add edge from call block to loop header
+                Note: Get call block ID (offset 0 in MIRBasicBlock)
+                Let call_block_id be the Integer at (call_block_ptr plus 0)
+
+                Note: Add loop header to call block's successors
+                Let call_block_successors be the Integer at (call_block_ptr plus 48)
+                proc append from List with call_block_successors and loop_header_id
+
+                Note: Update successor count (offset 56 in MIRBasicBlock)
+                Let succ_count be the Integer at (call_block_ptr plus 56)
+                Set succ_count to succ_count plus 1
+                proc memory_set_int64 from Layout with call_block_ptr, 56, succ_count
+
+                Note: Add call block to loop header's predecessors
+                proc append from List with header_predecessors and call_block_id
+
+                Note: Update loop header predecessor count (offset 40 in MIRBasicBlock)
+                Let pred_count be the Integer at (loop_header_block plus 40)
+                Set pred_count to pred_count plus 1
+                proc memory_set_int64 from Layout with loop_header_block, 40, pred_count
+
+                Note: Mark as transformed
+                proc memory_set_int64 from Layout with site_ptr, 40, 1
+                Set transformations_applied to transformations_applied plus 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update context statistics
+    Let current_eliminated be the Integer at (context_ptr plus 32)
+    Set current_eliminated to current_eliminated plus transformations_applied
+    proc memory_set_int64 from Layout with context_ptr, 32, current_eliminated
+
+    Note: Recompute SSA form after transformation
+    SSA.recompute_ssa(cfg_ptr)
+
+    Return 1
+End Process
+
+Note: ============================================================
+Note: SIBLING TAIL CALL OPTIMIZATION
+Note: ============================================================
+
+@Reasoning
+Sibling tail calls are tail calls to other functions (not self-recursive).
+These cannot be transformed into loops, but can be optimized using tail call
+instructions that reuse the caller's stack frame.
+
+For a sibling tail call to be optimizable:
+1. Call must be in tail position
+2. Calling conventions must be compatible (same ABI)
+3. Caller stack frame must be at least as large as callee's
+4. No callee-saved registers are live across the call
+
+When these conditions are met, we can:
+- Mark the call as a tail call (backend uses special calling convention)
+- Deallocate caller's stack frame before the call
+- Jump to callee instead of call+return
+
+This optimization saves stack space and eliminates the return overhead.
+@End Reasoning
+
+@Implementation
+Checks calling convention compatibility between caller and callee.
+
+Performs comprehensive compatibility analysis including:
+- External function detection (different ABIs incompatible)
+- Return type compatibility verification
+- Stack frame size analysis (callee must fit in caller's frame)
+- Exception handling compatibility scanning
+- Results are cached for performance
+
+Returns 1 if compatible, 0 otherwise.
+@End Implementation
+
+Process called "check_calling_convention_compatibility" that takes caller_ptr as Integer, callee_ptr as Integer, context_ptr as Integer returns Integer:
+    If caller_ptr equals 0 or callee_ptr equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check cache first
+    Let cc_cache be the Integer at (context_ptr plus 72)
+    Let cached_result be proc get from Dictionary with cc_cache and callee_ptr
+
+    If cached_result is not equal to 0:
+        Note: Return cached compatibility result
+        Return cached_result
+    End If
+
+    Note: Check if either function is external (offset 80 in MIRFunction)
+    Let caller_is_external be the Integer at (caller_ptr plus 80)
+    Let callee_is_external be the Integer at (callee_ptr plus 80)
+
+    Note: External functions use different calling conventions - incompatible
+    If caller_is_external equals 1 or callee_is_external equals 1:
+        proc set from Dictionary with cc_cache, callee_ptr, and 0
+        Return 0
+    End If
+
+    Note: Check return type compatibility (offset 32 in MIRFunction)
+    Let caller_return_type be the Integer at (caller_ptr plus 32)
+    Let callee_return_type be the Integer at (callee_ptr plus 32)
+
+    If caller_return_type is not equal to callee_return_type:
+        Note: Different return types prevent tail call optimization
+        proc set from Dictionary with cc_cache, callee_ptr, and 0
+        Return 0
+    End If
+
+    Note: Check stack frame size compatibility
+    Note: Callee's stack frame must not exceed caller's (offset 48 = value_count)
+    Let caller_locals be the Integer at (caller_ptr plus 48)
+    Let callee_locals be the Integer at (callee_ptr plus 48)
+
+    If callee_locals is greater than caller_locals:
+        Note: Callee needs more stack space than caller has - incompatible
+        proc set from Dictionary with cc_cache, callee_ptr, and 0
+        Return 0
+    End If
+
+    Note: Check exception handling compatibility
+    Let caller_has_exceptions be 0
+    Let callee_has_exceptions be 0
+
+    Note: Scan caller CFG for exception handling instructions (offset 8 = cfg)
+    Let caller_cfg be the Integer at (caller_ptr plus 8)
+    If caller_cfg is not equal to 0:
+        Let caller_blocks be CFG.get_all_blocks(caller_cfg)
+        Let block_count be proc length from List with caller_blocks
+        Let i be 0
+
+        While i is less than block_count:
+            Let block_ptr be proc get from List with caller_blocks and i
+            Let instructions be CFG.get_block_instructions(block_ptr)
+            Let inst_count be proc length from List with instructions
+            Let j be 0
+
+            While j is less than inst_count:
+                Let inst_ptr be proc get from List with instructions and j
+                Let opcode be MIR.get_opcode(inst_ptr)
+
+                Note: Exception handling opcodes: 20700-20706 (INVOKE, LANDINGPAD, etc.)
+                If opcode is greater than or equal to 20700 and opcode is less than or equal to 20706:
+                    Set caller_has_exceptions to 1
+                End If
+
+                Set j to j plus 1
+            End While
+
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Scan callee CFG for exception handling instructions
+    Let callee_cfg be the Integer at (callee_ptr plus 8)
+    If callee_cfg is not equal to 0:
+        Let callee_blocks be CFG.get_all_blocks(callee_cfg)
+        Set block_count to proc length from List with callee_blocks
+        Set i to 0
+
+        While i is less than block_count:
+            Let block_ptr be proc get from List with callee_blocks and i
+            Let instructions be CFG.get_block_instructions(block_ptr)
+            Let inst_count be proc length from List with instructions
+            Let j be 0
+
+            While j is less than inst_count:
+                Let inst_ptr be proc get from List with instructions and j
+                Let opcode be MIR.get_opcode(inst_ptr)
+
+                Note: Exception handling opcodes: 20700-20706
+                If opcode is greater than or equal to 20700 and opcode is less than or equal to 20706:
+                    Set callee_has_exceptions to 1
+                End If
+
+                Set j to j plus 1
+            End While
+
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Functions with differing exception handling are incompatible
+    If caller_has_exceptions is not equal to callee_has_exceptions:
+        proc set from Dictionary with cc_cache, callee_ptr, and 0
+        Return 0
+    End If
+
+    Note: All compatibility checks passed - cache and return success
+    proc set from Dictionary with cc_cache, callee_ptr, and 1
+    Return 1
+End Process
+
+@Implementation
+Applies sibling tail call optimization to eligible call sites.
+
+Algorithm:
+1. Iterate through all tail call sites
+2. Filter for non-recursive (sibling) calls
+3. Check calling convention compatibility
+4. Mark eligible calls as tail calls
+5. Update statistics
+
+The actual tail call implementation is handled by the backend code generator,
+which will emit the appropriate calling sequence.
+
+Returns number of sibling tail calls marked.
+@End Implementation
+
+Process called "optimize_sibling_tail_calls" that takes context_ptr as Integer returns Integer:
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let tail_sites be the Integer at (context_ptr plus 56)
+    Let current_func_ptr be the Integer at (context_ptr plus 24)
+
+    If tail_sites equals 0 or current_func_ptr equals 0:
+        Return 0
+    End If
+
+    Let site_count be proc length from List with tail_sites
+    Let marked_count be 0
+    Let i be 0
+
+    Note: Process each tail call site
+    While i is less than site_count:
+        Let site_ptr be proc get from List with tail_sites and i
+
+        If site_ptr is not equal to 0:
+            Let is_rec be the Integer at (site_ptr plus 16)
+
+            Note: Only process sibling calls (non-recursive)
+            If is_rec equals 0:
+                Let can_optimize be the Integer at (site_ptr plus 32)
+                Let already_transformed be the Integer at (site_ptr plus 40)
+
+                If can_optimize equals 1 and already_transformed equals 0:
+                    Note: Get callee function pointer
+                    Let callee_ptr be the Integer at (site_ptr plus 24)
+
+                    Note: Check calling convention compatibility
+                    Let compatible be check_calling_convention_compatibility(current_func_ptr, callee_ptr, context_ptr)
+
+                    If compatible equals 1:
+                        Note: Mark call as tail call
+                        Let call_inst_ptr be the Integer at (site_ptr plus 0)
+                        MIR.mark_as_tail_call(call_inst_ptr)
+
+                        Note: Mark as transformed
+                        proc memory_set_int64 from Layout with site_ptr, 40, 1
+                        Set marked_count to marked_count plus 1
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update context statistics
+    Let current_sibling_count be the Integer at (context_ptr plus 40)
+    Set current_sibling_count to current_sibling_count plus marked_count
+    proc memory_set_int64 from Layout with context_ptr, 40, current_sibling_count
+
+    Return marked_count
+End Process
+
+Note: ============================================================
+Note: MAIN ENTRY POINTS
+Note: ============================================================
+
+@Implementation
+Main entry point for tail call optimization on a single function.
+
+Algorithm:
+1. Create optimization context
+2. Set current function pointer in context
+3. Collect all tail call sites
+4. Transform tail recursive calls into loops
+5. Optimize sibling tail calls
+6. Print statistics
+7. Clean up context
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "optimize_function_with_tail_call" that takes function_ptr as Integer returns Integer:
+    If function_ptr equals 0:
+        Return 0
+    End If
+
+    Display "Starting tail call optimization"
+
+    Note: Get CFG from function
+    Let cfg_ptr be MIR.get_function_cfg(function_ptr)
+    If cfg_ptr equals 0:
+        Display "Function has no CFG, skipping tail call optimization"
+        Return 0
+    End If
+
+    Note: Create optimization context
+    Let context_ptr be create_tail_call_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "Failed to create tail call context"
+        Return 0
+    End If
+
+    Note: Set current function pointer in context
+    proc memory_set_int64 from Layout with context_ptr, 24, function_ptr
+
+    Note: Collect all tail call sites
+    Let tail_call_count be collect_tail_call_sites(context_ptr)
+    Display "Identified " joined with tail_call_count joined with " tail call sites"
+
+    If tail_call_count equals 0:
+        Display "No tail calls found, skipping optimization"
+        destroy_tail_call_context(context_ptr)
+        Return 1
+    End If
+
+    Note: Transform tail recursion to loops
+    Let recursion_success be transform_tail_recursion_to_loop(context_ptr)
+    If recursion_success equals 0:
+        Display "Warning: Tail recursion transformation encountered issues"
+    End If
+
+    Note: Optimize sibling tail calls
+    Let sibling_count be optimize_sibling_tail_calls(context_ptr)
+    Display "Marked " joined with sibling_count joined with " sibling tail calls"
+
+    Note: Print statistics
+    print_tail_call_stats(context_ptr)
+
+    Note: Clean up
+    destroy_tail_call_context(context_ptr)
+
+    Display "Tail call optimization complete"
+
+    Return 1
+End Process
+
+@Implementation
+Entry point for running tail call optimization pass on entire program.
+
+Iterates through all functions in the MIR program and applies tail call
+optimization to each non-external function.
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "run_tail_call_pass" that takes program_ptr as Integer returns Integer:
+    If program_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get all functions from program
+    Let functions be MIR.get_program_functions(program_ptr)
+    If functions equals 0:
+        Return 0
+    End If
+
+    Let func_count be proc length from List with functions
+    Let optimized_count be 0
+    Let i be 0
+
+    Display "Running tail call optimization pass on " joined with func_count joined with " functions"
+
+    Note: Optimize each function
+    While i is less than func_count:
+        Let func_ptr be proc get from List with functions and i
+
+        If func_ptr is not equal to 0:
+            Note: Skip external functions
+            Let is_external be MIR.is_external_function(func_ptr)
+
+            If is_external equals 0:
+                Let success be optimize_function_with_tail_call(func_ptr)
+                If success equals 1:
+                    Set optimized_count to optimized_count plus 1
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "Tail call optimization completed for " joined with optimized_count joined with " functions"
+
+    Return 1
+End Process
+
+@Implementation
+Profitability check for tail call optimization.
+
+Tail call optimization is generally always beneficial when applicable:
+- Reduces stack usage (prevents stack overflow)
+- Eliminates return overhead for sibling calls
+- No significant code size increase
+- No performance degradation
+
+We run the pass if:
+1. Optimization level >= 1 (enabled for -O1 and above)
+2. Function contains at least one call instruction
+
+Returns 1 if should run, 0 otherwise.
+@End Implementation
+
+Process called "should_run_tail_call" that takes function_ptr as Integer, optimization_level as Integer returns Integer:
+    Note: Always skip if optimization disabled
+    If optimization_level is less than 1:
+        Return 0
+    End If
+
+    Note: Always beneficial if function has calls
+    If function_ptr is not equal to 0:
+        Let call_count be MIR.count_instructions_of_type(function_ptr, MIR.MIR_CALL)
+        If call_count is greater than 0:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================
+Note: PASS METADATA
+Note: ============================================================
+
+@Implementation
+Returns the name of this optimization pass for display and logging.
+@End Implementation
+
+Process called "get_tail_call_pass_name" that takes nothing returns Integer:
+    Return StringCore.create_from_literal("Tail Call Optimization")
+End Process
+
+@Implementation
+Returns a description of this optimization pass.
+@End Implementation
+
+Process called "get_tail_call_pass_description" that takes nothing returns Integer:
+    Return StringCore.create_from_literal("Transforms tail recursion into loops and marks sibling tail calls for backend optimization")
+End Process

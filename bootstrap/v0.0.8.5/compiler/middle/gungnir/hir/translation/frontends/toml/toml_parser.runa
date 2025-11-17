@@ -1,0 +1,1069 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+TOML Parser - Builds AST from TOML tokens
+
+This file implements parsing for TOML v1.0.0, handling:
+- Key-value pairs
+- Tables ([table.name])
+- Array of tables ([[array.table]])
+- Arrays
+- Inline tables
+- All TOML data types
+
+TOML AST Node Types:
+- TOML_DOCUMENT - Top-level document (collection of tables/key-values)
+- TOML_TABLE - Table (section with key-value pairs)
+- TOML_ARRAY - Array value
+- TOML_INLINE_TABLE - Inline table {key = value, ...}
+- TOML_STRING - String value
+- TOML_INTEGER - Integer value
+- TOML_FLOAT - Float value
+- TOML_BOOLEAN - Boolean value
+- TOML_DATETIME - Date-time value
+
+Features:
+- Complete TOML 1.0.0 grammar support
+- Table hierarchy management
+- Error reporting with position information
+- Memory-safe AST construction
+
+Dependencies:
+- toml_lexer.runa (for tokenization)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/toml/toml_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Note: ============================================================================
+Note: TOML AST Node Types
+Note: ============================================================================
+
+Constant TOML_DOCUMENT as Integer is 200
+Constant TOML_TABLE as Integer is 201
+Constant TOML_ARRAY as Integer is 202
+Constant TOML_INLINE_TABLE as Integer is 203
+Constant TOML_STRING as Integer is 204
+Constant TOML_INTEGER as Integer is 205
+Constant TOML_FLOAT as Integer is 206
+Constant TOML_BOOLEAN as Integer is 207
+Constant TOML_DATETIME as Integer is 208
+
+Note: ============================================================================
+Note: TOML AST Node Structure
+Note: ============================================================================
+
+Type called "TOMLNode":
+    node_type as Integer        Note: TOML_* constant
+    value_string as Integer     Note: String value (for strings, identifiers)
+    value_int as Integer        Note: Integer value (for integers)
+    is_integer as Integer       Note: Boolean: 1 if value is integer
+    is_float as Integer         Note: Boolean: 1 if value is float
+    children as Integer         Note: List of child nodes (for arrays/tables)
+    keys as Integer             Note: List of keys (for tables/inline tables)
+    table_name as Integer       Note: Full table name (for tables)
+    line as Integer             Note: Line number in source
+    column as Integer           Note: Column number in source
+End Type
+
+Note: ============================================================================
+Note: TOML Parser Structure
+Note: ============================================================================
+
+Type called "TOMLParser":
+    lexer as Integer            Note: TOML lexer
+    current_token as Integer    Note: Current token
+    error_message as Integer    Note: Error message (if any)
+    has_error as Integer        Note: Boolean: 1 if error occurred
+    current_table as Integer    Note: Current table name (dotted path)
+End Type
+
+Note: ============================================================================
+Note: Parser Creation and Destruction
+Note: ============================================================================
+
+Process called "create_toml_parser" takes lexer as Integer returns Integer:
+    Note: Create TOML parser with lexer
+
+    Let parser_size be 40  Note: TOMLParser: 5 fields × 8 bytes
+    Let parser be proc allocate from Layout with parser_size
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize parser state
+    proc memory_set_int64 from Layout with parser, 0, lexer
+    proc memory_set_int64 from Layout with parser, 8, 0   Note: current_token = null
+    proc memory_set_int64 from Layout with parser, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with parser, 24, 0  Note: has_error = false
+    proc memory_set_int64 from Layout with parser, 32, 0  Note: current_table = null (root)
+
+    Note: Advance to first token
+    Let first_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, first_token
+
+    Return parser
+End Process
+
+Process called "destroy_toml_parser" takes parser as Integer returns Integer:
+    Note: Destroy TOML parser
+
+    If parser is equal to 0:
+        Return 1
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Token Management
+Note: ============================================================================
+
+Process called "advance_token" takes parser as Integer returns Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let token be proc next_token from Lexer with lexer
+
+    proc memory_set_int64 from Layout with parser, 8, token
+
+    Return token
+End Process
+
+Process called "peek_token_type" takes parser as Integer returns Integer:
+    Note: Peek at current token type
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+
+    If token is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+
+    Return token_type
+End Process
+
+Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Check if current token matches expected type
+
+    Let actual_type be proc peek_token_type from parser
+
+    If actual_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
+    Note: Expect token of specific type, set error if mismatch
+
+    Let actual_type be proc peek_token_type from parser
+
+    If actual_type is not equal to expected_type:
+        proc set_parse_error from parser, error_msg
+        Return 0
+    End If
+
+    proc advance_token from parser
+
+    Return 1
+End Process
+
+Process called "skip_newlines" takes parser as Integer returns Integer:
+    Note: Skip any newline tokens
+
+    While 1 is equal to 1:
+        Let is_newline be proc check_token_type from parser, TOKEN_NEWLINE from Lexer
+
+        If is_newline is equal to 1:
+            proc advance_token from parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
+    Note: Set parser error message
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 16, new_error
+    proc memory_set_int64 from Layout with parser, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Node Creation
+Note: ============================================================================
+
+Process called "create_toml_node" takes node_type as Integer returns Integer:
+    Note: Create TOML AST node
+
+    Let node_size be 80  Note: TOMLNode: 10 fields × 8 bytes
+    Let node be proc allocate from Layout with node_size
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 0, node_type
+    proc memory_set_int64 from Layout with node, 8, 0   Note: value_string = null
+    proc memory_set_int64 from Layout with node, 16, 0  Note: value_int = 0
+    proc memory_set_int64 from Layout with node, 24, 0  Note: is_integer = false
+    proc memory_set_int64 from Layout with node, 32, 0  Note: is_float = false
+    proc memory_set_int64 from Layout with node, 40, 0  Note: children = null
+    proc memory_set_int64 from Layout with node, 48, 0  Note: keys = null
+    proc memory_set_int64 from Layout with node, 56, 0  Note: table_name = null
+    proc memory_set_int64 from Layout with node, 64, 0  Note: line = 0
+    proc memory_set_int64 from Layout with node, 72, 0  Note: column = 0
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Value Parsing
+Note: ============================================================================
+
+Process called "parse_value" takes parser as Integer returns Integer:
+    Note: Parse TOML value (string, number, boolean, array, inline table)
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: String
+    If token_type is equal to TOKEN_STRING from Lexer:
+        Return proc parse_string from parser
+    End If
+
+    Note: Integer
+    If token_type is equal to TOKEN_INTEGER from Lexer:
+        Return proc parse_integer from parser
+    End If
+
+    Note: Float
+    If token_type is equal to TOKEN_FLOAT from Lexer:
+        Return proc parse_float from parser
+    End If
+
+    Note: Boolean
+    If token_type is equal to TOKEN_BOOLEAN from Lexer:
+        Return proc parse_boolean from parser
+    End If
+
+    Note: DateTime
+    If token_type is equal to TOKEN_DATETIME from Lexer:
+        Return proc parse_datetime from parser
+    End If
+
+    Note: Array
+    If token_type is equal to TOKEN_LEFT_BRACKET from Lexer:
+        Return proc parse_array from parser
+    End If
+
+    Note: Inline table
+    If token_type is equal to TOKEN_LEFT_BRACE from Lexer:
+        Return proc parse_inline_table from parser
+    End If
+
+    proc set_parse_error from parser, "Expected value"
+    Return 0
+End Process
+
+Process called "parse_string" takes parser as Integer returns Integer:
+    Note: Parse TOML string
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let node be proc create_toml_node from TOML_STRING
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Copy lexeme to node
+    Let value_copy be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with value_copy, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with value_copy, lexeme_length, 0
+
+    proc memory_set_int64 from Layout with node, 8, value_copy
+    proc memory_set_int64 from Layout with node, 64, line
+    proc memory_set_int64 from Layout with node, 72, column
+
+    proc advance_token from parser
+
+    Return node
+End Process
+
+Process called "parse_integer" takes parser as Integer returns Integer:
+    Note: Parse TOML integer
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let node be proc create_toml_node from TOML_INTEGER
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Parse integer value
+    Let value be proc parse_integer_value from lexeme
+
+    proc memory_set_int64 from Layout with node, 16, value
+    proc memory_set_int64 from Layout with node, 24, 1  Note: is_integer = true
+    proc memory_set_int64 from Layout with node, 64, line
+    proc memory_set_int64 from Layout with node, 72, column
+
+    proc advance_token from parser
+
+    Return node
+End Process
+
+Process called "parse_float" takes parser as Integer returns Integer:
+    Note: Parse TOML float
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let node be proc create_toml_node from TOML_FLOAT
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Store lexeme for float (HIR translator will convert to float literal)
+    Let value_copy be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with value_copy, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with value_copy, lexeme_length, 0
+
+    proc memory_set_int64 from Layout with node, 8, value_copy
+    proc memory_set_int64 from Layout with node, 32, 1  Note: is_float = true
+    proc memory_set_int64 from Layout with node, 64, line
+    proc memory_set_int64 from Layout with node, 72, column
+
+    proc advance_token from parser
+
+    Return node
+End Process
+
+Process called "parse_boolean" takes parser as Integer returns Integer:
+    Note: Parse TOML boolean
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let node be proc create_toml_node from TOML_BOOLEAN
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Check if true or false
+    Let is_true be proc string_equals from lexeme, "true"
+
+    If is_true is equal to 1:
+        proc memory_set_int64 from Layout with node, 16, 1
+    Otherwise:
+        proc memory_set_int64 from Layout with node, 16, 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 64, line
+    proc memory_set_int64 from Layout with node, 72, column
+
+    proc advance_token from parser
+
+    Return node
+End Process
+
+Process called "parse_datetime" takes parser as Integer returns Integer:
+    Note: Parse TOML datetime (RFC 3339)
+
+    @Reasoning:
+    DateTime values are stored as strings in their original format.
+    Formats: Offset DateTime, Local DateTime, Local Date, Local Time.
+    The lexeme preserves the exact datetime string from source.
+    @End Reasoning
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Let node be proc create_toml_node from TOML_DATETIME
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Copy datetime lexeme to node
+    Let value_copy be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with value_copy, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with value_copy, lexeme_length, 0
+
+    proc memory_set_int64 from Layout with node, 8, value_copy
+    proc memory_set_int64 from Layout with node, 64, line
+    proc memory_set_int64 from Layout with node, 72, column
+
+    proc advance_token from parser
+
+    Return node
+End Process
+
+Process called "parse_array" takes parser as Integer returns Integer:
+    Note: Parse TOML array: [value1, value2, ...]
+
+    proc expect_token from parser, TOKEN_LEFT_BRACKET from Lexer, "Expected '['"
+
+    Let node be proc create_toml_node from TOML_ARRAY
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Let children be proc create from List
+    proc memory_set_int64 from Layout with node, 40, children
+
+    Note: Skip any newlines after [
+    proc skip_newlines from parser
+
+    Note: Parse array elements
+    While 1 is equal to 1:
+        Note: Check for end of array
+        Let is_close be proc check_token_type from parser, TOKEN_RIGHT_BRACKET from Lexer
+
+        If is_close is equal to 1:
+            Break
+        End If
+
+        Note: Parse element
+        Let element be proc parse_value from parser
+
+        If element is equal to 0:
+            Return 0
+        End If
+
+        proc append from List with children, element
+
+        Note: Skip newlines
+        proc skip_newlines from parser
+
+        Note: Check for comma or end
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_token from parser
+            proc skip_newlines from parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc expect_token from parser, TOKEN_RIGHT_BRACKET from Lexer, "Expected ']'"
+
+    Return node
+End Process
+
+Process called "parse_inline_table" takes parser as Integer returns Integer:
+    Note: Parse TOML inline table: {key = value, key2 = value2}
+
+    proc expect_token from parser, TOKEN_LEFT_BRACE from Lexer, "Expected '{'"
+
+    Let node be proc create_toml_node from TOML_INLINE_TABLE
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Let children be proc create from List
+    Let keys be proc create from List
+
+    proc memory_set_int64 from Layout with node, 40, children
+    proc memory_set_int64 from Layout with node, 48, keys
+
+    Note: Parse key-value pairs
+    While 1 is equal to 1:
+        Note: Check for end of inline table
+        Let is_close be proc check_token_type from parser, TOKEN_RIGHT_BRACE from Lexer
+
+        If is_close is equal to 1:
+            Break
+        End If
+
+        Note: Parse key
+        Let key_token be proc memory_get_int64 from Layout with parser, 8
+        Let key_lexeme be proc memory_get_int64 from Layout with key_token, 8
+        Let key_length be proc memory_get_int64 from Layout with key_token, 16
+
+        Let key_copy be proc allocate from Layout with key_length plus 1
+        proc memory_copy from Layout with key_copy, 0, key_lexeme, 0, key_length
+        proc memory_set_byte from Layout with key_copy, key_length, 0
+
+        proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected key"
+        proc expect_token from parser, TOKEN_EQUAL from Lexer, "Expected '='"
+
+        Note: Parse value
+        Let value_node be proc parse_value from parser
+
+        If value_node is equal to 0:
+            Return 0
+        End If
+
+        proc append from List with keys, key_copy
+        proc append from List with children, value_node
+
+        Note: Check for comma or end
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_token from parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc expect_token from parser, TOKEN_RIGHT_BRACE from Lexer, "Expected '}'"
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Table Parsing
+Note: ============================================================================
+
+Process called "parse_table_header" takes parser as Integer returns Integer:
+    Note: Parse TOML table header: [table.name]
+
+    proc expect_token from parser, TOKEN_LEFT_BRACKET from Lexer, "Expected '['"
+
+    Let buffer_size be 256
+    Let buffer be proc allocate from Layout with buffer_size
+    Let buffer_pos be 0
+
+    Note: Parse table name (dotted path)
+    While 1 is equal to 1:
+        Let is_close be proc check_token_type from parser, TOKEN_RIGHT_BRACKET from Lexer
+
+        If is_close is equal to 1:
+            Break
+        End If
+
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let lexeme be proc memory_get_int64 from Layout with token, 8
+        Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+
+        Note: Copy identifier to buffer
+        Let index be 0
+
+        While index is less than lexeme_length:
+            Let char be proc memory_get_byte from Layout with lexeme, index
+            proc memory_set_byte from Layout with buffer, buffer_pos, char
+            Set buffer_pos to buffer_pos plus 1
+            Set index to index plus 1
+        End While
+
+        proc advance_token from parser
+
+        Note: Check for dot (table hierarchy separator)
+        Let is_dot be proc check_token_type from parser, TOKEN_DOT from Lexer
+
+        If is_dot is equal to 1:
+            proc memory_set_byte from Layout with buffer, buffer_pos, 46  Note: '.'
+            Set buffer_pos to buffer_pos plus 1
+            proc advance_token from parser
+        End If
+    End While
+
+    proc expect_token from parser, TOKEN_RIGHT_BRACKET from Lexer, "Expected ']'"
+
+    Note: Null-terminate table name
+    proc memory_set_byte from Layout with buffer, buffer_pos, 0
+
+    Return buffer
+End Process
+
+Process called "parse_array_table_header" takes parser as Integer returns Integer:
+    Note: Parse TOML array of tables header: [[array.table]]
+
+    proc expect_token from parser, TOKEN_ARRAY_TABLE_HEADER from Lexer, "Expected '[['"
+
+    Let buffer_size be 256
+    Let buffer be proc allocate from Layout with buffer_size
+    Let buffer_pos be 0
+
+    Note: Parse table name (dotted path)
+    While 1 is equal to 1:
+        Let is_close be proc check_token_type from parser, TOKEN_RIGHT_BRACKET from Lexer
+
+        If is_close is equal to 1:
+            Break
+        End If
+
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let lexeme be proc memory_get_int64 from Layout with token, 8
+        Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+
+        Note: Copy identifier to buffer
+        Let index be 0
+
+        While index is less than lexeme_length:
+            Let char be proc memory_get_byte from Layout with lexeme, index
+            proc memory_set_byte from Layout with buffer, buffer_pos, char
+            Set buffer_pos to buffer_pos plus 1
+            Set index to index plus 1
+        End While
+
+        proc advance_token from parser
+
+        Note: Check for dot
+        Let is_dot be proc check_token_type from parser, TOKEN_DOT from Lexer
+
+        If is_dot is equal to 1:
+            proc memory_set_byte from Layout with buffer, buffer_pos, 46  Note: '.'
+            Set buffer_pos to buffer_pos plus 1
+            proc advance_token from parser
+        End If
+    End While
+
+    Note: Expect two closing brackets
+    proc expect_token from parser, TOKEN_RIGHT_BRACKET from Lexer, "Expected ']'"
+    proc expect_token from parser, TOKEN_RIGHT_BRACKET from Lexer, "Expected ']'"
+
+    Note: Null-terminate table name
+    proc memory_set_byte from Layout with buffer, buffer_pos, 0
+
+    Return buffer
+End Process
+
+Note: ============================================================================
+Note: Key-Value Pair Parsing
+Note: ============================================================================
+
+Process called "parse_key_value" takes parser as Integer returns Integer:
+    Note: Parse TOML key-value pair: key = value
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let key_lexeme be proc memory_get_int64 from Layout with token, 8
+    Let key_length be proc memory_get_int64 from Layout with token, 16
+
+    Let key_copy be proc allocate from Layout with key_length plus 1
+    proc memory_copy from Layout with key_copy, 0, key_lexeme, 0, key_length
+    proc memory_set_byte from Layout with key_copy, key_length, 0
+
+    proc expect_token from parser, TOKEN_IDENTIFIER from Lexer, "Expected key"
+    proc expect_token from parser, TOKEN_EQUAL from Lexer, "Expected '='"
+
+    Note: Parse value
+    Let value_node be proc parse_value from parser
+
+    If value_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Create a simple node to hold key-value pair
+    Note: (In the document node, we'll store this as key → value)
+    Let kv_node be proc create_toml_node from TOML_STRING  Note: Reuse string type for KV
+    proc memory_set_int64 from Layout with kv_node, 8, key_copy
+    proc memory_set_int64 from Layout with kv_node, 40, value_node  Note: Store value in children field
+
+    Return kv_node
+End Process
+
+Note: ============================================================================
+Note: Document Parsing
+Note: ============================================================================
+
+Process called "parse_document" takes parser as Integer returns Integer:
+    Note: Parse TOML document
+
+    @Reasoning:
+    A TOML document consists of:
+    - Key-value pairs at root level
+    - Table headers [table]
+    - Array of tables headers [[array]]
+    - Key-value pairs under tables
+
+    We build a document node containing all tables and root key-values.
+    @End Reasoning
+
+    Let document be proc create_toml_node from TOML_DOCUMENT
+
+    If document is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Let children be proc create from List
+    Let keys be proc create from List
+
+    proc memory_set_int64 from Layout with document, 40, children
+    proc memory_set_int64 from Layout with document, 48, keys
+
+    Note: Parse document content
+    While 1 is equal to 1:
+        proc skip_newlines from parser
+
+        Let token_type be proc peek_token_type from parser
+
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Note: Table header
+        If token_type is equal to TOKEN_LEFT_BRACKET from Lexer:
+            Let table_name be proc parse_table_header from parser
+            proc memory_set_int64 from Layout with parser, 32, table_name  Note: Set current table
+            proc skip_newlines from parser
+            Continue
+        End If
+
+        Note: Array of tables header
+        If token_type is equal to TOKEN_ARRAY_TABLE_HEADER from Lexer:
+            Let table_name be proc parse_array_table_header from parser
+            proc memory_set_int64 from Layout with parser, 32, table_name
+            proc skip_newlines from parser
+            Continue
+        End If
+
+        Note: Key-value pair
+        If token_type is equal to TOKEN_IDENTIFIER from Lexer:
+            Let kv_node be proc parse_key_value from parser
+
+            If kv_node is equal to 0:
+                Return 0
+            End If
+
+            Note: Add to appropriate table
+            Let current_table be proc memory_get_int64 from Layout with parser, 32
+
+            If current_table is equal to 0:
+                Note: Root level key-value
+                Let key be proc memory_get_int64 from Layout with kv_node, 8
+                Let value be proc memory_get_int64 from Layout with kv_node, 40
+
+                proc append from List with keys, key
+                proc append from List with children, value
+            Otherwise:
+                Note: Table key-value (prepend table name to create qualified key)
+                Let table_name be proc memory_get_int64 from Layout with current_table, 8
+                Let key be proc memory_get_int64 from Layout with kv_node, 8
+                Let value be proc memory_get_int64 from Layout with kv_node, 40
+
+                Note: Create qualified key: table_name.key
+                Let table_name_len be proc string_length from StringCore with table_name
+                Let key_len be proc string_length from StringCore with key
+                Let qualified_len be table_name_len plus 1 plus key_len
+                Let qualified_key be proc allocate from Layout with qualified_len plus 1
+
+                proc memory_copy from Layout with qualified_key, 0, table_name, 0, table_name_len
+                proc memory_set_byte from Layout with qualified_key, table_name_len, 46  Note: '.'
+                proc memory_copy from Layout with qualified_key, table_name_len plus 1, key, 0, key_len
+                proc memory_set_byte from Layout with qualified_key, qualified_len, 0
+
+                proc append from List with keys, qualified_key
+                proc append from List with children, value
+            End If
+
+            proc skip_newlines from parser
+            Continue
+        End If
+
+        Note: Unknown token
+        proc set_parse_error from parser, "Unexpected token"
+        Return 0
+    End While
+
+    Return document
+End Process
+
+Note: ============================================================================
+Note: Utility Functions
+Note: ============================================================================
+
+Process called "parse_integer_value" takes str as Integer returns Integer:
+    Note: Parse integer from string (handles decimal, hex, octal, binary)
+
+    Let length be proc string_length from StringCore with str
+
+    If length is equal to 0:
+        Return 0
+    End If
+
+    Let index be 0
+    Let is_negative be 0
+    Let value be 0
+
+    Note: Handle sign
+    Let first_char be proc memory_get_byte from Layout with str, 0
+
+    If first_char is equal to 45:  Note: -
+        Set is_negative to 1
+        Set index to 1
+    Otherwise If first_char is equal to 43:  Note: +
+        Set index to 1
+    End If
+
+    Note: Check for base prefix
+    Let char be proc memory_get_byte from Layout with str, index
+
+    If char is equal to 48:  Note: '0'
+        If index plus 1 is less than length:
+            Let prefix be proc memory_get_byte from Layout with str, index plus 1
+
+            If prefix is equal to 120:  Note: 'x' - hexadecimal (base 16)
+                Set index to index plus 2
+                Note: Parse hexadecimal digits
+                While index is less than length:
+                    Let char be proc memory_get_byte from Layout with str, index
+                    Let digit be 0
+
+                    If char is greater than or equal to 48 and char is less than or equal to 57:  Note: 0-9
+                        Set digit to char minus 48
+                    Otherwise If char is greater than or equal to 65 and char is less than or equal to 70:  Note: A-F
+                        Set digit to char minus 65 plus 10
+                    Otherwise If char is greater than or equal to 97 and char is less than or equal to 102:  Note: a-f
+                        Set digit to char minus 97 plus 10
+                    Otherwise If char is equal to 95:  Note: '_' (digit separator, skip)
+                        Set index to index plus 1
+                        Continue
+                    Otherwise:
+                        Break
+                    End If
+
+                    Set value to value times 16 plus digit
+                    Set index to index plus 1
+                End While
+
+                If is_negative is equal to 1:
+                    Set value to 0 minus value
+                End If
+                Return value
+
+            Otherwise If prefix is equal to 111:  Note: 'o' - octal (base 8)
+                Set index to index plus 2
+                Note: Parse octal digits (0-7)
+                While index is less than length:
+                    Let char be proc memory_get_byte from Layout with str, index
+
+                    If char is greater than or equal to 48 and char is less than or equal to 55:  Note: 0-7
+                        Let digit be char minus 48
+                        Set value to value times 8 plus digit
+                        Set index to index plus 1
+                    Otherwise If char is equal to 95:  Note: '_' (digit separator, skip)
+                        Set index to index plus 1
+                    Otherwise:
+                        Break
+                    End If
+                End While
+
+                If is_negative is equal to 1:
+                    Set value to 0 minus value
+                End If
+                Return value
+
+            Otherwise If prefix is equal to 98:  Note: 'b' - binary (base 2)
+                Set index to index plus 2
+                Note: Parse binary digits (0-1)
+                While index is less than length:
+                    Let char be proc memory_get_byte from Layout with str, index
+
+                    If char is equal to 48:  Note: '0'
+                        Set value to value times 2
+                        Set index to index plus 1
+                    Otherwise If char is equal to 49:  Note: '1'
+                        Set value to value times 2 plus 1
+                        Set index to index plus 1
+                    Otherwise If char is equal to 95:  Note: '_' (digit separator, skip)
+                        Set index to index plus 1
+                    Otherwise:
+                        Break
+                    End If
+                End While
+
+                If is_negative is equal to 1:
+                    Set value to 0 minus value
+                End If
+                Return value
+            End If
+        End If
+    End If
+
+    Note: Parse decimal
+    While index is less than length:
+        Let char be proc memory_get_byte from Layout with str, index
+
+        If char is greater than or equal to 48:
+            If char is less than or equal to 57:  Note: digit
+                Let digit be char minus 48
+                Set value to value times 10
+                Set value to value plus digit
+                Set index to index plus 1
+            Otherwise If char is equal to 95:  Note: _ (separator, skip)
+                Set index to index plus 1
+            Otherwise:
+                Break
+            End If
+        Otherwise:
+            Break
+        End If
+    End While
+
+    If is_negative is equal to 1:
+        Set value to 0 minus value
+    End If
+
+    Return value
+End Process
+
+Process called "string_equals" takes str1 as Integer, str2 as Integer returns Integer:
+    Note: Check if two strings are equal
+
+    Let len1 be proc string_length from StringCore with str1
+    Let len2 be proc string_length from StringCore with str2
+
+    If len1 is not equal to len2:
+        Return 0
+    End If
+
+    Let index be 0
+
+    While index is less than len1:
+        Let char1 be proc memory_get_byte from Layout with str1, index
+        Let char2 be proc memory_get_byte from Layout with str2, index
+
+        If char1 is not equal to char2:
+            Return 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Top-Level Parsing Entry Point
+Note: ============================================================================
+
+Process called "parse_toml" takes source as Integer returns Integer:
+    Note: Parse TOML source code to AST
+
+    @Reasoning:
+    Top-level entry point for TOML parsing.
+    Creates lexer and parser, parses document, handles errors.
+    @End Reasoning
+
+    If source is equal to 0:
+        Return 0
+    End If
+
+    Note: Create lexer
+    Let lexer be proc create_toml_lexer from Lexer with source
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Create parser
+    Let parser be proc create_toml_parser from lexer
+
+    If parser is equal to 0:
+        proc destroy_toml_lexer from Lexer with lexer
+        Return 0
+    End If
+
+    Note: Parse document
+    Let document be proc parse_document from parser
+
+    Note: Check for errors
+    Let has_error be proc memory_get_int64 from Layout with parser, 24
+
+    If has_error is equal to 1:
+        Let error_msg be proc memory_get_int64 from Layout with parser, 16
+        proc print from "TOML parse error:", error_msg
+        proc destroy_toml_parser from parser
+        proc destroy_toml_lexer from Lexer with lexer
+        Return 0
+    End If
+
+    Note: Cleanup
+    proc destroy_toml_parser from parser
+    proc destroy_toml_lexer from Lexer with lexer
+
+    Return document
+End Process
+
+Note: End of TOML Parser

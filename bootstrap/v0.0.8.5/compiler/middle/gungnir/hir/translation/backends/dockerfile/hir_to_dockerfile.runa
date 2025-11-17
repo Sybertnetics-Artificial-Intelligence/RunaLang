@@ -1,0 +1,1387 @@
+Note: HIR to Dockerfile Backend - Converts HIR back to Dockerfile AST
+Note: Part of Translation universal language translation system
+Note: Translates HIR function call representations back to Dockerfile instructions
+
+Import "compiler/middle/gungnir/hir/translation/frontends/dockerfile/dockerfile_parser.runa" as DockerfileParser
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: Translation Strategy
+Note: ============================================================================
+Note:
+Note: HIR function calls are translated back to Dockerfile AST nodes.
+Note: Each dockerfile_* function corresponds to a specific instruction type.
+Note:
+Note: Example reverse translations:
+Note:   call dockerfile_from("ubuntu", "20.04", "", "builder", "")
+Note:   → FROM ubuntu:20.04 AS builder
+Note:
+Note:   call dockerfile_run_shell("apt-get update")
+Note:   → RUN apt-get update
+Note:
+Note:   call dockerfile_copy(["/app"], "/dest", "builder", "", "", false)
+Note:   → COPY --from=builder /app /dest
+Note:
+Note: ============================================================================
+
+Note: ============================================================================
+Note: Backend State
+Note: ============================================================================
+
+Type called "HIRToDockerfileBackend":
+    error_message as String
+    has_error as Integer
+End Type
+
+Note: ============================================================================
+Note: Backend Creation
+Note: ============================================================================
+
+Process called "create_backend" returns Integer:
+    @Reasoning
+    Create a new HIR→Dockerfile backend instance.
+    @End Reasoning
+
+    @Implementation
+    Allocate backend structure and initialize state.
+    @End Implementation
+
+    Let backend_ptr be proc allocate from Layout with 16
+
+    proc memory_set_string from Layout with backend_ptr, 0, ""  Note: error_message
+    proc memory_set_int64 from Layout with backend_ptr, 8, 0  Note: has_error
+
+    Return backend_ptr
+End Process
+
+Process called "free_backend" that takes backend_ptr as Integer returns Integer:
+    @Reasoning
+    Free the backend structure.
+    @End Reasoning
+
+    @Implementation
+    Deallocate backend memory.
+    @End Implementation
+
+    proc deallocate from Layout at backend_ptr
+    Return 1
+End Process
+
+Process called "set_backend_error" that takes backend_ptr as Integer, message as String returns Integer:
+    @Reasoning
+    Record a backend error message.
+    @End Reasoning
+
+    @Implementation
+    Store error message and set error flag.
+    @End Implementation
+
+    proc memory_set_string from Layout with backend_ptr, 0, message
+    proc memory_set_int64 from Layout with backend_ptr, 8, 1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HIR Helper Functions
+Note: ============================================================================
+
+Process called "extract_string_literal" that takes hir_node_ptr as Integer returns String:
+    @Reasoning
+    Extract string value from HIR_LITERAL node.
+    @End Reasoning
+
+    @Implementation
+    Read value field from HIR node.
+    @End Implementation
+
+    If hir_node_ptr is equal to 0:
+        Return ""
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node_ptr, 0
+
+    If node_type is equal to HIR.HIR_LITERAL:
+        Let value be proc memory_get_string from Layout with hir_node_ptr, 40
+        Return value
+    End If
+
+    Return ""
+End Process
+
+Process called "extract_integer_literal" that takes hir_node_ptr as Integer returns Integer:
+    @Reasoning
+    Extract integer value from HIR_LITERAL node.
+    @End Reasoning
+
+    @Implementation
+    Read value field from HIR node.
+    @End Implementation
+
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node_ptr, 0
+
+    If node_type is equal to HIR.HIR_LITERAL:
+        Let value be proc memory_get_int64 from Layout with hir_node_ptr, 40
+        Return value
+    End If
+
+    Return 0
+End Process
+
+Process called "extract_boolean_literal" that takes hir_node_ptr as Integer returns Integer:
+    @Reasoning
+    Extract boolean value from HIR_LITERAL node.
+    @End Reasoning
+
+    @Implementation
+    Read value field from HIR node (0 or 1).
+    @End Implementation
+
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node_ptr, 0
+
+    If node_type is equal to HIR.HIR_LITERAL:
+        Let value be proc memory_get_int64 from Layout with hir_node_ptr, 40
+        Return value
+    End If
+
+    Return 0
+End Process
+
+Process called "extract_array_elements" that takes hir_array_ptr as Integer returns Integer:
+    @Reasoning
+    Extract list of string values from HIR_ARRAY_LITERAL node.
+    @End Reasoning
+
+    @Implementation
+    Read children list and extract string literals from each element.
+    @End Implementation
+
+    If hir_array_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_array_ptr, 0
+
+    If node_type is not equal to HIR.HIR_ARRAY_LITERAL:
+        Return 0
+    End If
+
+    Let elements_ptr be proc memory_get_int64 from Layout with hir_array_ptr, 24
+    Let element_count be proc memory_get_int64 from Layout with hir_array_ptr, 32
+
+    Note: Create list of extracted strings
+    Let strings_list be proc list_create from List
+
+    Let i be 0
+    While i is less than element_count:
+        Let element_node be proc list_get from List with elements_ptr, i
+        Let element_str be proc extract_string_literal from element_node
+        proc list_append from List with strings_list, element_str
+        Set i to i plus 1
+    End While
+
+    Return strings_list
+End Process
+
+Process called "extract_tuple_elements" that takes hir_tuple_ptr as Integer returns Integer:
+    @Reasoning
+    Extract list of element HIR nodes from HIR_TUPLE_LITERAL node.
+    @End Reasoning
+
+    @Implementation
+    Read children list from tuple node.
+    @End Implementation
+
+    If hir_tuple_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_tuple_ptr, 0
+
+    If node_type is not equal to HIR.HIR_TUPLE_LITERAL:
+        Return 0
+    End If
+
+    Let elements_ptr be proc memory_get_int64 from Layout with hir_tuple_ptr, 24
+    Return elements_ptr
+End Process
+
+Process called "get_function_name" that takes hir_call_ptr as Integer returns String:
+    @Reasoning
+    Extract function name from HIR_CALL_EXPRESSION node.
+    @End Reasoning
+
+    @Implementation
+    Read callee identifier node and extract name string.
+    @End Implementation
+
+    If hir_call_ptr is equal to 0:
+        Return ""
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_call_ptr, 0
+
+    If node_type is not equal to HIR.HIR_CALL_EXPRESSION:
+        Return ""
+    End If
+
+    Let callee_ptr be proc memory_get_int64 from Layout with hir_call_ptr, 24
+
+    If callee_ptr is equal to 0:
+        Return ""
+    End If
+
+    Let callee_type be proc memory_get_int64 from Layout with callee_ptr, 0
+
+    If callee_type is equal to HIR.HIR_IDENTIFIER:
+        Let name be proc memory_get_string from Layout with callee_ptr, 40
+        Return name
+    End If
+
+    Return ""
+End Process
+
+Process called "get_call_arguments" that takes hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Extract argument list from HIR_CALL_EXPRESSION node.
+    @End Reasoning
+
+    @Implementation
+    Read arguments list pointer from call node.
+    @End Implementation
+
+    If hir_call_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_call_ptr, 0
+
+    If node_type is not equal to HIR.HIR_CALL_EXPRESSION:
+        Return 0
+    End If
+
+    Let args_ptr be proc memory_get_int64 from Layout with hir_call_ptr, 32
+    Return args_ptr
+End Process
+
+Note: ============================================================================
+Note: Instruction Translation Functions
+Note: ============================================================================
+
+Process called "translate_from_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_from HIR call back to FROM instruction AST.
+    Arguments: (image: String, tag: String, digest: String, stage_name: String, platform: String)
+    @End Reasoning
+
+    @Implementation
+    Extract arguments and create FromInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "FROM call has no arguments"
+        Return 0
+    End If
+
+    Let arg_count be proc list_size from List with args_ptr
+
+    If arg_count is not equal to 5:
+        proc set_backend_error from backend_ptr, "FROM call requires 5 arguments"
+        Return 0
+    End If
+
+    Note: Extract arguments
+    Let image_node be proc list_get from List with args_ptr, 0
+    Let tag_node be proc list_get from List with args_ptr, 1
+    Let digest_node be proc list_get from List with args_ptr, 2
+    Let stage_node be proc list_get from List with args_ptr, 3
+    Let platform_node be proc list_get from List with args_ptr, 4
+
+    Let image be proc extract_string_literal from image_node
+    Let tag be proc extract_string_literal from tag_node
+    Let digest be proc extract_string_literal from digest_node
+    Let stage_name be proc extract_string_literal from stage_node
+    Let platform be proc extract_string_literal from platform_node
+
+    Note: Create FromInstruction node
+    Let from_ptr be proc allocate from Layout with 64
+    proc memory_set_int64 from Layout with from_ptr, 0, DockerfileParser.NODE_FROM
+    proc memory_set_string from Layout with from_ptr, 8, image
+    proc memory_set_string from Layout with from_ptr, 16, tag
+    proc memory_set_string from Layout with from_ptr, 24, digest
+    proc memory_set_string from Layout with from_ptr, 32, stage_name
+    proc memory_set_string from Layout with from_ptr, 40, platform
+    proc memory_set_int64 from Layout with from_ptr, 48, line
+    proc memory_set_int64 from Layout with from_ptr, 56, col
+
+    Return from_ptr
+End Process
+
+Process called "translate_run_shell_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_run_shell HIR call back to RUN instruction AST (shell form).
+    Arguments: (command: String)
+    @End Reasoning
+
+    @Implementation
+    Extract command argument and create RunInstruction AST node with shell form.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "RUN shell call has no arguments"
+        Return 0
+    End If
+
+    Let arg_count be proc list_size from List with args_ptr
+
+    If arg_count is not equal to 1:
+        proc set_backend_error from backend_ptr, "RUN shell call requires 1 argument"
+        Return 0
+    End If
+
+    Let command_node be proc list_get from List with args_ptr, 0
+    Let command be proc extract_string_literal from command_node
+
+    Note: Create RunInstruction node (shell form)
+    Let run_ptr be proc allocate from Layout with 48
+    proc memory_set_int64 from Layout with run_ptr, 0, DockerfileParser.NODE_RUN
+    proc memory_set_int64 from Layout with run_ptr, 8, DockerfileParser.SHELL_FORM
+    proc memory_set_string from Layout with run_ptr, 16, command
+    proc memory_set_int64 from Layout with run_ptr, 24, 0  Note: args (null for shell form)
+    proc memory_set_int64 from Layout with run_ptr, 32, line
+    proc memory_set_int64 from Layout with run_ptr, 40, col
+
+    Return run_ptr
+End Process
+
+Process called "translate_run_exec_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_run_exec HIR call back to RUN instruction AST (exec form).
+    Arguments: (args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Extract args array and create RunInstruction AST node with exec form.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "RUN exec call has no arguments"
+        Return 0
+    End If
+
+    Let arg_count be proc list_size from List with args_ptr
+
+    If arg_count is not equal to 1:
+        proc set_backend_error from backend_ptr, "RUN exec call requires 1 argument"
+        Return 0
+    End If
+
+    Let array_node be proc list_get from List with args_ptr, 0
+    Let cmd_args_list be proc extract_array_elements from array_node
+
+    Note: Create RunInstruction node (exec form)
+    Let run_ptr be proc allocate from Layout with 48
+    proc memory_set_int64 from Layout with run_ptr, 0, DockerfileParser.NODE_RUN
+    proc memory_set_int64 from Layout with run_ptr, 8, DockerfileParser.EXEC_FORM
+    proc memory_set_string from Layout with run_ptr, 16, ""  Note: command (empty for exec form)
+    proc memory_set_int64 from Layout with run_ptr, 24, cmd_args_list
+    proc memory_set_int64 from Layout with run_ptr, 32, line
+    proc memory_set_int64 from Layout with run_ptr, 40, col
+
+    Return run_ptr
+End Process
+
+Process called "translate_cmd_shell_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_cmd_shell HIR call back to CMD instruction AST (shell form).
+    Arguments: (command: String)
+    @End Reasoning
+
+    @Implementation
+    Extract command argument and create CmdInstruction AST node with shell form.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "CMD shell call has no arguments"
+        Return 0
+    End If
+
+    Let command_node be proc list_get from List with args_ptr, 0
+    Let command be proc extract_string_literal from command_node
+
+    Note: Create CmdInstruction node (shell form)
+    Let cmd_ptr be proc allocate from Layout with 48
+    proc memory_set_int64 from Layout with cmd_ptr, 0, DockerfileParser.NODE_CMD
+    proc memory_set_int64 from Layout with cmd_ptr, 8, DockerfileParser.SHELL_FORM
+    proc memory_set_string from Layout with cmd_ptr, 16, command
+    proc memory_set_int64 from Layout with cmd_ptr, 24, 0
+    proc memory_set_int64 from Layout with cmd_ptr, 32, line
+    proc memory_set_int64 from Layout with cmd_ptr, 40, col
+
+    Return cmd_ptr
+End Process
+
+Process called "translate_cmd_exec_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_cmd_exec HIR call back to CMD instruction AST (exec form).
+    Arguments: (args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Extract args array and create CmdInstruction AST node with exec form.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "CMD exec call has no arguments"
+        Return 0
+    End If
+
+    Let array_node be proc list_get from List with args_ptr, 0
+    Let cmd_args_list be proc extract_array_elements from array_node
+
+    Note: Create CmdInstruction node (exec form)
+    Let cmd_ptr be proc allocate from Layout with 48
+    proc memory_set_int64 from Layout with cmd_ptr, 0, DockerfileParser.NODE_CMD
+    proc memory_set_int64 from Layout with cmd_ptr, 8, DockerfileParser.EXEC_FORM
+    proc memory_set_string from Layout with cmd_ptr, 16, ""
+    proc memory_set_int64 from Layout with cmd_ptr, 24, cmd_args_list
+    proc memory_set_int64 from Layout with cmd_ptr, 32, line
+    proc memory_set_int64 from Layout with cmd_ptr, 40, col
+
+    Return cmd_ptr
+End Process
+
+Process called "translate_label_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_label HIR call back to LABEL instruction AST.
+    Arguments: (labels: Array[KeyValuePair])
+    @End Reasoning
+
+    @Implementation
+    Extract labels array and create LabelInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "LABEL call has no arguments"
+        Return 0
+    End If
+
+    Let array_node be proc list_get from List with args_ptr, 0
+    Let tuples_ptr be proc memory_get_int64 from Layout with array_node, 24
+    Let tuple_count be proc memory_get_int64 from Layout with array_node, 32
+
+    Note: Extract key-value pairs from tuples
+    Let pairs_list be proc list_create from List
+
+    Let i be 0
+    While i is less than tuple_count:
+        Let tuple_node be proc list_get from List with tuples_ptr, i
+        Let tuple_elements be proc extract_tuple_elements from tuple_node
+
+        Let key_node be proc list_get from List with tuple_elements, 0
+        Let value_node be proc list_get from List with tuple_elements, 1
+
+        Let key be proc extract_string_literal from key_node
+        Let value be proc extract_string_literal from value_node
+
+        Note: Create KeyValuePair
+        Let pair_ptr be proc allocate from Layout with 16
+        proc memory_set_string from Layout with pair_ptr, 0, key
+        proc memory_set_string from Layout with pair_ptr, 8, value
+
+        proc list_append from List with pairs_list, pair_ptr
+        Set i to i plus 1
+    End While
+
+    Note: Create LabelInstruction node
+    Let label_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with label_ptr, 0, DockerfileParser.NODE_LABEL
+    proc memory_set_int64 from Layout with label_ptr, 8, pairs_list
+    proc memory_set_int64 from Layout with label_ptr, 16, line
+    proc memory_set_int64 from Layout with label_ptr, 24, col
+
+    Return label_ptr
+End Process
+
+Process called "translate_expose_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_expose HIR call back to EXPOSE instruction AST.
+    Arguments: (ports: Array[PortSpec])
+    @End Reasoning
+
+    @Implementation
+    Extract ports array and create ExposeInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "EXPOSE call has no arguments"
+        Return 0
+    End If
+
+    Let array_node be proc list_get from List with args_ptr, 0
+    Let tuples_ptr be proc memory_get_int64 from Layout with array_node, 24
+    Let tuple_count be proc memory_get_int64 from Layout with array_node, 32
+
+    Note: Extract port specs from tuples
+    Let specs_list be proc list_create from List
+
+    Let i be 0
+    While i is less than tuple_count:
+        Let tuple_node be proc list_get from List with tuples_ptr, i
+        Let tuple_elements be proc extract_tuple_elements from tuple_node
+
+        Let port_node be proc list_get from List with tuple_elements, 0
+        Let protocol_node be proc list_get from List with tuple_elements, 1
+
+        Let port be proc extract_integer_literal from port_node
+        Let protocol be proc extract_string_literal from protocol_node
+
+        Note: Create PortSpec
+        Let spec_ptr be proc allocate from Layout with 16
+        proc memory_set_int64 from Layout with spec_ptr, 0, port
+        proc memory_set_string from Layout with spec_ptr, 8, protocol
+
+        proc list_append from List with specs_list, spec_ptr
+        Set i to i plus 1
+    End While
+
+    Note: Create ExposeInstruction node
+    Let expose_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with expose_ptr, 0, DockerfileParser.NODE_EXPOSE
+    proc memory_set_int64 from Layout with expose_ptr, 8, specs_list
+    proc memory_set_int64 from Layout with expose_ptr, 16, line
+    proc memory_set_int64 from Layout with expose_ptr, 24, col
+
+    Return expose_ptr
+End Process
+
+Process called "translate_env_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_env HIR call back to ENV instruction AST.
+    Arguments: (variables: Array[KeyValuePair])
+    @End Reasoning
+
+    @Implementation
+    Extract variables array and create EnvInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "ENV call has no arguments"
+        Return 0
+    End If
+
+    Let array_node be proc list_get from List with args_ptr, 0
+    Let tuples_ptr be proc memory_get_int64 from Layout with array_node, 24
+    Let tuple_count be proc memory_get_int64 from Layout with array_node, 32
+
+    Note: Extract key-value pairs from tuples
+    Let pairs_list be proc list_create from List
+
+    Let i be 0
+    While i is less than tuple_count:
+        Let tuple_node be proc list_get from List with tuples_ptr, i
+        Let tuple_elements be proc extract_tuple_elements from tuple_node
+
+        Let key_node be proc list_get from List with tuple_elements, 0
+        Let value_node be proc list_get from List with tuple_elements, 1
+
+        Let key be proc extract_string_literal from key_node
+        Let value be proc extract_string_literal from value_node
+
+        Note: Create KeyValuePair
+        Let pair_ptr be proc allocate from Layout with 16
+        proc memory_set_string from Layout with pair_ptr, 0, key
+        proc memory_set_string from Layout with pair_ptr, 8, value
+
+        proc list_append from List with pairs_list, pair_ptr
+        Set i to i plus 1
+    End While
+
+    Note: Create EnvInstruction node
+    Let env_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with env_ptr, 0, DockerfileParser.NODE_ENV
+    proc memory_set_int64 from Layout with env_ptr, 8, pairs_list
+    proc memory_set_int64 from Layout with env_ptr, 16, line
+    proc memory_set_int64 from Layout with env_ptr, 24, col
+
+    Return env_ptr
+End Process
+
+Process called "translate_copy_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_copy HIR call back to COPY instruction AST.
+    Arguments: (sources: Array[String], dest: String, from_stage: String, chown: String, chmod: String, link: Boolean)
+    @End Reasoning
+
+    @Implementation
+    Extract all arguments and create CopyInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "COPY call has no arguments"
+        Return 0
+    End If
+
+    Let arg_count be proc list_size from List with args_ptr
+
+    If arg_count is not equal to 6:
+        proc set_backend_error from backend_ptr, "COPY call requires 6 arguments"
+        Return 0
+    End If
+
+    Let sources_array_node be proc list_get from List with args_ptr, 0
+    Let dest_node be proc list_get from List with args_ptr, 1
+    Let from_node be proc list_get from List with args_ptr, 2
+    Let chown_node be proc list_get from List with args_ptr, 3
+    Let chmod_node be proc list_get from List with args_ptr, 4
+    Let link_node be proc list_get from List with args_ptr, 5
+
+    Let sources_list be proc extract_array_elements from sources_array_node
+    Let dest be proc extract_string_literal from dest_node
+    Let from_stage be proc extract_string_literal from from_node
+    Let chown be proc extract_string_literal from chown_node
+    Let chmod be proc extract_string_literal from chmod_node
+    Let link_flag be proc extract_boolean_literal from link_node
+
+    Note: Create CopyInstruction node
+    Let copy_ptr be proc allocate from Layout with 72
+    proc memory_set_int64 from Layout with copy_ptr, 0, DockerfileParser.NODE_COPY
+    proc memory_set_int64 from Layout with copy_ptr, 8, sources_list
+    proc memory_set_string from Layout with copy_ptr, 16, dest
+    proc memory_set_string from Layout with copy_ptr, 24, from_stage
+    proc memory_set_string from Layout with copy_ptr, 32, chown
+    proc memory_set_string from Layout with copy_ptr, 40, chmod
+    proc memory_set_int64 from Layout with copy_ptr, 48, link_flag
+    proc memory_set_int64 from Layout with copy_ptr, 56, line
+    proc memory_set_int64 from Layout with copy_ptr, 64, col
+
+    Return copy_ptr
+End Process
+
+Process called "translate_add_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_add HIR call back to ADD instruction AST.
+    Arguments: (sources: Array[String], dest: String, chown: String, chmod: String, link: Boolean, keep_git_dir: Boolean, checksum: String)
+    @End Reasoning
+
+    @Implementation
+    Extract all arguments and create AddInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "ADD call has no arguments"
+        Return 0
+    End If
+
+    Let arg_count be proc list_size from List with args_ptr
+
+    If arg_count is not equal to 7:
+        proc set_backend_error from backend_ptr, "ADD call requires 7 arguments"
+        Return 0
+    End If
+
+    Let sources_array_node be proc list_get from List with args_ptr, 0
+    Let dest_node be proc list_get from List with args_ptr, 1
+    Let chown_node be proc list_get from List with args_ptr, 2
+    Let chmod_node be proc list_get from List with args_ptr, 3
+    Let link_node be proc list_get from List with args_ptr, 4
+    Let keep_git_node be proc list_get from List with args_ptr, 5
+    Let checksum_node be proc list_get from List with args_ptr, 6
+
+    Let sources_list be proc extract_array_elements from sources_array_node
+    Let dest be proc extract_string_literal from dest_node
+    Let chown be proc extract_string_literal from chown_node
+    Let chmod be proc extract_string_literal from chmod_node
+    Let link_flag be proc extract_boolean_literal from link_node
+    Let keep_git_flag be proc extract_boolean_literal from keep_git_node
+    Let checksum be proc extract_string_literal from checksum_node
+
+    Note: Create AddInstruction node
+    Let add_ptr be proc allocate from Layout with 80
+    proc memory_set_int64 from Layout with add_ptr, 0, DockerfileParser.NODE_ADD
+    proc memory_set_int64 from Layout with add_ptr, 8, sources_list
+    proc memory_set_string from Layout with add_ptr, 16, dest
+    proc memory_set_string from Layout with add_ptr, 24, chown
+    proc memory_set_string from Layout with add_ptr, 32, chmod
+    proc memory_set_int64 from Layout with add_ptr, 40, link_flag
+    proc memory_set_int64 from Layout with add_ptr, 48, keep_git_flag
+    proc memory_set_string from Layout with add_ptr, 56, checksum
+    proc memory_set_int64 from Layout with add_ptr, 64, line
+    proc memory_set_int64 from Layout with add_ptr, 72, col
+
+    Return add_ptr
+End Process
+
+Process called "translate_entrypoint_shell_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_entrypoint_shell HIR call back to ENTRYPOINT instruction AST (shell form).
+    Arguments: (command: String)
+    @End Reasoning
+
+    @Implementation
+    Extract command argument and create EntrypointInstruction AST node with shell form.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "ENTRYPOINT shell call has no arguments"
+        Return 0
+    End If
+
+    Let command_node be proc list_get from List with args_ptr, 0
+    Let command be proc extract_string_literal from command_node
+
+    Note: Create EntrypointInstruction node (shell form)
+    Let entrypoint_ptr be proc allocate from Layout with 48
+    proc memory_set_int64 from Layout with entrypoint_ptr, 0, DockerfileParser.NODE_ENTRYPOINT
+    proc memory_set_int64 from Layout with entrypoint_ptr, 8, DockerfileParser.SHELL_FORM
+    proc memory_set_string from Layout with entrypoint_ptr, 16, command
+    proc memory_set_int64 from Layout with entrypoint_ptr, 24, 0
+    proc memory_set_int64 from Layout with entrypoint_ptr, 32, line
+    proc memory_set_int64 from Layout with entrypoint_ptr, 40, col
+
+    Return entrypoint_ptr
+End Process
+
+Process called "translate_entrypoint_exec_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_entrypoint_exec HIR call back to ENTRYPOINT instruction AST (exec form).
+    Arguments: (args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Extract args array and create EntrypointInstruction AST node with exec form.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "ENTRYPOINT exec call has no arguments"
+        Return 0
+    End If
+
+    Let array_node be proc list_get from List with args_ptr, 0
+    Let cmd_args_list be proc extract_array_elements from array_node
+
+    Note: Create EntrypointInstruction node (exec form)
+    Let entrypoint_ptr be proc allocate from Layout with 48
+    proc memory_set_int64 from Layout with entrypoint_ptr, 0, DockerfileParser.NODE_ENTRYPOINT
+    proc memory_set_int64 from Layout with entrypoint_ptr, 8, DockerfileParser.EXEC_FORM
+    proc memory_set_string from Layout with entrypoint_ptr, 16, ""
+    proc memory_set_int64 from Layout with entrypoint_ptr, 24, cmd_args_list
+    proc memory_set_int64 from Layout with entrypoint_ptr, 32, line
+    proc memory_set_int64 from Layout with entrypoint_ptr, 40, col
+
+    Return entrypoint_ptr
+End Process
+
+Process called "translate_volume_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_volume HIR call back to VOLUME instruction AST.
+    Arguments: (paths: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Extract paths array and create VolumeInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "VOLUME call has no arguments"
+        Return 0
+    End If
+
+    Let array_node be proc list_get from List with args_ptr, 0
+    Let paths_list be proc extract_array_elements from array_node
+
+    Note: Create VolumeInstruction node
+    Let volume_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with volume_ptr, 0, DockerfileParser.NODE_VOLUME
+    proc memory_set_int64 from Layout with volume_ptr, 8, paths_list
+    proc memory_set_int64 from Layout with volume_ptr, 16, line
+    proc memory_set_int64 from Layout with volume_ptr, 24, col
+
+    Return volume_ptr
+End Process
+
+Process called "translate_user_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_user HIR call back to USER instruction AST.
+    Arguments: (user: String, group: String)
+    @End Reasoning
+
+    @Implementation
+    Extract user and group arguments and create UserInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "USER call has no arguments"
+        Return 0
+    End If
+
+    Let arg_count be proc list_size from List with args_ptr
+
+    If arg_count is not equal to 2:
+        proc set_backend_error from backend_ptr, "USER call requires 2 arguments"
+        Return 0
+    End If
+
+    Let user_node be proc list_get from List with args_ptr, 0
+    Let group_node be proc list_get from List with args_ptr, 1
+
+    Let user be proc extract_string_literal from user_node
+    Let group be proc extract_string_literal from group_node
+
+    Note: Create UserInstruction node
+    Let user_ptr be proc allocate from Layout with 40
+    proc memory_set_int64 from Layout with user_ptr, 0, DockerfileParser.NODE_USER
+    proc memory_set_string from Layout with user_ptr, 8, user
+    proc memory_set_string from Layout with user_ptr, 16, group
+    proc memory_set_int64 from Layout with user_ptr, 24, line
+    proc memory_set_int64 from Layout with user_ptr, 32, col
+
+    Return user_ptr
+End Process
+
+Process called "translate_workdir_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_workdir HIR call back to WORKDIR instruction AST.
+    Arguments: (path: String)
+    @End Reasoning
+
+    @Implementation
+    Extract path argument and create WorkdirInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "WORKDIR call has no arguments"
+        Return 0
+    End If
+
+    Let path_node be proc list_get from List with args_ptr, 0
+    Let path be proc extract_string_literal from path_node
+
+    Note: Create WorkdirInstruction node
+    Let workdir_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with workdir_ptr, 0, DockerfileParser.NODE_WORKDIR
+    proc memory_set_string from Layout with workdir_ptr, 8, path
+    proc memory_set_int64 from Layout with workdir_ptr, 16, line
+    proc memory_set_int64 from Layout with workdir_ptr, 24, col
+
+    Return workdir_ptr
+End Process
+
+Process called "translate_arg_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_arg HIR call back to ARG instruction AST.
+    Arguments: (name: String, default_value: String)
+    @End Reasoning
+
+    @Implementation
+    Extract name and default value arguments and create ArgInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "ARG call has no arguments"
+        Return 0
+    End If
+
+    Let arg_count be proc list_size from List with args_ptr
+
+    If arg_count is not equal to 2:
+        proc set_backend_error from backend_ptr, "ARG call requires 2 arguments"
+        Return 0
+    End If
+
+    Let name_node be proc list_get from List with args_ptr, 0
+    Let default_node be proc list_get from List with args_ptr, 1
+
+    Let name be proc extract_string_literal from name_node
+    Let default_value be proc extract_string_literal from default_node
+
+    Note: Create ArgInstruction node
+    Let arg_ptr be proc allocate from Layout with 40
+    proc memory_set_int64 from Layout with arg_ptr, 0, DockerfileParser.NODE_ARG
+    proc memory_set_string from Layout with arg_ptr, 8, name
+    proc memory_set_string from Layout with arg_ptr, 16, default_value
+    proc memory_set_int64 from Layout with arg_ptr, 24, line
+    proc memory_set_int64 from Layout with arg_ptr, 32, col
+
+    Return arg_ptr
+End Process
+
+Process called "translate_onbuild_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_onbuild HIR call back to ONBUILD instruction AST.
+    Arguments: (instruction: HIRNode)
+    The nested instruction is translated recursively.
+    @End Reasoning
+
+    @Implementation
+    Translate the nested instruction and create OnbuildInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "ONBUILD call has no arguments"
+        Return 0
+    End If
+
+    Let instruction_hir_node be proc list_get from List with args_ptr, 0
+
+    Note: Translate the nested instruction
+    Let instruction_ast be proc translate_hir_call from backend_ptr, instruction_hir_node
+
+    Note: Create OnbuildInstruction node
+    Let onbuild_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with onbuild_ptr, 0, DockerfileParser.NODE_ONBUILD
+    proc memory_set_int64 from Layout with onbuild_ptr, 8, instruction_ast
+    proc memory_set_int64 from Layout with onbuild_ptr, 16, line
+    proc memory_set_int64 from Layout with onbuild_ptr, 24, col
+
+    Return onbuild_ptr
+End Process
+
+Process called "translate_stopsignal_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_stopsignal HIR call back to STOPSIGNAL instruction AST.
+    Arguments: (signal: String)
+    @End Reasoning
+
+    @Implementation
+    Extract signal argument and create StopsignalInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "STOPSIGNAL call has no arguments"
+        Return 0
+    End If
+
+    Let signal_node be proc list_get from List with args_ptr, 0
+    Let signal be proc extract_string_literal from signal_node
+
+    Note: Create StopsignalInstruction node
+    Let stopsignal_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with stopsignal_ptr, 0, DockerfileParser.NODE_STOPSIGNAL
+    proc memory_set_string from Layout with stopsignal_ptr, 8, signal
+    proc memory_set_int64 from Layout with stopsignal_ptr, 16, line
+    proc memory_set_int64 from Layout with stopsignal_ptr, 24, col
+
+    Return stopsignal_ptr
+End Process
+
+Process called "translate_healthcheck_none_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_healthcheck_none HIR call back to HEALTHCHECK NONE instruction AST.
+    Arguments: (none)
+    @End Reasoning
+
+    @Implementation
+    Create HealthcheckInstruction AST node with is_none flag set.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+
+    Note: Create HealthcheckInstruction node (NONE variant)
+    Let healthcheck_ptr be proc allocate from Layout with 88
+    proc memory_set_int64 from Layout with healthcheck_ptr, 0, DockerfileParser.NODE_HEALTHCHECK
+    proc memory_set_int64 from Layout with healthcheck_ptr, 8, 1  Note: is_none = 1
+    proc memory_set_string from Layout with healthcheck_ptr, 16, ""  Note: interval
+    proc memory_set_string from Layout with healthcheck_ptr, 24, ""  Note: timeout
+    proc memory_set_string from Layout with healthcheck_ptr, 32, ""  Note: start_period
+    proc memory_set_int64 from Layout with healthcheck_ptr, 40, 0  Note: retries
+    proc memory_set_int64 from Layout with healthcheck_ptr, 48, DockerfileParser.SHELL_FORM
+    proc memory_set_string from Layout with healthcheck_ptr, 56, ""  Note: cmd_command
+    proc memory_set_int64 from Layout with healthcheck_ptr, 64, 0  Note: cmd_args
+    proc memory_set_int64 from Layout with healthcheck_ptr, 72, line
+    proc memory_set_int64 from Layout with healthcheck_ptr, 80, col
+
+    Return healthcheck_ptr
+End Process
+
+Process called "translate_healthcheck_cmd_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_healthcheck_cmd HIR call back to HEALTHCHECK CMD instruction AST.
+    Arguments: (interval: String, timeout: String, start_period: String, retries: Integer, cmd_form: Integer, cmd_command: String, cmd_args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Extract all arguments and create HealthcheckInstruction AST node with CMD variant.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "HEALTHCHECK CMD call has no arguments"
+        Return 0
+    End If
+
+    Let arg_count be proc list_size from List with args_ptr
+
+    If arg_count is not equal to 7:
+        proc set_backend_error from backend_ptr, "HEALTHCHECK CMD call requires 7 arguments"
+        Return 0
+    End If
+
+    Let interval_node be proc list_get from List with args_ptr, 0
+    Let timeout_node be proc list_get from List with args_ptr, 1
+    Let start_period_node be proc list_get from List with args_ptr, 2
+    Let retries_node be proc list_get from List with args_ptr, 3
+    Let form_node be proc list_get from List with args_ptr, 4
+    Let command_node be proc list_get from List with args_ptr, 5
+    Let args_array_node be proc list_get from List with args_ptr, 6
+
+    Let interval be proc extract_string_literal from interval_node
+    Let timeout be proc extract_string_literal from timeout_node
+    Let start_period be proc extract_string_literal from start_period_node
+    Let retries be proc extract_integer_literal from retries_node
+    Let cmd_form be proc extract_integer_literal from form_node
+    Let cmd_command be proc extract_string_literal from command_node
+    Let cmd_args_list be proc extract_array_elements from args_array_node
+
+    Note: Create HealthcheckInstruction node (CMD variant)
+    Let healthcheck_ptr be proc allocate from Layout with 88
+    proc memory_set_int64 from Layout with healthcheck_ptr, 0, DockerfileParser.NODE_HEALTHCHECK
+    proc memory_set_int64 from Layout with healthcheck_ptr, 8, 0  Note: is_none = 0
+    proc memory_set_string from Layout with healthcheck_ptr, 16, interval
+    proc memory_set_string from Layout with healthcheck_ptr, 24, timeout
+    proc memory_set_string from Layout with healthcheck_ptr, 32, start_period
+    proc memory_set_int64 from Layout with healthcheck_ptr, 40, retries
+    proc memory_set_int64 from Layout with healthcheck_ptr, 48, cmd_form
+    proc memory_set_string from Layout with healthcheck_ptr, 56, cmd_command
+    proc memory_set_int64 from Layout with healthcheck_ptr, 64, cmd_args_list
+    proc memory_set_int64 from Layout with healthcheck_ptr, 72, line
+    proc memory_set_int64 from Layout with healthcheck_ptr, 80, col
+
+    Return healthcheck_ptr
+End Process
+
+Process called "translate_shell_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_shell HIR call back to SHELL instruction AST.
+    Arguments: (shell_args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Extract shell args array and create ShellInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "SHELL call has no arguments"
+        Return 0
+    End If
+
+    Let array_node be proc list_get from List with args_ptr, 0
+    Let shell_args_list be proc extract_array_elements from array_node
+
+    Note: Create ShellInstruction node
+    Let shell_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with shell_ptr, 0, DockerfileParser.NODE_SHELL
+    proc memory_set_int64 from Layout with shell_ptr, 8, shell_args_list
+    proc memory_set_int64 from Layout with shell_ptr, 16, line
+    proc memory_set_int64 from Layout with shell_ptr, 24, col
+
+    Return shell_ptr
+End Process
+
+Process called "translate_maintainer_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate dockerfile_maintainer HIR call back to MAINTAINER instruction AST.
+    Arguments: (name: String)
+    @End Reasoning
+
+    @Implementation
+    Extract name argument and create MaintainerInstruction AST node.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_call_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_call_ptr, 16
+    Let args_ptr be proc get_call_arguments from hir_call_ptr
+
+    If args_ptr is equal to 0:
+        proc set_backend_error from backend_ptr, "MAINTAINER call has no arguments"
+        Return 0
+    End If
+
+    Let name_node be proc list_get from List with args_ptr, 0
+    Let name be proc extract_string_literal from name_node
+
+    Note: Create MaintainerInstruction node
+    Let maintainer_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with maintainer_ptr, 0, DockerfileParser.NODE_MAINTAINER
+    proc memory_set_string from Layout with maintainer_ptr, 8, name
+    proc memory_set_int64 from Layout with maintainer_ptr, 16, line
+    proc memory_set_int64 from Layout with maintainer_ptr, 24, col
+
+    Return maintainer_ptr
+End Process
+
+Note: ============================================================================
+Note: Main Translation Functions
+Note: ============================================================================
+
+Process called "translate_hir_call" that takes backend_ptr as Integer, hir_call_ptr as Integer returns Integer:
+    @Reasoning
+    Translate a single HIR function call to Dockerfile instruction AST.
+    Dispatch to appropriate translator based on function name.
+    @End Reasoning
+
+    @Implementation
+    Get function name and dispatch to appropriate instruction translator.
+    @End Implementation
+
+    Let function_name be proc get_function_name from hir_call_ptr
+
+    If function_name is equal to "":
+        proc set_backend_error from backend_ptr, "Invalid HIR call node"
+        Return 0
+    End If
+
+    Note: Dispatch based on function name
+    If proc string_equals from StringCore with function_name, "dockerfile_from":
+        Let ast_node be proc translate_from_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_run_shell":
+        Let ast_node be proc translate_run_shell_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_run_exec":
+        Let ast_node be proc translate_run_exec_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_cmd_shell":
+        Let ast_node be proc translate_cmd_shell_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_cmd_exec":
+        Let ast_node be proc translate_cmd_exec_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_label":
+        Let ast_node be proc translate_label_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_expose":
+        Let ast_node be proc translate_expose_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_env":
+        Let ast_node be proc translate_env_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_copy":
+        Let ast_node be proc translate_copy_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_add":
+        Let ast_node be proc translate_add_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_entrypoint_shell":
+        Let ast_node be proc translate_entrypoint_shell_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_entrypoint_exec":
+        Let ast_node be proc translate_entrypoint_exec_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_volume":
+        Let ast_node be proc translate_volume_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_user":
+        Let ast_node be proc translate_user_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_workdir":
+        Let ast_node be proc translate_workdir_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_arg":
+        Let ast_node be proc translate_arg_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_onbuild":
+        Let ast_node be proc translate_onbuild_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_stopsignal":
+        Let ast_node be proc translate_stopsignal_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_healthcheck_none":
+        Let ast_node be proc translate_healthcheck_none_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_healthcheck_cmd":
+        Let ast_node be proc translate_healthcheck_cmd_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_shell":
+        Let ast_node be proc translate_shell_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    If proc string_equals from StringCore with function_name, "dockerfile_maintainer":
+        Let ast_node be proc translate_maintainer_call from backend_ptr, hir_call_ptr
+        Return ast_node
+    End If
+
+    proc set_backend_error from backend_ptr, "Unknown Dockerfile function"
+    Return 0
+End Process
+
+Process called "translate_hir_to_dockerfile" that takes backend_ptr as Integer, hir_block_ptr as Integer returns Integer:
+    @Reasoning
+    Translate HIR block containing dockerfile function calls back to Dockerfile AST.
+    Returns a DockerfileAST node containing all translated instructions.
+    @End Reasoning
+
+    @Implementation
+    Extract expression statements from HIR block, translate each call, create Dockerfile AST.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with hir_block_ptr, 8
+    Let col be proc memory_get_int64 from Layout with hir_block_ptr, 16
+    Let hir_statements_ptr be proc memory_get_int64 from Layout with hir_block_ptr, 24
+    Let statement_count be proc memory_get_int64 from Layout with hir_block_ptr, 32
+
+    Note: Create Dockerfile AST root node
+    Let dockerfile_ast_ptr be proc allocate from Layout with 32
+    proc memory_set_int64 from Layout with dockerfile_ast_ptr, 0, DockerfileParser.NODE_DOCKERFILE
+
+    Note: Create list for translated instructions
+    Let instructions_list be proc list_create from List
+
+    Note: Translate each HIR expression statement
+    Let i be 0
+    While i is less than statement_count:
+        Let expr_stmt_ptr be proc list_get from List with hir_statements_ptr, i
+
+        Note: Extract call expression from expression statement
+        Let hir_call_ptr be proc memory_get_int64 from Layout with expr_stmt_ptr, 24
+
+        Note: Translate HIR call to Dockerfile instruction
+        Let instruction_ast be proc translate_hir_call from backend_ptr, hir_call_ptr
+
+        If instruction_ast is equal to 0:
+            Note: Translation error occurred
+            Return 0
+        End If
+
+        proc list_append from List with instructions_list, instruction_ast
+        Set i to i plus 1
+    End While
+
+    Note: Set Dockerfile instructions
+    proc memory_set_int64 from Layout with dockerfile_ast_ptr, 8, instructions_list
+    proc memory_set_int64 from Layout with dockerfile_ast_ptr, 16, line
+    proc memory_set_int64 from Layout with dockerfile_ast_ptr, 24, col
+
+    Return dockerfile_ast_ptr
+End Process

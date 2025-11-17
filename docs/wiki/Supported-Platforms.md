@@ -21,7 +21,7 @@ These platforms receive the highest level of support and testing:
 - **ARM64** (AArch64)
   - Raspberry Pi 4+
   - AWS Graviton
-  - Apple Silicon via Rosetta (native macOS support available)
+  - Apple Silicon via Translation (native macOS support available)
 
 - **ARM32** (ARMv7)
   - Raspberry Pi 2/3
@@ -263,7 +263,7 @@ See the [Contributing Guide](https://github.com/Sybertnetics-Artificial-Intellig
 - Full feature parity with x86_64
 
 ### Apple Silicon
-- Native ARM64 support (no Rosetta required)
+- Native ARM64 support (no Translation required)
 - Optimized for M1/M2/M3 processors
 - Universal binary support planned
 

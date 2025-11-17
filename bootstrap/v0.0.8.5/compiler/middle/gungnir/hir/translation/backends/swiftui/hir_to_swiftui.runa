@@ -1,0 +1,1140 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+HIR to SwiftUI Code Generator - Converts Runa HIR to SwiftUI
+
+This file generates SwiftUI code from Runa's High-level Intermediate
+Representation (HIR). Converts Runa dictionaries and literals back to
+valid SwiftUI declarative UI syntax with proper formatting.
+
+Translation Mapping (reverse of swiftui_to_hir):
+- Dictionary with "_type": "view_struct" → SwiftUI struct declaration
+- Dictionary with "_type": "view_body" → View body property
+- Dictionary with "_type": "container" → Container view (VStack, HStack, ZStack)
+- Dictionary with "_type": "element" → Element view (Text, Button, Image, etc.)
+- Dictionary with "_type": "modifier" → View modifier (.padding(), etc.)
+- Dictionary with "_type": "property" → Property declaration with wrapper
+- Dictionary with "_type": "closure" → Closure expression
+- Dictionary with "_type": "binding" → State binding ($variable)
+- Dictionary with "_type": "member_access" → Member access (Color.red)
+- Dictionary with "_type": "function_call" → Function call
+- String/Number/Boolean literals → SwiftUI literals
+
+Features:
+- Pretty printing with proper indentation
+- Property wrapper generation
+- View hierarchy generation
+- Modifier chain generation
+- Closure generation with parameters
+- State binding generation ($var)
+- Member access generation (Type.member)
+- Parameter formatting (named and positional)
+
+Dependencies:
+- swiftui_emitter.runa (for buffered output)
+- compiler/middle/gungnir/hir/hir.runa (for HIR nodes)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/backends/swiftui/swiftui_emitter.runa" as Emitter
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Note: ============================================================================
+Note: SwiftUI Generation Context
+Note: ============================================================================
+
+Type called "SwiftUIGenContext":
+    emitter as Integer          Note: SwiftUIEmitter instance
+    indent_level as Integer     Note: Current indentation level
+    error_message as Integer    Note: Error message (if any)
+    has_error as Integer        Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Context Creation and Destruction
+Note: ============================================================================
+
+Process called "create_generation_context" returns Integer:
+    Note: Create SwiftUI generation context
+
+    Let context_size be 32  Note: SwiftUIGenContext: 4 fields × 8 bytes
+    Let context be proc allocate from Layout with context_size
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Create emitter
+    Let emitter be proc create_swiftui_emitter from Emitter
+
+    If emitter is equal to 0:
+        proc deallocate from Layout with context
+        Return 0
+    End If
+
+    Note: Initialize context
+    proc memory_set_int64 from Layout with context, 0, emitter
+    proc memory_set_int64 from Layout with context, 8, 0   Note: indent_level = 0
+    proc memory_set_int64 from Layout with context, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with context, 24, 0  Note: has_error = false
+
+    Return context
+End Process
+
+Process called "destroy_generation_context" takes context as Integer returns Integer:
+    Note: Destroy generation context and free resources
+
+    If context is equal to 0:
+        Return 1
+    End If
+
+    Note: Free emitter
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    If emitter is not equal to 0:
+        proc destroy_swiftui_emitter from Emitter with emitter
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Free context
+    proc deallocate from Layout with context
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
+    Note: Set generation error message
+
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with context, 16, new_error
+    proc memory_set_int64 from Layout with context, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Process called "has_generation_error" takes context as Integer returns Integer:
+    Note: Check if generation has error
+
+    Let has_error be proc memory_get_int64 from Layout with context, 24
+
+    Return has_error
+End Process
+
+Process called "get_error_message" takes context as Integer returns Integer:
+    Note: Get generation error message
+
+    Let error_message be proc memory_get_int64 from Layout with context, 16
+
+    Return error_message
+End Process
+
+Note: ============================================================================
+Note: HIR Node Type Detection
+Note: ============================================================================
+
+Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a dictionary literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "DictionaryLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_string_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a string literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "StringLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_list_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a list literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "ListLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_integer_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is an integer literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "IntegerLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_float_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a float literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "FloatLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_boolean_hir" takes hir_node as Integer returns Integer:
+    Note: Check if HIR node is a boolean literal
+
+    If hir_node is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with hir_node, 0
+    Let expected_type be proc get_hir_node_type from HIR with "BooleanLiteral"
+
+    If node_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: HIR Dictionary Key Access
+Note: ============================================================================
+
+Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get string value from HIR dictionary by key
+
+    Let entries be proc get_dictionary_entries from HIR with hir_dict
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Note: Compare key strings
+        Let matches be proc strings_equal from StringCore with key, entry_key
+
+        If matches is equal to 1:
+            Note: Found matching key, extract string value
+            Let is_string be proc is_string_hir from entry_value
+
+            If is_string is equal to 1:
+                Return proc get_string_literal_value from HIR with entry_value
+            End If
+
+            Return 0  Note: Value is not a string
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Process called "get_dict_hir_value" takes hir_dict as Integer, key as Integer returns Integer:
+    Note: Get HIR node value from HIR dictionary by key
+
+    Let entries be proc get_dictionary_entries from HIR with hir_dict
+
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Note: Compare key strings
+        Let matches be proc strings_equal from StringCore with key, entry_key
+
+        If matches is equal to 1:
+            Return entry_value
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 0  Note: Key not found
+End Process
+
+Note: ============================================================================
+Note: Indentation
+Note: ============================================================================
+
+Process called "emit_indent" takes context as Integer returns Integer:
+    Note: Emit indentation for current level
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+
+    proc emit_indent from Emitter with emitter, indent_level
+
+    Return 1
+End Process
+
+Process called "increase_indent" takes context as Integer returns Integer:
+    Note: Increase indentation level
+
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+    proc memory_set_int64 from Layout with context, 8, indent_level plus 1
+
+    Return 1
+End Process
+
+Process called "decrease_indent" takes context as Integer returns Integer:
+    Note: Decrease indentation level
+
+    Let indent_level be proc memory_get_int64 from Layout with context, 8
+
+    If indent_level is greater than 0:
+        proc memory_set_int64 from Layout with context, 8, indent_level minus 1
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: View Structure Generation
+Note: ============================================================================
+
+Process called "generate_view_struct" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate SwiftUI view struct declaration
+
+    @Reasoning:
+    Generates:
+    struct ViewName: View {
+        @State var property: Type
+        var body: some View {
+            view_hierarchy
+        }
+    }
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get struct name
+    Let struct_name be proc get_dict_string_value from hir_node, "name"
+
+    If struct_name is equal to 0:
+        proc set_generation_error from context, "View struct missing 'name'"
+        Return 0
+    End If
+
+    Note: Generate struct declaration
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "struct "
+    proc emit_string from Emitter with emitter, struct_name
+    proc emit_string from Emitter with emitter, ": View {"
+    proc emit_char from Emitter with emitter, 10  Note: newline
+
+    proc increase_indent from context
+
+    Note: Generate properties
+    Let properties be proc get_dict_hir_value from hir_node, "properties"
+
+    If properties is not equal to 0:
+        Let is_list be proc is_list_hir from properties
+
+        If is_list is equal to 1:
+            Let list_items be proc get_list_elements from HIR with properties
+            Let count be proc size from List with list_items
+            Let index be 0
+
+            While index is less than count:
+                Let property_hir be proc get_at from List with list_items, index
+                proc generate_property from context, property_hir
+                Set index to index plus 1
+            End While
+
+            Note: Empty line after properties
+            If count is greater than 0:
+                proc emit_char from Emitter with emitter, 10
+            End If
+        End If
+    End If
+
+    Note: Generate body
+    Let body be proc get_dict_hir_value from hir_node, "body"
+
+    If body is not equal to 0:
+        proc generate_view_body from context, body
+    End If
+
+    proc decrease_indent from context
+
+    Note: Closing brace
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 125  Note: }
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Return 1
+End Process
+
+Process called "generate_property" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate SwiftUI property declaration
+
+    @Reasoning:
+    Generates:
+    @State var propertyName: Type = initialValue
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get property details
+    Let property_name be proc get_dict_string_value from hir_node, "name"
+    Let wrapper be proc get_dict_string_value from hir_node, "wrapper"
+    Let type_annotation be proc get_dict_string_value from hir_node, "type_annotation"
+    Let initial_value be proc get_dict_hir_value from hir_node, "initial_value"
+
+    proc emit_indent from context
+
+    Note: Emit property wrapper if present
+    If wrapper is not equal to 0:
+        proc emit_char from Emitter with emitter, 64  Note: @
+        proc emit_string from Emitter with emitter, wrapper
+        proc emit_space from Emitter with emitter
+    End If
+
+    Note: Emit var or let based on mutability
+    Let is_mutable be proc get_dict_hir_value from hir_node, "is_mutable"
+
+    If is_mutable is not equal to 0:
+        Note: Check if explicitly marked as immutable
+        Let mutability_value be proc get_int_literal_value from HIR with is_mutable
+
+        If mutability_value is equal to 0:
+            Note: Immutable property - use let
+            proc emit_string from Emitter with emitter, "let "
+        Otherwise:
+            Note: Mutable property - use var
+            proc emit_string from Emitter with emitter, "var "
+        End If
+    Otherwise:
+        Note: Default to var if mutability not specified (SwiftUI properties are typically mutable)
+        proc emit_string from Emitter with emitter, "var "
+    End If
+
+    Note: Emit property name
+    proc emit_string from Emitter with emitter, property_name
+
+    Note: Emit type annotation if present
+    If type_annotation is not equal to 0:
+        proc emit_string from Emitter with emitter, ": "
+        proc emit_string from Emitter with emitter, type_annotation
+    End If
+
+    Note: Emit initial value if present
+    If initial_value is not equal to 0:
+        proc emit_string from Emitter with emitter, " = "
+        proc generate_expression from context, initial_value
+    End If
+
+    proc emit_char from Emitter with emitter, 10  Note: newline
+
+    Return 1
+End Process
+
+Process called "generate_view_body" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate SwiftUI view body property
+
+    @Reasoning:
+    Generates:
+    var body: some View {
+        view_hierarchy
+    }
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get view hierarchy
+    Let view be proc get_dict_hir_value from hir_node, "view"
+
+    proc emit_indent from context
+    proc emit_string from Emitter with emitter, "var body: some View {"
+    proc emit_char from Emitter with emitter, 10  Note: newline
+
+    proc increase_indent from context
+
+    Note: Generate view hierarchy
+    If view is not equal to 0:
+        proc generate_view_hierarchy from context, view
+    End If
+
+    proc decrease_indent from context
+
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 125  Note: }
+    proc emit_char from Emitter with emitter, 10   Note: newline
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: View Hierarchy Generation
+Note: ============================================================================
+
+Process called "generate_view_hierarchy" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate SwiftUI view hierarchy
+
+    @Reasoning:
+    Dispatches based on HIR dictionary "_type" field:
+    - "container" → VStack/HStack/ZStack
+    - "element" → Text/Button/Image/etc.
+    - Other types → recursively generate
+    @End Reasoning
+
+    If hir_node is equal to 0:
+        Return 1
+    End If
+
+    Let is_dict be proc is_dictionary_hir from hir_node
+
+    If is_dict is equal to 0:
+        Note: Not a dictionary, might be a literal or expression
+        proc generate_expression from context, hir_node
+        Return 1
+    End If
+
+    Note: Get type field
+    Let type_str be proc get_dict_string_value from hir_node, "_type"
+
+    If type_str is equal to 0:
+        Note: No type field, treat as expression
+        proc generate_expression from context, hir_node
+        Return 1
+    End If
+
+    Note: Dispatch based on type
+    Let is_container be proc strings_equal from StringCore with type_str, "container"
+    Let is_element be proc strings_equal from StringCore with type_str, "element"
+    Let is_closure be proc strings_equal from StringCore with type_str, "closure"
+
+    If is_container is equal to 1:
+        proc generate_container_view from context, hir_node
+        Return 1
+    End If
+
+    If is_element is equal to 1:
+        proc generate_element_view from context, hir_node
+        Return 1
+    End If
+
+    If is_closure is equal to 1:
+        proc generate_closure from context, hir_node
+        Return 1
+    End If
+
+    Note: Unknown type, try to generate as expression
+    proc generate_expression from context, hir_node
+
+    Return 1
+End Process
+
+Process called "generate_container_view" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate SwiftUI container view (VStack, HStack, ZStack)
+
+    @Reasoning:
+    Generates:
+    VStack(alignment: .leading, spacing: 10) {
+        child_views
+    }
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get container details
+    Let container_name be proc get_dict_string_value from hir_node, "name"
+    Let parameters be proc get_dict_hir_value from hir_node, "parameters"
+    Let children be proc get_dict_hir_value from hir_node, "children"
+    Let modifiers be proc get_dict_hir_value from hir_node, "modifiers"
+
+    proc emit_indent from context
+
+    Note: Emit container name
+    proc emit_string from Emitter with emitter, container_name
+
+    Note: Emit parameters if present
+    If parameters is not equal to 0:
+        proc emit_char from Emitter with emitter, 40  Note: (
+        proc generate_parameters from context, parameters
+        proc emit_char from Emitter with emitter, 41  Note: )
+    End If
+
+    Note: Emit trailing closure
+    proc emit_string from Emitter with emitter, " {"
+    proc emit_char from Emitter with emitter, 10  Note: newline
+
+    proc increase_indent from context
+
+    Note: Emit children
+    If children is not equal to 0:
+        Let is_list be proc is_list_hir from children
+
+        If is_list is equal to 1:
+            Let child_items be proc get_list_elements from HIR with children
+            Let count be proc size from List with child_items
+            Let index be 0
+
+            While index is less than count:
+                Let child_hir be proc get_at from List with child_items, index
+                proc generate_view_hierarchy from context, child_hir
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    proc decrease_indent from context
+
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 125  Note: }
+
+    Note: Emit modifiers
+    If modifiers is not equal to 0:
+        proc generate_modifiers from context, modifiers
+    End If
+
+    proc emit_char from Emitter with emitter, 10  Note: newline
+
+    Return 1
+End Process
+
+Process called "generate_element_view" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate SwiftUI element view (Text, Button, Image, etc.)
+
+    @Reasoning:
+    Generates:
+    Text("Hello")
+    Button("Click me") { action }
+    Image(systemName: "star")
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get element details
+    Let element_name be proc get_dict_string_value from hir_node, "name"
+    Let parameters be proc get_dict_hir_value from hir_node, "parameters"
+    Let children be proc get_dict_hir_value from hir_node, "children"
+    Let modifiers be proc get_dict_hir_value from hir_node, "modifiers"
+
+    proc emit_indent from context
+
+    Note: Emit element name
+    proc emit_string from Emitter with emitter, element_name
+
+    Note: Emit parameters if present
+    If parameters is not equal to 0:
+        proc emit_char from Emitter with emitter, 40  Note: (
+        proc generate_parameters from context, parameters
+        proc emit_char from Emitter with emitter, 41  Note: )
+    End If
+
+    Note: Emit trailing closure for children (Button actions, etc.)
+    If children is not equal to 0:
+        Let is_list be proc is_list_hir from children
+
+        If is_list is equal to 1:
+            Let child_items be proc get_list_elements from HIR with children
+            Let count be proc size from List with child_items
+
+            If count is greater than 0:
+                proc emit_string from Emitter with emitter, " {"
+                proc emit_char from Emitter with emitter, 10  Note: newline
+
+                proc increase_indent from context
+
+                Let index be 0
+                While index is less than count:
+                    Let child_hir be proc get_at from List with child_items, index
+                    proc generate_view_hierarchy from context, child_hir
+                    Set index to index plus 1
+                End While
+
+                proc decrease_indent from context
+
+                proc emit_indent from context
+                proc emit_char from Emitter with emitter, 125  Note: }
+            End If
+        End If
+    End If
+
+    Note: Emit modifiers
+    If modifiers is not equal to 0:
+        proc generate_modifiers from context, modifiers
+    End If
+
+    proc emit_char from Emitter with emitter, 10  Note: newline
+
+    Return 1
+End Process
+
+Process called "generate_modifiers" takes context as Integer, modifiers_list as Integer returns Integer:
+    Note: Generate modifier chain
+
+    @Reasoning:
+    Generates:
+    .padding()
+    .background(Color.red)
+    .foregroundColor(.blue)
+    @End Reasoning
+
+    Let is_list be proc is_list_hir from modifiers_list
+
+    If is_list is equal to 0:
+        Return 1
+    End If
+
+    Let list_items be proc get_list_elements from HIR with modifiers_list
+    Let count be proc size from List with list_items
+    Let index be 0
+
+    While index is less than count:
+        Let modifier_hir be proc get_at from List with list_items, index
+        proc generate_modifier from context, modifier_hir
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "generate_modifier" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate single view modifier
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get modifier details
+    Let modifier_name be proc get_dict_string_value from hir_node, "name"
+    Let parameters be proc get_dict_hir_value from hir_node, "parameters"
+
+    proc emit_char from Emitter with emitter, 10  Note: newline
+    proc emit_indent from context
+    proc emit_char from Emitter with emitter, 46  Note: .
+    proc emit_string from Emitter with emitter, modifier_name
+
+    Note: Emit parameters if present
+    If parameters is not equal to 0:
+        proc emit_char from Emitter with emitter, 40  Note: (
+        proc generate_parameters from context, parameters
+        proc emit_char from Emitter with emitter, 41  Note: )
+    Otherwise:
+        Note: Parameterless modifier
+        proc emit_string from Emitter with emitter, "()"
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Parameter Generation
+Note: ============================================================================
+
+Process called "generate_parameters" takes context as Integer, params_dict as Integer returns Integer:
+    Note: Generate function/modifier parameters
+
+    @Reasoning:
+    Parameters can be:
+    - Positional: keyed by "0", "1", "2", etc.
+    - Named: keyed by parameter name
+    We generate named parameters as "name: value" and positional as just "value"
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Let entries be proc get_dictionary_entries from HIR with params_dict
+
+    If entries is equal to 0:
+        Return 1
+    End If
+
+    Let count be proc size from List with entries
+    Let index be 0
+    Let first be 1
+
+    Note: First pass: emit positional parameters (keys "0", "1", etc.)
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Note: Check if key is numeric (positional parameter)
+        Let is_numeric be proc is_numeric_string from StringCore with entry_key
+
+        If is_numeric is equal to 1:
+            If first is equal to 0:
+                proc emit_string from Emitter with emitter, ", "
+            End If
+
+            proc generate_expression from context, entry_value
+            Set first to 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: Second pass: emit named parameters
+    Set index to 0
+
+    While index is less than count:
+        Let entry be proc get_at from List with entries, index
+        Let entry_key be proc memory_get_int64 from Layout with entry, 0
+        Let entry_value be proc memory_get_int64 from Layout with entry, 8
+
+        Note: Check if key is NOT numeric (named parameter)
+        Let is_numeric be proc is_numeric_string from StringCore with entry_key
+
+        If is_numeric is equal to 0:
+            If first is equal to 0:
+                proc emit_string from Emitter with emitter, ", "
+            End If
+
+            proc emit_string from Emitter with emitter, entry_key
+            proc emit_string from Emitter with emitter, ": "
+            proc generate_expression from context, entry_value
+            Set first to 0
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Expression Generation
+Note: ============================================================================
+
+Process called "generate_expression" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate Swift expression
+
+    @Reasoning:
+    Expressions can be:
+    - Literals (string, number, boolean)
+    - Identifiers (string literals)
+    - State bindings (dictionaries with "_type": "binding")
+    - Member access (dictionaries with "_type": "member_access")
+    - Function calls (dictionaries with "_type": "function_call")
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    If hir_node is equal to 0:
+        Return 1
+    End If
+
+    Note: Check for string literal
+    Let is_string be proc is_string_hir from hir_node
+
+    If is_string is equal to 1:
+        Let str_value be proc get_string_literal_value from HIR with hir_node
+        proc emit_char from Emitter with emitter, 34  Note: "
+        proc emit_string from Emitter with emitter, str_value
+        proc emit_char from Emitter with emitter, 34  Note: "
+        Return 1
+    End If
+
+    Note: Check for integer literal
+    Let is_int be proc is_integer_hir from hir_node
+
+    If is_int is equal to 1:
+        Let int_value be proc get_integer_literal_value from HIR with hir_node
+        Let int_str be proc allocate from Layout with 32
+        proc int_to_string from StringCore with int_value, int_str, 32
+        proc emit_string from Emitter with emitter, int_str
+        proc deallocate from Layout with int_str
+        Return 1
+    End If
+
+    Note: Check for float literal
+    Let is_float be proc is_float_hir from hir_node
+
+    If is_float is equal to 1:
+        Let float_value be proc get_float_literal_value from HIR with hir_node
+        Let float_str be proc allocate from Layout with 32
+        proc float_to_string from StringCore with float_value, float_str, 32
+        proc emit_string from Emitter with emitter, float_str
+        proc deallocate from Layout with float_str
+        Return 1
+    End If
+
+    Note: Check for boolean literal
+    Let is_bool be proc is_boolean_hir from hir_node
+
+    If is_bool is equal to 1:
+        Let bool_value be proc get_boolean_literal_value from HIR with hir_node
+
+        If bool_value is equal to 1:
+            proc emit_string from Emitter with emitter, "true"
+        Otherwise:
+            proc emit_string from Emitter with emitter, "false"
+        End If
+
+        Return 1
+    End If
+
+    Note: Check for dictionary (binding, member_access, function_call)
+    Let is_dict be proc is_dictionary_hir from hir_node
+
+    If is_dict is equal to 1:
+        Let type_str be proc get_dict_string_value from hir_node, "_type"
+
+        If type_str is not equal to 0:
+            Let is_binding be proc strings_equal from StringCore with type_str, "binding"
+            Let is_member be proc strings_equal from StringCore with type_str, "member_access"
+            Let is_call be proc strings_equal from StringCore with type_str, "function_call"
+            Let is_closure be proc strings_equal from StringCore with type_str, "closure"
+
+            If is_binding is equal to 1:
+                Let value be proc get_dict_string_value from hir_node, "value"
+                proc emit_string from Emitter with emitter, value
+                Return 1
+            End If
+
+            If is_member is equal to 1:
+                Let value be proc get_dict_string_value from hir_node, "value"
+                proc emit_string from Emitter with emitter, value
+                Return 1
+            End If
+
+            If is_call is equal to 1:
+                Let name be proc get_dict_string_value from hir_node, "name"
+                Let parameters be proc get_dict_hir_value from hir_node, "parameters"
+
+                proc emit_string from Emitter with emitter, name
+                proc emit_char from Emitter with emitter, 40  Note: (
+
+                If parameters is not equal to 0:
+                    proc generate_parameters from context, parameters
+                End If
+
+                proc emit_char from Emitter with emitter, 41  Note: )
+                Return 1
+            End If
+
+            If is_closure is equal to 1:
+                proc generate_closure from context, hir_node
+                Return 1
+            End If
+        End If
+    End If
+
+    Note: Unknown expression type
+    proc set_generation_error from context, "Unknown expression type"
+    Return 0
+End Process
+
+Process called "generate_closure" takes context as Integer, hir_node as Integer returns Integer:
+    Note: Generate closure expression
+
+    @Reasoning:
+    Generates:
+    { }
+    { value in statements }
+    @End Reasoning
+
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+
+    Note: Get closure details
+    Let parameter be proc get_dict_string_value from hir_node, "parameter"
+    Let body be proc get_dict_hir_value from hir_node, "body"
+
+    proc emit_char from Emitter with emitter, 123  Note: {
+
+    Note: Emit parameter if present
+    If parameter is not equal to 0:
+        proc emit_space from Emitter with emitter
+        proc emit_string from Emitter with emitter, parameter
+        proc emit_string from Emitter with emitter, " in"
+        proc emit_char from Emitter with emitter, 10  Note: newline
+        proc increase_indent from context
+    End If
+
+    Note: Emit body statements
+    If body is not equal to 0:
+        Let is_list be proc is_list_hir from body
+
+        If is_list is equal to 1:
+            Let body_items be proc get_list_elements from HIR with body
+            Let count be proc size from List with body_items
+            Let index be 0
+
+            If parameter is equal to 0:
+                Note: No parameter, simple closure
+                proc emit_space from Emitter with emitter
+            End If
+
+            While index is less than count:
+                Let stmt_hir be proc get_at from List with body_items, index
+
+                If parameter is not equal to 0:
+                    proc emit_indent from context
+                End If
+
+                proc generate_view_hierarchy from context, stmt_hir
+                Set index to index plus 1
+            End While
+        End If
+    End If
+
+    If parameter is not equal to 0:
+        proc decrease_indent from context
+        proc emit_indent from context
+    Otherwise:
+        proc emit_space from Emitter with emitter
+    End If
+
+    proc emit_char from Emitter with emitter, 125  Note: }
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Top-Level Generation
+Note: ============================================================================
+
+Process called "generate_swiftui" takes hir_node as Integer returns Integer:
+    Note: Generate SwiftUI code from HIR (top-level entry point)
+
+    @Reasoning:
+    Entry point for generating SwiftUI code from HIR representation.
+    Typically takes a view struct HIR node and generates complete SwiftUI code.
+    @End Reasoning
+
+    Note: Create generation context
+    Let context be proc create_generation_context
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if HIR node is a view struct
+    Let is_dict be proc is_dictionary_hir from hir_node
+
+    If is_dict is equal to 1:
+        Let type_str be proc get_dict_string_value from hir_node, "_type"
+
+        If type_str is not equal to 0:
+            Let is_struct be proc strings_equal from StringCore with type_str, "view_struct"
+
+            If is_struct is equal to 1:
+                proc generate_view_struct from context, hir_node
+            Otherwise:
+                Note: Not a view struct, try to generate as expression
+                proc generate_expression from context, hir_node
+            End If
+        Otherwise:
+            Note: No type field, generate as expression
+            proc generate_expression from context, hir_node
+        End If
+    Otherwise:
+        Note: Not a dictionary, generate as expression
+        proc generate_expression from context, hir_node
+    End If
+
+    Note: Check for errors
+    Let has_error be proc has_generation_error from context
+
+    If has_error is equal to 1:
+        proc destroy_generation_context from context
+        Return 0
+    End If
+
+    Note: Get output
+    Let emitter be proc memory_get_int64 from Layout with context, 0
+    Let output be proc get_output from Emitter with emitter
+
+    Note: Destroy context
+    proc destroy_generation_context from context
+
+    Return output
+End Process

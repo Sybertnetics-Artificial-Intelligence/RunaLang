@@ -38,18 +38,22 @@ def process_user_analytics(users, start_date, end_date, metrics=['engagement', '
 
 **Runa** (Same functionality):
 ```runa
-Process called "analyze user behavior" that takes users and date range and metrics
+Process called "analyze user behavior" that takes users and date range and metrics:
     Let active users be Filter users where last activity is within date range
     
     For each metric in metrics:
-        When metric is "engagement":
+        If metric is "engagement":
             Let average sessions be the average of sessions from active users
             Let top performers be the top 10 users sorted by engagement score
+            End If
             
-        When metric is "retention":
+        If metric is "retention":
             Let retention rate be the percentage of active users who are retained
+            End If
+        End For
     
     Return analysis results
+End Process
 ```
 
 **The difference is striking:** The Python code requires deep programming knowledge to understand the logic. The Runa code can be read and understood by anyone who speaks English - product managers, data scientists, business analysts, or domain experts.
@@ -83,12 +87,13 @@ Process called "analyze user behavior" that takes users and date range and metri
 Process called "calculate shipping cost" that takes order and destination:
     Let base cost be order total multiplied by 0.08
     
-    When destination is "international":
+    If destination is "international":
         Let customs fee be base cost multiplied by 0.15
         Return base cost plus customs fee
-    
     Otherwise:
         Return base cost
+    End If
+End Process
 ```
 
 ### AI Agent Coordination
@@ -110,7 +115,7 @@ Let clean data be Filter user data where age is greater than 0
 Let processed data be Map over clean data using standardize user record
 Let insights be analyze patterns in processed data
 
-Display "Found " with message length of insights with message " key insights"
+Display "Found " joined with length of insights to string joined with " key insights"
 ```
 
 ### Machine Learning Workflow
@@ -133,8 +138,8 @@ Let predictions be model predict with input as new data
 
 ### 📖 **Natural Language Syntax**
 - Multi-word identifiers: `user name`, `account balance`, `processing status`
-- English operators: `is greater than`, `multiplied by`, `concatenated with`
-- Intuitive control flow: `If...Otherwise`, `For each...in`, `When...`
+- English operators: `is greater than`, `multiplied by`, `joined with`
+- Intuitive control flow: `If...Otherwise`, `For each...in`, `Match...When`
 
 ### 🔧 **Advanced Language Features**
 - **Powerful Type System**: Gradual typing with sophisticated inference
@@ -175,7 +180,7 @@ curl -sSf https://get.runa-lang.org | sh
 ```runa
 Note: A simple greeting program
 Let username be input with prompt "What's your name?"
-Let greeting be "Hello, " joined with username followed by "!"
+Let greeting be "Hello, " joined with username joined with "!"
 
 Display greeting
 Display "Welcome to Runa Programming!"

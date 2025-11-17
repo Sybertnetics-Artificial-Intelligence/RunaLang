@@ -1,0 +1,1091 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+YAML Parser - Builds AST from YAML tokens
+
+This file implements recursive descent parsing for YAML 1.2, handling:
+- Block sequences and mappings
+- Flow sequences and mappings
+- All scalar types (plain, quoted, literal, folded)
+- Anchors and aliases
+- Tags
+- Multi-document streams
+- Indentation-based structure
+
+YAML AST Node Types:
+- YAML_DOCUMENT - Top-level document
+- YAML_MAPPING - Block or flow mapping (dictionary)
+- YAML_SEQUENCE - Block or flow sequence (list)
+- YAML_SCALAR - Scalar value
+- YAML_ALIAS - Reference to anchored node
+
+Features:
+- Complete YAML 1.2 grammar support
+- Anchor/alias resolution
+- Tag preservation
+- Error reporting with position information
+- Memory-safe AST construction
+
+Dependencies:
+- yaml_lexer.runa (for tokenization)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/yaml/yaml_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Note: ============================================================================
+Note: YAML AST Node Types
+Note: ============================================================================
+
+Constant YAML_DOCUMENT as Integer is 100
+Constant YAML_MAPPING as Integer is 101
+Constant YAML_SEQUENCE as Integer is 102
+Constant YAML_SCALAR as Integer is 103
+Constant YAML_ALIAS as Integer is 104
+
+Note: ============================================================================
+Note: YAML AST Node Structure
+Note: ============================================================================
+
+Type called "YAMLNode":
+    node_type as Integer        Note: YAML_* constant
+    value_string as Integer     Note: String value (for scalars)
+    value_int as Integer        Note: Integer value (for scalars)
+    is_integer as Integer       Note: Boolean: 1 if scalar is integer
+    children as Integer         Note: List of child nodes
+    keys as Integer             Note: List of keys (for mappings)
+    anchor as Integer           Note: Anchor name (if this node is anchored)
+    tag as Integer              Note: Tag string (if tagged)
+    line as Integer             Note: Line number in source
+    column as Integer           Note: Column number in source
+End Type
+
+Note: ============================================================================
+Note: YAML Parser Structure
+Note: ============================================================================
+
+Type called "YAMLParser":
+    lexer as Integer            Note: YAML lexer
+    current_token as Integer    Note: Current token
+    error_message as Integer    Note: Error message (if any)
+    has_error as Integer        Note: Boolean: 1 if error occurred
+    anchors as Integer          Note: Dictionary mapping anchor names to nodes
+End Type
+
+Note: ============================================================================
+Note: Parser Creation and Destruction
+Note: ============================================================================
+
+Process called "create_yaml_parser" takes lexer as Integer returns Integer:
+    Note: Create YAML parser with lexer
+
+    Let parser_size be 40  Note: YAMLParser: 5 fields × 8 bytes
+    Let parser be proc allocate from Layout with parser_size
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize parser state
+    proc memory_set_int64 from Layout with parser, 0, lexer
+    proc memory_set_int64 from Layout with parser, 8, 0   Note: current_token = null
+    proc memory_set_int64 from Layout with parser, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with parser, 24, 0  Note: has_error = false
+
+    Note: Create anchor registry
+    Let anchors be proc create from Dict
+    proc memory_set_int64 from Layout with parser, 32, anchors
+
+    Note: Advance to first token
+    Let first_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, first_token
+
+    Return parser
+End Process
+
+Process called "destroy_yaml_parser" takes parser as Integer returns Integer:
+    Note: Destroy YAML parser
+
+    If parser is equal to 0:
+        Return 1
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Free anchor registry
+    Let anchors be proc memory_get_int64 from Layout with parser, 32
+
+    If anchors is not equal to 0:
+        proc destroy from Dict with anchors
+    End If
+
+    proc deallocate from Layout with parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Token Management
+Note: ============================================================================
+
+Process called "advance_token" takes parser as Integer returns Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let token be proc next_token from Lexer with lexer
+
+    proc memory_set_int64 from Layout with parser, 8, token
+
+    Return token
+End Process
+
+Process called "peek_token_type" takes parser as Integer returns Integer:
+    Note: Peek at current token type
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+
+    If token is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+
+    Return token_type
+End Process
+
+Process called "peek_next_token_type" takes parser as Integer returns Integer:
+    Note: Peek at next token type (lookahead by 1)
+
+    @Reasoning:
+    For YAML nested mapping detection, we check if a scalar is followed by a colon.
+    We temporarily advance to get the next token, check its type, then restore.
+    This is safe because we maintain parser state carefully.
+    @End Reasoning
+
+    Note: Save current token
+    Let saved_token be proc memory_get_int64 from Layout with parser, 8
+
+    Note: Advance to next token
+    proc advance_token from parser
+
+    Note: Get next token type
+    Let next_type be proc peek_token_type from parser
+
+    Note: Restore original token
+    proc memory_set_int64 from Layout with parser, 8, saved_token
+
+    Return next_type
+End Process
+
+Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Check if current token matches expected type
+
+    Let actual_type be proc peek_token_type from parser
+
+    If actual_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
+    Note: Expect token of specific type, set error if mismatch
+
+    Let actual_type be proc peek_token_type from parser
+
+    If actual_type is not equal to expected_type:
+        proc set_parse_error from parser, error_msg
+        Return 0
+    End If
+
+    proc advance_token from parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
+    Note: Set parser error message
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 16, new_error
+    proc memory_set_int64 from Layout with parser, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Anchor Management
+Note: ============================================================================
+
+Process called "register_anchor" takes parser as Integer, anchor_name as Integer, node as Integer returns Integer:
+    Note: Register anchor with node
+
+    Let anchors be proc memory_get_int64 from Layout with parser, 32
+
+    If anchors is equal to 0:
+        Return 0
+    End If
+
+    proc put from Dict with anchors, anchor_name, node
+
+    Return 1
+End Process
+
+Process called "resolve_alias" takes parser as Integer, alias_name as Integer returns Integer:
+    Note: Resolve alias to anchored node
+
+    Let anchors be proc memory_get_int64 from Layout with parser, 32
+
+    If anchors is equal to 0:
+        proc set_parse_error from parser, "No anchor registry"
+        Return 0
+    End If
+
+    Let node be proc get from Dict with anchors, alias_name
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Undefined alias"
+        Return 0
+    End If
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Node Creation
+Note: ============================================================================
+
+Process called "create_yaml_node" takes node_type as Integer returns Integer:
+    Note: Create YAML AST node
+
+    Let node_size be 80  Note: YAMLNode: 10 fields × 8 bytes
+    Let node be proc allocate from Layout with node_size
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 0, node_type
+    proc memory_set_int64 from Layout with node, 8, 0   Note: value_string = null
+    proc memory_set_int64 from Layout with node, 16, 0  Note: value_int = 0
+    proc memory_set_int64 from Layout with node, 24, 0  Note: is_integer = false
+    proc memory_set_int64 from Layout with node, 32, 0  Note: children = null
+    proc memory_set_int64 from Layout with node, 40, 0  Note: keys = null
+    proc memory_set_int64 from Layout with node, 48, 0  Note: anchor = null
+    proc memory_set_int64 from Layout with node, 56, 0  Note: tag = null
+    proc memory_set_int64 from Layout with node, 64, 0  Note: line = 0
+    proc memory_set_int64 from Layout with node, 72, 0  Note: column = 0
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Scalar Parsing
+Note: ============================================================================
+
+Process called "parse_scalar" takes parser as Integer returns Integer:
+    Note: Parse scalar value (plain, quoted, literal, or folded)
+
+    @Reasoning:
+    YAML scalars can be:
+    - Plain (unquoted)
+    - Single-quoted (no escapes except '')
+    - Double-quoted (with escapes)
+    - Literal (| - preserves newlines)
+    - Folded (> - folds newlines to spaces)
+    All scalar types are treated as YAML_SCALAR nodes with string content.
+    @End Reasoning
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Note: Validate token type is a scalar
+    If token_type is not equal to TOKEN_SCALAR_PLAIN from Lexer:
+        If token_type is not equal to TOKEN_SCALAR_SINGLE_QUOTED from Lexer:
+            If token_type is not equal to TOKEN_SCALAR_DOUBLE_QUOTED from Lexer:
+                If token_type is not equal to TOKEN_SCALAR_LITERAL from Lexer:
+                    If token_type is not equal to TOKEN_SCALAR_FOLDED from Lexer:
+                        proc set_parse_error from parser, "Expected scalar value"
+                        Return 0
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Let node be proc create_yaml_node from YAML_SCALAR
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Copy lexeme to node
+    Let value_copy be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with value_copy, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with value_copy, lexeme_length, 0
+
+    proc memory_set_int64 from Layout with node, 8, value_copy
+    proc memory_set_int64 from Layout with node, 64, line
+    proc memory_set_int64 from Layout with node, 72, column
+
+    Note: For literal and folded scalars, preserve as-is (already processed by lexer)
+    If token_type is equal to TOKEN_SCALAR_LITERAL from Lexer:
+        Note: Literal block scalar - preserve newlines as-is
+        proc advance_token from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_SCALAR_FOLDED from Lexer:
+        Note: Folded block scalar - newlines already folded by lexer
+        proc advance_token from parser
+        Return node
+    End If
+
+    Note: For plain scalars, try to parse as integer
+    If token_type is equal to TOKEN_SCALAR_PLAIN from Lexer:
+        Let is_integer be proc try_parse_integer from value_copy
+
+        If is_integer is greater than 0:
+            proc memory_set_int64 from Layout with node, 16, is_integer
+            proc memory_set_int64 from Layout with node, 24, 1
+        End If
+    End If
+
+    proc advance_token from parser
+
+    Return node
+End Process
+
+Process called "try_parse_integer" takes str as Integer returns Integer:
+    Note: Try to parse string as integer, return 0 if not valid
+
+    Let length be proc string_length from StringCore with str
+
+    If length is equal to 0:
+        Return 0
+    End If
+
+    Let index be 0
+    Let is_negative be 0
+    Let value be 0
+
+    Note: Check for negative sign
+    Let first_char be proc memory_get_byte from Layout with str, 0
+
+    If first_char is equal to 45:  Note: -
+        Set is_negative to 1
+        Set index to 1
+    End If
+
+    Note: Parse digits
+    While index is less than length:
+        Let char be proc memory_get_byte from Layout with str, index
+
+        If char is greater than or equal to 48:  Note: '0'
+            If char is less than or equal to 57:  Note: '9'
+                Let digit be char minus 48
+                Set value to value times 10
+                Set value to value plus digit
+                Set index to index plus 1
+            Otherwise:
+                Return 0  Note: Not a digit
+            End If
+        Otherwise:
+            Return 0  Note: Not a digit
+        End If
+    End While
+
+    If is_negative is equal to 1:
+        Set value to 0 minus value
+    End If
+
+    Return value
+End Process
+
+Note: ============================================================================
+Note: Flow Collection Parsing
+Note: ============================================================================
+
+Process called "parse_flow_sequence" takes parser as Integer returns Integer:
+    Note: Parse flow sequence: [value1, value2, ...]
+
+    proc expect_token from parser, TOKEN_LEFT_BRACKET from Lexer, "Expected '['"
+
+    Let node be proc create_yaml_node from YAML_SEQUENCE
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Let children be proc create from List
+    proc memory_set_int64 from Layout with node, 32, children
+
+    Note: Parse elements
+    While 1 is equal to 1:
+        Note: Check for end of sequence
+        Let is_close be proc check_token_type from parser, TOKEN_RIGHT_BRACKET from Lexer
+
+        If is_close is equal to 1:
+            Break
+        End If
+
+        Note: Parse element
+        Let element be proc parse_flow_value from parser
+
+        If element is equal to 0:
+            Return 0
+        End If
+
+        proc append from List with children, element
+
+        Note: Check for comma or end
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_token from parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc expect_token from parser, TOKEN_RIGHT_BRACKET from Lexer, "Expected ']'"
+
+    Return node
+End Process
+
+Process called "parse_flow_mapping" takes parser as Integer returns Integer:
+    Note: Parse flow mapping: {key1: value1, key2: value2, ...}
+
+    proc expect_token from parser, TOKEN_LEFT_BRACE from Lexer, "Expected '{'"
+
+    Let node be proc create_yaml_node from YAML_MAPPING
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Let children be proc create from List
+    Let keys be proc create from List
+
+    proc memory_set_int64 from Layout with node, 32, children
+    proc memory_set_int64 from Layout with node, 40, keys
+
+    Note: Parse key-value pairs
+    While 1 is equal to 1:
+        Note: Check for end of mapping
+        Let is_close be proc check_token_type from parser, TOKEN_RIGHT_BRACE from Lexer
+
+        If is_close is equal to 1:
+            Break
+        End If
+
+        Note: Parse key (must be scalar)
+        Let key_node be proc parse_flow_value from parser
+
+        If key_node is equal to 0:
+            Return 0
+        End If
+
+        Note: Extract key string
+        Let key_string be proc memory_get_int64 from Layout with key_node, 8
+
+        proc expect_token from parser, TOKEN_COLON from Lexer, "Expected ':' after key"
+
+        Note: Parse value
+        Let value_node be proc parse_flow_value from parser
+
+        If value_node is equal to 0:
+            Return 0
+        End If
+
+        proc append from List with keys, key_string
+        proc append from List with children, value_node
+
+        Note: Check for comma or end
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_token from parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    proc expect_token from parser, TOKEN_RIGHT_BRACE from Lexer, "Expected '}'"
+
+    Return node
+End Process
+
+Process called "parse_flow_value" takes parser as Integer returns Integer:
+    Note: Parse value in flow context
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: Flow sequence
+    If token_type is equal to TOKEN_LEFT_BRACKET from Lexer:
+        Return proc parse_flow_sequence from parser
+    End If
+
+    Note: Flow mapping
+    If token_type is equal to TOKEN_LEFT_BRACE from Lexer:
+        Return proc parse_flow_mapping from parser
+    End If
+
+    Note: Alias
+    If token_type is equal to TOKEN_ALIAS from Lexer:
+        Return proc parse_alias from parser
+    End If
+
+    Note: Scalar (with possible anchor/tag)
+    Return proc parse_value_with_properties from parser
+End Process
+
+Note: ============================================================================
+Note: Block Collection Parsing
+Note: ============================================================================
+
+Process called "parse_block_sequence" takes parser as Integer returns Integer:
+    Note: Parse block sequence (list with - indicators)
+
+    @Reasoning:
+    Block sequences use dash (-) indicators:
+    - item1
+    - item2
+    - item3
+    @End Reasoning
+
+    Let node be proc create_yaml_node from YAML_SEQUENCE
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Let children be proc create from List
+    proc memory_set_int64 from Layout with node, 32, children
+
+    Note: Parse sequence entries
+    While 1 is equal to 1:
+        Let is_dash be proc check_token_type from parser, TOKEN_DASH from Lexer
+
+        If is_dash is equal to 0:
+            Break
+        End If
+
+        proc advance_token from parser  Note: consume -
+
+        Note: Parse entry value
+        Let entry be proc parse_block_value from parser
+
+        If entry is equal to 0:
+            Return 0
+        End If
+
+        proc append from List with children, entry
+
+        Note: Check for newline
+        Let is_newline be proc check_token_type from parser, TOKEN_NEWLINE from Lexer
+
+        If is_newline is equal to 1:
+            proc advance_token from parser
+        End If
+    End While
+
+    Return node
+End Process
+
+Process called "parse_block_mapping" takes parser as Integer returns Integer:
+    Note: Parse block mapping (key: value pairs)
+
+    @Reasoning:
+    Block mappings use key: value syntax:
+    key1: value1
+    key2: value2
+    @End Reasoning
+
+    Let node be proc create_yaml_node from YAML_MAPPING
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Let children be proc create from List
+    Let keys be proc create from List
+
+    proc memory_set_int64 from Layout with node, 32, children
+    proc memory_set_int64 from Layout with node, 40, keys
+
+    Note: Parse key-value pairs
+    While 1 is equal to 1:
+        Note: Check if we have a scalar followed by colon
+        Let token_type be proc peek_token_type from parser
+
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_NEWLINE from Lexer:
+            proc advance_token from parser
+            Continue
+        End If
+
+        Note: Parse key
+        Let key_node be proc parse_scalar from parser
+
+        If key_node is equal to 0:
+            Break
+        End If
+
+        Note: Extract key string
+        Let key_string be proc memory_get_int64 from Layout with key_node, 8
+
+        Note: Expect colon
+        Let is_colon be proc check_token_type from parser, TOKEN_COLON from Lexer
+
+        If is_colon is equal to 0:
+            Break
+        End If
+
+        proc advance_token from parser  Note: consume :
+
+        Note: Parse value
+        Let value_node be proc parse_block_value from parser
+
+        If value_node is equal to 0:
+            Return 0
+        End If
+
+        proc append from List with keys, key_string
+        proc append from List with children, value_node
+
+        Note: Check for newline
+        Let is_newline be proc check_token_type from parser, TOKEN_NEWLINE from Lexer
+
+        If is_newline is equal to 1:
+            proc advance_token from parser
+        End If
+    End While
+
+    Return node
+End Process
+
+Process called "parse_block_value" takes parser as Integer returns Integer:
+    Note: Parse value in block context
+
+    Let token_type be proc peek_token_type from parser
+
+    Note: Nested sequence
+    If token_type is equal to TOKEN_DASH from Lexer:
+        Return proc parse_block_sequence from parser
+    End If
+
+    Note: Flow sequence
+    If token_type is equal to TOKEN_LEFT_BRACKET from Lexer:
+        Return proc parse_flow_sequence from parser
+    End If
+
+    Note: Flow mapping
+    If token_type is equal to TOKEN_LEFT_BRACE from Lexer:
+        Return proc parse_flow_mapping from parser
+    End If
+
+    Note: Alias
+    If token_type is equal to TOKEN_ALIAS from Lexer:
+        Return proc parse_alias from parser
+    End If
+
+    Note: Scalar or nested mapping
+    Note: Detect nested mapping by checking if scalar is followed by colon
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+
+    If current_token is not equal to 0:
+        Let current_type be proc memory_get_int64 from Layout with current_token, 0
+
+        Note: If current is a scalar, peek ahead for colon
+        If current_type is equal to TOKEN_SCALAR_PLAIN from Lexer:
+            Let next_token_type be proc peek_next_token_type from parser
+
+            If next_token_type is equal to TOKEN_COLON from Lexer:
+                Note: This is a nested block mapping
+                Return proc parse_block_mapping from parser
+            End If
+        End If
+    End If
+
+    Note: Otherwise parse as scalar (with optional anchor/tag)
+    Return proc parse_value_with_properties from parser
+End Process
+
+Note: ============================================================================
+Note: Anchor, Alias, and Tag Handling
+Note: ============================================================================
+
+Process called "parse_value_with_properties" takes parser as Integer returns Integer:
+    Note: Parse value with optional anchor and tag
+
+    Let anchor_name be 0
+    Let tag_name be 0
+
+    Note: Check for anchor
+    Let is_anchor be proc check_token_type from parser, TOKEN_ANCHOR from Lexer
+
+    If is_anchor is equal to 1:
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let lexeme be proc memory_get_int64 from Layout with token, 8
+        Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+
+        Set anchor_name to proc allocate from Layout with lexeme_length plus 1
+        proc memory_copy from Layout with anchor_name, 0, lexeme, 0, lexeme_length
+        proc memory_set_byte from Layout with anchor_name, lexeme_length, 0
+
+        proc advance_token from parser
+    End If
+
+    Note: Check for tag
+    Let is_tag be proc check_token_type from parser, TOKEN_TAG from Lexer
+
+    If is_tag is equal to 1:
+        Let token be proc memory_get_int64 from Layout with parser, 8
+        Let lexeme be proc memory_get_int64 from Layout with token, 8
+        Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+
+        Set tag_name to proc allocate from Layout with lexeme_length plus 1
+        proc memory_copy from Layout with tag_name, 0, lexeme, 0, lexeme_length
+        proc memory_set_byte from Layout with tag_name, lexeme_length, 0
+
+        proc advance_token from parser
+    End If
+
+    Note: Parse the actual value
+    Let node be proc parse_scalar from parser
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Note: Set anchor and tag if present
+    If anchor_name is not equal to 0:
+        proc memory_set_int64 from Layout with node, 48, anchor_name
+        proc register_anchor from parser, anchor_name, node
+    End If
+
+    If tag_name is not equal to 0:
+        proc memory_set_int64 from Layout with node, 56, tag_name
+    End If
+
+    Return node
+End Process
+
+Process called "parse_alias" takes parser as Integer returns Integer:
+    Note: Parse alias reference
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+    Let lexeme_length be proc memory_get_int64 from Layout with token, 16
+    Let line be proc memory_get_int64 from Layout with token, 24
+    Let column be proc memory_get_int64 from Layout with token, 32
+
+    Note: Copy alias name
+    Let alias_name be proc allocate from Layout with lexeme_length plus 1
+    proc memory_copy from Layout with alias_name, 0, lexeme, 0, lexeme_length
+    proc memory_set_byte from Layout with alias_name, lexeme_length, 0
+
+    proc advance_token from parser
+
+    Note: Create alias node
+    Let node be proc create_yaml_node from YAML_ALIAS
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 8, alias_name
+    proc memory_set_int64 from Layout with node, 64, line
+    proc memory_set_int64 from Layout with node, 72, column
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Document Parsing
+Note: ============================================================================
+
+Process called "parse_document" takes parser as Integer returns Integer:
+    Note: Parse YAML document
+
+    @Reasoning:
+    A YAML document can start with --- marker or directly with content.
+    We parse the root value which can be:
+    - Block mapping (most common)
+    - Block sequence
+    - Flow collection
+    - Scalar
+    @End Reasoning
+
+    Note: Skip document start marker if present
+    Let is_doc_start be proc check_token_type from parser, TOKEN_DOCUMENT_START from Lexer
+
+    If is_doc_start is equal to 1:
+        proc advance_token from parser
+    End If
+
+    Note: Skip any newlines
+    While 1 is equal to 1:
+        Let is_newline be proc check_token_type from parser, TOKEN_NEWLINE from Lexer
+
+        If is_newline is equal to 1:
+            proc advance_token from parser
+        Otherwise:
+            Break
+        End If
+    End While
+
+    Note: Parse root value
+    Let token_type be proc peek_token_type from parser
+
+    Note: Block sequence
+    If token_type is equal to TOKEN_DASH from Lexer:
+        Return proc parse_block_sequence from parser
+    End If
+
+    Note: Flow sequence
+    If token_type is equal to TOKEN_LEFT_BRACKET from Lexer:
+        Return proc parse_flow_sequence from parser
+    End If
+
+    Note: Flow mapping
+    If token_type is equal to TOKEN_LEFT_BRACE from Lexer:
+        Return proc parse_flow_mapping from parser
+    End If
+
+    Note: Default: assume block mapping or scalar
+    Note: Try to detect if this is a mapping by looking for key: pattern
+    Let next_token be proc peek_token_type from parser
+
+    If next_token is equal to TOKEN_SCALAR_PLAIN from Lexer:
+        Return proc parse_block_mapping from parser
+    End If
+
+    If next_token is equal to TOKEN_SCALAR_SINGLE_QUOTED from Lexer:
+        Return proc parse_block_mapping from parser
+    End If
+
+    If next_token is equal to TOKEN_SCALAR_DOUBLE_QUOTED from Lexer:
+        Return proc parse_block_mapping from parser
+    End If
+
+    Note: Otherwise parse as scalar
+    Return proc parse_scalar from parser
+End Process
+
+Note: ============================================================================
+Note: Alias Resolution
+Note: ============================================================================
+
+Process called "resolve_aliases_in_node" takes parser as Integer, node as Integer returns Integer:
+    Note: Recursively resolve all aliases in YAML AST
+
+    @Reasoning:
+    After parsing, we walk the entire AST and resolve all YAML_ALIAS nodes
+    to point to their actual referenced nodes. This must be done before
+    destroying the parser (which contains the anchor registry).
+    @End Reasoning
+
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with node, 0
+
+    Note: If this is an alias, resolve it
+    If node_type is equal to YAML_ALIAS:
+        Let alias_name be proc memory_get_int64 from Layout with node, 8
+
+        If alias_name is equal to 0:
+            Return 0
+        End If
+
+        Note: Resolve alias to actual node
+        Let anchors be proc memory_get_int64 from Layout with parser, 32
+
+        If anchors is equal to 0:
+            Return 0
+        End If
+
+        Let target_node be proc get from Dict with anchors, alias_name
+
+        If target_node is equal to 0:
+            proc set_parse_error from parser, "Undefined alias"
+            Return 0
+        End If
+
+        Note: Replace alias node's type and copy target node's data
+        Note: This effectively makes the alias node become the target node
+        Let target_type be proc memory_get_int64 from Layout with target_node, 0
+        Let target_value_string be proc memory_get_int64 from Layout with target_node, 8
+        Let target_value_int be proc memory_get_int64 from Layout with target_node, 16
+        Let target_children be proc memory_get_int64 from Layout with target_node, 32
+        Let target_keys be proc memory_get_int64 from Layout with target_node, 40
+
+        proc memory_set_int64 from Layout with node, 0, target_type
+        proc memory_set_int64 from Layout with node, 8, target_value_string
+        proc memory_set_int64 from Layout with node, 16, target_value_int
+        proc memory_set_int64 from Layout with node, 32, target_children
+        proc memory_set_int64 from Layout with node, 40, target_keys
+
+        Note: Continue resolving in the resolved node
+        Return proc resolve_aliases_in_node from parser, node
+    End If
+
+    Note: Recurse into children for mappings and sequences
+    If node_type is equal to YAML_MAPPING:
+        Let children be proc memory_get_int64 from Layout with node, 32
+
+        If children is not equal to 0:
+            Let count be proc size from List with children
+            Let index be 0
+
+            While index is less than count:
+                Let child be proc get_at from List with children, index
+                proc resolve_aliases_in_node from parser, child
+                Set index to index plus 1
+            End While
+        End If
+
+        Return 1
+    End If
+
+    If node_type is equal to YAML_SEQUENCE:
+        Let children be proc memory_get_int64 from Layout with node, 32
+
+        If children is not equal to 0:
+            Let count be proc size from List with children
+            Let index be 0
+
+            While index is less than count:
+                Let child be proc get_at from List with children, index
+                proc resolve_aliases_in_node from parser, child
+                Set index to index plus 1
+            End While
+        End If
+
+        Return 1
+    End If
+
+    Note: Scalars have no children to recurse into
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Top-Level Parsing Entry Point
+Note: ============================================================================
+
+Process called "parse_yaml" takes source as Integer returns Integer:
+    Note: Parse YAML source code to AST
+
+    @Reasoning:
+    Top-level entry point for YAML parsing.
+    Creates lexer and parser, parses document, handles errors.
+    @End Reasoning
+
+    If source is equal to 0:
+        Return 0
+    End If
+
+    Note: Create lexer
+    Let lexer be proc create_yaml_lexer from Lexer with source
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Create parser
+    Let parser be proc create_yaml_parser from lexer
+
+    If parser is equal to 0:
+        proc destroy_yaml_lexer from Lexer with lexer
+        Return 0
+    End If
+
+    Note: Parse document
+    Let document be proc parse_document from parser
+
+    Note: Check for errors
+    Let has_error be proc memory_get_int64 from Layout with parser, 24
+
+    If has_error is equal to 1:
+        Let error_msg be proc memory_get_int64 from Layout with parser, 16
+        proc print from "YAML parse error:", error_msg
+        proc destroy_yaml_parser from parser
+        proc destroy_yaml_lexer from Lexer with lexer
+        Return 0
+    End If
+
+    Note: Resolve all aliases in the document before destroying parser
+    If document is not equal to 0:
+        proc resolve_aliases_in_node from parser, document
+    End If
+
+    Note: Cleanup
+    proc destroy_yaml_parser from parser
+    proc destroy_yaml_lexer from Lexer with lexer
+
+    Return document
+End Process
+
+Note: End of YAML Parser

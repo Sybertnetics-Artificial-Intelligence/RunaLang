@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1187 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles LIR node definitions and LIR data structures.
+This file handles LIR node definitions and specialized instruction structures.
 
 This file performs the following tasks:
-- Process LIR node definitions and LIR data structure management
-- Handle LIR instruction nodes and LIR virtual register nodes
-- Manage LIR memory addressing and LIR instruction types
-- Process LIR metadata and LIR optimization information
+- Process LIR operand definitions (registers, immediates, memory operands)
+- Handle LIR instruction node creation and manipulation
+- Manage complex addressing modes and register allocation constraints
+- Process stack frame layout and calling convention structures
 
 This file is essential because of the following reasons:
-- LIR node definitions enable low-level representation for code generation
-- Proper LIR node handling ensures correct LIR data structure management
-- LIR nodes support enables Runa compilation for register allocation
+- LIR nodes bridge MIR and machine code generation
+- Proper operand representation enables efficient instruction selection
+- Register and memory operand tracking supports register allocation
+- Complete instruction structures enable backend code generation
 
 This file consists of the following functions/features/operation types:
-- LIR node definitions and LIR data structure management
-- LIR instruction nodes and LIR virtual register nodes
-- LIR memory addressing and LIR instruction types
-- LIR metadata and LIR optimization information
+- LIR operand type definitions and creation functions
+- LIR instruction node definitions and specialized structures
+- Addressing mode representation and memory operand handling
+- Stack frame and calling convention data structures
 :End Note
 
-Note: TODO - Implement LIR nodes functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: LIR OPERAND TYPE DEFINITIONS
+Note: ============================================================================
+
+@Reasoning
+LIR operands represent the arguments to low-level instructions. There are three
+fundamental operand types:
+
+1. Register Operands: Physical or virtual registers (e.g., %rax, %v42)
+2. Immediate Operands: Compile-time constants (e.g., $10, $0x1234)
+3. Memory Operands: Memory addresses with complex addressing modes
+
+Memory operands use the form: [base + index*scale + displacement]
+where:
+- base: base register (or 0 if none)
+- index: index register (or 0 if none)
+- scale: 1, 2, 4, or 8 (element size multiplier)
+- displacement: constant byte offset
+
+This supports all common addressing patterns:
+- [%rax]           -> base only
+- [%rax + 16]      -> base + displacement
+- [%rax + %rbx*4]  -> base + scaled index
+- [%rax + %rbx*4 + 16] -> full addressing mode
+@End Reasoning
+
+Constant OPERAND_TYPE_REGISTER as Integer is 1
+Constant OPERAND_TYPE_IMMEDIATE as Integer is 2
+Constant OPERAND_TYPE_MEMORY as Integer is 3
+
+Type called "LIROperand":
+    operand_type as Integer      Note: 1=register, 2=immediate, 3=memory
+    register_id as Integer        Note: Register ID (physical or virtual)
+    immediate_value as Integer    Note: Immediate constant value
+    base_register as Integer      Note: Base register for memory operands (0 if none)
+    index_register as Integer     Note: Index register for memory operands (0 if none)
+    scale as Integer              Note: Index scale: 1, 2, 4, or 8
+    displacement as Integer       Note: Constant displacement in bytes
+    operand_size as Integer       Note: Size in bytes (1, 2, 4, 8, 16, 32)
+End Type
+
+Note: Size: 8 fields * 8 bytes = 64 bytes per LIROperand
+
+@Reasoning
+Physical registers are the actual CPU registers. Each architecture has a fixed
+set of physical registers with specific purposes:
+- General-purpose registers (GPR): %rax, %rbx, etc.
+- Floating-point registers (FPR): %xmm0, %xmm1, etc.
+- Vector registers (VEC): %ymm0, %zmm0, etc.
+- Special registers: %rsp (stack pointer), %rbp (frame pointer)
+
+Virtual registers are used before register allocation. They represent abstract
+storage locations that will be assigned to physical registers or spilled to
+the stack during register allocation.
+
+Register classes group registers by type and capability:
+- GPR (0): General-purpose integer registers
+- FPR (1): Floating-point/SSE registers
+- VEC (2): Vector/AVX registers
+- FLAGS (3): Condition code registers
+@End Reasoning
+
+Constant REGISTER_CLASS_GPR as Integer is 0
+Constant REGISTER_CLASS_FPR as Integer is 1
+Constant REGISTER_CLASS_VEC as Integer is 2
+Constant REGISTER_CLASS_FLAGS as Integer is 3
+
+Type called "LIRRegister":
+    register_id as Integer        Note: Unique register ID (physical or virtual)
+    register_class as Integer     Note: Register class (0=GPR, 1=FPR, 2=VEC, 3=FLAGS)
+    register_size as Integer      Note: Size in bits (8, 16, 32, 64, 128, 256, 512)
+    is_physical as Integer        Note: 1 if physical register, 0 if virtual
+    physical_number as Integer    Note: Physical register number (for physical regs)
+    register_name as Integer      Note: String pointer to register name (e.g., "rax")
+    is_callee_saved as Integer    Note: 1 if callee-saved, 0 if caller-saved
+    is_allocatable as Integer     Note: 1 if available for allocation, 0 if reserved
+End Type
+
+Note: Size: 8 fields * 8 bytes = 64 bytes per LIRRegister
+
+Note: ============================================================================
+Note: LIR INSTRUCTION NODE DEFINITIONS
+Note: ============================================================================
+
+@Reasoning
+LIR instructions are low-level operations close to assembly. Each instruction
+has an opcode, operands, and metadata for register allocation and optimization.
+
+Unlike MIR which uses SSA form, LIR instructions can write to memory and
+registers multiple times. This reflects the reality of machine code where
+registers are mutable storage locations.
+@End Reasoning
+
+Type called "LIRInstruction":
+    opcode as Integer             Note: LIR opcode (30000-30999)
+    result as Integer             Note: LIROperand pointer for result (0 if none)
+    operand1 as Integer           Note: LIROperand pointer for first operand (0 if none)
+    operand2 as Integer           Note: LIROperand pointer for second operand (0 if none)
+    operand3 as Integer           Note: LIROperand pointer for third operand (0 if none)
+    next as Integer               Note: Next instruction in block (0 if last)
+    parent_block as Integer       Note: Pointer to containing LIRBasicBlock
+    metadata as Integer           Note: Optional metadata (debug info, etc.)
+    instruction_index as Integer  Note: Index within parent block
+End Type
+
+Note: Size: 9 fields * 8 bytes = 72 bytes per LIRInstruction
+
+@Reasoning
+Move instructions are the most common LIR operation. They transfer data between
+registers, from immediates to registers, and between registers and memory.
+
+Move types:
+- Register to register: mov %rax, %rbx
+- Immediate to register: mov $42, %rax
+- Memory to register: mov [%rsp + 8], %rax (load)
+- Register to memory: mov %rax, [%rsp + 8] (store)
+@End Reasoning
+
+Type called "LIRMove":
+    base as Integer               Note: Base LIRInstruction pointer
+    destination as Integer        Note: LIROperand pointer (register or memory)
+    source as Integer             Note: LIROperand pointer (register, immediate, or memory)
+    move_size as Integer          Note: Size in bytes (1, 2, 4, 8, 16)
+    is_sign_extend as Integer     Note: 1 if sign-extend on smaller moves
+    is_zero_extend as Integer     Note: 1 if zero-extend on smaller moves
+End Type
+
+Note: Size: 6 fields * 8 bytes = 48 bytes per LIRMove
+
+@Reasoning
+Binary operations perform computation on two operands and produce a result.
+Common operations include arithmetic (add, sub, mul, div), logical (and, or, xor),
+and shifts (shl, shr, sar).
+
+Operand patterns:
+- Two-operand form: add %rax, %rbx  (result overwrites first operand)
+- Three-operand form: imul %rax, %rbx, %rcx  (result in separate register)
+@End Reasoning
+
+Type called "LIRBinaryOp":
+    base as Integer               Note: Base LIRInstruction pointer
+    destination as Integer        Note: LIROperand pointer for result
+    left_operand as Integer       Note: LIROperand pointer for left operand
+    right_operand as Integer      Note: LIROperand pointer for right operand
+    operation_size as Integer     Note: Size in bytes (1, 2, 4, 8)
+    sets_flags as Integer         Note: 1 if operation sets CPU flags
+End Type
+
+Note: Size: 6 fields * 8 bytes = 48 bytes per LIRBinaryOp
+
+@Reasoning
+Unary operations perform computation on a single operand. Examples include
+negation (neg), bitwise NOT (not), increment (inc), decrement (dec).
+@End Reasoning
+
+Type called "LIRUnaryOp":
+    base as Integer               Note: Base LIRInstruction pointer
+    destination as Integer        Note: LIROperand pointer for result
+    operand as Integer            Note: LIROperand pointer for operand
+    operation_size as Integer     Note: Size in bytes (1, 2, 4, 8)
+    sets_flags as Integer         Note: 1 if operation sets CPU flags
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per LIRUnaryOp
+
+@Reasoning
+Compare instructions compare two operands and set CPU flags. They don't produce
+a value but affect subsequent conditional branches.
+
+Example: cmp %rax, %rbx  (compares rax and rbx, sets flags)
+Followed by: jl label   (jump if less than, based on flags)
+@End Reasoning
+
+Type called "LIRCompare":
+    base as Integer               Note: Base LIRInstruction pointer
+    left_operand as Integer       Note: LIROperand pointer for left operand
+    right_operand as Integer      Note: LIROperand pointer for right operand
+    compare_size as Integer       Note: Size in bytes (1, 2, 4, 8)
+    is_signed as Integer          Note: 1 for signed comparison, 0 for unsigned
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per LIRCompare
+
+@Reasoning
+Load instructions read from memory into a register. They handle complex
+addressing modes and alignment requirements.
+@End Reasoning
+
+Type called "LIRLoad":
+    base as Integer               Note: Base LIRInstruction pointer
+    destination as Integer        Note: LIROperand pointer (must be register)
+    address as Integer            Note: LIROperand pointer (memory operand)
+    load_size as Integer          Note: Size in bytes (1, 2, 4, 8, 16, 32)
+    is_volatile as Integer        Note: 1 if volatile (no optimization)
+    is_atomic as Integer          Note: 1 if atomic load
+    alignment as Integer          Note: Required alignment (1, 2, 4, 8, 16)
+End Type
+
+Note: Size: 7 fields * 8 bytes = 56 bytes per LIRLoad
+
+@Reasoning
+Store instructions write from a register to memory. Similar to loads but
+in reverse direction.
+@End Reasoning
+
+Type called "LIRStore":
+    base as Integer               Note: Base LIRInstruction pointer
+    address as Integer            Note: LIROperand pointer (memory operand)
+    source as Integer             Note: LIROperand pointer (register or immediate)
+    store_size as Integer         Note: Size in bytes (1, 2, 4, 8, 16, 32)
+    is_volatile as Integer        Note: 1 if volatile (no optimization)
+    is_atomic as Integer          Note: 1 if atomic store
+    alignment as Integer          Note: Required alignment (1, 2, 4, 8, 16)
+End Type
+
+Note: Size: 7 fields * 8 bytes = 56 bytes per LIRStore
+
+@Reasoning
+Call instructions invoke functions. They must handle:
+- Argument passing (registers and stack)
+- Return values
+- Callee-saved register preservation
+- Stack alignment
+- Calling conventions (System V, Win64, etc.)
+@End Reasoning
+
+Type called "LIRCall":
+    base as Integer               Note: Base LIRInstruction pointer
+    callee as Integer             Note: Function name string or register (indirect)
+    arguments as Integer          Note: List of LIROperand pointers
+    argument_count as Integer     Note: Number of arguments
+    return_register as Integer    Note: Register for return value (0 if void)
+    return_type as Integer        Note: HIRTypeInfo pointer for return type
+    is_indirect as Integer        Note: 1 if indirect call (callee is register)
+    is_tail_call as Integer       Note: 1 if tail call optimization
+    calling_convention as Integer Note: Calling convention ID
+End Type
+
+Note: Size: 9 fields * 8 bytes = 72 bytes per LIRCall
+
+@Reasoning
+Branch instructions implement conditional control flow. They check CPU flags
+set by previous compare instructions and jump to a target label if the
+condition is satisfied.
+
+Condition codes:
+- EQ (0): Equal (zero flag set)
+- NE (1): Not equal (zero flag clear)
+- LT (2): Less than (signed)
+- LE (3): Less than or equal (signed)
+- GT (4): Greater than (signed)
+- GE (5): Greater than or equal (signed)
+- Below/Above: Unsigned comparisons
+@End Reasoning
+
+Constant CONDITION_EQ as Integer is 0
+Constant CONDITION_NE as Integer is 1
+Constant CONDITION_LT as Integer is 2
+Constant CONDITION_LE as Integer is 3
+Constant CONDITION_GT as Integer is 4
+Constant CONDITION_GE as Integer is 5
+Constant CONDITION_ULT as Integer is 6
+Constant CONDITION_ULE as Integer is 7
+Constant CONDITION_UGT as Integer is 8
+Constant CONDITION_UGE as Integer is 9
+
+Type called "LIRBranch":
+    base as Integer               Note: Base LIRInstruction pointer
+    condition as Integer          Note: Branch condition code (0-9)
+    target_label as Integer       Note: Target block ID for jump
+    fall_through_label as Integer Note: Fall-through block ID (if not taken)
+    branch_weight as Integer      Note: Profile weight (0-100, 50=unknown)
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per LIRBranch
+
+@Reasoning
+Labels mark locations in code for branches and calls. They don't generate
+machine code themselves but mark positions in the instruction stream.
+@End Reasoning
+
+Type called "LIRLabel":
+    base as Integer               Note: Base LIRInstruction pointer
+    label_id as Integer           Note: Unique label ID (matches block ID)
+    label_name as Integer         Note: String pointer to label name
+End Type
+
+Note: Size: 3 fields * 8 bytes = 24 bytes per LIRLabel
+
+@Reasoning
+Stack frame information tracks local variables, spill slots, and function
+prologue/epilogue requirements.
+
+Frame layout (grows downward):
+```
+High addresses
++------------------+
+| Return address   | <- pushed by call
++------------------+
+| Saved RBP        | <- saved by prologue
++------------------+ <- RBP points here
+| Local variables  |
++------------------+
+| Spill slots      |
++------------------+
+| Function args    |
++------------------+ <- RSP points here
+Low addresses
+```
+@End Reasoning
+
+Type called "StackFrame":
+    frame_size as Integer         Note: Total frame size in bytes
+    local_area_size as Integer    Note: Size of local variables area
+    spill_area_size as Integer    Note: Size of register spill area
+    max_call_frame_size as Integer Note: Largest outgoing argument area
+    alignment as Integer          Note: Frame alignment requirement (16 bytes typical)
+    has_frame_pointer as Integer  Note: 1 if using frame pointer (%rbp)
+    local_slots as Integer        Note: Dictionary mapping var_id → stack_offset
+    spill_slots as Integer        Note: List of spill slot allocations
+End Type
+
+Note: Size: 8 fields * 8 bytes = 64 bytes per StackFrame
+
+Note: ============================================================================
+Note: OPERAND CREATION AND MANIPULATION FUNCTIONS
+Note: ============================================================================
+
+Process called "create_register_operand" that takes register_id as Integer, size as Integer returns Integer:
+    @Reasoning
+    Creates a register operand. Registers are the most common operands in LIR.
+    @End Reasoning
+
+    Let operand be Layout.allocate(64)
+    If operand equals 0:
+        Display "create_register_operand: allocation failed"
+        Return 0
+    End If
+
+    Layout.memory_set_int64(operand, 0, OPERAND_TYPE_REGISTER)
+    Layout.memory_set_int64(operand, 8, register_id)
+    Layout.memory_set_int64(operand, 16, 0)   Note: immediate_value unused
+    Layout.memory_set_int64(operand, 24, 0)   Note: base_register unused
+    Layout.memory_set_int64(operand, 32, 0)   Note: index_register unused
+    Layout.memory_set_int64(operand, 40, 0)   Note: scale unused
+    Layout.memory_set_int64(operand, 48, 0)   Note: displacement unused
+    Layout.memory_set_int64(operand, 56, size)
+
+    Return operand
+End Process
+
+Process called "create_immediate_operand" that takes value as Integer, size as Integer returns Integer:
+    @Reasoning
+    Creates an immediate (constant) operand. Used for literal values in code.
+    @End Reasoning
+
+    Let operand be Layout.allocate(64)
+    If operand equals 0:
+        Display "create_immediate_operand: allocation failed"
+        Return 0
+    End If
+
+    Layout.memory_set_int64(operand, 0, OPERAND_TYPE_IMMEDIATE)
+    Layout.memory_set_int64(operand, 8, 0)      Note: register_id unused
+    Layout.memory_set_int64(operand, 16, value)
+    Layout.memory_set_int64(operand, 24, 0)     Note: base_register unused
+    Layout.memory_set_int64(operand, 32, 0)     Note: index_register unused
+    Layout.memory_set_int64(operand, 40, 0)     Note: scale unused
+    Layout.memory_set_int64(operand, 48, 0)     Note: displacement unused
+    Layout.memory_set_int64(operand, 56, size)
+
+    Return operand
+End Process
+
+Process called "create_memory_operand" that takes base as Integer, index as Integer, scale as Integer, displacement as Integer, size as Integer returns Integer:
+    @Reasoning
+    Creates a memory operand with full addressing mode support.
+    Represents: [base + index*scale + displacement]
+    @End Reasoning
+
+    Let operand be Layout.allocate(64)
+    If operand equals 0:
+        Display "create_memory_operand: allocation failed"
+        Return 0
+    End If
+
+    Layout.memory_set_int64(operand, 0, OPERAND_TYPE_MEMORY)
+    Layout.memory_set_int64(operand, 8, 0)            Note: register_id unused
+    Layout.memory_set_int64(operand, 16, 0)           Note: immediate_value unused
+    Layout.memory_set_int64(operand, 24, base)
+    Layout.memory_set_int64(operand, 32, index)
+    Layout.memory_set_int64(operand, 40, scale)
+    Layout.memory_set_int64(operand, 48, displacement)
+    Layout.memory_set_int64(operand, 56, size)
+
+    Return operand
+End Process
+
+Process called "create_simple_memory_operand" that takes base as Integer, displacement as Integer, size as Integer returns Integer:
+    @Reasoning
+    Creates a simple memory operand: [base + displacement]
+    This is the most common memory addressing pattern.
+    @End Reasoning
+
+    Return create_memory_operand(base, 0, 1, displacement, size)
+End Process
+
+Process called "is_register_operand" that takes operand as Integer returns Integer:
+    @Reasoning
+    Checks if an operand is a register operand.
+    @End Reasoning
+
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+    If operand_type equals OPERAND_TYPE_REGISTER:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_immediate_operand" that takes operand as Integer returns Integer:
+    @Reasoning
+    Checks if an operand is an immediate operand.
+    @End Reasoning
+
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+    If operand_type equals OPERAND_TYPE_IMMEDIATE:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_memory_operand" that takes operand as Integer returns Integer:
+    @Reasoning
+    Checks if an operand is a memory operand.
+    @End Reasoning
+
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+    If operand_type equals OPERAND_TYPE_MEMORY:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "get_operand_register_id" that takes operand as Integer returns Integer:
+    @Reasoning
+    Extracts register ID from a register operand.
+    Returns 0 if not a register operand.
+    @End Reasoning
+
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+    If operand_type is not equal to OPERAND_TYPE_REGISTER:
+        Return 0
+    End If
+
+    Let register_id be Layout.memory_get_int64(operand, 8)
+    Return register_id
+End Process
+
+Process called "get_operand_immediate_value" that takes operand as Integer returns Integer:
+    @Reasoning
+    Extracts immediate value from an immediate operand.
+    Returns 0 if not an immediate operand.
+    @End Reasoning
+
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+    If operand_type is not equal to OPERAND_TYPE_IMMEDIATE:
+        Return 0
+    End If
+
+    Let immediate_value be Layout.memory_get_int64(operand, 16)
+    Return immediate_value
+End Process
+
+Process called "get_operand_size" that takes operand as Integer returns Integer:
+    @Reasoning
+    Gets the size of an operand in bytes.
+    @End Reasoning
+
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let size be Layout.memory_get_int64(operand, 56)
+    Return size
+End Process
+
+Process called "get_memory_base_register" that takes operand as Integer returns Integer:
+    @Reasoning
+    Gets the base register from a memory operand.
+    @End Reasoning
+
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+    If operand_type is not equal to OPERAND_TYPE_MEMORY:
+        Return 0
+    End If
+
+    Let base_register be Layout.memory_get_int64(operand, 24)
+    Return base_register
+End Process
+
+Process called "get_memory_index_register" that takes operand as Integer returns Integer:
+    @Reasoning
+    Gets the index register from a memory operand.
+    @End Reasoning
+
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+    If operand_type is not equal to OPERAND_TYPE_MEMORY:
+        Return 0
+    End If
+
+    Let index_register be Layout.memory_get_int64(operand, 32)
+    Return index_register
+End Process
+
+Process called "get_memory_displacement" that takes operand as Integer returns Integer:
+    @Reasoning
+    Gets the displacement from a memory operand.
+    @End Reasoning
+
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+    If operand_type is not equal to OPERAND_TYPE_MEMORY:
+        Return 0
+    End If
+
+    Let displacement be Layout.memory_get_int64(operand, 48)
+    Return displacement
+End Process
+
+Process called "operands_equal" that takes op1 as Integer, op2 as Integer returns Integer:
+    @Reasoning
+    Checks if two operands are equal. Used for optimization and analysis.
+    @End Reasoning
+
+    If op1 equals 0 or op2 equals 0:
+        Return 0
+    End If
+
+    Note: Check operand type
+    Let type1 be Layout.memory_get_int64(op1, 0)
+    Let type2 be Layout.memory_get_int64(op2, 0)
+
+    If type1 is not equal to type2:
+        Return 0
+    End If
+
+    Note: Check size
+    Let size1 be Layout.memory_get_int64(op1, 56)
+    Let size2 be Layout.memory_get_int64(op2, 56)
+
+    If size1 is not equal to size2:
+        Return 0
+    End If
+
+    Note: Type-specific comparison
+    If type1 equals OPERAND_TYPE_REGISTER:
+        Let reg1 be Layout.memory_get_int64(op1, 8)
+        Let reg2 be Layout.memory_get_int64(op2, 8)
+        If reg1 equals reg2:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If type1 equals OPERAND_TYPE_IMMEDIATE:
+        Let val1 be Layout.memory_get_int64(op1, 16)
+        Let val2 be Layout.memory_get_int64(op2, 16)
+        If val1 equals val2:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If type1 equals OPERAND_TYPE_MEMORY:
+        Let base1 be Layout.memory_get_int64(op1, 24)
+        Let base2 be Layout.memory_get_int64(op2, 24)
+        Let index1 be Layout.memory_get_int64(op1, 32)
+        Let index2 be Layout.memory_get_int64(op2, 32)
+        Let scale1 be Layout.memory_get_int64(op1, 40)
+        Let scale2 be Layout.memory_get_int64(op2, 40)
+        Let disp1 be Layout.memory_get_int64(op1, 48)
+        Let disp2 be Layout.memory_get_int64(op2, 48)
+
+        If base1 equals base2 and index1 equals index2 and scale1 equals scale2 and disp1 equals disp2:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: LIR INSTRUCTION CREATION FUNCTIONS
+Note: ============================================================================
+
+Process called "create_lir_instruction" that takes opcode as Integer returns Integer:
+    @Reasoning
+    Creates a base LIR instruction with the given opcode.
+    @End Reasoning
+
+    Let instruction be Layout.allocate(72)
+    If instruction equals 0:
+        Display "create_lir_instruction: allocation failed"
+        Return 0
+    End If
+
+    Layout.memory_set_int64(instruction, 0, opcode)
+    Layout.memory_set_int64(instruction, 8, 0)   Note: result
+    Layout.memory_set_int64(instruction, 16, 0)  Note: operand1
+    Layout.memory_set_int64(instruction, 24, 0)  Note: operand2
+    Layout.memory_set_int64(instruction, 32, 0)  Note: operand3
+    Layout.memory_set_int64(instruction, 40, 0)  Note: next
+    Layout.memory_set_int64(instruction, 48, 0)  Note: parent_block
+    Layout.memory_set_int64(instruction, 56, 0)  Note: metadata
+    Layout.memory_set_int64(instruction, 64, 0)  Note: instruction_index
+
+    Return instruction
+End Process
+
+Process called "create_lir_move" that takes destination as Integer, source as Integer, size as Integer returns Integer:
+    @Reasoning
+    Creates a move instruction. Handles register-to-register, immediate-to-register,
+    and memory moves.
+    @End Reasoning
+
+    Let move_inst be Layout.allocate(48)
+    If move_inst equals 0:
+        Display "create_lir_move: allocation failed"
+        Return 0
+    End If
+
+    Note: Create base instruction with MOV opcode
+    Let base be create_lir_instruction(LIR.LIR_MOV)
+    If base equals 0:
+        Layout.deallocate(move_inst)
+        Return 0
+    End If
+
+    Layout.memory_set_int64(move_inst, 0, base)
+    Layout.memory_set_int64(move_inst, 8, destination)
+    Layout.memory_set_int64(move_inst, 16, source)
+    Layout.memory_set_int64(move_inst, 24, size)
+    Layout.memory_set_int64(move_inst, 32, 0)  Note: is_sign_extend
+    Layout.memory_set_int64(move_inst, 40, 0)  Note: is_zero_extend
+
+    Note: Set operands in base instruction
+    Layout.memory_set_int64(base, 8, destination)
+    Layout.memory_set_int64(base, 16, source)
+
+    Return move_inst
+End Process
+
+Process called "create_lir_binary_op" that takes opcode as Integer, destination as Integer, left as Integer, right as Integer, size as Integer returns Integer:
+    @Reasoning
+    Creates a binary operation instruction (add, sub, mul, etc.).
+    @End Reasoning
+
+    Let binary_op be Layout.allocate(48)
+    If binary_op equals 0:
+        Display "create_lir_binary_op: allocation failed"
+        Return 0
+    End If
+
+    Let base be create_lir_instruction(opcode)
+    If base equals 0:
+        Layout.deallocate(binary_op)
+        Return 0
+    End If
+
+    Layout.memory_set_int64(binary_op, 0, base)
+    Layout.memory_set_int64(binary_op, 8, destination)
+    Layout.memory_set_int64(binary_op, 16, left)
+    Layout.memory_set_int64(binary_op, 24, right)
+    Layout.memory_set_int64(binary_op, 32, size)
+    Layout.memory_set_int64(binary_op, 40, 1)  Note: sets_flags
+
+    Note: Set operands in base instruction
+    Layout.memory_set_int64(base, 8, destination)
+    Layout.memory_set_int64(base, 16, left)
+    Layout.memory_set_int64(base, 24, right)
+
+    Return binary_op
+End Process
+
+Process called "create_lir_unary_op" that takes opcode as Integer, destination as Integer, operand as Integer, size as Integer returns Integer:
+    @Reasoning
+    Creates a unary operation instruction (neg, not, etc.).
+    @End Reasoning
+
+    Let unary_op be Layout.allocate(40)
+    If unary_op equals 0:
+        Display "create_lir_unary_op: allocation failed"
+        Return 0
+    End If
+
+    Let base be create_lir_instruction(opcode)
+    If base equals 0:
+        Layout.deallocate(unary_op)
+        Return 0
+    End If
+
+    Layout.memory_set_int64(unary_op, 0, base)
+    Layout.memory_set_int64(unary_op, 8, destination)
+    Layout.memory_set_int64(unary_op, 16, operand)
+    Layout.memory_set_int64(unary_op, 24, size)
+    Layout.memory_set_int64(unary_op, 32, 1)  Note: sets_flags
+
+    Note: Set operands in base instruction
+    Layout.memory_set_int64(base, 8, destination)
+    Layout.memory_set_int64(base, 16, operand)
+
+    Return unary_op
+End Process
+
+Process called "create_lir_compare" that takes left as Integer, right as Integer, size as Integer, is_signed as Integer returns Integer:
+    @Reasoning
+    Creates a compare instruction that sets CPU flags.
+    @End Reasoning
+
+    Let compare be Layout.allocate(40)
+    If compare equals 0:
+        Display "create_lir_compare: allocation failed"
+        Return 0
+    End If
+
+    Let base be create_lir_instruction(LIR.LIR_CMP)
+    If base equals 0:
+        Layout.deallocate(compare)
+        Return 0
+    End If
+
+    Layout.memory_set_int64(compare, 0, base)
+    Layout.memory_set_int64(compare, 8, left)
+    Layout.memory_set_int64(compare, 16, right)
+    Layout.memory_set_int64(compare, 24, size)
+    Layout.memory_set_int64(compare, 32, is_signed)
+
+    Note: Set operands in base instruction
+    Layout.memory_set_int64(base, 16, left)
+    Layout.memory_set_int64(base, 24, right)
+
+    Return compare
+End Process
+
+Process called "create_lir_load" that takes destination as Integer, address as Integer, size as Integer returns Integer:
+    @Reasoning
+    Creates a load instruction that reads from memory.
+    @End Reasoning
+
+    Let load be Layout.allocate(56)
+    If load equals 0:
+        Display "create_lir_load: allocation failed"
+        Return 0
+    End If
+
+    Let base be create_lir_instruction(LIR.LIR_LOAD)
+    If base equals 0:
+        Layout.deallocate(load)
+        Return 0
+    End If
+
+    Layout.memory_set_int64(load, 0, base)
+    Layout.memory_set_int64(load, 8, destination)
+    Layout.memory_set_int64(load, 16, address)
+    Layout.memory_set_int64(load, 24, size)
+    Layout.memory_set_int64(load, 32, 0)  Note: is_volatile
+    Layout.memory_set_int64(load, 40, 0)  Note: is_atomic
+    Layout.memory_set_int64(load, 48, size)  Note: alignment (default to size)
+
+    Note: Set operands in base instruction
+    Layout.memory_set_int64(base, 8, destination)
+    Layout.memory_set_int64(base, 16, address)
+
+    Return load
+End Process
+
+Process called "create_lir_store" that takes address as Integer, source as Integer, size as Integer returns Integer:
+    @Reasoning
+    Creates a store instruction that writes to memory.
+    @End Reasoning
+
+    Let store be Layout.allocate(56)
+    If store equals 0:
+        Display "create_lir_store: allocation failed"
+        Return 0
+    End If
+
+    Let base be create_lir_instruction(LIR.LIR_STORE)
+    If base equals 0:
+        Layout.deallocate(store)
+        Return 0
+    End If
+
+    Layout.memory_set_int64(store, 0, base)
+    Layout.memory_set_int64(store, 8, address)
+    Layout.memory_set_int64(store, 16, source)
+    Layout.memory_set_int64(store, 24, size)
+    Layout.memory_set_int64(store, 32, 0)  Note: is_volatile
+    Layout.memory_set_int64(store, 40, 0)  Note: is_atomic
+    Layout.memory_set_int64(store, 48, size)  Note: alignment (default to size)
+
+    Note: Set operands in base instruction
+    Layout.memory_set_int64(base, 16, address)
+    Layout.memory_set_int64(base, 24, source)
+
+    Return store
+End Process
+
+Process called "create_lir_call" that takes callee as Integer, arguments as Integer, arg_count as Integer, return_reg as Integer returns Integer:
+    @Reasoning
+    Creates a call instruction for function invocation.
+    @End Reasoning
+
+    Let call be Layout.allocate(72)
+    If call equals 0:
+        Display "create_lir_call: allocation failed"
+        Return 0
+    End If
+
+    Let base be create_lir_instruction(LIR.LIR_CALL)
+    If base equals 0:
+        Layout.deallocate(call)
+        Return 0
+    End If
+
+    Layout.memory_set_int64(call, 0, base)
+    Layout.memory_set_int64(call, 8, callee)
+    Layout.memory_set_int64(call, 16, arguments)
+    Layout.memory_set_int64(call, 24, arg_count)
+    Layout.memory_set_int64(call, 32, return_reg)
+    Layout.memory_set_int64(call, 40, 0)  Note: return_type
+    Layout.memory_set_int64(call, 48, 0)  Note: is_indirect
+    Layout.memory_set_int64(call, 56, 0)  Note: is_tail_call
+    Layout.memory_set_int64(call, 64, 0)  Note: calling_convention (0 = default)
+
+    Return call
+End Process
+
+Process called "create_lir_return" that takes return_value as Integer returns Integer:
+    @Reasoning
+    Creates a return instruction that exits the function.
+    @End Reasoning
+
+    Let base be create_lir_instruction(LIR.LIR_RET)
+    If base equals 0:
+        Return 0
+    End If
+
+    Note: Set return value operand if present
+    If return_value is not equal to 0:
+        Layout.memory_set_int64(base, 16, return_value)
+    End If
+
+    Return base
+End Process
+
+Process called "create_lir_branch" that takes condition as Integer, target_label as Integer, fall_through as Integer returns Integer:
+    @Reasoning
+    Creates a conditional branch instruction.
+    @End Reasoning
+
+    Let branch be Layout.allocate(40)
+    If branch equals 0:
+        Display "create_lir_branch: allocation failed"
+        Return 0
+    End If
+
+    Let base be create_lir_instruction(LIR.LIR_BRANCH)
+    If base equals 0:
+        Layout.deallocate(branch)
+        Return 0
+    End If
+
+    Layout.memory_set_int64(branch, 0, base)
+    Layout.memory_set_int64(branch, 8, condition)
+    Layout.memory_set_int64(branch, 16, target_label)
+    Layout.memory_set_int64(branch, 24, fall_through)
+    Layout.memory_set_int64(branch, 32, 50)  Note: branch_weight (50 = unknown)
+
+    Return branch
+End Process
+
+Process called "create_lir_jump" that takes target_label as Integer returns Integer:
+    @Reasoning
+    Creates an unconditional jump instruction.
+    @End Reasoning
+
+    Let base be create_lir_instruction(LIR.LIR_JMP)
+    If base equals 0:
+        Return 0
+    End If
+
+    Note: Store target label in operand1
+    Let label_operand be create_immediate_operand(target_label, 8)
+    Layout.memory_set_int64(base, 16, label_operand)
+
+    Return base
+End Process
+
+Process called "create_lir_label" that takes label_id as Integer, label_name as Integer returns Integer:
+    @Reasoning
+    Creates a label instruction marking a code location.
+    @End Reasoning
+
+    Let label be Layout.allocate(24)
+    If label equals 0:
+        Display "create_lir_label: allocation failed"
+        Return 0
+    End If
+
+    Let base be create_lir_instruction(LIR.LIR_LABEL)
+    If base equals 0:
+        Layout.deallocate(label)
+        Return 0
+    End If
+
+    Layout.memory_set_int64(label, 0, base)
+    Layout.memory_set_int64(label, 8, label_id)
+    Layout.memory_set_int64(label, 16, label_name)
+
+    Return label
+End Process
+
+Process called "create_lir_nop" that takes unit as Integer returns Integer:
+    @Reasoning
+    Creates a no-operation instruction.
+    @End Reasoning
+
+    Let base be create_lir_instruction(LIR.LIR_NOP)
+    Return base
+End Process
+
+Note: ============================================================================
+Note: DEBUG PRINTING FUNCTIONS
+Note: ============================================================================
+
+Process called "print_lir_operand" that takes operand as Integer returns Integer:
+    @Reasoning
+    Prints a human-readable representation of an LIR operand.
+    @End Reasoning
+
+    If operand equals 0:
+        Display "null"
+        Return 1
+    End If
+
+    Let operand_type be Layout.memory_get_int64(operand, 0)
+
+    If operand_type equals OPERAND_TYPE_REGISTER:
+        Let register_id be Layout.memory_get_int64(operand, 8)
+        Display "%r"
+        Display register_id
+        Return 1
+    End If
+
+    If operand_type equals OPERAND_TYPE_IMMEDIATE:
+        Let immediate_value be Layout.memory_get_int64(operand, 16)
+        Display "$"
+        Display immediate_value
+        Return 1
+    End If
+
+    If operand_type equals OPERAND_TYPE_MEMORY:
+        Let base be Layout.memory_get_int64(operand, 24)
+        Let index be Layout.memory_get_int64(operand, 32)
+        Let scale be Layout.memory_get_int64(operand, 40)
+        Let displacement be Layout.memory_get_int64(operand, 48)
+
+        Display "["
+
+        If base is not equal to 0:
+            Display "%r"
+            Display base
+        End If
+
+        If index is not equal to 0:
+            If base is not equal to 0:
+                Display " + "
+            End If
+            Display "%r"
+            Display index
+            If scale is greater than 1:
+                Display "*"
+                Display scale
+            End If
+        End If
+
+        If displacement is not equal to 0:
+            If base is not equal to 0 or index is not equal to 0:
+                If displacement is greater than 0:
+                    Display " + "
+                Otherwise:
+                    Display " - "
+                    Set displacement to 0 minus displacement
+                End If
+            End If
+            Display displacement
+        End If
+
+        Display "]"
+        Return 1
+    End If
+
+    Display "unknown_operand"
+    Return 0
+End Process
+
+Process called "print_lir_instruction" that takes instruction as Integer returns Integer:
+    @Reasoning
+    Prints a human-readable representation of an LIR instruction.
+    @End Reasoning
+
+    If instruction equals 0:
+        Display "null instruction"
+        Return 0
+    End If
+
+    Let opcode be Layout.memory_get_int64(instruction, 0)
+    Let result be Layout.memory_get_int64(instruction, 8)
+    Let operand1 be Layout.memory_get_int64(instruction, 16)
+    Let operand2 be Layout.memory_get_int64(instruction, 24)
+    Let operand3 be Layout.memory_get_int64(instruction, 32)
+
+    Note: Print opcode name
+    Display "  "
+    Let opcode_name be LIR.lir_get_opcode_name(opcode)
+    Display opcode_name
+    Display " "
+
+    Note: Print result if present
+    If result is not equal to 0:
+        print_lir_operand(result)
+        Display ", "
+    End If
+
+    Note: Print operand1 if present
+    If operand1 is not equal to 0:
+        print_lir_operand(operand1)
+        If operand2 is not equal to 0:
+            Display ", "
+        End If
+    End If
+
+    Note: Print operand2 if present
+    If operand2 is not equal to 0:
+        print_lir_operand(operand2)
+        If operand3 is not equal to 0:
+            Display ", "
+        End If
+    End If
+
+    Note: Print operand3 if present
+    If operand3 is not equal to 0:
+        print_lir_operand(operand3)
+    End If
+
+    Display ""
+
+    Return 1
+End Process
+
+Process called "print_lir_function" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Prints a complete LIR function with all its instructions.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "print_lir_function: null function"
+        Return 0
+    End If
+
+    Display "========== LIR Function =========="
+
+    Note: Get function name (offset 0 in LIRFunction)
+    Let function_name be Layout.memory_get_int64(function_ptr, 0)
+    If function_name is not equal to 0:
+        Display "Function: "
+        Display function_name
+        Display ""
+    End If
+
+    Note: Get basic blocks (offset 32 in LIRFunction)
+    Let blocks be Layout.memory_get_int64(function_ptr, 32)
+    Note: Get block count (offset 40 in LIRFunction)
+    Let block_count be Layout.memory_get_int64(function_ptr, 40)
+
+    If blocks is not equal to 0:
+        Let i be 0
+
+        While i is less than block_count:
+            Let block be List.get(blocks, i)
+
+            Note: Get block label (offset 8 in LIRBasicBlock)
+            Let block_label be Layout.memory_get_int64(block, 8)
+            Display ""
+            Display block_label
+            Display ":"
+
+            Note: Get instructions in block (offset 16 in LIRBasicBlock)
+            Let instructions be Layout.memory_get_int64(block, 16)
+            Note: Get instruction count (offset 24 in LIRBasicBlock)
+            Let inst_count be Layout.memory_get_int64(block, 24)
+
+            If instructions is not equal to 0:
+                Let j be 0
+
+                While j is less than inst_count:
+                    Let instruction be List.get(instructions, j)
+                    print_lir_instruction(instruction)
+                    Set j to j plus 1
+                End While
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+
+    Display "=================================="
+
+    Return 1
+End Process

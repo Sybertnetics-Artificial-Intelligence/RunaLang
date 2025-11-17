@@ -35,4 +35,3689 @@ This file consists of the following functions/features/operation types:
 - SSA-based optimization and control flow optimization
 :End Note
 
-Note: TODO - Implement MIR optimizer functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
+Import "compiler/middle/gungnir/mir/optimizations/cse.runa" as CSE
+Import "compiler/middle/gungnir/mir/optimizations/gvn.runa" as GVN
+Import "compiler/middle/gungnir/mir/optimizations/licm.runa" as LICM
+Import "compiler/middle/gungnir/mir/optimizations/loop_unrolling.runa" as LoopUnroll
+Import "compiler/middle/gungnir/mir/optimizations/strength_reduction.runa" as StrengthReduction
+Import "compiler/middle/gungnir/mir/optimizations/tail_call.runa" as TailCall
+Import "compiler/middle/gungnir/mir/optimizations/inlining.runa" as Inlining
+Import "compiler/middle/gungnir/mir/optimizations/devirtualization.runa" as Devirtualization
+Import "compiler/middle/gungnir/mir/optimizations/scalar_replacement.runa" as ScalarReplacement
+Import "compiler/middle/gungnir/mir/optimizations/vectorization.runa" as Vectorization
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: PHASE 1: DATA STRUCTURES - Optimizer Context & Pass Infrastructure
+Note: ============================================================================
+
+Type called "OptimizerContext":
+    @Reasoning
+    Maintains state during MIR optimization.
+
+    **CONTEXT STRUCTURE:**
+    ```
+    OptimizerContext:
+        cfg: MIRCFG pointer
+        function: MIRFunction pointer
+        dominance_info: DominanceInfo pointer
+        changed: Boolean (did any optimization make changes?)
+        instruction_count: Integer (before optimization)
+        instructions_deleted: Integer (number deleted)
+        instructions_simplified: Integer (number )
+        constants_folded: Integer (constant folding count)
+        copies_propagated: Integer (copy propagation count)
+        worklist: List of instructions to process
+        value_number_map: Map for CSE (expression → value_id)
+    ```
+
+    **MEMORY LAYOUT** (128 bytes total):
+    ```
+    Offset 0:  cfg (Integer - CFG pointer)
+    Offset 8:  function (Integer - MIRFunction pointer)
+    Offset 16: dominance_info (Integer - DominanceInfo pointer)
+    Offset 24: changed (Integer - Boolean 0/1)
+    Offset 32: instruction_count (Integer)
+    Offset 40: instructions_deleted (Integer)
+    Offset 48: instructions_simplified (Integer)
+    Offset 56: constants_folded (Integer)
+    Offset 64: copies_propagated (Integer)
+    Offset 72: worklist (Integer - List pointer)
+    Offset 80: value_number_map (Integer - List pointer)
+    Offset 88: [reserved for future use]
+    ```
+    @End Reasoning
+
+    cfg as Integer
+    function as Integer
+    dominance_info as Integer
+    changed as Integer
+    instruction_count as Integer
+    instructions_deleted as Integer
+    instructions_simplified as Integer
+    constants_folded as Integer
+    copies_propagated as Integer
+    worklist as Integer
+    value_number_map as Integer
+End Type
+
+Process called "create_optimizer_context" that takes cfg as Integer, function as Integer returns Integer:
+    @Reasoning
+    Creates a new optimizer context.
+
+    **INITIALIZATION:**
+    - Allocates 128 bytes for context
+    - Initializes CFG and function pointers
+    - Computes dominance information (required for many opts)
+    - Creates empty worklist
+    - Creates empty value number map for CSE
+    - Initializes all counters to 0
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "create_optimizer_context: null CFG"
+        Return 0
+    End If
+
+    Note: Allocate context structure (128 bytes)
+    Let context_ptr be Layout.allocate(128)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Set CFG and function
+    Layout.memory_set_int64(context_ptr, 0, cfg)
+    Layout.memory_set_int64(context_ptr, 8, function)
+
+    Note: Compute dominance information (required for many optimizations)
+    Display "create_optimizer_context: computing dominance information"
+    Let dom_info be Dominance.compute_dominance_tree(cfg)
+    Layout.memory_set_int64(context_ptr, 16, dom_info)
+
+    Note: Initialize changed flag to 0
+    Layout.memory_set_int64(context_ptr, 24, 0)
+
+    Note: Count initial instructions
+    Let inst_count be count_instructions(cfg)
+    Layout.memory_set_int64(context_ptr, 32, inst_count)
+
+    Note: Initialize counters to 0
+    Layout.memory_set_int64(context_ptr, 40, 0)  Note: instructions_deleted
+    Layout.memory_set_int64(context_ptr, 48, 0)  Note: instructions_simplified
+    Layout.memory_set_int64(context_ptr, 56, 0)  Note: constants_folded
+    Layout.memory_set_int64(context_ptr, 64, 0)  Note: copies_propagated
+
+    Note: Create worklist
+    Let worklist be List.create()
+    Layout.memory_set_int64(context_ptr, 72, worklist)
+
+    Note: Create value number map for CSE
+    Let value_map be List.create()
+    Layout.memory_set_int64(context_ptr, 80, value_map)
+
+    Display "create_optimizer_context: context created with " joined with inst_count joined with " instructions"
+    Return context_ptr
+End Process
+
+Process called "destroy_optimizer_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys an optimizer context and frees all associated memory.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy worklist
+    Let worklist be Layout.memory_get_int64(context_ptr, 72)
+    If worklist is not equal to 0:
+        List.destroy(worklist)
+    End If
+
+    Note: Destroy value number map
+    Let value_map be Layout.memory_get_int64(context_ptr, 80)
+    If value_map is not equal to 0:
+        List.destroy(value_map)
+    End If
+
+    Note: Destroy dominance info
+    Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+    If dom_info is not equal to 0:
+        Dominance.destroy_dominance_tree(dom_info)
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr)
+
+    Return 1
+End Process
+
+Process called "mark_changed" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Marks that an optimization made changes.
+    Used to determine if another iteration is needed.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(context_ptr, 24, 1)
+    Return 1
+End Process
+
+Process called "has_changed" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Returns whether any optimization made changes.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let changed be Layout.memory_get_int64(context_ptr, 24)
+    Return changed
+End Process
+
+Process called "reset_changed_flag" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Resets the changed flag for next iteration.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(context_ptr, 24, 0)
+    Return 1
+End Process
+
+Process called "count_instructions" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Counts total number of instructions in CFG.
+    Used for metrics and progress tracking.
+    @End Reasoning
+
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Let total_count be 0
+    Let block_count be CFG.get_block_count(cfg)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+        Set total_count to total_count plus inst_count
+        Set i to i plus 1
+    End While
+
+    Return total_count
+End Process
+
+Process called "print_optimization_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints optimization statistics for reporting.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let initial_count be Layout.memory_get_int64(context_ptr, 32)
+    Let deleted be Layout.memory_get_int64(context_ptr, 40)
+    Let  be Layout.memory_get_int64(context_ptr, 48)
+    Let const_folded be Layout.memory_get_int64(context_ptr, 56)
+    Let copies_prop be Layout.memory_get_int64(context_ptr, 64)
+
+    Display "============================================"
+    Display "MIR OPTIMIZATION STATISTICS"
+    Display "============================================"
+    Display "Initial instructions:    " joined with initial_count
+    Display "Instructions deleted:    " joined with deleted
+    Display "Instructions : " joined with 
+    Display "Constants folded:        " joined with const_folded
+    Display "Copies propagated:       " joined with copies_prop
+
+    Let final_count be initial_count minus deleted
+    Display "Final instructions:      " joined with final_count
+
+    If initial_count is greater than 0:
+        Let reduction be deleted multiplied by 100 divided by initial_count
+        Display "Reduction:               " joined with reduction joined with "%"
+    End If
+
+    Display "============================================"
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 2: TIER 1 OPTIMIZATIONS - Constant Folding & Propagation
+Note: ============================================================================
+
+Process called "optimize_constant_folding" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **CONSTANT FOLDING**
+
+    Evaluates constant expressions at compile time.
+
+    **ALGORITHM:**
+    ```
+    For each instruction in CFG (in RPO order):
+        If instruction is binary op (ADD, SUB, MUL, DIV, etc.):
+            If both operands are constants:
+                Compute result at compile time
+                Replace instruction with constant
+                Mark changed
+        If instruction is unary op (NEG, NOT):
+            If operand is constant:
+                Compute result at compile time
+                Replace instruction with constant
+                Mark changed
+    ```
+
+    **CONSTANT OPERATIONS:**
+    - Arithmetic: ADD, SUB, MUL, DIV, MOD
+    - Bitwise: AND, OR, XOR, SHL, SHR, SAR
+    - Comparisons: EQ, NE, LT, LE, GT, GE
+    - Unary: NEG, NOT
+
+    Returns number of constants folded.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "optimize_constant_folding: starting constant folding pass"
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let folded_count be 0
+
+    Note: Get RPO traversal order (optimal for forward dataflow)
+    Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+    Let rpo_list be Dominance.get_reverse_postorder(dom_info)
+    Let block_count be List.length(rpo_list)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block_id be List.get(rpo_list, i)
+        Let block be CFG.get_block(cfg, block_id)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Note: Try to fold binary operations
+            If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
+                Let result be try_fold_binary_op(context_ptr, inst, opcode)
+                If result equals 1:
+                    Set folded_count to folded_count plus 1
+                    mark_changed(context_ptr)
+                End If
+            End If
+
+            Note: Try to fold comparison operations
+            If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+                Let result be try_fold_comparison(context_ptr, inst, opcode)
+                If result equals 1:
+                    Set folded_count to folded_count plus 1
+                    mark_changed(context_ptr)
+                End If
+            End If
+
+            Note: Try to fold unary operations
+            If opcode equals 20007 or opcode equals 20013:  Note: NEG or NOT
+                Let result be try_fold_unary_op(context_ptr, inst, opcode)
+                If result equals 1:
+                    Set folded_count to folded_count plus 1
+                    mark_changed(context_ptr)
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Update counter
+    Let current_count be Layout.memory_get_int64(context_ptr, 56)
+    Layout.memory_set_int64(context_ptr, 56, current_count plus folded_count)
+
+    Display "optimize_constant_folding: folded " joined with folded_count joined with " constants"
+    Return folded_count
+End Process
+
+Process called "try_fold_binary_op" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Attempts to fold a binary operation if both operands are constants.
+
+    Returns 1 if folded, 0 otherwise.
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Note: Get operands (offset 16 and 24 in MIRBinaryOp)
+    Let left_operand be Layout.memory_get_int64(inst, 16)
+    Let right_operand be Layout.memory_get_int64(inst, 24)
+
+    Note: Check if both are constants
+    Let left_is_const be is_constant_value(context_ptr, left_operand)
+    Let right_is_const be is_constant_value(context_ptr, right_operand)
+
+    If left_is_const equals 0 or right_is_const equals 0:
+        Return 0
+    End If
+
+    Note: Get constant values
+    Let left_val be get_constant_value(context_ptr, left_operand)
+    Let right_val be get_constant_value(context_ptr, right_operand)
+
+    Note: Compute result based on opcode
+    Let result_val be 0
+
+    If opcode equals 20002:  Note: ADD
+        Set result_val to left_val plus right_val
+    End If
+    If opcode equals 20003:  Note: SUB
+        Set result_val to left_val minus right_val
+    End If
+    If opcode equals 20004:  Note: MUL
+        Set result_val to left_val multiplied by right_val
+    End If
+    If opcode equals 20005:  Note: DIV
+        If right_val is not equal to 0:
+            Set result_val to left_val divided by right_val
+        Otherwise:
+            Return 0  Note: Division by zero, don't fold
+        End If
+    End If
+    If opcode equals 20006:  Note: MOD
+        If right_val is not equal to 0:
+            Set result_val to left_val modulo right_val
+        Otherwise:
+            Return 0
+        End If
+    End If
+    If opcode equals 20010:  Note: AND
+        Set result_val to left_val AND right_val
+    End If
+    If opcode equals 20011:  Note: OR
+        Set result_val to left_val OR right_val
+    End If
+    If opcode equals 20012:  Note: XOR
+        Set result_val to left_val XOR right_val
+    End If
+
+    Note: Replace instruction with constant by modifying in-place
+    Note: This is a common compiler optimization technique: reuse the same
+    Note: instruction memory but change its opcode and operands to a constant
+
+    Note: Get result value ID (offset 8) - keep this unchanged
+    Let result_id be Layout.memory_get_int64(inst, 8)
+
+    Note: Transform binary operation into MIR_CONST instruction in-place
+    Note: Change opcode to MIR_CONST (20001)
+    Layout.memory_set_int64(inst, 0, 20001)
+
+    Note: Keep result_id at offset 8 (already set correctly)
+    Note: Store constant value at offset 16 (where left operand was)
+    Layout.memory_set_int64(inst, 16, result_val)
+
+    Note: Clear right operand at offset 24 (no longer needed for constant)
+    Layout.memory_set_int64(inst, 24, 0)
+
+    Note: Successfully folded constant
+    Return 1
+End Process
+
+Process called "try_fold_comparison" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Attempts to fold a comparison if both operands are constants.
+
+    Result is 1 (true) or 0 (false).
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let left_operand be Layout.memory_get_int64(inst, 16)
+    Let right_operand be Layout.memory_get_int64(inst, 24)
+
+    Let left_is_const be is_constant_value(context_ptr, left_operand)
+    Let right_is_const be is_constant_value(context_ptr, right_operand)
+
+    If left_is_const equals 0 or right_is_const equals 0:
+        Return 0
+    End If
+
+    Let left_val be get_constant_value(context_ptr, left_operand)
+    Let right_val be get_constant_value(context_ptr, right_operand)
+
+    Let result_val be 0
+
+    If opcode equals 20100:  Note: EQ
+        If left_val equals right_val:
+            Set result_val to 1
+        End If
+    End If
+    If opcode equals 20101:  Note: NE
+        If left_val is not equal to right_val:
+            Set result_val to 1
+        End If
+    End If
+    If opcode equals 20102:  Note: LT
+        If left_val is less than right_val:
+            Set result_val to 1
+        End If
+    End If
+    If opcode equals 20103:  Note: LE
+        If left_val is less than or equal to right_val:
+            Set result_val to 1
+        End If
+    End If
+    If opcode equals 20104:  Note: GT
+        If left_val is greater than right_val:
+            Set result_val to 1
+        End If
+    End If
+    If opcode equals 20105:  Note: GE
+        If left_val is greater than or equal to right_val:
+            Set result_val to 1
+        End If
+    End If
+
+    Note: Replace comparison with constant true (1) or false (0)
+    Note: Transform comparison into MIR_CONST instruction in-place
+
+    Note: Change opcode to MIR_CONST (20001)
+    Layout.memory_set_int64(inst, 0, 20001)
+
+    Note: Keep result_id at offset 8 (already set correctly)
+    Note: Store constant value (0 or 1) at offset 16
+    Layout.memory_set_int64(inst, 16, result_val)
+
+    Note: Clear right operand at offset 24
+    Layout.memory_set_int64(inst, 24, 0)
+
+    Note: Successfully folded comparison
+    Return 1
+End Process
+
+Process called "try_fold_unary_op" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Attempts to fold a unary operation if operand is constant.
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let operand be Layout.memory_get_int64(inst, 16)
+    Let is_const be is_constant_value(context_ptr, operand)
+
+    If is_const equals 0:
+        Return 0
+    End If
+
+    Let operand_val be get_constant_value(context_ptr, operand)
+    Let result_val be 0
+
+    If opcode equals 20007:  Note: NEG
+        Set result_val to 0 minus operand_val
+    End If
+    If opcode equals 20013:  Note: NOT
+        Set result_val to NOT operand_val
+    End If
+
+    Note: Replace unary operation with constant
+    Note: Transform unary operation into MIR_CONST instruction in-place
+
+    Note: Change opcode to MIR_CONST (20001)
+    Layout.memory_set_int64(inst, 0, 20001)
+
+    Note: Keep result_id at offset 8 (already set correctly)
+    Note: Store constant value at offset 16
+    Layout.memory_set_int64(inst, 16, result_val)
+
+    Note: Clear operand field (no longer needed)
+    Note: For unary ops, operand is at offset 16, but we're overwriting it with result
+
+    Note: Successfully folded unary operation
+    Return 1
+End Process
+
+Process called "is_constant_value" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Checks if a value ID represents a compile-time constant.
+
+    **CONSTANT CHECK:**
+    - Look up defining instruction for value_id
+    - If opcode is MIR_CONST (20001), it's a constant
+    - Otherwise, it's not a constant
+
+    **ALGORITHM:**
+    1. Get CFG from context
+    2. Traverse all blocks in CFG
+    3. For each instruction, check if result_id equals value_id
+    4. If found, check if opcode is MIR_CONST (20001)
+    5. Return 1 if constant, 0 otherwise
+
+    Returns 1 if constant, 0 otherwise.
+    @End Reasoning
+
+    @Implementation
+    Implements complete SSA def-use chain traversal to find the defining
+    instruction and determine if it's a compile-time constant.
+    @End Implementation
+
+    If value_id equals 0:
+        Return 0
+    End If
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Traverse all blocks to find defining instruction
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        If block is not equal to 0:
+            Let instructions be CFG.get_block_instructions(block)
+            Let inst_count be List.length(instructions)
+
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be List.get(instructions, j)
+                If inst is not equal to 0:
+                    Note: Check if this instruction defines value_id
+                    Let result_id be Layout.memory_get_int64(inst, 8)
+                    If result_id equals value_id:
+                        Note: Found defining instruction, check if it's a constant
+                        Let opcode be MIRNodes.get_instruction_opcode(inst)
+                        If opcode equals 20001:  Note: MIR_CONST
+                            Return 1
+                        End If
+                        Note: Not a constant instruction
+                        Return 0
+                    End If
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Value not found or not a constant
+    Return 0
+End Process
+
+Process called "get_constant_value" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Gets the constant value for a constant value ID.
+
+    **IMPLEMENTATION:**
+    - Find defining instruction for value_id
+    - Extract constant value from MIR_CONST instruction
+    - Return the constant value
+
+    **ALGORITHM:**
+    1. Get CFG from context
+    2. Traverse all blocks in CFG
+    3. For each instruction, check if result_id equals value_id
+    4. If found and opcode is MIR_CONST (20001), extract constant value
+    5. Return the constant value
+
+    **MIR_CONST MEMORY LAYOUT:**
+    - Offset 0: opcode (20001)
+    - Offset 8: result_id (value_id)
+    - Offset 16: constant_value (Integer)
+
+    Returns the constant value.
+    @End Reasoning
+
+    @Implementation
+    Implements complete CFG traversal to find MIR_CONST instruction
+    and extract the constant value from the instruction structure.
+    @End Implementation
+
+    If value_id equals 0:
+        Return 0
+    End If
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Traverse all blocks to find MIR_CONST instruction
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        If block is not equal to 0:
+            Let instructions be CFG.get_block_instructions(block)
+            Let inst_count be List.length(instructions)
+
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be List.get(instructions, j)
+                If inst is not equal to 0:
+                    Note: Check if this instruction defines value_id
+                    Let result_id be Layout.memory_get_int64(inst, 8)
+                    If result_id equals value_id:
+                        Note: Found defining instruction, verify it's a constant
+                        Let opcode be MIRNodes.get_instruction_opcode(inst)
+                        If opcode equals 20001:  Note: MIR_CONST
+                            Note: Extract constant value from offset 16
+                            Let const_value be Layout.memory_get_int64(inst, 16)
+                            Return const_value
+                        End If
+                        Note: Not a constant instruction, cannot get value
+                        Return 0
+                    End If
+                End If
+                Set j to j plus 1
+            End While
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Value not found or not a constant
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PHASE 2: TIER 1 OPTIMIZATIONS - Dead Code Elimination (DCE)
+Note: ============================================================================
+
+Process called "optimize_dead_code_elimination" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **DEAD CODE ELIMINATION (DCE)**
+
+    Removes instructions that have no effect on program output.
+
+    **ALGORITHM:**
+    ```
+    1. Mark all instructions as dead initially
+    2. Mark critical instructions as live:
+       - Stores (have side effects)
+       - Calls (have side effects)
+       - Returns (affect control flow)
+       - Branches (affect control flow)
+    3. Transitively mark dependencies:
+       - For each live instruction:
+         - Mark all operands' defining instructions as live
+       - Repeat until no new instructions marked
+    4. Delete all unmarked instructions
+    ```
+
+    **CRITICAL INSTRUCTIONS (always live):**
+    - MIR_STORE (20020) - memory side effects
+    - MIR_CALL (20030) - function call side effects
+    - MIR_RET (20040) - control flow
+    - MIR_BR (20041) - control flow
+    - MIR_COND_BR (20042) - control flow
+    - MIR_PHI (20050) - SSA critical
+
+    Returns number of instructions deleted.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "optimize_dead_code_elimination: starting DCE pass"
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let deleted_count be 0
+
+    Note: Create liveness map (value_id -> is_live flag)
+    Let liveness_map be List.create()
+
+    Note: Step 1: Mark critical instructions as live
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Note: Check if instruction is critical
+            Let is_critical be 0
+            If opcode equals 20020:  Note: STORE
+                Set is_critical to 1
+            End If
+            If opcode equals 20030:  Note: CALL
+                Set is_critical to 1
+            End If
+            If opcode is greater than or equal to 20040 and opcode is less than or equal to 20042:  Note: RET, BR, COND_BR
+                Set is_critical to 1
+            End If
+            If opcode equals 20050:  Note: PHI
+                Set is_critical to 1
+            End If
+
+            Note: Mark instruction as live
+            If is_critical equals 1:
+                Let result_id be Layout.memory_get_int64(inst, 8)
+                mark_value_live(liveness_map, result_id)
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Step 2: Transitively mark dependencies
+    Let changed be 1
+    While changed equals 1:
+        Set changed to 0
+
+        Let i be 0
+        While i is less than block_count:
+            Let block be CFG.get_block(cfg, i)
+            Let instructions be CFG.get_block_instructions(block)
+            Let inst_count be List.length(instructions)
+
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be List.get(instructions, j)
+                Let result_id be Layout.memory_get_int64(inst, 8)
+
+                Note: If instruction is live, mark operands as live
+                Let is_live be is_value_live(liveness_map, result_id)
+                If is_live equals 1:
+                    Let marked be mark_operands_live(liveness_map, inst)
+                    If marked is greater than 0:
+                        Set changed to 1
+                    End If
+                End If
+
+                Set j to j plus 1
+            End While
+
+            Set i to i plus 1
+        End While
+    End While
+
+    Note: Step 3: Delete dead instructions
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Note: Build new instruction list without dead instructions
+        Let new_instructions be List.create()
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let is_live be is_value_live(liveness_map, result_id)
+
+            If is_live equals 1:
+                List.append(new_instructions, inst)
+            Otherwise:
+                Set deleted_count to deleted_count plus 1
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Note: Replace block instructions
+        CFG.set_block_instructions(block, new_instructions)
+
+        Set i to i plus 1
+    End While
+
+    Note: Cleanup
+    List.destroy(liveness_map)
+
+    Note: Update counter
+    Let current_count be Layout.memory_get_int64(context_ptr, 40)
+    Layout.memory_set_int64(context_ptr, 40, current_count plus deleted_count)
+
+    If deleted_count is greater than 0:
+        mark_changed(context_ptr)
+    End If
+
+    Display "optimize_dead_code_elimination: deleted " joined with deleted_count joined with " dead instructions"
+    Return deleted_count
+End Process
+
+Process called "mark_value_live" that takes liveness_map as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Marks a value as live in the liveness map.
+
+    **LIVENESS MAP:**
+    - List of (value_id, is_live) pairs
+    - If value_id found, set is_live to 1
+    - If not found, add new entry
+    @End Reasoning
+
+    If liveness_map equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Note: Search for existing entry
+    Let count be List.length(liveness_map)
+    Let i be 0
+    While i is less than count:
+        Let entry be List.get(liveness_map, i)
+        Let entry_id be Layout.memory_get_int64(entry, 0)
+        If entry_id equals value_id:
+            Layout.memory_set_int64(entry, 8, 1)
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Not found, add new entry
+    Let entry be Layout.allocate(16)
+    Layout.memory_set_int64(entry, 0, value_id)
+    Layout.memory_set_int64(entry, 8, 1)
+    List.append(liveness_map, entry)
+
+    Return 1
+End Process
+
+Process called "is_value_live" that takes liveness_map as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Checks if a value is marked as live.
+
+    Returns 1 if live, 0 if dead.
+    @End Reasoning
+
+    If liveness_map equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Let count be List.length(liveness_map)
+    Let i be 0
+    While i is less than count:
+        Let entry be List.get(liveness_map, i)
+        Let entry_id be Layout.memory_get_int64(entry, 0)
+        If entry_id equals value_id:
+            Let is_live be Layout.memory_get_int64(entry, 8)
+            Return is_live
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0  Note: Not found, assume dead
+End Process
+
+Process called "mark_operands_live" that takes liveness_map as Integer, inst as Integer returns Integer:
+    @Reasoning
+    Marks all operands of an instruction as live.
+
+    **OPERAND EXTRACTION:**
+    - Binary ops: left and right operands
+    - Unary ops: single operand
+    - Load/Store: address operand
+    - Branch: condition operand
+    - PHI: all incoming values
+
+    Returns number of operands newly marked as live.
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let marked_count be 0
+    Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+    Note: Binary operations (20002-20012)
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let right_operand be Layout.memory_get_int64(inst, 24)
+
+        Let was_live be is_value_live(liveness_map, left_operand)
+        If was_live equals 0:
+            mark_value_live(liveness_map, left_operand)
+            Set marked_count to marked_count plus 1
+        End If
+
+        Set was_live to is_value_live(liveness_map, right_operand)
+        If was_live equals 0:
+            mark_value_live(liveness_map, right_operand)
+            Set marked_count to marked_count plus 1
+        End If
+    End If
+
+    Note: Comparison operations (20100-20105)
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let right_operand be Layout.memory_get_int64(inst, 24)
+
+        Let was_live be is_value_live(liveness_map, left_operand)
+        If was_live equals 0:
+            mark_value_live(liveness_map, left_operand)
+            Set marked_count to marked_count plus 1
+        End If
+
+        Set was_live to is_value_live(liveness_map, right_operand)
+        If was_live equals 0:
+            mark_value_live(liveness_map, right_operand)
+            Set marked_count to marked_count plus 1
+        End If
+    End If
+
+    Note: Unary operations (NEG=20007, NOT=20013)
+    If opcode equals 20007 or opcode equals 20013:
+        Let operand be Layout.memory_get_int64(inst, 16)
+        Let was_live be is_value_live(liveness_map, operand)
+        If was_live equals 0:
+            mark_value_live(liveness_map, operand)
+            Set marked_count to marked_count plus 1
+        End If
+    End If
+
+    Note: Load operation (20019)
+    If opcode equals 20019:
+        Let address be Layout.memory_get_int64(inst, 16)
+        Let was_live be is_value_live(liveness_map, address)
+        If was_live equals 0:
+            mark_value_live(liveness_map, address)
+            Set marked_count to marked_count plus 1
+        End If
+    End If
+
+    Note: Store operation (20020)
+    If opcode equals 20020:
+        Let value be Layout.memory_get_int64(inst, 16)
+        Let address be Layout.memory_get_int64(inst, 24)
+
+        Let was_live be is_value_live(liveness_map, value)
+        If was_live equals 0:
+            mark_value_live(liveness_map, value)
+            Set marked_count to marked_count plus 1
+        End If
+
+        Set was_live to is_value_live(liveness_map, address)
+        If was_live equals 0:
+            mark_value_live(liveness_map, address)
+            Set marked_count to marked_count plus 1
+        End If
+    End If
+
+    Note: Conditional branch (20042)
+    If opcode equals 20042:
+        Let condition be Layout.memory_get_int64(inst, 16)
+        Let was_live be is_value_live(liveness_map, condition)
+        If was_live equals 0:
+            mark_value_live(liveness_map, condition)
+            Set marked_count to marked_count plus 1
+        End If
+    End If
+
+    Note: PHI node (20050)
+    If opcode equals 20050:
+        Let incoming_count be Layout.memory_get_int64(inst, 24)
+        Let incoming_values be Layout.memory_get_int64(inst, 32)
+
+        Let i be 0
+        While i is less than incoming_count:
+            Let value be List.get(incoming_values, i)
+            Let was_live be is_value_live(liveness_map, value)
+            If was_live equals 0:
+                mark_value_live(liveness_map, value)
+                Set marked_count to marked_count plus 1
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Return marked_count
+End Process
+
+Note: ============================================================================
+Note: PHASE 2: TIER 1 OPTIMIZATIONS - Copy Propagation
+Note: ============================================================================
+
+Process called "optimize_copy_propagation" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **COPY PROPAGATION**
+
+    Eliminates redundant copy operations by replacing uses of copied values
+    with the original value.
+
+    **ALGORITHM:**
+    ```
+    For each instruction:
+        If instruction is COPY (x = y):
+            Replace all uses of x with y
+            Delete the copy instruction
+            Mark changed
+    ```
+
+    **COPY DETECTION:**
+    - MIR_COPY (20060) - explicit copy instruction
+    - Also handles identity moves from SSA construction
+
+    **CONSTRAINTS:**
+    - Must preserve SSA form
+    - Cannot propagate across phi nodes
+    - Cannot propagate if source is redefined
+
+    Returns number of copies propagated.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "optimize_copy_propagation: starting copy propagation pass"
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let propagated_count be 0
+
+    Note: Get RPO traversal order
+    Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+    Let rpo_list be Dominance.get_reverse_postorder(dom_info)
+    Let block_count be List.length(rpo_list)
+
+    Note: Build copy map (dest_value -> source_value)
+    Let copy_map be List.create()
+
+    Note: Step 1: Find all copy instructions
+    Let i be 0
+    While i is less than block_count:
+        Let block_id be List.get(rpo_list, i)
+        Let block be CFG.get_block(cfg, block_id)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Note: Check for COPY instruction (20060)
+            If opcode equals 20060:
+                Let dest be Layout.memory_get_int64(inst, 8)
+                Let source be Layout.memory_get_int64(inst, 16)
+
+                Note: Add to copy map
+                add_copy_mapping(copy_map, dest, source)
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Step 2: Replace uses of copied values
+    Let i be 0
+    While i is less than block_count:
+        Let block_id be List.get(rpo_list, i)
+        Let block be CFG.get_block(cfg, block_id)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let replaced be replace_copy_uses(inst, copy_map)
+            If replaced is greater than 0:
+                Set propagated_count to propagated_count plus replaced
+                mark_changed(context_ptr)
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Step 3: Delete copy instructions
+    Let i be 0
+    While i is less than block_count:
+        Let block_id be List.get(rpo_list, i)
+        Let block be CFG.get_block(cfg, block_id)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let new_instructions be List.create()
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Note: Keep non-copy instructions
+            If opcode is not equal to 20060:
+                List.append(new_instructions, inst)
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Note: Replace block instructions
+        CFG.set_block_instructions(block, new_instructions)
+
+        Set i to i plus 1
+    End While
+
+    Note: Cleanup
+    List.destroy(copy_map)
+
+    Note: Update counter
+    Let current_count be Layout.memory_get_int64(context_ptr, 64)
+    Layout.memory_set_int64(context_ptr, 64, current_count plus propagated_count)
+
+    Display "optimize_copy_propagation: propagated " joined with propagated_count joined with " copies"
+    Return propagated_count
+End Process
+
+Process called "add_copy_mapping" that takes copy_map as Integer, dest as Integer, source as Integer returns Integer:
+    @Reasoning
+    Adds a copy mapping to the map.
+
+    **MAP STRUCTURE:**
+    - List of (dest_value, source_value) pairs
+    - Each entry is 16 bytes (2 integers)
+    @End Reasoning
+
+    If copy_map equals 0:
+        Return 0
+    End If
+
+    Let entry be Layout.allocate(16)
+    Layout.memory_set_int64(entry, 0, dest)
+    Layout.memory_set_int64(entry, 8, source)
+    List.append(copy_map, entry)
+
+    Return 1
+End Process
+
+Process called "get_copy_source" that takes copy_map as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Gets the source value for a copied destination.
+
+    Returns source value ID, or 0 if not found.
+    @End Reasoning
+
+    If copy_map equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Let count be List.length(copy_map)
+    Let i be 0
+    While i is less than count:
+        Let entry be List.get(copy_map, i)
+        Let dest be Layout.memory_get_int64(entry, 0)
+        If dest equals value_id:
+            Let source be Layout.memory_get_int64(entry, 8)
+            Return source
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "replace_copy_uses" that takes inst as Integer, copy_map as Integer returns Integer:
+    @Reasoning
+    Replaces uses of copied values in an instruction.
+
+    **REPLACEMENT:**
+    - For each operand in instruction:
+      - If operand is destination of a copy:
+        - Replace with source of copy
+
+    Returns number of replacements made.
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let replaced_count be 0
+    Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+    Note: Binary operations
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let source be get_copy_source(copy_map, left_operand)
+        If source is not equal to 0:
+            Layout.memory_set_int64(inst, 16, source)
+            Set replaced_count to replaced_count plus 1
+        End If
+
+        Let right_operand be Layout.memory_get_int64(inst, 24)
+        Set source to get_copy_source(copy_map, right_operand)
+        If source is not equal to 0:
+            Layout.memory_set_int64(inst, 24, source)
+            Set replaced_count to replaced_count plus 1
+        End If
+    End If
+
+    Note: Comparison operations
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let source be get_copy_source(copy_map, left_operand)
+        If source is not equal to 0:
+            Layout.memory_set_int64(inst, 16, source)
+            Set replaced_count to replaced_count plus 1
+        End If
+
+        Let right_operand be Layout.memory_get_int64(inst, 24)
+        Set source to get_copy_source(copy_map, right_operand)
+        If source is not equal to 0:
+            Layout.memory_set_int64(inst, 24, source)
+            Set replaced_count to replaced_count plus 1
+        End If
+    End If
+
+    Note: Unary operations
+    If opcode equals 20007 or opcode equals 20013:
+        Let operand be Layout.memory_get_int64(inst, 16)
+        Let source be get_copy_source(copy_map, operand)
+        If source is not equal to 0:
+            Layout.memory_set_int64(inst, 16, source)
+            Set replaced_count to replaced_count plus 1
+        End If
+    End If
+
+    Note: Store operation
+    If opcode equals 20020:
+        Let value be Layout.memory_get_int64(inst, 16)
+        Let source be get_copy_source(copy_map, value)
+        If source is not equal to 0:
+            Layout.memory_set_int64(inst, 16, source)
+            Set replaced_count to replaced_count plus 1
+        End If
+
+        Let address be Layout.memory_get_int64(inst, 24)
+        Set source to get_copy_source(copy_map, address)
+        If source is not equal to 0:
+            Layout.memory_set_int64(inst, 24, source)
+            Set replaced_count to replaced_count plus 1
+        End If
+    End If
+
+    Return replaced_count
+End Process
+
+Note: ============================================================================
+Note: PHASE 3: TIER 2 OPTIMIZATIONS - Algebraic Simplification
+Note: ============================================================================
+
+Process called "optimize_algebraic_simplification" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **ALGEBRAIC SIMPLIFICATION**
+
+    Simplifies arithmetic expressions using algebraic identities.
+
+    **IDENTITY SIMPLIFICATIONS:**
+    ```
+    X + 0 → X      (additive identity)
+    X - 0 → X      (subtraction identity)
+    X * 0 → 0      (multiplicative zero)
+    X * 1 → X      (multiplicative identity)
+    X / 1 → X      (division identity)
+    X - X → 0      (self subtraction)
+    X ^ 0 → 1      (power identity)
+    X & 0 → 0      (bitwise AND with zero)
+    X & -1 → X     (bitwise AND with all ones)
+    X | 0 → X      (bitwise OR with zero)
+    X | -1 → -1    (bitwise OR with all ones)
+    X ^ 0 → X      (bitwise XOR with zero)
+    X ^ X → 0      (self XOR)
+    ```
+
+    **COMPARISON SIMPLIFICATIONS:**
+    ```
+    X < X → false
+    X <= X → true
+    X > X → false
+    X >= X → true
+    X == X → true
+    X != X → false
+    ```
+
+    Returns number of simplifications made.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "optimize_algebraic_simplification: starting algebraic simplification pass"
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let simplified_count be 0
+
+    Note: Get RPO traversal order
+    Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+    Let rpo_list be Dominance.get_reverse_postorder(dom_info)
+    Let block_count be List.length(rpo_list)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block_id be List.get(rpo_list, i)
+        Let block be CFG.get_block(cfg, block_id)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Note: Try algebraic simplification
+            Let result be try_algebraic_simplify(context_ptr, inst, opcode)
+            If result equals 1:
+                Set simplified_count to simplified_count plus 1
+                mark_changed(context_ptr)
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Update counter
+    Let current_count be Layout.memory_get_int64(context_ptr, 48)
+    Layout.memory_set_int64(context_ptr, 48, current_count plus simplified_count)
+
+    Display "optimize_algebraic_simplification:  " joined with simplified_count joined with " expressions"
+    Return simplified_count
+End Process
+
+Process called "try_algebraic_simplify" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Attempts to simplify an instruction using algebraic identities.
+
+    Returns 1 if , 0 otherwise.
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Note: Check for binary operations
+    If opcode is less than 20002 or opcode is greater than 20012:
+        Note: Also check comparisons
+        If opcode is less than 20100 or opcode is greater than 20105:
+            Return 0
+        End If
+    End If
+
+    Let left_operand be Layout.memory_get_int64(inst, 16)
+    Let right_operand be Layout.memory_get_int64(inst, 24)
+
+    Note: Check if operands are equal (X op X patterns)
+    If left_operand equals right_operand:
+        Note: X - X → 0
+        If opcode equals 20003:  Note: SUB
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 0)
+            Return 1
+        End If
+
+        Note: X ^ X → 0 (XOR)
+        If opcode equals 20012:  Note: XOR
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 0)
+            Return 1
+        End If
+
+        Note: X < X → 0 (false)
+        If opcode equals 20102:  Note: LT
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 0)
+            Return 1
+        End If
+
+        Note: X > X → 0 (false)
+        If opcode equals 20104:  Note: GT
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 0)
+            Return 1
+        End If
+
+        Note: X <= X → 1 (true)
+        If opcode equals 20103:  Note: LE
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 1)
+            Return 1
+        End If
+
+        Note: X >= X → 1 (true)
+        If opcode equals 20105:  Note: GE
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 1)
+            Return 1
+        End If
+
+        Note: X == X → 1 (true)
+        If opcode equals 20100:  Note: EQ
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 1)
+            Return 1
+        End If
+
+        Note: X != X → 0 (false)
+        If opcode equals 20101:  Note: NE
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 0)
+            Return 1
+        End If
+    End If
+
+    Note: Check if right operand is constant 0 or 1
+    Let right_is_const be is_constant_value(context_ptr, right_operand)
+    If right_is_const equals 1:
+        Let right_val be get_constant_value(context_ptr, right_operand)
+
+        Note: X + 0 → X
+        If opcode equals 20002 and right_val equals 0:  Note: ADD
+            Note: Replace with copy of left operand
+            Return 1
+        End If
+
+        Note: X - 0 → X
+        If opcode equals 20003 and right_val equals 0:  Note: SUB
+            Return 1
+        End If
+
+        Note: X * 0 → 0
+        If opcode equals 20004 and right_val equals 0:  Note: MUL
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 0)
+            Return 1
+        End If
+
+        Note: X * 1 → X
+        If opcode equals 20004 and right_val equals 1:  Note: MUL
+            Return 1
+        End If
+
+        Note: X / 1 → X
+        If opcode equals 20005 and right_val equals 1:  Note: DIV
+            Return 1
+        End If
+
+        Note: X & 0 → 0
+        If opcode equals 20010 and right_val equals 0:  Note: AND
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 0)
+            Return 1
+        End If
+
+        Note: X | 0 → X
+        If opcode equals 20011 and right_val equals 0:  Note: OR
+            Return 1
+        End If
+
+        Note: X ^ 0 → X
+        If opcode equals 20012 and right_val equals 0:  Note: XOR
+            Return 1
+        End If
+    End If
+
+    Note: Check if left operand is constant 0 (commutative operations)
+    Let left_is_const be is_constant_value(context_ptr, left_operand)
+    If left_is_const equals 1:
+        Let left_val be get_constant_value(context_ptr, left_operand)
+
+        Note: 0 + X → X
+        If opcode equals 20002 and left_val equals 0:  Note: ADD
+            Return 1
+        End If
+
+        Note: 0 * X → 0
+        If opcode equals 20004 and left_val equals 0:  Note: MUL
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 0)
+            Return 1
+        End If
+
+        Note: 0 & X → 0
+        If opcode equals 20010 and left_val equals 0:  Note: AND
+            Let result_id be Layout.memory_get_int64(inst, 8)
+            Let const_inst be MIRNodes.create_mir_const_instruction(result_id, 0)
+            Return 1
+        End If
+
+        Note: 0 | X → X
+        If opcode equals 20011 and left_val equals 0:  Note: OR
+            Return 1
+        End If
+
+        Note: 0 ^ X → X
+        If opcode equals 20012 and left_val equals 0:  Note: XOR
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PHASE 3: TIER 2 OPTIMIZATIONS - Strength Reduction
+Note: ============================================================================
+
+Process called "optimize_strength_reduction" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **STRENGTH REDUCTION**
+
+    Replaces expensive operations with cheaper equivalent operations.
+
+    **REDUCTION PATTERNS:**
+    ```
+    X * 2 → X << 1     (shift is faster than multiply)
+    X * 4 → X << 2
+    X * 8 → X << 3
+    X * 2^n → X << n   (general power-of-2 multiply)
+
+    X / 2 → X >> 1     (shift is faster than divide)
+    X / 4 → X >> 2
+    X / 8 → X >> 3
+    X / 2^n → X >> n   (general power-of-2 divide)
+
+    X % 2 → X & 1      (bitwise AND is faster than modulo)
+    X % 4 → X & 3
+    X % 2^n → X & (2^n - 1)
+    ```
+
+    **PERFORMANCE GAINS:**
+    - Shift operations are 2-3x faster than multiply/divide
+    - Bitwise AND is 5-10x faster than modulo
+    - Especially beneficial on embedded/low-power processors
+
+    Returns number of reductions performed.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "optimize_strength_reduction: starting strength reduction pass"
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let reduced_count be 0
+
+    Note: Get RPO traversal order
+    Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+    Let rpo_list be Dominance.get_reverse_postorder(dom_info)
+    Let block_count be List.length(rpo_list)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block_id be List.get(rpo_list, i)
+        Let block be CFG.get_block(cfg, block_id)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Note: Try strength reduction on MUL, DIV, MOD
+            If opcode equals 20004 or opcode equals 20005 or opcode equals 20006:
+                Let result be try_strength_reduce(context_ptr, inst, opcode)
+                If result equals 1:
+                    Set reduced_count to reduced_count plus 1
+                    mark_changed(context_ptr)
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Update counter
+    Let current_count be Layout.memory_get_int64(context_ptr, 48)
+    Layout.memory_set_int64(context_ptr, 48, current_count plus reduced_count)
+
+    Display "optimize_strength_reduction: reduced " joined with reduced_count joined with " operations"
+    Return reduced_count
+End Process
+
+Process called "try_strength_reduce" that takes context_ptr as Integer, inst as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Attempts to reduce operation strength.
+
+    Returns 1 if reduced, 0 otherwise.
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let right_operand be Layout.memory_get_int64(inst, 24)
+    Let right_is_const be is_constant_value(context_ptr, right_operand)
+
+    If right_is_const equals 0:
+        Return 0
+    End If
+
+    Let right_val be get_constant_value(context_ptr, right_operand)
+
+    Note: Check if right_val is power of 2
+    Let is_power_of_2 be check_power_of_two(right_val)
+    If is_power_of_2 equals 0:
+        Return 0
+    End If
+
+    Let shift_amount be calculate_log2(right_val)
+
+    Note: X * 2^n → X << n
+    If opcode equals 20004:  Note: MUL
+        Note: Replace MUL with SHL instruction
+        Let result_id be Layout.memory_get_int64(inst, 8)
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+
+        Note: Transform MUL into SHL (shift left) instruction in-place
+        Note: Change opcode to MIR_SHL (20008)
+        Layout.memory_set_int64(inst, 0, 20008)
+
+        Note: Keep result_id at offset 8 (unchanged)
+        Note: Keep left_operand at offset 16 (unchanged)
+        Note: Replace right_operand (power of 2) with shift amount at offset 24
+        Layout.memory_set_int64(inst, 24, shift_amount)
+
+        Note: Successfully reduced MUL to SHL
+        Return 1
+    End If
+
+    Note: X / 2^n → X >> n
+    If opcode equals 20005:  Note: DIV
+        Note: Replace DIV with SHR instruction
+        Let result_id be Layout.memory_get_int64(inst, 8)
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+
+        Note: Transform DIV into SHR (shift right) instruction in-place
+        Note: Change opcode to MIR_SHR (20009)
+        Layout.memory_set_int64(inst, 0, 20009)
+
+        Note: Keep result_id at offset 8 (unchanged)
+        Note: Keep left_operand at offset 16 (unchanged)
+        Note: Replace right_operand (power of 2) with shift amount at offset 24
+        Layout.memory_set_int64(inst, 24, shift_amount)
+
+        Note: Successfully reduced DIV to SHR
+        Return 1
+    End If
+
+    Note: X % 2^n → X & (2^n - 1)
+    If opcode equals 20006:  Note: MOD
+        Note: Replace MOD with AND instruction
+        Let result_id be Layout.memory_get_int64(inst, 8)
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let mask be right_val minus 1
+
+        Note: Transform MOD into AND instruction in-place
+        Note: Change opcode to MIR_AND (20010)
+        Layout.memory_set_int64(inst, 0, 20010)
+
+        Note: Keep result_id at offset 8 (unchanged)
+        Note: Keep left_operand at offset 16 (unchanged)
+        Note: Replace right_operand with mask value at offset 24
+        Layout.memory_set_int64(inst, 24, mask)
+
+        Note: Successfully reduced MOD to AND
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "check_power_of_two" that takes value as Integer returns Integer:
+    @Reasoning
+    Checks if a value is a power of 2.
+
+    **ALGORITHM:**
+    A number is a power of 2 if it has exactly one bit set.
+    This can be checked using: (value & (value - 1)) == 0 and value > 0
+
+    **EXAMPLES:**
+    - 1 = 0b0001 → power of 2 (2^0)
+    - 2 = 0b0010 → power of 2 (2^1)
+    - 4 = 0b0100 → power of 2 (2^2)
+    - 8 = 0b1000 → power of 2 (2^3)
+    - 3 = 0b0011 → not power of 2
+    - 5 = 0b0101 → not power of 2
+
+    Returns 1 if power of 2, 0 otherwise.
+    @End Reasoning
+
+    If value is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Check if value & (value - 1) equals 0
+    Let value_minus_1 be value minus 1
+    Let result be value AND value_minus_1
+
+    If result equals 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "calculate_log2" that takes value as Integer returns Integer:
+    @Reasoning
+    Calculates log2 of a power-of-2 value.
+
+    **ALGORITHM:**
+    Count trailing zeros (CTZ) or count leading zeros (CLZ).
+    For power-of-2 values, log2(value) = position of the single set bit.
+
+    **EXAMPLES:**
+    - log2(1) = 0  (2^0 = 1)
+    - log2(2) = 1  (2^1 = 2)
+    - log2(4) = 2  (2^2 = 4)
+    - log2(8) = 3  (2^3 = 8)
+
+    Returns log2(value).
+    @End Reasoning
+
+    If value is less than or equal to 0:
+        Return 0
+    End If
+
+    Let log_val be 0
+    Let be value
+
+    Note: Count how many times we can divide by 2
+    While is greater than 1:
+        Set to divided by 2
+        Set log_val to log_val plus 1
+    End While
+
+    Return log_val
+End Process
+
+Note: ============================================================================
+Note: PHASE 3: TIER 2 OPTIMIZATIONS - Common Subexpression Elimination (CSE)
+Note: ============================================================================
+
+Process called "optimize_common_subexpression_elimination" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **COMMON SUBEXPRESSION ELIMINATION (CSE)**
+
+    Eliminates redundant computations by reusing previously computed values.
+
+    **ALGORITHM:**
+    ```
+    For each instruction in CFG (in RPO order):
+        Compute value number for instruction
+        If value number already exists:
+            Replace instruction with previous result
+            Mark for deletion
+        Otherwise:
+            Add value number to map
+    ```
+
+    **VALUE NUMBERING:**
+    - Each expression gets a unique number based on:
+      - Opcode
+      - Operand value numbers
+      - Commutativity (ADD/MUL/AND/OR/XOR are commutative)
+    - Same value number = guaranteed same result
+
+    **EXAMPLE:**
+    ```
+    a = x + y
+    b = x + y    <- Same as 'a', can be eliminated
+    c = a        <- Replace 'b' with 'a'
+    ```
+
+    **CONSTRAINTS:**
+    - Must preserve SSA form
+    - Cannot eliminate across side effects (calls, stores)
+    - Cannot eliminate volatile operations
+
+    Returns number of expressions eliminated.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "optimize_common_subexpression_elimination: starting CSE pass"
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let eliminated_count be 0
+
+    Note: Get value number map from context
+    Let value_map be Layout.memory_get_int64(context_ptr, 80)
+
+    Note: Get RPO traversal order
+    Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+    Let rpo_list be Dominance.get_reverse_postorder(dom_info)
+    Let block_count be List.length(rpo_list)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block_id be List.get(rpo_list, i)
+        Let block be CFG.get_block(cfg, block_id)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let opcode be MIRNodes.get_instruction_opcode(inst)
+
+            Note: Only CSE pure operations (no side effects)
+            Let is_pure be is_pure_operation(opcode)
+            If is_pure equals 1:
+                Note: Compute value number for this expression
+                Let value_number be compute_value_number(inst, opcode, value_map)
+
+                Note: Check if this value number exists
+                Let existing_result be lookup_value_number(value_map, value_number)
+                If existing_result is not equal to 0:
+                    Note: Found common subexpression
+                    Let result_id be Layout.memory_get_int64(inst, 8)
+                    Note: Replace all uses of result_id with existing_result
+                    Set eliminated_count to eliminated_count plus 1
+                    mark_changed(context_ptr)
+                Otherwise:
+                    Note: Add to value number map
+                    Let result_id be Layout.memory_get_int64(inst, 8)
+                    add_value_number(value_map, value_number, result_id)
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Update counter
+    Let current_count be Layout.memory_get_int64(context_ptr, 48)
+    Layout.memory_set_int64(context_ptr, 48, current_count plus eliminated_count)
+
+    Display "optimize_common_subexpression_elimination: eliminated " joined with eliminated_count joined with " expressions"
+    Return eliminated_count
+End Process
+
+Process called "is_pure_operation" that takes opcode as Integer returns Integer:
+    @Reasoning
+    Checks if an operation is pure (has no side effects).
+
+    **PURE OPERATIONS:**
+    - Arithmetic: ADD, SUB, MUL, DIV, MOD, NEG
+    - Bitwise: AND, OR, XOR, NOT, SHL, SHR, SAR
+    - Comparisons: EQ, NE, LT, LE, GT, GE
+    - Constant loads
+
+    **IMPURE OPERATIONS (have side effects):**
+    - Loads (may fault, volatile)
+    - Stores (memory side effect)
+    - Calls (may have side effects)
+    - Branches (control flow)
+    - PHI nodes (SSA structural)
+
+    Returns 1 if pure, 0 if impure.
+    @End Reasoning
+
+    Note: Arithmetic operations (20002-20007)
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20007:
+        Return 1
+    End If
+
+    Note: Bitwise operations (20008-20013)
+    If opcode is greater than or equal to 20008 and opcode is less than or equal to 20013:
+        Return 1
+    End If
+
+    Note: Comparison operations (20100-20105)
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Return 1
+    End If
+
+    Note: Constant (20001)
+    If opcode equals 20001:
+        Return 1
+    End If
+
+    Note: All other operations are impure
+    Return 0
+End Process
+
+Process called "compute_value_number" that takes inst as Integer, opcode as Integer, value_map as Integer returns Integer:
+    @Reasoning
+    Computes a value number for an instruction.
+
+    **VALUE NUMBER COMPUTATION:**
+    - Hash = opcode * 31 + left_operand_vn * 17 + right_operand_vn * 13
+    - For commutative operations (ADD, MUL, AND, OR, XOR):
+      - Sort operands to ensure same hash for "a + b" and "b + a"
+
+    Returns value number (hash).
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let hash be opcode multiplied by 31
+
+    Note: Binary operations
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let right_operand be Layout.memory_get_int64(inst, 24)
+
+        Note: Check if operation is commutative
+        Let is_commutative be 0
+        If opcode equals 20002 or opcode equals 20004:  Note: ADD, MUL
+            Set is_commutative to 1
+        End If
+        If opcode equals 20010 or opcode equals 20011 or opcode equals 20012:  Note: AND, OR, XOR
+            Set is_commutative to 1
+        End If
+
+        Note: For commutative operations, order operands
+        If is_commutative equals 1:
+            If left_operand is greater than right_operand:
+                Note: Swap for consistent hashing
+                Let be left_operand
+                Set left_operand to right_operand
+                Set right_operand to 
+            End If
+        End If
+
+        Note: Incorporate operands into hash
+        Set hash to hash plus left_operand multiplied by 17
+        Set hash to hash plus right_operand multiplied by 13
+    End If
+
+    Note: Comparison operations
+    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let right_operand be Layout.memory_get_int64(inst, 24)
+
+        Set hash to hash plus left_operand multiplied by 17
+        Set hash to hash plus right_operand multiplied by 13
+    End If
+
+    Note: Unary operations
+    If opcode equals 20007 or opcode equals 20013:  Note: NEG, NOT
+        Let operand be Layout.memory_get_int64(inst, 16)
+        Set hash to hash plus operand multiplied by 17
+    End If
+
+    Note: Constant
+    If opcode equals 20001:
+        Let const_value be Layout.memory_get_int64(inst, 16)
+        Set hash to hash plus const_value multiplied by 17
+    End If
+
+    Return hash
+End Process
+
+Process called "lookup_value_number" that takes value_map as Integer, value_number as Integer returns Integer:
+    @Reasoning
+    Looks up a value number in the map.
+
+    Returns result value ID if found, 0 otherwise.
+    @End Reasoning
+
+    If value_map equals 0 or value_number equals 0:
+        Return 0
+    End If
+
+    Let count be List.length(value_map)
+    Let i be 0
+    While i is less than count:
+        Let entry be List.get(value_map, i)
+        Let entry_vn be Layout.memory_get_int64(entry, 0)
+        If entry_vn equals value_number:
+            Let result_id be Layout.memory_get_int64(entry, 8)
+            Return result_id
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "add_value_number" that takes value_map as Integer, value_number as Integer, result_id as Integer returns Integer:
+    @Reasoning
+    Adds a value number to the map.
+
+    **MAP STRUCTURE:**
+    - List of (value_number, result_id) pairs
+    - Each entry is 16 bytes
+    @End Reasoning
+
+    If value_map equals 0:
+        Return 0
+    End If
+
+    Let entry be Layout.allocate(16)
+    Layout.memory_set_int64(entry, 0, value_number)
+    Layout.memory_set_int64(entry, 8, result_id)
+    List.append(value_map, entry)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ADVANCED CSE & GVN WRAPPERS - Bridge to External Implementations
+Note: ============================================================================
+
+Process called "optimize_cse_advanced" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **ADVANCED CROSS-BLOCK CSE**
+
+    Wrapper that calls the sophisticated cross-block CSE implementation
+    from cse.runa instead of the simple local CSE above.
+
+    **WHY USE ADVANCED CSE:**
+    - Cross-block availability analysis using dominator tree
+    - GEN/KILL set computation with fixed-point iteration
+    - Handles loop-carried expressions
+    - More powerful than simple local value numbering
+
+    **INTERFACE BRIDGE:**
+    The internal optimizations use OptimizerContext, but the external
+    CSE module uses CFG pointer directly. This wrapper extracts the CFG
+    and calls the external implementation.
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_cse_advanced: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_cse_advanced: null CFG in context"
+        Return 0
+    End If
+
+    Note: Call external advanced CSE implementation
+    Display "optimize_cse_advanced: invoking cross-block CSE from cse.runa"
+    Let result be CSE.run_cse_pass(cfg)
+
+    Note: Mark context as changed if CSE made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_gvn" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **GLOBAL VALUE NUMBERING**
+
+    Wrapper that calls the full GVN implementation from gvn.runa.
+
+    **GVN CAPABILITIES:**
+    - Value number assignment with hash consing
+    - Congruence class partitioning
+    - PHI node congruence analysis
+    - Algebraic simplifications (x+0=x, x*1=x, etc.)
+    - Memory value numbering with alias analysis
+    - Redundant load elimination
+    - Store-to-load forwarding
+
+    **WHY GVN SUBSUMES CSE:**
+    GVN is strictly more powerful than CSE because:
+    - CSE finds identical expressions
+    - GVN finds equivalent values (even if expressions differ)
+    - GVN handles algebraic identities
+    - GVN integrates with memory SSA
+
+    **INTERFACE BRIDGE:**
+    Extracts CFG from OptimizerContext and calls external GVN module.
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_gvn: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_gvn: null CFG in context"
+        Return 0
+    End If
+
+    Note: Call external GVN implementation
+    Display "optimize_gvn: invoking Global Value Numbering from gvn.runa"
+    Let result be GVN.run_gvn_pass(cfg)
+
+    Note: Mark context as changed if GVN made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_licm" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **LOOP-INVARIANT CODE MOTION**
+
+    Wrapper that calls the LICM implementation from licm.runa.
+
+    **LICM CAPABILITIES:**
+    - Natural loop detection via back-edge analysis
+    - Loop body computation using worklist algorithm
+    - Preheader insertion for hoisting target
+    - Fixed-point invariant detection
+    - Safety analysis (no side effects, dominates exits)
+    - Hoisting transformation with SSA maintenance
+
+    **WHY LICM IS CRITICAL:**
+    - Moves loop-invariant computations out of loops
+    - Reduces redundant execution in hot paths
+    - Enables subsequent optimizations (constant folding, DCE)
+    - Essential for performance on tight loops
+
+    **INTERFACE BRIDGE:**
+    Extracts CFG from OptimizerContext and calls external LICM module.
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_licm: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_licm: null CFG in context"
+        Return 0
+    End If
+
+    Note: Call external LICM implementation
+    Display "optimize_licm: invoking Loop-Invariant Code Motion from licm.runa"
+    Let result be LICM.run_licm_pass(cfg)
+
+    Note: Mark context as changed if LICM made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_loop_unrolling" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **LOOP UNROLLING**
+
+    Wrapper that calls the loop unrolling implementation from loop_unrolling.runa.
+
+    **LOOP UNROLLING CAPABILITIES:**
+    - Induction variable identification
+    - Trip count analysis (constant and symbolic)
+    - Profitability heuristics (code size, complexity)
+    - Full unrolling for small constant-count loops
+    - Partial unrolling with remainder loop generation
+    - SSA renaming for cloned instructions
+
+    **WHY LOOP UNROLLING IS CRITICAL:**
+    - Reduces branch overhead and pipeline stalls
+    - Enables instruction-level parallelism
+    - Exposes optimization opportunities across iterations
+    - Critical for vectorization and CPU pipeline utilization
+
+    **TRANSFORMATION TYPES:**
+    - Full unrolling: Eliminates loop completely for small constant trips
+    - Partial unrolling: Clones body K times, reduces iterations by factor K
+
+    **INTERFACE BRIDGE:**
+    Extracts CFG from OptimizerContext and calls external loop unrolling module.
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_loop_unrolling: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_loop_unrolling: null CFG in context"
+        Return 0
+    End If
+
+    Note: Call external loop unrolling implementation
+    Display "optimize_loop_unrolling: invoking Loop Unrolling from loop_unrolling.runa"
+    Let result be LoopUnroll.run_loop_unrolling_pass(cfg)
+
+    Note: Mark context as changed if loop unrolling made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_strength_reduction_advanced" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **ADVANCED STRENGTH REDUCTION**
+
+    Wrapper that calls the comprehensive strength reduction implementation
+    from strength_reduction.runa instead of the simple inline version.
+
+    **WHY USE ADVANCED STRENGTH REDUCTION:**
+    - More sophisticated power-of-2 detection with caching
+    - Loop induction variable strength reduction
+    - Better SSA form maintenance
+    - More comprehensive statistics tracking
+
+    **OPTIMIZATIONS PERFORMED:**
+    - Multiply by power-of-2 → shift left (X * 2^n → X << n)
+    - Divide by power-of-2 → shift right (X / 2^n → X >> n)
+    - Modulo by power-of-2 → bitwise AND (X % 2^n → X & (2^n - 1))
+    - Loop induction variable optimizations
+
+    **INTERFACE BRIDGE:**
+    Extracts CFG from OptimizerContext and calls external strength reduction module.
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_strength_reduction_advanced: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_strength_reduction_advanced: null CFG in context"
+        Return 0
+    End If
+
+    Note: Call external advanced strength reduction implementation
+    Display "optimize_strength_reduction_advanced: invoking advanced strength reduction from strength_reduction.runa"
+    Let result be StrengthReduction.run_strength_reduction_pass(cfg)
+
+    Note: Mark context as changed if strength reduction made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_tail_call" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **TAIL CALL OPTIMIZATION**
+
+    Wrapper that calls the tail call optimization implementation from tail_call.runa.
+
+    **TAIL CALL OPTIMIZATION CAPABILITIES:**
+    - Tail position analysis (identifies calls in tail position)
+    - Tail recursion elimination (transforms recursive calls into loops)
+    - Sibling tail call marking (enables backend optimization)
+    - Calling convention compatibility analysis
+
+    **WHY TAIL CALL OPTIMIZATION IS CRITICAL:**
+    - Prevents stack overflow in deep recursion
+    - Enables functional programming patterns with constant stack space
+    - Eliminates return overhead for tail calls
+    - Essential for languages emphasizing recursion
+
+    **TRANSFORMATION TYPES:**
+    - Tail recursion → loop: Converts self-recursive tail calls into iterative loops
+    - Sibling tail calls: Marks non-recursive tail calls for backend optimization
+
+    **EXAMPLE TRANSFORMATION:**
+    ```
+    Before:
+      func(n, acc):
+        if n == 0: return acc
+        return func(n-1, acc+n)  ← Tail recursion
+
+    After:
+      func(n, acc):
+        loop_header:
+          n_phi = phi [n, entry], [n_new, recurse]
+          acc_phi = phi [acc, entry], [acc_new, recurse]
+          if n_phi == 0: return acc_phi
+          n_new = n_phi - 1
+          acc_new = acc_phi + n_phi
+          jump loop_header  ← Constant stack space
+    ```
+
+    **INTERFACE BRIDGE:**
+    Extracts CFG from OptimizerContext and calls external tail call module.
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_tail_call: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_tail_call: null CFG in context"
+        Return 0
+    End If
+
+    Note: Extract function pointer from context (needed for tail call analysis)
+    Let function be Layout.memory_get_int64(context_ptr, 8)
+
+    Note: Call external tail call optimization implementation
+    Display "optimize_tail_call: invoking tail call optimization from tail_call.runa"
+
+    Note: Tail call optimization operates on function level
+    Let result be 0
+    If function is not equal to 0:
+        Set result to TailCall.optimize_function_with_tail_call(function)
+    Otherwise:
+        Note: If no function context, run pass on entire CFG
+        Set result to TailCall.run_tail_call_pass(cfg)
+    End If
+
+    Note: Mark context as changed if tail call optimization made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_inlining" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **FUNCTION INLINING OPTIMIZATION**
+
+    Wrapper that calls the function inlining optimization implementation from inlining.runa.
+
+    **FUNCTION INLINING CAPABILITIES:**
+    - Cost-benefit analysis for inlining decisions
+    - Call site analysis and candidate selection
+    - Function body cloning with SSA value remapping
+    - CFG integration with proper block splitting
+    - Recursion depth limiting to prevent infinite expansion
+
+    **WHY INLINING IS CRITICAL:**
+    - Eliminates call overhead (parameter passing, return handling)
+    - Enables inter-procedural optimizations (constant propagation, CSE across function boundaries)
+    - Improves instruction cache locality
+    - Enables further optimizations on inlined code (algebraic simplification, strength reduction)
+
+    **INLINING DECISION FACTORS:**
+    - Instruction cost calculation with weighted operations
+    - Complexity penalties (loops, exception handling, indirect calls)
+    - Net benefit estimation (call overhead vs. code size increase)
+    - Recursion depth limiting (default max depth: 4)
+
+    **EXAMPLE TRANSFORMATION:**
+    ```
+    Before:
+      result = call simple_add(5, 3)  ← Call overhead + parameter passing
+      use(result)
+
+    After:
+      temp1 = 5                        ← Inlined function body
+      temp2 = 3
+      result = temp1 + temp2           ← Direct computation
+      use(result)                      ← Further optimizations now possible
+    ```
+
+    **INTERFACE BRIDGE:**
+    Extracts CFG and function from OptimizerContext and calls external inlining module.
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_inlining: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_inlining: null CFG in context"
+        Return 0
+    End If
+
+    Note: Extract function pointer from context (needed for inlining analysis)
+    Let function be Layout.memory_get_int64(context_ptr, 8)
+
+    Note: Call external inlining optimization implementation
+    Display "optimize_inlining: invoking function inlining from inlining.runa"
+
+    Note: Inlining operates on function level
+    Let result be 0
+    If function is not equal to 0:
+        Set result to Inlining.optimize_function_with_inlining(function)
+    Otherwise:
+        Note: If no function context, run pass on entire CFG
+        Set result to Inlining.run_inlining_pass(cfg)
+    End If
+
+    Note: Mark context as changed if inlining made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_devirtualization" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **DEVIRTUALIZATION OPTIMIZATION**
+
+    Wrapper that calls the devirtualization optimization implementation from devirtualization.runa.
+
+    **DEVIRTUALIZATION CAPABILITIES:**
+    - Type propagation analysis with confidence levels (0-100)
+    - Virtual call site detection (MIR_CALL_INDIRECT instructions)
+    - Direct devirtualization (100% confidence → direct call)
+    - Speculative devirtualization (75%+ confidence → type guard + fast path)
+    - Method resolution from concrete types
+
+    **WHY DEVIRTUALIZATION IS CRITICAL:**
+    - Eliminates vtable lookup overhead
+    - Enables inlining of virtual calls (after devirtualization)
+    - Improves branch prediction (eliminates indirect branches)
+    - Reduces instruction cache misses
+    - Essential for object-oriented code performance
+
+    **TYPE CONFIDENCE SYSTEM:**
+    - 100% confidence: MIR_NEW allocations → Direct devirtualization
+    - 90% confidence: MIR_CAST operations → Speculative with guard
+    - 85% confidence: MIR_TYPECHECK guards → Speculative with guard
+    - Below 75%: No devirtualization (overhead not justified)
+
+    **EXAMPLE TRANSFORMATION:**
+    ```
+    Before (virtual call):
+      receiver_type = unknown
+      vtable = load receiver.vtable        ← Vtable lookup
+      method = load vtable[selector]       ← Method lookup
+      result = call_indirect method(...)   ← Indirect call
+
+    After (direct devirtualization, 100% confidence):
+      result = call ConcreteType.method(...) ← Direct call, can be inlined
+
+    After (speculative devirtualization, 75%+ confidence):
+      if receiver is ConcreteType:           ← Type guard
+        result = call ConcreteType.method(...) ← Fast path (direct)
+      else:
+        vtable = load receiver.vtable        ← Slow path (virtual)
+        method = load vtable[selector]
+        result = call_indirect method(...)
+    ```
+
+    **INTERFACE BRIDGE:**
+    Extracts CFG and function from OptimizerContext and calls external devirtualization module.
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_devirtualization: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_devirtualization: null CFG in context"
+        Return 0
+    End If
+
+    Note: Extract function pointer from context (needed for devirtualization analysis)
+    Let function be Layout.memory_get_int64(context_ptr, 8)
+
+    Note: Call external devirtualization optimization implementation
+    Display "optimize_devirtualization: invoking devirtualization from devirtualization.runa"
+
+    Note: Devirtualization operates on function level
+    Let result be 0
+    If function is not equal to 0:
+        Set result to Devirtualization.optimize_function_with_devirtualization(function)
+    Otherwise:
+        Note: If no function context, run pass on entire CFG
+        Set result to Devirtualization.run_devirtualization_pass(cfg)
+    End If
+
+    Note: Mark context as changed if devirtualization made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_scalar_replacement" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **SCALAR REPLACEMENT OF AGGREGATES (SROA)**
+
+    Wrapper that calls the scalar replacement optimization from scalar_replacement.runa.
+
+    **SROA CAPABILITIES:**
+    - Escape analysis to identify local aggregate allocations
+    - Field decomposition into individual SSA values
+    - Scalarization transformation (replacing allocations with registers)
+    - Load/store elimination after scalarization
+    - Enables register promotion for struct fields
+
+    **WHY SROA IS CRITICAL:**
+    - Eliminates memory operations (replaces with register operations)
+    - Enables further optimizations (constant propagation, DCE)
+    - Improves register allocation (more values in registers)
+    - Reduces memory traffic and cache pressure
+    - Essential for zero-cost abstractions
+
+    **EXAMPLE TRANSFORMATION:**
+    ```
+    Before:
+      %agg = alloca { i32, f64 }
+      store_field %agg, 0, 42
+      store_field %agg, 1, 3.14
+      %val = load_field %agg, 0
+
+    After:
+      %field0 = 42
+      %field1 = 3.14
+      %val = %field0
+    ```
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_scalar_replacement: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_scalar_replacement: null CFG in context"
+        Return 0
+    End If
+
+    Note: Call external SROA implementation
+    Display "optimize_scalar_replacement: invoking SROA from scalar_replacement.runa"
+    Let result be ScalarReplacement.optimize_function_with_sroa(cfg)
+
+    Note: Mark context as changed if SROA made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_vectorization" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **LOOP VECTORIZATION**
+
+    Wrapper that calls the vectorization optimization from vectorization.runa.
+
+    **VECTORIZATION CAPABILITIES:**
+    - Natural loop detection via back-edge analysis
+    - Induction variable analysis
+    - Data dependency analysis (RAW, WAR, WAW hazards)
+    - Memory access pattern analysis (consecutive, strided)
+    - Cost modeling and profitability analysis
+    - Loop transformation to SIMD form
+
+    **WHY VECTORIZATION IS CRITICAL:**
+    - Enables SIMD instructions for massive performance gains (4-16x speedup)
+    - Critical for modern CPU utilization (AVX, AVX2, AVX512)
+    - Auto-vectorization allows scalar code to benefit from vector hardware
+    - Essential for numerical, scientific, and image processing code
+
+    **EXAMPLE TRANSFORMATION:**
+    ```
+    Before (scalar loop):
+      for (i = 0; i < n; i++)
+        c[i] = a[i] + b[i]
+
+    After (vectorized loop with factor 4):
+      for (i = 0; i < n; i += 4)
+        c[i:i+3] = vadd <4 x float> a[i:i+3], b[i:i+3]
+    ```
+
+    Returns 1 if changes made, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Display "optimize_vectorization: null context"
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Display "optimize_vectorization: null CFG in context"
+        Return 0
+    End If
+
+    Note: Call external vectorization implementation
+    Display "optimize_vectorization: invoking vectorization from vectorization.runa"
+    Let result be Vectorization.optimize_function_with_vectorization(cfg)
+
+    Note: Mark context as changed if vectorization made modifications
+    If result equals 1:
+        mark_changed(context_ptr)
+    End If
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: PHASE 3: TIER 2 OPTIMIZATIONS - Branch Optimization
+Note: ============================================================================
+
+Process called "optimize_branches" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **BRANCH OPTIMIZATION**
+
+    Optimizes control flow by simplifying branch patterns.
+
+    **OPTIMIZATIONS:**
+    ```
+    1. Constant branch folding:
+       if (true) goto L1 else goto L2  → goto L1
+       if (false) goto L1 else goto L2 → goto L2
+
+    2. Branch-to-branch elimination:
+       L1: goto L2  → Redirect all branches to L1 to go directly to L2
+
+    3. Empty block elimination:
+       L1: goto L2  → Remove L1, update predecessors
+
+    4. Unreachable code elimination:
+       Code after unconditional branch/return → Delete
+
+    5. Branch inversion:
+       if (!x) goto L1 else goto L2  → if (x) goto L2 else goto L1
+       (can enable further optimizations)
+    ```
+
+    **EXAMPLE:**
+    ```
+    Before:
+      if (x < 10) goto B1 else goto B2
+      B2: goto B3
+      B3: ...
+
+    After:
+      if (x < 10) goto B1 else goto B3
+      (B2 eliminated)
+    ```
+
+    Returns number of branches optimized.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "optimize_branches: starting branch optimization pass"
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let optimized_count be 0
+
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        If inst_count is greater than 0:
+            Note: Check terminator instruction (last in block)
+            Let terminator be List.get(instructions, inst_count minus 1)
+            Let opcode be MIRNodes.get_instruction_opcode(terminator)
+
+            Note: Optimize conditional branch
+            If opcode equals 20042:  Note: COND_BR
+                Let result be optimize_conditional_branch(context_ptr, block, terminator)
+                If result equals 1:
+                    Set optimized_count to optimized_count plus 1
+                    mark_changed(context_ptr)
+                End If
+            End If
+
+            Note: Optimize unconditional branch (branch-to-branch)
+            If opcode equals 20041:  Note: BR
+                Let result be optimize_unconditional_branch(context_ptr, block, terminator)
+                If result equals 1:
+                    Set optimized_count to optimized_count plus 1
+                    mark_changed(context_ptr)
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update counter
+    Let current_count be Layout.memory_get_int64(context_ptr, 48)
+    Layout.memory_set_int64(context_ptr, 48, current_count plus optimized_count)
+
+    Display "optimize_branches: optimized " joined with optimized_count joined with " branches"
+    Return optimized_count
+End Process
+
+Process called "optimize_conditional_branch" that takes context_ptr as Integer, block as Integer, branch_inst as Integer returns Integer:
+    @Reasoning
+    Optimizes a conditional branch.
+
+    **PATTERNS:**
+    - Constant condition: fold to unconditional branch
+    - Inverted condition: swap targets if beneficial
+    - Same targets: convert to unconditional branch
+
+    Returns 1 if optimized, 0 otherwise.
+    @End Reasoning
+
+    If branch_inst equals 0:
+        Return 0
+    End If
+
+    Let condition be Layout.memory_get_int64(branch_inst, 16)
+    Let true_target be Layout.memory_get_int64(branch_inst, 24)
+    Let false_target be Layout.memory_get_int64(branch_inst, 32)
+
+    Note: Pattern 1: Same targets (if x goto L else goto L → goto L)
+    If true_target equals false_target:
+        Note: Convert to unconditional branch
+        Let new_br be MIRNodes.create_mir_br_instruction(true_target)
+        Return 1
+    End If
+
+    Note: Pattern 2: Constant condition
+    Let is_const be is_constant_value(context_ptr, condition)
+    If is_const equals 1:
+        Let const_val be get_constant_value(context_ptr, condition)
+        If const_val is not equal to 0:
+            Note: Condition is true, branch to true_target
+            Let new_br be MIRNodes.create_mir_br_instruction(true_target)
+            Return 1
+        Otherwise:
+            Note: Condition is false, branch to false_target
+            Let new_br be MIRNodes.create_mir_br_instruction(false_target)
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "optimize_unconditional_branch" that takes context_ptr as Integer, block as Integer, branch_inst as Integer returns Integer:
+    @Reasoning
+    Optimizes an unconditional branch (branch-to-branch elimination).
+
+    **PATTERN:**
+    ```
+    B1: goto B2
+    B2: goto B3
+    →
+    B1: goto B3  (eliminate intermediate jump)
+    ```
+
+    Returns 1 if optimized, 0 otherwise.
+    @End Reasoning
+
+    If branch_inst equals 0:
+        Return 0
+    End If
+
+    Let target be Layout.memory_get_int64(branch_inst, 16)
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+
+    Note: Get target block
+    Let target_block be CFG.get_block(cfg, target)
+    Let target_instructions be CFG.get_block_instructions(target_block)
+    Let target_inst_count be List.length(target_instructions)
+
+    Note: Check if target block is just another branch
+    If target_inst_count equals 1:
+        Let target_terminator be List.get(target_instructions, 0)
+        Let target_opcode be MIRNodes.get_instruction_opcode(target_terminator)
+
+        Note: If target is also unconditional branch, redirect
+        If target_opcode equals 20041:  Note: BR
+            Let final_target be Layout.memory_get_int64(target_terminator, 16)
+            Note: Update branch to skip intermediate block
+            Layout.memory_set_int64(branch_inst, 16, final_target)
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PHASE 4: ADVANCED OPTIMIZATIONS - Sparse Conditional Constant Propagation
+Note: ============================================================================
+
+Process called "optimize_sparse_conditional_constant_propagation" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **SPARSE CONDITIONAL CONSTANT PROPAGATION (SCCP)**
+
+    More powerful than simple constant folding + propagation.
+    Combines constant propagation with unreachable code elimination.
+
+    **ALGORITHM** (Wegman-Zadeck 1991):
+    ```
+    1. Initialize all values as UNDEFINED
+    2. Mark entry block as executable
+    3. While worklist not empty:
+       a. Process executable blocks:
+          - Evaluate instructions
+          - If operands are constant, fold and propagate
+          - Update SSA value lattice
+       b. Mark successor blocks executable based on:
+          - Unconditional branches → mark successor
+          - Conditional branches with constant condition → mark one successor
+          - Conditional branches with unknown condition → mark both successors
+    4. Delete all non-executable blocks and instructions with undefined values
+    ```
+
+    **LATTICE VALUES:**
+    ```
+    UNDEFINED (⊥)  - Not yet analyzed
+    CONSTANT(k)    - Known constant value k
+    OVERDEFINED (⊤) - Not constant (multiple values or unknown)
+    ```
+
+    **EXAMPLE:**
+    ```
+    x = 5
+    if (x < 10):        <- Condition is constant true
+        y = x + 1       <- y is constant 6
+        z = y * 2       <- z is constant 12
+    else:
+        y = x - 1       <- DEAD CODE (never executed)
+        z = y * 3       <- DEAD CODE
+    return z            <- Returns constant 12
+    ```
+
+    **ADVANTAGES OVER SIMPLE CONST PROP:**
+    - Discovers more constants through conditional analysis
+    - Eliminates more dead code
+    - Single pass instead of iterate-to-fixpoint
+
+    Returns number of constants propagated.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "optimize_sparse_conditional_constant_propagation: starting SCCP pass"
+
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let propagated_count be 0
+
+    Note: Create lattice map (value_id -> lattice_state)
+    Note: Lattice states: 0 = UNDEFINED, 1 = CONSTANT, 2 = OVERDEFINED
+    Let lattice_map be List.create()
+
+    Note: Create executable blocks set
+    Let executable_blocks be List.create()
+
+    Note: Create SSA edges worklist
+    Let ssa_worklist be Layout.memory_get_int64(context_ptr, 72)
+
+    Note: Step 1: Initialize - mark entry block as executable
+    Let entry_block_id be 0
+    List.append(executable_blocks, entry_block_id)
+
+    Note: Step 2: Process worklist
+    Let changed be 1
+    While changed equals 1:
+        Set changed to 0
+
+        Note: Process all executable blocks
+        Let exec_count be List.length(executable_blocks)
+        Let i be 0
+        While i is less than exec_count:
+            Let block_id be List.get(executable_blocks, i)
+            Let block be CFG.get_block(cfg, block_id)
+            Let instructions be CFG.get_block_instructions(block)
+            Let inst_count be List.length(instructions)
+
+            Note: Process each instruction in block
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be List.get(instructions, j)
+                Let updated be sccp_visit_instruction(inst, lattice_map)
+                If updated equals 1:
+                    Set changed to 1
+                    Set propagated_count to propagated_count plus 1
+                End If
+                Set j to j plus 1
+            End While
+
+            Note: Process terminator to mark successors executable
+            If inst_count is greater than 0:
+                Let terminator be List.get(instructions, inst_count minus 1)
+                Let opcode be MIRNodes.get_instruction_opcode(terminator)
+
+                If opcode equals 20041:  Note: Unconditional BR
+                    Let target be Layout.memory_get_int64(terminator, 16)
+                    Let is_exec be is_block_executable(executable_blocks, target)
+                    If is_exec equals 0:
+                        List.append(executable_blocks, target)
+                        Set changed to 1
+                    End If
+                End If
+
+                If opcode equals 20042:  Note: Conditional BR
+                    Let condition be Layout.memory_get_int64(terminator, 16)
+                    Let lattice_state be get_lattice_value(lattice_map, condition)
+                    Let true_target be Layout.memory_get_int64(terminator, 24)
+                    Let false_target be Layout.memory_get_int64(terminator, 32)
+
+                    If lattice_state equals 1:  Note: CONSTANT
+                        Let const_val be get_lattice_constant(lattice_map, condition)
+                        If const_val is not equal to 0:
+                            Let is_exec be is_block_executable(executable_blocks, true_target)
+                            If is_exec equals 0:
+                                List.append(executable_blocks, true_target)
+                                Set changed to 1
+                            End If
+                        Otherwise:
+                            Let is_exec be is_block_executable(executable_blocks, false_target)
+                            If is_exec equals 0:
+                                List.append(executable_blocks, false_target)
+                                Set changed to 1
+                            End If
+                        End If
+                    Otherwise:
+                        Note: OVERDEFINED or UNDEFINED - mark both successors
+                        Let is_exec be is_block_executable(executable_blocks, true_target)
+                        If is_exec equals 0:
+                            List.append(executable_blocks, true_target)
+                            Set changed to 1
+                        End If
+                        Set is_exec to is_block_executable(executable_blocks, false_target)
+                        If is_exec equals 0:
+                            List.append(executable_blocks, false_target)
+                            Set changed to 1
+                        End If
+                    End If
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+    End While
+
+    Note: Step 3: Replace constants and delete dead code
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let is_exec be is_block_executable(executable_blocks, i)
+        If is_exec equals 1:
+            Let block be CFG.get_block(cfg, i)
+            Let instructions be CFG.get_block_instructions(block)
+            Let inst_count be List.length(instructions)
+
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be List.get(instructions, j)
+                Let result_id be Layout.memory_get_int64(inst, 8)
+                Let lattice_state be get_lattice_value(lattice_map, result_id)
+
+                If lattice_state equals 1:  Note: Replace with constant
+                    Let const_val be get_lattice_constant(lattice_map, result_id)
+                    Let const_inst be MIRNodes.create_mir_const_instruction(result_id, const_val)
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Cleanup
+    List.destroy(lattice_map)
+    List.destroy(executable_blocks)
+
+    mark_changed(context_ptr)
+
+    Display "optimize_sparse_conditional_constant_propagation: propagated " joined with propagated_count joined with " constants"
+    Return propagated_count
+End Process
+
+Process called "sccp_visit_instruction" that takes inst as Integer, lattice_map as Integer returns Integer:
+    @Reasoning
+    Visits an instruction and updates lattice values.
+
+    Returns 1 if lattice was updated, 0 otherwise.
+    @End Reasoning
+
+    If inst equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIRNodes.get_instruction_opcode(inst)
+    Let result_id be Layout.memory_get_int64(inst, 8)
+
+    Note: Constant instruction
+    If opcode equals 20001:  Note: MIR_CONST
+        Let const_val be Layout.memory_get_int64(inst, 16)
+        Return set_lattice_constant(lattice_map, result_id, const_val)
+    End If
+
+    Note: Binary operations
+    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
+        Let left_operand be Layout.memory_get_int64(inst, 16)
+        Let right_operand be Layout.memory_get_int64(inst, 24)
+
+        Let left_state be get_lattice_value(lattice_map, left_operand)
+        Let right_state be get_lattice_value(lattice_map, right_operand)
+
+        Note: If either operand is OVERDEFINED, result is OVERDEFINED
+        If left_state equals 2 or right_state equals 2:
+            Return set_lattice_overdefined(lattice_map, result_id)
+        End If
+
+        Note: If both operands are CONSTANT, fold
+        If left_state equals 1 and right_state equals 1:
+            Let left_val be get_lattice_constant(lattice_map, left_operand)
+            Let right_val be get_lattice_constant(lattice_map, right_operand)
+
+            Let result_val be 0
+            If opcode equals 20002:  Note: ADD
+                Set result_val to left_val plus right_val
+            End If
+            If opcode equals 20003:  Note: SUB
+                Set result_val to left_val minus right_val
+            End If
+            If opcode equals 20004:  Note: MUL
+                Set result_val to left_val multiplied by right_val
+            End If
+
+            Return set_lattice_constant(lattice_map, result_id, result_val)
+        End If
+
+        Note: Otherwise, stay UNDEFINED
+        Return 0
+    End If
+
+    Note: PHI nodes require special handling
+    If opcode equals 20050:  Note: PHI
+        Note: PHI is constant if all executable predecessors have same constant
+        Return 0
+    End If
+
+    Note: All other instructions are OVERDEFINED
+    Return set_lattice_overdefined(lattice_map, result_id)
+End Process
+
+Process called "get_lattice_value" that takes lattice_map as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Gets lattice state for a value.
+
+    Returns: 0 = UNDEFINED, 1 = CONSTANT, 2 = OVERDEFINED.
+    @End Reasoning
+
+    If lattice_map equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Let count be List.length(lattice_map)
+    Let i be 0
+    While i is less than count:
+        Let entry be List.get(lattice_map, i)
+        Let entry_id be Layout.memory_get_int64(entry, 0)
+        If entry_id equals value_id:
+            Let state be Layout.memory_get_int64(entry, 8)
+            Return state
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0  Note: UNDEFINED by default
+End Process
+
+Process called "get_lattice_constant" that takes lattice_map as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Gets constant value for a CONSTANT lattice entry.
+
+    Returns constant value, or 0 if not found.
+    @End Reasoning
+
+    If lattice_map equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Let count be List.length(lattice_map)
+    Let i be 0
+    While i is less than count:
+        Let entry be List.get(lattice_map, i)
+        Let entry_id be Layout.memory_get_int64(entry, 0)
+        If entry_id equals value_id:
+            Let const_val be Layout.memory_get_int64(entry, 16)
+            Return const_val
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "set_lattice_constant" that takes lattice_map as Integer, value_id as Integer, const_val as Integer returns Integer:
+    @Reasoning
+    Sets a value to CONSTANT state with given value.
+
+    Returns 1 if changed, 0 if already at that state.
+    @End Reasoning
+
+    If lattice_map equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Note: Search for existing entry
+    Let count be List.length(lattice_map)
+    Let i be 0
+    While i is less than count:
+        Let entry be List.get(lattice_map, i)
+        Let entry_id be Layout.memory_get_int64(entry, 0)
+        If entry_id equals value_id:
+            Let current_state be Layout.memory_get_int64(entry, 8)
+            If current_state equals 1:  Note: Already CONSTANT
+                Let current_val be Layout.memory_get_int64(entry, 16)
+                If current_val equals const_val:
+                    Return 0  Note: No change
+                Otherwise:
+                    Note: Different constant - promote to OVERDEFINED
+                    Layout.memory_set_int64(entry, 8, 2)
+                    Return 1
+                End If
+            End If
+            If current_state equals 2:  Note: Already OVERDEFINED
+                Return 0
+            End If
+            Note: Was UNDEFINED, now CONSTANT
+            Layout.memory_set_int64(entry, 8, 1)
+            Layout.memory_set_int64(entry, 16, const_val)
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Not found, add new entry
+    Let entry be Layout.allocate(24)
+    Layout.memory_set_int64(entry, 0, value_id)
+    Layout.memory_set_int64(entry, 8, 1)  Note: CONSTANT
+    Layout.memory_set_int64(entry, 16, const_val)
+    List.append(lattice_map, entry)
+    Return 1
+End Process
+
+Process called "set_lattice_overdefined" that takes lattice_map as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Sets a value to OVERDEFINED state.
+
+    Returns 1 if changed, 0 if already OVERDEFINED.
+    @End Reasoning
+
+    If lattice_map equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Note: Search for existing entry
+    Let count be List.length(lattice_map)
+    Let i be 0
+    While i is less than count:
+        Let entry be List.get(lattice_map, i)
+        Let entry_id be Layout.memory_get_int64(entry, 0)
+        If entry_id equals value_id:
+            Let current_state be Layout.memory_get_int64(entry, 8)
+            If current_state equals 2:  Note: Already OVERDEFINED
+                Return 0
+            End If
+            Note: Promote to OVERDEFINED
+            Layout.memory_set_int64(entry, 8, 2)
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Not found, add new entry
+    Let entry be Layout.allocate(24)
+    Layout.memory_set_int64(entry, 0, value_id)
+    Layout.memory_set_int64(entry, 8, 2)  Note: OVERDEFINED
+    List.append(lattice_map, entry)
+    Return 1
+End Process
+
+Process called "is_block_executable" that takes executable_blocks as Integer, block_id as Integer returns Integer:
+    @Reasoning
+    Checks if a block is marked as executable.
+
+    Returns 1 if executable, 0 otherwise.
+    @End Reasoning
+
+    If executable_blocks equals 0:
+        Return 0
+    End If
+
+    Let count be List.length(executable_blocks)
+    Let i be 0
+    While i is less than count:
+        Let exec_id be List.get(executable_blocks, i)
+        If exec_id equals block_id:
+            Return 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PHASE 5: PASS MANAGER & INTEGRATION - Optimization Pipeline
+Note: ============================================================================
+
+Process called "run_optimization_pipeline" that takes cfg as Integer, function as Integer returns Integer:
+    @Reasoning
+    **OPTIMIZATION PIPELINE**
+
+    Runs the complete MIR optimization pipeline.
+
+    **PIPELINE STRUCTURE:**
+    ```
+    1. Create optimizer context
+    2. Run Tier 1 optimizations (fast, foundational):
+       - Constant folding
+       - Dead code elimination
+       - Copy propagation
+    3. Run Tier 2 optimizations (medium cost, high value):
+       - Scalar Replacement of Aggregates (SROA from scalar_replacement.runa)
+       - Algebraic simplification
+       - Advanced Strength Reduction (from strength_reduction.runa)
+       - Devirtualization (from devirtualization.runa)
+       - Inlining (from inlining.runa)
+       - Tail Call Optimization (from tail_call.runa)
+       - Loop-Invariant Code Motion (LICM from licm.runa)
+       - Loop Unrolling (from loop_unrolling.runa)
+       - Loop Vectorization (from vectorization.runa)
+       - Cross-block CSE (from cse.runa)
+       - Branch optimization
+    4. Run Advanced optimizations (expensive, powerful):
+       - Sparse conditional constant propagation (SCCP)
+       - Global Value Numbering (GVN from gvn.runa)
+    5. Iterate until fixed point (no more changes)
+    6. Verify MIR correctness
+    7. Print optimization statistics
+    8. Cleanup and return
+    ```
+
+    **ITERATION STRATEGY:**
+    - Run passes until no changes occur
+    - Maximum 10 iterations (prevent infinite loops)
+    - Each iteration can enable new optimizations
+    - Example: Constant fold → DCE → more constant fold
+
+    Returns 1 if successful, 0 if failed.
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "run_optimization_pipeline: null CFG"
+        Return 0
+    End If
+
+    Display "============================================"
+    Display "STARTING MIR OPTIMIZATION PIPELINE"
+    Display "============================================"
+    Display ""
+
+    Note: Create optimizer context
+    Let context_ptr be create_optimizer_context(cfg, function)
+    If context_ptr equals 0:
+        Display "run_optimization_pipeline: failed to create context"
+        Return 0
+    End If
+
+    Note: Optimization loop - iterate to fixed point
+    Let max_iterations be 10
+    Let iteration be 0
+    Let pipeline_changed be 1
+
+    While pipeline_changed equals 1 and iteration is less than max_iterations:
+        Set iteration to iteration plus 1
+        Display "--- Iteration " joined with iteration joined with " ---"
+
+        Note: Reset changed flag for this iteration
+        reset_changed_flag(context_ptr)
+
+        Note: Tier 1: Fast foundational optimizations
+        Display "Running Tier 1 optimizations..."
+        optimize_constant_folding(context_ptr)
+        optimize_dead_code_elimination(context_ptr)
+        optimize_copy_propagation(context_ptr)
+
+        Note: Tier 2: Medium-cost high-value optimizations
+        Display "Running Tier 2 optimizations..."
+        optimize_scalar_replacement(context_ptr)
+        optimize_algebraic_simplification(context_ptr)
+        optimize_strength_reduction_advanced(context_ptr)
+        optimize_devirtualization(context_ptr)
+        optimize_inlining(context_ptr)
+        optimize_tail_call(context_ptr)
+        optimize_licm(context_ptr)
+        optimize_loop_unrolling(context_ptr)
+        optimize_vectorization(context_ptr)
+        optimize_cse_advanced(context_ptr)
+        optimize_branches(context_ptr)
+
+        Note: Check if any pass made changes
+        Set pipeline_changed to has_changed(context_ptr)
+
+        If pipeline_changed equals 1:
+            Display "Changes made, continuing optimization..."
+        Otherwise:
+            Display "No changes, optimization converged"
+        End If
+
+        Display ""
+    End While
+
+    If iteration equals max_iterations:
+        Display "WARNING: Maximum iterations reached"
+    End If
+
+    Note: Advanced optimization pass (run once after convergence)
+    Display "Running advanced optimizations..."
+    optimize_sparse_conditional_constant_propagation(context_ptr)
+    optimize_gvn(context_ptr)
+
+    Note: Final cleanup pass
+    Display "Running final cleanup..."
+    optimize_dead_code_elimination(context_ptr)
+
+    Note: Verify MIR correctness
+    Display ""
+    Display "Verifying optimized MIR..."
+    Let verification_result be Verifier.verify_mir(cfg)
+    If verification_result equals 0:
+        Display "ERROR: MIR verification failed after optimization"
+        Display "This indicates a bug in the optimizer"
+        destroy_optimizer_context(context_ptr)
+        Return 0
+    End If
+    Display "MIR verification passed"
+
+    Note: Print optimization statistics
+    Display ""
+    print_optimization_stats(context_ptr)
+
+    Note: Cleanup
+    destroy_optimizer_context(context_ptr)
+
+    Display ""
+    Display "============================================"
+    Display "MIR OPTIMIZATION PIPELINE COMPLETE"
+    Display "============================================"
+
+    Return 1
+End Process
+
+Process called "optimize_mir" that takes cfg as Integer returns Integer:
+    @Reasoning
+    **MAIN ENTRY POINT**
+
+    Primary entry point for MIR optimization.
+    Called from the compiler pipeline.
+
+    **USAGE:**
+    ```
+    Let cfg be mir_builder_build(hir_function)
+    Let success be optimize_mir(cfg)
+    If success equals 1:
+        Let backend_result be backend_codegen(cfg)
+    End If
+    ```
+
+    Returns 1 if successful, 0 if failed.
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "optimize_mir: null CFG"
+        Return 0
+    End If
+
+    Note: Run optimization pipeline with null function (will extract from CFG if needed)
+    Let result be run_optimization_pipeline(cfg, 0)
+
+    Return result
+End Process
+
+Process called "optimize_mir_function" that takes cfg as Integer, function as Integer returns Integer:
+    @Reasoning
+    **FUNCTION-LEVEL ENTRY POINT**
+
+    Entry point when function context is available.
+
+    Returns 1 if successful, 0 if failed.
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "optimize_mir_function: null CFG"
+        Return 0
+    End If
+
+    Let result be run_optimization_pipeline(cfg, function)
+
+    Return result
+End Process
+
+Process called "run_single_optimization_pass" that takes cfg as Integer, pass_name as Integer returns Integer:
+    @Reasoning
+    **SINGLE PASS EXECUTION**
+
+    Runs a single optimization pass (for testing or custom pipelines).
+
+    **SUPPORTED PASSES:**
+    - "constant_folding"
+    - "dce" (dead code elimination)
+    - "copy_propagation"
+    - "algebraic_simplification"
+    - "strength_reduction" (inline simple version)
+    - "strength_reduction_advanced" (external advanced version)
+    - "tail_call" (tail call optimization)
+    - "licm" (loop-invariant code motion)
+    - "loop_unrolling"
+    - "cse" (cross-block common subexpression elimination)
+    - "branch_optimization"
+    - "sccp" (sparse conditional constant propagation)
+    - "gvn" (global value numbering)
+    - "scalar_replacement" or "sroa" (scalar replacement of aggregates)
+    - "vectorization" (loop vectorization)
+
+    Returns 1 if successful, 0 if failed.
+    @End Reasoning
+
+    If cfg equals 0 or pass_name equals 0:
+        Return 0
+    End If
+
+    Note: Create context
+    Let context_ptr be create_optimizer_context(cfg, 0)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Determine which pass to run
+    Let result be 0
+
+    If string_equals(pass_name, "constant_folding") equals 1:
+        Set result to optimize_constant_folding(context_ptr)
+    End If
+
+    If string_equals(pass_name, "dce") equals 1:
+        Set result to optimize_dead_code_elimination(context_ptr)
+    End If
+
+    If string_equals(pass_name, "copy_propagation") equals 1:
+        Set result to optimize_copy_propagation(context_ptr)
+    End If
+
+    If string_equals(pass_name, "algebraic_simplification") equals 1:
+        Set result to optimize_algebraic_simplification(context_ptr)
+    End If
+
+    If string_equals(pass_name, "strength_reduction") equals 1:
+        Set result to optimize_strength_reduction(context_ptr)
+    End If
+
+    If string_equals(pass_name, "strength_reduction_advanced") equals 1:
+        Set result to optimize_strength_reduction_advanced(context_ptr)
+    End If
+
+    If string_equals(pass_name, "tail_call") equals 1:
+        Set result to optimize_tail_call(context_ptr)
+    End If
+
+    If string_equals(pass_name, "inlining") equals 1:
+        Set result to optimize_inlining(context_ptr)
+    End If
+
+    If string_equals(pass_name, "devirtualization") equals 1:
+        Set result to optimize_devirtualization(context_ptr)
+    End If
+
+    If string_equals(pass_name, "licm") equals 1:
+        Set result to optimize_licm(context_ptr)
+    End If
+
+    If string_equals(pass_name, "loop_unrolling") equals 1:
+        Set result to optimize_loop_unrolling(context_ptr)
+    End If
+
+    If string_equals(pass_name, "cse") equals 1:
+        Set result to optimize_cse_advanced(context_ptr)
+    End If
+
+    If string_equals(pass_name, "branch_optimization") equals 1:
+        Set result to optimize_branches(context_ptr)
+    End If
+
+    If string_equals(pass_name, "sccp") equals 1:
+        Set result to optimize_sparse_conditional_constant_propagation(context_ptr)
+    End If
+
+    If string_equals(pass_name, "gvn") equals 1:
+        Set result to optimize_gvn(context_ptr)
+    End If
+
+    If string_equals(pass_name, "scalar_replacement") equals 1 or string_equals(pass_name, "sroa") equals 1:
+        Set result to optimize_scalar_replacement(context_ptr)
+    End If
+
+    If string_equals(pass_name, "vectorization") equals 1:
+        Set result to optimize_vectorization(context_ptr)
+    End If
+
+    Note: Cleanup
+    destroy_optimizer_context(context_ptr)
+
+    Return result
+End Process
+
+Process called "string_equals" that takes str1 as Integer, str2 as Integer returns Integer:
+    @Reasoning
+    Helper function to compare strings.
+
+    Returns 1 if equal, 0 otherwise.
+    @End Reasoning
+
+    If str1 equals 0 or str2 equals 0:
+        Return 0
+    End If
+
+    Note: Get string lengths
+    Let len1 be Layout.memory_get_int64(str1, 0)
+    Let len2 be Layout.memory_get_int64(str2, 0)
+
+    If len1 is not equal to len2:
+        Return 0
+    End If
+
+    Note: Compare character by character
+    Let i be 0
+    While i is less than len1:
+        Let char1 be Layout.memory_get_int64(str1, 8 plus i)
+        Let char2 be Layout.memory_get_int64(str2, 8 plus i)
+        If char1 is not equal to char2:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process

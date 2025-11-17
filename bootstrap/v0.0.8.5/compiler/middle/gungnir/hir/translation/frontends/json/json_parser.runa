@@ -1,0 +1,612 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+JSON Parser - Builds JSON AST from tokens
+
+This file implements a recursive descent parser for JSON. Takes tokens from
+the JSON lexer and produces an Abstract Syntax Tree representing the
+JSON structure.
+
+Features:
+- Recursive descent parsing
+- Complete JSON grammar support (objects, arrays, primitives)
+- Comprehensive error reporting with line/column information
+- Memory-safe AST construction
+
+JSON Grammar:
+value    ::= object | array | string | number | "true" | "false" | "null"
+object   ::= "{" members "}"
+members  ::= pair ("," pair)*  | ε
+pair     ::= string ":" value
+array    ::= "[" elements "]"
+elements ::= value ("," value)* | ε
+
+Dependencies:
+- json_lexer.runa (for tokenization)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/collections/list.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/json/json_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: JSON AST Node Types
+Note: ============================================================================
+
+Constant JSON_OBJECT as Integer is 1
+Constant JSON_ARRAY as Integer is 2
+Constant JSON_STRING as Integer is 3
+Constant JSON_NUMBER as Integer is 4
+Constant JSON_TRUE as Integer is 5
+Constant JSON_FALSE as Integer is 6
+Constant JSON_NULL as Integer is 7
+
+Note: ============================================================================
+Note: JSON AST Node Structure
+Note: ============================================================================
+
+Type called "JSONNode":
+    node_type as Integer        Note: JSON node type constant
+    value_string as Integer     Note: For STRING: pointer to string value
+    value_int as Integer        Note: For NUMBER: integer value
+    is_integer as Integer       Note: For NUMBER: 1 if integer, 0 if float
+    lexeme as Integer           Note: For NUMBER: original token text (for float parsing)
+    children as Integer         Note: For OBJECT/ARRAY: list of child nodes
+    keys as Integer             Note: For OBJECT: list of keys (strings)
+    line as Integer             Note: Source line number
+    column as Integer           Note: Source column number
+End Type
+
+Note: ============================================================================
+Note: Parser State Structure
+Note: ============================================================================
+
+Type called "JSONParser":
+    lexer as Integer            Note: JSON lexer instance
+    current_token as Integer    Note: Current token
+    error_message as Integer    Note: Error message (if any)
+    has_error as Integer        Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Parser Creation and Destruction
+Note: ============================================================================
+
+Process called "create_json_parser" takes lexer as Integer returns Integer:
+    Note: Create JSON parser with lexer
+
+    @Reasoning:
+    Parser maintains current token and error state.
+    Initializes by reading first token from lexer.
+    @End Reasoning
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Let parser_size be 32  Note: JSONParser: 4 fields × 8 bytes
+    Let parser be proc allocate from Layout with parser_size
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize parser
+    proc memory_set_int64 from Layout with parser, 0, lexer
+    proc memory_set_int64 from Layout with parser, 8, 0  Note: current_token = null
+    proc memory_set_int64 from Layout with parser, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with parser, 24, 0  Note: has_error = false
+
+    Note: Read first token
+    Let first_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, first_token
+
+    Return parser
+End Process
+
+Process called "destroy_json_parser" takes parser as Integer returns Integer:
+    Note: Destroy JSON parser and free resources
+
+    If parser is equal to 0:
+        Return 1
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Note: Lexer is owned by caller, don't free it
+    Note: Current token is freed by caller after parsing
+
+    proc deallocate from Layout with parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Token Management
+Note: ============================================================================
+
+Process called "advance_parser" takes parser as Integer returns Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let next_tok be proc next_token from Lexer with lexer
+
+    proc memory_set_int64 from Layout with parser, 8, next_tok
+
+    Return next_tok
+End Process
+
+Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Check if current token matches expected type
+
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+
+    If current_token is equal to 0:
+        Return 0
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with current_token, 0
+
+    If token_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
+    Note: Expect token of given type, set error if not match
+
+    Let is_match be proc check_token_type from parser, expected_type
+
+    If is_match is equal to 1:
+        proc advance_parser from parser
+        Return 1
+    End If
+
+    Note: Set error
+    proc set_parser_error from parser, error_msg
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_parser_error" takes parser as Integer, message as Integer returns Integer:
+    Note: Set parser error message
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 16, new_error
+    proc memory_set_int64 from Layout with parser, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: AST Node Creation
+Note: ============================================================================
+
+Process called "create_json_node" takes node_type as Integer, line as Integer, column as Integer returns Integer:
+    Note: Create JSON AST node
+
+    Let node_size be 72  Note: JSONNode: 9 fields × 8 bytes
+    Let node be proc allocate from Layout with node_size
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize node
+    proc memory_set_int64 from Layout with node, 0, node_type
+    proc memory_set_int64 from Layout with node, 8, 0   Note: value_string = null
+    proc memory_set_int64 from Layout with node, 16, 0  Note: value_int = 0
+    proc memory_set_int64 from Layout with node, 24, 0  Note: is_integer = 0
+    proc memory_set_int64 from Layout with node, 32, 0  Note: lexeme = null
+    proc memory_set_int64 from Layout with node, 40, 0  Note: children = null
+    proc memory_set_int64 from Layout with node, 48, 0  Note: keys = null
+    proc memory_set_int64 from Layout with node, 56, line
+    proc memory_set_int64 from Layout with node, 64, column
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Recursive Descent Parsing
+Note: ============================================================================
+
+Process called "parse_value" takes parser as Integer returns Integer:
+    Note: Parse JSON value (entry point for recursive descent)
+
+    @Reasoning:
+    Dispatches to appropriate parser based on current token type.
+    value ::= object | array | string | number | "true" | "false" | "null"
+    @End Reasoning
+
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+
+    If current_token is equal to 0:
+        proc set_parser_error from parser, "Unexpected end of input"
+        Return 0
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with current_token, 0
+    Let line be proc memory_get_int64 from Layout with current_token, 24
+    Let column be proc memory_get_int64 from Layout with current_token, 32
+
+    Note: Object
+    If token_type is equal to TOKEN_LEFT_BRACE from Lexer:
+        Return proc parse_object from parser
+    End If
+
+    Note: Array
+    If token_type is equal to TOKEN_LEFT_BRACKET from Lexer:
+        Return proc parse_array from parser
+    End If
+
+    Note: String
+    If token_type is equal to TOKEN_STRING from Lexer:
+        Let lexeme be proc memory_get_int64 from Layout with current_token, 8
+        Let lexeme_length be proc memory_get_int64 from Layout with current_token, 16
+
+        Let node be proc create_json_node from JSON_STRING, line, column
+
+        If node is equal to 0:
+            proc set_parser_error from parser, "Out of memory"
+            Return 0
+        End If
+
+        Note: Copy string value
+        Let str_copy be proc allocate from Layout with lexeme_length plus 1
+        proc memory_copy from Layout with str_copy, 0, lexeme, 0, lexeme_length
+        proc memory_set_byte from Layout with str_copy, lexeme_length, 0
+        proc memory_set_int64 from Layout with node, 8, str_copy
+
+        proc advance_parser from parser
+        Return node
+    End If
+
+    Note: Number
+    If token_type is equal to TOKEN_NUMBER from Lexer:
+        Let is_int be proc memory_get_int64 from Layout with current_token, 56
+        Let value_int be proc memory_get_int64 from Layout with current_token, 40
+        Let lexeme be proc memory_get_int64 from Layout with current_token, 8
+        Let lexeme_length be proc memory_get_int64 from Layout with current_token, 16
+
+        Let node be proc create_json_node from JSON_NUMBER, line, column
+
+        If node is equal to 0:
+            proc set_parser_error from parser, "Out of memory"
+            Return 0
+        End If
+
+        Note: Copy lexeme for float parsing
+        Let lexeme_copy be proc allocate from Layout with lexeme_length plus 1
+        proc memory_copy from Layout with lexeme_copy, 0, lexeme, 0, lexeme_length
+        proc memory_set_byte from Layout with lexeme_copy, lexeme_length, 0
+
+        proc memory_set_int64 from Layout with node, 16, value_int
+        proc memory_set_int64 from Layout with node, 24, is_int
+        proc memory_set_int64 from Layout with node, 32, lexeme_copy
+
+        proc advance_parser from parser
+        Return node
+    End If
+
+    Note: true
+    If token_type is equal to TOKEN_TRUE from Lexer:
+        Let node be proc create_json_node from JSON_TRUE, line, column
+        proc advance_parser from parser
+        Return node
+    End If
+
+    Note: false
+    If token_type is equal to TOKEN_FALSE from Lexer:
+        Let node be proc create_json_node from JSON_FALSE, line, column
+        proc advance_parser from parser
+        Return node
+    End If
+
+    Note: null
+    If token_type is equal to TOKEN_NULL from Lexer:
+        Let node be proc create_json_node from JSON_NULL, line, column
+        proc advance_parser from parser
+        Return node
+    End If
+
+    Note: Error
+    If token_type is equal to TOKEN_ERROR from Lexer:
+        proc set_parser_error from parser, "Lexer error"
+        Return 0
+    End If
+
+    proc set_parser_error from parser, "Unexpected token"
+    Return 0
+End Process
+
+Process called "parse_object" takes parser as Integer returns Integer:
+    Note: Parse JSON object
+
+    @Reasoning:
+    object ::= "{" members "}"
+    members ::= pair ("," pair)* | ε
+    pair ::= string ":" value
+    @End Reasoning
+
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+    Let line be proc memory_get_int64 from Layout with current_token, 24
+    Let column be proc memory_get_int64 from Layout with current_token, 32
+
+    Note: Expect '{'
+    Let result1 be proc expect_token from parser, TOKEN_LEFT_BRACE from Lexer, "Expected '{'"
+
+    If result1 is equal to 0:
+        Return 0
+    End If
+
+    Let node be proc create_json_node from JSON_OBJECT, line, column
+
+    If node is equal to 0:
+        proc set_parser_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Create children and keys lists
+    Let children be proc create from List
+    Let keys be proc create from List
+
+    If children is equal to 0:
+        proc set_parser_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    If keys is equal to 0:
+        proc destroy from List with children
+        proc set_parser_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 40, children
+    proc memory_set_int64 from Layout with node, 48, keys
+
+    Note: Check for empty object
+    Let is_close_brace be proc check_token_type from parser, TOKEN_RIGHT_BRACE from Lexer
+
+    If is_close_brace is equal to 1:
+        proc advance_parser from parser
+        Return node
+    End If
+
+    Note: Parse members
+    While 1 is equal to 1:
+        Note: Parse key (must be string)
+        Let is_string be proc check_token_type from parser, TOKEN_STRING from Lexer
+
+        If is_string is equal to 0:
+            proc set_parser_error from parser, "Expected string key in object"
+            Return 0
+        End If
+
+        Let key_token be proc memory_get_int64 from Layout with parser, 8
+        Let key_lexeme be proc memory_get_int64 from Layout with key_token, 8
+        Let key_length be proc memory_get_int64 from Layout with key_token, 16
+
+        Note: Copy key
+        Let key_copy be proc allocate from Layout with key_length plus 1
+        proc memory_copy from Layout with key_copy, 0, key_lexeme, 0, key_length
+        proc memory_set_byte from Layout with key_copy, key_length, 0
+
+        proc advance_parser from parser
+
+        Note: Expect ':'
+        Let result2 be proc expect_token from parser, TOKEN_COLON from Lexer, "Expected ':' after key"
+
+        If result2 is equal to 0:
+            Return 0
+        End If
+
+        Note: Parse value
+        Let value_node be proc parse_value from parser
+
+        If value_node is equal to 0:
+            Return 0
+        End If
+
+        Note: Add key and value
+        proc append from List with keys, key_copy
+        proc append from List with children, value_node
+
+        Note: Check for comma or end
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_parser from parser
+            Note: Continue to next pair
+        Otherwise:
+            Note: Must be closing brace
+            Break
+        End If
+    End While
+
+    Note: Expect '}'
+    Let result3 be proc expect_token from parser, TOKEN_RIGHT_BRACE from Lexer, "Expected '}'"
+
+    If result3 is equal to 0:
+        Return 0
+    End If
+
+    Return node
+End Process
+
+Process called "parse_array" takes parser as Integer returns Integer:
+    Note: Parse JSON array
+
+    @Reasoning:
+    array ::= "[" elements "]"
+    elements ::= value ("," value)* | ε
+    @End Reasoning
+
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+    Let line be proc memory_get_int64 from Layout with current_token, 24
+    Let column be proc memory_get_int64 from Layout with current_token, 32
+
+    Note: Expect '['
+    Let result1 be proc expect_token from parser, TOKEN_LEFT_BRACKET from Lexer, "Expected '['"
+
+    If result1 is equal to 0:
+        Return 0
+    End If
+
+    Let node be proc create_json_node from JSON_ARRAY, line, column
+
+    If node is equal to 0:
+        proc set_parser_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Create children list
+    Let children be proc create from List
+
+    If children is equal to 0:
+        proc set_parser_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 40, children
+
+    Note: Check for empty array
+    Let is_close_bracket be proc check_token_type from parser, TOKEN_RIGHT_BRACKET from Lexer
+
+    If is_close_bracket is equal to 1:
+        proc advance_parser from parser
+        Return node
+    End If
+
+    Note: Parse elements
+    While 1 is equal to 1:
+        Note: Parse value
+        Let value_node be proc parse_value from parser
+
+        If value_node is equal to 0:
+            Return 0
+        End If
+
+        Note: Add value
+        proc append from List with children, value_node
+
+        Note: Check for comma or end
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 1:
+            proc advance_parser from parser
+            Note: Continue to next element
+        Otherwise:
+            Note: Must be closing bracket
+            Break
+        End If
+    End While
+
+    Note: Expect ']'
+    Let result2 be proc expect_token from parser, TOKEN_RIGHT_BRACKET from Lexer, "Expected ']'"
+
+    If result2 is equal to 0:
+        Return 0
+    End If
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Top-Level Parse Function
+Note: ============================================================================
+
+Process called "parse_json" takes source as Integer returns Integer:
+    Note: Parse JSON source string and return AST root
+
+    @Reasoning:
+    Entry point for JSON parsing. Creates lexer and parser,
+    parses top-level value, and handles errors.
+    @End Reasoning
+
+    If source is equal to 0:
+        Return 0
+    End If
+
+    Note: Create lexer
+    Let lexer be proc create_json_lexer from Lexer with source
+
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    Note: Create parser
+    Let parser be proc create_json_parser from lexer
+
+    If parser is equal to 0:
+        proc destroy_json_lexer from Lexer with lexer
+        Return 0
+    End If
+
+    Note: Parse value
+    Let ast_root be proc parse_value from parser
+
+    Note: Check for trailing content
+    If ast_root is not equal to 0:
+        Let current_token be proc memory_get_int64 from Layout with parser, 8
+
+        If current_token is not equal to 0:
+            Let token_type be proc memory_get_int64 from Layout with current_token, 0
+
+            If token_type is not equal to TOKEN_EOF from Lexer:
+                Note: Unexpected content after JSON value
+                proc set_parser_error from parser, "Unexpected content after JSON value"
+                Set ast_root to 0
+            End If
+        End If
+    End If
+
+    Note: Cleanup
+    proc destroy_json_parser from parser
+    proc destroy_json_lexer from Lexer with lexer
+
+    Return ast_root
+End Process
+
+Note: End of JSON Parser

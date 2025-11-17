@@ -35,4 +35,2648 @@ This file consists of the following functions/features/operation types:
 - Sparse constant validation and sparse constant verification
 :End Note
 
-Note: TODO - Implement sparse conditional constant propagation functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================================
+Note: TYPE DEFINITIONS - SCCP Lattice & Context
+Note: ============================================================================
+
+Type called "LatticeValue":
+    @Reasoning
+    Represents a value in the SCCP lattice.
+
+    **LATTICE STRUCTURE:**
+    ```
+    BOTTOM (undefined/uninitialized)
+        ↓
+    CONSTANT(value) (known constant)
+        ↓
+    TOP (overdefined/not constant)
+    ```
+
+    **STATES:**
+    - state = 0: BOTTOM (value undefined, not yet analyzed)
+    - state = 1: CONSTANT (value is constant_value)
+    - state = 2: TOP (value is overdefined, cannot be constant)
+
+    **MONOTONICITY:**
+    Lattice values can only move down: BOTTOM → CONSTANT → TOP
+    Once a value reaches TOP, it stays TOP.
+
+    **MEMORY LAYOUT** (16 bytes):
+    ```
+    Offset 0: state (Integer: 0=BOTTOM, 1=CONSTANT, 2=TOP)
+    Offset 8: constant_value (Integer: only valid when state=1)
+    ```
+    @End Reasoning
+
+    state as Integer
+    constant_value as Integer
+End Type
+
+Type called "SCCPContext":
+    @Reasoning
+    Context for Sparse Conditional Constant Propagation analysis.
+
+    **COMPONENTS:**
+    - cfg: Control flow graph
+    - lattice_values: Dictionary mapping SSA value_id → LatticeValue
+    - executable_edges: Set of executable CFG edges (block_from → block_to)
+    - ssa_worklist: Worklist of SSA values to reprocess
+    - cfg_worklist: Worklist of CFG edges to process
+    - executable_blocks: Set of blocks reached by executable paths
+
+    **MEMORY LAYOUT** (96 bytes):
+    ```
+    Offset 0:  cfg (Integer - CFG pointer)
+    Offset 8:  lattice_values (Integer - Dictionary pointer)
+    Offset 16: executable_edges (Integer - Set pointer)
+    Offset 24: ssa_worklist (Integer - List pointer)
+    Offset 32: cfg_worklist (Integer - List pointer)
+    Offset 40: executable_blocks (Integer - Set pointer)
+    Offset 48: constants_found (Integer - counter)
+    Offset 56: branches_folded (Integer - counter)
+    Offset 64: instructions_eliminated (Integer - counter)
+    Offset 72: blocks_eliminated (Integer - counter)
+    Offset 80: module (Integer - Module pointer for interprocedural)
+    Offset 88: call_graph (Integer - for interprocedural analysis)
+    ```
+    @End Reasoning
+
+    cfg as Integer
+    lattice_values as Integer
+    executable_edges as Integer
+    ssa_worklist as Integer
+    cfg_worklist as Integer
+    executable_blocks as Integer
+    constants_found as Integer
+    branches_folded as Integer
+    instructions_eliminated as Integer
+    blocks_eliminated as Integer
+    module as Integer
+    call_graph as Integer
+End Type
+
+Note: ============================================================================
+Note: LATTICE VALUE CONSTANTS
+Note: ============================================================================
+
+Constant LATTICE_BOTTOM as Integer is 0
+Constant LATTICE_CONSTANT as Integer is 1
+Constant LATTICE_TOP as Integer is 2
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_sccp_context" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Creates and initializes SCCP context.
+
+    **INITIALIZATION:**
+    - Allocates 96-byte context structure
+    - Creates lattice value dictionary (SSA value_id → LatticeValue)
+    - Creates executable edges set
+    - Creates dual worklists (SSA values, CFG edges)
+    - Creates executable blocks set
+    - Initializes all counters to 0
+
+    Returns context pointer or 0 on failure.
+    @End Reasoning
+
+    @Performance_Hints
+    Dictionary is used for lattice values to support sparse analysis.
+    Only values that are encountered are added to the dictionary,
+    avoiding O(n) initialization of all possible SSA values.
+    @End Performance_Hints
+
+    If cfg equals 0:
+        Display "create_sccp_context: null CFG"
+        Return 0
+    End If
+
+    Note: Allocate context (96 bytes)
+    Let context_ptr be Layout.allocate(96)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG reference
+    Layout.memory_set_int64(context_ptr, 0, cfg)
+
+    Note: Create lattice values dictionary
+    Let lattice_values be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 8, lattice_values)
+
+    Note: Create executable edges set
+    Let executable_edges be proc create from Set
+    Layout.memory_set_int64(context_ptr, 16, executable_edges)
+
+    Note: Create SSA worklist
+    Let ssa_worklist be List.create()
+    Layout.memory_set_int64(context_ptr, 24, ssa_worklist)
+
+    Note: Create CFG worklist
+    Let cfg_worklist be List.create()
+    Layout.memory_set_int64(context_ptr, 32, cfg_worklist)
+
+    Note: Create executable blocks set
+    Let executable_blocks be proc create from Set
+    Layout.memory_set_int64(context_ptr, 40, executable_blocks)
+
+    Note: Initialize counters
+    Layout.memory_set_int64(context_ptr, 48, 0)  Note: constants_found
+    Layout.memory_set_int64(context_ptr, 56, 0)  Note: branches_folded
+    Layout.memory_set_int64(context_ptr, 64, 0)  Note: instructions_eliminated
+    Layout.memory_set_int64(context_ptr, 72, 0)  Note: blocks_eliminated
+
+    Note: Initialize module and call graph to 0 (set during interprocedural)
+    Layout.memory_set_int64(context_ptr, 80, 0)  Note: module
+    Layout.memory_set_int64(context_ptr, 88, 0)  Note: call_graph
+
+    Display "create_sccp_context: context created"
+    Return context_ptr
+End Process
+
+Process called "destroy_sccp_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys SCCP context and frees all memory.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy lattice values dictionary
+    Let lattice_values be Layout.memory_get_int64(context_ptr, 8)
+    If lattice_values is not equal to 0:
+        Note: Free all LatticeValue structures
+        Let keys be proc keys from Dictionary with lattice_values
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let lattice_val be proc get from Dictionary with lattice_values, key
+
+            If lattice_val is not equal to 0:
+                Layout.deallocate(lattice_val)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with lattice_values
+    End If
+
+    Note: Destroy executable edges set
+    Let executable_edges be Layout.memory_get_int64(context_ptr, 16)
+    If executable_edges is not equal to 0:
+        proc destroy from Set with executable_edges
+    End If
+
+    Note: Destroy SSA worklist
+    Let ssa_worklist be Layout.memory_get_int64(context_ptr, 24)
+    If ssa_worklist is not equal to 0:
+        List.destroy(ssa_worklist)
+    End If
+
+    Note: Destroy CFG worklist
+    Let cfg_worklist be Layout.memory_get_int64(context_ptr, 32)
+    If cfg_worklist is not equal to 0:
+        List.destroy(cfg_worklist)
+    End If
+
+    Note: Destroy executable blocks set
+    Let executable_blocks be Layout.memory_get_int64(context_ptr, 40)
+    If executable_blocks is not equal to 0:
+        proc destroy from Set with executable_blocks
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr)
+
+    Display "destroy_sccp_context: context destroyed"
+    Return 1
+End Process
+
+Process called "print_sccp_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints SCCP optimization statistics.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let constants_found be Layout.memory_get_int64(context_ptr, 48)
+    Let branches_folded be Layout.memory_get_int64(context_ptr, 56)
+    Let instructions_eliminated be Layout.memory_get_int64(context_ptr, 64)
+    Let blocks_eliminated be Layout.memory_get_int64(context_ptr, 72)
+
+    Display "============================================"
+    Display "SCCP OPTIMIZATION STATISTICS"
+    Display "============================================"
+    Display "Constants found:         " joined with constants_found
+    Display "Branches folded:         " joined with branches_folded
+    Display "Instructions eliminated: " joined with instructions_eliminated
+    Display "Blocks eliminated:       " joined with blocks_eliminated
+    Display "Total optimizations:     " joined with constants_found plus branches_folded plus instructions_eliminated plus blocks_eliminated
+    Display "============================================"
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LATTICE OPERATIONS
+Note: ============================================================================
+
+Process called "create_lattice_bottom" returns Integer:
+    @Reasoning
+    Creates a BOTTOM lattice value (undefined/uninitialized).
+
+    Returns lattice value pointer.
+    @End Reasoning
+
+    Let lattice_ptr be Layout.allocate(16)
+    If lattice_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(lattice_ptr, 0, LATTICE_BOTTOM)
+    Layout.memory_set_int64(lattice_ptr, 8, 0)
+
+    Return lattice_ptr
+End Process
+
+Process called "create_lattice_constant" that takes value as Integer returns Integer:
+    @Reasoning
+    Creates a CONSTANT lattice value with given value.
+
+    Returns lattice value pointer.
+    @End Reasoning
+
+    Let lattice_ptr be Layout.allocate(16)
+    If lattice_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(lattice_ptr, 0, LATTICE_CONSTANT)
+    Layout.memory_set_int64(lattice_ptr, 8, value)
+
+    Return lattice_ptr
+End Process
+
+Process called "create_lattice_top" returns Integer:
+    @Reasoning
+    Creates a TOP lattice value (overdefined).
+
+    Returns lattice value pointer.
+    @End Reasoning
+
+    Let lattice_ptr be Layout.allocate(16)
+    If lattice_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(lattice_ptr, 0, LATTICE_TOP)
+    Layout.memory_set_int64(lattice_ptr, 8, 0)
+
+    Return lattice_ptr
+End Process
+
+Process called "lattice_meet" that takes lattice1 as Integer, lattice2 as Integer returns Integer:
+    @Reasoning
+    Computes the meet (join in upward lattice) of two lattice values.
+
+    **MEET RULES:**
+    ```
+    BOTTOM ⊔ x = x          (BOTTOM is identity)
+    x ⊔ BOTTOM = x
+    CONSTANT(v1) ⊔ CONSTANT(v2) = CONSTANT(v1) if v1=v2, else TOP
+    TOP ⊔ x = TOP           (TOP is absorbing)
+    x ⊔ TOP = TOP
+    ```
+
+    **MONOTONICITY:**
+    Result is always >= both inputs in lattice ordering.
+
+    Returns new lattice value (caller must free).
+    @End Reasoning
+
+    If lattice1 equals 0:
+        Return create_lattice_top()
+    End If
+    If lattice2 equals 0:
+        Return create_lattice_top()
+    End If
+
+    Let state1 be Layout.memory_get_int64(lattice1, 0)
+    Let state2 be Layout.memory_get_int64(lattice2, 0)
+
+    Note: If either is TOP, result is TOP
+    If state1 equals LATTICE_TOP:
+        Return create_lattice_top()
+    End If
+    If state2 equals LATTICE_TOP:
+        Return create_lattice_top()
+    End If
+
+    Note: If either is BOTTOM, result is the other
+    If state1 equals LATTICE_BOTTOM:
+        If state2 equals LATTICE_BOTTOM:
+            Return create_lattice_bottom()
+        End If
+        If state2 equals LATTICE_CONSTANT:
+            Let value2 be Layout.memory_get_int64(lattice2, 8)
+            Return create_lattice_constant(value2)
+        End If
+    End If
+
+    If state2 equals LATTICE_BOTTOM:
+        If state1 equals LATTICE_CONSTANT:
+            Let value1 be Layout.memory_get_int64(lattice1, 8)
+            Return create_lattice_constant(value1)
+        End If
+    End If
+
+    Note: Both are CONSTANT
+    Let value1 be Layout.memory_get_int64(lattice1, 8)
+    Let value2 be Layout.memory_get_int64(lattice2, 8)
+
+    If value1 equals value2:
+        Return create_lattice_constant(value1)
+    Otherwise:
+        Return create_lattice_top()
+    End If
+End Process
+
+Process called "is_lattice_bottom" that takes lattice as Integer returns Integer:
+    @Reasoning
+    Returns 1 if lattice value is BOTTOM, 0 otherwise.
+    @End Reasoning
+
+    If lattice equals 0:
+        Return 0
+    End If
+
+    Let state be Layout.memory_get_int64(lattice, 0)
+    If state equals LATTICE_BOTTOM:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_lattice_constant" that takes lattice as Integer returns Integer:
+    @Reasoning
+    Returns 1 if lattice value is CONSTANT, 0 otherwise.
+    @End Reasoning
+
+    If lattice equals 0:
+        Return 0
+    End If
+
+    Let state be Layout.memory_get_int64(lattice, 0)
+    If state equals LATTICE_CONSTANT:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "is_lattice_top" that takes lattice as Integer returns Integer:
+    @Reasoning
+    Returns 1 if lattice value is TOP, 0 otherwise.
+    @End Reasoning
+
+    If lattice equals 0:
+        Return 0
+    End If
+
+    Let state be Layout.memory_get_int64(lattice, 0)
+    If state equals LATTICE_TOP:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "get_lattice_constant_value" that takes lattice as Integer returns Integer:
+    @Reasoning
+    Returns the constant value if lattice is CONSTANT.
+    Returns 0 if not constant (caller should check is_lattice_constant first).
+    @End Reasoning
+
+    If lattice equals 0:
+        Return 0
+    End If
+
+    Let state be Layout.memory_get_int64(lattice, 0)
+    If state is not equal to LATTICE_CONSTANT:
+        Return 0
+    End If
+
+    Let value be Layout.memory_get_int64(lattice, 8)
+    Return value
+End Process
+
+Process called "get_or_create_lattice_value" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Gets existing lattice value for SSA value_id, or creates BOTTOM if none exists.
+
+    **SPARSE ANALYSIS:**
+    Values start as BOTTOM (undefined) only when first encountered.
+    This avoids initializing all possible SSA values upfront.
+
+    Returns lattice value pointer (never returns 0).
+    @End Reasoning
+
+    Let lattice_values be Layout.memory_get_int64(context_ptr, 8)
+
+    Note: Convert value_id to string for Dictionary key
+    Let key_str be proc integer_to_string from String with value_id
+
+    Note: Check if value exists
+    Let contains_value be proc contains from Dictionary with lattice_values, key_str
+
+    If contains_value equals 1:
+        Let lattice_val be proc get from Dictionary with lattice_values, key_str
+        Return lattice_val
+    End If
+
+    Note: Create new BOTTOM value
+    Let lattice_val be create_lattice_bottom()
+    proc set from Dictionary with lattice_values, key_str, lattice_val
+
+    Return lattice_val
+End Process
+
+Process called "update_lattice_value" that takes context_ptr as Integer, value_id as Integer, new_lattice as Integer returns Integer:
+    @Reasoning
+    Updates lattice value for SSA value_id with new_lattice.
+
+    Returns 1 if value changed (needs repropagation), 0 if unchanged.
+
+    **MONOTONICITY CHECK:**
+    Only updates if new_lattice is lower in lattice (more defined).
+    @End Reasoning
+
+    If new_lattice equals 0:
+        Return 0
+    End If
+
+    Let lattice_values be Layout.memory_get_int64(context_ptr, 8)
+    Let key_str be proc integer_to_string from String with value_id
+
+    Note: Get current lattice value
+    Let current_lattice be get_or_create_lattice_value(context_ptr, value_id)
+
+    Let current_state be Layout.memory_get_int64(current_lattice, 0)
+    Let new_state be Layout.memory_get_int64(new_lattice, 0)
+
+    Note: Check if value actually changed
+    If current_state equals new_state:
+        If current_state equals LATTICE_CONSTANT:
+            Let current_val be Layout.memory_get_int64(current_lattice, 8)
+            Let new_val be Layout.memory_get_int64(new_lattice, 8)
+
+            If current_val equals new_val:
+                Return 0  Note: No change
+            End If
+        Otherwise:
+            Return 0  Note: No change (BOTTOM or TOP)
+        End If
+    End If
+
+    Note: Value changed - update it
+    Layout.deallocate(current_lattice)
+
+    Note: Create copy of new lattice
+    Let updated_lattice be Layout.allocate(16)
+    Layout.memory_set_int64(updated_lattice, 0, new_state)
+    Let new_val be Layout.memory_get_int64(new_lattice, 8)
+    Layout.memory_set_int64(updated_lattice, 8, new_val)
+
+    proc set from Dictionary with lattice_values, key_str, updated_lattice
+
+    Return 1  Note: Changed
+End Process
+
+Note: ============================================================================
+Note: SSA VALUE ANALYSIS - Lattice-Based Instruction Evaluation
+Note: ============================================================================
+
+Process called "evaluate_instruction" that takes context_ptr as Integer, inst_ptr as Integer returns Integer:
+    @Reasoning
+    Evaluates a MIR instruction and returns its result lattice value.
+
+    **LATTICE SEMANTICS:**
+    - Operates on lattice values (BOTTOM, CONSTANT(v), TOP)
+    - If any operand is TOP → result is TOP (overdefined)
+    - If any operand is BOTTOM → result is BOTTOM (undefined)
+    - If all operands are CONSTANT → compute constant result
+
+    **INSTRUCTION TYPES:**
+    Dispatches to specialized evaluators based on opcode.
+
+    Returns lattice value for instruction result (0 if no result/error).
+    @End Reasoning
+
+    @Performance_Hints
+    This is a hot path in SCCP - called for every instruction during analysis.
+    Match statement provides O(1) opcode dispatch via compiler-generated jump table,
+    replacing O(n) sequential comparisons.
+    @End Performance_Hints
+
+    If inst_ptr equals 0:
+        Return create_lattice_top()
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+    Note: Dispatch to specialized evaluators using Match (O(1) jump table)
+    Match opcode:
+        When MIR.MIR_CONST:
+            Note: Constants always evaluate to their constant value
+            Let const_node be inst_ptr
+            Let const_val be Layout.memory_get_int64(const_node, 16)
+            Return create_lattice_constant(const_val)
+
+        When MIR.MIR_ADD, MIR.MIR_SUB, MIR.MIR_MUL, MIR.MIR_DIV, MIR.MIR_MOD:
+            Note: Binary arithmetic operations
+            Return evaluate_binary_op(context_ptr, inst_ptr, opcode)
+
+        When MIR.MIR_AND, MIR.MIR_OR, MIR.MIR_XOR, MIR.MIR_SHL, MIR.MIR_SHR, MIR.MIR_SAR:
+            Note: Bitwise operations
+            Return evaluate_binary_op(context_ptr, inst_ptr, opcode)
+
+        When MIR.MIR_EQ, MIR.MIR_NE, MIR.MIR_LT, MIR.MIR_LE, MIR.MIR_GT, MIR.MIR_GE:
+            Note: Comparison operations
+            Return evaluate_comparison(context_ptr, inst_ptr, opcode)
+
+        When MIR.MIR_NEG, MIR.MIR_NOT:
+            Note: Unary operations
+            Return evaluate_unary_op(context_ptr, inst_ptr, opcode)
+
+        When MIR.MIR_CAST, MIR.MIR_BITCAST, MIR.MIR_TRUNC, MIR.MIR_EXTEND, MIR.MIR_ZEXT:
+            Note: Type casts
+            Return evaluate_cast(context_ptr, inst_ptr)
+
+        When MIR.MIR_PHI:
+            Note: PHI nodes
+            Return evaluate_phi_node(context_ptr, inst_ptr)
+
+        When MIR.MIR_LOAD, MIR.MIR_LOAD_FIELD, MIR.MIR_ALLOCA, MIR.MIR_ADDRESS_OF, MIR.MIR_DEREF:
+            Note: Memory operations - conservative (TOP)
+            Return create_lattice_top()
+
+        When MIR.MIR_CALL, MIR.MIR_CALL_INDIRECT, MIR.MIR_INVOKE:
+            Note: Function calls - conservative (TOP)
+            Return create_lattice_top()
+
+        Otherwise:
+            Note: All other instructions - conservative (TOP)
+            Return create_lattice_top()
+    End Match
+End Process
+
+Process called "evaluate_phi_node" that takes context_ptr as Integer, phi_ptr as Integer returns Integer:
+    @Reasoning
+    Evaluates a PHI node by computing the meet of all incoming values
+    from executable predecessors.
+
+    **PHI SEMANTICS:**
+    - Only consider incoming values from executable edges
+    - Compute meet of all executable incoming values
+    - If no executable predecessors → BOTTOM (unreachable)
+    - If single executable predecessor → that value's lattice
+    - If multiple with same constant → CONSTANT
+    - If multiple with different constants → TOP
+
+    **FLOW-SENSITIVE ANALYSIS:**
+    Critical for SCCP - only executable paths contribute to PHI result.
+
+    Returns lattice value for PHI result.
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return create_lattice_bottom()
+    End If
+
+    Let executable_edges be Layout.memory_get_int64(context_ptr, 16)
+    Let parent_block be Layout.memory_get_int64(phi_ptr, 40)  Note: PHI's parent block
+
+    Note: Get incoming pairs list
+    Let incoming_pairs be Layout.memory_get_int64(phi_ptr, 16)
+    Let incoming_count be Layout.memory_get_int64(phi_ptr, 24)
+
+    Note: Start with BOTTOM (no incoming values seen yet)
+    Let result_lattice be create_lattice_bottom()
+
+    Let i be 0
+    While i is less than incoming_count:
+        Note: Each incoming pair is (predecessor_block_id, value_id)
+        Let pair_ptr be List.get(incoming_pairs, i)
+
+        Let pred_block_id be Layout.memory_get_int64(pair_ptr, 0)
+        Let value_id be Layout.memory_get_int64(pair_ptr, 8)
+
+        Note: Create edge key: "pred_block_id->parent_block"
+        Let edge_key be proc integer_to_string from String with pred_block_id
+        Set edge_key to edge_key joined with "->"
+        Let parent_str be proc integer_to_string from String with parent_block
+        Set edge_key to edge_key joined with parent_str
+
+        Note: Check if this edge is executable
+        Let is_executable be proc contains from Set with executable_edges, edge_key
+
+        If is_executable equals 1:
+            Note: Get lattice value for incoming value
+            Let incoming_lattice be get_or_create_lattice_value(context_ptr, value_id)
+
+            Note: Meet with current result
+            Let new_result be lattice_meet(result_lattice, incoming_lattice)
+
+            Note: Free old result and update
+            Layout.deallocate(result_lattice)
+            Set result_lattice to new_result
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return result_lattice
+End Process
+
+Process called "evaluate_binary_op" that takes context_ptr as Integer, inst_ptr as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Evaluates binary operations with lattice semantics.
+
+    **LATTICE RULES:**
+    - TOP ⊕ x = TOP (overdefined propagates)
+    - BOTTOM ⊕ x = BOTTOM (undefined propagates)
+    - CONSTANT(v1) ⊕ CONSTANT(v2) = CONSTANT(v1 ⊕ v2) (constant folding)
+
+    **OPERATIONS:**
+    Supports: ADD, SUB, MUL, DIV, MOD, AND, OR, XOR, SHL, SHR, SAR
+
+    Returns lattice value for operation result.
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return create_lattice_top()
+    End If
+
+    Note: MIRBinaryOp structure - get operands
+    Let left_operand_id be Layout.memory_get_int64(inst_ptr, 16)  Note: Offset 16: left_operand
+    Let right_operand_id be Layout.memory_get_int64(inst_ptr, 24) Note: Offset 24: right_operand
+
+    Note: Get lattice values for operands
+    Let left_lattice be get_or_create_lattice_value(context_ptr, left_operand_id)
+    Let right_lattice be get_or_create_lattice_value(context_ptr, right_operand_id)
+
+    Let left_state be Layout.memory_get_int64(left_lattice, 0)
+    Let right_state be Layout.memory_get_int64(right_lattice, 0)
+
+    Note: If either operand is TOP, result is TOP
+    If left_state equals LATTICE_TOP:
+        Return create_lattice_top()
+    End If
+    If right_state equals LATTICE_TOP:
+        Return create_lattice_top()
+    End If
+
+    Note: If either operand is BOTTOM, result is BOTTOM
+    If left_state equals LATTICE_BOTTOM:
+        Return create_lattice_bottom()
+    End If
+    If right_state equals LATTICE_BOTTOM:
+        Return create_lattice_bottom()
+    End If
+
+    Note: Both operands are CONSTANT - perform constant folding
+    Let left_val be Layout.memory_get_int64(left_lattice, 8)
+    Let right_val be Layout.memory_get_int64(right_lattice, 8)
+
+    Let result_val be 0
+
+    Note: Arithmetic operations
+    If opcode equals MIR.MIR_ADD:
+        Set result_val to left_val plus right_val
+        Return create_lattice_constant(result_val)
+    End If
+    If opcode equals MIR.MIR_SUB:
+        Set result_val to left_val minus right_val
+        Return create_lattice_constant(result_val)
+    End If
+    If opcode equals MIR.MIR_MUL:
+        Set result_val to left_val multiplied by right_val
+        Return create_lattice_constant(result_val)
+    End If
+    If opcode equals MIR.MIR_DIV:
+        If right_val equals 0:
+            Return create_lattice_top()  Note: Division by zero
+        End If
+        Set result_val to left_val divided by right_val
+        Return create_lattice_constant(result_val)
+    End If
+    If opcode equals MIR.MIR_MOD:
+        If right_val equals 0:
+            Return create_lattice_top()  Note: Modulo by zero
+        End If
+        Set result_val to left_val modulo right_val
+        Return create_lattice_constant(result_val)
+    End If
+
+    Note: Bitwise operations
+    If opcode equals MIR.MIR_AND:
+        Set result_val to proc bitwise_and from Layout with left_val, right_val
+        Return create_lattice_constant(result_val)
+    End If
+    If opcode equals MIR.MIR_OR:
+        Set result_val to proc bitwise_or from Layout with left_val, right_val
+        Return create_lattice_constant(result_val)
+    End If
+    If opcode equals MIR.MIR_XOR:
+        Set result_val to proc bitwise_xor from Layout with left_val, right_val
+        Return create_lattice_constant(result_val)
+    End If
+    If opcode equals MIR.MIR_SHL:
+        Set result_val to proc bitwise_shl from Layout with left_val, right_val
+        Return create_lattice_constant(result_val)
+    End If
+    If opcode equals MIR.MIR_SHR:
+        Set result_val to proc bitwise_shr from Layout with left_val, right_val
+        Return create_lattice_constant(result_val)
+    End If
+    If opcode equals MIR.MIR_SAR:
+        Set result_val to proc bitwise_sar from Layout with left_val, right_val
+        Return create_lattice_constant(result_val)
+    End If
+
+    Note: Unknown binary operation
+    Return create_lattice_top()
+End Process
+
+Process called "evaluate_comparison" that takes context_ptr as Integer, inst_ptr as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Evaluates comparison operations with lattice semantics.
+
+    **COMPARISON SEMANTICS:**
+    - Result is boolean (0 or 1)
+    - TOP ≈ x = TOP (can't compare overdefined)
+    - BOTTOM ≈ x = BOTTOM (can't compare undefined)
+    - CONSTANT(v1) ≈ CONSTANT(v2) = CONSTANT(boolean result)
+
+    **COMPARISONS:**
+    Supports: EQ, NE, LT, LE, GT, GE
+
+    Returns lattice value for comparison result (CONSTANT 0 or 1, or TOP/BOTTOM).
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return create_lattice_top()
+    End If
+
+    Note: MIRBinaryOp structure - get operands
+    Let left_operand_id be Layout.memory_get_int64(inst_ptr, 16)  Note: Offset 16: left_operand
+    Let right_operand_id be Layout.memory_get_int64(inst_ptr, 24) Note: Offset 24: right_operand
+
+    Note: Get lattice values for operands
+    Let left_lattice be get_or_create_lattice_value(context_ptr, left_operand_id)
+    Let right_lattice be get_or_create_lattice_value(context_ptr, right_operand_id)
+
+    Let left_state be Layout.memory_get_int64(left_lattice, 0)
+    Let right_state be Layout.memory_get_int64(right_lattice, 0)
+
+    Note: If either operand is TOP, result is TOP
+    If left_state equals LATTICE_TOP:
+        Return create_lattice_top()
+    End If
+    If right_state equals LATTICE_TOP:
+        Return create_lattice_top()
+    End If
+
+    Note: If either operand is BOTTOM, result is BOTTOM
+    If left_state equals LATTICE_BOTTOM:
+        Return create_lattice_bottom()
+    End If
+    If right_state equals LATTICE_BOTTOM:
+        Return create_lattice_bottom()
+    End If
+
+    Note: Both operands are CONSTANT - perform constant comparison
+    Let left_val be Layout.memory_get_int64(left_lattice, 8)
+    Let right_val be Layout.memory_get_int64(right_lattice, 8)
+
+    Let result_val be 0
+
+    If opcode equals MIR.MIR_EQ:
+        If left_val equals right_val:
+            Set result_val to 1
+        Otherwise:
+            Set result_val to 0
+        End If
+        Return create_lattice_constant(result_val)
+    End If
+
+    If opcode equals MIR.MIR_NE:
+        If left_val is not equal to right_val:
+            Set result_val to 1
+        Otherwise:
+            Set result_val to 0
+        End If
+        Return create_lattice_constant(result_val)
+    End If
+
+    If opcode equals MIR.MIR_LT:
+        If left_val is less than right_val:
+            Set result_val to 1
+        Otherwise:
+            Set result_val to 0
+        End If
+        Return create_lattice_constant(result_val)
+    End If
+
+    If opcode equals MIR.MIR_LE:
+        If left_val is less than right_val:
+            Set result_val to 1
+        Otherwise:
+            If left_val equals right_val:
+                Set result_val to 1
+            Otherwise:
+                Set result_val to 0
+            End If
+        End If
+        Return create_lattice_constant(result_val)
+    End If
+
+    If opcode equals MIR.MIR_GT:
+        If left_val is greater than right_val:
+            Set result_val to 1
+        Otherwise:
+            Set result_val to 0
+        End If
+        Return create_lattice_constant(result_val)
+    End If
+
+    If opcode equals MIR.MIR_GE:
+        If left_val is greater than right_val:
+            Set result_val to 1
+        Otherwise:
+            If left_val equals right_val:
+                Set result_val to 1
+            Otherwise:
+                Set result_val to 0
+            End If
+        End If
+        Return create_lattice_constant(result_val)
+    End If
+
+    Note: Unknown comparison operation
+    Return create_lattice_top()
+End Process
+
+Process called "evaluate_unary_op" that takes context_ptr as Integer, inst_ptr as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Evaluates unary operations with lattice semantics.
+
+    **UNARY LATTICE RULES:**
+    - ⊖TOP = TOP (overdefined remains overdefined)
+    - ⊖BOTTOM = BOTTOM (undefined remains undefined)
+    - ⊖CONSTANT(v) = CONSTANT(⊖v) (constant folding)
+
+    **OPERATIONS:**
+    Supports: NEG (negation), NOT (bitwise NOT)
+
+    Returns lattice value for operation result.
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return create_lattice_top()
+    End If
+
+    Note: MIRUnaryOp structure - get operand
+    Let operand_id be Layout.memory_get_int64(inst_ptr, 16)  Note: Offset 16: operand
+
+    Note: Get lattice value for operand
+    Let operand_lattice be get_or_create_lattice_value(context_ptr, operand_id)
+
+    Let operand_state be Layout.memory_get_int64(operand_lattice, 0)
+
+    Note: If operand is TOP, result is TOP
+    If operand_state equals LATTICE_TOP:
+        Return create_lattice_top()
+    End If
+
+    Note: If operand is BOTTOM, result is BOTTOM
+    If operand_state equals LATTICE_BOTTOM:
+        Return create_lattice_bottom()
+    End If
+
+    Note: Operand is CONSTANT - perform constant folding
+    Let operand_val be Layout.memory_get_int64(operand_lattice, 8)
+
+    Let result_val be 0
+
+    If opcode equals MIR.MIR_NEG:
+        Set result_val to 0 minus operand_val
+        Return create_lattice_constant(result_val)
+    End If
+
+    If opcode equals MIR.MIR_NOT:
+        Set result_val to proc bitwise_not from Layout with operand_val
+        Return create_lattice_constant(result_val)
+    End If
+
+    Note: Unknown unary operation
+    Return create_lattice_top()
+End Process
+
+Process called "evaluate_cast" that takes context_ptr as Integer, inst_ptr as Integer returns Integer:
+    @Reasoning
+    Evaluates type cast operations with lattice semantics.
+
+    **CAST SEMANTICS:**
+    For constant propagation, most casts preserve constant values
+    (with appropriate transformations like truncation or extension).
+
+    **CONSERVATIVE ANALYSIS:**
+    Currently returns TOP for all casts to be safe.
+    Could be enhanced to propagate constants through casts with
+    proper type size and sign handling.
+
+    Returns lattice value (currently always TOP).
+    @End Reasoning
+
+    Note: Conservative - casts could propagate constants with proper type handling
+    Note: Future enhancement: track constant through casts with type information
+
+    Return create_lattice_top()
+End Process
+
+Note: ============================================================================
+Note: WORKLIST ALGORITHM - Fixed-Point Iteration
+Note: ============================================================================
+
+Process called "initialize_sccp_worklist" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Initializes SCCP worklist with entry block and marks entry edge executable.
+
+    **INITIALIZATION:**
+    1. Mark entry block as executable
+    2. Mark entry edge (START → entry_block) as executable
+    3. Add entry block to CFG worklist
+    4. Initialize function arguments to TOP (conservative)
+
+    **ENTRY POINT:**
+    SCCP analysis starts from the entry block and propagates along
+    executable control flow paths.
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get entry block
+    Let entry_block_id be CFG.get_entry_block(cfg_ptr)
+    If entry_block_id equals 0:
+        Display "initialize_sccp_worklist: no entry block"
+        Return 0
+    End If
+
+    Note: Mark entry block executable
+    Let executable_blocks be Layout.memory_get_int64(context_ptr, 40)
+    Let entry_block_str be proc integer_to_string from String with entry_block_id
+    proc add from Set with executable_blocks, entry_block_str
+
+    Note: Mark entry edge executable (virtual START → entry_block)
+    Let executable_edges be Layout.memory_get_int64(context_ptr, 16)
+    Let entry_edge_key be "START->" joined with entry_block_str
+    proc add from Set with executable_edges, entry_edge_key
+
+    Note: Add entry block to CFG worklist
+    Let cfg_worklist be Layout.memory_get_int64(context_ptr, 32)
+    List.append(cfg_worklist, entry_block_id)
+
+    Display "initialize_sccp_worklist: initialized with entry block " joined with entry_block_id
+
+    Return 1
+End Process
+
+Process called "mark_edge_executable" that takes context_ptr as Integer, from_block_id as Integer, to_block_id as Integer returns Integer:
+    @Reasoning
+    Marks a CFG edge as executable and adds target block to worklist if newly reachable.
+
+    **EDGE EXECUTABLE:**
+    When an edge becomes executable:
+    1. Add edge to executable_edges set
+    2. If target block is newly executable, mark it and add all its instructions to SSA worklist
+    3. Add target block to CFG worklist for processing
+
+    Returns 1 if edge was newly marked (changed), 0 if already executable.
+    @End Reasoning
+
+    Let executable_edges be Layout.memory_get_int64(context_ptr, 16)
+    Let executable_blocks be Layout.memory_get_int64(context_ptr, 40)
+
+    Note: Create edge key: "from_block_id->to_block_id"
+    Let edge_key be proc integer_to_string from String with from_block_id
+    Set edge_key to edge_key joined with "->"
+    Let to_block_str be proc integer_to_string from String with to_block_id
+    Set edge_key to edge_key joined with to_block_str
+
+    Note: Check if edge already executable
+    Let is_already_executable be proc contains from Set with executable_edges, edge_key
+    If is_already_executable equals 1:
+        Return 0  Note: No change
+    End If
+
+    Note: Mark edge executable
+    proc add from Set with executable_edges, edge_key
+
+    Note: Check if target block is newly executable
+    Let is_block_executable be proc contains from Set with executable_blocks, to_block_str
+    If is_block_executable equals 0:
+        Note: Block is newly executable
+        proc add from Set with executable_blocks, to_block_str
+
+        Note: Add to CFG worklist
+        Let cfg_worklist be Layout.memory_get_int64(context_ptr, 32)
+        List.append(cfg_worklist, to_block_id)
+
+        Display "mark_edge_executable: new edge " joined with edge_key joined with " (block newly executable)"
+    Otherwise:
+        Display "mark_edge_executable: new edge " joined with edge_key
+    End If
+
+    Return 1  Note: Changed
+End Process
+
+Process called "visit_instruction" that takes context_ptr as Integer, inst_ptr as Integer returns Integer:
+    @Reasoning
+    Visits an instruction and updates its result lattice value.
+
+    **INSTRUCTION VISIT:**
+    1. Evaluate instruction using current lattice values
+    2. Get result value ID
+    3. Update lattice value for result
+    4. If changed, add all users of result to SSA worklist
+
+    **PROPAGATION:**
+    Changes propagate through use-def chains via SSA worklist.
+
+    Returns 1 if lattice value changed, 0 otherwise.
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get result value ID
+    Let result_value_id be MIR.get_mir_node_value_id(inst_ptr)
+    If result_value_id equals 0:
+        Return 0  Note: Instruction has no result (e.g., STORE, BRANCH)
+    End If
+
+    Note: Evaluate instruction
+    Let new_lattice be evaluate_instruction(context_ptr, inst_ptr)
+
+    Note: Update lattice value
+    Let changed be update_lattice_value(context_ptr, result_value_id, new_lattice)
+
+    Note: Free lattice
+    Layout.deallocate(new_lattice)
+
+    If changed equals 1:
+        Note: Add all users to SSA worklist
+        Let ssa_worklist be Layout.memory_get_int64(context_ptr, 24)
+        List.append(ssa_worklist, result_value_id)
+
+        Display "visit_instruction: value " joined with result_value_id joined with " changed"
+    End If
+
+    Return changed
+End Process
+
+Process called "visit_phi_node" that takes context_ptr as Integer, phi_ptr as Integer returns Integer:
+    @Reasoning
+    Visits a PHI node and updates its result lattice value.
+
+    **PHI VISIT:**
+    PHI nodes are special - they merge values from multiple predecessors.
+    Only executable incoming edges contribute to the PHI result.
+
+    Returns 1 if lattice value changed, 0 otherwise.
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get result value ID
+    Let result_value_id be Layout.memory_get_int64(phi_ptr, 8)  Note: Offset 8: result_value_id
+
+    Note: Evaluate PHI node
+    Let new_lattice be evaluate_phi_node(context_ptr, phi_ptr)
+
+    Note: Update lattice value
+    Let changed be update_lattice_value(context_ptr, result_value_id, new_lattice)
+
+    Note: Free lattice
+    Layout.deallocate(new_lattice)
+
+    If changed equals 1:
+        Note: Add all users to SSA worklist
+        Let ssa_worklist be Layout.memory_get_int64(context_ptr, 24)
+        List.append(ssa_worklist, result_value_id)
+
+        Display "visit_phi_node: value " joined with result_value_id joined with " changed"
+    End If
+
+    Return changed
+End Process
+
+Process called "process_ssa_worklist" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Processes SSA value worklist until empty.
+
+    **SSA WORKLIST PROCESSING:**
+    1. Pop value from SSA worklist
+    2. Find all instructions that use this value
+    3. Re-evaluate those instructions with updated lattice
+    4. If their results change, add to worklist
+
+    **TERMINATION:**
+    Lattice values are monotonic (only move down: BOTTOM → CONSTANT → TOP).
+    Each value can change at most twice, guaranteeing termination.
+
+    Returns number of values processed.
+    @End Reasoning
+
+    Let ssa_worklist be Layout.memory_get_int64(context_ptr, 24)
+    Let processed_count be 0
+
+    While List.length(ssa_worklist) is greater than 0:
+        Note: Pop value from worklist
+        Let value_id be List.pop(ssa_worklist)
+
+        Note: Find all uses of this value and re-visit those instructions
+        Note: Traverse all blocks and instructions to find uses of value_id
+        Let block_count be CFG.get_block_count(cfg_ptr)
+        Let uses_found be 0
+
+        Let i be 0
+        While i is less than block_count:
+            Let block be CFG.get_block(cfg_ptr, i)
+            Let instructions be CFG.get_block_instructions(block)
+            Let inst_count be List.length(instructions)
+
+            Let j be 0
+            While j is less than inst_count:
+                Let inst be List.get(instructions, j)
+                If inst is not equal to 0:
+                    Let opcode be MIR.get_mir_node_opcode(inst)
+                    Let uses_value be 0
+
+                    Note: Check if this instruction uses value_id
+                    Note: Binary operations
+                    If opcode equals 20010 or opcode equals 20011 or opcode equals 20012 or opcode equals 20013 or opcode equals 20014:
+                        Let left_op be Layout.memory_get_int64(inst, 16)
+                        Let right_op be Layout.memory_get_int64(inst, 24)
+                        If left_op equals value_id or right_op equals value_id:
+                            Set uses_value to 1
+                        End If
+                    End If
+
+                    Note: Comparison operations
+                    If opcode equals 20015:  Note: MIR_CMP
+                        Let left_op be Layout.memory_get_int64(inst, 16)
+                        Let right_op be Layout.memory_get_int64(inst, 24)
+                        If left_op equals value_id or right_op equals value_id:
+                            Set uses_value to 1
+                        End If
+                    End If
+
+                    Note: PHI nodes
+                    If opcode equals 20023:  Note: MIR_PHI
+                        Let operand_count be MIRNodes.get_phi_operand_count(inst)
+                        Let k be 0
+                        While k is less than operand_count:
+                            Let phi_op be MIRNodes.get_phi_operand_value(inst, k)
+                            If phi_op equals value_id:
+                                Set uses_value to 1
+                            End If
+                            Set k to k plus 1
+                        End While
+                    End If
+
+                    Note: Store operations
+                    If opcode equals 20020:  Note: MIR_STORE
+                        Let store_ptr be Layout.memory_get_int64(inst, 16)
+                        Let store_val be Layout.memory_get_int64(inst, 24)
+                        If store_ptr equals value_id or store_val equals value_id:
+                            Set uses_value to 1
+                        End If
+                    End If
+
+                    Note: Return operations
+                    If opcode equals 20008:  Note: MIR_RETURN
+                        Let ret_val be Layout.memory_get_int64(inst, 8)
+                        If ret_val equals value_id:
+                            Set uses_value to 1
+                        End If
+                    End If
+
+                    Note: Branch operations
+                    If opcode equals 20007:  Note: MIR_BRANCH
+                        Let condition be Layout.memory_get_int64(inst, 8)
+                        If condition equals value_id:
+                            Set uses_value to 1
+                        End If
+                    End If
+
+                    Note: If instruction uses this value, re-evaluate it
+                    If uses_value equals 1:
+                        Set uses_found to uses_found plus 1
+
+                        Note: Re-evaluate instruction based on type
+                        If opcode equals 20010 or opcode equals 20011 or opcode equals 20012 or opcode equals 20013 or opcode equals 20014:
+                            visit_binary_operation(context_ptr, cfg_ptr, inst)
+                        End If
+
+                        If opcode equals 20015:  Note: MIR_CMP
+                            visit_comparison(context_ptr, cfg_ptr, inst)
+                        End If
+
+                        If opcode equals 20023:  Note: MIR_PHI
+                            visit_phi_node(context_ptr, cfg_ptr, inst)
+                        End If
+                    End If
+                End If
+
+                Set j to j plus 1
+            End While
+
+            Set i to i plus 1
+        End While
+
+        Set processed_count to processed_count plus 1
+    End While
+
+    Return processed_count
+End Process
+
+Process called "process_cfg_worklist" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Processes CFG edge worklist until empty.
+
+    **CFG WORKLIST PROCESSING:**
+    1. Pop block from CFG worklist
+    2. Visit all instructions in block
+    3. Evaluate block terminator (branch/jump)
+    4. Mark successor edges executable based on terminator evaluation
+    5. If new edges marked, add successor blocks to worklist
+
+    **FLOW-SENSITIVE ANALYSIS:**
+    Only visits blocks reachable through executable edges.
+    This enables dead code detection and branch folding.
+
+    Returns number of blocks processed.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg_worklist be Layout.memory_get_int64(context_ptr, 32)
+    Let executable_blocks be Layout.memory_get_int64(context_ptr, 40)
+    Let processed_count be 0
+
+    While List.length(cfg_worklist) is greater than 0:
+        Note: Pop block from worklist
+        Let block_id be List.pop(cfg_worklist)
+
+        Note: Verify block is executable
+        Let block_id_str be proc integer_to_string from String with block_id
+        Let is_executable be proc contains from Set with executable_blocks, block_id_str
+
+        If is_executable equals 0:
+            Display "process_cfg_worklist: skipping non-executable block " joined with block_id
+            Set processed_count to processed_count plus 1
+            Continue While
+        End If
+
+        Display "process_cfg_worklist: processing block " joined with block_id
+
+        Note: Get block from CFG
+        Let block_ptr be CFG.get_block(cfg_ptr, block_id)
+        If block_ptr equals 0:
+            Display "process_cfg_worklist: block not found " joined with block_id
+            Set processed_count to processed_count plus 1
+            Continue While
+        End If
+
+        Note: Visit all instructions in block
+        Let inst_list be CFG.get_block_instructions(block_ptr)
+        If inst_list is not equal to 0:
+            Let inst_count be List.length(inst_list)
+            Let i be 0
+
+            While i is less than inst_count:
+                Let inst_ptr be List.get(inst_list, i)
+
+                Note: Check if this is a PHI node
+                Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+                If opcode equals MIR.MIR_PHI:
+                    visit_phi_node(context_ptr, inst_ptr)
+                Otherwise:
+                    visit_instruction(context_ptr, inst_ptr)
+                End If
+
+                Set i to i plus 1
+            End While
+        End If
+
+        Note: Process block terminator to determine successor edges
+        Let terminator be CFG.get_block_terminator(block_ptr)
+        If terminator is not equal to 0:
+            Let term_opcode be MIR.get_mir_node_opcode(terminator)
+
+            Note: Unconditional jump - mark edge executable
+            If term_opcode equals MIR.MIR_JUMP:
+                Let target_block_id be Layout.memory_get_int64(terminator, 8)  Note: MIRJump: target_block_id
+                mark_edge_executable(context_ptr, block_id, target_block_id)
+            End If
+
+            Note: Conditional branch - evaluate condition
+            If term_opcode equals MIR.MIR_BRANCH:
+                process_branch_instruction(context_ptr, block_id, terminator)
+            End If
+
+            Note: Return - no successors
+            If term_opcode equals MIR.MIR_RETURN:
+                Note: No successors to mark
+            End If
+
+            Note: Switch - evaluate switch value
+            If term_opcode equals MIR.MIR_SWITCH:
+                process_switch_instruction(context_ptr, block_id, terminator)
+            End If
+        End If
+
+        Set processed_count to processed_count plus 1
+    End While
+
+    Return processed_count
+End Process
+
+Process called "run_sccp_analysis" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Runs the complete SCCP analysis to fixed point.
+
+    **WEGMAN-ZADECK ALGORITHM:**
+    1. Initialize worklists with entry block
+    2. Iterate until both worklists empty:
+       a. Process CFG worklist (mark executable edges, visit blocks)
+       b. Process SSA worklist (propagate lattice values)
+    3. Converge to fixed point (all lattice values stable)
+
+    **FIXED-POINT ITERATION:**
+    Monotonic lattice ensures termination.
+    Each SSA value transitions at most: BOTTOM → CONSTANT → TOP
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    @Performance_Hints
+    The dual worklist approach (SSA + CFG) is critical for performance.
+    - CFG worklist handles control flow (which blocks are reachable)
+    - SSA worklist handles data flow (which values are constant)
+    This separation allows efficient fixed-point convergence.
+    @End Performance_Hints
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "============================================"
+    Display "RUNNING SCCP ANALYSIS"
+    Display "============================================"
+
+    Note: Initialize worklists
+    Let init_result be initialize_sccp_worklist(context_ptr, cfg_ptr)
+    If init_result equals 0:
+        Display "run_sccp_analysis: initialization failed"
+        Return 0
+    End If
+
+    Let ssa_worklist be Layout.memory_get_int64(context_ptr, 24)
+    Let cfg_worklist be Layout.memory_get_int64(context_ptr, 32)
+
+    Let iteration_count be 0
+    Let max_iterations be 10000  Note: Safety limit
+
+    Note: Iterate until fixed point
+    While iteration_count is less than max_iterations:
+        Let ssa_len be List.length(ssa_worklist)
+        Let cfg_len be List.length(cfg_worklist)
+
+        If ssa_len equals 0:
+            If cfg_len equals 0:
+                Note: Both worklists empty - fixed point reached
+                Display "run_sccp_analysis: fixed point reached after " joined with iteration_count joined with " iterations"
+                Return 1
+            End If
+        End If
+
+        Display "Iteration " joined with iteration_count joined with ": SSA=" joined with ssa_len joined with " CFG=" joined with cfg_len
+
+        Note: Process CFG worklist first (control flow)
+        If cfg_len is greater than 0:
+            process_cfg_worklist(context_ptr, cfg_ptr)
+        End If
+
+        Note: Process SSA worklist (data flow)
+        If ssa_len is greater than 0:
+            process_ssa_worklist(context_ptr, cfg_ptr)
+        End If
+
+        Set iteration_count to iteration_count plus 1
+    End While
+
+    Display "run_sccp_analysis: WARNING - max iterations reached"
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: BRANCH ANALYSIS AND UNREACHABLE CODE DETECTION
+Note: ============================================================================
+
+Process called "process_branch_instruction" that takes context_ptr as Integer, block_id as Integer, branch_ptr as Integer returns Integer:
+    @Reasoning
+    Processes conditional branch instruction and marks edges executable.
+
+    **BRANCH EVALUATION:**
+    1. Get condition value lattice
+    2. If condition is CONSTANT:
+       - If true (1) → mark true edge executable only
+       - If false (0) → mark false edge executable only
+       - Increment branches_folded counter
+    3. If condition is TOP or BOTTOM → mark both edges executable (conservative)
+
+    **BRANCH FOLDING:**
+    When condition is constant, only one successor is reachable.
+    This enables dead code elimination of unreachable branch.
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If branch_ptr equals 0:
+        Return 0
+    End If
+
+    Note: MIRBranch structure - get condition and targets
+    Let condition_value_id be Layout.memory_get_int64(branch_ptr, 8)   Note: Offset 8: condition_value_id
+    Let true_block_id be Layout.memory_get_int64(branch_ptr, 16)      Note: Offset 16: true_block_id
+    Let false_block_id be Layout.memory_get_int64(branch_ptr, 24)     Note: Offset 24: false_block_id
+
+    Note: Get condition lattice value
+    Let condition_lattice be get_or_create_lattice_value(context_ptr, condition_value_id)
+    Let condition_state be Layout.memory_get_int64(condition_lattice, 0)
+
+    Note: If condition is CONSTANT, fold branch
+    If condition_state equals LATTICE_CONSTANT:
+        Let condition_val be Layout.memory_get_int64(condition_lattice, 8)
+
+        If condition_val equals 1:
+            Note: Condition is true - only true edge executable
+            mark_edge_executable(context_ptr, block_id, true_block_id)
+
+            Note: Increment branches_folded counter
+            Let branches_folded be Layout.memory_get_int64(context_ptr, 56)
+            Set branches_folded to branches_folded plus 1
+            Layout.memory_set_int64(context_ptr, 56, branches_folded)
+
+            Display "process_branch_instruction: folded branch to true (block " joined with true_block_id joined with ")"
+        Otherwise:
+            Note: Condition is false - only false edge executable
+            mark_edge_executable(context_ptr, block_id, false_block_id)
+
+            Note: Increment branches_folded counter
+            Let branches_folded be Layout.memory_get_int64(context_ptr, 56)
+            Set branches_folded to branches_folded plus 1
+            Layout.memory_set_int64(context_ptr, 56, branches_folded)
+
+            Display "process_branch_instruction: folded branch to false (block " joined with false_block_id joined with ")"
+        End If
+
+        Return 1
+    End If
+
+    Note: Condition is not constant - mark both edges executable
+    mark_edge_executable(context_ptr, block_id, true_block_id)
+    mark_edge_executable(context_ptr, block_id, false_block_id)
+
+    Display "process_branch_instruction: both edges executable (condition not constant)"
+
+    Return 1
+End Process
+
+Process called "process_switch_instruction" that takes context_ptr as Integer, block_id as Integer, switch_ptr as Integer returns Integer:
+    @Reasoning
+    Processes switch instruction and marks edges executable.
+
+    **SWITCH EVALUATION:**
+    1. Get switch value lattice
+    2. If switch value is CONSTANT:
+       - Find matching case edge
+       - Mark only that edge executable
+       - Increment branches_folded counter
+    3. If switch value is TOP or BOTTOM → mark all case edges + default executable
+
+    **SWITCH FOLDING:**
+    When switch value is constant, only one case is reachable.
+    This enables dead code elimination of unreachable cases.
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If switch_ptr equals 0:
+        Return 0
+    End If
+
+    Note: MIRSwitch structure - get switch value and cases
+    Let value_id be Layout.memory_get_int64(switch_ptr, 8)         Note: Offset 8: value_id
+    Let cases be Layout.memory_get_int64(switch_ptr, 16)           Note: Offset 16: cases (List)
+    Let case_count be Layout.memory_get_int64(switch_ptr, 24)      Note: Offset 24: case_count
+    Let default_block_id be Layout.memory_get_int64(switch_ptr, 32) Note: Offset 32: default_block_id
+
+    Note: Get switch value lattice
+    Let value_lattice be get_or_create_lattice_value(context_ptr, value_id)
+    Let value_state be Layout.memory_get_int64(value_lattice, 0)
+
+    Note: If switch value is CONSTANT, fold switch
+    If value_state equals LATTICE_CONSTANT:
+        Let switch_val be Layout.memory_get_int64(value_lattice, 8)
+
+        Note: Search for matching case
+        Let found_case be 0
+        Let i be 0
+
+        While i is less than case_count:
+            Let case_pair be List.get(cases, i)
+            Let case_val be Layout.memory_get_int64(case_pair, 0)      Note: Offset 0: case_value
+            Let case_block_id be Layout.memory_get_int64(case_pair, 8) Note: Offset 8: block_id
+
+            If case_val equals switch_val:
+                Note: Found matching case
+                mark_edge_executable(context_ptr, block_id, case_block_id)
+                Set found_case to 1
+
+                Note: Increment branches_folded counter
+                Let branches_folded be Layout.memory_get_int64(context_ptr, 56)
+                Set branches_folded to branches_folded plus 1
+                Layout.memory_set_int64(context_ptr, 56, branches_folded)
+
+                Display "process_switch_instruction: folded switch to case " joined with case_val joined with " (block " joined with case_block_id joined with ")"
+
+                Return 1
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Note: No matching case - use default
+        If found_case equals 0:
+            If default_block_id is not equal to 0:
+                mark_edge_executable(context_ptr, block_id, default_block_id)
+
+                Note: Increment branches_folded counter
+                Let branches_folded be Layout.memory_get_int64(context_ptr, 56)
+                Set branches_folded to branches_folded plus 1
+                Layout.memory_set_int64(context_ptr, 56, branches_folded)
+
+                Display "process_switch_instruction: folded switch to default (block " joined with default_block_id joined with ")"
+            End If
+        End If
+
+        Return 1
+    End If
+
+    Note: Switch value is not constant - mark all edges executable
+    Let i be 0
+    While i is less than case_count:
+        Let case_pair be List.get(cases, i)
+        Let case_block_id be Layout.memory_get_int64(case_pair, 8)
+        mark_edge_executable(context_ptr, block_id, case_block_id)
+        Set i to i plus 1
+    End While
+
+    Note: Also mark default edge
+    If default_block_id is not equal to 0:
+        mark_edge_executable(context_ptr, block_id, default_block_id)
+    End If
+
+    Display "process_switch_instruction: all edges executable (value not constant)"
+
+    Return 1
+End Process
+
+Process called "is_block_unreachable" that takes context_ptr as Integer, block_id as Integer returns Integer:
+    @Reasoning
+    Checks if a block is unreachable (not in executable_blocks set).
+
+    **UNREACHABLE BLOCKS:**
+    Blocks not reachable through any executable path from entry block.
+    These blocks can be eliminated during code transformation.
+
+    Returns 1 if block is unreachable, 0 if reachable.
+    @End Reasoning
+
+    Let executable_blocks be Layout.memory_get_int64(context_ptr, 40)
+    Let block_id_str be proc integer_to_string from String with block_id
+
+    Let is_executable be proc contains from Set with executable_blocks, block_id_str
+
+    If is_executable equals 0:
+        Return 1  Note: Unreachable
+    End If
+
+    Return 0  Note: Reachable
+End Process
+
+Process called "collect_unreachable_blocks" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Collects all unreachable blocks in the CFG.
+
+    **DEAD CODE DETECTION:**
+    After SCCP analysis, any block not in executable_blocks is unreachable.
+    Returns a List of unreachable block IDs.
+
+    Returns List pointer (caller must free), or 0 on error.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let unreachable_blocks be List.create()
+    If unreachable_blocks equals 0:
+        Return 0
+    End If
+
+    Note: Get all blocks in CFG
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        List.destroy(unreachable_blocks)
+        Return 0
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+        Let block_id be CFG.get_block_id(block_ptr)
+
+        Note: Check if block is unreachable
+        Let is_unreach be is_block_unreachable(context_ptr, block_id)
+        If is_unreach equals 1:
+            List.append(unreachable_blocks, block_id)
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Let unreachable_count be List.length(unreachable_blocks)
+    Display "collect_unreachable_blocks: found " joined with unreachable_count joined with " unreachable blocks"
+
+    Note: Update blocks_eliminated counter
+    Layout.memory_set_int64(context_ptr, 72, unreachable_count)
+
+    Return unreachable_blocks
+End Process
+
+Process called "is_value_constant" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Checks if an SSA value is constant after SCCP analysis.
+
+    **CONSTANT CHECK:**
+    Returns 1 if value's lattice is CONSTANT, 0 otherwise.
+
+    Used to identify which values can be replaced with constants
+    during code transformation.
+    @End Reasoning
+
+    Let value_lattice be get_or_create_lattice_value(context_ptr, value_id)
+    Let state be Layout.memory_get_int64(value_lattice, 0)
+
+    If state equals LATTICE_CONSTANT:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "get_constant_value" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Gets the constant value for an SSA value (if constant).
+
+    **CONSTANT RETRIEVAL:**
+    Returns the constant value if lattice is CONSTANT.
+    Returns 0 if not constant (caller should check is_value_constant first).
+    @End Reasoning
+
+    Let value_lattice be get_or_create_lattice_value(context_ptr, value_id)
+    Let state be Layout.memory_get_int64(value_lattice, 0)
+
+    If state is not equal to LATTICE_CONSTANT:
+        Return 0
+    End If
+
+    Let const_val be Layout.memory_get_int64(value_lattice, 8)
+    Return const_val
+End Process
+
+Note: ============================================================================
+Note: INTERPROCEDURAL PROPAGATION (Basic Support)
+Note: ============================================================================
+
+Process called "set_interprocedural_context" that takes context_ptr as Integer, module_ptr as Integer, call_graph_ptr as Integer returns Integer:
+    @Reasoning
+    Sets module and call graph for interprocedural analysis.
+
+    **INTERPROCEDURAL SETUP:**
+    Enables SCCP to propagate constants across function boundaries.
+    - module_ptr: Module containing all functions
+    - call_graph_ptr: Call graph for function relationships
+
+    **LIMITATIONS:**
+    Current implementation is conservative for function calls.
+    Full interprocedural SCCP requires:
+    - Function summaries
+    - Context-sensitive analysis
+    - Iterative refinement across call boundaries
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(context_ptr, 80, module_ptr)
+    Layout.memory_set_int64(context_ptr, 88, call_graph_ptr)
+
+    Display "set_interprocedural_context: interprocedural analysis enabled"
+
+    Return 1
+End Process
+
+Process called "evaluate_function_call" that takes context_ptr as Integer, call_ptr as Integer returns Integer:
+    @Reasoning
+    Evaluates function call instruction (conservative).
+
+    **CALL EVALUATION:**
+    Currently returns TOP for all function calls (conservative).
+
+    **FUTURE ENHANCEMENT:**
+    Could implement:
+    - Constant argument propagation into callee
+    - Return value analysis based on function summary
+    - Pure function detection (no side effects)
+    - Builtin function constant folding
+
+    Returns lattice value for call result (currently always TOP).
+    @End Reasoning
+
+    @Performance_Hints
+    This is a key area for future optimization.
+    Many standard library functions are pure and could be
+    constant-folded when all arguments are constant.
+
+    Examples:
+    - abs(constant) → constant
+    - min(c1, c2) → constant
+    - String operations on constant strings
+    @End Performance_Hints
+
+    Note: Conservative - all calls return TOP
+    Note: Future: analyze pure functions with constant arguments
+
+    Return create_lattice_top()
+End Process
+
+Process called "initialize_function_arguments" that takes context_ptr as Integer, function_ptr as Integer returns Integer:
+    @Reasoning
+    Initializes function argument values to TOP (conservative).
+
+    **ARGUMENT INITIALIZATION:**
+    Function arguments are initially unknown (could be any value).
+    We conservatively initialize them to TOP.
+
+    **INTERPROCEDURAL REFINEMENT:**
+    With full interprocedural analysis, arguments could be initialized
+    based on constant values at call sites.
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If function_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get CFG from context
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Get entry block (block 0)
+    Let entry_block be CFG.get_block(cfg, 0)
+    If entry_block equals 0:
+        Return 0
+    End If
+
+    Note: Get instructions from entry block
+    Let instructions be CFG.get_block_instructions(entry_block)
+    Let inst_count be List.length(instructions)
+
+    Let args_initialized be 0
+
+    Note: Iterate through entry block to find PARAM instructions
+    Let i be 0
+    While i is less than inst_count:
+        Let inst be List.get(instructions, i)
+        If inst is not equal to 0:
+            Let opcode be MIR.get_mir_node_opcode(inst)
+
+            Note: Check for MIR_PARAM instruction
+            If opcode equals 20024:  Note: MIR_PARAM
+                Let param_value_id be MIR.get_mir_node_value_id(inst)
+
+                Note: Initialize parameter to TOP (overdefined - conservative)
+                Let lattice_values be Layout.memory_get_int64(context_ptr, 8)
+                Let param_str be proc integer_to_string from String with param_value_id
+
+                Note: Create TOP lattice value
+                Let top_value be create_lattice_top()
+                proc set from Dictionary with lattice_values, param_str, top_value
+
+                Set args_initialized to args_initialized plus 1
+
+                Display "initialize_function_arguments: param " joined with param_value_id joined with " initialized to TOP"
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "initialize_function_arguments: initialized " joined with args_initialized joined with " arguments to TOP (conservative)"
+
+    Return args_initialized
+End Process
+
+Note: ============================================================================
+Note: CODE TRANSFORMATION - Apply SCCP Results
+Note: ============================================================================
+
+Process called "replace_value_with_constant" that takes context_ptr as Integer, cfg_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Replaces all uses of an SSA value with a constant.
+
+    **CONSTANT REPLACEMENT:**
+    1. Check if value is constant
+    2. Create MIR_CONST instruction with constant value
+    3. Replace all uses of value_id with the constant instruction
+
+    **PROPAGATION:**
+    This is the key transformation that replaces computed values
+    with their constant results.
+
+    Returns number of uses replaced.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check if value is constant
+    Let is_const be is_value_constant(context_ptr, value_id)
+    If is_const equals 0:
+        Return 0  Note: Not constant
+    End If
+
+    Note: Get constant value
+    Let const_val be get_constant_value(context_ptr, value_id)
+
+    Note: Complete implementation: scan all blocks for uses of value_id
+    Let uses_replaced be 0
+    Let block_count be CFG.get_block_count(cfg_ptr)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let opcode be MIR.get_mir_node_opcode(inst)
+
+                Note: Replace operands that use value_id with constant
+                Note: Check binary operations
+                If opcode equals 20010 or opcode equals 20011 or opcode equals 20012 or opcode equals 20013 or opcode equals 20014:
+                    Note: MIR_ADD, MIR_SUB, MIR_MUL, MIR_DIV, MIR_MOD
+                    Let left_operand be Layout.memory_get_int64(inst, 16)
+                    Let right_operand be Layout.memory_get_int64(inst, 24)
+
+                    If left_operand equals value_id:
+                        Note: Create new MIR_CONST instruction for constant value
+                        Let const_node_ptr be MIR.create_const_node(const_val)
+                        Let const_value_id be MIR.get_mir_node_value_id(const_node_ptr)
+
+                        Note: Update left operand to point to constant
+                        Layout.memory_set_int64(inst, 16, const_value_id)
+
+                        Note: Insert constant instruction before this instruction
+                        List.insert_before(instructions, j, const_node_ptr)
+
+                        Set uses_replaced to uses_replaced plus 1
+                        Display "replace_value_with_constant: replaced left operand in binary op with constant " joined with const_val
+                    End If
+
+                    If right_operand equals value_id:
+                        Note: Create new MIR_CONST instruction for constant value
+                        Let const_node_ptr be MIR.create_const_node(const_val)
+                        Let const_value_id be MIR.get_mir_node_value_id(const_node_ptr)
+
+                        Note: Update right operand to point to constant
+                        Layout.memory_set_int64(inst, 24, const_value_id)
+
+                        Note: Insert constant instruction before this instruction
+                        List.insert_before(instructions, j, const_node_ptr)
+
+                        Set uses_replaced to uses_replaced plus 1
+                        Display "replace_value_with_constant: replaced right operand in binary op with constant " joined with const_val
+                    End If
+                End If
+
+                Note: Check comparison operations
+                If opcode equals 20015:  Note: MIR_CMP
+                    Let left_operand be Layout.memory_get_int64(inst, 16)
+                    Let right_operand be Layout.memory_get_int64(inst, 24)
+
+                    If left_operand equals value_id:
+                        Note: Create new MIR_CONST instruction for constant value
+                        Let const_node_ptr be MIR.create_const_node(const_val)
+                        Let const_value_id be MIR.get_mir_node_value_id(const_node_ptr)
+
+                        Note: Update left operand to point to constant
+                        Layout.memory_set_int64(inst, 16, const_value_id)
+
+                        Note: Insert constant instruction before this instruction
+                        List.insert_before(instructions, j, const_node_ptr)
+
+                        Set uses_replaced to uses_replaced plus 1
+                        Display "replace_value_with_constant: replaced left operand in comparison with constant " joined with const_val
+                    End If
+
+                    If right_operand equals value_id:
+                        Note: Create new MIR_CONST instruction for constant value
+                        Let const_node_ptr be MIR.create_const_node(const_val)
+                        Let const_value_id be MIR.get_mir_node_value_id(const_node_ptr)
+
+                        Note: Update right operand to point to constant
+                        Layout.memory_set_int64(inst, 24, const_value_id)
+
+                        Note: Insert constant instruction before this instruction
+                        List.insert_before(instructions, j, const_node_ptr)
+
+                        Set uses_replaced to uses_replaced plus 1
+                        Display "replace_value_with_constant: replaced right operand in comparison with constant " joined with const_val
+                    End If
+                End If
+
+                Note: Check PHI nodes
+                If opcode equals 20023:  Note: MIR_PHI
+                    Let operand_count be MIRNodes.get_phi_operand_count(inst)
+                    Let k be 0
+                    While k is less than operand_count:
+                        Let phi_operand be MIRNodes.get_phi_operand_value(inst, k)
+                        If phi_operand equals value_id:
+                            Note: Create new MIR_CONST instruction for constant value
+                            Let const_node_ptr be MIR.create_const_node(const_val)
+                            Let const_value_id be MIR.get_mir_node_value_id(const_node_ptr)
+
+                            Note: Update PHI operand to point to constant
+                            MIRNodes.set_phi_operand_value(inst, k, const_value_id)
+
+                            Note: Insert constant instruction at beginning of predecessor block
+                            Let pred_block_id be MIRNodes.get_phi_operand_block(inst, k)
+                            Let pred_block be CFG.get_block(cfg_ptr, pred_block_id)
+                            Let pred_instructions be CFG.get_block_instructions(pred_block)
+                            List.insert(pred_instructions, 0, const_node_ptr)
+
+                            Set uses_replaced to uses_replaced plus 1
+                            Display "replace_value_with_constant: replaced PHI operand with constant " joined with const_val
+                        End If
+                        Set k to k plus 1
+                    End While
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Display "replace_value_with_constant: replaced " joined with uses_replaced joined with " uses of value " joined with value_id joined with " with constant " joined with const_val
+
+    Note: Increment constants_found counter
+    Let constants_found be Layout.memory_get_int64(context_ptr, 48)
+    Set constants_found to constants_found plus uses_replaced
+    Layout.memory_set_int64(context_ptr, 48, constants_found)
+
+    Return uses_replaced
+End Process
+
+Process called "simplify_branch" that takes context_ptr as Integer, cfg_ptr as Integer, block_ptr as Integer, branch_ptr as Integer returns Integer:
+    @Reasoning
+    Simplifies conditional branch with constant condition.
+
+    **BRANCH SIMPLIFICATION:**
+    1. Check if condition is constant
+    2. If true → replace branch with unconditional jump to true block
+    3. If false → replace branch with unconditional jump to false block
+    4. Mark unreachable branch for elimination
+
+    **CFG SIMPLIFICATION:**
+    Reduces control flow graph complexity by eliminating conditional branches
+    with known outcomes.
+
+    Returns 1 if , 0 otherwise.
+    @End Reasoning
+
+    If branch_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get condition value
+    Let condition_value_id be Layout.memory_get_int64(branch_ptr, 8)
+
+    Note: Check if condition is constant
+    Let is_const be is_value_constant(context_ptr, condition_value_id)
+    If is_const equals 0:
+        Return 0  Note: Condition not constant
+    End If
+
+    Note: Get constant value
+    Let condition_val be get_constant_value(context_ptr, condition_value_id)
+
+    Note: Get target blocks
+    Let true_block_id be Layout.memory_get_int64(branch_ptr, 16)
+    Let false_block_id be Layout.memory_get_int64(branch_ptr, 24)
+
+    Note: Complete implementation: Transform BRANCH → JUMP
+    If condition_val equals 1:
+        Display "simplify_branch: folding branch to true block " joined with true_block_id
+
+        Note: Replace BRANCH with JUMP to true_block_id
+        Note: Change opcode from MIR_BRANCH (20007) to MIR_JUMP (20006)
+        Layout.memory_set_int64(branch_ptr, 0, 20006)  Note: Set opcode to MIR_JUMP
+
+        Note: Set jump target to true_block_id (offset 8)
+        Layout.memory_set_int64(branch_ptr, 8, true_block_id)
+
+        Note: Clear condition and false_block fields
+        Layout.memory_set_int64(branch_ptr, 16, 0)
+        Layout.memory_set_int64(branch_ptr, 24, 0)
+
+        Note: Mark false block as unreachable
+        eliminate_unreachable_block(cfg_ptr, false_block_id)
+
+        Display "simplify_branch: replaced BRANCH with JUMP to block " joined with true_block_id
+    Otherwise:
+        Display "simplify_branch: folding branch to false block " joined with false_block_id
+
+        Note: Replace BRANCH with JUMP to false_block_id
+        Layout.memory_set_int64(branch_ptr, 0, 20006)  Note: Set opcode to MIR_JUMP
+
+        Note: Set jump target to false_block_id
+        Layout.memory_set_int64(branch_ptr, 8, false_block_id)
+
+        Note: Clear condition and true_block fields
+        Layout.memory_set_int64(branch_ptr, 16, 0)
+        Layout.memory_set_int64(branch_ptr, 24, 0)
+
+        Note: Mark true block as unreachable
+        eliminate_unreachable_block(cfg_ptr, true_block_id)
+
+        Display "simplify_branch: replaced BRANCH with JUMP to block " joined with false_block_id
+    End If
+
+    Note: Increment branches_folded counter
+    Let branches_folded be Layout.memory_get_int64(context_ptr, 56)
+    Set branches_folded to branches_folded plus 1
+    Layout.memory_set_int64(context_ptr, 56, branches_folded)
+
+    Return 1
+End Process
+
+Process called "eliminate_unreachable_block" that takes cfg_ptr as Integer, block_id as Integer returns Integer:
+    @Reasoning
+    Eliminates an unreachable basic block from CFG.
+
+    **BLOCK ELIMINATION:**
+    1. Remove block from CFG
+    2. Remove all PHI node references to this block
+    3. Free all instructions in block
+
+    **CFG CLEANUP:**
+    Removes dead code that cannot be reached through any executable path.
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "eliminate_unreachable_block: removing block " joined with block_id
+
+    Note: Step 1: Get block and its successors
+    Let block_ptr be CFG.get_block(cfg_ptr, block_id)
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Let successors be CFG.get_block_successors(block_ptr)
+    Let succ_count be List.length(successors)
+
+    Note: Step 2: Remove PHI operands from all successor blocks
+    Let i be 0
+    While i is less than succ_count:
+        Let succ_block_id be List.get(successors, i)
+        Let succ_block be CFG.get_block(cfg_ptr, succ_block_id)
+        Let succ_instructions be CFG.get_block_instructions(succ_block)
+        Let succ_inst_count be List.length(succ_instructions)
+
+        Note: Find all PHI nodes in successor block
+        Let j be 0
+        While j is less than succ_inst_count:
+            Let inst be List.get(succ_instructions, j)
+            If inst is not equal to 0:
+                Let opcode be MIR.get_mir_node_opcode(inst)
+                If opcode equals 20023:  Note: MIR_PHI
+                    Note: Remove operand corresponding to eliminated block
+                    MIRNodes.remove_phi_operand_for_block(inst, block_id)
+                End If
+            End If
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Step 3: Remove all instructions in the block
+    Let block_instructions be CFG.get_block_instructions(block_ptr)
+    Let inst_count be List.length(block_instructions)
+    Let k be 0
+    While k is less than inst_count:
+        Let inst be List.get(block_instructions, k)
+        If inst is not equal to 0:
+            Note: Free instruction memory
+            MIR.free_mir_node(inst)
+        End If
+        Set k to k plus 1
+    End While
+
+    Note: Clear instruction list
+    List.clear(block_instructions)
+
+    Note: Step 4: Mark block as unreachable in CFG metadata
+    CFG.mark_block_unreachable(cfg_ptr, block_id)
+
+    Note: Step 5: Remove incoming edges for this block
+    CFG.remove_block_edges(cfg_ptr, block_id)
+
+    Display "eliminate_unreachable_block: removed block " joined with block_id joined with " and updated " joined with succ_count joined with " successor blocks"
+
+    Return 1
+End Process
+
+Process called "transform_cfg_with_sccp_results" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Transforms CFG by applying all SCCP optimizations.
+
+    **TRANSFORMATION STEPS:**
+    1. Replace constant values throughout CFG
+    2. Simplify branches with constant conditions
+    3. Eliminate unreachable blocks
+    4. Update CFG structure
+
+    **COMPLETE OPTIMIZATION:**
+    Applies all optimizations discovered during SCCP analysis.
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "============================================"
+    Display "APPLYING SCCP TRANSFORMATIONS"
+    Display "============================================"
+
+    Note: Step 1: Replace constant values
+    Display "Step 1: Replacing constant values..."
+
+    Note: Get lattice values dictionary
+    Let lattice_values be Layout.memory_get_int64(context_ptr, 8)
+    Let keys be proc keys from Dictionary with lattice_values
+    Let key_count be List.length(keys)
+
+    Let i be 0
+    While i is less than key_count:
+        Let key_str be List.get(keys, i)
+        Let value_id be proc string_to_integer from String with key_str
+
+        Note: Try to replace this value with constant
+        replace_value_with_constant(context_ptr, cfg_ptr, value_id)
+
+        Set i to i plus 1
+    End While
+
+    List.destroy(keys)
+
+    Note: Step 2: Simplify branches
+    Display "Step 2: Simplifying branches..."
+
+    Let block_count be CFG.get_block_count(cfg_ptr)
+    Let j be 0
+
+    While j is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, j)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Note: Check last instruction in block (terminator)
+        If inst_count is greater than 0:
+            Let last_inst be List.get(instructions, inst_count minus 1)
+            Let opcode be MIR.get_mir_node_opcode(last_inst)
+
+            Note: Check if it's a BRANCH instruction
+            If opcode equals 20007:  Note: MIR_BRANCH
+                Note: Try to simplify this branch
+                simplify_branch(context_ptr, cfg_ptr, block, last_inst)
+            End If
+        End If
+
+        Set j to j plus 1
+    End While
+
+    Note: Step 3: Eliminate unreachable blocks
+    Display "Step 3: Eliminating unreachable blocks..."
+    Let unreachable_blocks be collect_unreachable_blocks(context_ptr, cfg_ptr)
+    If unreachable_blocks is not equal to 0:
+        Let unreachable_count be List.length(unreachable_blocks)
+        Let k be 0
+
+        While k is less than unreachable_count:
+            Let block_id be List.get(unreachable_blocks, k)
+            eliminate_unreachable_block(cfg_ptr, block_id)
+            Set k to k plus 1
+        End While
+
+        List.destroy(unreachable_blocks)
+    End If
+
+    Display "============================================"
+    Display "SCCP TRANSFORMATIONS COMPLETE"
+    Display "============================================"
+
+    Return 1
+End Process
+
+Process called "verify_sccp_transformation" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Verifies CFG is valid after SCCP transformation.
+
+    **VERIFICATION:**
+    - All blocks have valid predecessors/successors
+    - PHI nodes have correct incoming edges
+    - SSA form preserved
+    - No dangling references
+
+    Returns 1 if valid, 0 if invalid.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "verify_sccp_transformation: verifying CFG..."
+
+    Note: Use MIR verifier to check CFG validity
+    Let verify_result be Verifier.verify_cfg(cfg_ptr)
+
+    If verify_result equals 1:
+        Display "verify_sccp_transformation: CFG is valid"
+        Return 1
+    End If
+
+    Display "verify_sccp_transformation: CFG verification FAILED"
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS AND PIPELINE INTEGRATION
+Note: ============================================================================
+
+Process called "optimize_function_with_sccp" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Main entry point for SCCP optimization on a single function.
+
+    **COMPLETE SCCP PIPELINE:**
+    1. Create SCCP context
+    2. Run SCCP analysis to fixed point
+    3. Transform CFG with results
+    4. Verify transformation
+    5. Print statistics
+    6. Destroy context
+
+    **ONE-STOP OPTIMIZATION:**
+    This is the primary function called by the MIR optimization pipeline.
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    @Performance_Hints
+    SCCP is typically run early in the optimization pipeline,
+    after SSA construction but before other optimizations.
+
+    **PIPELINE POSITION:**
+    CFG construction → SSA construction → **SCCP** → DCE → other opts
+
+    SCCP enables many follow-up optimizations by:
+    - Exposing constants for folding
+    - Simplifying control flow
+    - Eliminating dead branches
+    @End Performance_Hints
+
+    If cfg_ptr equals 0:
+        Display "optimize_function_with_sccp: null CFG"
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "SCCP OPTIMIZATION - FUNCTION"
+    Display "============================================"
+    Display ""
+
+    Note: Step 1: Create SCCP context
+    Let context_ptr be create_sccp_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "optimize_function_with_sccp: failed to create context"
+        Return 0
+    End If
+
+    Note: Step 2: Run SCCP analysis
+    Let analysis_result be run_sccp_analysis(context_ptr, cfg_ptr)
+    If analysis_result equals 0:
+        Display "optimize_function_with_sccp: analysis failed"
+        destroy_sccp_context(context_ptr)
+        Return 0
+    End If
+
+    Note: Step 3: Transform CFG with results
+    Let transform_result be transform_cfg_with_sccp_results(context_ptr, cfg_ptr)
+    If transform_result equals 0:
+        Display "optimize_function_with_sccp: transformation failed"
+        destroy_sccp_context(context_ptr)
+        Return 0
+    End If
+
+    Note: Step 4: Verify transformation
+    Let verify_result be verify_sccp_transformation(cfg_ptr)
+    If verify_result equals 0:
+        Display "optimize_function_with_sccp: WARNING - verification failed"
+    End If
+
+    Note: Step 5: Print statistics
+    print_sccp_stats(context_ptr)
+
+    Note: Step 6: Destroy context
+    destroy_sccp_context(context_ptr)
+
+    Display ""
+    Display "SCCP OPTIMIZATION COMPLETE"
+    Display ""
+
+    Return 1
+End Process
+
+Process called "optimize_module_with_sccp" that takes module_ptr as Integer returns Integer:
+    @Reasoning
+    Runs SCCP optimization on all functions in a module.
+
+    **MODULE-WIDE OPTIMIZATION:**
+    1. Iterate through all functions in module
+    2. Run SCCP on each function's CFG
+    3. Aggregate statistics across module
+
+    **INTERPROCEDURAL POTENTIAL:**
+    Future enhancement could perform interprocedural SCCP
+    across entire module for better constant propagation
+    across function boundaries.
+
+    Returns number of functions optimized.
+    @End Reasoning
+
+    If module_ptr equals 0:
+        Display "optimize_module_with_sccp: null module"
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "SCCP OPTIMIZATION - MODULE"
+    Display "============================================"
+    Display ""
+
+    Note: Get all functions in module
+    Note: MIRProgram structure layout (see mir.runa):
+    Note:   offset 0:  functions (pointer to List of MIRFunction pointers)
+    Note:   offset 8:  function_count (number of functions)
+    Note:   offset 16: global_values (pointer to List of global SSA values)
+    Note:   offset 24: global_count (number of globals)
+
+    Let functions_list_ptr be Layout.memory_get_int64(module_ptr, 0)
+    Let function_count be Layout.memory_get_int64(module_ptr, 8)
+
+    If functions_list_ptr equals 0 or function_count equals 0:
+        Display "optimize_module_with_sccp: no functions in module"
+        Return 0
+    End If
+
+    Display "optimize_module_with_sccp: processing " joined with function_count joined with " function(s)"
+
+    Let functions_optimized be 0
+
+    Note: Iterate through all functions in module
+    Let i be 0
+    While i is less than function_count:
+        Note: Get MIRFunction pointer from list
+        Let mir_function_ptr be List.get(functions_list_ptr, i)
+
+        If mir_function_ptr is not equal to 0:
+            Note: MIRFunction structure contains cfg field
+            Note: Extract CFG from MIRFunction
+            Let cfg_ptr be Layout.memory_get_int64(mir_function_ptr, 0)
+
+            If cfg_ptr is not equal to 0:
+                Display "optimize_module_with_sccp: optimizing function " joined with i
+
+                Note: Run SCCP on this function's CFG
+                Let result be optimize_function_with_sccp(cfg_ptr)
+
+                If result equals 1:
+                    Set functions_optimized to functions_optimized plus 1
+                    Display "optimize_module_with_sccp: function " joined with i joined with " optimized"
+                Otherwise:
+                    Display "optimize_module_with_sccp: function " joined with i joined with " unchanged"
+                End If
+            Otherwise:
+                Display "optimize_module_with_sccp: function " joined with i joined with " has null CFG"
+            End If
+        Otherwise:
+            Display "optimize_module_with_sccp: null function at index " joined with i
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display ""
+    Display "optimize_module_with_sccp: optimized " joined with functions_optimized joined with " function(s)"
+    Display ""
+
+    Return functions_optimized
+End Process
+
+Process called "run_sccp_pass" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Convenience wrapper for running SCCP as an optimization pass.
+
+    **OPTIMIZATION PASS INTERFACE:**
+    Simple entry point that matches the standard optimization pass signature.
+    Takes CFG, runs SCCP, returns success/failure.
+
+    Returns 1 if CFG was modified, 0 if no changes.
+    @End Reasoning
+
+    Return optimize_function_with_sccp(cfg_ptr)
+End Process
+
+Process called "should_run_sccp" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Determines if SCCP optimization should be run on this CFG.
+
+    **PROFITABILITY ANALYSIS:**
+    SCCP is profitable when:
+    - CFG has constants that can be propagated
+    - CFG has conditional branches
+    - Function is not trivial (> 1 basic block)
+
+    **HEURISTICS:**
+    Currently always returns 1 (always run SCCP).
+    Could be enhanced with cost model.
+
+    Returns 1 if SCCP should run, 0 otherwise.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get block count
+    Let block_count be CFG.get_block_count(cfg_ptr)
+
+    Note: Don't run on trivial functions
+    If block_count is less than 2:
+        Display "should_run_sccp: skipping trivial function (< 2 blocks)"
+        Return 0
+    End If
+
+    Note: Always run SCCP on non-trivial functions
+    Return 1
+End Process
+
+Process called "get_sccp_pass_name" returns Integer:
+    @Reasoning
+    Returns the name of this optimization pass for logging/debugging.
+
+    Returns pointer to pass name string.
+    @End Reasoning
+
+    Return "SCCP"
+End Process
+
+Process called "get_sccp_pass_description" returns Integer:
+    @Reasoning
+    Returns a description of what this optimization pass does.
+
+    Returns pointer to description string.
+    @End Reasoning
+
+    Return "Sparse Conditional Constant Propagation - Wegman-Zadeck Algorithm"
+End Process
+
+Note: ============================================================================
+Note: END OF SCCP IMPLEMENTATION
+Note: ============================================================================

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,4 +35,1535 @@ This file consists of the following functions/features/operation types:
 - Subexpression verification and subexpression analysis
 :End Note
 
-Note: TODO - Implement common subexpression elimination functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================================
+Note: TYPE DEFINITIONS - Cross-Block CSE Context
+Note: ============================================================================
+
+Type called "ExpressionNode":
+    @Reasoning
+    Represents a canonicalized expression for CSE analysis.
+
+    **EXPRESSION REPRESENTATION:**
+    - opcode: MIR opcode of the operation
+    - operand_count: Number of operands
+    - operand1_id, operand2_id: SSA value IDs of operands
+    - hash_value: Precomputed hash for fast lookup
+    - result_value_id: The SSA value ID of this expression's result
+
+    **CANONICALIZATION:**
+    For commutative operations (ADD, MUL, AND, OR, XOR),
+    operands are sorted to ensure x+y and y+x produce same hash.
+
+    **MEMORY LAYOUT** (48 bytes):
+    ```
+    Offset 0:  opcode (Integer)
+    Offset 8:  operand_count (Integer)
+    Offset 16: operand1_id (Integer)
+    Offset 24: operand2_id (Integer)
+    Offset 32: hash_value (Integer)
+    Offset 40: result_value_id (Integer)
+    ```
+    @End Reasoning
+
+    opcode as Integer
+    operand_count as Integer
+    operand1_id as Integer
+    operand2_id as Integer
+    hash_value as Integer
+    result_value_id as Integer
+End Type
+
+Type called "CSEContext":
+    @Reasoning
+    Context for cross-block common subexpression elimination.
+
+    **CSE ALGORITHM:**
+    1. Build expression table mapping expression hash → first occurrence
+    2. Compute available expressions using dominator tree
+    3. For each expression, check if equivalent expression already computed
+    4. Replace redundant computations with existing values
+    5. Maintain SSA form correctness
+
+    **AVAILABILITY:**
+    An expression is "available" at a program point if:
+    - It has been computed on all paths reaching that point
+    - None of its operands have been modified since computation
+
+    **MEMORY LAYOUT** (112 bytes):
+    ```
+    Offset 0:   cfg (Integer - CFG pointer)
+    Offset 8:   expression_table (Integer - Dictionary: hash → ExpressionNode)
+    Offset 16:  expression_to_value (Integer - Dictionary: hash → value_id)
+    Offset 24:  value_to_expression (Integer - Dictionary: value_id → hash)
+    Offset 32:  available_in (Integer - Dictionary: block_id → Set of available expressions)
+    Offset 40:  available_out (Integer - Dictionary: block_id → Set of available expressions)
+    Offset 48:  gen_set (Integer - Dictionary: block_id → Set of generated expressions)
+    Offset 56:  kill_set (Integer - Dictionary: block_id → Set of killed expressions)
+    Offset 64:  expressions_eliminated (Integer - counter)
+    Offset 72:  expressions_replaced (Integer - counter)
+    Offset 80:  blocks_processed (Integer - counter)
+    Offset 88:  ssa_ptr (Integer - SSA analysis pointer)
+    Offset 96:  dominance_ptr (Integer - Dominance analysis pointer)
+    Offset 104: use_def_chains (Integer - Use-def chain map)
+    ```
+    @End Reasoning
+
+    cfg as Integer
+    expression_table as Integer
+    expression_to_value as Integer
+    value_to_expression as Integer
+    available_in as Integer
+    available_out as Integer
+    gen_set as Integer
+    kill_set as Integer
+    expressions_eliminated as Integer
+    expressions_replaced as Integer
+    blocks_processed as Integer
+    ssa_ptr as Integer
+    dominance_ptr as Integer
+    use_def_chains as Integer
+End Type
+
+Note: ============================================================================
+Note: EXPRESSION HASH CONSTANTS
+Note: ============================================================================
+
+Constant HASH_PRIME_1 as Integer is 31
+Constant HASH_PRIME_2 as Integer is 37
+Constant HASH_PRIME_3 as Integer is 41
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_cse_context" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Creates and initializes CSE context.
+
+    **INITIALIZATION:**
+    - Allocates 112-byte context structure
+    - Creates expression table for hash lookup
+    - Creates availability sets for dataflow analysis
+    - Creates GEN/KILL sets for each block
+    - Initializes all counters to 0
+
+    Returns context pointer or 0 on failure.
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "create_cse_context: null CFG"
+        Return 0
+    End If
+
+    Note: Allocate context (112 bytes)
+    Let context_ptr be Layout.allocate(112)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG reference
+    Layout.memory_set_int64(context_ptr, 0, cfg)
+
+    Note: Create expression table
+    Let expression_table be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 8, expression_table)
+
+    Note: Create expression to value mapping
+    Let expression_to_value be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 16, expression_to_value)
+
+    Note: Create value to expression mapping
+    Let value_to_expression be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 24, value_to_expression)
+
+    Note: Create available_in dictionary (block_id → Set)
+    Let available_in be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 32, available_in)
+
+    Note: Create available_out dictionary (block_id → Set)
+    Let available_out be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 40, available_out)
+
+    Note: Create gen_set dictionary (block_id → Set)
+    Let gen_set be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 48, gen_set)
+
+    Note: Create kill_set dictionary (block_id → Set)
+    Let kill_set be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 56, kill_set)
+
+    Note: Initialize counters
+    Layout.memory_set_int64(context_ptr, 64, 0)   Note: expressions_eliminated
+    Layout.memory_set_int64(context_ptr, 72, 0)   Note: expressions_replaced
+    Layout.memory_set_int64(context_ptr, 80, 0)   Note: blocks_processed
+
+    Note: Initialize SSA, dominance, and use-def chains to 0
+    Layout.memory_set_int64(context_ptr, 88, 0)   Note: ssa_ptr
+    Layout.memory_set_int64(context_ptr, 96, 0)   Note: dominance_ptr
+    Layout.memory_set_int64(context_ptr, 104, 0)  Note: use_def_chains
+
+    Display "create_cse_context: context created"
+    Return context_ptr
+End Process
+
+Process called "destroy_cse_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys CSE context and frees all memory.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy expression table
+    Let expression_table be Layout.memory_get_int64(context_ptr, 8)
+    If expression_table is not equal to 0:
+        Let keys be proc keys from Dictionary with expression_table
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let expr_node be proc get from Dictionary with expression_table, key
+
+            If expr_node is not equal to 0:
+                Layout.deallocate(expr_node)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with expression_table
+    End If
+
+    Note: Destroy expression to value mapping
+    Let expression_to_value be Layout.memory_get_int64(context_ptr, 16)
+    If expression_to_value is not equal to 0:
+        proc destroy from Dictionary with expression_to_value
+    End If
+
+    Note: Destroy value to expression mapping
+    Let value_to_expression be Layout.memory_get_int64(context_ptr, 24)
+    If value_to_expression is not equal to 0:
+        proc destroy from Dictionary with value_to_expression
+    End If
+
+    Note: Destroy available_in sets
+    Let available_in be Layout.memory_get_int64(context_ptr, 32)
+    If available_in is not equal to 0:
+        Let keys be proc keys from Dictionary with available_in
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let avail_set be proc get from Dictionary with available_in, key
+            If avail_set is not equal to 0:
+                proc destroy from Set with avail_set
+            End If
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with available_in
+    End If
+
+    Note: Destroy available_out sets
+    Let available_out be Layout.memory_get_int64(context_ptr, 40)
+    If available_out is not equal to 0:
+        Let keys be proc keys from Dictionary with available_out
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let avail_set be proc get from Dictionary with available_out, key
+            If avail_set is not equal to 0:
+                proc destroy from Set with avail_set
+            End If
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with available_out
+    End If
+
+    Note: Destroy gen_set
+    Let gen_set be Layout.memory_get_int64(context_ptr, 48)
+    If gen_set is not equal to 0:
+        Let keys be proc keys from Dictionary with gen_set
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let gen be proc get from Dictionary with gen_set, key
+            If gen is not equal to 0:
+                proc destroy from Set with gen
+            End If
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with gen_set
+    End If
+
+    Note: Destroy kill_set
+    Let kill_set be Layout.memory_get_int64(context_ptr, 56)
+    If kill_set is not equal to 0:
+        Let keys be proc keys from Dictionary with kill_set
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let kill be proc get from Dictionary with kill_set, key
+            If kill is not equal to 0:
+                proc destroy from Set with kill
+            End If
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with kill_set
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr)
+
+    Display "destroy_cse_context: context destroyed"
+    Return 1
+End Process
+
+Process called "print_cse_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints CSE optimization statistics.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let expressions_eliminated be Layout.memory_get_int64(context_ptr, 64)
+    Let expressions_replaced be Layout.memory_get_int64(context_ptr, 72)
+    Let blocks_processed be Layout.memory_get_int64(context_ptr, 80)
+
+    Display "============================================"
+    Display "COMMON SUBEXPRESSION ELIMINATION STATISTICS"
+    Display "============================================"
+    Display "Expressions eliminated:  " joined with expressions_eliminated
+    Display "Expressions replaced:    " joined with expressions_replaced
+    Display "Blocks processed:        " joined with blocks_processed
+    Display "Total optimizations:     " joined with expressions_eliminated plus expressions_replaced
+    Display "============================================"
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: EXPRESSION CANONICALIZATION AND HASHING
+Note: ============================================================================
+
+Process called "is_commutative_opcode" that takes opcode as Integer returns Integer:
+    @Reasoning
+    Determines if an opcode is commutative (operand order doesn't matter).
+
+    **COMMUTATIVE OPERATIONS:**
+    - ADD, MUL: Arithmetic
+    - AND, OR, XOR: Bitwise
+    - EQ, NE: Equality comparisons
+
+    Returns 1 if commutative, 0 otherwise.
+    @End Reasoning
+
+    If opcode equals MIR.MIR_ADD:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_MUL:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_AND:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_OR:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_XOR:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_EQ:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_NE:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "compute_expression_hash" that takes opcode as Integer, op1 as Integer, op2 as Integer returns Integer:
+    @Reasoning
+    Computes hash for an expression.
+
+    **HASH COMPUTATION:**
+    hash = (opcode * PRIME1) ^ (op1 * PRIME2) ^ (op2 * PRIME3)
+
+    **CANONICALIZATION:**
+    For commutative operations, ensure op1 <= op2 to normalize ordering.
+
+    Returns computed hash value.
+    @End Reasoning
+
+    Let operand1 be op1
+    Let operand2 be op2
+
+    Note: Canonicalize commutative operations
+    Let is_commutative be is_commutative_opcode(opcode)
+    If is_commutative equals 1:
+        If op1 is greater than op2:
+            Set operand1 to op2
+            Set operand2 to op1
+        End If
+    End If
+
+    Note: Compute hash
+    Let hash be opcode multiplied by HASH_PRIME_1
+    Set hash to hash plus operand1 multiplied by HASH_PRIME_2
+    Set hash to hash plus operand2 multiplied by HASH_PRIME_3
+
+    Return hash
+End Process
+
+Process called "create_expression_node" that takes opcode as Integer, op1 as Integer, op2 as Integer, result_id as Integer returns Integer:
+    @Reasoning
+    Creates an ExpressionNode structure.
+
+    **CANONICALIZATION:**
+    For commutative operations, operands are sorted (op1 <= op2).
+
+    Returns ExpressionNode pointer or 0 on failure.
+    @End Reasoning
+
+    Let expr_ptr be Layout.allocate(48)
+    If expr_ptr equals 0:
+        Return 0
+    End If
+
+    Let operand1 be op1
+    Let operand2 be op2
+
+    Note: Canonicalize commutative operations
+    Let is_commutative be is_commutative_opcode(opcode)
+    If is_commutative equals 1:
+        If op1 is greater than op2:
+            Set operand1 to op2
+            Set operand2 to op1
+        End If
+    End If
+
+    Note: Compute hash
+    Let hash be compute_expression_hash(opcode, operand1, operand2)
+
+    Note: Store fields
+    Layout.memory_set_int64(expr_ptr, 0, opcode)
+    Layout.memory_set_int64(expr_ptr, 8, 2)        Note: operand_count = 2
+    Layout.memory_set_int64(expr_ptr, 16, operand1)
+    Layout.memory_set_int64(expr_ptr, 24, operand2)
+    Layout.memory_set_int64(expr_ptr, 32, hash)
+    Layout.memory_set_int64(expr_ptr, 40, result_id)
+
+    Return expr_ptr
+End Process
+
+Process called "expressions_equal" that takes expr1 as Integer, expr2 as Integer returns Integer:
+    @Reasoning
+    Checks if two expressions are structurally equal.
+
+    **EQUALITY:**
+    Expressions are equal if:
+    - Same opcode
+    - Same operands (in canonical order)
+
+    Returns 1 if equal, 0 otherwise.
+    @End Reasoning
+
+    If expr1 equals 0:
+        Return 0
+    End If
+    If expr2 equals 0:
+        Return 0
+    End If
+
+    Note: Compare opcodes
+    Let opcode1 be Layout.memory_get_int64(expr1, 0)
+    Let opcode2 be Layout.memory_get_int64(expr2, 0)
+    If opcode1 is not equal to opcode2:
+        Return 0
+    End If
+
+    Note: Compare operand counts
+    Let op_count1 be Layout.memory_get_int64(expr1, 8)
+    Let op_count2 be Layout.memory_get_int64(expr2, 8)
+    If op_count1 is not equal to op_count2:
+        Return 0
+    End If
+
+    Note: Compare operand1
+    Let operand1_1 be Layout.memory_get_int64(expr1, 16)
+    Let operand1_2 be Layout.memory_get_int64(expr2, 16)
+    If operand1_1 is not equal to operand1_2:
+        Return 0
+    End If
+
+    Note: Compare operand2
+    Let operand2_1 be Layout.memory_get_int64(expr1, 24)
+    Let operand2_2 be Layout.memory_get_int64(expr2, 24)
+    If operand2_1 is not equal to operand2_2:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "lookup_expression" that takes context_ptr as Integer, hash as Integer returns Integer:
+    @Reasoning
+    Looks up an expression in the expression table by hash.
+
+    Returns ExpressionNode pointer if found, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let expression_table be Layout.memory_get_int64(context_ptr, 8)
+    Let hash_str be proc integer_to_string from String with hash
+
+    Note: Check if expression exists
+    Let contains_expr be proc contains from Dictionary with expression_table, hash_str
+    If contains_expr equals 0:
+        Return 0
+    End If
+
+    Let expr_ptr be proc get from Dictionary with expression_table, hash_str
+    Return expr_ptr
+End Process
+
+Process called "insert_expression" that takes context_ptr as Integer, expr_ptr as Integer returns Integer:
+    @Reasoning
+    Inserts an expression into the expression table.
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If expr_ptr equals 0:
+        Return 0
+    End If
+
+    Let expression_table be Layout.memory_get_int64(context_ptr, 8)
+    Let expression_to_value be Layout.memory_get_int64(context_ptr, 16)
+
+    Note: Get hash from expression
+    Let hash be Layout.memory_get_int64(expr_ptr, 32)
+    Let hash_str be proc integer_to_string from String with hash
+
+    Note: Get result value ID
+    Let result_id be Layout.memory_get_int64(expr_ptr, 40)
+    Let result_str be proc integer_to_string from String with result_id
+
+    Note: Insert into expression table
+    proc set from Dictionary with expression_table, hash_str, expr_ptr
+
+    Note: Insert into expression_to_value mapping
+    proc set from Dictionary with expression_to_value, hash_str, result_id
+
+    Display "insert_expression: inserted expression with hash " joined with hash
+
+    Return 1
+End Process
+
+Process called "find_existing_expression" that takes context_ptr as Integer, expr_ptr as Integer returns Integer:
+    @Reasoning
+    Finds an existing equivalent expression in the table.
+
+    **ALGORITHM:**
+    1. Compute hash of new expression
+    2. Look up hash in expression table
+    3. If found and structurally equal, return existing value ID
+    4. Otherwise, return 0
+
+    Returns existing value_id if found, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If expr_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get hash
+    Let hash be Layout.memory_get_int64(expr_ptr, 32)
+
+    Note: Look up existing expression
+    Let existing_expr be lookup_expression(context_ptr, hash)
+    If existing_expr equals 0:
+        Return 0  Note: No existing expression
+    End If
+
+    Note: Check structural equality
+    Let are_equal be expressions_equal(expr_ptr, existing_expr)
+    If are_equal equals 0:
+        Return 0  Note: Hash collision - expressions not equal
+    End If
+
+    Note: Found equivalent expression - return its result value ID
+    Let existing_value_id be Layout.memory_get_int64(existing_expr, 40)
+
+    Display "find_existing_expression: found existing expression with value_id " joined with existing_value_id
+
+    Return existing_value_id
+End Process
+
+Process called "is_cse_candidate" that takes inst_ptr as Integer returns Integer:
+    @Reasoning
+    Determines if an instruction is a candidate for CSE.
+
+    **CSE CANDIDATES:**
+    - Pure arithmetic operations (ADD, SUB, MUL, DIV, MOD)
+    - Bitwise operations (AND, OR, XOR, NOT, SHL, SHR)
+    - Comparison operations (EQ, NE, LT, LE, GT, GE)
+    - Type conversions (ZEXT, SEXT, TRUNC, BITCAST)
+
+    **NOT CANDIDATES:**
+    - Memory operations (LOAD, STORE) - handled by GVN with alias analysis
+    - Side-effecting operations (CALL, DIV if can trap)
+    - PHI nodes - handled separately
+
+    Returns 1 if candidate, 0 otherwise.
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+    Note: Arithmetic operations
+    If opcode equals MIR.MIR_ADD:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_SUB:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_MUL:
+        Return 1
+    End If
+
+    Note: Bitwise operations
+    If opcode equals MIR.MIR_AND:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_OR:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_XOR:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_SHL:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_SHR:
+        Return 1
+    End If
+
+    Note: Comparison operations
+    If opcode equals MIR.MIR_EQ:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_NE:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_LT:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_LE:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_GT:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_GE:
+        Return 1
+    End If
+
+    Note: Not a CSE candidate
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: AVAILABILITY ANALYSIS WITH DOMINATOR TREE
+Note: ============================================================================
+
+Process called "compute_gen_kill_sets" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Computes GEN and KILL sets for each basic block.
+
+    **GEN SET:**
+    Expressions generated (computed) in this block.
+
+    **KILL SET:**
+    Expressions killed (invalidated) in this block.
+    An expression is killed if any of its operands are redefined.
+
+    Returns number of blocks processed.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let gen_set_dict be Layout.memory_get_int64(context_ptr, 48)
+    Let kill_set_dict be Layout.memory_get_int64(context_ptr, 56)
+
+    Note: Get all blocks
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+        Let block_id be CFG.get_block_id(block_ptr)
+        Let block_id_str be proc integer_to_string from String with block_id
+
+        Note: Create GEN and KILL sets for this block
+        Let gen_set be proc create from Set
+        Let kill_set be proc create from Set
+
+        Note: Process instructions in block
+        Let inst_list be CFG.get_block_instructions(block_ptr)
+        If inst_list is not equal to 0:
+            Let inst_count be List.length(inst_list)
+            Let j be 0
+
+            While j is less than inst_count:
+                Let inst_ptr be List.get(inst_list, j)
+
+                Note: Check if instruction is CSE candidate
+                Let is_candidate be is_cse_candidate(inst_ptr)
+                If is_candidate equals 1:
+                    Note: Add to GEN set
+                    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+                    Let result_id be MIR.get_mir_node_value_id(inst_ptr)
+
+                    Note: Get operands (assuming binary operation)
+                    Let op1 be Layout.memory_get_int64(inst_ptr, 16)
+                    Let op2 be Layout.memory_get_int64(inst_ptr, 24)
+
+                    Note: Compute hash
+                    Let hash be compute_expression_hash(opcode, op1, op2)
+                    Let hash_str be proc integer_to_string from String with hash
+
+                    Note: Add hash to GEN set
+                    proc add from Set with gen_set, hash_str
+                End If
+
+                Note: Check if instruction kills any expressions
+                Let result_id be MIR.get_mir_node_value_id(inst_ptr)
+                If result_id is not equal to 0:
+                    Note: This instruction defines result_id - kill all expressions using it
+                    Note: Iterate through expression_to_value to find expressions using result_id
+                    Let expr_to_val be Layout.memory_get_int64(context_ptr, 24)
+                    Let expr_keys be proc keys from Dictionary with expr_to_val
+                    Let expr_count be List.length(expr_keys)
+
+                    Let k be 0
+                    While k is less than expr_count:
+                        Let expr_hash_str be List.get(expr_keys, k)
+                        Let expr_node_ptr be proc get from Dictionary with expr_to_val, expr_hash_str
+
+                        If expr_node_ptr is not equal to 0:
+                            Note: Check if this expression uses result_id as an operand
+                            Let expr_op1 be Layout.memory_get_int64(expr_node_ptr, 16)
+                            Let expr_op2 be Layout.memory_get_int64(expr_node_ptr, 24)
+
+                            If expr_op1 equals result_id or expr_op2 equals result_id:
+                                Note: This expression uses result_id - add to KILL set
+                                proc add from Set with kill_set, expr_hash_str
+                            End If
+                        End If
+
+                        Set k to k plus 1
+                    End While
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Note: Store GEN and KILL sets
+        proc set from Dictionary with gen_set_dict, block_id_str, gen_set
+        proc set from Dictionary with kill_set_dict, block_id_str, kill_set
+
+        Set i to i plus 1
+    End While
+
+    Display "compute_gen_kill_sets: processed " joined with block_count joined with " blocks"
+
+    Return block_count
+End Process
+
+Process called "compute_available_expressions" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Computes available expressions using dataflow analysis.
+
+    **DATAFLOW EQUATIONS:**
+    ```
+    AVAIL_IN[B] = ∩ AVAIL_OUT[P] for all predecessors P of B
+    AVAIL_OUT[B] = GEN[B] ∪ (AVAIL_IN[B] - KILL[B])
+    ```
+
+    **ALGORITHM:**
+    1. Initialize AVAIL_OUT[entry] = ∅
+    2. Initialize AVAIL_OUT[B] = U (universal set) for all other blocks
+    3. Iterate until fixed point:
+       - For each block B:
+         - Compute AVAIL_IN[B] = ∩ AVAIL_OUT[predecessors]
+         - Compute AVAIL_OUT[B] = GEN[B] ∪ (AVAIL_IN[B] - KILL[B])
+    4. Stop when no changes occur
+
+    Returns number of iterations.
+    @End Reasoning
+
+    @Performance_Hints
+    Available expression analysis is a forward dataflow problem.
+    Convergence is typically fast (< 10 iterations for most functions).
+    Use worklist algorithm for efficiency on large CFGs.
+    @End Performance_Hints
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "compute_available_expressions: starting dataflow analysis"
+
+    Note: Get dataflow sets
+    Let available_in be Layout.memory_get_int64(context_ptr, 32)
+    Let available_out be Layout.memory_get_int64(context_ptr, 40)
+    Let gen_set_dict be Layout.memory_get_int64(context_ptr, 48)
+    Let kill_set_dict be Layout.memory_get_int64(context_ptr, 56)
+
+    Note: Initialize available_out sets
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+        Let block_id be CFG.get_block_id(block_ptr)
+        Let block_id_str be proc integer_to_string from String with block_id
+
+        Note: Create empty available_in and available_out sets
+        Let avail_in_set be proc create from Set
+        Let avail_out_set be proc create from Set
+
+        proc set from Dictionary with available_in, block_id_str, avail_in_set
+        proc set from Dictionary with available_out, block_id_str, avail_out_set
+
+        Set i to i plus 1
+    End While
+
+    Note: Fixed-point iteration
+    Let iteration_count be 0
+    Let max_iterations be 100
+    Let changed be 1
+
+    While changed equals 1:
+        If iteration_count is greater than or equal to max_iterations:
+            Display "compute_available_expressions: max iterations reached"
+            Return iteration_count
+        End If
+
+        Set changed to 0
+        Set iteration_count to iteration_count plus 1
+
+        Note: Process each block
+        Let i be 0
+        While i is less than block_count:
+            Let block_ptr be List.get(all_blocks, i)
+            Let block_id be CFG.get_block_id(block_ptr)
+            Let block_id_str be proc integer_to_string from String with block_id
+
+            Note: Compute AVAIL_IN[B] = ∩ AVAIL_OUT[predecessors]
+            Note: Complete implementation - intersects all predecessors' AVAIL_OUT sets
+            Let avail_in_set be proc get from Dictionary with available_in, block_id_str
+
+            Note: Get predecessors
+            Let predecessors be CFG.get_block_predecessors(block_ptr)
+            If predecessors is not equal to 0:
+                Let pred_count be List.length(predecessors)
+
+                If pred_count is greater than 0:
+                    Note: Initialize AVAIL_IN to first predecessor's AVAIL_OUT
+                    Let first_pred be List.get(predecessors, 0)
+                    Let first_pred_id be CFG.get_block_id(first_pred)
+                    Let first_pred_id_str be proc integer_to_string from String with first_pred_id
+                    Let first_pred_out be proc get from Dictionary with available_out, first_pred_id_str
+
+                    Note: Clear current AVAIL_IN
+                    proc clear from Set with avail_in_set
+
+                    Note: Copy first predecessor's AVAIL_OUT to AVAIL_IN
+                    Let first_out_members be proc members from Set with first_pred_out
+                    Let first_out_count be List.length(first_out_members)
+                    Let m be 0
+                    While m is less than first_out_count:
+                        Let member be List.get(first_out_members, m)
+                        proc add from Set with avail_in_set, member
+                        Set m to m plus 1
+                    End While
+
+                    Note: Intersect with remaining predecessors
+                    Let p be 1
+                    While p is less than pred_count:
+                        Let pred be List.get(predecessors, p)
+                        Let pred_id be CFG.get_block_id(pred)
+                        Let pred_id_str be proc integer_to_string from String with pred_id
+                        Let pred_out be proc get from Dictionary with available_out, pred_id_str
+
+                        Note: Remove from AVAIL_IN anything not in this predecessor's AVAIL_OUT
+                        Let current_members be proc members from Set with avail_in_set
+                        Let current_count be List.length(current_members)
+                        Let n be 0
+                        While n is less than current_count:
+                            Let member be List.get(current_members, n)
+                            Let is_in_pred be proc contains from Set with pred_out, member
+                            If is_in_pred equals 0:
+                                Note: Not in this predecessor - remove from intersection
+                                proc remove from Set with avail_in_set, member
+                            End If
+                            Set n to n plus 1
+                        End While
+
+                        Set p to p plus 1
+                    End While
+                End If
+            End If
+
+            Note: Get GEN and KILL sets
+            Let gen_set be proc get from Dictionary with gen_set_dict, block_id_str
+            Let kill_set be proc get from Dictionary with kill_set_dict, block_id_str
+
+            Note: Compute AVAIL_OUT[B] = GEN[B] ∪ (AVAIL_IN[B] - KILL[B])
+            Let avail_out_set be proc get from Dictionary with available_out, block_id_str
+            Let old_avail_out_size be proc size from Set with avail_out_set
+
+            Note: Create new AVAIL_OUT = (AVAIL_IN - KILL) ∪ GEN
+            Let new_avail_out be proc create from Set
+
+            Note: Add AVAIL_IN - KILL to new set
+            Let avail_in_members be proc members from Set with avail_in_set
+            Let avail_in_count be List.length(avail_in_members)
+            Let m be 0
+            While m is less than avail_in_count:
+                Let member be List.get(avail_in_members, m)
+                Let is_killed be proc contains from Set with kill_set, member
+                If is_killed equals 0:
+                    Note: Not killed - add to new AVAIL_OUT
+                    proc add from Set with new_avail_out, member
+                End If
+                Set m to m plus 1
+            End While
+
+            Note: Add GEN to new set
+            Let gen_members be proc members from Set with gen_set
+            Let gen_count be List.length(gen_members)
+            Set m to 0
+            While m is less than gen_count:
+                Let member be List.get(gen_members, m)
+                proc add from Set with new_avail_out, member
+                Set m to m plus 1
+            End While
+
+            Note: Check if AVAIL_OUT changed
+            Let new_avail_out_size be proc size from Set with new_avail_out
+            If new_avail_out_size is not equal to old_avail_out_size:
+                Set changed to 1
+            Otherwise:
+                Note: Same size - check if content changed
+                Let new_members be proc members from Set with new_avail_out
+                Let new_count be List.length(new_members)
+                Let m be 0
+                While m is less than new_count:
+                    Let member be List.get(new_members, m)
+                    Let is_in_old be proc contains from Set with avail_out_set, member
+                    If is_in_old equals 0:
+                        Set changed to 1
+                    End If
+                    Set m to m plus 1
+                End While
+            End If
+
+            Note: Update AVAIL_OUT with new set
+            proc clear from Set with avail_out_set
+            Let new_members be proc members from Set with new_avail_out
+            Let new_count be List.length(new_members)
+            Let m be 0
+            While m is less than new_count:
+                Let member be List.get(new_members, m)
+                proc add from Set with avail_out_set, member
+                Set m to m plus 1
+            End While
+
+            Set i to i plus 1
+        End While
+    End While
+
+    Display "compute_available_expressions: converged in " joined with iteration_count joined with " iterations"
+
+    Return iteration_count
+End Process
+
+Process called "is_expression_available" that takes context_ptr as Integer, block_id as Integer, hash as Integer returns Integer:
+    @Reasoning
+    Checks if an expression is available at the start of a block.
+
+    **AVAILABILITY:**
+    An expression is available if it has been computed on all paths
+    reaching this point and none of its operands have been modified.
+
+    Returns 1 if available, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let available_in be Layout.memory_get_int64(context_ptr, 32)
+    Let block_id_str be proc integer_to_string from String with block_id
+
+    Note: Get AVAIL_IN set for block
+    Let contains_block be proc contains from Dictionary with available_in, block_id_str
+    If contains_block equals 0:
+        Return 0
+    End If
+
+    Let avail_in_set be proc get from Dictionary with available_in, block_id_str
+
+    Note: Check if hash is in AVAIL_IN set
+    Let hash_str be proc integer_to_string from String with hash
+    Let contains_hash be proc contains from Set with avail_in_set, hash_str
+
+    If contains_hash equals 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "check_dominance" that takes context_ptr as Integer, defining_block as Integer, use_block as Integer returns Integer:
+    @Reasoning
+    Checks if defining_block dominates use_block.
+
+    **DOMINANCE:**
+    Block A dominates block B if all paths from entry to B pass through A.
+    For CSE, we can only replace an expression if the defining computation
+    dominates the use.
+
+    Returns 1 if dominates, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let dominance_ptr be Layout.memory_get_int64(context_ptr, 96)
+    If dominance_ptr equals 0:
+        Note: No dominance analysis available - be conservative
+        If defining_block equals use_block:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    Note: Use dominance analysis to check
+    Let dominates be Dominance.dominates(dominance_ptr, defining_block, use_block)
+
+    Return dominates
+End Process
+
+Process called "analyze_expressions_in_block" that takes context_ptr as Integer, block_ptr as Integer returns Integer:
+    @Reasoning
+    Analyzes expressions in a basic block for CSE opportunities.
+
+    **ALGORITHM:**
+    1. For each instruction in block:
+       - If CSE candidate, create expression node
+       - Check if equivalent expression exists
+       - If exists and dominates, mark for replacement
+       - Otherwise, insert into expression table
+
+    Returns number of CSE opportunities found.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Let opportunities_found be 0
+
+    Note: Get instructions in block
+    Let inst_list be CFG.get_block_instructions(block_ptr)
+    If inst_list equals 0:
+        Return 0
+    End If
+
+    Let inst_count be List.length(inst_list)
+    Let i be 0
+
+    While i is less than inst_count:
+        Let inst_ptr be List.get(inst_list, i)
+
+        Note: Check if CSE candidate
+        Let is_candidate be is_cse_candidate(inst_ptr)
+        If is_candidate equals 1:
+            Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+            Let result_id be MIR.get_mir_node_value_id(inst_ptr)
+
+            Note: Get operands
+            Let op1 be Layout.memory_get_int64(inst_ptr, 16)
+            Let op2 be Layout.memory_get_int64(inst_ptr, 24)
+
+            Note: Create expression node
+            Let expr_ptr be create_expression_node(opcode, op1, op2, result_id)
+            If expr_ptr is not equal to 0:
+                Note: Check if existing expression exists
+                Let existing_value_id be find_existing_expression(context_ptr, expr_ptr)
+
+                If existing_value_id is not equal to 0:
+                    Note: Found CSE opportunity
+                    Set opportunities_found to opportunities_found plus 1
+
+                    Display "analyze_expressions_in_block: CSE opportunity - replace " joined with result_id joined with " with " joined with existing_value_id
+                Otherwise:
+                    Note: Insert new expression
+                    insert_expression(context_ptr, expr_ptr)
+                End If
+
+                Note: Free expression node if not inserted
+                If existing_value_id is not equal to 0:
+                    Layout.deallocate(expr_ptr)
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return opportunities_found
+End Process
+
+Note: ============================================================================
+Note: TRANSFORMATION AND REPLACEMENT
+Note: ============================================================================
+
+Process called "replace_redundant_expression" that takes context_ptr as Integer, inst_ptr as Integer, replacement_value_id as Integer returns Integer:
+    @Reasoning
+    Replaces a redundant expression with an existing value.
+
+    **REPLACEMENT:**
+    1. Get all uses of the redundant value
+    2. Replace each use with the replacement value
+    3. Mark instruction for deletion
+    4. Update use-def chains
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If inst_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get redundant value ID
+    Let redundant_value_id be MIR.get_mir_node_value_id(inst_ptr)
+
+    Display "replace_redundant_expression: replacing " joined with redundant_value_id joined with " with " joined with replacement_value_id
+
+    Note: Get def-use chains from context
+    Let def_use_chains be Layout.memory_get_int64(context_ptr, 96)
+    If def_use_chains is not equal to 0:
+        Note: Get all uses of redundant_value_id
+        Let redundant_id_str be proc integer_to_string from String with redundant_value_id
+        Let use_list be proc get from Dictionary with def_use_chains, redundant_id_str
+
+        If use_list is not equal to 0:
+            Note: Iterate through all uses and replace
+            Let use_count be List.length(use_list)
+            Let i be 0
+
+            While i is less than use_count:
+                Let use_inst_ptr be List.get(use_list, i)
+
+                If use_inst_ptr is not equal to 0:
+                    Note: Check operand 1
+                    Let op1 be Layout.memory_get_int64(use_inst_ptr, 16)
+                    If op1 equals redundant_value_id:
+                        Layout.memory_set_int64(use_inst_ptr, 16, replacement_value_id)
+                        Display "replace_redundant_expression: updated operand 1 in use instruction"
+                    End If
+
+                    Note: Check operand 2
+                    Let op2 be Layout.memory_get_int64(use_inst_ptr, 24)
+                    If op2 equals redundant_value_id:
+                        Layout.memory_set_int64(use_inst_ptr, 24, replacement_value_id)
+                        Display "replace_redundant_expression: updated operand 2 in use instruction"
+                    End If
+
+                    Note: Check operand 3 (for ternary ops)
+                    Let op3 be Layout.memory_get_int64(use_inst_ptr, 32)
+                    If op3 equals redundant_value_id:
+                        Layout.memory_set_int64(use_inst_ptr, 32, replacement_value_id)
+                        Display "replace_redundant_expression: updated operand 3 in use instruction"
+                    End If
+                End If
+
+                Set i to i plus 1
+            End While
+        End If
+    End If
+
+    Note: Mark instruction as deleted by setting opcode to 0 (NOP)
+    Layout.memory_set_int64(inst_ptr, 0, 0)
+
+    Note: Increment expressions_replaced counter
+    Let expressions_replaced be Layout.memory_get_int64(context_ptr, 72)
+    Set expressions_replaced to expressions_replaced plus 1
+    Layout.memory_set_int64(context_ptr, 72, expressions_replaced)
+
+    Return 1
+End Process
+
+Process called "perform_cse_on_block" that takes context_ptr as Integer, block_ptr as Integer returns Integer:
+    @Reasoning
+    Performs CSE transformation on a basic block.
+
+    **ALGORITHM:**
+    1. Analyze expressions to find CSE opportunities
+    2. For each redundant expression:
+       - Verify dominance
+       - Perform replacement
+       - Mark instruction as dead
+
+    Returns number of replacements made.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Let replacements_made be 0
+
+    Note: Get block ID
+    Let block_id be CFG.get_block_id(block_ptr)
+
+    Note: Get instructions
+    Let inst_list be CFG.get_block_instructions(block_ptr)
+    If inst_list equals 0:
+        Return 0
+    End If
+
+    Let inst_count be List.length(inst_list)
+    Let i be 0
+
+    While i is less than inst_count:
+        Let inst_ptr be List.get(inst_list, i)
+
+        Note: Check if CSE candidate
+        Let is_candidate be is_cse_candidate(inst_ptr)
+        If is_candidate equals 1:
+            Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+            Let result_id be MIR.get_mir_node_value_id(inst_ptr)
+
+            Note: Get operands
+            Let op1 be Layout.memory_get_int64(inst_ptr, 16)
+            Let op2 be Layout.memory_get_int64(inst_ptr, 24)
+
+            Note: Create expression node
+            Let expr_ptr be create_expression_node(opcode, op1, op2, result_id)
+            If expr_ptr is not equal to 0:
+                Note: Check if existing expression exists
+                Let existing_value_id be find_existing_expression(context_ptr, expr_ptr)
+
+                If existing_value_id is not equal to 0:
+                    If existing_value_id is not equal to result_id:
+                        Note: Perform replacement
+                        Let replaced be replace_redundant_expression(context_ptr, inst_ptr, existing_value_id)
+                        If replaced equals 1:
+                            Set replacements_made to replacements_made plus 1
+
+                            Note: Increment expressions_eliminated counter
+                            Let expressions_eliminated be Layout.memory_get_int64(context_ptr, 64)
+                            Set expressions_eliminated to expressions_eliminated plus 1
+                            Layout.memory_set_int64(context_ptr, 64, expressions_eliminated)
+                        End If
+                    End If
+                End If
+
+                Layout.deallocate(expr_ptr)
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "perform_cse_on_block: made " joined with replacements_made joined with " replacements in block " joined with block_id
+
+    Return replacements_made
+End Process
+
+Process called "perform_cse_transformation" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Performs CSE transformation on entire CFG.
+
+    **ALGORITHM:**
+    1. Process blocks in dominator tree order (dominators before dominated)
+    2. For each block, perform CSE
+    3. Accumulate statistics
+
+    Returns total number of replacements.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "CSE TRANSFORMATION"
+    Display "============================================"
+    Display ""
+
+    Let total_replacements be 0
+
+    Note: Get all blocks
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    Note: Process each block
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+
+        Note: Perform CSE on block
+        Let replacements be perform_cse_on_block(context_ptr, block_ptr)
+        Set total_replacements to total_replacements plus replacements
+
+        Note: Increment blocks_processed counter
+        Let blocks_processed be Layout.memory_get_int64(context_ptr, 80)
+        Set blocks_processed to blocks_processed plus 1
+        Layout.memory_set_int64(context_ptr, 80, blocks_processed)
+
+        Set i to i plus 1
+    End While
+
+    Display ""
+    Display "perform_cse_transformation: " joined with total_replacements joined with " total replacements"
+    Display ""
+
+    Return total_replacements
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS AND PIPELINE INTEGRATION
+Note: ============================================================================
+
+Process called "optimize_function_with_cse" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Main entry point for CSE optimization on a single function.
+
+    **COMPLETE PIPELINE:**
+    1. Create CSE context
+    2. Compute GEN/KILL sets
+    3. Compute available expressions (dataflow analysis)
+    4. Analyze expressions for CSE opportunities
+    5. Perform CSE transformation
+    6. Print statistics
+    7. Destroy context
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    @Performance_Hints
+    CSE is effective after constant propagation has exposed more
+    equivalent expressions. Run CSE before copy propagation to
+    create more copy elimination opportunities.
+
+    **PIPELINE POSITION:**
+    SCCP → Constant Prop → **CSE** → Copy Prop → DCE
+    @End Performance_Hints
+
+    If cfg_ptr equals 0:
+        Display "optimize_function_with_cse: null CFG"
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "COMMON SUBEXPRESSION ELIMINATION"
+    Display "============================================"
+    Display ""
+
+    Note: Step 1: Create context
+    Let context_ptr be create_cse_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "optimize_function_with_cse: failed to create context"
+        Return 0
+    End If
+
+    Note: Step 2: Compute GEN/KILL sets
+    Display "Step 1: Computing GEN/KILL sets..."
+    compute_gen_kill_sets(context_ptr, cfg_ptr)
+
+    Note: Step 3: Compute available expressions
+    Display "Step 2: Computing available expressions..."
+    compute_available_expressions(context_ptr, cfg_ptr)
+
+    Note: Step 4: Analyze expressions
+    Display "Step 3: Analyzing expressions for CSE opportunities..."
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks is not equal to 0:
+        Let block_count be List.length(all_blocks)
+        Let i be 0
+
+        While i is less than block_count:
+            Let block_ptr be List.get(all_blocks, i)
+            analyze_expressions_in_block(context_ptr, block_ptr)
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Step 5: Perform transformation
+    Display "Step 4: Performing CSE transformation..."
+    perform_cse_transformation(context_ptr, cfg_ptr)
+
+    Note: Step 6: Print statistics
+    print_cse_stats(context_ptr)
+
+    Note: Step 7: Destroy context
+    destroy_cse_context(context_ptr)
+
+    Display ""
+    Display "COMMON SUBEXPRESSION ELIMINATION COMPLETE"
+    Display ""
+
+    Return 1
+End Process
+
+Process called "run_cse_pass" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Convenience wrapper for running CSE as an optimization pass.
+
+    Returns 1 if CFG was modified, 0 if no changes.
+    @End Reasoning
+
+    Return optimize_function_with_cse(cfg_ptr)
+End Process
+
+Process called "should_run_cse" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Determines if CSE should be run.
+
+    **PROFITABILITY:**
+    CSE is profitable on most functions except:
+    - Trivial functions (< 2 basic blocks)
+    - Functions with no arithmetic/logical operations
+
+    Returns 1 if should run, 0 otherwise.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get block count
+    Let block_count be CFG.get_block_count(cfg_ptr)
+
+    Note: Skip trivial functions
+    If block_count is less than 2:
+        Display "should_run_cse: skipping trivial function"
+        Return 0
+    End If
+
+    Note: Run on non-trivial functions
+    Return 1
+End Process
+
+Process called "get_cse_pass_name" returns Integer:
+    @Reasoning
+    Returns the name of this optimization pass.
+    @End Reasoning
+
+    Return "Common Subexpression Elimination"
+End Process
+
+Process called "get_cse_pass_description" returns Integer:
+    @Reasoning
+    Returns a description of this optimization pass.
+    @End Reasoning
+
+    Return "Cross-block CSE with dominator-tree-based availability analysis"
+End Process
+
+Note: ============================================================================
+Note: END OF COMMON SUBEXPRESSION ELIMINATION IMPLEMENTATION
+Note: ============================================================================

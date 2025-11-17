@@ -1,0 +1,1122 @@
+Note: Dockerfile to HIR Translator - Converts Dockerfile AST to HIR
+Note: Part of Translation universal language translation system
+Note: Translates all Dockerfile instructions into HIR function call representations
+
+Import "compiler/middle/gungnir/hir/translation/frontends/dockerfile/dockerfile_parser.runa" as DockerfileParser
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: Translation Strategy
+Note: ============================================================================
+Note:
+Note: Dockerfile instructions are translated to HIR as function calls to
+Note: dockerfile-specific functions. This preserves semantic meaning while
+Note: enabling bidirectional translation.
+Note:
+Note: Example translations:
+Note:   FROM ubuntu:20.04 AS builder
+Note:   → call dockerfile_from("ubuntu", "20.04", "", "builder", "")
+Note:
+Note:   RUN apt-get update && apt-get install -y curl
+Note:   → call dockerfile_run_shell("apt-get update && apt-get install -y curl")
+Note:
+Note:   COPY --from=builder /app /dest
+Note:   → call dockerfile_copy(["/app"], "/dest", "builder", "", "", false)
+Note:
+Note: ============================================================================
+
+Note: ============================================================================
+Note: Translator State
+Note: ============================================================================
+
+Type called "DockerfileToHIRTranslator":
+    current_scope_id as Integer
+    error_message as String
+    has_error as Integer
+End Type
+
+Note: ============================================================================
+Note: Translator Creation
+Note: ============================================================================
+
+Process called "create_translator" returns Integer:
+    @Reasoning
+    Create a new Dockerfile→HIR translator instance.
+    @End Reasoning
+
+    @Implementation
+    Allocate translator structure and initialize state.
+    @End Implementation
+
+    Let translator_ptr be proc allocate from Layout with 24
+
+    proc memory_set_int64 from Layout with translator_ptr, 0, 0  Note: current_scope_id
+    proc memory_set_string from Layout with translator_ptr, 8, ""  Note: error_message
+    proc memory_set_int64 from Layout with translator_ptr, 16, 0  Note: has_error
+
+    Return translator_ptr
+End Process
+
+Process called "free_translator" that takes translator_ptr as Integer returns Integer:
+    @Reasoning
+    Free the translator structure.
+    @End Reasoning
+
+    @Implementation
+    Deallocate translator memory.
+    @End Implementation
+
+    proc deallocate from Layout at translator_ptr
+    Return 1
+End Process
+
+Process called "set_translator_error" that takes translator_ptr as Integer, message as String returns Integer:
+    @Reasoning
+    Record a translation error message.
+    @End Reasoning
+
+    @Implementation
+    Store error message and set error flag.
+    @End Implementation
+
+    proc memory_set_string from Layout with translator_ptr, 8, message
+    proc memory_set_int64 from Layout with translator_ptr, 16, 1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HIR Helper Functions
+Note: ============================================================================
+
+Process called "create_string_literal" that takes value as String, line as Integer, col as Integer returns Integer:
+    @Reasoning
+    Create an HIR string literal node.
+    @End Reasoning
+
+    @Implementation
+    Create HIR_LITERAL node with string value and String type info.
+    @End Implementation
+
+    Let literal_node be proc create_hir_node from HIR with HIR.HIR_LITERAL, line, col
+
+    Note: Set value as string
+    proc memory_set_string from Layout with literal_node, 40, value
+
+    Note: Create String type info
+    Let type_info be proc create_hir_type_info from HIR with HIR.HIR_BASIC_TYPE
+    proc memory_set_string from Layout with type_info, 8, "String"
+    proc memory_set_int64 from Layout with literal_node, 72, type_info
+
+    Return literal_node
+End Process
+
+Process called "create_integer_literal" that takes value as Integer, line as Integer, col as Integer returns Integer:
+    @Reasoning
+    Create an HIR integer literal node.
+    @End Reasoning
+
+    @Implementation
+    Create HIR_LITERAL node with integer value and Integer type info.
+    @End Implementation
+
+    Let literal_node be proc create_hir_node from HIR with HIR.HIR_LITERAL, line, col
+
+    Note: Set value as integer
+    proc memory_set_int64 from Layout with literal_node, 40, value
+
+    Note: Create Integer type info
+    Let type_info be proc create_hir_type_info from HIR with HIR.HIR_BASIC_TYPE
+    proc memory_set_string from Layout with type_info, 8, "Integer"
+    proc memory_set_int64 from Layout with literal_node, 72, type_info
+
+    Return literal_node
+End Process
+
+Process called "create_boolean_literal" that takes value as Integer, line as Integer, col as Integer returns Integer:
+    @Reasoning
+    Create an HIR boolean literal node.
+    @End Reasoning
+
+    @Implementation
+    Create HIR_LITERAL node with boolean value and Boolean type info.
+    @End Implementation
+
+    Let literal_node be proc create_hir_node from HIR with HIR.HIR_LITERAL, line, col
+
+    Note: Set value as boolean (0 or 1)
+    proc memory_set_int64 from Layout with literal_node, 40, value
+
+    Note: Create Boolean type info
+    Let type_info be proc create_hir_type_info from HIR with HIR.HIR_BASIC_TYPE
+    proc memory_set_string from Layout with type_info, 8, "Boolean"
+    proc memory_set_int64 from Layout with literal_node, 72, type_info
+
+    Return literal_node
+End Process
+
+Process called "create_array_literal" that takes elements_ptr as Integer, line as Integer, col as Integer returns Integer:
+    @Reasoning
+    Create an HIR array literal node from a list of element nodes.
+    @End Reasoning
+
+    @Implementation
+    Create HIR_ARRAY_LITERAL node with element list.
+    @End Implementation
+
+    Let array_node be proc create_hir_node from HIR with HIR.HIR_ARRAY_LITERAL, line, col
+
+    Note: Set children to elements list
+    proc memory_set_int64 from Layout with array_node, 24, elements_ptr
+
+    Let element_count be proc list_size from List with elements_ptr
+    proc memory_set_int64 from Layout with array_node, 32, element_count
+
+    Note: Create Array[String] type info
+    Note: Dockerfile instructions take string arrays as arguments (e.g., RUN ["ls", "-l"])
+    Let type_info be proc create_hir_type_info from HIR with HIR.HIR_ARRAY_TYPE
+    proc memory_set_string from Layout with type_info, 8, "Array"
+
+    Note: Set element type to String (all Dockerfile arguments are strings)
+    Let element_type_info be proc create_hir_type_info from HIR with HIR.HIR_BASIC_TYPE
+    proc memory_set_string from Layout with element_type_info, 8, "String"
+    proc memory_set_int64 from Layout with type_info, 112, element_type_info
+
+    proc memory_set_int64 from Layout with array_node, 72, type_info
+
+    Return array_node
+End Process
+
+Process called "create_function_call" that takes function_name as String, args_ptr as Integer, line as Integer, col as Integer returns Integer:
+    @Reasoning
+    Create an HIR function call expression.
+    @End Reasoning
+
+    @Implementation
+    Create HIR_CALL_EXPRESSION node with callee identifier and argument list.
+    @End Implementation
+
+    Let call_node be proc create_hir_node from HIR with HIR.HIR_CALL_EXPRESSION, line, col
+
+    Note: Create callee identifier node
+    Let callee_node be proc create_hir_node from HIR with HIR.HIR_IDENTIFIER, line, col
+    proc memory_set_string from Layout with callee_node, 40, function_name
+
+    Note: Set callee
+    proc memory_set_int64 from Layout with call_node, 24, callee_node
+
+    Note: Set arguments list
+    proc memory_set_int64 from Layout with call_node, 32, args_ptr
+
+    Let arg_count be proc list_size from List with args_ptr
+    proc memory_set_int64 from Layout with call_node, 40, arg_count
+
+    Return call_node
+End Process
+
+Note: ============================================================================
+Note: Instruction Translation Functions
+Note: ============================================================================
+
+Process called "translate_from_instruction" that takes translator_ptr as Integer, from_ptr as Integer returns Integer:
+    @Reasoning
+    Translate FROM instruction to HIR function call.
+    Function signature: dockerfile_from(image: String, tag: String, digest: String, stage_name: String, platform: String)
+    @End Reasoning
+
+    @Implementation
+    Extract FROM instruction fields and create HIR call with 5 string arguments.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with from_ptr, 48
+    Let col be proc memory_get_int64 from Layout with from_ptr, 56
+
+    Note: Extract FROM instruction fields
+    Let image be proc memory_get_string from Layout with from_ptr, 8
+    Let tag be proc memory_get_string from Layout with from_ptr, 16
+    Let digest be proc memory_get_string from Layout with from_ptr, 24
+    Let stage_name be proc memory_get_string from Layout with from_ptr, 32
+    Let platform be proc memory_get_string from Layout with from_ptr, 40
+
+    Note: Create argument list
+    Let args_list be proc list_create from List
+
+    Let image_lit be proc create_string_literal from image, line, col
+    proc list_append from List with args_list, image_lit
+
+    Let tag_lit be proc create_string_literal from tag, line, col
+    proc list_append from List with args_list, tag_lit
+
+    Let digest_lit be proc create_string_literal from digest, line, col
+    proc list_append from List with args_list, digest_lit
+
+    Let stage_lit be proc create_string_literal from stage_name, line, col
+    proc list_append from List with args_list, stage_lit
+
+    Let platform_lit be proc create_string_literal from platform, line, col
+    proc list_append from List with args_list, platform_lit
+
+    Note: Create function call
+    Let call_node be proc create_function_call from "dockerfile_from", args_list, line, col
+
+    Return call_node
+End Process
+
+Process called "translate_run_instruction" that takes translator_ptr as Integer, run_ptr as Integer returns Integer:
+    @Reasoning
+    Translate RUN instruction to HIR function call.
+    For shell form: dockerfile_run_shell(command: String)
+    For exec form: dockerfile_run_exec(args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Check form type and create appropriate function call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with run_ptr, 32
+    Let col be proc memory_get_int64 from Layout with run_ptr, 40
+    Let form be proc memory_get_int64 from Layout with run_ptr, 8
+
+    Let args_list be proc list_create from List
+
+    If form is equal to DockerfileParser.SHELL_FORM:
+        Note: Shell form - single string command
+        Let command be proc memory_get_string from Layout with run_ptr, 16
+        Let command_lit be proc create_string_literal from command, line, col
+        proc list_append from List with args_list, command_lit
+
+        Let call_node be proc create_function_call from "dockerfile_run_shell", args_list, line, col
+        Return call_node
+    Otherwise:
+        Note: Exec form - array of strings
+        Let cmd_args_ptr be proc memory_get_int64 from Layout with run_ptr, 24
+
+        Note: Convert string list to array literal of string nodes
+        Let string_nodes_list be proc list_create from List
+        Let arg_count be proc list_size from List with cmd_args_ptr
+
+        Let i be 0
+        While i is less than arg_count:
+            Let arg_str be proc list_get from List with cmd_args_ptr, i
+            Let arg_lit be proc create_string_literal from arg_str, line, col
+            proc list_append from List with string_nodes_list, arg_lit
+            Set i to i plus 1
+        End While
+
+        Let array_lit be proc create_array_literal from string_nodes_list, line, col
+        proc list_append from List with args_list, array_lit
+
+        Let call_node be proc create_function_call from "dockerfile_run_exec", args_list, line, col
+        Return call_node
+    End If
+End Process
+
+Process called "translate_cmd_instruction" that takes translator_ptr as Integer, cmd_ptr as Integer returns Integer:
+    @Reasoning
+    Translate CMD instruction to HIR function call.
+    For shell form: dockerfile_cmd_shell(command: String)
+    For exec form: dockerfile_cmd_exec(args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Check form type and create appropriate function call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with cmd_ptr, 32
+    Let col be proc memory_get_int64 from Layout with cmd_ptr, 40
+    Let form be proc memory_get_int64 from Layout with cmd_ptr, 8
+
+    Let args_list be proc list_create from List
+
+    If form is equal to DockerfileParser.SHELL_FORM:
+        Let command be proc memory_get_string from Layout with cmd_ptr, 16
+        Let command_lit be proc create_string_literal from command, line, col
+        proc list_append from List with args_list, command_lit
+
+        Let call_node be proc create_function_call from "dockerfile_cmd_shell", args_list, line, col
+        Return call_node
+    Otherwise:
+        Let cmd_args_ptr be proc memory_get_int64 from Layout with cmd_ptr, 24
+
+        Let string_nodes_list be proc list_create from List
+        Let arg_count be proc list_size from List with cmd_args_ptr
+
+        Let i be 0
+        While i is less than arg_count:
+            Let arg_str be proc list_get from List with cmd_args_ptr, i
+            Let arg_lit be proc create_string_literal from arg_str, line, col
+            proc list_append from List with string_nodes_list, arg_lit
+            Set i to i plus 1
+        End While
+
+        Let array_lit be proc create_array_literal from string_nodes_list, line, col
+        proc list_append from List with args_list, array_lit
+
+        Let call_node be proc create_function_call from "dockerfile_cmd_exec", args_list, line, col
+        Return call_node
+    End If
+End Process
+
+Process called "translate_label_instruction" that takes translator_ptr as Integer, label_ptr as Integer returns Integer:
+    @Reasoning
+    Translate LABEL instruction to HIR function call.
+    Function signature: dockerfile_label(labels: Array[KeyValuePair])
+    @End Reasoning
+
+    @Implementation
+    Convert key-value pairs to array of tuples.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with label_ptr, 16
+    Let col be proc memory_get_int64 from Layout with label_ptr, 24
+    Let labels_ptr be proc memory_get_int64 from Layout with label_ptr, 8
+
+    Note: Create array of key-value pair tuples
+    Let pairs_list be proc list_create from List
+    Let label_count be proc list_size from List with labels_ptr
+
+    Let i be 0
+    While i is less than label_count:
+        Let pair_ptr be proc list_get from List with labels_ptr, i
+        Let key be proc memory_get_string from Layout with pair_ptr, 0
+        Let value be proc memory_get_string from Layout with pair_ptr, 8
+
+        Note: Create tuple literal (key, value)
+        Let tuple_elements be proc list_create from List
+        Let key_lit be proc create_string_literal from key, line, col
+        Let value_lit be proc create_string_literal from value, line, col
+        proc list_append from List with tuple_elements, key_lit
+        proc list_append from List with tuple_elements, value_lit
+
+        Let tuple_node be proc create_hir_node from HIR with HIR.HIR_TUPLE_LITERAL, line, col
+        proc memory_set_int64 from Layout with tuple_node, 24, tuple_elements
+        proc memory_set_int64 from Layout with tuple_node, 32, 2
+
+        proc list_append from List with pairs_list, tuple_node
+        Set i to i plus 1
+    End While
+
+    Let array_lit be proc create_array_literal from pairs_list, line, col
+
+    Let args_list be proc list_create from List
+    proc list_append from List with args_list, array_lit
+
+    Let call_node be proc create_function_call from "dockerfile_label", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_expose_instruction" that takes translator_ptr as Integer, expose_ptr as Integer returns Integer:
+    @Reasoning
+    Translate EXPOSE instruction to HIR function call.
+    Function signature: dockerfile_expose(ports: Array[PortSpec])
+    Where PortSpec is (port: Integer, protocol: String)
+    @End Reasoning
+
+    @Implementation
+    Convert port specifications to array of tuples.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with expose_ptr, 16
+    Let col be proc memory_get_int64 from Layout with expose_ptr, 24
+    Let ports_ptr be proc memory_get_int64 from Layout with expose_ptr, 8
+
+    Note: Create array of port spec tuples
+    Let port_specs_list be proc list_create from List
+    Let port_count be proc list_size from List with ports_ptr
+
+    Let i be 0
+    While i is less than port_count:
+        Let spec_ptr be proc list_get from List with ports_ptr, i
+        Let port be proc memory_get_int64 from Layout with spec_ptr, 0
+        Let protocol be proc memory_get_string from Layout with spec_ptr, 8
+
+        Note: Create tuple literal (port, protocol)
+        Let tuple_elements be proc list_create from List
+        Let port_lit be proc create_integer_literal from port, line, col
+        Let protocol_lit be proc create_string_literal from protocol, line, col
+        proc list_append from List with tuple_elements, port_lit
+        proc list_append from List with tuple_elements, protocol_lit
+
+        Let tuple_node be proc create_hir_node from HIR with HIR.HIR_TUPLE_LITERAL, line, col
+        proc memory_set_int64 from Layout with tuple_node, 24, tuple_elements
+        proc memory_set_int64 from Layout with tuple_node, 32, 2
+
+        proc list_append from List with port_specs_list, tuple_node
+        Set i to i plus 1
+    End While
+
+    Let array_lit be proc create_array_literal from port_specs_list, line, col
+
+    Let args_list be proc list_create from List
+    proc list_append from List with args_list, array_lit
+
+    Let call_node be proc create_function_call from "dockerfile_expose", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_env_instruction" that takes translator_ptr as Integer, env_ptr as Integer returns Integer:
+    @Reasoning
+    Translate ENV instruction to HIR function call.
+    Function signature: dockerfile_env(variables: Array[KeyValuePair])
+    @End Reasoning
+
+    @Implementation
+    Convert environment variable definitions to array of tuples.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with env_ptr, 16
+    Let col be proc memory_get_int64 from Layout with env_ptr, 24
+    Let vars_ptr be proc memory_get_int64 from Layout with env_ptr, 8
+
+    Note: Create array of key-value pair tuples
+    Let pairs_list be proc list_create from List
+    Let var_count be proc list_size from List with vars_ptr
+
+    Let i be 0
+    While i is less than var_count:
+        Let pair_ptr be proc list_get from List with vars_ptr, i
+        Let key be proc memory_get_string from Layout with pair_ptr, 0
+        Let value be proc memory_get_string from Layout with pair_ptr, 8
+
+        Note: Create tuple literal (key, value)
+        Let tuple_elements be proc list_create from List
+        Let key_lit be proc create_string_literal from key, line, col
+        Let value_lit be proc create_string_literal from value, line, col
+        proc list_append from List with tuple_elements, key_lit
+        proc list_append from List with tuple_elements, value_lit
+
+        Let tuple_node be proc create_hir_node from HIR with HIR.HIR_TUPLE_LITERAL, line, col
+        proc memory_set_int64 from Layout with tuple_node, 24, tuple_elements
+        proc memory_set_int64 from Layout with tuple_node, 32, 2
+
+        proc list_append from List with pairs_list, tuple_node
+        Set i to i plus 1
+    End While
+
+    Let array_lit be proc create_array_literal from pairs_list, line, col
+
+    Let args_list be proc list_create from List
+    proc list_append from List with args_list, array_lit
+
+    Let call_node be proc create_function_call from "dockerfile_env", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_copy_instruction" that takes translator_ptr as Integer, copy_ptr as Integer returns Integer:
+    @Reasoning
+    Translate COPY instruction to HIR function call.
+    Function signature: dockerfile_copy(sources: Array[String], dest: String, from_stage: String, chown: String, chmod: String, link: Boolean)
+    @End Reasoning
+
+    @Implementation
+    Extract COPY fields and create HIR call with 6 arguments.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with copy_ptr, 56
+    Let col be proc memory_get_int64 from Layout with copy_ptr, 64
+    Let sources_ptr be proc memory_get_int64 from Layout with copy_ptr, 8
+    Let dest be proc memory_get_string from Layout with copy_ptr, 16
+    Let from_stage be proc memory_get_string from Layout with copy_ptr, 24
+    Let chown be proc memory_get_string from Layout with copy_ptr, 32
+    Let chmod be proc memory_get_string from Layout with copy_ptr, 40
+    Let link_flag be proc memory_get_int64 from Layout with copy_ptr, 48
+
+    Note: Create sources array
+    Let sources_list be proc list_create from List
+    Let source_count be proc list_size from List with sources_ptr
+
+    Let i be 0
+    While i is less than source_count:
+        Let source be proc list_get from List with sources_ptr, i
+        Let source_lit be proc create_string_literal from source, line, col
+        proc list_append from List with sources_list, source_lit
+        Set i to i plus 1
+    End While
+
+    Let sources_array be proc create_array_literal from sources_list, line, col
+
+    Note: Create argument list
+    Let args_list be proc list_create from List
+    proc list_append from List with args_list, sources_array
+
+    Let dest_lit be proc create_string_literal from dest, line, col
+    proc list_append from List with args_list, dest_lit
+
+    Let from_lit be proc create_string_literal from from_stage, line, col
+    proc list_append from List with args_list, from_lit
+
+    Let chown_lit be proc create_string_literal from chown, line, col
+    proc list_append from List with args_list, chown_lit
+
+    Let chmod_lit be proc create_string_literal from chmod, line, col
+    proc list_append from List with args_list, chmod_lit
+
+    Let link_lit be proc create_boolean_literal from link_flag, line, col
+    proc list_append from List with args_list, link_lit
+
+    Let call_node be proc create_function_call from "dockerfile_copy", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_add_instruction" that takes translator_ptr as Integer, add_ptr as Integer returns Integer:
+    @Reasoning
+    Translate ADD instruction to HIR function call.
+    Function signature: dockerfile_add(sources: Array[String], dest: String, chown: String, chmod: String, link: Boolean, keep_git_dir: Boolean, checksum: String)
+    @End Reasoning
+
+    @Implementation
+    Extract ADD fields and create HIR call with 7 arguments.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with add_ptr, 64
+    Let col be proc memory_get_int64 from Layout with add_ptr, 72
+    Let sources_ptr be proc memory_get_int64 from Layout with add_ptr, 8
+    Let dest be proc memory_get_string from Layout with add_ptr, 16
+    Let chown be proc memory_get_string from Layout with add_ptr, 24
+    Let chmod be proc memory_get_string from Layout with add_ptr, 32
+    Let link_flag be proc memory_get_int64 from Layout with add_ptr, 40
+    Let keep_git_flag be proc memory_get_int64 from Layout with add_ptr, 48
+    Let checksum be proc memory_get_string from Layout with add_ptr, 56
+
+    Note: Create sources array
+    Let sources_list be proc list_create from List
+    Let source_count be proc list_size from List with sources_ptr
+
+    Let i be 0
+    While i is less than source_count:
+        Let source be proc list_get from List with sources_ptr, i
+        Let source_lit be proc create_string_literal from source, line, col
+        proc list_append from List with sources_list, source_lit
+        Set i to i plus 1
+    End While
+
+    Let sources_array be proc create_array_literal from sources_list, line, col
+
+    Note: Create argument list
+    Let args_list be proc list_create from List
+    proc list_append from List with args_list, sources_array
+
+    Let dest_lit be proc create_string_literal from dest, line, col
+    proc list_append from List with args_list, dest_lit
+
+    Let chown_lit be proc create_string_literal from chown, line, col
+    proc list_append from List with args_list, chown_lit
+
+    Let chmod_lit be proc create_string_literal from chmod, line, col
+    proc list_append from List with args_list, chmod_lit
+
+    Let link_lit be proc create_boolean_literal from link_flag, line, col
+    proc list_append from List with args_list, link_lit
+
+    Let keep_git_lit be proc create_boolean_literal from keep_git_flag, line, col
+    proc list_append from List with args_list, keep_git_lit
+
+    Let checksum_lit be proc create_string_literal from checksum, line, col
+    proc list_append from List with args_list, checksum_lit
+
+    Let call_node be proc create_function_call from "dockerfile_add", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_entrypoint_instruction" that takes translator_ptr as Integer, entrypoint_ptr as Integer returns Integer:
+    @Reasoning
+    Translate ENTRYPOINT instruction to HIR function call.
+    For shell form: dockerfile_entrypoint_shell(command: String)
+    For exec form: dockerfile_entrypoint_exec(args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Check form type and create appropriate function call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with entrypoint_ptr, 32
+    Let col be proc memory_get_int64 from Layout with entrypoint_ptr, 40
+    Let form be proc memory_get_int64 from Layout with entrypoint_ptr, 8
+
+    Let args_list be proc list_create from List
+
+    If form is equal to DockerfileParser.SHELL_FORM:
+        Let command be proc memory_get_string from Layout with entrypoint_ptr, 16
+        Let command_lit be proc create_string_literal from command, line, col
+        proc list_append from List with args_list, command_lit
+
+        Let call_node be proc create_function_call from "dockerfile_entrypoint_shell", args_list, line, col
+        Return call_node
+    Otherwise:
+        Let cmd_args_ptr be proc memory_get_int64 from Layout with entrypoint_ptr, 24
+
+        Let string_nodes_list be proc list_create from List
+        Let arg_count be proc list_size from List with cmd_args_ptr
+
+        Let i be 0
+        While i is less than arg_count:
+            Let arg_str be proc list_get from List with cmd_args_ptr, i
+            Let arg_lit be proc create_string_literal from arg_str, line, col
+            proc list_append from List with string_nodes_list, arg_lit
+            Set i to i plus 1
+        End While
+
+        Let array_lit be proc create_array_literal from string_nodes_list, line, col
+        proc list_append from List with args_list, array_lit
+
+        Let call_node be proc create_function_call from "dockerfile_entrypoint_exec", args_list, line, col
+        Return call_node
+    End If
+End Process
+
+Process called "translate_volume_instruction" that takes translator_ptr as Integer, volume_ptr as Integer returns Integer:
+    @Reasoning
+    Translate VOLUME instruction to HIR function call.
+    Function signature: dockerfile_volume(paths: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Convert mount point paths to array of strings.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with volume_ptr, 16
+    Let col be proc memory_get_int64 from Layout with volume_ptr, 24
+    Let paths_ptr be proc memory_get_int64 from Layout with volume_ptr, 8
+
+    Note: Create array of path strings
+    Let paths_list be proc list_create from List
+    Let path_count be proc list_size from List with paths_ptr
+
+    Let i be 0
+    While i is less than path_count:
+        Let path be proc list_get from List with paths_ptr, i
+        Let path_lit be proc create_string_literal from path, line, col
+        proc list_append from List with paths_list, path_lit
+        Set i to i plus 1
+    End While
+
+    Let array_lit be proc create_array_literal from paths_list, line, col
+
+    Let args_list be proc list_create from List
+    proc list_append from List with args_list, array_lit
+
+    Let call_node be proc create_function_call from "dockerfile_volume", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_user_instruction" that takes translator_ptr as Integer, user_ptr as Integer returns Integer:
+    @Reasoning
+    Translate USER instruction to HIR function call.
+    Function signature: dockerfile_user(user: String, group: String)
+    @End Reasoning
+
+    @Implementation
+    Extract user and optional group, create HIR call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with user_ptr, 24
+    Let col be proc memory_get_int64 from Layout with user_ptr, 32
+    Let user be proc memory_get_string from Layout with user_ptr, 8
+    Let group be proc memory_get_string from Layout with user_ptr, 16
+
+    Let args_list be proc list_create from List
+
+    Let user_lit be proc create_string_literal from user, line, col
+    proc list_append from List with args_list, user_lit
+
+    Let group_lit be proc create_string_literal from group, line, col
+    proc list_append from List with args_list, group_lit
+
+    Let call_node be proc create_function_call from "dockerfile_user", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_workdir_instruction" that takes translator_ptr as Integer, workdir_ptr as Integer returns Integer:
+    @Reasoning
+    Translate WORKDIR instruction to HIR function call.
+    Function signature: dockerfile_workdir(path: String)
+    @End Reasoning
+
+    @Implementation
+    Extract path and create HIR call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with workdir_ptr, 16
+    Let col be proc memory_get_int64 from Layout with workdir_ptr, 24
+    Let path be proc memory_get_string from Layout with workdir_ptr, 8
+
+    Let args_list be proc list_create from List
+
+    Let path_lit be proc create_string_literal from path, line, col
+    proc list_append from List with args_list, path_lit
+
+    Let call_node be proc create_function_call from "dockerfile_workdir", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_arg_instruction" that takes translator_ptr as Integer, arg_ptr as Integer returns Integer:
+    @Reasoning
+    Translate ARG instruction to HIR function call.
+    Function signature: dockerfile_arg(name: String, default_value: String)
+    @End Reasoning
+
+    @Implementation
+    Extract argument name and optional default value, create HIR call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with arg_ptr, 24
+    Let col be proc memory_get_int64 from Layout with arg_ptr, 32
+    Let name be proc memory_get_string from Layout with arg_ptr, 8
+    Let default_value be proc memory_get_string from Layout with arg_ptr, 16
+
+    Let args_list be proc list_create from List
+
+    Let name_lit be proc create_string_literal from name, line, col
+    proc list_append from List with args_list, name_lit
+
+    Let default_lit be proc create_string_literal from default_value, line, col
+    proc list_append from List with args_list, default_lit
+
+    Let call_node be proc create_function_call from "dockerfile_arg", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_onbuild_instruction" that takes translator_ptr as Integer, onbuild_ptr as Integer returns Integer:
+    @Reasoning
+    Translate ONBUILD instruction to HIR function call.
+    Function signature: dockerfile_onbuild(instruction: HIRNode)
+    The deferred instruction is translated recursively.
+    @End Reasoning
+
+    @Implementation
+    Translate the nested instruction and wrap in onbuild call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with onbuild_ptr, 16
+    Let col be proc memory_get_int64 from Layout with onbuild_ptr, 24
+    Let instruction_ptr be proc memory_get_int64 from Layout with onbuild_ptr, 8
+
+    Note: Translate the deferred instruction
+    Let translated_instruction be proc translate_instruction from translator_ptr, instruction_ptr
+
+    Let args_list be proc list_create from List
+    proc list_append from List with args_list, translated_instruction
+
+    Let call_node be proc create_function_call from "dockerfile_onbuild", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_stopsignal_instruction" that takes translator_ptr as Integer, stopsignal_ptr as Integer returns Integer:
+    @Reasoning
+    Translate STOPSIGNAL instruction to HIR function call.
+    Function signature: dockerfile_stopsignal(signal: String)
+    @End Reasoning
+
+    @Implementation
+    Extract signal and create HIR call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with stopsignal_ptr, 16
+    Let col be proc memory_get_int64 from Layout with stopsignal_ptr, 24
+    Let signal be proc memory_get_string from Layout with stopsignal_ptr, 8
+
+    Let args_list be proc list_create from List
+
+    Let signal_lit be proc create_string_literal from signal, line, col
+    proc list_append from List with args_list, signal_lit
+
+    Let call_node be proc create_function_call from "dockerfile_stopsignal", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_healthcheck_instruction" that takes translator_ptr as Integer, healthcheck_ptr as Integer returns Integer:
+    @Reasoning
+    Translate HEALTHCHECK instruction to HIR function call.
+    For NONE: dockerfile_healthcheck_none()
+    For CMD: dockerfile_healthcheck_cmd(interval: String, timeout: String, start_period: String, retries: Integer, cmd_form: Integer, cmd_command: String, cmd_args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Check if NONE or CMD variant and create appropriate function call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with healthcheck_ptr, 72
+    Let col be proc memory_get_int64 from Layout with healthcheck_ptr, 80
+    Let is_none be proc memory_get_int64 from Layout with healthcheck_ptr, 8
+
+    If is_none is equal to 1:
+        Note: HEALTHCHECK NONE
+        Let args_list be proc list_create from List
+        Let call_node be proc create_function_call from "dockerfile_healthcheck_none", args_list, line, col
+        Return call_node
+    Otherwise:
+        Note: HEALTHCHECK CMD with options
+        Let interval be proc memory_get_string from Layout with healthcheck_ptr, 16
+        Let timeout be proc memory_get_string from Layout with healthcheck_ptr, 24
+        Let start_period be proc memory_get_string from Layout with healthcheck_ptr, 32
+        Let retries be proc memory_get_int64 from Layout with healthcheck_ptr, 40
+        Let cmd_form be proc memory_get_int64 from Layout with healthcheck_ptr, 48
+        Let cmd_command be proc memory_get_string from Layout with healthcheck_ptr, 56
+        Let cmd_args_ptr be proc memory_get_int64 from Layout with healthcheck_ptr, 64
+
+        Let args_list be proc list_create from List
+
+        Let interval_lit be proc create_string_literal from interval, line, col
+        proc list_append from List with args_list, interval_lit
+
+        Let timeout_lit be proc create_string_literal from timeout, line, col
+        proc list_append from List with args_list, timeout_lit
+
+        Let start_period_lit be proc create_string_literal from start_period, line, col
+        proc list_append from List with args_list, start_period_lit
+
+        Let retries_lit be proc create_integer_literal from retries, line, col
+        proc list_append from List with args_list, retries_lit
+
+        Let form_lit be proc create_integer_literal from cmd_form, line, col
+        proc list_append from List with args_list, form_lit
+
+        If cmd_form is equal to DockerfileParser.SHELL_FORM:
+            Let cmd_lit be proc create_string_literal from cmd_command, line, col
+            proc list_append from List with args_list, cmd_lit
+
+            Note: Empty array for exec args
+            Let empty_array be proc create_array_literal from proc list_create from List, line, col
+            proc list_append from List with args_list, empty_array
+        Otherwise:
+            Note: Empty string for shell command
+            Let empty_cmd be proc create_string_literal from "", line, col
+            proc list_append from List with args_list, empty_cmd
+
+            Note: Create args array
+            Let args_nodes_list be proc list_create from List
+            Let arg_count be proc list_size from List with cmd_args_ptr
+
+            Let i be 0
+            While i is less than arg_count:
+                Let arg_str be proc list_get from List with cmd_args_ptr, i
+                Let arg_lit be proc create_string_literal from arg_str, line, col
+                proc list_append from List with args_nodes_list, arg_lit
+                Set i to i plus 1
+            End While
+
+            Let args_array be proc create_array_literal from args_nodes_list, line, col
+            proc list_append from List with args_list, args_array
+        End If
+
+        Let call_node be proc create_function_call from "dockerfile_healthcheck_cmd", args_list, line, col
+        Return call_node
+    End If
+End Process
+
+Process called "translate_shell_instruction" that takes translator_ptr as Integer, shell_ptr as Integer returns Integer:
+    @Reasoning
+    Translate SHELL instruction to HIR function call.
+    Function signature: dockerfile_shell(shell_args: Array[String])
+    @End Reasoning
+
+    @Implementation
+    Convert shell command array to HIR array literal.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with shell_ptr, 16
+    Let col be proc memory_get_int64 from Layout with shell_ptr, 24
+    Let shell_args_ptr be proc memory_get_int64 from Layout with shell_ptr, 8
+
+    Note: Create array of shell args
+    Let args_nodes_list be proc list_create from List
+    Let arg_count be proc list_size from List with shell_args_ptr
+
+    Let i be 0
+    While i is less than arg_count:
+        Let arg_str be proc list_get from List with shell_args_ptr, i
+        Let arg_lit be proc create_string_literal from arg_str, line, col
+        proc list_append from List with args_nodes_list, arg_lit
+        Set i to i plus 1
+    End While
+
+    Let array_lit be proc create_array_literal from args_nodes_list, line, col
+
+    Let args_list be proc list_create from List
+    proc list_append from List with args_list, array_lit
+
+    Let call_node be proc create_function_call from "dockerfile_shell", args_list, line, col
+    Return call_node
+End Process
+
+Process called "translate_maintainer_instruction" that takes translator_ptr as Integer, maintainer_ptr as Integer returns Integer:
+    @Reasoning
+    Translate MAINTAINER instruction to HIR function call.
+    Function signature: dockerfile_maintainer(name: String)
+    @End Reasoning
+
+    @Implementation
+    Extract maintainer name and create HIR call.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with maintainer_ptr, 16
+    Let col be proc memory_get_int64 from Layout with maintainer_ptr, 24
+    Let name be proc memory_get_string from Layout with maintainer_ptr, 8
+
+    Let args_list be proc list_create from List
+
+    Let name_lit be proc create_string_literal from name, line, col
+    proc list_append from List with args_list, name_lit
+
+    Let call_node be proc create_function_call from "dockerfile_maintainer", args_list, line, col
+    Return call_node
+End Process
+
+Note: ============================================================================
+Note: Main Translation Functions
+Note: ============================================================================
+
+Process called "translate_instruction" that takes translator_ptr as Integer, instruction_ptr as Integer returns Integer:
+    @Reasoning
+    Translate a single Dockerfile instruction AST node to HIR.
+    @End Reasoning
+
+    @Implementation
+    Dispatch to appropriate instruction translator based on node type.
+    @End Implementation
+
+    Let node_type be proc memory_get_int64 from Layout with instruction_ptr, 0
+
+    If node_type is equal to DockerfileParser.NODE_FROM:
+        Let hir_node be proc translate_from_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_RUN:
+        Let hir_node be proc translate_run_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_CMD:
+        Let hir_node be proc translate_cmd_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_LABEL:
+        Let hir_node be proc translate_label_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_EXPOSE:
+        Let hir_node be proc translate_expose_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_ENV:
+        Let hir_node be proc translate_env_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_ADD:
+        Let hir_node be proc translate_add_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_COPY:
+        Let hir_node be proc translate_copy_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_ENTRYPOINT:
+        Let hir_node be proc translate_entrypoint_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_VOLUME:
+        Let hir_node be proc translate_volume_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_USER:
+        Let hir_node be proc translate_user_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_WORKDIR:
+        Let hir_node be proc translate_workdir_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_ARG:
+        Let hir_node be proc translate_arg_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_ONBUILD:
+        Let hir_node be proc translate_onbuild_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_STOPSIGNAL:
+        Let hir_node be proc translate_stopsignal_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_HEALTHCHECK:
+        Let hir_node be proc translate_healthcheck_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_SHELL:
+        Let hir_node be proc translate_shell_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    If node_type is equal to DockerfileParser.NODE_MAINTAINER:
+        Let hir_node be proc translate_maintainer_instruction from translator_ptr, instruction_ptr
+        Return hir_node
+    End If
+
+    proc set_translator_error from translator_ptr, "Unknown Dockerfile instruction type"
+    Return 0
+End Process
+
+Process called "translate_dockerfile" that takes translator_ptr as Integer, dockerfile_ast_ptr as Integer returns Integer:
+    @Reasoning
+    Translate a complete Dockerfile AST to HIR.
+    Returns an HIR_BLOCK_STATEMENT containing all translated instructions.
+    @End Reasoning
+
+    @Implementation
+    Create HIR block statement containing sequence of translated instruction calls.
+    @End Implementation
+
+    Let line be proc memory_get_int64 from Layout with dockerfile_ast_ptr, 16
+    Let col be proc memory_get_int64 from Layout with dockerfile_ast_ptr, 24
+    Let instructions_ptr be proc memory_get_int64 from Layout with dockerfile_ast_ptr, 8
+
+    Note: Create HIR block statement
+    Let block_node be proc create_hir_node from HIR with HIR.HIR_BLOCK_STATEMENT, line, col
+
+    Note: Create list for translated instructions
+    Let hir_instructions_list be proc list_create from List
+
+    Note: Translate each instruction
+    Let instruction_count be proc list_size from List with instructions_ptr
+
+    Let i be 0
+    While i is less than instruction_count:
+        Let instruction_ptr be proc list_get from List with instructions_ptr, i
+        Let hir_instruction be proc translate_instruction from translator_ptr, instruction_ptr
+
+        If hir_instruction is equal to 0:
+            Note: Translation error occurred
+            Return 0
+        End If
+
+        Note: Wrap call in expression statement
+        Let expr_stmt be proc create_hir_node from HIR with HIR.HIR_EXPRESSION_STATEMENT, line, col
+        proc memory_set_int64 from Layout with expr_stmt, 24, hir_instruction
+
+        proc list_append from List with hir_instructions_list, expr_stmt
+        Set i to i plus 1
+    End While
+
+    Note: Set block children to translated instructions
+    proc memory_set_int64 from Layout with block_node, 24, hir_instructions_list
+    proc memory_set_int64 from Layout with block_node, 32, instruction_count
+
+    Return block_node
+End Process

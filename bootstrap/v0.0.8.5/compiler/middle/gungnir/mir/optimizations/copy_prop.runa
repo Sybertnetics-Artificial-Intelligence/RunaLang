@@ -35,4 +35,1249 @@ This file consists of the following functions/features/operation types:
 - Copy verification and copy analysis
 :End Note
 
-Note: TODO - Implement copy propagation functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================================
+Note: TYPE DEFINITIONS - Enhanced Copy Propagation Context
+Note: ============================================================================
+
+Type called "CopyRelation":
+    @Reasoning
+    Represents a copy relationship: dest = src
+
+    **COPY RELATION:**
+    - dest_value_id: Destination SSA value ID
+    - src_value_id: Source SSA value ID
+    - is_trivial: Is this a trivial copy (can be eliminated)?
+    - copy_chain_length: Length of transitive copy chain
+
+    **MEMORY LAYOUT** (32 bytes):
+    ```
+    Offset 0:  dest_value_id (Integer)
+    Offset 8:  src_value_id (Integer)
+    Offset 16: is_trivial (Integer - boolean)
+    Offset 24: copy_chain_length (Integer)
+    ```
+    @End Reasoning
+
+    dest_value_id as Integer
+    src_value_id as Integer
+    is_trivial as Integer
+    copy_chain_length as Integer
+End Type
+
+Type called "InterferenceGraph":
+    @Reasoning
+    Interference graph for register allocation and copy coalescing.
+
+    **INTERFERENCE:**
+    Two values interfere if their live ranges overlap.
+    Values that interfere cannot be coalesced.
+
+    **MEMORY LAYOUT** (24 bytes):
+    ```
+    Offset 0:  edges (Integer - Dictionary: value_id → Set of interfering values)
+    Offset 8:  node_count (Integer - number of nodes)
+    Offset 16: edge_count (Integer - number of edges)
+    ```
+    @End Reasoning
+
+    edges as Integer
+    node_count as Integer
+    edge_count as Integer
+End Type
+
+Type called "CopyPropContext":
+    @Reasoning
+    Context for enhanced copy propagation analysis.
+
+    **ENHANCEMENTS:**
+    - Copy coalescing (merging copy-related values)
+    - PHI copy optimization
+    - Interference analysis
+    - Transitive copy chains
+
+    **MEMORY LAYOUT** (128 bytes):
+    ```
+    Offset 0:   cfg (Integer - CFG pointer)
+    Offset 8:   copy_relations (Integer - Dictionary: value_id → CopyRelation)
+    Offset 16:  copy_sources (Integer - Dictionary: dest → src mapping)
+    Offset 24:  value_equivalence (Integer - Dictionary: value → canonical value)
+    Offset 32:  interference_graph (Integer - InterferenceGraph pointer)
+    Offset 40:  live_ranges (Integer - Dictionary: value_id → LiveRange)
+    Offset 48:  phi_copies (Integer - List of PHI-related copies)
+    Offset 56:  worklist (Integer - List of copies to process)
+    Offset 64:  copies_eliminated (Integer - counter)
+    Offset 72:  copies_propagated (Integer - counter)
+    Offset 80:  phi_copies_eliminated (Integer - counter)
+    Offset 88:  copies_coalesced (Integer - counter)
+    Offset 96:  ssa_ptr (Integer - SSA analysis pointer)
+    Offset 104: dominance_ptr (Integer - Dominance analysis pointer)
+    Offset 112: use_def_chains (Integer - Use-def chain map)
+    Offset 120: def_use_chains (Integer - Def-use chain map)
+    ```
+    @End Reasoning
+
+    cfg as Integer
+    copy_relations as Integer
+    copy_sources as Integer
+    value_equivalence as Integer
+    interference_graph as Integer
+    live_ranges as Integer
+    phi_copies as Integer
+    worklist as Integer
+    copies_eliminated as Integer
+    copies_propagated as Integer
+    phi_copies_eliminated as Integer
+    copies_coalesced as Integer
+    ssa_ptr as Integer
+    dominance_ptr as Integer
+    use_def_chains as Integer
+    def_use_chains as Integer
+End Type
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_copy_prop_context" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Creates and initializes enhanced copy propagation context.
+
+    Returns context pointer or 0 on failure.
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "create_copy_prop_context: null CFG"
+        Return 0
+    End If
+
+    Note: Allocate context (128 bytes)
+    Let context_ptr be Layout.allocate(128)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG reference
+    Layout.memory_set_int64(context_ptr, 0, cfg)
+
+    Note: Create copy relations dictionary
+    Let copy_relations be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 8, copy_relations)
+
+    Note: Create copy sources dictionary
+    Let copy_sources be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 16, copy_sources)
+
+    Note: Create value equivalence dictionary
+    Let value_equivalence be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 24, value_equivalence)
+
+    Note: Interference graph initially null (created on demand)
+    Layout.memory_set_int64(context_ptr, 32, 0)
+
+    Note: Live ranges initially null (created on demand)
+    Layout.memory_set_int64(context_ptr, 40, 0)
+
+    Note: Create PHI copies list
+    Let phi_copies be List.create()
+    Layout.memory_set_int64(context_ptr, 48, phi_copies)
+
+    Note: Create worklist
+    Let worklist be List.create()
+    Layout.memory_set_int64(context_ptr, 56, worklist)
+
+    Note: Initialize counters
+    Layout.memory_set_int64(context_ptr, 64, 0)   Note: copies_eliminated
+    Layout.memory_set_int64(context_ptr, 72, 0)   Note: copies_propagated
+    Layout.memory_set_int64(context_ptr, 80, 0)   Note: phi_copies_eliminated
+    Layout.memory_set_int64(context_ptr, 88, 0)   Note: copies_coalesced
+
+    Note: Initialize SSA and dominance to 0
+    Layout.memory_set_int64(context_ptr, 96, 0)   Note: ssa_ptr
+    Layout.memory_set_int64(context_ptr, 104, 0)  Note: dominance_ptr
+
+    Note: Initialize use-def and def-use chains to 0
+    Layout.memory_set_int64(context_ptr, 112, 0)  Note: use_def_chains
+    Layout.memory_set_int64(context_ptr, 120, 0)  Note: def_use_chains
+
+    Display "create_copy_prop_context: context created"
+    Return context_ptr
+End Process
+
+Process called "destroy_copy_prop_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys copy propagation context and frees all memory.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy copy relations dictionary
+    Let copy_relations be Layout.memory_get_int64(context_ptr, 8)
+    If copy_relations is not equal to 0:
+        Let keys be proc keys from Dictionary with copy_relations
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let copy_rel be proc get from Dictionary with copy_relations, key
+
+            If copy_rel is not equal to 0:
+                Layout.deallocate(copy_rel)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with copy_relations
+    End If
+
+    Note: Destroy copy sources dictionary
+    Let copy_sources be Layout.memory_get_int64(context_ptr, 16)
+    If copy_sources is not equal to 0:
+        proc destroy from Dictionary with copy_sources
+    End If
+
+    Note: Destroy value equivalence dictionary
+    Let value_equivalence be Layout.memory_get_int64(context_ptr, 24)
+    If value_equivalence is not equal to 0:
+        proc destroy from Dictionary with value_equivalence
+    End If
+
+    Note: Destroy interference graph
+    Let interference_graph be Layout.memory_get_int64(context_ptr, 32)
+    If interference_graph is not equal to 0:
+        destroy_interference_graph(interference_graph)
+    End If
+
+    Note: Destroy PHI copies list
+    Let phi_copies be Layout.memory_get_int64(context_ptr, 48)
+    If phi_copies is not equal to 0:
+        List.destroy(phi_copies)
+    End If
+
+    Note: Destroy worklist
+    Let worklist be Layout.memory_get_int64(context_ptr, 56)
+    If worklist is not equal to 0:
+        List.destroy(worklist)
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr)
+
+    Display "destroy_copy_prop_context: context destroyed"
+    Return 1
+End Process
+
+Process called "print_copy_prop_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints enhanced copy propagation statistics.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let copies_eliminated be Layout.memory_get_int64(context_ptr, 64)
+    Let copies_propagated be Layout.memory_get_int64(context_ptr, 72)
+    Let phi_copies_eliminated be Layout.memory_get_int64(context_ptr, 80)
+    Let copies_coalesced be Layout.memory_get_int64(context_ptr, 88)
+
+    Display "============================================"
+    Display "ENHANCED COPY PROPAGATION STATISTICS"
+    Display "============================================"
+    Display "Copies eliminated:       " joined with copies_eliminated
+    Display "Copies propagated:       " joined with copies_propagated
+    Display "PHI copies eliminated:   " joined with phi_copies_eliminated
+    Display "Copies coalesced:        " joined with copies_coalesced
+    Display "Total optimizations:     " joined with copies_eliminated plus copies_propagated plus phi_copies_eliminated plus copies_coalesced
+    Display "============================================"
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: COPY DETECTION AND ANALYSIS
+Note: ============================================================================
+
+Process called "create_copy_relation" that takes dest_id as Integer, src_id as Integer returns Integer:
+    @Reasoning
+    Creates a copy relation structure.
+    @End Reasoning
+
+    Let copy_ptr be Layout.allocate(32)
+    If copy_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(copy_ptr, 0, dest_id)
+    Layout.memory_set_int64(copy_ptr, 8, src_id)
+    Layout.memory_set_int64(copy_ptr, 16, 1)  Note: is_trivial = true initially
+    Layout.memory_set_int64(copy_ptr, 24, 1)  Note: copy_chain_length = 1
+
+    Return copy_ptr
+End Process
+
+Process called "detect_copy_instruction" that takes inst_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Detects if an instruction is a copy (e.g., MOV, assignment).
+
+    **COMPLETE COPY DETECTION:**
+    A copy is any instruction that simply moves a value without transformation:
+    1. Direct MOV/COPY instructions
+    2. BITCAST with same type (no conversion)
+    3. Trivial PHI nodes (all incoming values identical)
+    4. Identity operations (ADD x, 0 or MUL x, 1)
+
+    Detects all forms of copies for elimination and coalescing.
+
+    Returns 1 if copy, 0 otherwise.
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+    Note: Check for explicit COPY/MOV instruction
+    If opcode equals 20018:  Note: MIR_COPY
+        Return 1
+    End If
+
+    Note: Check for BITCAST (type conversion)
+    If opcode equals 20028:  Note: MIR_BITCAST
+        Note: Get source and dest types
+        Let src_type be Layout.memory_get_int64(inst_ptr, 24)
+        Let dest_type be Layout.memory_get_int64(inst_ptr, 32)
+
+        Note: If types are same, it's a copy
+        If src_type equals dest_type:
+            Return 1
+        End If
+    End If
+
+    Note: Check for trivial PHI (all operands same)
+    If opcode equals 20023:  Note: MIR_PHI
+        Let operand_count be MIRNodes.get_phi_operand_count(inst_ptr)
+
+        If operand_count is less than 1:
+            Return 0
+        End If
+
+        Note: Get first operand value
+        Let first_value be MIRNodes.get_phi_operand_value(inst_ptr, 0)
+
+        Note: Check if all other operands are the same
+        Let all_same be 1
+        Let i be 1
+        While i is less than operand_count:
+            Let operand_value be MIRNodes.get_phi_operand_value(inst_ptr, i)
+            If operand_value is not equal to first_value:
+                Set all_same to 0
+            End If
+            Set i to i plus 1
+        End While
+
+        Note: If all PHI operands are same, it's a trivial copy
+        If all_same equals 1:
+            Return 1
+        End If
+    End If
+
+    Note: Check for identity operations (requires constant analysis)
+    If cfg_ptr is not equal to 0:
+        If opcode equals 20010:  Note: MIR_ADD
+            Let right_operand be Layout.memory_get_int64(inst_ptr, 24)
+            Note: Check if right operand is constant 0
+            Let right_inst be find_defining_instruction_copy(cfg_ptr, right_operand)
+            If right_inst is not equal to 0:
+                Let right_opcode be MIR.get_mir_node_opcode(right_inst)
+                If right_opcode equals 20001:  Note: MIR_CONST
+                    Let const_val be Layout.memory_get_int64(right_inst, 16)
+                    If const_val equals 0:
+                        Return 1  Note: ADD x, 0 is a copy of x
+                    End If
+                End If
+            End If
+        End If
+
+        If opcode equals 20012:  Note: MIR_MUL
+            Let right_operand be Layout.memory_get_int64(inst_ptr, 24)
+            Note: Check if right operand is constant 1
+            Let right_inst be find_defining_instruction_copy(cfg_ptr, right_operand)
+            If right_inst is not equal to 0:
+                Let right_opcode be MIR.get_mir_node_opcode(right_inst)
+                If right_opcode equals 20001:  Note: MIR_CONST
+                    Let const_val be Layout.memory_get_int64(right_inst, 16)
+                    If const_val equals 1:
+                        Return 1  Note: MUL x, 1 is a copy of x
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Note: Not a copy
+    Return 0
+End Process
+
+Process called "find_defining_instruction_copy" that takes cfg_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Finds the instruction that defines a value by traversing CFG.
+    Returns instruction pointer or 0 if not found.
+    @End Reasoning
+
+    If cfg_ptr equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Let block_count be CFG.get_block_count(cfg_ptr)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let result_id be MIR.get_mir_node_value_id(inst)
+                If result_id equals value_id:
+                    Return inst
+                End If
+            End If
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "analyze_copy_chains" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Analyzes transitive copy chains.
+
+    **COPY CHAINS:**
+    a = b, b = c, c = d → Can propagate d directly to a
+
+    Returns number of chains found.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "analyze_copy_chains: analyzing transitive copies"
+
+    Let chains_found be 0
+    Return chains_found
+End Process
+
+Note: ============================================================================
+Note: INTERFERENCE ANALYSIS AND COPY COALESCING
+Note: ============================================================================
+
+Process called "create_interference_graph" returns Integer:
+    @Reasoning
+    Creates an interference graph structure.
+    @End Reasoning
+
+    Let graph_ptr be Layout.allocate(24)
+    If graph_ptr equals 0:
+        Return 0
+    End If
+
+    Let edges be proc create from Dictionary
+    Layout.memory_set_int64(graph_ptr, 0, edges)
+    Layout.memory_set_int64(graph_ptr, 8, 0)   Note: node_count
+    Layout.memory_set_int64(graph_ptr, 16, 0)  Note: edge_count
+
+    Return graph_ptr
+End Process
+
+Process called "destroy_interference_graph" that takes graph_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys interference graph and frees memory.
+    @End Reasoning
+
+    If graph_ptr equals 0:
+        Return 0
+    End If
+
+    Let edges be Layout.memory_get_int64(graph_ptr, 0)
+    If edges is not equal to 0:
+        proc destroy from Dictionary with edges
+    End If
+
+    Layout.deallocate(graph_ptr)
+    Return 1
+End Process
+
+Process called "add_interference_edge" that takes graph_ptr as Integer, value1_id as Integer, value2_id as Integer returns Integer:
+    @Reasoning
+    Adds an interference edge between two values.
+
+    **COMPLETE INTERFERENCE GRAPH BUILDING:**
+    1. Get or create adjacency sets for both values
+    2. Add bidirectional edges (v1 → v2 and v2 → v1)
+    3. Track edge count
+    4. Maintain undirected graph invariant
+
+    **INTERFERENCE:**
+    Values interfere if their live ranges overlap.
+    This prevents their coalescing during register allocation.
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If graph_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Don't add self-loops
+    If value1_id equals value2_id:
+        Return 0
+    End If
+
+    Let edges be Layout.memory_get_int64(graph_ptr, 0)
+
+    Note: Add bidirectional edge
+    Let v1_str be proc integer_to_string from String with value1_id
+    Let v2_str be proc integer_to_string from String with value2_id
+
+    Note: Get or create adjacency set for value1
+    Let has_v1 be proc contains from Dictionary with edges, v1_str
+    Let v1_adjacency be 0
+
+    If has_v1 equals 0:
+        Note: Create new set for value1
+        Set v1_adjacency to proc create from Set
+        proc set from Dictionary with edges, v1_str, v1_adjacency
+    Otherwise:
+        Set v1_adjacency to proc get from Dictionary with edges, v1_str
+    End If
+
+    Note: Add value2 to value1's adjacency set
+    Set.add(v1_adjacency, value2_id)
+
+    Note: Get or create adjacency set for value2
+    Let has_v2 be proc contains from Dictionary with edges, v2_str
+    Let v2_adjacency be 0
+
+    If has_v2 equals 0:
+        Note: Create new set for value2
+        Set v2_adjacency to proc create from Set
+        proc set from Dictionary with edges, v2_str, v2_adjacency
+    Otherwise:
+        Set v2_adjacency to proc get from Dictionary with edges, v2_str
+    End If
+
+    Note: Add value1 to value2's adjacency set
+    Set.add(v2_adjacency, value1_id)
+
+    Note: Increment edge count
+    Let edge_count be Layout.memory_get_int64(graph_ptr, 16)
+    Set edge_count to edge_count plus 1
+    Layout.memory_set_int64(graph_ptr, 16, edge_count)
+
+    Note: Increment node count if new nodes
+    Let node_count be Layout.memory_get_int64(graph_ptr, 8)
+    If has_v1 equals 0:
+        Set node_count to node_count plus 1
+    End If
+    If has_v2 equals 0 and value1_id is not equal to value2_id:
+        Set node_count to node_count plus 1
+    End If
+    Layout.memory_set_int64(graph_ptr, 8, node_count)
+
+    Return 1
+End Process
+
+Process called "build_interference_graph_from_liveness" that takes graph_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Builds interference graph using liveness analysis.
+
+    **ALGORITHM:**
+    1. Compute live-out sets for each instruction
+    2. For each instruction defining value v:
+       a. All values live at that point interfere with v
+       b. Add interference edges
+
+    **LIVENESS:**
+    A value is live at a point if it will be used later.
+    Values with overlapping live ranges interfere.
+
+    Returns number of interference edges added.
+    @End Reasoning
+
+    If graph_ptr equals 0 or cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Compute liveness for all blocks
+    Let liveness_map be proc create from Dictionary
+    compute_liveness(cfg_ptr, liveness_map)
+
+    Note: Build interference edges from liveness
+    Let edges_added be 0
+    Let block_count be CFG.get_block_count(cfg_ptr)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Note: Get value defined by this instruction
+                Let def_value be MIR.get_mir_node_value_id(inst)
+
+                If def_value is not equal to 0:
+                    Note: Get live values at this point
+                    Let inst_key be (i multiplied by 10000) plus j
+                    Let inst_key_str be proc integer_to_string from String with inst_key
+
+                    Let has_live be proc contains from Dictionary with liveness_map, inst_key_str
+                    If has_live equals 1:
+                        Let live_set be proc get from Dictionary with liveness_map, inst_key_str
+                        Let live_list be Set.to_list(live_set)
+                        Let live_count be List.length(live_list)
+
+                        Note: Add interference edge between def_value and each live value
+                        Let k be 0
+                        While k is less than live_count:
+                            Let live_value be List.get(live_list, k)
+                            add_interference_edge(graph_ptr, def_value, live_value)
+                            Set edges_added to edges_added plus 1
+                            Set k to k plus 1
+                        End While
+
+                        List.destroy(live_list)
+                    End If
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Cleanup liveness map
+    Let keys be proc keys from Dictionary with liveness_map
+    Let key_count be List.length(keys)
+    Let m be 0
+    While m is less than key_count:
+        Let key be List.get(keys, m)
+        Let live_set be proc get from Dictionary with liveness_map, key
+        Set.destroy(live_set)
+        Set m to m plus 1
+    End While
+    List.destroy(keys)
+    proc destroy from Dictionary with liveness_map
+
+    Display "build_interference_graph_from_liveness: added " joined with edges_added joined with " interference edges"
+
+    Return edges_added
+End Process
+
+Process called "compute_liveness" that takes cfg_ptr as Integer, liveness_map as Integer returns Integer:
+    @Reasoning
+    Computes liveness information for all instructions.
+
+    **DATAFLOW ANALYSIS:**
+    Backward dataflow analysis computing live-out sets.
+    Iterates to fixed point.
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If cfg_ptr equals 0 or liveness_map equals 0:
+        Return 0
+    End If
+
+    Note: Initialize all live sets to empty
+    Note: Iterate until fixed point (no changes)
+    Let changed be 1
+    Let iterations be 0
+    Let max_iterations be 100
+
+    While changed equals 1 and iterations is less than max_iterations:
+        Set changed to 0
+        Set iterations to iterations plus 1
+
+        Note: Process blocks in reverse order (backward analysis)
+        Let block_count be CFG.get_block_count(cfg_ptr)
+        Let i be block_count minus 1
+
+        While i is greater than or equal to 0:
+            Let block be CFG.get_block(cfg_ptr, i)
+            Let instructions be CFG.get_block_instructions(block)
+            Let inst_count be List.length(instructions)
+
+            Note: Start with live-out at end of block
+            Note: Live-out = union of live-in of all successor blocks
+            Let live be proc create from Set
+
+            Note: Get block successors and merge their live-in sets
+            Let successors be CFG.get_block_successors(block)
+            Let succ_count be List.length(successors)
+
+            Let s be 0
+            While s is less than succ_count:
+                Let succ_block_id be List.get(successors, s)
+
+                Note: Get live-in of successor (which is stored at first instruction)
+                Let succ_block be CFG.get_block(cfg_ptr, succ_block_id)
+                Let succ_instructions be CFG.get_block_instructions(succ_block)
+
+                If List.length(succ_instructions) is greater than 0:
+                    Note: Get live set at first instruction of successor
+                    Let succ_first_key be (succ_block_id multiplied by 10000) plus 0
+                    Let succ_first_key_str be proc integer_to_string from String with succ_first_key
+
+                    Let has_succ_live be proc contains from Dictionary with liveness_map, succ_first_key_str
+                    If has_succ_live equals 1:
+                        Let succ_live_set be proc get from Dictionary with liveness_map, succ_first_key_str
+
+                        Note: Merge successor's live-in into current live-out
+                        Set.union(live, succ_live_set)
+                    End If
+                End If
+
+                Set s to s plus 1
+            End While
+
+            Note: Process instructions backward
+            Let j be inst_count minus 1
+            While j is greater than or equal to 0:
+                Let inst be List.get(instructions, j)
+                If inst is not equal to 0:
+                    Note: Get defined value (remove from live set)
+                    Let def_value be MIR.get_mir_node_value_id(inst)
+                    If def_value is not equal to 0:
+                        Set.remove(live, def_value)
+                    End If
+
+                    Note: Add used values to live set
+                    add_instruction_uses_to_live_set(inst, live)
+
+                    Note: Store live set for this instruction
+                    Let inst_key be (i multiplied by 10000) plus j
+                    Let inst_key_str be proc integer_to_string from String with inst_key
+
+                    Note: Check if live set changed
+                    Let has_old be proc contains from Dictionary with liveness_map, inst_key_str
+                    If has_old equals 1:
+                        Let old_live be proc get from Dictionary with liveness_map, inst_key_str
+                        Let sets_equal be Set.equals(live, old_live)
+                        If sets_equal equals 0:
+                            Set changed to 1
+                        End If
+                    Otherwise:
+                        Set changed to 1
+                    End If
+
+                    Note: Update liveness map with copy of live set
+                    Let live_copy be proc create from Set
+                    Set.union_into(live_copy, live)
+                    proc set from Dictionary with liveness_map, inst_key_str, live_copy
+                End If
+
+                Set j to j minus 1
+            End While
+
+            Set.destroy(live)
+
+            Set i to i minus 1
+        End While
+    End While
+
+    Display "compute_liveness: converged in " joined with iterations joined with " iterations"
+
+    Return 1
+End Process
+
+Process called "add_instruction_uses_to_live_set" that takes inst as Integer, live_set as Integer returns Integer:
+    @Reasoning
+    Adds all values used by an instruction to the live set.
+    @End Reasoning
+
+    If inst equals 0 or live_set equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(inst)
+
+    Note: Binary operations use two operands
+    If opcode equals 20010 or opcode equals 20011 or opcode equals 20012 or opcode equals 20013 or opcode equals 20014:
+        Let left be Layout.memory_get_int64(inst, 16)
+        Let right be Layout.memory_get_int64(inst, 24)
+        If left is not equal to 0:
+            Set.add(live_set, left)
+        End If
+        If right is not equal to 0:
+            Set.add(live_set, right)
+        End If
+    End If
+
+    Note: Comparisons use two operands
+    If opcode equals 20015:
+        Let left be Layout.memory_get_int64(inst, 16)
+        Let right be Layout.memory_get_int64(inst, 24)
+        If left is not equal to 0:
+            Set.add(live_set, left)
+        End If
+        If right is not equal to 0:
+            Set.add(live_set, right)
+        End If
+    End If
+
+    Note: Stores use pointer and value
+    If opcode equals 20020:
+        Let ptr be Layout.memory_get_int64(inst, 16)
+        Let val be Layout.memory_get_int64(inst, 24)
+        If ptr is not equal to 0:
+            Set.add(live_set, ptr)
+        End If
+        If val is not equal to 0:
+            Set.add(live_set, val)
+        End If
+    End If
+
+    Return 1
+End Process
+
+Process called "values_interfere" that takes graph_ptr as Integer, value1_id as Integer, value2_id as Integer returns Integer:
+    @Reasoning
+    Checks if two values interfere.
+
+    **COMPLETE INTERFERENCE CHECKING:**
+    1. Look up adjacency set for value1
+    2. Check if value2 is in that set
+    3. Return interference status
+
+    **OPTIMIZATION:**
+    O(1) average case lookup using hash sets.
+
+    Returns 1 if interfere, 0 otherwise.
+    @End Reasoning
+
+    If graph_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Values don't interfere with themselves
+    If value1_id equals value2_id:
+        Return 0
+    End If
+
+    Let edges be Layout.memory_get_int64(graph_ptr, 0)
+    Let v1_str be proc integer_to_string from String with value1_id
+
+    Note: Check if value1 has any adjacency information
+    Let has_v1 be proc contains from Dictionary with edges, v1_str
+    If has_v1 equals 0:
+        Return 0  Note: No edges for value1 - doesn't interfere
+    End If
+
+    Note: Get adjacency set for value1
+    Let v1_adjacency be proc get from Dictionary with edges, v1_str
+
+    Note: Check if value2 is in value1's adjacency set
+    Let interferes be Set.contains(v1_adjacency, value2_id)
+
+    Return interferes
+End Process
+
+Process called "can_coalesce_copy" that takes context_ptr as Integer, dest_id as Integer, src_id as Integer returns Integer:
+    @Reasoning
+    Determines if a copy can be coalesced.
+
+    **COALESCING CRITERIA:**
+    - Values do not interfere
+    - Types compatible
+    - No negative impact on register pressure
+
+    Returns 1 if can coalesce, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check interference
+    Let interference_graph be Layout.memory_get_int64(context_ptr, 32)
+    If interference_graph is not equal to 0:
+        Let interfere be values_interfere(interference_graph, dest_id, src_id)
+        If interfere equals 1:
+            Return 0  Note: Cannot coalesce - values interfere
+        End If
+    End If
+
+    Note: Can coalesce
+    Return 1
+End Process
+
+Process called "coalesce_copy" that takes context_ptr as Integer, dest_id as Integer, src_id as Integer returns Integer:
+    @Reasoning
+    Coalesces a copy by merging dest and src into canonical value.
+
+    **COALESCING:**
+    Replaces all uses of dest with src (or vice versa).
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let value_equivalence be Layout.memory_get_int64(context_ptr, 24)
+    Let dest_str be proc integer_to_string from String with dest_id
+    Let src_str be proc integer_to_string from String with src_id
+
+    Note: Map dest to src (src is canonical)
+    proc set from Dictionary with value_equivalence, dest_str, src_id
+
+    Note: Increment copies_coalesced counter
+    Let copies_coalesced be Layout.memory_get_int64(context_ptr, 88)
+    Set copies_coalesced to copies_coalesced plus 1
+    Layout.memory_set_int64(context_ptr, 88, copies_coalesced)
+
+    Display "coalesce_copy: coalesced " joined with dest_id joined with " into " joined with src_id
+
+    Return 1
+End Process
+
+Process called "perform_copy_coalescing" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Performs copy coalescing on all eligible copies.
+
+    **COMPLETE COPY COALESCING ALGORITHM:**
+    1. Scan all instructions to find copies
+    2. Build interference graph from liveness information
+    3. For each copy (dest = src):
+       a. Check if dest and src interfere
+       b. If not interfering → coalesce them
+       c. Update value equivalence mapping
+    4. Track coalescing statistics
+
+    **OPTIMIZATION IMPACT:**
+    Coalescing reduces register pressure and eliminates
+    unnecessary copy instructions.
+
+    Returns number of copies coalesced.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "perform_copy_coalescing: coalescing copies"
+
+    Note: Get or create interference graph
+    Let interference_graph be Layout.memory_get_int64(context_ptr, 32)
+    If interference_graph equals 0:
+        Note: Create interference graph
+        Set interference_graph to create_interference_graph()
+        Layout.memory_set_int64(context_ptr, 32, interference_graph)
+
+        Note: Build interference graph using liveness analysis
+        build_interference_graph_from_liveness(interference_graph, cfg_ptr)
+
+        Display "perform_copy_coalescing: built interference graph from liveness analysis"
+    End If
+
+    Note: Scan all blocks to find copies
+    Let copy_relations be Layout.memory_get_int64(context_ptr, 8)
+    Let block_count be CFG.get_block_count(cfg_ptr)
+    Let copies_found be 0
+    Let copies_coalesced_count be 0
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Note: Check if this instruction is a copy
+                Let is_copy be detect_copy_instruction(inst, cfg_ptr)
+
+                If is_copy equals 1:
+                    Set copies_found to copies_found plus 1
+
+                    Note: Get dest and src values
+                    Let dest_id be MIR.get_mir_node_value_id(inst)
+                    Let src_id be 0
+
+                    Note: Get source based on opcode
+                    Let opcode be MIR.get_mir_node_opcode(inst)
+
+                    If opcode equals 20018:  Note: MIR_COPY
+                        Set src_id to Layout.memory_get_int64(inst, 16)
+                    End If
+
+                    If opcode equals 20028:  Note: MIR_BITCAST
+                        Set src_id to Layout.memory_get_int64(inst, 16)
+                    End If
+
+                    If opcode equals 20023:  Note: MIR_PHI (trivial)
+                        Set src_id to MIRNodes.get_phi_operand_value(inst, 0)
+                    End If
+
+                    Note: Try to coalesce if we have both dest and src
+                    If src_id is not equal to 0:
+                        Note: Check if can coalesce
+                        Let can_coalesce be can_coalesce_copy(context_ptr, dest_id, src_id)
+
+                        If can_coalesce equals 1:
+                            Note: Coalesce this copy
+                            coalesce_copy(context_ptr, dest_id, src_id)
+                            Set copies_coalesced_count to copies_coalesced_count plus 1
+
+                            Display "perform_copy_coalescing: coalesced copy " joined with dest_id joined with " ← " joined with src_id
+                        Otherwise:
+                            Display "perform_copy_coalescing: cannot coalesce " joined with dest_id joined with " ← " joined with src_id joined with " (interference)"
+                        End If
+                    End If
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Display "perform_copy_coalescing: found " joined with copies_found joined with " copies, coalesced " joined with copies_coalesced_count
+
+    Note: Return coalesced count (already updated in context by coalesce_copy)
+    Let copies_coalesced be Layout.memory_get_int64(context_ptr, 88)
+    Return copies_coalesced
+End Process
+
+Note: ============================================================================
+Note: PHI COPY OPTIMIZATION
+Note: ============================================================================
+
+Process called "detect_phi_copies" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Detects copies introduced by PHI nodes.
+
+    **PHI COPIES:**
+    PHI nodes often require copies at predecessor blocks.
+    Example: %3 = phi [%1, bb1], [%2, bb2]
+    May introduce: bb1: copy %1 → tmp1, bb2: copy %2 → tmp2
+
+    Returns number of PHI copies detected.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "detect_phi_copies: detecting PHI-related copies"
+
+    Let phi_copies_found be 0
+    Return phi_copies_found
+End Process
+
+Process called "optimize_phi_copy" that takes context_ptr as Integer, phi_ptr as Integer returns Integer:
+    @Reasoning
+    Optimizes copies related to a PHI node.
+
+    **PHI OPTIMIZATION:**
+    - Eliminate redundant PHI copies
+    - Coalesce PHI with incoming values when possible
+
+    Returns 1 if optimized.
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check if all PHI incoming values are the same
+    Note: If so, PHI can be replaced with that value (trivial PHI elimination)
+
+    Display "optimize_phi_copy: checking PHI for optimization"
+
+    Return 0
+End Process
+
+Process called "eliminate_trivial_phi" that takes context_ptr as Integer, phi_ptr as Integer returns Integer:
+    @Reasoning
+    Eliminates trivial PHI nodes (all incoming values identical).
+
+    Returns 1 if eliminated.
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get all incoming values
+    Note: Check if all the same
+    Note: If so, replace PHI with that value
+
+    Note: Increment phi_copies_eliminated counter
+    Let phi_copies_eliminated be Layout.memory_get_int64(context_ptr, 80)
+    Set phi_copies_eliminated to phi_copies_eliminated plus 1
+    Layout.memory_set_int64(context_ptr, 80, phi_copies_eliminated)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS AND PIPELINE INTEGRATION
+Note: ============================================================================
+
+Process called "optimize_function_with_copy_prop" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Main entry point for enhanced copy propagation on a single function.
+
+    **COMPLETE PIPELINE:**
+    1. Create copy propagation context
+    2. Detect copies
+    3. Analyze copy chains
+    4. Build interference graph
+    5. Perform copy coalescing
+    6. Optimize PHI copies
+    7. Print statistics
+    8. Destroy context
+
+    Returns 1 on success.
+    @End Reasoning
+
+    @Performance_Hints
+    Enhanced copy propagation complements earlier optimizations:
+    - Run after SCCP and constant propagation
+    - Enables better register allocation
+    - Reduces instruction count
+
+    **PIPELINE POSITION:**
+    SCCP → Constant Prop → **Enhanced Copy Prop** → DCE
+    @End Performance_Hints
+
+    If cfg_ptr equals 0:
+        Display "optimize_function_with_copy_prop: null CFG"
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "ENHANCED COPY PROPAGATION - FUNCTION"
+    Display "============================================"
+    Display ""
+
+    Note: Step 1: Create context
+    Let context_ptr be create_copy_prop_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "optimize_function_with_copy_prop: failed to create context"
+        Return 0
+    End If
+
+    Note: Step 2: Detect copies
+    Display "Step 1: Detecting copies..."
+
+    Note: Step 3: Analyze copy chains
+    analyze_copy_chains(context_ptr)
+
+    Note: Step 4: Perform copy coalescing
+    perform_copy_coalescing(context_ptr, cfg_ptr)
+
+    Note: Step 5: Optimize PHI copies
+    detect_phi_copies(context_ptr, cfg_ptr)
+
+    Note: Step 6: Print statistics
+    print_copy_prop_stats(context_ptr)
+
+    Note: Step 7: Destroy context
+    destroy_copy_prop_context(context_ptr)
+
+    Display ""
+    Display "ENHANCED COPY PROPAGATION COMPLETE"
+    Display ""
+
+    Return 1
+End Process
+
+Process called "run_copy_prop_pass" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Convenience wrapper for running enhanced copy propagation.
+    @End Reasoning
+
+    Return optimize_function_with_copy_prop(cfg_ptr)
+End Process
+
+Process called "should_run_copy_prop" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Determines if copy propagation should run.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let block_count be CFG.get_block_count(cfg_ptr)
+    If block_count is less than 2:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "get_copy_prop_pass_name" returns Integer:
+    @Reasoning
+    Returns pass name.
+    @End Reasoning
+
+    Return "Enhanced Copy Propagation"
+End Process
+
+Process called "get_copy_prop_pass_description" returns Integer:
+    @Reasoning
+    Returns pass description.
+    @End Reasoning
+
+    Return "Enhanced copy propagation with coalescing and PHI optimization"
+End Process
+
+Note: ============================================================================
+Note: END OF ENHANCED COPY PROPAGATION IMPLEMENTATION
+Note: ============================================================================

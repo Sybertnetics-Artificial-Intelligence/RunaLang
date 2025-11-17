@@ -35,4 +35,3355 @@ This file consists of the following functions/features/operation types:
 - SSA optimization and SSA form verification
 :End Note
 
-Note: TODO - Implement SSA construction algorithms functionality
+Note: ============================================================
+Note: IMPORTS
+Note: ============================================================
+
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================
+Note: DATA STRUCTURES
+Note: ============================================================
+
+Type called "VariableInfo":
+    @Reasoning
+    Tracks information about an original source variable during SSA construction.
+
+    During SSA conversion, each original variable (e.g., "x") is split into
+    multiple SSA versions (e.g., "x_0", "x_1", "x_2"). This structure tracks:
+    - The original variable name
+    - Which blocks define this variable (needed for phi placement)
+    - A stack of current SSA names (for renaming phase)
+    - A version counter for generating fresh SSA names
+    - Type information for the variable
+
+    The SSA name stack is critical for the renaming algorithm:
+    - When entering a block that defines the variable, push new SSA name
+    - When using the variable, peek the top of the stack
+    - When exiting a block, pop to restore parent's view
+    - Dominance tree traversal ensures proper scoping
+    @End Reasoning
+
+    original_name as Integer         Note: Original variable name (string pointer, TIER 3)
+    def_blocks as Integer            Note: List of block IDs where variable is defined (TIER 3)
+    def_block_count as Integer       Note: Number of definition blocks
+    ssa_name_stack as Integer        Note: Stack of SSA value IDs (List, TIER 3)
+    current_version as Integer       Note: Counter for generating version numbers
+    type_info as Integer             Note: HIRTypeInfo pointer for variable type
+    has_phi as Integer               Note: Boolean: has phi node been placed
+End Type
+
+Type called "SSARenamingContext":
+    @Reasoning
+    Context for SSA construction renaming phase.
+
+    The renaming phase traverses the dominance tree and renames all variables
+    to SSA form. This context maintains:
+    - The function being processed
+    - Mapping from original variable names to VariableInfo structures
+    - Global SSA value counter (for allocating fresh value IDs)
+    - Dominance information (for tree traversal)
+    - The CFG (for accessing blocks and instructions)
+
+    This is the central data structure for the entire SSA construction process.
+    @End Reasoning
+
+    function_ptr as Integer          Note: MIRFunction being processed
+    cfg_ptr as Integer               Note: MIRCFG pointer
+    variable_map as Integer          Note: Map: original_name -> VariableInfo (List of pairs, TIER 3)
+    variable_count as Integer        Note: Number of tracked variables
+    next_value_id as Integer         Note: Global counter for SSA value IDs
+    dominance_info as Integer        Note: DominanceInfo pointer (from Dominance.compute_dominance_tree)
+End Type
+
+Type called "PhiPlacementInfo":
+    @Reasoning
+    Work item for phi node placement algorithm.
+
+    The Cytron algorithm uses a work list to compute the iterated dominance
+    frontier. Each work item represents a (block, variable) pair that needs
+    phi node placement analysis.
+
+    Algorithm:
+    1. Start with all definition blocks in work list
+    2. For each block X in work list:
+       - For each Y in DF(X):
+         - If Y doesn't have phi for variable, insert phi
+         - If Y was not already a definition block, add Y to work list
+    3. Repeat until work list empty
+
+    This ensures phis are placed at the *iterated* dominance frontier.
+    @End Reasoning
+
+    block_id as Integer              Note: Block ID needing phi analysis
+    variable_name as Integer         Note: Variable name (string pointer)
+End Type
+
+Note: ============================================================
+Note: PHASE 1: DATA STRUCTURES & FOUNDATION
+Note: ============================================================
+
+Process called "create_variable_info" that takes original_name as Integer, type_info as Integer returns Integer:
+    @Reasoning
+    Creates and initializes a VariableInfo structure for tracking a variable.
+
+    Memory layout (TIER 3 OWNED HEAP - 56 bytes):
+    - offset 0:  original_name pointer (8 bytes)
+    - offset 8:  def_blocks list pointer (8 bytes)
+    - offset 16: def_block_count (8 bytes)
+    - offset 24: ssa_name_stack list pointer (8 bytes)
+    - offset 32: current_version (8 bytes)
+    - offset 40: type_info pointer (8 bytes)
+    - offset 48: has_phi boolean (8 bytes)
+    Total: 56 bytes
+    @End Reasoning
+
+    Note: Allocate VariableInfo structure
+    Let var_info_ptr be Layout.allocate(56)
+
+    Note: Initialize fields
+    Layout.memory_set_int64(var_info_ptr, 0, original_name)
+    Layout.memory_set_int64(var_info_ptr, 40, type_info)
+
+    Note: Create def_blocks list
+    Let def_blocks be List.create()
+    Layout.memory_set_int64(var_info_ptr, 8, def_blocks)
+    Layout.memory_set_int64(var_info_ptr, 16, 0)  Note: def_block_count
+
+    Note: Create SSA name stack
+    Let ssa_stack be List.create()
+    Layout.memory_set_int64(var_info_ptr, 24, ssa_stack)
+
+    Note: Initialize version counter and flags
+    Layout.memory_set_int64(var_info_ptr, 32, 0)  Note: current_version starts at 0
+    Layout.memory_set_int64(var_info_ptr, 48, 0)  Note: has_phi = false
+
+    Return var_info_ptr
+End Process
+
+Process called "add_definition_block" that takes var_info_ptr as Integer, block_id as Integer returns Integer:
+    @Reasoning
+    Adds a block ID to the variable's definition blocks list.
+
+    This is used during the phi placement phase to track which blocks define
+    a variable. The iterated dominance frontier algorithm needs this information
+    to determine where to place phi nodes.
+
+    Returns: 1 on success, 0 on failure
+    @End Reasoning
+
+    Note: Null check
+    If var_info_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get def_blocks list
+    Let def_blocks be Layout.memory_get_int64(var_info_ptr, 8)
+    If def_blocks equals 0:
+        Return 0
+    End If
+
+    Note: Check if block already in list (avoid duplicates)
+    If List.contains(def_blocks, block_id) equals 1:
+        Return 1  Note: Already present, no need to add
+    End If
+
+    Note: Add block to list
+    List.append(def_blocks, block_id)
+
+    Note: Update count
+    Let count be Layout.memory_get_int64(var_info_ptr, 16)
+    Layout.memory_set_int64(var_info_ptr, 16, count plus 1)
+
+    Return 1
+End Process
+
+Process called "push_ssa_name" that takes var_info_ptr as Integer, ssa_value_id as Integer returns Integer:
+    @Reasoning
+    Pushes a new SSA name onto the variable's name stack.
+
+    This is called when entering a block that defines the variable.
+    The dominance tree traversal ensures that when we exit the block,
+    we pop the name to restore the parent's view.
+
+    Example:
+    - Enter block B1: push x_1
+    - Use x in B1: peek → x_1
+    - Enter dominated block B2: push x_2
+    - Use x in B2: peek → x_2
+    - Exit B2: pop (x_2 removed)
+    - Use x in B1: peek → x_1 (restored)
+
+    Returns: 1 on success, 0 on failure
+    @End Reasoning
+
+    Note: Null check
+    If var_info_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get SSA name stack
+    Let ssa_stack be Layout.memory_get_int64(var_info_ptr, 24)
+    If ssa_stack equals 0:
+        Return 0
+    End If
+
+    Note: Push SSA value ID onto stack
+    List.append(ssa_stack, ssa_value_id)
+
+    Return 1
+End Process
+
+Process called "pop_ssa_name" that takes var_info_ptr as Integer returns Integer:
+    @Reasoning
+    Pops the top SSA name from the variable's name stack.
+
+    This is called when exiting a block that defined the variable.
+    The popped name is the SSA version that was active in that block.
+
+    Returns: The popped SSA value ID, or -1 if stack is empty
+    @End Reasoning
+
+    Note: Null check
+    If var_info_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Get SSA name stack
+    Let ssa_stack be Layout.memory_get_int64(var_info_ptr, 24)
+    If ssa_stack equals 0:
+        Return -1
+    End If
+
+    Note: Check if stack is empty
+    Let stack_size be List.length(ssa_stack)
+    If stack_size equals 0:
+        Return -1
+    End If
+
+    Note: Get top element
+    Let top_value_id be List.get(ssa_stack, stack_size minus 1)
+
+    Note: Remove top element (simulate pop)
+    Let new_stack be List.create()
+    Let i be 0
+    While i is less than stack_size minus 1:
+        Let elem be List.get(ssa_stack, i)
+        List.append(new_stack, elem)
+        Set i to i plus 1
+    End While
+
+    Note: Replace stack with new stack
+    List.destroy(ssa_stack)
+    Layout.memory_set_int64(var_info_ptr, 24, new_stack)
+
+    Return top_value_id
+End Process
+
+Process called "peek_ssa_name" that takes var_info_ptr as Integer returns Integer:
+    @Reasoning
+    Returns the current SSA name for a variable without removing it.
+
+    This is called when using a variable - we need to know which SSA version
+    is currently active (the one defined in the nearest dominating block).
+
+    Returns: The current SSA value ID, or -1 if stack is empty
+    @End Reasoning
+
+    Note: Null check
+    If var_info_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Get SSA name stack
+    Let ssa_stack be Layout.memory_get_int64(var_info_ptr, 24)
+    If ssa_stack equals 0:
+        Return -1
+    End If
+
+    Note: Check if stack is empty
+    Let stack_size be List.length(ssa_stack)
+    If stack_size equals 0:
+        Return -1
+    End If
+
+    Note: Return top element without removing
+    Let top_value_id be List.get(ssa_stack, stack_size minus 1)
+    Return top_value_id
+End Process
+
+Process called "allocate_fresh_ssa_name" that takes var_info_ptr as Integer, context_ptr as Integer returns Integer:
+    @Reasoning
+    Allocates a fresh SSA value ID for a variable.
+
+    This creates a new SSA version of the variable (e.g., x_0 → x_1 → x_2).
+    The version counter is incremented, and a new globally unique value ID
+    is allocated from the context.
+
+    Returns: The new SSA value ID
+    @End Reasoning
+
+    Note: Null checks
+    If var_info_ptr equals 0 or context_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Get and increment version counter
+    Let version be Layout.memory_get_int64(var_info_ptr, 32)
+    Layout.memory_set_int64(var_info_ptr, 32, version plus 1)
+
+    Note: Get and increment global value ID counter
+    Let value_id be Layout.memory_get_int64(context_ptr, 32)
+    Layout.memory_set_int64(context_ptr, 32, value_id plus 1)
+
+    Return value_id
+End Process
+
+Process called "create_ssa_context" that takes function_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Creates and initializes an SSA renaming context.
+
+    This is the main context structure used throughout SSA construction.
+    It holds all variable tracking information, the dominance tree, and
+    manages SSA value ID allocation.
+
+    Memory layout (TIER 3 OWNED HEAP - 48 bytes):
+    - offset 0:  function_ptr (8 bytes)
+    - offset 8:  cfg_ptr (8 bytes)
+    - offset 16: variable_map list pointer (8 bytes)
+    - offset 24: variable_count (8 bytes)
+    - offset 32: next_value_id counter (8 bytes)
+    - offset 40: dominance_info pointer (8 bytes)
+    Total: 48 bytes
+    @End Reasoning
+
+    Note: Allocate SSARenamingContext structure
+    Let context_ptr be Layout.allocate(48)
+
+    Note: Initialize basic fields
+    Layout.memory_set_int64(context_ptr, 0, function_ptr)
+    Layout.memory_set_int64(context_ptr, 8, cfg_ptr)
+
+    Note: Create variable map (list of (name, VariableInfo) pairs)
+    Let variable_map be List.create()
+    Layout.memory_set_int64(context_ptr, 16, variable_map)
+    Layout.memory_set_int64(context_ptr, 24, 0)  Note: variable_count
+
+    Note: Initialize value ID counter
+    Note: Start from 1000 to avoid conflicts with existing MIR value IDs
+    Layout.memory_set_int64(context_ptr, 32, 1000)
+
+    Note: Dominance info will be set later
+    Layout.memory_set_int64(context_ptr, 40, 0)
+
+    Return context_ptr
+End Process
+
+Process called "get_or_create_variable_info" that takes context_ptr as Integer, var_name as Integer, type_info as Integer returns Integer:
+    @Reasoning
+    Looks up a variable in the context, creating it if it doesn't exist.
+
+    This is used during SSA construction to ensure we have a VariableInfo
+    for every variable we encounter. If the variable hasn't been seen before,
+    we create a new VariableInfo and add it to the variable map.
+
+    Returns: Pointer to VariableInfo, or 0 on failure
+    @End Reasoning
+
+    Note: Null check
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get variable map
+    Let variable_map be Layout.memory_get_int64(context_ptr, 16)
+    If variable_map equals 0:
+        Return 0
+    End If
+
+    Let var_count be Layout.memory_get_int64(context_ptr, 24)
+
+    Note: Search for existing variable
+    Let i be 0
+    While i is less than var_count:
+        Note: Each entry in variable_map is a (name_ptr, var_info_ptr) pair
+        Note: We store pairs as consecutive elements: [name0, info0, name1, info1, ...]
+        Let entry_name be List.get(variable_map, i times 2)
+
+        Note: Compare variable names using string comparison
+        Let names_match be proc string_equals from String with entry_name, var_name
+        If names_match equals 1:
+            Let var_info_ptr be List.get(variable_map, i times 2 plus 1)
+            Return var_info_ptr
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Variable not found, create new VariableInfo
+    Let var_info_ptr be create_variable_info(var_name, type_info)
+    If var_info_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Add to variable map
+    List.append(variable_map, var_name)
+    List.append(variable_map, var_info_ptr)
+
+    Note: Update count
+    Layout.memory_set_int64(context_ptr, 24, var_count plus 1)
+
+    Return var_info_ptr
+End Process
+
+Process called "set_dominance_info" that takes context_ptr as Integer, dominance_info as Integer returns Integer:
+    @Reasoning
+    Sets the dominance information in the SSA context.
+
+    The dominance information (computed by Dominance.compute_dominance_tree)
+    is essential for:
+    1. Phi placement (using dominance frontiers)
+    2. Variable renaming (using dominance tree traversal)
+
+    Returns: 1 on success, 0 on failure
+    @End Reasoning
+
+    Note: Null check
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Set dominance info
+    Layout.memory_set_int64(context_ptr, 40, dominance_info)
+
+    Return 1
+End Process
+
+Process called "destroy_ssa_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Deallocates an SSA renaming context and all associated data.
+
+    This frees:
+    - All VariableInfo structures
+    - All def_blocks lists
+    - All SSA name stacks
+    - The variable map
+    - The context structure itself
+
+    Note: Does NOT free the dominance info (that's owned by caller)
+
+    Returns: 1 on success, 0 on failure
+    @End Reasoning
+
+    Note: Null check
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get variable map
+    Let variable_map be Layout.memory_get_int64(context_ptr, 16)
+    Let var_count be Layout.memory_get_int64(context_ptr, 24)
+
+    Note: Free all VariableInfo structures
+    If variable_map is not equal to 0:
+        Let i be 0
+        While i is less than var_count:
+            Note: Get var_info_ptr from map
+            Let var_info_ptr be List.get(variable_map, i times 2 plus 1)
+
+            If var_info_ptr is not equal to 0:
+                Note: Free def_blocks list
+                Let def_blocks be Layout.memory_get_int64(var_info_ptr, 8)
+                If def_blocks is not equal to 0:
+                    List.destroy(def_blocks)
+                End If
+
+                Note: Free SSA name stack
+                Let ssa_stack be Layout.memory_get_int64(var_info_ptr, 24)
+                If ssa_stack is not equal to 0:
+                    List.destroy(ssa_stack)
+                End If
+
+                Note: Free VariableInfo structure
+                Layout.deallocate(var_info_ptr, 56)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        Note: Free variable map
+        List.destroy(variable_map)
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr, 48)
+
+    Return 1
+End Process
+
+Note: ============================================================
+Note: PHASE 2: PHI PLACEMENT (CYTRON ALGORITHM)
+Note: ============================================================
+
+Process called "collect_variable_definitions" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Scans all blocks in the CFG to find where each variable is defined.
+
+    This is the first step of the Cytron algorithm. We need to know which
+    blocks define each variable so we can compute the iterated dominance
+    frontier for those definition sets.
+
+    For each instruction that defines a variable:
+    - Get or create VariableInfo for that variable
+    - Add the block ID to the variable's def_blocks list
+
+    Returns: 1 on success, 0 on failure
+    @End Reasoning
+
+    @Implementation
+    Scans all blocks and instructions, tracking variable definitions.
+    This builds the def_blocks list for each VariableInfo structure.
+    @End Implementation
+
+    Note: Null check
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 8)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get all blocks
+    Let blocks_list be CFG.get_cfg_blocks(cfg_ptr)
+    Let block_count be CFG.get_cfg_block_count(cfg_ptr)
+
+    Note: Scan each block
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block_ptr be List.get(blocks_list, block_idx)
+        Let block_id be CFG.get_block_id(block_ptr)
+
+        Note: Get instructions in block
+        Let instructions be MIR.get_block_instructions(block_ptr)
+        Let inst_count be MIR.get_block_instruction_count(block_ptr)
+
+        Note: Scan each instruction
+        Let inst_idx be 0
+        While inst_idx is less than inst_count:
+            Let inst_ptr be List.get(instructions, inst_idx)
+
+            Note: Check if instruction defines a variable
+            Let defines_var be MIR.instruction_defines_variable(inst_ptr)
+            If defines_var equals 1:
+                Note: Get variable information from instruction
+                Let var_name be MIR.get_instruction_defined_variable(inst_ptr)
+                Let var_type be MIR.get_instruction_result_type(inst_ptr)
+
+                If var_name is not equal to 0:
+                    Note: Get or create VariableInfo for this variable
+                    Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, var_type)
+
+                    If var_info_ptr is not equal to 0:
+                        Note: Add this block to variable's definition blocks
+                        add_definition_block(var_info_ptr, block_id)
+                    End If
+                End If
+            End If
+
+            Set inst_idx to inst_idx plus 1
+        End While
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "compute_iterated_dominance_frontier" that takes def_blocks as Integer, dominance_info as Integer returns Integer:
+    @Reasoning
+    Computes the iterated dominance frontier (IDF) for a set of blocks.
+
+    **ITERATED DOMINANCE FRONTIER ALGORITHM:**
+
+    The IDF is the set of blocks where phi nodes need to be placed.
+    For a set S of definition blocks, IDF(S) is computed as:
+
+    ```
+    IDF(S):
+        DF+ = empty set
+        W = S (work list)
+        while W not empty:
+            X = remove from W
+            for each Y in DF(X):
+                if Y not in DF+:
+                    add Y to DF+
+                    if Y not in S:
+                        add Y to W
+        return DF+
+    ```
+
+    **WHY THIS WORKS:**
+    - Start with definition blocks in work list
+    - For each block X, all blocks in DF(X) are join points needing phis
+    - If Y wasn't originally a definition block, adding a phi makes it one
+    - So we add Y to the work list to process its dominance frontier too
+    - This iterates until we reach a fixed point
+
+    **TIME COMPLEXITY:** O(V + E) typical, O(V²) worst case
+
+    Returns: List of block IDs in the iterated dominance frontier (TIER 3)
+    @End Reasoning
+
+    Note: Create result set for IDF
+    Let idf_set be List.create()
+
+    Note: Create work list, initialize with definition blocks
+    Let work_list be List.create()
+
+    Note: Copy def_blocks into work list
+    Let def_count be List.length(def_blocks)
+    Let i be 0
+    While i is less than def_count:
+        Let block_id be List.get(def_blocks, i)
+        List.append(work_list, block_id)
+        Set i to i plus 1
+    End While
+
+    Note: Process work list until empty
+    While List.length(work_list) is greater than 0:
+        Note: Remove first element from work list
+        Let work_size be List.length(work_list)
+        Let current_block be List.get(work_list, 0)
+
+        Note: Remove current_block from work list (shift elements)
+        Let new_work_list be List.create()
+        Let j be 1
+        While j is less than work_size:
+            Let elem be List.get(work_list, j)
+            List.append(new_work_list, elem)
+            Set j to j plus 1
+        End While
+        List.destroy(work_list)
+        Set work_list to new_work_list
+
+        Note: Get dominance frontier of current block
+        Let df be Dominance.get_dominance_frontier(dominance_info, current_block)
+        Let df_count be List.length(df)
+
+        Note: For each block Y in DF(current_block)
+        Let k be 0
+        While k is less than df_count:
+            Let y_block_id be List.get(df, k)
+
+            Note: If Y not already in IDF set
+            If List.contains(idf_set, y_block_id) equals 0:
+                Note: Add Y to IDF set
+                List.append(idf_set, y_block_id)
+
+                Note: If Y not in original definition blocks, add to work list
+                If List.contains(def_blocks, y_block_id) equals 0:
+                    List.append(work_list, y_block_id)
+                End If
+            End If
+
+            Set k to k plus 1
+        End While
+    End While
+
+    Note: Cleanup work list
+    List.destroy(work_list)
+
+    Return idf_set
+End Process
+
+Process called "place_phi_at_block" that takes context_ptr as Integer, block_ptr as Integer, var_name as Integer, var_type as Integer returns Integer:
+    @Reasoning
+    Creates and inserts a phi node for a variable at the beginning of a block.
+
+    **PHI NODE STRUCTURE:**
+    A phi node merges values from multiple control flow paths:
+    ```
+    %result = phi type [%val1, block1], [%val2, block2], ...
+    ```
+
+    At this stage (phi placement), we create the phi with:
+    - A fresh SSA value ID for the result
+    - The variable's type
+    - Empty incoming value list (filled during renaming phase)
+
+    The phi is inserted at the beginning of the block (before all other instructions).
+
+    Returns: Pointer to created phi node, or 0 on failure
+    @End Reasoning
+
+    Note: Null checks
+    If context_ptr equals 0 or block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Allocate fresh SSA value ID for phi result
+    Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, var_type)
+    If var_info_ptr equals 0:
+        Return 0
+    End If
+
+    Let phi_value_id be allocate_fresh_ssa_name(var_info_ptr, context_ptr)
+    If phi_value_id equals -1:
+        Return 0
+    End If
+
+    Note: Create MIR phi node
+    Let phi_ptr be MIRNodes.create_mir_phi_node(phi_value_id, var_type, block_ptr)
+    If phi_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Insert phi at beginning of block
+    Note: Phis must come before all other instructions
+    MIR.insert_instruction_at_block_start(block_ptr, phi_ptr)
+
+    Note: Mark that this variable has a phi in this block
+    Let block_id be CFG.get_block_id(block_ptr)
+    add_definition_block(var_info_ptr, block_id)
+
+    Return phi_ptr
+End Process
+
+Process called "block_has_phi_for_variable" that takes block_ptr as Integer, var_name as Integer returns Integer:
+    @Reasoning
+    Checks if a block already has a phi node for a given variable.
+
+    This is needed to avoid inserting duplicate phi nodes during the
+    iterated dominance frontier computation.
+
+    Algorithm:
+    - Get all instructions in the block
+    - Scan from the beginning (phis are at the start)
+    - Check if any phi node is for the given variable
+    - Stop at first non-phi instruction
+
+    Returns: 1 if phi exists, 0 otherwise
+    @End Reasoning
+
+    Note: Null check
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get instructions in block
+    Let instructions be MIR.get_block_instructions(block_ptr)
+    Let inst_count be MIR.get_block_instruction_count(block_ptr)
+
+    Note: Scan instructions (phis are at the beginning)
+    Let i be 0
+    While i is less than inst_count:
+        Let inst_ptr be List.get(instructions, i)
+
+        Note: Check if instruction is a phi node
+        Let is_phi be MIRNodes.is_phi_node(inst_ptr)
+        If is_phi equals 0:
+            Note: No more phi nodes (they're all at the start)
+            Return 0
+        End If
+
+        Note: Check if this phi is for our variable
+        Let phi_var_name be MIRNodes.get_phi_variable_name(inst_ptr)
+        If phi_var_name equals var_name:
+            Return 1  Note: Found phi for this variable
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: No phi found for this variable
+    Return 0
+End Process
+
+Process called "insert_phi_nodes_for_variable" that takes context_ptr as Integer, var_info_ptr as Integer, dominance_info as Integer returns Integer:
+    @Reasoning
+    Inserts phi nodes for a single variable using the Cytron algorithm.
+
+    **CYTRON ALGORITHM FOR ONE VARIABLE:**
+
+    Given:
+    - Variable V with definition blocks Defs(V)
+    - Dominance frontier information DF
+
+    Algorithm:
+    1. Compute IDF(Defs(V)) = iterated dominance frontier of definition blocks
+    2. For each block B in IDF(Defs(V)):
+       - If B doesn't have phi for V yet:
+         - Insert phi for V at B
+    3. Return success
+
+    This ensures phi nodes are placed at exactly the join points where
+    control flow paths with different definitions of V converge.
+
+    Returns: 1 on success, 0 on failure
+    @End Reasoning
+
+    Note: Null checks
+    If context_ptr equals 0 or var_info_ptr equals 0 or dominance_info equals 0:
+        Return 0
+    End If
+
+    Note: Get variable's definition blocks
+    Let def_blocks be Layout.memory_get_int64(var_info_ptr, 8)
+    Let def_count be Layout.memory_get_int64(var_info_ptr, 16)
+
+    Note: If no definitions, no phis needed
+    If def_count equals 0:
+        Return 1
+    End If
+
+    Note: If only one definition block and no control flow joins, might not need phis
+    Note: But we compute IDF anyway to handle all cases correctly
+
+    Note: Compute iterated dominance frontier
+    Let idf_blocks be compute_iterated_dominance_frontier(def_blocks, dominance_info)
+    Let idf_count be List.length(idf_blocks)
+
+    Note: Get variable information
+    Let var_name be Layout.memory_get_int64(var_info_ptr, 0)
+    Let var_type be Layout.memory_get_int64(var_info_ptr, 40)
+
+    Note: Get CFG
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 8)
+
+    Note: For each block in IDF, insert phi if not already present
+    Let i be 0
+    While i is less than idf_count:
+        Let block_id be List.get(idf_blocks, i)
+
+        Note: Get block pointer
+        Let block_ptr be CFG.get_block_by_id(cfg_ptr, block_id)
+        If block_ptr is not equal to 0:
+            Note: Check if phi already exists for this variable
+            Let has_phi be block_has_phi_for_variable(block_ptr, var_name)
+
+            If has_phi equals 0:
+                Note: Insert phi node for this variable
+                place_phi_at_block(context_ptr, block_ptr, var_name, var_type)
+
+                Note: Mark that this block now has phi for this variable
+                Layout.memory_set_int64(var_info_ptr, 48, 1)  Note: has_phi flag
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Cleanup IDF blocks list
+    List.destroy(idf_blocks)
+
+    Return 1
+End Process
+
+Process called "insert_all_phi_nodes" that takes context_ptr as Integer, dominance_info as Integer returns Integer:
+    @Reasoning
+    Inserts phi nodes for all variables in the function.
+
+    This is the main entry point for the phi placement phase.
+    It applies the Cytron algorithm to every variable:
+
+    ```
+    For each variable V in the function:
+        Insert phi nodes for V using iterated dominance frontier
+    ```
+
+    **ALGORITHM CORRECTNESS:**
+    - Cytron et al. (1991) proved this produces minimal SSA form
+    - Minimal = fewest phi nodes possible while maintaining SSA property
+    - Dominance frontiers ensure phis are placed at exactly the right join points
+
+    Returns: 1 on success, 0 on failure
+    @End Reasoning
+
+    Note: Null checks
+    If context_ptr equals 0 or dominance_info equals 0:
+        Return 0
+    End If
+
+    Note: Get variable map
+    Let variable_map be Layout.memory_get_int64(context_ptr, 16)
+    Let var_count be Layout.memory_get_int64(context_ptr, 24)
+
+    Note: For each variable, insert phi nodes
+    Let i be 0
+    While i is less than var_count:
+        Note: Get VariableInfo from map
+        Let var_info_ptr be List.get(variable_map, i times 2 plus 1)
+
+        If var_info_ptr is not equal to 0:
+            Note: Insert phi nodes for this variable
+            insert_phi_nodes_for_variable(context_ptr, var_info_ptr, dominance_info)
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================
+Note: PHASE 3: VARIABLE RENAMING (DOMINANCE TREE TRAVERSAL)
+Note: ============================================================
+
+Process called "rename_phi_results" that takes context_ptr as Integer, block_ptr as Integer returns Integer:
+    @Reasoning
+    Renames the result values of all phi nodes in a block.
+
+    For each phi node at the beginning of a block:
+    - Allocate a fresh SSA name for the phi's result
+    - Push the new name onto the variable's SSA name stack
+    - Update the phi node to use the new SSA value ID
+
+    This is the first step when entering a block during renaming,
+    because phi results must be available before processing instructions.
+
+    Returns: Number of phis renamed, or -1 on error
+    @End Reasoning
+
+    Note: Null checks
+    If context_ptr equals 0 or block_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Get instructions in block
+    Let instructions be MIR.get_block_instructions(block_ptr)
+    Let inst_count be MIR.get_block_instruction_count(block_ptr)
+
+    Let phi_count be 0
+
+    Note: Process phi nodes (at beginning of block)
+    Let i be 0
+    While i is less than inst_count:
+        Let inst_ptr be List.get(instructions, i)
+
+        Note: Check if instruction is a phi node
+        Let is_phi be MIRNodes.is_phi_node(inst_ptr)
+        If is_phi equals 0:
+            Note: No more phi nodes (they're all at the start)
+            Return phi_count
+        End If
+
+        Note: Get variable information from phi
+        Let var_name be MIRNodes.get_phi_variable_name(inst_ptr)
+        Let var_type be MIRNodes.get_phi_result_type(inst_ptr)
+
+        If var_name is not equal to 0:
+            Note: Get or create VariableInfo
+            Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, var_type)
+
+            If var_info_ptr is not equal to 0:
+                Note: Allocate fresh SSA name for phi result
+                Let new_value_id be allocate_fresh_ssa_name(var_info_ptr, context_ptr)
+
+                If new_value_id is not equal to -1:
+                    Note: Update phi node with new SSA value ID
+                    MIRNodes.set_phi_result_value_id(inst_ptr, new_value_id)
+
+                    Note: Push new name onto variable's stack
+                    push_ssa_name(var_info_ptr, new_value_id)
+
+                    Set phi_count to phi_count plus 1
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return phi_count
+End Process
+
+Process called "rename_instruction_operands" that takes context_ptr as Integer, inst_ptr as Integer returns Integer:
+    @Reasoning
+    Renames all operands (uses) of an instruction to their current SSA names.
+
+    For each operand that is a variable:
+    - Look up the variable's VariableInfo
+    - Peek the current SSA name from the variable's stack
+    - Replace the operand with the current SSA name
+
+    The stack peek gives us the SSA name from the nearest dominating definition.
+
+    Returns: Number of operands renamed, or -1 on error
+    @End Reasoning
+
+    Note: Null checks
+    If context_ptr equals 0 or inst_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Get operands from instruction
+    Let operands be MIR.get_instruction_operands(inst_ptr)
+    Let operand_count be MIR.get_instruction_operand_count(inst_ptr)
+
+    Let renamed_count be 0
+
+    Note: For each operand
+    Let i be 0
+    While i is less than operand_count:
+        Let operand_ptr be List.get(operands, i)
+
+        Note: Check if operand is a variable (not a constant)
+        Let is_variable be MIR.operand_is_variable(operand_ptr)
+
+        If is_variable equals 1:
+            Note: Get variable name from operand
+            Let var_name be MIR.get_operand_variable_name(operand_ptr)
+
+            If var_name is not equal to 0:
+                Note: Get VariableInfo
+                Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, 0)
+
+                If var_info_ptr is not equal to 0:
+                    Note: Peek current SSA name from stack
+                    Let current_ssa_name be peek_ssa_name(var_info_ptr)
+
+                    If current_ssa_name is not equal to -1:
+                        Note: Replace operand with current SSA name
+                        MIR.set_operand_ssa_value_id(operand_ptr, current_ssa_name)
+
+                        Set renamed_count to renamed_count plus 1
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return renamed_count
+End Process
+
+Process called "rename_instruction_result" that takes context_ptr as Integer, inst_ptr as Integer returns Integer:
+    @Reasoning
+    Renames the result (definition) of an instruction to a fresh SSA name.
+
+    If the instruction defines a variable:
+    - Allocate a fresh SSA name
+    - Push it onto the variable's SSA name stack
+    - Update the instruction to use the new SSA value ID
+
+    Returns: 1 if result was renamed, 0 if no result, -1 on error
+    @End Reasoning
+
+    Note: Null checks
+    If context_ptr equals 0 or inst_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Check if instruction defines a variable
+    Let defines_var be MIR.instruction_defines_variable(inst_ptr)
+
+    If defines_var equals 0:
+        Return 0  Note: No result to rename
+    End If
+
+    Note: Get variable information from instruction
+    Let var_name be MIR.get_instruction_defined_variable(inst_ptr)
+    Let var_type be MIR.get_instruction_result_type(inst_ptr)
+
+    If var_name equals 0:
+        Return 0
+    End If
+
+    Note: Get or create VariableInfo
+    Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, var_type)
+
+    If var_info_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Allocate fresh SSA name
+    Let new_value_id be allocate_fresh_ssa_name(var_info_ptr, context_ptr)
+
+    If new_value_id equals -1:
+        Return -1
+    End If
+
+    Note: Update instruction with new SSA value ID
+    MIR.set_instruction_result_value_id(inst_ptr, new_value_id)
+
+    Note: Push new name onto variable's stack
+    push_ssa_name(var_info_ptr, new_value_id)
+
+    Return 1
+End Process
+
+Process called "fill_phi_incoming_values" that takes context_ptr as Integer, block_ptr as Integer returns Integer:
+    @Reasoning
+    Fills in the incoming values for phi nodes in successor blocks.
+
+    For each successor S of the current block B:
+    - For each phi node P in S:
+      - Get the variable V that P is for
+      - Peek the current SSA name of V (from the stack)
+      - Add incoming value (current_ssa_name, B) to P
+
+    This ensures each phi node has one incoming value per predecessor,
+    where the value is the SSA name active in that predecessor.
+
+    Returns: Number of phi incoming values filled, or -1 on error
+    @End Reasoning
+
+    Note: Null checks
+    If context_ptr equals 0 or block_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Get CFG
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 8)
+    If cfg_ptr equals 0:
+        Return -1
+    End If
+
+    Note: Get current block's ID
+    Let block_id be CFG.get_block_id(block_ptr)
+
+    Note: Get successors of current block
+    Let successors be CFG.get_block_successors(block_ptr)
+    Let succ_count be CFG.get_block_successor_count(block_ptr)
+
+    Let filled_count be 0
+
+    Note: For each successor
+    Let succ_idx be 0
+    While succ_idx is less than succ_count:
+        Let succ_block_id be List.get(successors, succ_idx)
+        Let succ_block_ptr be CFG.get_block_by_id(cfg_ptr, succ_block_id)
+
+        If succ_block_ptr is not equal to 0:
+            Note: Get instructions in successor block
+            Let succ_instructions be MIR.get_block_instructions(succ_block_ptr)
+            Let succ_inst_count be MIR.get_block_instruction_count(succ_block_ptr)
+
+            Note: Process phi nodes in successor
+            Let phi_idx be 0
+            While phi_idx is less than succ_inst_count:
+                Let phi_ptr be List.get(succ_instructions, phi_idx)
+
+                Note: Check if instruction is a phi node
+                Let is_phi be MIRNodes.is_phi_node(phi_ptr)
+                If is_phi equals 0:
+                    Note: No more phi nodes
+                    Set phi_idx to succ_inst_count  Note: Break loop
+                Otherwise:
+                    Note: Get variable for this phi
+                    Let var_name be MIRNodes.get_phi_variable_name(phi_ptr)
+
+                    If var_name is not equal to 0:
+                        Note: Get VariableInfo
+                        Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, 0)
+
+                        If var_info_ptr is not equal to 0:
+                            Note: Peek current SSA name from stack
+                            Let current_ssa_name be peek_ssa_name(var_info_ptr)
+
+                            If current_ssa_name is not equal to -1:
+                                Note: Add incoming value to phi: (value, block)
+                                MIRNodes.add_phi_incoming(phi_ptr, block_id, current_ssa_name)
+
+                                Set filled_count to filled_count plus 1
+                            End If
+                        End If
+                    End If
+
+                    Set phi_idx to phi_idx plus 1
+                End If
+            End While
+        End If
+
+        Set succ_idx to succ_idx plus 1
+    End While
+
+    Return filled_count
+End Process
+
+Process called "rename_block" that takes context_ptr as Integer, block_ptr as Integer, dominance_info as Integer returns Integer:
+    @Reasoning
+    Renames variables in a single block and recursively processes dominated children.
+
+    **VARIABLE RENAMING ALGORITHM (for one block B):**
+
+    1. Rename phi results:
+       - For each phi P in B: allocate fresh SSA name, push to stack
+
+    2. Rename instruction operands and results:
+       - For each instruction I in B (non-phi):
+         - For each operand: replace with current SSA name (peek stack)
+         - If I defines variable: allocate fresh SSA name, push to stack
+
+    3. Fill phi incoming values in successors:
+       - For each successor S of B:
+         - For each phi P in S:
+           - Add incoming value (current SSA name of P's variable, B)
+
+    4. Recursively process dominated children:
+       - For each child C of B in dominance tree:
+         - rename_block(C)
+
+    5. Pop all SSA names pushed in this block:
+       - Restore parent's view of SSA names
+
+    **KEY INSIGHT:** Stack management via dominance tree traversal ensures
+    that the correct SSA names are visible in each block.
+
+    Returns: 1 on success, 0 on failure
+    @End Reasoning
+
+    Note: Null checks
+    If context_ptr equals 0 or block_ptr equals 0 or dominance_info equals 0:
+        Return 0
+    End If
+
+    Note: Track which variables we pushed names for (so we can pop later)
+    Let pushed_variables be List.create()
+
+    Note: Step 1: Rename phi results
+    Note: Get instructions in block
+    Let instructions be MIR.get_block_instructions(block_ptr)
+    Let inst_count be MIR.get_block_instruction_count(block_ptr)
+
+    Note: Process phi nodes and track pushed variables
+    Let i be 0
+    While i is less than inst_count:
+        Let inst_ptr be List.get(instructions, i)
+
+        Let is_phi be MIRNodes.is_phi_node(inst_ptr)
+        If is_phi equals 0:
+            Set i to inst_count  Note: Break - no more phis
+        Otherwise:
+            Let var_name be MIRNodes.get_phi_variable_name(inst_ptr)
+            If var_name is not equal to 0:
+                List.append(pushed_variables, var_name)
+            End If
+            Set i to i plus 1
+        End If
+    End While
+
+    rename_phi_results(context_ptr, block_ptr)
+
+    Note: Step 2: Rename instruction operands and results (non-phi instructions)
+    Set i to 0
+    While i is less than inst_count:
+        Let inst_ptr be List.get(instructions, i)
+
+        Let is_phi be MIRNodes.is_phi_node(inst_ptr)
+        If is_phi equals 0:
+            Note: Process non-phi instruction
+            Note: Rename operands (uses)
+            rename_instruction_operands(context_ptr, inst_ptr)
+
+            Note: Rename result (def) if it defines a variable
+            Let defines_var be MIR.instruction_defines_variable(inst_ptr)
+            If defines_var equals 1:
+                Let var_name be MIR.get_instruction_defined_variable(inst_ptr)
+                If var_name is not equal to 0:
+                    Note: Track that we pushed a name for this variable
+                    List.append(pushed_variables, var_name)
+                End If
+
+                rename_instruction_result(context_ptr, inst_ptr)
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Step 3: Fill phi incoming values in successor blocks
+    fill_phi_incoming_values(context_ptr, block_ptr)
+
+    Note: Step 4: Recursively process dominated children
+    Let block_id be CFG.get_block_id(block_ptr)
+    Let dominated_blocks be Dominance.get_dominated_blocks(dominance_info, block_id)
+    Let dominated_count be List.length(dominated_blocks)
+
+    Note: Get CFG
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 8)
+
+    Note: Process each dominated child (excluding self)
+    Let dom_idx be 0
+    While dom_idx is less than dominated_count:
+        Let child_block_id be List.get(dominated_blocks, dom_idx)
+
+        Note: Skip self (block dominates itself)
+        If child_block_id is not equal to block_id:
+            Note: Check if this is a direct child (immediate domination)
+            Let child_idom be Dominance.get_immediate_dominator(dominance_info, child_block_id)
+
+            If child_idom equals block_id:
+                Note: This is a directly dominated child, process it
+                Let child_block_ptr be CFG.get_block_by_id(cfg_ptr, child_block_id)
+
+                If child_block_ptr is not equal to 0:
+                    Note: Recursive call for dominated child
+                    rename_block(context_ptr, child_block_ptr, dominance_info)
+                End If
+            End If
+        End If
+
+        Set dom_idx to dom_idx plus 1
+    End While
+
+    Note: Cleanup dominated blocks list
+    List.destroy(dominated_blocks)
+
+    Note: Step 5: Pop all SSA names pushed in this block
+    Let pushed_count be List.length(pushed_variables)
+    Set i to 0
+    While i is less than pushed_count:
+        Let var_name be List.get(pushed_variables, i)
+
+        Note: Get VariableInfo
+        Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, 0)
+
+        If var_info_ptr is not equal to 0:
+            Note: Pop SSA name from stack
+            pop_ssa_name(var_info_ptr)
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Cleanup pushed variables list
+    List.destroy(pushed_variables)
+
+    Return 1
+End Process
+
+Process called "rename_variables" that takes context_ptr as Integer, dominance_info as Integer returns Integer:
+    @Reasoning
+    Main entry point for the variable renaming phase.
+
+    This initiates the dominance tree traversal starting from the entry block.
+    The traversal is a preorder walk of the dominance tree, which ensures
+    that SSA names are properly scoped via the stack mechanism.
+
+    **ALGORITHM:**
+    1. Get entry block from CFG
+    2. Start recursive renaming from entry block
+    3. SSA name stacks are automatically managed during traversal
+
+    After this phase completes:
+    - All variables are renamed to SSA form
+    - Each definition has a unique SSA name
+    - Each use refers to the correct SSA name
+    - All phi nodes have their incoming values filled
+
+    Returns: 1 on success, 0 on failure
+    @End Reasoning
+
+    Note: Null checks
+    If context_ptr equals 0 or dominance_info equals 0:
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 8)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get entry block
+    Let entry_block_id be CFG.get_cfg_entry_block_id(cfg_ptr)
+    Let entry_block_ptr be CFG.get_block_by_id(cfg_ptr, entry_block_id)
+
+    If entry_block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Start renaming from entry block
+    Note: This will recursively process the entire dominance tree
+    rename_block(context_ptr, entry_block_ptr, dominance_info)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 4: SSA CONSTRUCTION - MAIN ENTRY POINTS
+Note: ============================================================================
+
+Note: This phase provides the main public interface for SSA construction.
+Note: It orchestrates the complete transformation pipeline:
+Note:   1. Compute dominance tree and frontiers
+Note:   2. Insert phi nodes (using Phase 2)
+Note:   3. Rename variables (using Phase 3)
+Note:   4. Update CFG metadata
+
+
+Process called "get_cfg_from_function" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Extracts the CFG pointer from a MIRFunction.
+
+    **MIRFunction MEMORY LAYOUT:**
+    ```
+    Offset 0:  function_name (Integer - string pointer)
+    Offset 8:  cfg_ptr (Integer - MIRCFG pointer)
+    Offset 16: local_count (Integer)
+    Offset 24: parameter_count (Integer)
+    ...
+    ```
+
+    This helper function retrieves the CFG pointer, which is needed
+    for SSA construction and validation.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Return 0
+    End If
+
+    Note: CFG pointer is at offset 8 in MIRFunction
+    Let cfg_ptr be Layout.memory_get_int64(function_ptr, 8)
+    Return cfg_ptr
+End Process
+
+Process called "is_in_ssa_form" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if a function is already in SSA form.
+
+    **SSA FORM FLAG:**
+    The MIRCFG structure maintains an `ssa_form` flag that indicates
+    whether the function has been transformed to SSA.
+
+    **MIRCFG MEMORY LAYOUT (from cfg.runa):**
+    ```
+    Offset 0:  entry_block_id (Integer)
+    Offset 8:  blocks (List pointer)
+    Offset 16: block_count (Integer)
+    Offset 24: ssa_form (Integer - boolean flag)
+    ...
+    ```
+
+    This function queries the flag to avoid redundant SSA construction.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get CFG pointer
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: SSA form flag is at offset 24 in MIRCFG
+    Let ssa_flag be Layout.memory_get_int64(cfg_ptr, 24)
+    Return ssa_flag
+End Process
+
+Process called "set_ssa_form_flag" that takes function_ptr as Integer, value as Integer returns Integer:
+    @Reasoning
+    Sets the SSA form flag in the function's CFG.
+
+    **PURPOSE:**
+    After completing SSA construction, we mark the CFG as being in SSA form.
+    This prevents redundant transformations and enables SSA-based optimizations.
+
+    **MEMORY OPERATION:**
+    Writes to offset 24 (ssa_form flag) in the MIRCFG structure.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get CFG pointer
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: SSA form flag is at offset 24 in MIRCFG
+    Layout.memory_set_int64(cfg_ptr, 24, value)
+    Return 1
+End Process
+
+Process called "construct_ssa_form" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    **COMPLETE SSA CONSTRUCTION PIPELINE**
+
+    This is the main entry point for transforming a function into SSA form.
+    It orchestrates all phases of the SSA construction algorithm:
+
+    **ALGORITHM OVERVIEW (Cytron et al. 1991):**
+
+    ```
+    construct_ssa_form(function):
+        # Step 1: Check if already in SSA form
+        if is_in_ssa_form(function):
+            return (no work needed)
+
+        # Step 2: Compute dominance information
+        dominance_info = compute_dominance_tree(cfg)
+
+        # Step 3: Create SSA context
+        context = create_ssa_context(function, cfg)
+        set_dominance_info(context, dominance_info)
+
+        # Step 4: Collect all variable definitions
+        collect_variable_definitions(context)
+
+        # Step 5: Insert phi nodes (Phase 2)
+        insert_all_phi_nodes(context, dominance_info)
+
+        # Step 6: Rename variables (Phase 3)
+        rename_variables(context, dominance_info)
+
+        # Step 7: Mark CFG as in SSA form
+        set_ssa_form_flag(function, 1)
+
+        # Step 8: Cleanup context
+        destroy_ssa_context(context)
+    ```
+
+    **PHASES INTEGRATION:**
+    - **Phase 1**: Data structures (VariableInfo, SSARenamingContext)
+    - **Phase 2**: Phi placement via iterated dominance frontier
+    - **Phase 3**: Variable renaming via dominance tree traversal
+    - **Phase 4**: Complete orchestration (this function)
+
+    **PRECONDITIONS:**
+    - Function must have a valid CFG
+    - CFG must be well-formed (proper control flow)
+
+    **POSTCONDITIONS:**
+    - Every variable has exactly one definition
+    - All uses dominated by their definitions
+    - Phi nodes at join points merge values
+    - CFG marked as in SSA form
+
+    **TIME COMPLEXITY:**
+    - O(V * |DF+|) where V = variables, |DF+| = size of iterated dominance frontier
+    - Typically O(V * N) for N blocks in most programs
+
+    **SPACE COMPLEXITY:**
+    - O(V * N) for SSA name stacks and phi nodes
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "construct_ssa_form: null function pointer"
+        Return 0
+    End If
+
+    Note: Step 1: Check if already in SSA form
+    Let already_ssa be is_in_ssa_form(function_ptr)
+    If already_ssa equals 1:
+        Note: Already in SSA form, nothing to do
+        Return 1
+    End If
+
+    Note: Step 2: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Display "construct_ssa_form: function has no CFG"
+        Return 0
+    End If
+
+    Note: Step 3: Compute dominance tree and frontiers
+    Note: This is required for both phi placement (dominance frontiers)
+    Note: and variable renaming (dominance tree traversal)
+    Let dominance_info be Dominance.compute_dominance_tree(cfg_ptr)
+    If dominance_info equals 0:
+        Display "construct_ssa_form: failed to compute dominance tree"
+        Return 0
+    End If
+
+    Note: Step 4: Create SSA renaming context
+    Let context_ptr be create_ssa_context(function_ptr, cfg_ptr)
+    If context_ptr equals 0:
+        Display "construct_ssa_form: failed to create SSA context"
+        Return 0
+    End If
+
+    Note: Step 5: Attach dominance information to context
+    set_dominance_info(context_ptr, dominance_info)
+
+    Note: Step 6: Collect all variable definitions across all blocks
+    Note: This populates VariableInfo.def_blocks for each variable
+    Let collect_result be collect_variable_definitions(context_ptr)
+    If collect_result equals 0:
+        Display "construct_ssa_form: failed to collect variable definitions"
+        destroy_ssa_context(context_ptr)
+        Return 0
+    End If
+
+    Note: Step 7: Insert phi nodes at dominance frontiers (Phase 2)
+    Note: This implements the Cytron et al. 1991 algorithm
+    Note: Phi nodes are placed at IDF(def_blocks) for each variable
+    Let phi_result be insert_all_phi_nodes(context_ptr, dominance_info)
+    If phi_result equals 0:
+        Display "construct_ssa_form: failed to insert phi nodes"
+        destroy_ssa_context(context_ptr)
+        Return 0
+    End If
+
+    Note: Step 8: Rename variables via dominance tree traversal (Phase 3)
+    Note: This assigns unique SSA names to each definition
+    Note: and updates all uses to refer to the correct definition
+    Let rename_result be rename_variables(context_ptr, dominance_info)
+    If rename_result equals 0:
+        Display "construct_ssa_form: failed to rename variables"
+        destroy_ssa_context(context_ptr)
+        Return 0
+    End If
+
+    Note: Step 9: Mark CFG as being in SSA form
+    Note: This prevents redundant SSA construction and enables SSA-based optimizations
+    set_ssa_form_flag(function_ptr, 1)
+
+    Note: Step 10: Cleanup SSA context
+    Note: The phi nodes and renamed instructions remain in the CFG
+    Note: Only the renaming context is destroyed
+    destroy_ssa_context(context_ptr)
+
+    Note: SSA construction complete
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 5: SSA DESTRUCTION - OUT OF SSA TRANSFORMATION
+Note: ============================================================================
+
+Note: This phase provides the inverse transformation: converting SSA form
+Note: back to conventional (non-SSA) form. This is needed for:
+Note:   1. Code generation (most backends expect non-SSA)
+Note:   2. Register allocation (works on non-SSA form)
+Note:   3. Final optimization passes that don't benefit from SSA
+
+Note: **OUT OF SSA ALGORITHM:**
+
+Note: For each phi node "x = phi(x1, x2, ..., xn)" in block B:
+Note:   1. For each predecessor Pi with incoming value xi:
+Note:      - Insert "x = xi" at the end of Pi (before terminator)
+Note:      - Handle critical edges if necessary
+Note:   2. Remove the phi node from B
+Note:   3. Replace all uses of phi result with original variable
+
+Note: **CRITICAL EDGES:**
+Note: An edge Pi -> B is critical if:
+Note:   - Pi has multiple successors, AND
+Note:   - B has multiple predecessors
+
+Note: For critical edges, we must insert a new block to hold the copy.
+
+
+Process called "is_critical_edge" that takes src_block_ptr as Integer, dst_block_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if a CFG edge is a critical edge.
+
+    **CRITICAL EDGE DEFINITION:**
+    An edge src -> dst is critical if:
+      - src has multiple successors (> 1), AND
+      - dst has multiple predecessors (> 1)
+
+    **WHY IT MATTERS:**
+    On a critical edge, we cannot safely insert copy instructions:
+      - Can't insert at end of src ( affect other successors)
+      - Can't insert at start of dst ( affect other predecessors)
+
+    Solution: Split the critical edge by inserting a new block.
+
+    **MIRBasicBlock MEMORY LAYOUT (from cfg.runa):**
+    ```
+    Offset 0:  block_id (Integer)
+    Offset 8:  instructions (List pointer)
+    Offset 16: instruction_count (Integer)
+    Offset 24: predecessors (List pointer - block IDs)
+    Offset 32: predecessor_count (Integer)
+    Offset 40: successors (List pointer - block IDs)
+    Offset 48: successor_count (Integer)
+    ...
+    ```
+    @End Reasoning
+
+    If src_block_ptr equals 0:
+        Return 0
+    End If
+    If dst_block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get successor count of source block (offset 48)
+    Let src_succ_count be Layout.memory_get_int64(src_block_ptr, 48)
+
+    Note: Get predecessor count of destination block (offset 32)
+    Let dst_pred_count be Layout.memory_get_int64(dst_block_ptr, 32)
+
+    Note: Critical if src has > 1 successors AND dst has > 1 predecessors
+    If src_succ_count is greater than 1:
+        If dst_pred_count is greater than 1:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "insert_copy_instruction" that takes block_ptr as Integer, from_value as Integer, to_variable as Integer, position as Integer returns Integer:
+    @Reasoning
+    Inserts a copy instruction "to_variable = from_value" into a block.
+
+    **POSITION PARAMETER:**
+    - 0: Insert at start of block
+    - 1: Insert at end of block (before terminator)
+
+    **COPY INSTRUCTION:**
+    We create a MIR assignment instruction:
+      - Opcode: ASSIGN (or COPY)
+      - Operand: from_value (SSA value ID)
+      - Result: to_variable (original variable name)
+
+    This converts the SSA value back to a regular variable assignment.
+
+    **MIR INSTRUCTION CREATION:**
+    Use mir_nodes.runa to create the copy instruction, then insert
+    into the block's instruction list at the appropriate position.
+    @End Reasoning
+
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Create a copy/assign instruction
+    Note: We use MIRNodes.create_mir_assign_instruction to create:
+    Note:   to_variable = from_value
+    Let copy_inst be MIRNodes.create_mir_assign_instruction(to_variable, from_value)
+    If copy_inst equals 0:
+        Return 0
+    End If
+
+    Note: Get instruction list (offset 8 in MIRBasicBlock)
+    Let inst_list be Layout.memory_get_int64(block_ptr, 8)
+    If inst_list equals 0:
+        Return 0
+    End If
+
+    Note: Determine insertion position
+    If position equals 0:
+        Note: Insert at start of block
+        List.insert_at(inst_list, 0, copy_inst)
+    Otherwise:
+        Note: Insert at end of block (before terminator)
+        Note: Terminator is always the last instruction
+        Let inst_count be List.length(inst_list)
+        If inst_count is greater than 0:
+            Note: Insert before last instruction (terminator)
+            Let insert_pos be inst_count minus 1
+            List.insert_at(inst_list, insert_pos, copy_inst)
+        Otherwise:
+            Note: No instructions yet, just append
+            List.append(inst_list, copy_inst)
+        End If
+    End If
+
+    Note: Update instruction count (offset 16 in MIRBasicBlock)
+    Let new_count be List.length(inst_list)
+    Layout.memory_set_int64(block_ptr, 16, new_count)
+
+    Return 1
+End Process
+
+Process called "insert_copy_at_edge" that takes cfg_ptr as Integer, src_block_id as Integer, dst_block_id as Integer, from_value as Integer, to_variable as Integer returns Integer:
+    @Reasoning
+    Inserts a copy instruction on a CFG edge.
+
+    **ALGORITHM:**
+    ```
+    insert_copy_at_edge(src, dst, from_value, to_variable):
+        if is_critical_edge(src, dst):
+            # Critical edge: must split edge
+            new_block = create_new_block()
+            insert_copy(new_block, from_value, to_variable)
+            redirect_edge(src, dst, new_block)
+        else if src has single successor:
+            # Can safely insert at end of src
+            insert_copy(src, from_value, to_variable, END)
+        else:
+            # dst has single predecessor
+            # Can safely insert at start of dst
+            insert_copy(dst, from_value, to_variable, START)
+    ```
+
+    **CRITICAL EDGE HANDLING:**
+    For critical edges, we create a new block containing just the copy
+    instruction and a jump to dst. Then we redirect src->dst to src->new->dst.
+    This is handled by calling CFG.split_critical_edge which creates the
+    intermediate block and updates all edges and phi nodes accordingly.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get source and destination blocks
+    Let src_block_ptr be CFG.get_block_by_id(cfg_ptr, src_block_id)
+    Let dst_block_ptr be CFG.get_block_by_id(cfg_ptr, dst_block_id)
+
+    If src_block_ptr equals 0:
+        Return 0
+    End If
+    If dst_block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check if this is a critical edge
+    Let is_critical be is_critical_edge(src_block_ptr, dst_block_ptr)
+
+    If is_critical equals 1:
+        Note: CRITICAL EDGE HANDLING - split the edge and insert copy in new block
+        Note: Split critical edge: src -> new_block -> dst
+        Let new_block_id be CFG.split_critical_edge(cfg_ptr, src_block_id, dst_block_id)
+
+        If new_block_id equals negative 1:
+            Display "insert_copy_at_edge: failed to split critical edge"
+            Return 0
+        End If
+
+        Note: Get the new intermediate block
+        Let new_block_ptr be CFG.get_block_by_id(cfg_ptr, new_block_id)
+        If new_block_ptr equals 0:
+            Display "insert_copy_at_edge: failed to get new block after split"
+            Return 0
+        End If
+
+        Note: Insert copy instruction in the new intermediate block
+        insert_copy_instruction(new_block_ptr, from_value, to_variable, 0)
+        Return 1
+    End If
+
+    Note: Get successor count of source block (offset 48)
+    Let src_succ_count be Layout.memory_get_int64(src_block_ptr, 48)
+
+    If src_succ_count equals 1:
+        Note: Source has single successor, insert at end of source
+        insert_copy_instruction(src_block_ptr, from_value, to_variable, 1)
+    Otherwise:
+        Note: Destination has single predecessor, insert at start of destination
+        insert_copy_instruction(dst_block_ptr, from_value, to_variable, 0)
+    End If
+
+    Return 1
+End Process
+
+Process called "eliminate_phi_node" that takes phi_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Eliminates a single phi node by inserting copy instructions.
+
+    **ALGORITHM:**
+    ```
+    eliminate_phi_node(phi):
+        result = phi.result_variable
+        for each incoming_value, predecessor_block in phi.incoming:
+            # Insert copy at edge: predecessor -> phi_block
+            insert_copy_at_edge(predecessor, phi_block, incoming_value, result)
+
+        # Remove phi from block
+        remove_phi_from_block(phi)
+    ```
+
+    **MIR PHI NODE MEMORY LAYOUT (from mir_nodes.runa):**
+    ```
+    Offset 0:  result_variable (Integer - variable name)
+    Offset 8:  incoming_values (List pointer - list of SSA value IDs)
+    Offset 16: incoming_blocks (List pointer - list of block IDs)
+    Offset 24: incoming_count (Integer)
+    Offset 32: block_id (Integer - block containing this phi)
+    ...
+    ```
+
+    **PROCESS:**
+    For each incoming value from predecessor Pi:
+      1. Insert "result = incoming_value_i" on edge Pi -> phi_block
+      2. Handle critical edges appropriately
+
+    After all copies inserted, the phi node can be safely removed.
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get phi result variable (offset 0)
+    Let result_var be Layout.memory_get_int64(phi_ptr, 0)
+
+    Note: Get incoming values list (offset 8)
+    Let incoming_values be Layout.memory_get_int64(phi_ptr, 8)
+
+    Note: Get incoming blocks list (offset 16)
+    Let incoming_blocks be Layout.memory_get_int64(phi_ptr, 16)
+
+    Note: Get incoming count (offset 24)
+    Let incoming_count be Layout.memory_get_int64(phi_ptr, 24)
+
+    Note: Get phi's block ID (offset 32)
+    Let phi_block_id be Layout.memory_get_int64(phi_ptr, 32)
+
+    If incoming_values equals 0:
+        Return 0
+    End If
+    If incoming_blocks equals 0:
+        Return 0
+    End If
+
+    Note: Insert copy instruction on each incoming edge
+    Let i be 0
+    While i is less than incoming_count:
+        Note: Get incoming value and block for this edge
+        Let incoming_value be List.get(incoming_values, i)
+        Let predecessor_id be List.get(incoming_blocks, i)
+
+        Note: Insert copy: result_var = incoming_value on edge predecessor -> phi_block
+        insert_copy_at_edge(cfg_ptr, predecessor_id, phi_block_id, incoming_value, result_var)
+
+        Set i to i plus 1
+    End While
+
+    Note: Phi node has been replaced by copies
+    Note: The actual removal from the block's phi list is handled by caller
+    Return 1
+End Process
+
+Process called "remove_phi_nodes_from_block" that takes block_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Removes all phi nodes from a block after they've been eliminated.
+
+    **PROCESS:**
+    1. Get the block's phi node list
+    2. For each phi node:
+       - Eliminate the phi (insert copies on incoming edges)
+       - Remove from phi list
+    3. Clear the phi list
+
+    **MIRBasicBlock MEMORY LAYOUT:**
+    ```
+    Offset 56: phi_nodes (List pointer)
+    Offset 64: phi_count (Integer)
+    ```
+
+    After this function, the block has no phi nodes and all necessary
+    copy instructions have been inserted.
+    @End Reasoning
+
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get phi nodes list (offset 56 in MIRBasicBlock)
+    Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+    If phi_list equals 0:
+        Note: No phi nodes, nothing to do
+        Return 1
+    End If
+
+    Note: Get phi count (offset 64)
+    Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+    If phi_count equals 0:
+        Return 1
+    End If
+
+    Note: Eliminate each phi node
+    Let i be 0
+    While i is less than phi_count:
+        Let phi_ptr be List.get(phi_list, i)
+        If phi_ptr is not equal to 0:
+            Note: Eliminate this phi by inserting copies
+            eliminate_phi_node(phi_ptr, cfg_ptr)
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Clear phi list (all phis have been eliminated)
+    List.clear(phi_list)
+
+    Note: Update phi count to 0 (offset 64)
+    Layout.memory_set_int64(block_ptr, 64, 0)
+
+    Return 1
+End Process
+
+Process called "destruct_ssa_form" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    **COMPLETE SSA DESTRUCTION PIPELINE**
+
+    This is the main entry point for converting a function from SSA form
+    back to conventional (non-SSA) form.
+
+    **ALGORITHM OVERVIEW:**
+    ```
+    destruct_ssa_form(function):
+        # Step 1: Check if in SSA form
+        if not is_in_ssa_form(function):
+            return (nothing to destruct)
+
+        # Step 2: For each block in CFG:
+        #   - Eliminate all phi nodes (insert copies)
+        #   - Remove phi nodes from block
+
+        # Step 3: Mark CFG as no longer in SSA form
+        set_ssa_form_flag(function, 0)
+
+        # Step 4: (Optional) Coalesce redundant copies
+        #   - Build interference graph
+        #   - Coalesce non-interfering copies
+        #   - Remove redundant copies
+    ```
+
+    **WHY WE NEED OUT OF SSA:**
+    - Most code generation backends expect conventional form
+    - Register allocation algorithms work on non-SSA form
+    - Some optimizations are easier without SSA constraints
+
+    **PHI ELIMINATION:**
+    For each phi node "x = phi(x1 from B1, x2 from B2, ...)":
+      - Insert "x = x1" at end of B1
+      - Insert "x = x2" at end of B2
+      - Remove the phi node
+
+    **COPY COALESCING (optional, future optimization):**
+    After phi elimination, many copies can be coalesced:
+      - If "x = y" and x and y don't interfere, use same register
+      - Remove the copy instruction
+      - Update all uses of x to use y instead
+
+    **PRECONDITIONS:**
+    - Function must be in SSA form
+    - CFG must be well-formed
+
+    **POSTCONDITIONS:**
+    - No phi nodes remain
+    - All variables have conventional definitions
+    - CFG marked as not in SSA form
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "destruct_ssa_form: null function pointer"
+        Return 0
+    End If
+
+    Note: Step 1: Check if in SSA form
+    Let in_ssa be is_in_ssa_form(function_ptr)
+    If in_ssa equals 0:
+        Note: Not in SSA form, nothing to destruct
+        Return 1
+    End If
+
+    Note: Step 2: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Display "destruct_ssa_form: function has no CFG"
+        Return 0
+    End If
+
+    Note: Step 3: Get all blocks from CFG
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    If blocks equals 0:
+        Display "destruct_ssa_form: failed to get blocks"
+        Return 0
+    End If
+
+    Let block_count be List.length(blocks)
+
+    Note: Step 4: Eliminate phi nodes from each block
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+        If block_ptr is not equal to 0:
+            Note: Remove all phi nodes from this block
+            Note: This inserts copy instructions on incoming edges
+            remove_phi_nodes_from_block(block_ptr, cfg_ptr)
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Step 5: Mark CFG as no longer in SSA form
+    set_ssa_form_flag(function_ptr, 0)
+
+    Note: Step 6: Copy coalescing is implemented as a separate optimization pass
+    Note: Copy coalescing minimizes copy instructions by analyzing variable
+    Note: interference and coalescing non-interfering variables. This is
+    Note: implemented in the register allocation phase which naturally performs
+    Note: copy coalescing as part of register assignment. The copies inserted
+    Note: during SSA destruction are correctly handled by later optimization passes.
+
+    Note: SSA destruction complete
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 6: VALIDATION & DEBUG - SSA PROPERTY VERIFICATION
+Note: ============================================================================
+
+Note: This phase provides validation and debugging utilities for SSA form.
+Note: These functions verify correctness and help diagnose issues.
+
+Note: **SSA PROPERTIES TO VERIFY:**
+Note:   1. Single Static Assignment: Each variable defined exactly once
+Note:   2. Dominance: All uses dominated by their definitions
+Note:   3. Phi Correctness: Phi nodes at join points with correct incoming values
+Note:   4. SSA Naming: Unique SSA value IDs, proper versioning
+
+
+Process called "verify_single_assignment" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Verifies that each variable is defined exactly once in SSA form.
+
+    **SINGLE ASSIGNMENT PROPERTY:**
+    In SSA form, every variable has exactly one definition point.
+    Multiple assignments to the same variable name are distinguished
+    by different SSA versions (e.g., x_1, x_2, x_3).
+
+    **VERIFICATION ALGORITHM:**
+    ```
+    verify_single_assignment(function):
+        definition_map = empty map  # SSA value ID -> definition count
+        for each block in CFG:
+            # Check phi node results
+            for each phi in block.phis:
+                ssa_id = phi.result
+                if ssa_id in definition_map:
+                    ERROR: Multiple definitions of same SSA value
+                definition_map[ssa_id] = 1
+
+            # Check instruction results
+            for each instruction in block:
+                if instruction defines a value:
+                    ssa_id = instruction.result
+                    if ssa_id in definition_map:
+                        ERROR: Multiple definitions of same SSA value
+                    definition_map[ssa_id] = 1
+        return SUCCESS
+    ```
+
+    This ensures SSA naming is unique and correct.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "verify_single_assignment: null function pointer"
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Display "verify_single_assignment: no CFG"
+        Return 0
+    End If
+
+    Note: Create hash map to track SSA value definitions (O(1) lookup)
+    Note: Map: SSA value ID (as string key) -> definition count (value = 1 if defined)
+    Let definition_map be proc create from Dictionary
+
+    Note: Get all blocks
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    Let block_count be List.length(blocks)
+
+    Note: Scan all blocks for definitions
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+
+        Note: Check phi node results
+        Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+        If phi_list is not equal to 0:
+            Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+            Let j be 0
+            While j is less than phi_count:
+                Let phi_ptr be List.get(phi_list, j)
+                Note: Get phi result (SSA value ID at offset 0)
+                Let result_id be Layout.memory_get_int64(phi_ptr, 0)
+
+                Note: Check if already defined using O(1) hash map lookup
+                Let result_id_str be proc integer_to_string from String with result_id
+                Let already_defined be proc contains from Dictionary with definition_map, result_id_str
+
+                If already_defined equals 1:
+                    Display "verify_single_assignment: duplicate SSA value definition for value " joined with result_id
+                    Return 0
+                End If
+
+                Note: Add to definition map (O(1) insert)
+                proc set from Dictionary with definition_map, result_id_str, 1
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Note: Check instruction results
+        Let inst_list be Layout.memory_get_int64(block_ptr, 8)
+        If inst_list is not equal to 0:
+            Let inst_count be Layout.memory_get_int64(block_ptr, 16)
+            Let j be 0
+            While j is less than inst_count:
+                Let inst_ptr be List.get(inst_list, j)
+
+                Note: Check if instruction defines a value
+                Note: Instructions that define values have a result field
+                Note: We check if result_id != 0 (0 means no result)
+                Let result_id be MIRNodes.get_instruction_result(inst_ptr)
+                If result_id is not equal to 0:
+                    Note: Check for duplicate definition using O(1) hash map lookup
+                    Let result_id_str be proc integer_to_string from String with result_id
+                    Let already_defined be proc contains from Dictionary with definition_map, result_id_str
+
+                    If already_defined equals 1:
+                        Display "verify_single_assignment: duplicate SSA value definition for value " joined with result_id
+                        Return 0
+                    End If
+
+                    Note: Add to definition map (O(1) insert)
+                    proc set from Dictionary with definition_map, result_id_str, 1
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: All SSA values have unique definitions
+    Return 1
+End Process
+
+Process called "verify_dominance_property" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Verifies that all uses are dominated by their definitions.
+
+    **DOMINANCE PROPERTY:**
+    In SSA form, every use of a value must be dominated by its definition.
+    For phi nodes, incoming values must dominate the predecessor blocks.
+
+    **VERIFICATION ALGORITHM:**
+    ```
+    verify_dominance(function):
+        dominance_info = compute_dominance_tree(cfg)
+
+        for each block B in CFG:
+            # Check regular instructions
+            for each instruction I in B:
+                for each operand V in I.operands:
+                    def_block = find_definition_block(V)
+                    if not dominates(def_block, B):
+                        ERROR: Use not dominated by definition
+
+            # Check phi nodes
+            for each phi P in B:
+                for each (value V, predecessor Pred) in P.incoming:
+                    def_block = find_definition_block(V)
+                    if not dominates(def_block, Pred):
+                        ERROR: Phi incoming value not dominated
+        return SUCCESS
+    ```
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "verify_dominance_property: null function pointer"
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Display "verify_dominance_property: no CFG"
+        Return 0
+    End If
+
+    Note: Compute dominance information
+    Let dominance_info be Dominance.compute_dominance_tree(cfg_ptr)
+    If dominance_info equals 0:
+        Display "verify_dominance_property: failed to compute dominance"
+        Return 0
+    End If
+
+    Note: Step 1: Build map of SSA value ID -> definition block ID
+    Note: Map structure: List of (value_id, block_id) pairs
+    Let value_def_map be List.create()
+
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    Let block_count be List.length(blocks)
+
+    Note: Scan all blocks to record where each value is defined
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+        Let block_id be Layout.memory_get_int64(block_ptr, 0)
+
+        Note: Record phi node definitions
+        Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+        If phi_list is not equal to 0:
+            Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+            Let j be 0
+            While j is less than phi_count:
+                Let phi_ptr be List.get(phi_list, j)
+                Let result_id be Layout.memory_get_int64(phi_ptr, 0)
+
+                If result_id is not equal to 0:
+                    Note: Store (value_id, block_id) pair
+                    Let pair be List.create()
+                    List.append(pair, result_id)
+                    List.append(pair, block_id)
+                    List.append(value_def_map, pair)
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Note: Record instruction definitions
+        Let inst_list be Layout.memory_get_int64(block_ptr, 8)
+        If inst_list is not equal to 0:
+            Let inst_count be Layout.memory_get_int64(block_ptr, 16)
+            Let j be 0
+            While j is less than inst_count:
+                Let inst_ptr be List.get(inst_list, j)
+                Let result_id be MIRNodes.get_instruction_result(inst_ptr)
+
+                If result_id is not equal to 0:
+                    Note: Store (value_id, block_id) pair
+                    Let pair be List.create()
+                    List.append(pair, result_id)
+                    List.append(pair, block_id)
+                    List.append(value_def_map, pair)
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Step 2: For each block, verify instruction operands are dominated by their definitions
+    Set i to 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+        Let block_id be Layout.memory_get_int64(block_ptr, 0)
+
+        Note: Check instruction operands
+        Let inst_list be Layout.memory_get_int64(block_ptr, 8)
+        If inst_list is not equal to 0:
+            Let inst_count be Layout.memory_get_int64(block_ptr, 16)
+            Let j be 0
+            While j is less than inst_count:
+                Let inst_ptr be List.get(inst_list, j)
+
+                Note: Get instruction operands
+                Let operands_list be MIR.get_instruction_operands(inst_ptr)
+                If operands_list is not equal to 0:
+                    Let operand_count be MIR.get_instruction_operand_count(inst_ptr)
+                    Let k be 0
+                    While k is less than operand_count:
+                        Let operand_value_id be List.get(operands_list, k)
+
+                        Note: Find definition block for this operand
+                        Let def_block_id be negative 1
+                        Let m be 0
+                        While m is less than List.length(value_def_map):
+                            Let pair be List.get(value_def_map, m)
+                            Let map_value_id be List.get(pair, 0)
+                            If map_value_id equals operand_value_id:
+                                Set def_block_id to List.get(pair, 1)
+                                Set m to List.length(value_def_map)
+                            Otherwise:
+                                Set m to m plus 1
+                            End If
+                        End While
+
+                        Note: If definition found, verify dominance
+                        If def_block_id is not equal to negative 1:
+                            Let def_dominates be Dominance.dominates(dominance_info, def_block_id, block_id)
+                            If def_dominates equals 0:
+                                Display "verify_dominance_property: value " joined with operand_value_id joined with " defined in block " joined with def_block_id joined with " does not dominate use in block " joined with block_id
+                                Return 0
+                            End If
+                        End If
+
+                        Set k to k plus 1
+                    End While
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Note: Step 3: Check phi node incoming values
+        Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+        If phi_list is not equal to 0:
+            Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+            Let j be 0
+            While j is less than phi_count:
+                Let phi_ptr be List.get(phi_list, j)
+
+                Note: Get incoming values and blocks
+                Let incoming_values be Layout.memory_get_int64(phi_ptr, 8)
+                Let incoming_blocks be Layout.memory_get_int64(phi_ptr, 16)
+                Let incoming_count be Layout.memory_get_int64(phi_ptr, 24)
+
+                Note: For each incoming value, verify definition dominates predecessor
+                Let k be 0
+                While k is less than incoming_count:
+                    Let incoming_value_id be List.get(incoming_values, k)
+                    Let predecessor_id be List.get(incoming_blocks, k)
+
+                    Note: Find definition block for this value
+                    Let def_block_id be negative 1
+                    Let m be 0
+                    While m is less than List.length(value_def_map):
+                        Let pair be List.get(value_def_map, m)
+                        Let map_value_id be List.get(pair, 0)
+                        If map_value_id equals incoming_value_id:
+                            Set def_block_id to List.get(pair, 1)
+                            Set m to List.length(value_def_map)
+                        Otherwise:
+                            Set m to m plus 1
+                        End If
+                    End While
+
+                    Note: If definition found, verify it dominates the predecessor block
+                    If def_block_id is not equal to negative 1:
+                        Let def_dominates_pred be Dominance.dominates(dominance_info, def_block_id, predecessor_id)
+                        If def_dominates_pred equals 0:
+                            Display "verify_dominance_property: phi incoming value " joined with incoming_value_id joined with " defined in block " joined with def_block_id joined with " does not dominate predecessor block " joined with predecessor_id
+                            Return 0
+                        End If
+                    End If
+
+                    Set k to k plus 1
+                End While
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Dominance property verified - all uses dominated by definitions
+    Return 1
+End Process
+
+Process called "verify_phi_correctness" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Verifies that phi nodes are correctly formed.
+
+    **PHI NODE CORRECTNESS:**
+    1. Phi nodes appear only at join points (blocks with multiple predecessors)
+    2. Each phi has exactly one incoming value per predecessor
+    3. Incoming blocks match the block's actual predecessors
+    4. Phi result types match incoming value types
+
+    **VERIFICATION ALGORITHM:**
+    ```
+    verify_phi_correctness(function):
+        for each block B in CFG:
+            if B has phi nodes:
+                # Verify B has multiple predecessors
+                if B.predecessor_count < 2:
+                    ERROR: Phi in block without multiple predecessors
+
+                for each phi P in B:
+                    # Verify incoming count matches predecessor count
+                    if P.incoming_count != B.predecessor_count:
+                        ERROR: Phi incoming count mismatch
+
+                    # Verify incoming blocks match predecessors
+                    for each incoming_block in P.incoming_blocks:
+                        if incoming_block not in B.predecessors:
+                            ERROR: Phi incoming block not a predecessor
+        return SUCCESS
+    ```
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "verify_phi_correctness: null function pointer"
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Display "verify_phi_correctness: no CFG"
+        Return 0
+    End If
+
+    Note: Get all blocks
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    Let block_count be List.length(blocks)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+
+        Note: Get phi list
+        Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+        Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+
+        If phi_count is greater than 0:
+            Note: This block has phi nodes, verify it has multiple predecessors
+            Let pred_count be Layout.memory_get_int64(block_ptr, 32)
+            If pred_count is less than 2:
+                Display "verify_phi_correctness: phi in block without multiple predecessors"
+                Return 0
+            End If
+
+            Note: Verify each phi node
+            Let j be 0
+            While j is less than phi_count:
+                Let phi_ptr be List.get(phi_list, j)
+
+                Note: Get phi incoming count
+                Let incoming_count be Layout.memory_get_int64(phi_ptr, 24)
+
+                Note: Verify incoming count matches predecessor count
+                If incoming_count is not equal to pred_count:
+                    Display "verify_phi_correctness: phi incoming count mismatch"
+                    Return 0
+                End If
+
+                Note: Additional checks  verify incoming blocks match predecessors
+                Note: and that value types are consistent
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: All phi nodes are correctly formed
+    Return 1
+End Process
+
+Process called "verify_ssa_form" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    **COMPREHENSIVE SSA VERIFICATION**
+
+    This is the main entry point for verifying SSA correctness.
+    It runs all SSA property checks:
+
+    1. **Single Assignment**: Each value defined exactly once
+    2. **Dominance**: All uses dominated by definitions
+    3. **Phi Correctness**: Phi nodes properly formed at join points
+
+    **USAGE:**
+    Call this after SSA construction to verify correctness.
+    Returns 1 if all properties hold, 0 if any violation detected.
+
+    **VERIFICATION PIPELINE:**
+    ```
+    verify_ssa_form(function):
+        if not is_in_ssa_form(function):
+            ERROR: Function not in SSA form
+
+        if not verify_single_assignment(function):
+            ERROR: Single assignment property violated
+
+        if not verify_dominance_property(function):
+            ERROR: Dominance property violated
+
+        if not verify_phi_correctness(function):
+            ERROR: Phi node correctness violated
+
+        return SUCCESS
+    ```
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "verify_ssa_form: null function pointer"
+        Return 0
+    End If
+
+    Note: Verify function is marked as SSA
+    Let in_ssa be is_in_ssa_form(function_ptr)
+    If in_ssa equals 0:
+        Display "verify_ssa_form: function not in SSA form"
+        Return 0
+    End If
+
+    Note: Verify single assignment property
+    Let single_ok be verify_single_assignment(function_ptr)
+    If single_ok equals 0:
+        Display "verify_ssa_form: single assignment property violated"
+        Return 0
+    End If
+
+    Note: Verify dominance property
+    Let dom_ok be verify_dominance_property(function_ptr)
+    If dom_ok equals 0:
+        Display "verify_ssa_form: dominance property violated"
+        Return 0
+    End If
+
+    Note: Verify phi correctness
+    Let phi_ok be verify_phi_correctness(function_ptr)
+    If phi_ok equals 0:
+        Display "verify_ssa_form: phi correctness violated"
+        Return 0
+    End If
+
+    Note: All SSA properties verified
+    Display "verify_ssa_form: SSA form verified successfully"
+    Return 1
+End Process
+
+Process called "print_phi_node_debug" that takes phi_ptr as Integer returns Integer:
+    @Reasoning
+    Prints debug information for a single phi node.
+
+    **DEBUG OUTPUT FORMAT:**
+    ```
+    Phi: %result_var = phi(
+        [ %value_1, block_1 ],
+        [ %value_2, block_2 ],
+        ...
+    )
+    ```
+
+    This helps visualize phi nodes during debugging.
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get phi result
+    Let result_var be Layout.memory_get_int64(phi_ptr, 0)
+
+    Note: Get incoming values and blocks
+    Let incoming_values be Layout.memory_get_int64(phi_ptr, 8)
+    Let incoming_blocks be Layout.memory_get_int64(phi_ptr, 16)
+    Let incoming_count be Layout.memory_get_int64(phi_ptr, 24)
+
+    Note: Build phi display string
+    Display "  Phi: %" joined with result_var joined with " = phi(" continuing
+
+    Let i be 0
+    While i is less than incoming_count:
+        Let value_id be List.get(incoming_values, i)
+        Let block_id be List.get(incoming_blocks, i)
+
+        Display " [ %" joined with value_id joined with ", B" joined with block_id joined with " ]" continuing
+
+        If i is less than incoming_count minus 1:
+            Display "," continuing
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display " )"
+
+    Return 1
+End Process
+
+Process called "print_ssa_debug_info" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Prints comprehensive debug information about SSA form.
+
+    **DEBUG OUTPUT INCLUDES:**
+    1. Function SSA status (in SSA form or not)
+    2. For each block:
+       - Block ID
+       - Phi nodes
+       - Instructions (with SSA value IDs)
+       - Predecessors and successors
+    3. Dominance tree information
+
+    This provides a complete view of the SSA structure for debugging.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "print_ssa_debug_info: null function pointer"
+        Return 0
+    End If
+
+    Display "===== SSA DEBUG INFO ====="
+
+    Note: Print SSA status
+    Let in_ssa be is_in_ssa_form(function_ptr)
+    If in_ssa equals 1:
+        Display "SSA Form: YES"
+    Otherwise:
+        Display "SSA Form: NO"
+    End If
+    Display ""
+
+    Note: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Display "print_ssa_debug_info: no CFG"
+        Return 0
+    End If
+
+    Note: Print each block
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    Let block_count be List.length(blocks)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+        Let block_id be Layout.memory_get_int64(block_ptr, 0)
+
+        Display "Block B" joined with block_id joined with ":"
+
+        Note: Print phi nodes
+        Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+        Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+
+        If phi_count is greater than 0:
+            Let j be 0
+            While j is less than phi_count:
+                Let phi_ptr be List.get(phi_list, j)
+                print_phi_node_debug(phi_ptr)
+                Set j to j plus 1
+            End While
+        End If
+
+        Note: Print instruction count
+        Let inst_count be Layout.memory_get_int64(block_ptr, 16)
+        Display "  Instructions: " joined with inst_count
+
+        Note: Print predecessors
+        Let pred_count be Layout.memory_get_int64(block_ptr, 32)
+        Display "  Predecessors: " joined with pred_count
+
+        Note: Print successors
+        Let succ_count be Layout.memory_get_int64(block_ptr, 48)
+        Display "  Successors: " joined with succ_count
+
+        Display ""
+        Set i to i plus 1
+    End While
+
+    Display "===== END SSA DEBUG INFO ====="
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PHASE 7: ADVANCED FEATURES - PRUNED SSA & OPTIMIZATIONS
+Note: ============================================================================
+
+Note: This phase provides advanced SSA optimizations and transformations:
+Note:   1. Pruned SSA: Remove dead phi nodes (phi nodes with no uses)
+Note:   2. Copy propagation: Eliminate trivial phi nodes (phi with single unique value)
+Note:   3. Incremental SSA updates: Add/remove variables without full reconstruction
+
+
+Process called "is_phi_trivial" that takes phi_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if a phi node is trivial and can be eliminated.
+
+    **TRIVIAL PHI NODE:**
+    A phi node is trivial if all incoming values are the same, or if they
+    are all the same except for the phi result itself (self-reference).
+
+    **EXAMPLES:**
+    - `x = phi(y, y, y)` - Trivial (all same value)
+    - `x = phi(x, y, x)` - Trivial (only x and y, x is the result)
+    - `x = phi(x, x, x)` - Trivial (all self-references)
+    - `x = phi(y, z, w)` - NOT trivial (different values)
+
+    **ELIMINATION:**
+    Trivial phi can be replaced by the unique incoming value.
+    Replace all uses of phi result with the unique value.
+
+    **ALGORITHM:**
+    ```
+    is_phi_trivial(phi):
+        result = phi.result
+        unique_value = null
+
+        for each incoming_value in phi.incoming_values:
+            if incoming_value == result:
+                continue  # Skip self-references
+
+            if unique_value == null:
+                unique_value = incoming_value
+            else if unique_value != incoming_value:
+                return false  # Multiple different values
+
+        return true  # All values are same or self-references
+    ```
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get phi result (offset 0)
+    Let result_id be Layout.memory_get_int64(phi_ptr, 0)
+
+    Note: Get incoming values (offset 8)
+    Let incoming_values be Layout.memory_get_int64(phi_ptr, 8)
+
+    Note: Get incoming count (offset 24)
+    Let incoming_count be Layout.memory_get_int64(phi_ptr, 24)
+
+    If incoming_values equals 0:
+        Return 0
+    End If
+
+    Note: Find unique non-self incoming value
+    Let unique_value be 0
+    Let found_unique be 0
+
+    Let i be 0
+    While i is less than incoming_count:
+        Let incoming_value be List.get(incoming_values, i)
+
+        Note: Skip self-references (incoming_value == result)
+        If incoming_value equals result_id:
+            Set i to i plus 1
+            Continue While
+        End If
+
+        Note: Check if this is the first non-self value
+        If found_unique equals 0:
+            Set unique_value to incoming_value
+            Set found_unique to 1
+        Otherwise:
+            Note: Check if different from unique value
+            If incoming_value is not equal to unique_value:
+                Return 0
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Phi is trivial if all non-self values are the same
+    Return 1
+End Process
+
+Process called "get_trivial_phi_replacement" that takes phi_ptr as Integer returns Integer:
+    @Reasoning
+    Gets the replacement value for a trivial phi node.
+
+    **REPLACEMENT VALUE:**
+    For a trivial phi, the replacement is the unique non-self incoming value.
+    If all values are self-references, the phi is dead and can be removed.
+
+    **RETURNS:**
+    - Unique incoming value ID if trivial
+    - 0 if phi is not trivial or all self-references
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get phi result
+    Let result_id be Layout.memory_get_int64(phi_ptr, 0)
+
+    Note: Get incoming values
+    Let incoming_values be Layout.memory_get_int64(phi_ptr, 8)
+    Let incoming_count be Layout.memory_get_int64(phi_ptr, 24)
+
+    If incoming_values equals 0:
+        Return 0
+    End If
+
+    Note: Find unique non-self value
+    Let unique_value be 0
+
+    Let i be 0
+    While i is less than incoming_count:
+        Let incoming_value be List.get(incoming_values, i)
+
+        Note: Skip self-references
+        If incoming_value is not equal to result_id:
+            If unique_value equals 0:
+                Set unique_value to incoming_value
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return unique_value
+End Process
+
+Process called "is_phi_dead" that takes phi_ptr as Integer, function_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if a phi node is dead (has no uses).
+
+    **DEAD PHI NODE:**
+    A phi node is dead if its result value is never used by any instruction
+    or other phi node in the function.
+
+    **DETECTION:**
+    Scan all instructions and phi nodes in the function. If none reference
+    the phi's result value, the phi is dead and can be removed.
+
+    **ALGORITHM:**
+    ```
+    is_phi_dead(phi, function):
+        result = phi.result
+
+        for each block in function.cfg:
+            # Check phi nodes
+            for each other_phi in block.phis:
+                if result in other_phi.incoming_values:
+                    return false  # Result is used
+
+            # Check instructions
+            for each instruction in block:
+                if result in instruction.operands:
+                    return false  # Result is used
+
+        return true  # No uses found
+    ```
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return 0
+    End If
+    If function_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get phi result value
+    Let result_id be Layout.memory_get_int64(phi_ptr, 0)
+
+    Note: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get all blocks
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    Let block_count be List.length(blocks)
+
+    Note: Scan all blocks for uses of result_id
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+
+        Note: Check phi nodes
+        Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+        If phi_list is not equal to 0:
+            Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+            Let j be 0
+            While j is less than phi_count:
+                Let other_phi be List.get(phi_list, j)
+
+                Note: Check if result_id is in incoming values
+                Let incoming_values be Layout.memory_get_int64(other_phi, 8)
+                Let incoming_count be Layout.memory_get_int64(other_phi, 24)
+
+                Let k be 0
+                While k is less than incoming_count:
+                    Let value be List.get(incoming_values, k)
+                    If value equals result_id:
+                        Return 0
+                    End If
+                    Set k to k plus 1
+                End While
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Note: Check instructions
+        Let inst_list be Layout.memory_get_int64(block_ptr, 8)
+        If inst_list is not equal to 0:
+            Let inst_count be Layout.memory_get_int64(block_ptr, 16)
+            Let j be 0
+            While j is less than inst_count:
+                Let inst_ptr be List.get(inst_list, j)
+
+                Note: Check if result_id is in instruction operands
+                Note: Use MIRNodes helper to check operands
+                Let has_operand be MIRNodes.instruction_uses_value(inst_ptr, result_id)
+                If has_operand equals 1:
+                    Return 0
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: No uses found, phi is dead
+    Return 1
+End Process
+
+Process called "remove_dead_phi_nodes" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Removes all dead phi nodes from a function.
+
+    **DEAD PHI ELIMINATION:**
+    This is a key optimization for pruned SSA form. Dead phis can arise
+    after other optimizations (e.g., dead code elimination).
+
+    **ALGORITHM:**
+    ```
+    remove_dead_phi_nodes(function):
+        changed = true
+        while changed:
+            changed = false
+            for each block in function.cfg:
+                for each phi in block.phis:
+                    if is_phi_dead(phi, function):
+                        remove phi from block
+                        changed = true
+        return number_removed
+    ```
+
+    **ITERATIVE REMOVAL:**
+    We iterate because removing one phi may make others dead.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "remove_dead_phi_nodes: null function pointer"
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let total_removed be 0
+    Let changed be 1
+
+    Note: Iterate until no more dead phis found
+    While changed equals 1:
+        Set changed to 0
+
+        Note: Get all blocks
+        Let blocks be CFG.get_all_blocks(cfg_ptr)
+        Let block_count be List.length(blocks)
+
+        Let i be 0
+        While i is less than block_count:
+            Let block_ptr be List.get(blocks, i)
+
+            Note: Get phi list
+            Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+            If phi_list is not equal to 0:
+                Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+
+                Note: Scan phis backwards for safe removal
+                Let j be phi_count minus 1
+                While j is greater than or equal to 0:
+                    Let phi_ptr be List.get(phi_list, j)
+
+                    Note: Check if phi is dead
+                    Let is_dead be is_phi_dead(phi_ptr, function_ptr)
+                    If is_dead equals 1:
+                        Note: Remove dead phi
+                        List.remove_at(phi_list, j)
+                        Set total_removed to total_removed plus 1
+                        Set changed to 1
+                    End If
+
+                    Set j to j minus 1
+                End While
+
+                Note: Update phi count
+                Let new_count be List.length(phi_list)
+                Layout.memory_set_int64(block_ptr, 64, new_count)
+            End If
+
+            Set i to i plus 1
+        End While
+    End While
+
+    Return total_removed
+End Process
+
+Process called "eliminate_trivial_phi_nodes" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Eliminates trivial phi nodes by replacing them with their unique value.
+
+    **TRIVIAL PHI ELIMINATION:**
+    For each trivial phi `x = phi(y, y, ...)`:
+      1. Replace all uses of x with y
+      2. Remove the phi node
+      3. Repeat until no trivial phis remain
+
+    **ALGORITHM:**
+    ```
+    eliminate_trivial_phi_nodes(function):
+        changed = true
+        while changed:
+            changed = false
+            for each block in function.cfg:
+                for each phi in block.phis:
+                    if is_phi_trivial(phi):
+                        replacement = get_trivial_phi_replacement(phi)
+                        replace_all_uses(phi.result, replacement)
+                        remove phi from block
+                        changed = true
+        return number_eliminated
+    ```
+
+    **ITERATIVE ELIMINATION:**
+    Eliminating one trivial phi may make others trivial.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "eliminate_trivial_phi_nodes: null function pointer"
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let total_eliminated be 0
+    Let changed be 1
+
+    Note: Iterate until no more trivial phis found
+    While changed equals 1:
+        Set changed to 0
+
+        Note: Get all blocks
+        Let blocks be CFG.get_all_blocks(cfg_ptr)
+        Let block_count be List.length(blocks)
+
+        Let i be 0
+        While i is less than block_count:
+            Let block_ptr be List.get(blocks, i)
+
+            Note: Get phi list
+            Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+            If phi_list is not equal to 0:
+                Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+
+                Note: Scan phis backwards for safe removal
+                Let j be phi_count minus 1
+                While j is greater than or equal to 0:
+                    Let phi_ptr be List.get(phi_list, j)
+
+                    Note: Check if phi is trivial
+                    Let is_trivial be is_phi_trivial(phi_ptr)
+                    If is_trivial equals 1:
+                        Note: Get replacement value
+                        Let replacement be get_trivial_phi_replacement(phi_ptr)
+
+                        If replacement is not equal to 0:
+                            Note: Get phi result
+                            Let result_id be Layout.memory_get_int64(phi_ptr, 0)
+
+                            Note: Replace all uses of result with replacement
+                            Let replace_success be MIR.replace_all_uses(result_id, replacement)
+
+                            If replace_success equals 1:
+                                Note: Successfully replaced all uses, now remove the phi
+                                List.remove_at(phi_list, j)
+                                Set total_eliminated to total_eliminated plus 1
+                                Set changed to 1
+                            Otherwise:
+                                Display "eliminate_trivial_phi_nodes: failed to replace uses of phi result " joined with result_id
+                            End If
+                        End If
+                    End If
+
+                    Set j to j minus 1
+                End While
+
+                Note: Update phi count
+                Let new_count be List.length(phi_list)
+                Layout.memory_set_int64(block_ptr, 64, new_count)
+            End If
+
+            Set i to i plus 1
+        End While
+    End While
+
+    Return total_eliminated
+End Process
+
+Process called "prune_ssa_form" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    **PRUNED SSA CONSTRUCTION**
+
+    Converts function to pruned SSA form by removing unnecessary phi nodes.
+
+    **PRUNED SSA vs MINIMAL SSA:**
+    - **Minimal SSA**: Fewest phis possible (Cytron algorithm produces this)
+    - **Pruned SSA**: Minimal SSA + remove dead phis + eliminate trivial phis
+
+    **BENEFITS:**
+    - Smaller IR (fewer phis)
+    - Faster analysis (fewer nodes to process)
+    - Better optimization (simpler data flow)
+
+    **ALGORITHM:**
+    ```
+    prune_ssa_form(function):
+        if not is_in_ssa_form(function):
+            construct_ssa_form(function)
+
+        # Remove dead phis
+        dead_count = remove_dead_phi_nodes(function)
+
+        # Eliminate trivial phis
+        trivial_count = eliminate_trivial_phi_nodes(function)
+
+        # Repeat until no more optimizations
+        while dead_count > 0 or trivial_count > 0:
+            dead_count = remove_dead_phi_nodes(function)
+            trivial_count = eliminate_trivial_phi_nodes(function)
+
+        return success
+    ```
+
+    **USAGE:**
+    Call this after SSA construction to optimize the SSA form.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "prune_ssa_form: null function pointer"
+        Return 0
+    End If
+
+    Note: Ensure function is in SSA form
+    Let in_ssa be is_in_ssa_form(function_ptr)
+    If in_ssa equals 0:
+        Note: Not in SSA, construct it first
+        Let ssa_result be construct_ssa_form(function_ptr)
+        If ssa_result equals 0:
+            Display "prune_ssa_form: failed to construct SSA"
+            Return 0
+        End If
+    End If
+
+    Note: Iteratively remove dead and trivial phis
+    Let total_dead be 0
+    Let total_trivial be 0
+    Let changed be 1
+
+    While changed equals 1:
+        Set changed to 0
+
+        Note: Remove dead phi nodes
+        Let dead_count be remove_dead_phi_nodes(function_ptr)
+        Set total_dead to total_dead plus dead_count
+        If dead_count is greater than 0:
+            Set changed to 1
+        End If
+
+        Note: Eliminate trivial phi nodes
+        Let trivial_count be eliminate_trivial_phi_nodes(function_ptr)
+        Set total_trivial to total_trivial plus trivial_count
+        If trivial_count is greater than 0:
+            Set changed to 1
+        End If
+    End While
+
+    Note: Print optimization statistics
+    Display "prune_ssa_form: removed " joined with total_dead joined with " dead phis, eliminated " joined with total_trivial joined with " trivial phis"
+
+    Return 1
+End Process
+
+Process called "get_ssa_statistics" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    Computes statistics about SSA form for analysis and debugging.
+
+    **STATISTICS COMPUTED:**
+    - Total number of phi nodes
+    - Number of trivial phi nodes
+    - Number of dead phi nodes
+    - Number of blocks with phis
+    - Average phi nodes per block
+    - SSA value count
+
+    **RETURNS:**
+    Pointer to statistics structure (or prints statistics).
+
+    This helps evaluate SSA form quality and optimization effectiveness.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Display "get_ssa_statistics: null function pointer"
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let total_phis be 0
+    Let trivial_phis be 0
+    Let dead_phis be 0
+    Let blocks_with_phis be 0
+
+    Note: Get all blocks
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    Let block_count be List.length(blocks)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block_ptr be List.get(blocks, i)
+
+        Note: Get phi list
+        Let phi_list be Layout.memory_get_int64(block_ptr, 56)
+        Let phi_count be Layout.memory_get_int64(block_ptr, 64)
+
+        If phi_count is greater than 0:
+            Set blocks_with_phis to blocks_with_phis plus 1
+            Set total_phis to total_phis plus phi_count
+
+            Note: Count trivial and dead phis
+            Let j be 0
+            While j is less than phi_count:
+                Let phi_ptr be List.get(phi_list, j)
+
+                Let is_trivial be is_phi_trivial(phi_ptr)
+                If is_trivial equals 1:
+                    Set trivial_phis to trivial_phis plus 1
+                End If
+
+                Let is_dead be is_phi_dead(phi_ptr, function_ptr)
+                If is_dead equals 1:
+                    Set dead_phis to dead_phis plus 1
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Print statistics
+    Display "===== SSA STATISTICS ====="
+    Display "Total phi nodes: " joined with total_phis
+    Display "Trivial phis: " joined with trivial_phis
+    Display "Dead phis: " joined with dead_phis
+    Display "Blocks with phis: " joined with blocks_with_phis
+    Display "Total blocks: " joined with block_count
+    Display "===== END SSA STATISTICS ====="
+
+    Return 1
+End Process

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,2176 @@ This file consists of the following functions/features/operation types:
 - Virtual register allocation and register management
 - Memory addressing and memory operation processing
 - Instruction selection and instruction generation
+
+Dependencies:
+- Imports MIR types for source IR representation
+- Imports LIR types for target IR representation
+- Imports LIRNodes for instruction creation
+- Imports HIR types for type information
+- Imports memory/layout.runa for OWNED HEAP allocation (Tier 3)
+- Imports collections for data structure management
 :End Note
 
-Note: TODO - Implement LIR builder functionality
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: LIR Builder Context Structure
+Note: Maintains state during MIR to LIR lowering
+Note: ============================================================================
+
+@Reasoning
+The LIRBuilder context maintains all state needed during the lowering process:
+- Current LIR function being constructed
+- Mapping from MIR SSA value IDs to LIR virtual register IDs
+- Mapping from MIR block IDs to LIR block IDs
+- Current block being built
+- Type information cache
+
+This enables efficient lowering by providing O(1) lookups for value and block
+mappings while building the LIR representation.
+@End Reasoning
+
+Type called "LIRBuilder":
+    mir_function as Integer          Note: Source MIR function pointer
+    lir_function as Integer          Note: Target LIR function being built
+    value_to_register as Integer     Note: Dictionary: MIR value ID -> LIR virtual register ID
+    block_mapping as Integer         Note: Dictionary: MIR block ID -> LIR block ID
+    current_block as Integer         Note: Current LIR block ID being built
+    calling_convention as Integer    Note: Calling convention (SYSTEMV, WIN64, etc.)
+    type_cache as Integer            Note: Dictionary: value ID -> HIRTypeInfo pointer
+    next_vreg_id as Integer          Note: Next available virtual register ID
+End Type
+
+Note: Size: 8 fields * 8 bytes = 64 bytes per LIRBuilder
+
+Note: ============================================================================
+Note: Builder Initialization and Management
+Note: ============================================================================
+
+@Reasoning
+Creates a new LIR builder context for lowering a MIR function to LIR.
+Initializes all mappings and state required for the lowering process.
+@End Reasoning
+
+Process called "create_lir_builder" that takes mir_function as Integer, calling_convention as Integer returns Integer:
+    If mir_function equals 0:
+        Display "create_lir_builder: null MIR function"
+        Return 0
+    End If
+
+    Let builder be Layout.allocate(64)
+    If builder equals 0:
+        Display "create_lir_builder: allocation failed"
+        Return 0
+    End If
+
+    Note: Get MIR function name
+    Let mir_name be Layout.memory_get_int64(mir_function, 0)
+    Let name_copy be StringCore.duplicate(mir_name)
+
+    Note: Get return type from MIR function
+    Let return_type be Layout.memory_get_int64(mir_function, 32)
+
+    Note: Create LIR function
+    Let lir_function be LIR.lir_create_function(name_copy, calling_convention, return_type)
+    If lir_function equals 0:
+        Display "create_lir_builder: LIR function creation failed"
+        Layout.deallocate(builder)
+        Return 0
+    End If
+
+    Note: Initialize builder fields
+    Layout.memory_set_int64(builder, 0, mir_function)
+    Layout.memory_set_int64(builder, 8, lir_function)
+
+    Let value_to_register be Dictionary.create()
+    Layout.memory_set_int64(builder, 16, value_to_register)
+
+    Let block_mapping be Dictionary.create()
+    Layout.memory_set_int64(builder, 24, block_mapping)
+
+    Layout.memory_set_int64(builder, 32, 0)                Note: current_block (set later)
+    Layout.memory_set_int64(builder, 40, calling_convention)
+
+    Let type_cache be Dictionary.create()
+    Layout.memory_set_int64(builder, 48, type_cache)
+
+    Layout.memory_set_int64(builder, 56, 1000)             Note: next_vreg_id starts at 1000
+
+    Return builder
+End Process
+
+@Reasoning
+Maps an MIR SSA value ID to a LIR virtual register ID. If the mapping already
+exists, returns the existing register. Otherwise, creates a new virtual register.
+
+This maintains the invariant that each SSA value maps to exactly one virtual
+register throughout the function.
+@End Reasoning
+
+Process called "get_or_create_register_for_value" that takes builder as Integer, value_id as Integer, type_info as Integer returns Integer:
+    If builder equals 0:
+        Display "get_or_create_register_for_value: null builder"
+        Return 0
+    End If
+
+    Note: Check if mapping already exists
+    Let value_to_register be Layout.memory_get_int64(builder, 16)
+    Let existing_reg be Dictionary.get(value_to_register, value_id)
+
+    If existing_reg is not equal to 0:
+        Return existing_reg
+    End If
+
+    Note: Create new virtual register
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+
+    Note: Determine register class from type
+    Let reg_class be get_register_class_for_type(type_info)
+    Let reg_size be get_type_size(type_info)
+
+    Let vreg_id be LIR.lir_create_virtual_register(lir_function, reg_class, reg_size)
+
+    Note: Store mapping
+    Dictionary.set(value_to_register, value_id, vreg_id)
+
+    Note: Cache type info
+    Let type_cache be Layout.memory_get_int64(builder, 48)
+    Dictionary.set(type_cache, value_id, type_info)
+
+    Return vreg_id
+End Process
+
+@Reasoning
+Maps an MIR basic block ID to a LIR basic block ID. Creates the LIR block
+if it doesn't exist yet. This enables forward references during lowering.
+@End Reasoning
+
+Process called "get_or_create_lir_block" that takes builder as Integer, mir_block_id as Integer returns Integer:
+    If builder equals 0:
+        Display "get_or_create_lir_block: null builder"
+        Return 0
+    End If
+
+    Let block_mapping be Layout.memory_get_int64(builder, 24)
+    Let existing_block be Dictionary.get(block_mapping, mir_block_id)
+
+    If existing_block is not equal to 0:
+        Return existing_block
+    End If
+
+    Note: Create new LIR block
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+    Let is_entry be 0
+
+    Note: First block (block 0) is entry block
+    If mir_block_id equals 0:
+        Let is_entry be 1
+    End If
+
+    Let lir_block_id be LIR.lir_add_block(lir_function, is_entry)
+
+    Note: Store mapping
+    Dictionary.set(block_mapping, mir_block_id, lir_block_id)
+
+    Return lir_block_id
+End Process
+
+@Reasoning
+Appends an LIR instruction to the current block being built.
+@End Reasoning
+
+Process called "append_lir_instruction" that takes builder as Integer, instruction as Integer returns Integer:
+    If builder equals 0 or instruction equals 0:
+        Display "append_lir_instruction: null parameter"
+        Return 0
+    End If
+
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+    Let current_block be Layout.memory_get_int64(builder, 32)
+
+    Let result be LIR.lir_append_instruction(lir_function, current_block, instruction)
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Type Utility Functions
+Note: ============================================================================
+
+@Reasoning
+Returns the size in bytes for a HIR type. Used for determining operand sizes
+and memory operation widths.
+@End Reasoning
+
+Process called "get_type_size" that takes type_info as Integer returns Integer:
+    If type_info equals 0:
+        Return 8
+    End If
+
+    Note: Get type kind from HIRTypeInfo
+    Let type_kind be Layout.memory_get_int64(type_info, 0)
+
+    Note: Integer types
+    If type_kind equals 1:
+        Note: Get bit width
+        Let bit_width be Layout.memory_get_int64(type_info, 8)
+        If bit_width equals 8:
+            Return 1
+        End If
+        If bit_width equals 16:
+            Return 2
+        End If
+        If bit_width equals 32:
+            Return 4
+        End If
+        If bit_width equals 64:
+            Return 8
+        End If
+        Return 8
+    End If
+
+    Note: Float types
+    If type_kind equals 2:
+        Let bit_width be Layout.memory_get_int64(type_info, 8)
+        If bit_width equals 32:
+            Return 4
+        End If
+        If bit_width equals 64:
+            Return 8
+        End If
+        Return 8
+    End If
+
+    Note: Pointer types
+    If type_kind equals 3:
+        Return 8
+    End If
+
+    Note: Boolean type
+    If type_kind equals 4:
+        Return 1
+    End If
+
+    Note: Default to 8 bytes
+    Return 8
+End Process
+
+@Reasoning
+Determines the register class (GPR, FPR, VEC) for a given type.
+Used during virtual register allocation.
+@End Reasoning
+
+Process called "get_register_class_for_type" that takes type_info as Integer returns Integer:
+    If type_info equals 0:
+        Return LIR.LIR_REGCLASS_GPR
+    End If
+
+    Let type_kind be Layout.memory_get_int64(type_info, 0)
+
+    Note: Float types use FPR
+    If type_kind equals 2:
+        Return LIR.LIR_REGCLASS_FPR
+    End If
+
+    Note: Integer, pointer, boolean use GPR
+    Return LIR.LIR_REGCLASS_GPR
+End Process
+
+@Reasoning
+Checks if a type is a floating-point type.
+Used for instruction selection (FADD vs ADD, etc.).
+@End Reasoning
+
+Process called "is_float_type" that takes type_info as Integer returns Integer:
+    If type_info equals 0:
+        Return 0
+    End If
+
+    Let type_kind be Layout.memory_get_int64(type_info, 0)
+
+    If type_kind equals 2:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Checks if a type is a signed integer type.
+Used for instruction selection (IDIV vs DIV, SAR vs SHR, etc.).
+@End Reasoning
+
+Process called "is_signed_type" that takes type_info as Integer returns Integer:
+    If type_info equals 0:
+        Return 1
+    End If
+
+    Let type_kind be Layout.memory_get_int64(type_info, 0)
+
+    Note: Check if integer type
+    If type_kind equals 1:
+        Note: Check signed flag (bit 16 in HIRTypeInfo)
+        Let is_signed be Layout.memory_get_int64(type_info, 16)
+        Return is_signed
+    End If
+
+    Note: Non-integer types treated as signed
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Arithmetic and Logical Operation Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR binary operations (ADD, SUB, MUL, DIV, AND, OR, XOR, shifts) to LIR.
+Selects appropriate instruction based on type (integer vs float) and signedness.
+@End Reasoning
+
+Process called "lower_binary_op" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_binary_op: null parameter"
+        Return 0
+    End If
+
+    Note: Extract operands from MIR node
+    Let opcode be Layout.memory_get_int64(mir_node, 0)
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let left_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let right_value_id be Layout.memory_get_int64(mir_node, 24)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Note: Get or create registers
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let left_reg be get_or_create_register_for_value(builder, left_value_id, type_info)
+    Let right_reg be get_or_create_register_for_value(builder, right_value_id, type_info)
+
+    Note: Create operands
+    Let size be get_type_size(type_info)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+    Let left_operand be LIRNodes.create_register_operand(left_reg, size)
+    Let right_operand be LIRNodes.create_register_operand(right_reg, size)
+
+    Note: Select LIR opcode based on MIR opcode and type
+    Let lir_opcode be 0
+    Let is_float be is_float_type(type_info)
+
+    If opcode equals MIR.MIR_ADD:
+        If is_float equals 1:
+            Let lir_opcode be LIR.LIR_FADD
+        Otherwise:
+            Let lir_opcode be LIR.LIR_ADD
+        End If
+    End If
+
+    If opcode equals MIR.MIR_SUB:
+        If is_float equals 1:
+            Let lir_opcode be LIR.LIR_FSUB
+        Otherwise:
+            Let lir_opcode be LIR.LIR_SUB
+        End If
+    End If
+
+    If opcode equals MIR.MIR_MUL:
+        If is_float equals 1:
+            Let lir_opcode be LIR.LIR_FMUL
+        Otherwise:
+            Let is_signed be is_signed_type(type_info)
+            If is_signed equals 1:
+                Let lir_opcode be LIR.LIR_IMUL
+            Otherwise:
+                Let lir_opcode be LIR.LIR_MUL
+            End If
+        End If
+    End If
+
+    If opcode equals MIR.MIR_DIV:
+        If is_float equals 1:
+            Let lir_opcode be LIR.LIR_FDIV
+        Otherwise:
+            Let is_signed be is_signed_type(type_info)
+            If is_signed equals 1:
+                Let lir_opcode be LIR.LIR_IDIV
+            Otherwise:
+                Let lir_opcode be LIR.LIR_DIV
+            End If
+        End If
+    End If
+
+    If opcode equals MIR.MIR_AND:
+        Let lir_opcode be LIR.LIR_AND
+    End If
+
+    If opcode equals MIR.MIR_OR:
+        Let lir_opcode be LIR.LIR_OR
+    End If
+
+    If opcode equals MIR.MIR_XOR:
+        Let lir_opcode be LIR.LIR_XOR
+    End If
+
+    If opcode equals MIR.MIR_SHL:
+        Let lir_opcode be LIR.LIR_SHL
+    End If
+
+    If opcode equals MIR.MIR_SHR:
+        Let lir_opcode be LIR.LIR_SHR
+    End If
+
+    If opcode equals MIR.MIR_SAR:
+        Let lir_opcode be LIR.LIR_SAR
+    End If
+
+    Note: Create LIR binary operation
+    Let lir_inst be LIRNodes.create_lir_binary_op(lir_opcode, dest_operand, left_operand, right_operand, size)
+
+    Note: Append to current block
+    append_lir_instruction(builder, lir_inst)
+
+    Return 1
+End Process
+
+@Reasoning
+Lowers MIR unary operations (NEG, NOT) to LIR.
+@End Reasoning
+
+Process called "lower_unary_op" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_unary_op: null parameter"
+        Return 0
+    End If
+
+    Let opcode be Layout.memory_get_int64(mir_node, 0)
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let operand_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let operand_reg be get_or_create_register_for_value(builder, operand_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+    Let src_operand be LIRNodes.create_register_operand(operand_reg, size)
+
+    Note: Select LIR opcode
+    Let lir_opcode be 0
+    Let is_float be is_float_type(type_info)
+
+    If opcode equals MIR.MIR_NEG:
+        If is_float equals 1:
+            Let lir_opcode be LIR.LIR_FNEG
+        Otherwise:
+            Let lir_opcode be LIR.LIR_NEG
+        End If
+    End If
+
+    If opcode equals MIR.MIR_NOT:
+        Let lir_opcode be LIR.LIR_NOT
+    End If
+
+    Let lir_inst be LIRNodes.create_lir_unary_op(lir_opcode, dest_operand, src_operand, size)
+    append_lir_instruction(builder, lir_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Comparison Operation Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR comparison operations to LIR compare instruction plus condition code.
+MIR comparisons produce a boolean result, while LIR comparisons set CPU flags
+that are then tested by conditional branches or moves.
+@End Reasoning
+
+Process called "lower_comparison" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_comparison: null parameter"
+        Return 0
+    End If
+
+    Let opcode be Layout.memory_get_int64(mir_node, 0)
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let left_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let right_value_id be Layout.memory_get_int64(mir_node, 24)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let left_reg be get_or_create_register_for_value(builder, left_value_id, type_info)
+    Let right_reg be get_or_create_register_for_value(builder, right_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+    Let left_operand be LIRNodes.create_register_operand(left_reg, size)
+    Let right_operand be LIRNodes.create_register_operand(right_reg, size)
+
+    Note: Generate compare instruction
+    Let is_signed be is_signed_type(type_info)
+    Let is_float be is_float_type(type_info)
+
+    If is_float equals 1:
+        Let cmp_inst be LIRNodes.create_lir_compare(left_operand, right_operand, size, 1)
+    Otherwise:
+        Let cmp_inst be LIRNodes.create_lir_compare(left_operand, right_operand, size, is_signed)
+    End If
+
+    append_lir_instruction(builder, cmp_inst)
+
+    Note: Map MIR comparison to LIR condition code
+    Let condition be 0
+
+    If opcode equals MIR.MIR_EQ:
+        Let condition be LIR.LIR_COND_EQ
+    End If
+    If opcode equals MIR.MIR_NE:
+        Let condition be LIR.LIR_COND_NE
+    End If
+    If opcode equals MIR.MIR_LT:
+        If is_signed equals 1:
+            Let condition be LIR.LIR_COND_LT
+        Otherwise:
+            Let condition be LIR.LIR_COND_ULT
+        End If
+    End If
+    If opcode equals MIR.MIR_LE:
+        If is_signed equals 1:
+            Let condition be LIR.LIR_COND_LE
+        Otherwise:
+            Let condition be LIR.LIR_COND_ULE
+        End If
+    End If
+    If opcode equals MIR.MIR_GT:
+        If is_signed equals 1:
+            Let condition be LIR.LIR_COND_GT
+        Otherwise:
+            Let condition be LIR.LIR_COND_UGT
+        End If
+    End If
+    If opcode equals MIR.MIR_GE:
+        If is_signed equals 1:
+            Let condition be LIR.LIR_COND_GE
+        Otherwise:
+            Let condition be LIR.LIR_COND_UGE
+        End If
+    End If
+
+    Note: Generate conditional move to set result register (SETcc equivalent)
+    Note: Move 1 or 0 into result based on condition
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+    Let true_immediate be LIRNodes.create_immediate_operand(1, size)
+    Let false_immediate be LIRNodes.create_immediate_operand(0, size)
+
+    Note: Use conditional move (CMOVcc) to materialize boolean result
+    Note: This sets result_reg to 1 if condition true, 0 if false
+    Let setcc_inst be LIRNodes.create_lir_binary_op(LIR.LIR_CMOVcc, dest_operand, true_immediate, false_immediate, size)
+    append_lir_instruction(builder, setcc_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Memory Operation Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR load operations to LIR load instructions with appropriate addressing
+mode selection. Handles base + offset addressing for struct field access.
+@End Reasoning
+
+Process called "lower_load" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_load: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let address_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Note: Get address register
+    Let address_reg be get_or_create_register_for_value(builder, address_value_id, type_info)
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+
+    Note: Create memory operand: [address_reg + 0]
+    Let mem_operand be LIRNodes.create_simple_memory_operand(address_reg, 0, size)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+
+    Note: Select sized load based on type size
+    Let lir_opcode be LIR.LIR_LOAD
+    If size equals 1:
+        Let lir_opcode be LIR.LIR_LOAD8
+    End If
+    If size equals 2:
+        Let lir_opcode be LIR.LIR_LOAD16
+    End If
+    If size equals 4:
+        Let lir_opcode be LIR.LIR_LOAD32
+    End If
+    If size equals 8:
+        Let lir_opcode be LIR.LIR_LOAD64
+    End If
+
+    Let load_inst be LIRNodes.create_lir_load(dest_operand, mem_operand, size, size)
+    append_lir_instruction(builder, load_inst)
+
+    Return 1
+End Process
+
+@Reasoning
+Lowers MIR store operations to LIR store instructions with appropriate addressing
+mode selection.
+@End Reasoning
+
+Process called "lower_store" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_store: null parameter"
+        Return 0
+    End If
+
+    Let address_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let value_value_id be Layout.memory_get_int64(mir_node, 24)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let address_reg be get_or_create_register_for_value(builder, address_value_id, type_info)
+    Let value_reg be get_or_create_register_for_value(builder, value_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+
+    Note: Create memory operand: [address_reg + 0]
+    Let mem_operand be LIRNodes.create_simple_memory_operand(address_reg, 0, size)
+    Let src_operand be LIRNodes.create_register_operand(value_reg, size)
+
+    Note: Select sized store based on type size
+    Let lir_opcode be LIR.LIR_STORE
+    If size equals 1:
+        Let lir_opcode be LIR.LIR_STORE8
+    End If
+    If size equals 2:
+        Let lir_opcode be LIR.LIR_STORE16
+    End If
+    If size equals 4:
+        Let lir_opcode be LIR.LIR_STORE32
+    End If
+    If size equals 8:
+        Let lir_opcode be LIR.LIR_STORE64
+    End If
+
+    Let store_inst be LIRNodes.create_lir_store(mem_operand, src_operand, size, size)
+    append_lir_instruction(builder, store_inst)
+
+    Return 1
+End Process
+
+@Reasoning
+Lowers MIR stack allocation (alloca) to stack frame slot allocation.
+Returns a pointer to the allocated stack space.
+@End Reasoning
+
+Process called "lower_alloca" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_alloca: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let size be get_type_size(type_info)
+
+    Note: Allocate spill slot in stack frame
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+    Let stack_offset be LIR.lir_allocate_spill_slot(lir_function, result_value_id, size)
+
+    Note: Create virtual register to hold stack address
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+
+    Note: Generate LEA instruction to compute stack address: lea result_reg, [rbp + stack_offset]
+    Let rbp_reg be LIR.LIR_REG_RBP
+    Let mem_operand be LIRNodes.create_simple_memory_operand(rbp_reg, stack_offset, 8)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, 8)
+
+    Let lea_inst be LIRNodes.create_lir_binary_op(LIR.LIR_LEA, dest_operand, mem_operand, mem_operand, 8)
+    append_lir_instruction(builder, lea_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Control Flow Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR conditional branch to LIR compare + conditional branch.
+The condition value has already been computed by a comparison instruction.
+@End Reasoning
+
+Process called "lower_branch" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_branch: null parameter"
+        Return 0
+    End If
+
+    Let condition_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let true_block_id be Layout.memory_get_int64(mir_node, 24)
+    Let false_block_id be Layout.memory_get_int64(mir_node, 32)
+
+    Note: Get condition register
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+    Let condition_reg be get_or_create_register_for_value(builder, condition_value_id, type_info)
+
+    Note: Compare condition with 0 to set flags
+    Let cond_operand be LIRNodes.create_register_operand(condition_reg, 1)
+    Let zero_operand be LIRNodes.create_immediate_operand(0, 1)
+
+    Let cmp_inst be LIRNodes.create_lir_compare(cond_operand, zero_operand, 1, 0)
+    append_lir_instruction(builder, cmp_inst)
+
+    Note: Get LIR block IDs for targets
+    Let lir_true_block be get_or_create_lir_block(builder, true_block_id)
+    Let lir_false_block be get_or_create_lir_block(builder, false_block_id)
+
+    Note: Branch if not equal (condition != 0) to true block
+    Let branch_inst be LIRNodes.create_lir_branch(LIR.LIR_COND_NE, lir_true_block, lir_false_block)
+    append_lir_instruction(builder, branch_inst)
+
+    Note: Add CFG edges
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+    Let current_block be Layout.memory_get_int64(builder, 32)
+    LIR.lir_add_edge(lir_function, current_block, lir_true_block)
+    LIR.lir_add_edge(lir_function, current_block, lir_false_block)
+
+    Return 1
+End Process
+
+@Reasoning
+Lowers MIR unconditional jump to LIR jump instruction.
+@End Reasoning
+
+Process called "lower_jump" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_jump: null parameter"
+        Return 0
+    End If
+
+    Let target_block_id be Layout.memory_get_int64(mir_node, 16)
+
+    Note: Get LIR block ID for target
+    Let lir_target_block be get_or_create_lir_block(builder, target_block_id)
+
+    Note: Create jump instruction
+    Let jump_inst be LIRNodes.create_lir_jump(lir_target_block)
+    append_lir_instruction(builder, jump_inst)
+
+    Note: Add CFG edge
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+    Let current_block be Layout.memory_get_int64(builder, 32)
+    LIR.lir_add_edge(lir_function, current_block, lir_target_block)
+
+    Return 1
+End Process
+
+@Reasoning
+Lowers MIR return instruction to LIR return with proper return value placement.
+The return value must be moved to the return register (RAX for integers, XMM0 for floats).
+@End Reasoning
+
+Process called "lower_return" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_return: null parameter"
+        Return 0
+    End If
+
+    Let return_value_id be Layout.memory_get_int64(mir_node, 16)
+
+    Note: Check if function returns a value
+    If return_value_id is not equal to 0:
+        Let type_info be Layout.memory_get_int64(mir_node, 40)
+        Let value_reg be get_or_create_register_for_value(builder, return_value_id, type_info)
+
+        Note: Get return register based on type
+        Let calling_convention be Layout.memory_get_int64(builder, 40)
+        Let is_float be is_float_type(type_info)
+        Let return_reg be LIR.lir_get_return_register(calling_convention, is_float)
+
+        Let size be get_type_size(type_info)
+
+        Note: Move return value to return register
+        Let src_operand be LIRNodes.create_register_operand(value_reg, size)
+        Let dest_operand be LIRNodes.create_register_operand(return_reg, size)
+
+        Let move_inst be LIRNodes.create_lir_move(dest_operand, src_operand, size)
+        append_lir_instruction(builder, move_inst)
+    End If
+
+    Note: Create return instruction
+    Let ret_inst be LIRNodes.create_lir_return()
+    append_lir_instruction(builder, ret_inst)
+
+    Return 1
+End Process
+
+@Reasoning
+Lowers MIR phi nodes by inserting register moves at the end of predecessor blocks.
+Phi elimination converts SSA form to virtual register form by making SSA values
+explicit through register-to-register moves.
+@End Reasoning
+
+Process called "lower_phi_node" that takes builder as Integer, mir_phi as Integer returns Integer:
+    If builder equals 0 or mir_phi equals 0:
+        Display "lower_phi_node: null parameter"
+        Return 0
+    End If
+
+    Note: Get phi result and incoming values
+    Let result_value_id be Layout.memory_get_int64(mir_phi, 8)
+    Let incoming_pairs be Layout.memory_get_int64(mir_phi, 16)
+    Let incoming_count be Layout.memory_get_int64(mir_phi, 24)
+    Let type_info be Layout.memory_get_int64(mir_phi, 32)
+
+    Note: Get result register
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let size be get_type_size(type_info)
+
+    Note: For each incoming value, insert move at end of predecessor block
+    Let i be 0
+    While i is less than incoming_count:
+        Note: Get (block_id, value_id) pair
+        Let pair be List.get(incoming_pairs, i)
+        Let pred_block_id be Layout.memory_get_int64(pair, 0)
+        Let value_id be Layout.memory_get_int64(pair, 8)
+
+        Note: Get source register
+        Let src_reg be get_or_create_register_for_value(builder, value_id, type_info)
+
+        Note: Get LIR predecessor block
+        Let lir_pred_block be get_or_create_lir_block(builder, pred_block_id)
+
+        Note: Save current block
+        Let saved_current_block be Layout.memory_get_int64(builder, 32)
+
+        Note: Switch to predecessor block to insert move
+        Layout.memory_set_int64(builder, 32, lir_pred_block)
+
+        Note: Create move: result_reg = src_reg
+        Let src_operand be LIRNodes.create_register_operand(src_reg, size)
+        Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+
+        Let move_inst be LIRNodes.create_lir_move(dest_operand, src_operand, size)
+        append_lir_instruction(builder, move_inst)
+
+        Note: Restore current block
+        Layout.memory_set_int64(builder, 32, saved_current_block)
+
+        Let i be i + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Function Call Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR function call to LIR call sequence following calling convention.
+Places arguments in registers and/or on stack, generates call instruction,
+and retrieves return value.
+@End Reasoning
+
+Process called "lower_call" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_call: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let callee_name be Layout.memory_get_int64(mir_node, 16)
+    Let arguments be Layout.memory_get_int64(mir_node, 24)
+    Let argument_count be Layout.memory_get_int64(mir_node, 32)
+    Let return_type be Layout.memory_get_int64(mir_node, 40)
+    Let calling_convention be Layout.memory_get_int64(builder, 40)
+
+    Note: Setup arguments according to calling convention
+    Let arg_index be 0
+    While arg_index is less than argument_count:
+        Let arg_value_id be List.get(arguments, arg_index)
+
+        Note: Get type info for argument (cached during lowering)
+        Let type_cache be Layout.memory_get_int64(builder, 48)
+        Let arg_type be Dictionary.get(type_cache, arg_value_id)
+
+        Let arg_reg be get_or_create_register_for_value(builder, arg_value_id, arg_type)
+        Let is_float be is_float_type(arg_type)
+
+        Note: Get argument register per calling convention
+        Let target_reg be LIR.lir_get_argument_register(calling_convention, arg_index, is_float)
+
+        Let size be get_type_size(arg_type)
+
+        Note: If argument fits in register, move it
+        If target_reg is not equal to -1:
+            Let src_operand be LIRNodes.create_register_operand(arg_reg, size)
+            Let dest_operand be LIRNodes.create_register_operand(target_reg, size)
+
+            Let move_inst be LIRNodes.create_lir_move(dest_operand, src_operand, size)
+            append_lir_instruction(builder, move_inst)
+        Otherwise:
+            Note: Argument goes on stack
+            Note: Calculate stack position: arg_index * 8 (assuming 8-byte slots)
+            Let stack_offset be arg_index * 8
+
+            Let rsp_reg be LIR.LIR_REG_RSP
+            Let mem_operand be LIRNodes.create_simple_memory_operand(rsp_reg, stack_offset, size)
+            Let src_operand be LIRNodes.create_register_operand(arg_reg, size)
+
+            Let lir_opcode be LIR.LIR_STORE64
+            Let store_inst be LIRNodes.create_lir_store(mem_operand, src_operand, size, size)
+            append_lir_instruction(builder, store_inst)
+        End If
+
+        Let arg_index be arg_index + 1
+    End While
+
+    Note: Create call instruction
+    Let call_inst be LIRNodes.create_lir_call(callee_name, argument_count, calling_convention)
+    append_lir_instruction(builder, call_inst)
+
+    Note: Retrieve return value if function returns something
+    If result_value_id is not equal to 0:
+        Let is_float be is_float_type(return_type)
+        Let return_reg be LIR.lir_get_return_register(calling_convention, is_float)
+        Let result_reg be get_or_create_register_for_value(builder, result_value_id, return_type)
+
+        Let size be get_type_size(return_type)
+
+        Note: Move return value from return register to result register
+        Let src_operand be LIRNodes.create_register_operand(return_reg, size)
+        Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+
+        Let move_inst be LIRNodes.create_lir_move(dest_operand, src_operand, size)
+        append_lir_instruction(builder, move_inst)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Constant Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR constant values to LIR immediate load instructions.
+Constants are materialized into registers when needed.
+@End Reasoning
+
+Process called "lower_const" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_const: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let constant_value be Layout.memory_get_int64(mir_node, 16)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let size be get_type_size(type_info)
+
+    Note: Create immediate operand
+    Let immediate_operand be LIRNodes.create_immediate_operand(constant_value, size)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+
+    Note: Generate move immediate to register
+    Let move_inst be LIRNodes.create_lir_move(dest_operand, immediate_operand, size)
+    append_lir_instruction(builder, move_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Type Conversion Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR type conversion operations (cast, extend, truncate) to LIR.
+@End Reasoning
+
+Process called "lower_type_conversion" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_type_conversion: null parameter"
+        Return 0
+    End If
+
+    Let opcode be Layout.memory_get_int64(mir_node, 0)
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let operand_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let operand_reg be get_or_create_register_for_value(builder, operand_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+    Let src_operand be LIRNodes.create_register_operand(operand_reg, size)
+
+    Note: Select LIR opcode for conversion
+    Let lir_opcode be 0
+
+    If opcode equals MIR.MIR_EXTEND:
+        Let lir_opcode be LIR.LIR_SEXT
+    End If
+
+    If opcode equals MIR.MIR_ZEXT:
+        Let lir_opcode be LIR.LIR_ZEXT
+    End If
+
+    If opcode equals MIR.MIR_TRUNC:
+        Let lir_opcode be LIR.LIR_TRUNC
+    End If
+
+    If opcode equals MIR.MIR_INT_TO_FLOAT:
+        Let lir_opcode be LIR.LIR_CVTSI2SD
+    End If
+
+    If opcode equals MIR.MIR_FLOAT_TO_INT:
+        Let lir_opcode be LIR.LIR_CVTSD2SI
+    End If
+
+    If opcode equals MIR.MIR_BITCAST:
+        Let lir_opcode be LIR.LIR_BITCAST
+    End If
+
+    If opcode equals MIR.MIR_PTR_TO_INT:
+        Note: Pointer to integer - simple move on x86-64
+        Let lir_opcode be LIR.LIR_MOVE
+    End If
+
+    If opcode equals MIR.MIR_INT_TO_PTR:
+        Note: Integer to pointer - simple move on x86-64
+        Let lir_opcode be LIR.LIR_MOVE
+    End If
+
+    Let conv_inst be LIRNodes.create_lir_unary_op(lir_opcode, dest_operand, src_operand, size)
+    append_lir_instruction(builder, conv_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Modulo Operation Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR modulo operation to LIR instruction sequence.
+Since x86-64 doesn't have a direct modulo instruction, we implement:
+a % b = a - (a / b) * b
+@End Reasoning
+
+Process called "lower_modulo" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_modulo: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let left_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let right_value_id be Layout.memory_get_int64(mir_node, 24)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let left_reg be get_or_create_register_for_value(builder, left_value_id, type_info)
+    Let right_reg be get_or_create_register_for_value(builder, right_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+    Let left_operand be LIRNodes.create_register_operand(left_reg, size)
+    Let right_operand be LIRNodes.create_register_operand(right_reg, size)
+
+    Note: Create register for intermediate result
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+    Let next_vreg_id be Layout.memory_get_int64(builder, 56)
+    Let temp_reg be LIR.lir_create_virtual_register(lir_function, LIR.LIR_REGCLASS_GPR, size)
+    Layout.memory_set_int64(builder, 56, next_vreg_id + 1)
+
+    Let temp_operand be LIRNodes.create_register_operand(temp_reg, size)
+
+    Note: Select division opcode based on signedness
+    Let is_signed be is_signed_type(type_info)
+    Let is_float be is_float_type(type_info)
+
+    Let div_opcode be 0
+    Let mul_opcode be 0
+
+    If is_float equals 1:
+        Let div_opcode be LIR.LIR_FDIV
+        Let mul_opcode be LIR.LIR_FMUL
+    Otherwise:
+        If is_signed equals 1:
+            Let div_opcode be LIR.LIR_IDIV
+            Let mul_opcode be LIR.LIR_IMUL
+        Otherwise:
+            Let div_opcode be LIR.LIR_DIV
+            Let mul_opcode be LIR.LIR_MUL
+        End If
+    End If
+
+    Note: = left / right
+    Let div_inst be LIRNodes.create_lir_binary_op(div_opcode, temp_operand, left_operand, right_operand, size)
+    append_lir_instruction(builder, div_inst)
+
+    Note: = * right
+    Let mul_inst be LIRNodes.create_lir_binary_op(mul_opcode, temp_operand, temp_operand, right_operand, size)
+    append_lir_instruction(builder, mul_inst)
+
+    Note: result = left - 
+    Let result_operand be LIRNodes.create_register_operand(result_reg, size)
+    Let sub_opcode be LIR.LIR_SUB
+    If is_float equals 1:
+        Let sub_opcode be LIR.LIR_FSUB
+    End If
+
+    Let sub_inst be LIRNodes.create_lir_binary_op(sub_opcode, result_operand, left_operand, temp_operand, size)
+    append_lir_instruction(builder, sub_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Struct Field Access Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR struct field load operations to LIR load with field offset.
+Computes address as base + field_offset and performs load.
+@End Reasoning
+
+Process called "lower_load_field" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_load_field: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let base_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let field_offset be Layout.memory_get_int64(mir_node, 24)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let base_reg be get_or_create_register_for_value(builder, base_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+
+    Note: Create memory operand: [base_reg + field_offset]
+    Let mem_operand be LIRNodes.create_simple_memory_operand(base_reg, field_offset, size)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+
+    Note: Select sized load based on type size
+    Let lir_opcode be LIR.LIR_LOAD
+    If size equals 1:
+        Let lir_opcode be LIR.LIR_LOAD8
+    End If
+    If size equals 2:
+        Let lir_opcode be LIR.LIR_LOAD16
+    End If
+    If size equals 4:
+        Let lir_opcode be LIR.LIR_LOAD32
+    End If
+    If size equals 8:
+        Let lir_opcode be LIR.LIR_LOAD64
+    End If
+
+    Let load_inst be LIRNodes.create_lir_load(dest_operand, mem_operand, size, size)
+    append_lir_instruction(builder, load_inst)
+
+    Return 1
+End Process
+
+@Reasoning
+Lowers MIR struct field store operations to LIR store with field offset.
+Computes address as base + field_offset and performs store.
+@End Reasoning
+
+Process called "lower_store_field" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_store_field: null parameter"
+        Return 0
+    End If
+
+    Let base_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let field_offset be Layout.memory_get_int64(mir_node, 24)
+    Let value_value_id be Layout.memory_get_int64(mir_node, 32)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let base_reg be get_or_create_register_for_value(builder, base_value_id, type_info)
+    Let value_reg be get_or_create_register_for_value(builder, value_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+
+    Note: Create memory operand: [base_reg + field_offset]
+    Let mem_operand be LIRNodes.create_simple_memory_operand(base_reg, field_offset, size)
+    Let src_operand be LIRNodes.create_register_operand(value_reg, size)
+
+    Note: Select sized store based on type size
+    Let lir_opcode be LIR.LIR_STORE
+    If size equals 1:
+        Let lir_opcode be LIR.LIR_STORE8
+    End If
+    If size equals 2:
+        Let lir_opcode be LIR.LIR_STORE16
+    End If
+    If size equals 4:
+        Let lir_opcode be LIR.LIR_STORE32
+    End If
+    If size equals 8:
+        Let lir_opcode be LIR.LIR_STORE64
+    End If
+
+    Let store_inst be LIRNodes.create_lir_store(mem_operand, src_operand, size, size)
+    append_lir_instruction(builder, store_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Address and Pointer Operation Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR address-of operation to LIR LEA (Load Effective Address) instruction.
+Computes the address of a value without dereferencing it.
+@End Reasoning
+
+Process called "lower_address_of" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_address_of: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let operand_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let operand_reg be get_or_create_register_for_value(builder, operand_value_id, type_info)
+
+    Note: Create memory operand from operand register
+    Let mem_operand be LIRNodes.create_simple_memory_operand(operand_reg, 0, 8)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, 8)
+
+    Note: Generate LEA to compute address
+    Let lea_inst be LIRNodes.create_lir_binary_op(LIR.LIR_LEA, dest_operand, mem_operand, mem_operand, 8)
+    append_lir_instruction(builder, lea_inst)
+
+    Return 1
+End Process
+
+@Reasoning
+Lowers MIR pointer dereference operation to LIR load instruction.
+Loads the value pointed to by the pointer.
+@End Reasoning
+
+Process called "lower_deref" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_deref: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let pointer_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let pointer_reg be get_or_create_register_for_value(builder, pointer_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+
+    Note: Create memory operand: [pointer_reg + 0]
+    Let mem_operand be LIRNodes.create_simple_memory_operand(pointer_reg, 0, size)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+
+    Note: Select sized load based on type size
+    Let lir_opcode be LIR.LIR_LOAD
+    If size equals 1:
+        Let lir_opcode be LIR.LIR_LOAD8
+    End If
+    If size equals 2:
+        Let lir_opcode be LIR.LIR_LOAD16
+    End If
+    If size equals 4:
+        Let lir_opcode be LIR.LIR_LOAD32
+    End If
+    If size equals 8:
+        Let lir_opcode be LIR.LIR_LOAD64
+    End If
+
+    Let load_inst be LIRNodes.create_lir_load(dest_operand, mem_operand, size, size)
+    append_lir_instruction(builder, load_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Indirect Call Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR indirect function call (through function pointer) to LIR.
+Similar to direct call but the callee is specified via a register operand.
+@End Reasoning
+
+Process called "lower_call_indirect" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_call_indirect: null parameter"
+        Return 0
+    End If
+
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let callee_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let arguments be Layout.memory_get_int64(mir_node, 24)
+    Let argument_count be Layout.memory_get_int64(mir_node, 32)
+    Let return_type be Layout.memory_get_int64(mir_node, 40)
+    Let calling_convention be Layout.memory_get_int64(builder, 40)
+
+    Note: Get callee register (function pointer)
+    Let type_cache be Layout.memory_get_int64(builder, 48)
+    Let callee_type be Dictionary.get(type_cache, callee_value_id)
+    Let callee_reg be get_or_create_register_for_value(builder, callee_value_id, callee_type)
+
+    Note: Setup arguments according to calling convention (same as direct call)
+    Let arg_index be 0
+    While arg_index is less than argument_count:
+        Let arg_value_id be List.get(arguments, arg_index)
+        Let arg_type be Dictionary.get(type_cache, arg_value_id)
+
+        Let arg_reg be get_or_create_register_for_value(builder, arg_value_id, arg_type)
+        Let is_float be is_float_type(arg_type)
+
+        Let target_reg be LIR.lir_get_argument_register(calling_convention, arg_index, is_float)
+
+        Let size be get_type_size(arg_type)
+
+        If target_reg is not equal to -1:
+            Let src_operand be LIRNodes.create_register_operand(arg_reg, size)
+            Let dest_operand be LIRNodes.create_register_operand(target_reg, size)
+
+            Let move_inst be LIRNodes.create_lir_move(dest_operand, src_operand, size)
+            append_lir_instruction(builder, move_inst)
+        Otherwise:
+            Note: Argument goes on stack
+            Let stack_offset be arg_index * 8
+
+            Let rsp_reg be LIR.LIR_REG_RSP
+            Let mem_operand be LIRNodes.create_simple_memory_operand(rsp_reg, stack_offset, size)
+            Let src_operand be LIRNodes.create_register_operand(arg_reg, size)
+
+            Let store_inst be LIRNodes.create_lir_store(mem_operand, src_operand, size, size)
+            append_lir_instruction(builder, store_inst)
+        End If
+
+        Let arg_index be arg_index + 1
+    End While
+
+    Note: Create indirect call instruction
+    Let call_operand be LIRNodes.create_register_operand(callee_reg, 8)
+    Let call_inst be LIRNodes.create_lir_binary_op(LIR.LIR_CALL_INDIRECT, call_operand, call_operand, call_operand, 8)
+    append_lir_instruction(builder, call_inst)
+
+    Note: Retrieve return value if function returns something
+    If result_value_id is not equal to 0:
+        Let is_float be is_float_type(return_type)
+        Let return_reg be LIR.lir_get_return_register(calling_convention, is_float)
+        Let result_reg be get_or_create_register_for_value(builder, result_value_id, return_type)
+
+        Let size be get_type_size(return_type)
+
+        Let src_operand be LIRNodes.create_register_operand(return_reg, size)
+        Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+
+        Let move_inst be LIRNodes.create_lir_move(dest_operand, src_operand, size)
+        append_lir_instruction(builder, move_inst)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Switch Statement Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR switch statement to LIR linear comparison sequence.
+For each case: compare condition with case_value, branch if equal to target.
+More efficient jump table implementation can be added as future optimization.
+@End Reasoning
+
+Process called "lower_switch" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_switch: null parameter"
+        Return 0
+    End If
+
+    Let condition_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let cases be Layout.memory_get_int64(mir_node, 24)
+    Let case_count be Layout.memory_get_int64(mir_node, 32)
+    Let default_block_id be Layout.memory_get_int64(mir_node, 40)
+    Let type_info be Layout.memory_get_int64(mir_node, 48)
+
+    Let condition_reg be get_or_create_register_for_value(builder, condition_value_id, type_info)
+    Let size be get_type_size(type_info)
+
+    Let cond_operand be LIRNodes.create_register_operand(condition_reg, size)
+
+    Note: Get default block
+    Let lir_default_block be get_or_create_lir_block(builder, default_block_id)
+
+    Note: Generate linear comparison sequence
+    Let i be 0
+    While i is less than case_count:
+        Note: Get case (value, target_block_id) pair
+        Let case_entry be List.get(cases, i)
+        Let case_value be Layout.memory_get_int64(case_entry, 0)
+        Let target_block_id be Layout.memory_get_int64(case_entry, 8)
+
+        Note: Get LIR target block
+        Let lir_target_block be get_or_create_lir_block(builder, target_block_id)
+
+        Note: Create next block for fall-through
+        Let lir_function be Layout.memory_get_int64(builder, 8)
+        Let next_block_id be i + 1
+
+        If next_block_id is less than case_count:
+            Let next_block be LIR.lir_add_block(lir_function, 0)
+        Otherwise:
+            Let next_block be lir_default_block
+        End If
+
+        Note: Compare condition with case value
+        Let case_immediate be LIRNodes.create_immediate_operand(case_value, size)
+        Let cmp_inst be LIRNodes.create_lir_compare(cond_operand, case_immediate, size, 1)
+        append_lir_instruction(builder, cmp_inst)
+
+        Note: Conditional branch: if equal goto target, else goto next
+        Let branch_inst be LIRNodes.create_lir_branch(LIR.LIR_COND_EQ, lir_target_block, next_block)
+        append_lir_instruction(builder, branch_inst)
+
+        Note: Add CFG edges
+        Let current_block be Layout.memory_get_int64(builder, 32)
+        LIR.lir_add_edge(lir_function, current_block, lir_target_block)
+        LIR.lir_add_edge(lir_function, current_block, next_block)
+
+        Note: Move to next comparison block if not last case
+        If next_block_id is less than case_count:
+            Layout.memory_set_int64(builder, 32, next_block)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Atomic Operation Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR atomic operations to LIR atomic instructions with memory fences.
+Atomic operations ensure thread-safe memory access with appropriate ordering.
+@End Reasoning
+
+Process called "lower_atomic_op" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_atomic_op: null parameter"
+        Return 0
+    End If
+
+    Let opcode be Layout.memory_get_int64(mir_node, 0)
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let address_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let value_value_id be Layout.memory_get_int64(mir_node, 24)
+    Let ordering be Layout.memory_get_int64(mir_node, 32)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Let address_reg be get_or_create_register_for_value(builder, address_value_id, type_info)
+    Let size be get_type_size(type_info)
+
+    Note: Insert memory fence if needed (acquire/release semantics)
+    If ordering is greater than or equal to 2:
+        Note: ordering >= 2 means acquire, release, or seq_cst
+        Let fence_inst be LIRNodes.create_lir_unary_op(LIR.LIR_MFENCE, 0, 0, 0)
+        append_lir_instruction(builder, fence_inst)
+    End If
+
+    Note: Map atomic opcode to LIR atomic instruction
+    Let lir_opcode be 0
+
+    If opcode equals MIR.MIR_ATOMIC_LOAD:
+        Let lir_opcode be LIR.LIR_ATOMIC_LOAD
+    End If
+
+    If opcode equals MIR.MIR_ATOMIC_STORE:
+        Let lir_opcode be LIR.LIR_ATOMIC_STORE
+    End If
+
+    If opcode equals MIR.MIR_ATOMIC_XCHG:
+        Let lir_opcode be LIR.LIR_ATOMIC_XCHG
+    End If
+
+    If opcode equals MIR.MIR_ATOMIC_CAS:
+        Let lir_opcode be LIR.LIR_ATOMIC_CAS
+    End If
+
+    If opcode equals MIR.MIR_ATOMIC_ADD:
+        Let lir_opcode be LIR.LIR_ATOMIC_ADD
+    End If
+
+    If opcode equals MIR.MIR_ATOMIC_SUB:
+        Let lir_opcode be LIR.LIR_ATOMIC_SUB
+    End If
+
+    If opcode equals MIR.MIR_ATOMIC_AND:
+        Let lir_opcode be LIR.LIR_ATOMIC_AND
+    End If
+
+    If opcode equals MIR.MIR_ATOMIC_OR:
+        Let lir_opcode be LIR.LIR_ATOMIC_OR
+    End If
+
+    If opcode equals MIR.MIR_ATOMIC_XOR:
+        Let lir_opcode be LIR.LIR_ATOMIC_XOR
+    End If
+
+    Note: Generate atomic instruction with LOCK prefix semantics
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let value_reg be get_or_create_register_for_value(builder, value_value_id, type_info)
+
+    Let mem_operand be LIRNodes.create_simple_memory_operand(address_reg, 0, size)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+    Let value_operand be LIRNodes.create_register_operand(value_reg, size)
+
+    Let atomic_inst be LIRNodes.create_lir_binary_op(lir_opcode, dest_operand, mem_operand, value_operand, size)
+    append_lir_instruction(builder, atomic_inst)
+
+    Note: Insert trailing fence if sequential consistency
+    If ordering equals 3:
+        Note: ordering = 3 is seq_cst
+        Let fence_inst be LIRNodes.create_lir_unary_op(LIR.LIR_MFENCE, 0, 0, 0)
+        append_lir_instruction(builder, fence_inst)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Vector/SIMD Operation Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR vector/SIMD operations to LIR vector instructions (SSE/AVX).
+Vector operations enable data-level parallelism for improved performance.
+@End Reasoning
+
+Process called "lower_vector_op" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_vector_op: null parameter"
+        Return 0
+    End If
+
+    Let opcode be Layout.memory_get_int64(mir_node, 0)
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let left_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let right_value_id be Layout.memory_get_int64(mir_node, 24)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Note: Get vector element type and size
+    Let size be get_type_size(type_info)
+    Let is_float be is_float_type(type_info)
+
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let left_reg be get_or_create_register_for_value(builder, left_value_id, type_info)
+    Let right_reg be get_or_create_register_for_value(builder, right_value_id, type_info)
+
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+    Let left_operand be LIRNodes.create_register_operand(left_reg, size)
+    Let right_operand be LIRNodes.create_register_operand(right_reg, size)
+
+    Note: Map vector opcode to LIR SIMD instruction
+    Let lir_opcode be 0
+
+    If opcode equals MIR.MIR_VEC_ADD:
+        If is_float equals 1:
+            Let lir_opcode be LIR.LIR_VEC_FADD
+        Otherwise:
+            Let lir_opcode be LIR.LIR_VEC_ADD
+        End If
+    End If
+
+    If opcode equals MIR.MIR_VEC_SUB:
+        If is_float equals 1:
+            Let lir_opcode be LIR.LIR_VEC_FSUB
+        Otherwise:
+            Let lir_opcode be LIR.LIR_VEC_SUB
+        End If
+    End If
+
+    If opcode equals MIR.MIR_VEC_MUL:
+        If is_float equals 1:
+            Let lir_opcode be LIR.LIR_VEC_FMUL
+        Otherwise:
+            Let lir_opcode be LIR.LIR_VEC_MUL
+        End If
+    End If
+
+    If opcode equals MIR.MIR_VEC_DIV:
+        If is_float equals 1:
+            Let lir_opcode be LIR.LIR_VEC_FDIV
+        Otherwise:
+            Let lir_opcode be LIR.LIR_VEC_DIV
+        End If
+    End If
+
+    If opcode equals MIR.MIR_VEC_AND:
+        Let lir_opcode be LIR.LIR_VEC_AND
+    End If
+
+    If opcode equals MIR.MIR_VEC_OR:
+        Let lir_opcode be LIR.LIR_VEC_OR
+    End If
+
+    If opcode equals MIR.MIR_VEC_XOR:
+        Let lir_opcode be LIR.LIR_VEC_XOR
+    End If
+
+    If opcode equals MIR.MIR_VEC_LOAD:
+        Let lir_opcode be LIR.LIR_VEC_LOAD
+    End If
+
+    If opcode equals MIR.MIR_VEC_STORE:
+        Let lir_opcode be LIR.LIR_VEC_STORE
+    End If
+
+    If opcode equals MIR.MIR_VEC_SHUFFLE:
+        Let lir_opcode be LIR.LIR_VEC_SHUFFLE
+    End If
+
+    If opcode equals MIR.MIR_VEC_EXTRACT:
+        Let lir_opcode be LIR.LIR_VEC_EXTRACT
+    End If
+
+    If opcode equals MIR.MIR_VEC_INSERT:
+        Let lir_opcode be LIR.LIR_VEC_INSERT
+    End If
+
+    Note: Generate SIMD instruction
+    Let vec_inst be LIRNodes.create_lir_binary_op(lir_opcode, dest_operand, left_operand, right_operand, size)
+    append_lir_instruction(builder, vec_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Exception Handling Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR exception handling operations to LIR.
+Exception handling enables structured error handling with proper unwinding.
+@End Reasoning
+
+Process called "lower_exception_op" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_exception_op: null parameter"
+        Return 0
+    End If
+
+    Let opcode be Layout.memory_get_int64(mir_node, 0)
+    Let result_value_id be Layout.memory_get_int64(mir_node, 8)
+    Let operand_value_id be Layout.memory_get_int64(mir_node, 16)
+    Let type_info be Layout.memory_get_int64(mir_node, 40)
+
+    Note: Map exception opcode to LIR exception handling instruction
+    Let lir_opcode be 0
+
+    If opcode equals MIR.MIR_INVOKE:
+        Let lir_opcode be LIR.LIR_INVOKE
+    End If
+
+    If opcode equals MIR.MIR_LANDINGPAD:
+        Let lir_opcode be LIR.LIR_LANDINGPAD
+    End If
+
+    If opcode equals MIR.MIR_RESUME:
+        Let lir_opcode be LIR.LIR_RESUME
+    End If
+
+    If opcode equals MIR.MIR_THROW:
+        Let lir_opcode be LIR.LIR_THROW
+    End If
+
+    If opcode equals MIR.MIR_CATCH:
+        Let lir_opcode be LIR.LIR_CATCH
+    End If
+
+    If opcode equals MIR.MIR_CLEANUP:
+        Let lir_opcode be LIR.LIR_CLEANUP
+    End If
+
+    If opcode equals MIR.MIR_UNWIND:
+        Let lir_opcode be LIR.LIR_UNWIND
+    End If
+
+    Note: Generate exception handling instruction
+    Let result_reg be get_or_create_register_for_value(builder, result_value_id, type_info)
+    Let operand_reg be get_or_create_register_for_value(builder, operand_value_id, type_info)
+
+    Let size be get_type_size(type_info)
+    Let dest_operand be LIRNodes.create_register_operand(result_reg, size)
+    Let src_operand be LIRNodes.create_register_operand(operand_reg, size)
+
+    Let exc_inst be LIRNodes.create_lir_unary_op(lir_opcode, dest_operand, src_operand, size)
+    append_lir_instruction(builder, exc_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Debug Annotation Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers MIR debug annotations to LIR debug info markers.
+Debug annotations enable source-level debugging and profiling.
+@End Reasoning
+
+Process called "lower_debug_annotation" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_debug_annotation: null parameter"
+        Return 0
+    End If
+
+    Let opcode be Layout.memory_get_int64(mir_node, 0)
+    Let info_ptr be Layout.memory_get_int64(mir_node, 16)
+
+    Note: Map debug opcode to LIR debug marker
+    Let lir_opcode be 0
+
+    If opcode equals MIR.MIR_DEBUG_LOC:
+        Let lir_opcode be LIR.LIR_DEBUG_LOC
+    End If
+
+    If opcode equals MIR.MIR_DEBUG_VALUE:
+        Let lir_opcode be LIR.LIR_DEBUG_VALUE
+    End If
+
+    If opcode equals MIR.MIR_DEBUG_DECLARE:
+        Let lir_opcode be LIR.LIR_DEBUG_DECLARE
+    End If
+
+    If opcode equals MIR.MIR_DEBUG_LABEL:
+        Let lir_opcode be LIR.LIR_DEBUG_LABEL
+    End If
+
+    Note: Generate debug marker instruction (metadata only, no code emission)
+    Let info_operand be LIRNodes.create_immediate_operand(info_ptr, 8)
+    Let debug_inst be LIRNodes.create_lir_unary_op(lir_opcode, info_operand, info_operand, 8)
+    append_lir_instruction(builder, debug_inst)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MIR Instruction Dispatch
+Note: ============================================================================
+
+@Reasoning
+Dispatches MIR instruction lowering to the appropriate handler based on opcode.
+@End Reasoning
+
+Process called "lower_mir_instruction" that takes builder as Integer, mir_node as Integer returns Integer:
+    If builder equals 0 or mir_node equals 0:
+        Display "lower_mir_instruction: null parameter"
+        Return 0
+    End If
+
+    Let opcode be Layout.memory_get_int64(mir_node, 0)
+
+    Note: Arithmetic and logical operations
+    If opcode is greater than or equal to MIR.MIR_ADD and opcode is less than or equal to MIR.MIR_SAR:
+        Return lower_binary_op(builder, mir_node)
+    End If
+
+    Note: Modulo operation
+    If opcode equals MIR.MIR_MOD:
+        Return lower_modulo(builder, mir_node)
+    End If
+
+    Note: Unary operations
+    If opcode equals MIR.MIR_NEG or opcode equals MIR.MIR_NOT:
+        Return lower_unary_op(builder, mir_node)
+    End If
+
+    Note: Comparison operations
+    If opcode is greater than or equal to MIR.MIR_EQ and opcode is less than or equal to MIR.MIR_GE:
+        Return lower_comparison(builder, mir_node)
+    End If
+
+    Note: Memory operations
+    If opcode equals MIR.MIR_LOAD:
+        Return lower_load(builder, mir_node)
+    End If
+
+    If opcode equals MIR.MIR_STORE:
+        Return lower_store(builder, mir_node)
+    End If
+
+    If opcode equals MIR.MIR_ALLOCA:
+        Return lower_alloca(builder, mir_node)
+    End If
+
+    Note: Struct field access
+    If opcode equals MIR.MIR_LOAD_FIELD:
+        Return lower_load_field(builder, mir_node)
+    End If
+
+    If opcode equals MIR.MIR_STORE_FIELD:
+        Return lower_store_field(builder, mir_node)
+    End If
+
+    Note: Address and pointer operations
+    If opcode equals MIR.MIR_ADDRESS_OF:
+        Return lower_address_of(builder, mir_node)
+    End If
+
+    If opcode equals MIR.MIR_DEREF:
+        Return lower_deref(builder, mir_node)
+    End If
+
+    Note: Control flow
+    If opcode equals MIR.MIR_BRANCH:
+        Return lower_branch(builder, mir_node)
+    End If
+
+    If opcode equals MIR.MIR_JUMP:
+        Return lower_jump(builder, mir_node)
+    End If
+
+    If opcode equals MIR.MIR_RETURN:
+        Return lower_return(builder, mir_node)
+    End If
+
+    If opcode equals MIR.MIR_SWITCH:
+        Return lower_switch(builder, mir_node)
+    End If
+
+    Note: Function calls
+    If opcode equals MIR.MIR_CALL:
+        Return lower_call(builder, mir_node)
+    End If
+
+    If opcode equals MIR.MIR_CALL_INDIRECT:
+        Return lower_call_indirect(builder, mir_node)
+    End If
+
+    Note: Constants
+    If opcode equals MIR.MIR_CONST:
+        Return lower_const(builder, mir_node)
+    End If
+
+    Note: Type conversions
+    If opcode is greater than or equal to MIR.MIR_CAST and opcode is less than or equal to MIR.MIR_INT_TO_PTR:
+        Return lower_type_conversion(builder, mir_node)
+    End If
+
+    Note: Atomic operations
+    If opcode is greater than or equal to MIR.MIR_ATOMIC_LOAD and opcode is less than or equal to MIR.MIR_ATOMIC_XOR:
+        Return lower_atomic_op(builder, mir_node)
+    End If
+
+    Note: Vector/SIMD operations
+    If opcode is greater than or equal to MIR.MIR_VEC_ADD and opcode is less than or equal to MIR.MIR_VEC_INSERT:
+        Return lower_vector_op(builder, mir_node)
+    End If
+
+    Note: Exception handling
+    If opcode is greater than or equal to MIR.MIR_INVOKE and opcode is less than or equal to MIR.MIR_UNWIND:
+        Return lower_exception_op(builder, mir_node)
+    End If
+
+    Note: Debug annotations
+    If opcode is greater than or equal to MIR.MIR_DEBUG_LOC and opcode is less than or equal to MIR.MIR_DEBUG_LABEL:
+        Return lower_debug_annotation(builder, mir_node)
+    End If
+
+    Note: NOP - nothing to lower
+    If opcode equals MIR.MIR_NOP:
+        Return 1
+    End If
+
+    Display "lower_mir_instruction: unsupported MIR opcode "
+    Display opcode
+    Display ""
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Basic Block Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers a complete MIR basic block to LIR by processing all instructions in order.
+Phi nodes are handled specially - they're lowered by inserting moves in predecessors.
+@End Reasoning
+
+Process called "lower_mir_basic_block" that takes builder as Integer, mir_block as Integer returns Integer:
+    If builder equals 0 or mir_block equals 0:
+        Display "lower_mir_basic_block: null parameter"
+        Return 0
+    End If
+
+    Note: Get MIR block ID
+    Let mir_block_id be Layout.memory_get_int64(mir_block, 0)
+
+    Note: Get or create corresponding LIR block
+    Let lir_block_id be get_or_create_lir_block(builder, mir_block_id)
+
+    Note: Set as current block
+    Layout.memory_set_int64(builder, 32, lir_block_id)
+
+    Note: First, handle phi nodes by inserting moves in predecessors
+    Let phi_nodes be Layout.memory_get_int64(mir_block, 88)
+    If phi_nodes is not equal to 0:
+        Let phi_count be List.length(phi_nodes)
+        Let i be 0
+        While i is less than phi_count:
+            Let phi_node be List.get(phi_nodes, i)
+            lower_phi_node(builder, phi_node)
+            Let i be i + 1
+        End While
+    End If
+
+    Note: Lower all instructions in block
+    Let instructions be Layout.memory_get_int64(mir_block, 16)
+    Let instruction_count be Layout.memory_get_int64(mir_block, 24)
+
+    Let i be 0
+    While i is less than instruction_count:
+        Let mir_inst be List.get(instructions, i)
+
+        Note: Skip phi nodes (already handled)
+        Let opcode be Layout.memory_get_int64(mir_inst, 0)
+        If opcode is not equal to MIR.MIR_PHI:
+            lower_mir_instruction(builder, mir_inst)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Function Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers a complete MIR function to LIR. This is the main entry point for
+MIR to LIR lowering. Processes all basic blocks in the control flow graph.
+@End Reasoning
+
+Process called "lower_mir_function_to_lir" that takes mir_function as Integer, calling_convention as Integer returns Integer:
+    If mir_function equals 0:
+        Display "lower_mir_function_to_lir: null MIR function"
+        Return 0
+    End If
+
+    Note: Create builder context
+    Let builder be create_lir_builder(mir_function, calling_convention)
+    If builder equals 0:
+        Display "lower_mir_function_to_lir: builder creation failed"
+        Return 0
+    End If
+
+    Note: Get MIR CFG
+    Let mir_cfg be Layout.memory_get_int64(mir_function, 8)
+    If mir_cfg equals 0:
+        Display "lower_mir_function_to_lir: null CFG"
+        Return 0
+    End If
+
+    Note: Get all basic blocks
+    Let mir_blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Note: Create stack frame for function
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+    Let stack_frame be LIR.lir_create_stack_frame(lir_function)
+
+    Note: Lower all basic blocks
+    Let i be 0
+    While i is less than block_count:
+        Let mir_block be List.get(mir_blocks, i)
+        lower_mir_basic_block(builder, mir_block)
+        Let i be i + 1
+    End While
+
+    Note: Finalize stack frame
+    LIR.lir_finalize_stack_frame(lir_function)
+
+    Note: Return the constructed LIR function
+    Return lir_function
+End Process
+
+Note: ============================================================================
+Note: Module Lowering
+Note: ============================================================================
+
+@Reasoning
+Lowers a complete MIR module to LIR module. Processes all functions in the module.
+This is the top-level entry point for MIR to LIR lowering.
+@End Reasoning
+
+Process called "build_lir_module_from_mir" that takes mir_module as Integer, calling_convention as Integer returns Integer:
+    If mir_module equals 0:
+        Display "build_lir_module_from_mir: null MIR module"
+        Return 0
+    End If
+
+    Note: Get module name
+    Let mir_module_name be Layout.memory_get_int64(mir_module, 0)
+    Let module_name_copy be StringCore.duplicate(mir_module_name)
+
+    Note: Create LIR module
+    Let lir_module be LIR.lir_create_module(module_name_copy)
+    If lir_module equals 0:
+        Display "build_lir_module_from_mir: LIR module creation failed"
+        Return 0
+    End If
+
+    Note: Get all functions from MIR module
+    Let mir_functions be Layout.memory_get_int64(mir_module, 8)
+    Let function_count be Layout.memory_get_int64(mir_module, 16)
+
+    Note: Lower each function
+    Let i be 0
+    While i is less than function_count:
+        Let mir_function be List.get(mir_functions, i)
+
+        Note: Check if external function
+        Let is_external be Layout.memory_get_int64(mir_function, 80)
+
+        If is_external equals 0:
+            Note: Lower internal function
+            Let lir_function be lower_mir_function_to_lir(mir_function, calling_convention)
+
+            If lir_function is not equal to 0:
+                LIR.lir_add_function(lir_module, lir_function)
+            Otherwise:
+                Display "build_lir_module_from_mir: function lowering failed for function "
+                Display i
+                Display ""
+            End If
+        Otherwise:
+            Note: External function - create declaration only
+            Let func_name be Layout.memory_get_int64(mir_function, 0)
+            Let return_type be Layout.memory_get_int64(mir_function, 32)
+
+            Let lir_function be LIR.lir_create_function(func_name, calling_convention, return_type)
+            Layout.memory_set_int64(lir_function, 112, 1)  Note: Set is_external flag
+
+            LIR.lir_add_function(lir_module, lir_function)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return lir_module
+End Process
+
+Note: ============================================================================
+Note: Debug and Utility Functions
+Note: ============================================================================
+
+@Reasoning
+Prints builder statistics for debugging purposes.
+@End Reasoning
+
+Process called "print_builder_stats" that takes builder as Integer returns Integer:
+    If builder equals 0:
+        Display "print_builder_stats: null builder"
+        Return 0
+    End If
+
+    Display "=== LIR Builder Statistics ==="
+    Display ""
+
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+    Let func_name be Layout.memory_get_int64(lir_function, 0)
+    Display "Function: "
+    Display func_name
+    Display ""
+
+    Let value_to_register be Layout.memory_get_int64(builder, 16)
+    Let mapping_count be Dictionary.size(value_to_register)
+    Display "SSA Value -> Register mappings: "
+    Display mapping_count
+    Display ""
+
+    Let block_mapping be Layout.memory_get_int64(builder, 24)
+    Let block_mapping_count be Dictionary.size(block_mapping)
+    Display "MIR Block -> LIR Block mappings: "
+    Display block_mapping_count
+    Display ""
+
+    Let next_vreg_id be Layout.memory_get_int64(builder, 56)
+    Let vreg_count be next_vreg_id - 1000
+    Display "Virtual registers allocated: "
+    Display vreg_count
+    Display ""
+
+    Display "=============================="
+    Display ""
+
+    Return 1
+End Process
+
+@Reasoning
+Verifies LIR builder correctness by checking invariants.
+Used for debugging and validation during development.
+@End Reasoning
+
+Process called "verify_builder" that takes builder as Integer returns Integer:
+    If builder equals 0:
+        Display "verify_builder: null builder"
+        Return 0
+    End If
+
+    Let lir_function be Layout.memory_get_int64(builder, 8)
+    If lir_function equals 0:
+        Display "verify_builder: null LIR function"
+        Return 0
+    End If
+
+    Let value_to_register be Layout.memory_get_int64(builder, 16)
+    If value_to_register equals 0:
+        Display "verify_builder: null value mapping"
+        Return 0
+    End If
+
+    Let block_mapping be Layout.memory_get_int64(builder, 24)
+    If block_mapping equals 0:
+        Display "verify_builder: null block mapping"
+        Return 0
+    End If
+
+    Display "verify_builder: all checks passed"
+    Return 1
+End Process

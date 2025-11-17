@@ -1,0 +1,1746 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Java to HIR Translator - Converts Java AST to High-level Intermediate Representation
+
+This file translates Java Abstract Syntax Trees into HIR format,
+preserving all Java-specific semantics for bidirectional translation.
+
+Translation Features:
+- Compilation units → HIR modules with package/import metadata
+- Class/interface/enum/annotation declarations → HIR type definitions
+- Generic type parameters and bounds → HIR generic metadata
+- Modifiers and annotations → HIR attributes
+- Methods, constructors, fields → HIR members
+- Statements → HIR statement nodes
+- Expressions → HIR expression nodes
+- Lambda expressions → HIR lambda nodes
+- Method references → HIR method reference nodes
+
+HIR Preservation:
+- All Java modifiers (public, private, protected, static, final, etc.)
+- Generic type constraints (extends, super)
+- Annotation values and attributes
+- Type information for all expressions
+- Java-specific semantics (checked exceptions, method references, etc.)
+
+Dependencies:
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- frontends/java/java_parser.runa
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/middle/gungnir/hir/translation/frontends/java/java_parser.runa" as Parser
+
+Note: ============================================================================
+Note: HIR Structure Creation
+Note: ============================================================================
+
+Process called "create_hir_dict" returns Integer:
+    Note: Create HIR dictionary for structured data
+
+    @Reasoning:
+    HIR uses dictionaries to represent structured data like type definitions,
+    method signatures, and metadata. This provides a flexible, language-agnostic
+    representation that preserves all source language semantics.
+    @End Reasoning
+
+    Let dict_size be 16  Note: Initial capacity for dictionary
+    Let dict be proc allocate from Layout with dict_size
+
+    If dict is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with dict, 0, 0  Note: Entry count
+    proc memory_set_int64 from Layout with dict, 8, 0  Note: Entries array
+
+    Return dict
+End Process
+
+Process called "create_hir_list" returns Integer:
+    Note: Create HIR list for sequences
+
+    Let list_size be 16
+    Let list be proc allocate from Layout with list_size
+
+    If list is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with list, 0, 0  Note: Item count
+    proc memory_set_int64 from Layout with list, 8, 0  Note: Items array
+
+    Return list
+End Process
+
+Process called "set_dict_value" takes dict as Integer, key as Integer, value as Integer returns Integer:
+    Note: Set dictionary key-value pair
+
+    Note: Production hash table implementation with collision handling
+    Note: Hash table structure: [count, capacity, buckets_pointer]
+    Note: Each bucket: [key, value, next_pointer] - linked list for collisions
+
+    Let entry_count be proc memory_get_int64 from Layout with dict, 0
+    Let capacity be proc memory_get_int64 from Layout with dict, 8
+    Let buckets be proc memory_get_int64 from Layout with dict, 16
+
+    Note: Initialize hash table if empty
+    If buckets is equal to 0:
+        Set capacity to 16
+        Let buckets_size be capacity times 24  Note: key, value, next pointer (3 * 8 bytes)
+        Set buckets to proc allocate from Layout with buckets_size
+        proc memory_set_int64 from Layout with dict, 8, capacity
+        proc memory_set_int64 from Layout with dict, 16, buckets
+
+        Note: Initialize all buckets to empty (key = 0, value = 0, next = 0)
+        Let bucket_index be 0
+        While bucket_index is less than capacity:
+            Let bucket_offset be bucket_index times 24
+            proc memory_set_int64 from Layout with buckets, bucket_offset, 0
+            proc memory_set_int64 from Layout with buckets, bucket_offset plus 8, 0
+            proc memory_set_int64 from Layout with buckets, bucket_offset plus 16, 0
+            Set bucket_index to bucket_index plus 1
+        End While
+    End If
+
+    Note: Compute hash and find bucket
+    Let hash be key modulo capacity
+    Let bucket_offset be hash times 24
+    Let bucket_key be proc memory_get_int64 from Layout with buckets, bucket_offset
+
+    Note: Handle collision with linear probing
+    If bucket_key is equal to 0:
+        Note: Empty bucket, insert directly
+        proc memory_set_int64 from Layout with buckets, bucket_offset, key
+        proc memory_set_int64 from Layout with buckets, bucket_offset plus 8, value
+        Set entry_count to entry_count plus 1
+        proc memory_set_int64 from Layout with dict, 0, entry_count
+    Otherwise If bucket_key is equal to key:
+        Note: Key exists, update value
+        proc memory_set_int64 from Layout with buckets, bucket_offset plus 8, value
+    Otherwise:
+        Note: Collision, use linear probing to find next empty slot
+        Let probe_index be hash plus 1
+        Let found_slot be 0
+        While probe_index is not equal to hash and found_slot is equal to 0:
+            Set probe_index to probe_index modulo capacity
+            Let probe_offset be probe_index times 24
+            Let probe_key be proc memory_get_int64 from Layout with buckets, probe_offset
+
+            If probe_key is equal to 0:
+                Note: Found empty slot
+                proc memory_set_int64 from Layout with buckets, probe_offset, key
+                proc memory_set_int64 from Layout with buckets, probe_offset plus 8, value
+                Set entry_count to entry_count plus 1
+                proc memory_set_int64 from Layout with dict, 0, entry_count
+                Set found_slot to 1
+            Otherwise If probe_key is equal to key:
+                Note: Key exists, update value
+                proc memory_set_int64 from Layout with buckets, probe_offset plus 8, value
+                Set found_slot to 1
+            End If
+
+            Set probe_index to probe_index plus 1
+        End While
+
+        Note: If we couldn't find a slot, hash table is full - resize and retry
+        If found_slot is equal to 0:
+            Note: Resize hash table to double capacity
+            proc resize_hash_table from hash_table
+
+            Note: Retry insertion after resize
+            Return proc hash_table_set from hash_table, key, value
+        End If
+    End If
+
+    Return 1
+End Process
+
+Process called "resize_hash_table" takes hash_table as Integer returns Integer:
+    Note: Double the capacity of the hash table and rehash all entries
+
+    Let old_buckets be proc memory_get_int64 from Layout with hash_table, 0
+    Let old_capacity be proc memory_get_int64 from Layout with hash_table, 8
+    Let count be proc memory_get_int64 from Layout with hash_table, 16
+
+    Note: Double the capacity
+    Let new_capacity be old_capacity times 2
+    Let new_bucket_size be new_capacity times 16
+    Let new_buckets be proc allocate from Layout with new_bucket_size
+
+    Note: Initialize new buckets
+    Let i be 0
+    While i is less than new_capacity:
+        Let offset be i times 16
+        proc memory_set_int64 from Layout with new_buckets, offset, 0
+        proc memory_set_int64 from Layout with new_buckets, offset plus 8, 0
+        Set i to i plus 1
+    End While
+
+    Note: Rehash all existing entries from old table into new table
+    Set i to 0
+    While i is less than old_capacity:
+        Let old_offset be i times 16
+        Let old_key be proc memory_get_int64 from Layout with old_buckets, old_offset
+        Let old_value be proc memory_get_int64 from Layout with old_buckets, old_offset plus 8
+
+        Note: If slot has a key, rehash it into new table
+        If old_key is not equal to 0:
+            Note: Compute hash for new table
+            Let hash_value be proc hash_string from old_key
+            Let new_bucket_index be hash_value modulo new_capacity
+
+            Note: Linear probing to find empty slot in new table
+            Let found be 0
+            Let probe_idx be 0
+            While probe_idx is less than new_capacity and found is equal to 0:
+                Let probe_offset be ((new_bucket_index plus probe_idx) modulo new_capacity) times 16
+                Let probe_key be proc memory_get_int64 from Layout with new_buckets, probe_offset
+
+                If probe_key is equal to 0:
+                    Note: Empty slot - insert here
+                    proc memory_set_int64 from Layout with new_buckets, probe_offset, old_key
+                    proc memory_set_int64 from Layout with new_buckets, probe_offset plus 8, old_value
+                    Set found to 1
+                End If
+
+                Set probe_idx to probe_idx plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update hash table with new buckets and capacity
+    proc memory_set_int64 from Layout with hash_table, 0, new_buckets
+    proc memory_set_int64 from Layout with hash_table, 8, new_capacity
+
+    Note: Deallocate old buckets
+    proc deallocate from Layout with old_buckets
+
+    Return 1
+End Process
+
+Process called "add_to_list" takes list as Integer, item as Integer returns Integer:
+    Note: Add item to list
+
+    Let item_count be proc memory_get_int64 from Layout with list, 0
+    Let items be proc memory_get_int64 from Layout with list, 8
+
+    If items is equal to 0:
+        Let initial_capacity be 16
+        Let items_size be initial_capacity times 8
+        Set items to proc allocate from Layout with items_size
+        proc memory_set_int64 from Layout with list, 8, items
+    End If
+
+    Let item_offset be item_count times 8
+    proc memory_set_int64 from Layout with items, item_offset, item
+
+    Set item_count to item_count plus 1
+    proc memory_set_int64 from Layout with list, 0, item_count
+
+    Return list
+End Process
+
+Note: ============================================================================
+Note: Main Translation Entry Point
+Note: ============================================================================
+
+Process called "translate_to_hir" takes ast as Integer returns Integer:
+    Note: Translate Java AST to HIR
+
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with ast, 0
+
+    If node_type is equal to AST_COMPILATION_UNIT from Parser:
+        Return proc translate_compilation_unit from ast
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Compilation Unit Translation
+Note: ============================================================================
+
+Process called "translate_compilation_unit" takes ast as Integer returns Integer:
+    Note: Translate compilation unit to HIR module
+
+    Let hir_module be proc create_hir_dict
+
+    proc set_dict_value from hir_module, "node_type", "module"
+
+    Note: Package declaration
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let first_child be proc memory_get_int64 from Layout with children, 0
+        Let first_type be proc memory_get_int64 from Layout with first_child, 0
+
+        If first_type is equal to AST_PACKAGE_DECLARATION from Parser:
+            Let package_name be proc memory_get_int64 from Layout with first_child, 16
+            proc set_dict_value from hir_module, "package", package_name
+        End If
+    End If
+
+    Note: Import declarations
+    Let imports be proc create_hir_list
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_IMPORT_DECLARATION from Parser:
+            Let import_hir be proc translate_import_declaration from child
+            Set imports to proc add_to_list from imports, import_hir
+        End If
+
+        Set index to index plus 1
+    End While
+
+    proc set_dict_value from hir_module, "imports", imports
+
+    Note: Type declarations
+    Let types be proc create_hir_list
+    Set index to 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        Let is_type_decl be 0
+
+        If child_type is equal to AST_CLASS_DECLARATION from Parser:
+            Set is_type_decl to 1
+        Otherwise If child_type is equal to AST_INTERFACE_DECLARATION from Parser:
+            Set is_type_decl to 1
+        Otherwise If child_type is equal to AST_ENUM_DECLARATION from Parser:
+            Set is_type_decl to 1
+        Otherwise If child_type is equal to AST_ANNOTATION_DECLARATION from Parser:
+            Set is_type_decl to 1
+        End If
+
+        If is_type_decl is equal to 1:
+            Let type_hir be proc translate_type_declaration from child
+            Set types to proc add_to_list from types, type_hir
+        End If
+
+        Set index to index plus 1
+    End While
+
+    proc set_dict_value from hir_module, "types", types
+
+    Return hir_module
+End Process
+
+Process called "translate_import_declaration" takes ast as Integer returns Integer:
+    Note: Translate import declaration to HIR
+
+    Let hir_import be proc create_hir_dict
+
+    proc set_dict_value from hir_import, "node_type", "import"
+
+    Let import_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_import, "name", import_name
+
+    Note: Check if static import
+    Let is_static be proc memory_get_int64 from Layout with ast, 24
+    If is_static is not equal to 0:
+        proc set_dict_value from hir_import, "is_static", 1
+    End If
+
+    Return hir_import
+End Process
+
+Note: ============================================================================
+Note: Type Declaration Translation
+Note: ============================================================================
+
+Process called "translate_type_declaration" takes ast as Integer returns Integer:
+    Note: Translate type declaration (class, interface, enum, annotation)
+
+    Let node_type be proc memory_get_int64 from Layout with ast, 0
+
+    If node_type is equal to AST_CLASS_DECLARATION from Parser:
+        Return proc translate_class_declaration from ast
+    End If
+
+    If node_type is equal to AST_INTERFACE_DECLARATION from Parser:
+        Return proc translate_interface_declaration from ast
+    End If
+
+    If node_type is equal to AST_ENUM_DECLARATION from Parser:
+        Return proc translate_enum_declaration from ast
+    End If
+
+    If node_type is equal to AST_ANNOTATION_DECLARATION from Parser:
+        Return proc translate_annotation_declaration from ast
+    End If
+
+    Return 0
+End Process
+
+Process called "translate_class_declaration" takes ast as Integer returns Integer:
+    Note: Translate class declaration to HIR
+
+    Let hir_class be proc create_hir_dict
+
+    proc set_dict_value from hir_class, "node_type", "class_declaration"
+
+    Let class_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_class, "name", class_name
+
+    Note: Process children (modifiers, type parameters, extends, implements, members)
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_MODIFIER_LIST from Parser:
+            Let modifiers be proc translate_modifiers from child
+            proc set_dict_value from hir_class, "modifiers", modifiers
+        Otherwise If child_type is equal to AST_TYPE_PARAMETER from Parser:
+            Let type_params be proc translate_type_parameters from child
+            proc set_dict_value from hir_class, "type_parameters", type_params
+        Otherwise If child_type is equal to AST_TYPE_REFERENCE from Parser:
+            Let super_type be proc translate_type_reference from child
+            proc set_dict_value from hir_class, "extends", super_type
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: Members
+    Let members be proc create_hir_list
+    Set index to 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        Let is_member be 0
+
+        If child_type is equal to AST_FIELD_DECLARATION from Parser:
+            Set is_member to 1
+        Otherwise If child_type is equal to AST_METHOD_DECLARATION from Parser:
+            Set is_member to 1
+        Otherwise If child_type is equal to AST_CONSTRUCTOR_DECLARATION from Parser:
+            Set is_member to 1
+        Otherwise If child_type is equal to AST_CLASS_DECLARATION from Parser:
+            Set is_member to 1
+        Otherwise If child_type is equal to AST_INTERFACE_DECLARATION from Parser:
+            Set is_member to 1
+        Otherwise If child_type is equal to AST_ENUM_DECLARATION from Parser:
+            Set is_member to 1
+        End If
+
+        If is_member is equal to 1:
+            Let member_hir be proc translate_class_member from child
+            Set members to proc add_to_list from members, member_hir
+        End If
+
+        Set index to index plus 1
+    End While
+
+    proc set_dict_value from hir_class, "members", members
+
+    Return hir_class
+End Process
+
+Process called "translate_interface_declaration" takes ast as Integer returns Integer:
+    Note: Translate interface declaration to HIR
+
+    Let hir_interface be proc create_hir_dict
+
+    proc set_dict_value from hir_interface, "node_type", "interface_declaration"
+
+    Let interface_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_interface, "name", interface_name
+
+    Note: Process children
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_MODIFIER_LIST from Parser:
+            Let modifiers be proc translate_modifiers from child
+            proc set_dict_value from hir_interface, "modifiers", modifiers
+        Otherwise If child_type is equal to AST_TYPE_PARAMETER from Parser:
+            Let type_params be proc translate_type_parameters from child
+            proc set_dict_value from hir_interface, "type_parameters", type_params
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: Members
+    Let members be proc create_hir_list
+    Set index to 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        Let is_member be 0
+
+        If child_type is equal to AST_METHOD_DECLARATION from Parser:
+            Set is_member to 1
+        Otherwise If child_type is equal to AST_FIELD_DECLARATION from Parser:
+            Set is_member to 1
+        End If
+
+        If is_member is equal to 1:
+            Let member_hir be proc translate_interface_member from child
+            Set members to proc add_to_list from members, member_hir
+        End If
+
+        Set index to index plus 1
+    End While
+
+    proc set_dict_value from hir_interface, "members", members
+
+    Return hir_interface
+End Process
+
+Process called "translate_enum_declaration" takes ast as Integer returns Integer:
+    Note: Translate enum declaration to HIR
+
+    Let hir_enum be proc create_hir_dict
+
+    proc set_dict_value from hir_enum, "node_type", "enum_declaration"
+
+    Let enum_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_enum, "name", enum_name
+
+    Note: Process children
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_MODIFIER_LIST from Parser:
+            Let modifiers be proc translate_modifiers from child
+            proc set_dict_value from hir_enum, "modifiers", modifiers
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: Enum constants
+    Let constants be proc create_hir_list
+    Set index to 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_ENUM_CONSTANT from Parser:
+            Let constant_hir be proc translate_enum_constant from child
+            Set constants to proc add_to_list from constants, constant_hir
+        End If
+
+        Set index to index plus 1
+    End While
+
+    proc set_dict_value from hir_enum, "constants", constants
+
+    Return hir_enum
+End Process
+
+Process called "translate_enum_constant" takes ast as Integer returns Integer:
+    Note: Translate enum constant to HIR
+
+    Let hir_constant be proc create_hir_dict
+
+    proc set_dict_value from hir_constant, "node_type", "enum_constant"
+
+    Let constant_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_constant, "name", constant_name
+
+    Return hir_constant
+End Process
+
+Process called "translate_annotation_declaration" takes ast as Integer returns Integer:
+    Note: Translate annotation type declaration to HIR
+
+    Let hir_annotation be proc create_hir_dict
+
+    proc set_dict_value from hir_annotation, "node_type", "annotation_declaration"
+
+    Let annotation_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_annotation, "name", annotation_name
+
+    Return hir_annotation
+End Process
+
+Note: ============================================================================
+Note: Modifiers and Annotations Translation
+Note: ============================================================================
+
+Process called "translate_modifiers" takes ast as Integer returns Integer:
+    Note: Translate modifiers and annotations to HIR
+
+    Let modifiers_list be proc create_hir_list
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_ANNOTATION from Parser:
+            Let annotation_hir be proc translate_annotation from child
+            Set modifiers_list to proc add_to_list from modifiers_list, annotation_hir
+        Otherwise If child_type is equal to AST_IDENTIFIER from Parser:
+            Let token be proc memory_get_int64 from Layout with child, 8
+            Let modifier_text be proc memory_get_int64 from Layout with token, 8
+            Set modifiers_list to proc add_to_list from modifiers_list, modifier_text
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return modifiers_list
+End Process
+
+Process called "translate_annotation" takes ast as Integer returns Integer:
+    Note: Translate annotation to HIR
+
+    Let hir_annotation be proc create_hir_dict
+
+    proc set_dict_value from hir_annotation, "node_type", "annotation"
+
+    Let annotation_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_annotation, "name", annotation_name
+
+    Note: Annotation arguments
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let args be proc create_hir_list
+
+        Let index be 0
+        While index is less than child_count:
+            Let child be proc memory_get_int64 from Layout with children, index times 8
+            Let arg_hir be proc translate_expression from child
+            Set args to proc add_to_list from args, arg_hir
+            Set index to index plus 1
+        End While
+
+        proc set_dict_value from hir_annotation, "arguments", args
+    End If
+
+    Return hir_annotation
+End Process
+
+Note: ============================================================================
+Note: Member Translation
+Note: ============================================================================
+
+Process called "translate_class_member" takes ast as Integer returns Integer:
+    Note: Translate class member to HIR
+
+    Let node_type be proc memory_get_int64 from Layout with ast, 0
+
+    If node_type is equal to AST_FIELD_DECLARATION from Parser:
+        Return proc translate_field_declaration from ast
+    End If
+
+    If node_type is equal to AST_METHOD_DECLARATION from Parser:
+        Return proc translate_method_declaration from ast
+    End If
+
+    If node_type is equal to AST_CONSTRUCTOR_DECLARATION from Parser:
+        Return proc translate_constructor_declaration from ast
+    End If
+
+    If node_type is equal to AST_CLASS_DECLARATION from Parser:
+        Return proc translate_class_declaration from ast
+    End If
+
+    If node_type is equal to AST_INTERFACE_DECLARATION from Parser:
+        Return proc translate_interface_declaration from ast
+    End If
+
+    If node_type is equal to AST_ENUM_DECLARATION from Parser:
+        Return proc translate_enum_declaration from ast
+    End If
+
+    Return 0
+End Process
+
+Process called "translate_interface_member" takes ast as Integer returns Integer:
+    Note: Translate interface member to HIR
+
+    Let node_type be proc memory_get_int64 from Layout with ast, 0
+
+    If node_type is equal to AST_METHOD_DECLARATION from Parser:
+        Return proc translate_method_declaration from ast
+    End If
+
+    If node_type is equal to AST_FIELD_DECLARATION from Parser:
+        Return proc translate_field_declaration from ast
+    End If
+
+    Return 0
+End Process
+
+Process called "translate_field_declaration" takes ast as Integer returns Integer:
+    Note: Translate field declaration to HIR
+
+    Let hir_field be proc create_hir_dict
+
+    proc set_dict_value from hir_field, "node_type", "field_declaration"
+
+    Let field_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_field, "name", field_name
+
+    Note: Process children
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_MODIFIER_LIST from Parser:
+            Let modifiers be proc translate_modifiers from child
+            proc set_dict_value from hir_field, "modifiers", modifiers
+        Otherwise If child_type is equal to AST_TYPE_REFERENCE from Parser:
+            Let field_type be proc translate_type_reference from child
+            proc set_dict_value from hir_field, "type", field_type
+        Otherwise If child_type is equal to AST_ARRAY_TYPE from Parser:
+            Let field_type be proc translate_type_reference from child
+            proc set_dict_value from hir_field, "type", field_type
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return hir_field
+End Process
+
+Process called "translate_method_declaration" takes ast as Integer returns Integer:
+    Note: Translate method declaration to HIR
+
+    Let hir_method be proc create_hir_dict
+
+    proc set_dict_value from hir_method, "node_type", "method_declaration"
+
+    Let method_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_method, "name", method_name
+
+    Note: Process children
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_MODIFIER_LIST from Parser:
+            Let modifiers be proc translate_modifiers from child
+            proc set_dict_value from hir_method, "modifiers", modifiers
+        Otherwise If child_type is equal to AST_TYPE_REFERENCE from Parser:
+            Let return_type be proc translate_type_reference from child
+            proc set_dict_value from hir_method, "return_type", return_type
+        Otherwise If child_type is equal to AST_ARRAY_TYPE from Parser:
+            Let return_type be proc translate_type_reference from child
+            proc set_dict_value from hir_method, "return_type", return_type
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: Parameters
+    Set index to 0
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_IDENTIFIER from Parser:
+            Note: This is the parameters list wrapper
+            Let params be proc translate_parameter_list from child
+            proc set_dict_value from hir_method, "parameters", params
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: Method body
+    Set index to 0
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_BLOCK from Parser:
+            Let body be proc translate_block from child
+            proc set_dict_value from hir_method, "body", body
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return hir_method
+End Process
+
+Process called "translate_constructor_declaration" takes ast as Integer returns Integer:
+    Note: Translate constructor declaration to HIR
+
+    Let hir_constructor be proc create_hir_dict
+
+    proc set_dict_value from hir_constructor, "node_type", "constructor_declaration"
+
+    Let constructor_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_constructor, "name", constructor_name
+
+    Note: Process children (similar to method)
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_MODIFIER_LIST from Parser:
+            Let modifiers be proc translate_modifiers from child
+            proc set_dict_value from hir_constructor, "modifiers", modifiers
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return hir_constructor
+End Process
+
+Process called "translate_parameter_list" takes ast as Integer returns Integer:
+    Note: Translate parameter list to HIR
+
+    Let params_list be proc create_hir_list
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_PARAMETER from Parser:
+            Let param_hir be proc translate_parameter from child
+            Set params_list to proc add_to_list from params_list, param_hir
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Return params_list
+End Process
+
+Process called "translate_parameter" takes ast as Integer returns Integer:
+    Note: Translate parameter to HIR
+
+    Let hir_param be proc create_hir_dict
+
+    proc set_dict_value from hir_param, "node_type", "parameter"
+
+    Let param_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_param, "name", param_name
+
+    Note: Check for varargs
+    Let is_varargs be proc memory_get_int64 from Layout with ast, 24
+    If is_varargs is not equal to 0:
+        proc set_dict_value from hir_param, "is_varargs", 1
+    End If
+
+    Note: Parameter type
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let type_child be proc memory_get_int64 from Layout with children, 0
+        Let param_type be proc translate_type_reference from type_child
+        proc set_dict_value from hir_param, "type", param_type
+    End If
+
+    Return hir_param
+End Process
+
+Note: ============================================================================
+Note: Type Reference Translation
+Note: ============================================================================
+
+Process called "translate_type_reference" takes ast as Integer returns Integer:
+    Note: Translate type reference to HIR
+
+    Let node_type be proc memory_get_int64 from Layout with ast, 0
+
+    If node_type is equal to AST_ARRAY_TYPE from Parser:
+        Return proc translate_array_type from ast
+    End If
+
+    If node_type is equal to AST_GENERIC_TYPE from Parser:
+        Return proc translate_generic_type from ast
+    End If
+
+    If node_type is equal to AST_WILDCARD_TYPE from Parser:
+        Return proc translate_wildcard_type from ast
+    End If
+
+    Note: Simple type reference
+    Let hir_type be proc create_hir_dict
+
+    proc set_dict_value from hir_type, "node_type", "type_reference"
+
+    Let type_name be proc memory_get_int64 from Layout with ast, 16
+
+    If type_name is equal to 0:
+        Note: Primitive type from token
+        Let token be proc memory_get_int64 from Layout with ast, 8
+        If token is not equal to 0:
+            Set type_name to proc memory_get_int64 from Layout with token, 8
+        End If
+    End If
+
+    proc set_dict_value from hir_type, "name", type_name
+
+    Return hir_type
+End Process
+
+Process called "translate_array_type" takes ast as Integer returns Integer:
+    Note: Translate array type to HIR
+
+    Let hir_array be proc create_hir_dict
+
+    proc set_dict_value from hir_array, "node_type", "array_type"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let element_type_ast be proc memory_get_int64 from Layout with children, 0
+        Let element_type be proc translate_type_reference from element_type_ast
+        proc set_dict_value from hir_array, "element_type", element_type
+    End If
+
+    Return hir_array
+End Process
+
+Process called "translate_generic_type" takes ast as Integer returns Integer:
+    Note: Translate generic type with type arguments to HIR
+
+    Let hir_generic be proc create_hir_dict
+
+    proc set_dict_value from hir_generic, "node_type", "generic_type"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let type_args be proc create_hir_list
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let arg_hir be proc translate_type_reference from child
+        Set type_args to proc add_to_list from type_args, arg_hir
+        Set index to index plus 1
+    End While
+
+    proc set_dict_value from hir_generic, "type_arguments", type_args
+
+    Return hir_generic
+End Process
+
+Process called "translate_wildcard_type" takes ast as Integer returns Integer:
+    Note: Translate wildcard type (? extends/super) to HIR
+
+    Let hir_wildcard be proc create_hir_dict
+
+    proc set_dict_value from hir_wildcard, "node_type", "wildcard_type"
+
+    Let bound_kind be proc memory_get_int64 from Layout with ast, 24
+
+    If bound_kind is equal to 1:
+        proc set_dict_value from hir_wildcard, "bound", "extends"
+    Otherwise If bound_kind is equal to 2:
+        proc set_dict_value from hir_wildcard, "bound", "super"
+    End If
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let bound_type_ast be proc memory_get_int64 from Layout with children, 0
+        Let bound_type be proc translate_type_reference from bound_type_ast
+        proc set_dict_value from hir_wildcard, "bound_type", bound_type
+    End If
+
+    Return hir_wildcard
+End Process
+
+Process called "translate_type_parameters" takes ast as Integer returns Integer:
+    Note: Translate generic type parameters to HIR
+
+    Let type_params_list be proc create_hir_list
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let param_hir be proc translate_type_parameter from child
+        Set type_params_list to proc add_to_list from type_params_list, param_hir
+        Set index to index plus 1
+    End While
+
+    Return type_params_list
+End Process
+
+Process called "translate_type_parameter" takes ast as Integer returns Integer:
+    Note: Translate single type parameter to HIR
+
+    Let hir_param be proc create_hir_dict
+
+    proc set_dict_value from hir_param, "node_type", "type_parameter"
+
+    Let param_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_param, "name", param_name
+
+    Note: Type bounds
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let bounds_child be proc memory_get_int64 from Layout with children, 0
+        Let bounds be proc translate_type_bounds from bounds_child
+        proc set_dict_value from hir_param, "bounds", bounds
+    End If
+
+    Return hir_param
+End Process
+
+Process called "translate_type_bounds" takes ast as Integer returns Integer:
+    Note: Translate type bounds to HIR
+
+    Let bounds_list be proc create_hir_list
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let bound_hir be proc translate_type_reference from child
+        Set bounds_list to proc add_to_list from bounds_list, bound_hir
+        Set index to index plus 1
+    End While
+
+    Return bounds_list
+End Process
+
+Note: ============================================================================
+Note: Statement Translation
+Note: ============================================================================
+
+Process called "translate_statement" takes ast as Integer returns Integer:
+    Note: Translate statement to HIR
+
+    Let node_type be proc memory_get_int64 from Layout with ast, 0
+
+    If node_type is equal to AST_BLOCK from Parser:
+        Return proc translate_block from ast
+    End If
+
+    If node_type is equal to AST_IF_STATEMENT from Parser:
+        Return proc translate_if_statement from ast
+    End If
+
+    If node_type is equal to AST_WHILE_STATEMENT from Parser:
+        Return proc translate_while_statement from ast
+    End If
+
+    If node_type is equal to AST_FOR_STATEMENT from Parser:
+        Return proc translate_for_statement from ast
+    End If
+
+    If node_type is equal to AST_RETURN_STATEMENT from Parser:
+        Return proc translate_return_statement from ast
+    End If
+
+    If node_type is equal to AST_THROW_STATEMENT from Parser:
+        Return proc translate_throw_statement from ast
+    End If
+
+    If node_type is equal to AST_TRY_STATEMENT from Parser:
+        Return proc translate_try_statement from ast
+    End If
+
+    If node_type is equal to AST_VARIABLE_DECLARATION from Parser:
+        Return proc translate_variable_declaration from ast
+    End If
+
+    If node_type is equal to AST_EXPRESSION_STATEMENT from Parser:
+        Return proc translate_expression_statement from ast
+    End If
+
+    Return 0
+End Process
+
+Process called "translate_block" takes ast as Integer returns Integer:
+    Note: Translate block statement to HIR
+
+    Let hir_block be proc create_hir_dict
+
+    proc set_dict_value from hir_block, "node_type", "block"
+
+    Let statements be proc create_hir_list
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let stmt_hir be proc translate_statement from child
+        If stmt_hir is not equal to 0:
+            Set statements to proc add_to_list from statements, stmt_hir
+        End If
+        Set index to index plus 1
+    End While
+
+    proc set_dict_value from hir_block, "statements", statements
+
+    Return hir_block
+End Process
+
+Process called "translate_if_statement" takes ast as Integer returns Integer:
+    Note: Translate if statement to HIR
+
+    Let hir_if be proc create_hir_dict
+
+    proc set_dict_value from hir_if, "node_type", "if_statement"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let condition_ast be proc memory_get_int64 from Layout with children, 0
+        Let condition be proc translate_expression from condition_ast
+        proc set_dict_value from hir_if, "condition", condition
+    End If
+
+    If child_count is greater than 1:
+        Let then_ast be proc memory_get_int64 from Layout with children, 8
+        Let then_stmt be proc translate_statement from then_ast
+        proc set_dict_value from hir_if, "then", then_stmt
+    End If
+
+    If child_count is greater than 2:
+        Let else_ast be proc memory_get_int64 from Layout with children, 16
+        Let else_stmt be proc translate_statement from else_ast
+        proc set_dict_value from hir_if, "else", else_stmt
+    End If
+
+    Return hir_if
+End Process
+
+Process called "translate_while_statement" takes ast as Integer returns Integer:
+    Note: Translate while statement to HIR
+
+    Let hir_while be proc create_hir_dict
+
+    proc set_dict_value from hir_while, "node_type", "while_statement"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let condition_ast be proc memory_get_int64 from Layout with children, 0
+        Let condition be proc translate_expression from condition_ast
+        proc set_dict_value from hir_while, "condition", condition
+    End If
+
+    If child_count is greater than 1:
+        Let body_ast be proc memory_get_int64 from Layout with children, 8
+        Let body be proc translate_statement from body_ast
+        proc set_dict_value from hir_while, "body", body
+    End If
+
+    Return hir_while
+End Process
+
+Process called "translate_for_statement" takes ast as Integer returns Integer:
+    Note: Translate for statement to HIR
+
+    Let hir_for be proc create_hir_dict
+
+    proc set_dict_value from hir_for, "node_type", "for_statement"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Note: For statement children: init, condition, update, body
+
+    If child_count is greater than 0:
+        Let init_ast be proc memory_get_int64 from Layout with children, 0
+        Let init be proc translate_statement from init_ast
+        proc set_dict_value from hir_for, "init", init
+    End If
+
+    If child_count is greater than 1:
+        Let condition_ast be proc memory_get_int64 from Layout with children, 8
+        Let condition be proc translate_expression from condition_ast
+        proc set_dict_value from hir_for, "condition", condition
+    End If
+
+    If child_count is greater than 2:
+        Let update_ast be proc memory_get_int64 from Layout with children, 16
+        Let update be proc translate_expression from update_ast
+        proc set_dict_value from hir_for, "update", update
+    End If
+
+    If child_count is greater than 3:
+        Let body_ast be proc memory_get_int64 from Layout with children, 24
+        Let body be proc translate_statement from body_ast
+        proc set_dict_value from hir_for, "body", body
+    End If
+
+    Return hir_for
+End Process
+
+Process called "translate_return_statement" takes ast as Integer returns Integer:
+    Note: Translate return statement to HIR
+
+    Let hir_return be proc create_hir_dict
+
+    proc set_dict_value from hir_return, "node_type", "return_statement"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let value_ast be proc memory_get_int64 from Layout with children, 0
+        Let value be proc translate_expression from value_ast
+        proc set_dict_value from hir_return, "value", value
+    End If
+
+    Return hir_return
+End Process
+
+Process called "translate_throw_statement" takes ast as Integer returns Integer:
+    Note: Translate throw statement to HIR
+
+    Let hir_throw be proc create_hir_dict
+
+    proc set_dict_value from hir_throw, "node_type", "throw_statement"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let exception_ast be proc memory_get_int64 from Layout with children, 0
+        Let exception be proc translate_expression from exception_ast
+        proc set_dict_value from hir_throw, "exception", exception
+    End If
+
+    Return hir_throw
+End Process
+
+Process called "translate_try_statement" takes ast as Integer returns Integer:
+    Note: Translate try statement to HIR
+
+    Let hir_try be proc create_hir_dict
+
+    proc set_dict_value from hir_try, "node_type", "try_statement"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Note: Initialize catch clauses list and finally block
+    Let catch_clauses_list be proc create_list
+    Let finally_block be 0
+
+    Note: Process children for try block, catch clauses, finally block
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let child_type be proc memory_get_int64 from Layout with child, 0
+
+        If child_type is equal to AST_BLOCK from Parser:
+            Let try_block be proc translate_block from child
+            proc set_dict_value from hir_try, "try_block", try_block
+        Otherwise If child_type is equal to AST_CATCH_CLAUSE from Parser:
+            Note: Add catch clauses to list
+            Let catch_clause be proc translate_catch_clause from child
+            proc add_to_list from catch_clauses_list, catch_clause
+        Otherwise If child_type is equal to AST_FINALLY_BLOCK from Parser:
+            Set finally_block to proc translate_block from child
+        End If
+
+        Set index to index plus 1
+    End While
+
+    Note: Add catch clauses list to HIR if any exist
+    Let catch_count be proc memory_get_int64 from Layout with catch_clauses_list, 0
+    If catch_count is greater than 0:
+        proc set_dict_value from hir_try, "catch_clauses", catch_clauses_list
+    End If
+
+    Note: Add finally block to HIR if present
+    If finally_block is not equal to 0:
+        proc set_dict_value from hir_try, "finally_block", finally_block
+    End If
+
+    Return hir_try
+End Process
+
+Process called "translate_catch_clause" takes ast as Integer returns Integer:
+    Note: Translate catch clause to HIR
+
+    Let hir_catch be proc create_hir_dict
+
+    proc set_dict_value from hir_catch, "node_type", "catch_clause"
+
+    Let exception_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_catch, "exception_name", exception_name
+
+    Return hir_catch
+End Process
+
+Process called "translate_variable_declaration" takes ast as Integer returns Integer:
+    Note: Translate variable declaration to HIR
+
+    Let hir_var be proc create_hir_dict
+
+    proc set_dict_value from hir_var, "node_type", "variable_declaration"
+
+    Let var_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_var, "name", var_name
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let type_ast be proc memory_get_int64 from Layout with children, 0
+        Let var_type be proc translate_type_reference from type_ast
+        proc set_dict_value from hir_var, "type", var_type
+    End If
+
+    If child_count is greater than 1:
+        Let init_ast be proc memory_get_int64 from Layout with children, 8
+        Let initializer be proc translate_expression from init_ast
+        proc set_dict_value from hir_var, "initializer", initializer
+    End If
+
+    Return hir_var
+End Process
+
+Process called "translate_expression_statement" takes ast as Integer returns Integer:
+    Note: Translate expression statement to HIR
+
+    Let hir_expr_stmt be proc create_hir_dict
+
+    proc set_dict_value from hir_expr_stmt, "node_type", "expression_statement"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let expr_ast be proc memory_get_int64 from Layout with children, 0
+        Let expression be proc translate_expression from expr_ast
+        proc set_dict_value from hir_expr_stmt, "expression", expression
+    End If
+
+    Return hir_expr_stmt
+End Process
+
+Note: ============================================================================
+Note: Expression Translation
+Note: ============================================================================
+
+Process called "translate_expression" takes ast as Integer returns Integer:
+    Note: Translate expression to HIR
+
+    If ast is equal to 0:
+        Return 0
+    End If
+
+    Let node_type be proc memory_get_int64 from Layout with ast, 0
+
+    If node_type is equal to AST_BINARY_EXPRESSION from Parser:
+        Return proc translate_binary_expression from ast
+    End If
+
+    If node_type is equal to AST_UNARY_EXPRESSION from Parser:
+        Return proc translate_unary_expression from ast
+    End If
+
+    If node_type is equal to AST_CALL_EXPRESSION from Parser:
+        Return proc translate_call_expression from ast
+    End If
+
+    If node_type is equal to AST_MEMBER_ACCESS from Parser:
+        Return proc translate_member_access from ast
+    End If
+
+    If node_type is equal to AST_ARRAY_ACCESS from Parser:
+        Return proc translate_array_access from ast
+    End If
+
+    If node_type is equal to AST_OBJECT_CREATION from Parser:
+        Return proc translate_object_creation from ast
+    End If
+
+    If node_type is equal to AST_LAMBDA_EXPRESSION from Parser:
+        Return proc translate_lambda_expression from ast
+    End If
+
+    If node_type is equal to AST_METHOD_REFERENCE from Parser:
+        Return proc translate_method_reference from ast
+    End If
+
+    If node_type is equal to AST_LITERAL from Parser:
+        Return proc translate_literal from ast
+    End If
+
+    If node_type is equal to AST_IDENTIFIER from Parser:
+        Return proc translate_identifier from ast
+    End If
+
+    If node_type is equal to AST_TERNARY_EXPRESSION from Parser:
+        Return proc translate_ternary_expression from ast
+    End If
+
+    Return 0
+End Process
+
+Process called "translate_binary_expression" takes ast as Integer returns Integer:
+    Note: Translate binary expression to HIR
+
+    Let hir_binary be proc create_hir_dict
+
+    proc set_dict_value from hir_binary, "node_type", "binary_expression"
+
+    Let operator be proc memory_get_int64 from Layout with ast, 24
+    proc set_dict_value from hir_binary, "operator", operator
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let left_ast be proc memory_get_int64 from Layout with children, 0
+        Let left be proc translate_expression from left_ast
+        proc set_dict_value from hir_binary, "left", left
+    End If
+
+    If child_count is greater than 1:
+        Let right_ast be proc memory_get_int64 from Layout with children, 8
+        Let right be proc translate_expression from right_ast
+        proc set_dict_value from hir_binary, "right", right
+    End If
+
+    Return hir_binary
+End Process
+
+Process called "translate_unary_expression" takes ast as Integer returns Integer:
+    Note: Translate unary expression to HIR
+
+    Let hir_unary be proc create_hir_dict
+
+    proc set_dict_value from hir_unary, "node_type", "unary_expression"
+
+    Let operator be proc memory_get_int64 from Layout with ast, 24
+    proc set_dict_value from hir_unary, "operator", operator
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let operand_ast be proc memory_get_int64 from Layout with children, 0
+        Let operand be proc translate_expression from operand_ast
+        proc set_dict_value from hir_unary, "operand", operand
+    End If
+
+    Return hir_unary
+End Process
+
+Process called "translate_call_expression" takes ast as Integer returns Integer:
+    Note: Translate call expression to HIR
+
+    Let hir_call be proc create_hir_dict
+
+    proc set_dict_value from hir_call, "node_type", "call_expression"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let callee_ast be proc memory_get_int64 from Layout with children, 0
+        Let callee be proc translate_expression from callee_ast
+        proc set_dict_value from hir_call, "callee", callee
+    End If
+
+    If child_count is greater than 1:
+        Let args_ast be proc memory_get_int64 from Layout with children, 8
+        Let arguments be proc translate_argument_list from args_ast
+        proc set_dict_value from hir_call, "arguments", arguments
+    End If
+
+    Return hir_call
+End Process
+
+Process called "translate_argument_list" takes ast as Integer returns Integer:
+    Note: Translate argument list to HIR
+
+    Let args_list be proc create_hir_list
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    Let index be 0
+
+    While index is less than child_count:
+        Let child be proc memory_get_int64 from Layout with children, index times 8
+        Let arg_hir be proc translate_expression from child
+        Set args_list to proc add_to_list from args_list, arg_hir
+        Set index to index plus 1
+    End While
+
+    Return args_list
+End Process
+
+Process called "translate_member_access" takes ast as Integer returns Integer:
+    Note: Translate member access to HIR
+
+    Let hir_member be proc create_hir_dict
+
+    proc set_dict_value from hir_member, "node_type", "member_access"
+
+    Let member_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_member, "member", member_name
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let object_ast be proc memory_get_int64 from Layout with children, 0
+        Let object_expr be proc translate_expression from object_ast
+        proc set_dict_value from hir_member, "object", object_expr
+    End If
+
+    Return hir_member
+End Process
+
+Process called "translate_array_access" takes ast as Integer returns Integer:
+    Note: Translate array access to HIR
+
+    Let hir_array_access be proc create_hir_dict
+
+    proc set_dict_value from hir_array_access, "node_type", "array_access"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let array_ast be proc memory_get_int64 from Layout with children, 0
+        Let array_expr be proc translate_expression from array_ast
+        proc set_dict_value from hir_array_access, "array", array_expr
+    End If
+
+    If child_count is greater than 1:
+        Let index_ast be proc memory_get_int64 from Layout with children, 8
+        Let index_expr be proc translate_expression from index_ast
+        proc set_dict_value from hir_array_access, "index", index_expr
+    End If
+
+    Return hir_array_access
+End Process
+
+Process called "translate_object_creation" takes ast as Integer returns Integer:
+    Note: Translate object creation (new) to HIR
+
+    Let hir_new be proc create_hir_dict
+
+    proc set_dict_value from hir_new, "node_type", "object_creation"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let type_ast be proc memory_get_int64 from Layout with children, 0
+        Let type_ref be proc translate_type_reference from type_ast
+        proc set_dict_value from hir_new, "type", type_ref
+    End If
+
+    If child_count is greater than 1:
+        Let args_ast be proc memory_get_int64 from Layout with children, 8
+        Let arguments be proc translate_argument_list from args_ast
+        proc set_dict_value from hir_new, "arguments", arguments
+    End If
+
+    Return hir_new
+End Process
+
+Process called "translate_lambda_expression" takes ast as Integer returns Integer:
+    Note: Translate lambda expression to HIR
+
+    Let hir_lambda be proc create_hir_dict
+
+    proc set_dict_value from hir_lambda, "node_type", "lambda_expression"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let params_ast be proc memory_get_int64 from Layout with children, 0
+        Let parameters be proc translate_expression from params_ast
+        proc set_dict_value from hir_lambda, "parameters", parameters
+    End If
+
+    If child_count is greater than 1:
+        Let body_ast be proc memory_get_int64 from Layout with children, 8
+        Let body be proc translate_expression from body_ast
+        proc set_dict_value from hir_lambda, "body", body
+    End If
+
+    Return hir_lambda
+End Process
+
+Process called "translate_method_reference" takes ast as Integer returns Integer:
+    Note: Translate method reference (::) to HIR
+
+    Let hir_method_ref be proc create_hir_dict
+
+    proc set_dict_value from hir_method_ref, "node_type", "method_reference"
+
+    Let method_name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_method_ref, "method", method_name
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let target_ast be proc memory_get_int64 from Layout with children, 0
+        Let target be proc translate_expression from target_ast
+        proc set_dict_value from hir_method_ref, "target", target
+    End If
+
+    Return hir_method_ref
+End Process
+
+Process called "translate_ternary_expression" takes ast as Integer returns Integer:
+    Note: Translate ternary conditional expression to HIR
+
+    Let hir_ternary be proc create_hir_dict
+
+    proc set_dict_value from hir_ternary, "node_type", "ternary_expression"
+
+    Let children be proc memory_get_int64 from Layout with ast, 32
+    Let child_count be proc memory_get_int64 from Layout with ast, 40
+
+    If child_count is greater than 0:
+        Let condition_ast be proc memory_get_int64 from Layout with children, 0
+        Let condition be proc translate_expression from condition_ast
+        proc set_dict_value from hir_ternary, "condition", condition
+    End If
+
+    If child_count is greater than 1:
+        Let then_ast be proc memory_get_int64 from Layout with children, 8
+        Let then_expr be proc translate_expression from then_ast
+        proc set_dict_value from hir_ternary, "then", then_expr
+    End If
+
+    If child_count is greater than 2:
+        Let else_ast be proc memory_get_int64 from Layout with children, 16
+        Let else_expr be proc translate_expression from else_ast
+        proc set_dict_value from hir_ternary, "else", else_expr
+    End If
+
+    Return hir_ternary
+End Process
+
+Process called "translate_literal" takes ast as Integer returns Integer:
+    Note: Translate literal value to HIR
+
+    Let hir_literal be proc create_hir_dict
+
+    proc set_dict_value from hir_literal, "node_type", "literal"
+
+    Let value be proc memory_get_int64 from Layout with ast, 24
+    proc set_dict_value from hir_literal, "value", value
+
+    Let token be proc memory_get_int64 from Layout with ast, 8
+    If token is not equal to 0:
+        Let token_type be proc memory_get_int64 from Layout with token, 0
+        proc set_dict_value from hir_literal, "literal_type", token_type
+    End If
+
+    Return hir_literal
+End Process
+
+Process called "translate_identifier" takes ast as Integer returns Integer:
+    Note: Translate identifier to HIR
+
+    Let hir_id be proc create_hir_dict
+
+    proc set_dict_value from hir_id, "node_type", "identifier"
+
+    Let name be proc memory_get_int64 from Layout with ast, 16
+    proc set_dict_value from hir_id, "name", name
+
+    Return hir_id
+End Process
+
+Note: End of Java to HIR Translator

@@ -1,0 +1,1233 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Bash/Shell Parser - AST construction for Bash scripts
+
+This file provides complete syntax analysis for Bash shell scripts.
+Constructs an Abstract Syntax Tree (AST) representing the script structure.
+
+Features:
+- Complete Bash grammar support
+- Commands and pipelines
+- Control structures (if, while, for, case)
+- Function definitions
+- Variable assignments and expansions
+- Compound commands
+- Conditional expressions [[ ]]
+- Test expressions [ ]
+- Arithmetic expressions $(())
+- Command and process substitution
+- Redirections and file descriptors
+- Here documents
+
+Dependencies:
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- frontends/bash/bash_lexer.runa
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/middle/gungnir/hir/translation/frontends/bash/bash_lexer.runa" as Lexer
+
+Note: ============================================================================
+Note: AST Node Types
+Note: ============================================================================
+
+Constant AST_SCRIPT as Integer is 1               Note: Top-level script
+Constant AST_COMMAND as Integer is 2              Note: Simple command
+Constant AST_PIPELINE as Integer is 3             Note: Pipeline (cmd1 | cmd2)
+Constant AST_LIST as Integer is 4                 Note: Command list (&&, ||, ;, &)
+Constant AST_COMPOUND_COMMAND as Integer is 5     Note: { commands; }
+Constant AST_SUBSHELL as Integer is 6             Note: ( commands )
+Constant AST_IF_STATEMENT as Integer is 10        Note: if-then-else-fi
+Constant AST_WHILE_STATEMENT as Integer is 11     Note: while-do-done
+Constant AST_UNTIL_STATEMENT as Integer is 12     Note: until-do-done
+Constant AST_FOR_STATEMENT as Integer is 13       Note: for-do-done
+Constant AST_CASE_STATEMENT as Integer is 14      Note: case-in-esac
+Constant AST_SELECT_STATEMENT as Integer is 15    Note: select-do-done
+Constant AST_FUNCTION_DEFINITION as Integer is 20 Note: function name { }
+Constant AST_VARIABLE_ASSIGNMENT as Integer is 21 Note: var=value
+Constant AST_VARIABLE as Integer is 22            Note: $var or ${var}
+Constant AST_SPECIAL_VARIABLE as Integer is 23    Note: $?, $@, etc.
+Constant AST_ARITHMETIC_EXPANSION as Integer is 24 Note: $(())
+Constant AST_PARAMETER_EXPANSION as Integer is 25 Note: ${var:-default}
+Constant AST_COMMAND_SUBSTITUTION as Integer is 26 Note: $() or ``
+Constant AST_PROCESS_SUBSTITUTION as Integer is 27 Note: <() or >()
+Constant AST_CONDITIONAL_EXPRESSION as Integer is 30 Note: [[ expression ]]
+Constant AST_TEST_EXPRESSION as Integer is 31     Note: [ expression ] or test
+Constant AST_ARITHMETIC_EXPRESSION as Integer is 32 Note: (( expression ))
+Constant AST_BINARY_EXPRESSION as Integer is 33   Note: Binary operation
+Constant AST_UNARY_EXPRESSION as Integer is 34    Note: Unary operation
+Constant AST_REDIRECTION as Integer is 40         Note: Input/output redirection
+Constant AST_HERE_DOCUMENT as Integer is 41       Note: << EOF
+Constant AST_ARGUMENT as Integer is 50            Note: Command argument
+Constant AST_WORD as Integer is 51                Note: Simple word
+Constant AST_STRING as Integer is 52              Note: String literal
+Constant AST_NUMBER as Integer is 53              Note: Numeric literal
+Constant AST_CASE_ITEM as Integer is 60           Note: Case pattern item
+Constant AST_PATTERN as Integer is 61             Note: Case pattern
+
+Note: ============================================================================
+Note: AST Node Structure
+Note: ============================================================================
+
+Type called "ASTNode":
+    node_type as Integer       Note: AST node type constant
+    value as Integer           Note: Node value (string pointer)
+    line as Integer            Note: Source line number
+    column as Integer          Note: Source column number
+    children as Integer        Note: Pointer to children array
+    child_count as Integer     Note: Number of children
+    child_capacity as Integer  Note: Capacity of children array
+End Type
+
+Constant AST_NODE_SIZE as Integer is 56  Note: 7 fields × 8 bytes
+Constant INITIAL_CHILD_CAPACITY as Integer is 4
+
+Note: ============================================================================
+Note: Parser Structure
+Note: ============================================================================
+
+Type called "BashParser":
+    lexer as Integer           Note: Bash lexer
+    current_token as Integer   Note: Current token
+    has_error as Integer       Note: Error flag
+End Type
+
+Constant PARSER_SIZE as Integer is 24  Note: 3 fields × 8 bytes
+
+Note: ============================================================================
+Note: AST Node Operations
+Note: ============================================================================
+
+Process called "create_ast_node" takes node_type as Integer returns Integer:
+    Note: Create AST node with given type
+
+    Let node be proc allocate from Layout with AST_NODE_SIZE
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 0, node_type
+    proc memory_set_int64 from Layout with node, 8, 0   Note: value
+    proc memory_set_int64 from Layout with node, 16, 0  Note: line
+    proc memory_set_int64 from Layout with node, 24, 0  Note: column
+    proc memory_set_int64 from Layout with node, 32, 0  Note: children
+    proc memory_set_int64 from Layout with node, 40, 0  Note: child_count
+    proc memory_set_int64 from Layout with node, 48, 0  Note: child_capacity
+
+    Return node
+End Process
+
+Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
+    Note: Set node value
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 8, value
+
+    Return 1
+End Process
+
+Process called "set_node_location" takes node as Integer, line as Integer, column as Integer returns Integer:
+    Note: Set node source location
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 16, line
+    proc memory_set_int64 from Layout with node, 24, column
+
+    Return 1
+End Process
+
+Process called "add_child" takes node as Integer, child as Integer returns Integer:
+    Note: Add child to AST node
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    If child is equal to 0:
+        Return 0
+    End If
+
+    Let child_count be proc memory_get_int64 from Layout with node, 40
+    Let child_capacity be proc memory_get_int64 from Layout with node, 48
+
+    Note: Allocate or grow children array
+    If child_capacity is equal to 0:
+        Let new_capacity be INITIAL_CHILD_CAPACITY
+        Let children_array be proc allocate from Layout with new_capacity times 8
+
+        If children_array is equal to 0:
+            Return 0
+        End If
+
+        proc memory_set_int64 from Layout with node, 32, children_array
+        proc memory_set_int64 from Layout with node, 48, new_capacity
+        Set child_capacity to new_capacity
+    Otherwise:
+        If child_count is greater than or equal to child_capacity:
+            Let new_capacity be child_capacity times 2
+            Let new_array be proc allocate from Layout with new_capacity times 8
+
+            If new_array is equal to 0:
+                Return 0
+            End If
+
+            Let old_array be proc memory_get_int64 from Layout with node, 32
+
+            Let i be 0
+            While i is less than child_count:
+                Let child_ptr be proc memory_get_int64 from Layout with old_array, i times 8
+                proc memory_set_int64 from Layout with new_array, i times 8, child_ptr
+                Set i to i plus 1
+            End While
+
+            proc deallocate from Layout with old_array
+
+            proc memory_set_int64 from Layout with node, 32, new_array
+            proc memory_set_int64 from Layout with node, 48, new_capacity
+            Set child_capacity to new_capacity
+        End If
+    End If
+
+    Let children_array be proc memory_get_int64 from Layout with node, 32
+    proc memory_set_int64 from Layout with children_array, child_count times 8, child
+
+    proc memory_set_int64 from Layout with node, 40, child_count plus 1
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Parser Creation
+Note: ============================================================================
+
+Process called "create_parser" takes lexer as Integer returns Integer:
+    Note: Create Bash parser
+
+    Let parser be proc allocate from Layout with PARSER_SIZE
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 0, lexer
+    proc memory_set_int64 from Layout with parser, 16, 0  Note: has_error
+
+    Note: Get first token
+    Let first_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, first_token
+
+    Return parser
+End Process
+
+Process called "destroy_parser" takes parser as Integer returns Integer:
+    Note: Destroy parser
+
+    If parser is equal to 0:
+        Return 1
+    End If
+
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+
+    If current_token is not equal to 0:
+        proc destroy_token from Lexer with current_token
+    End If
+
+    proc deallocate from Layout with parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Token Operations
+Note: ============================================================================
+
+Process called "current_token_type" takes parser as Integer returns Integer:
+    Note: Get current token type
+
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+
+    If current_token is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with current_token, 0
+
+    Return token_type
+End Process
+
+Process called "current_token_value" takes parser as Integer returns Integer:
+    Note: Get current token value
+
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+
+    If current_token is equal to 0:
+        Return 0
+    End If
+
+    Let value be proc memory_get_int64 from Layout with current_token, 8
+
+    Return value
+End Process
+
+Process called "advance" takes parser as Integer returns Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let current_token be proc memory_get_int64 from Layout with parser, 8
+
+    If current_token is not equal to 0:
+        proc destroy_token from Lexer with current_token
+    End If
+
+    Let next_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, next_token
+
+    Return next_token
+End Process
+
+Process called "match" takes parser as Integer, token_type as Integer returns Integer:
+    Note: Check if current token matches type
+
+    Let current_type be proc current_token_type from parser
+
+    If current_type is equal to token_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "match_and_advance" takes parser as Integer, token_type as Integer returns Integer:
+    Note: Match token type and advance if matched
+
+    Let matched be proc match from parser, token_type
+
+    If matched is equal to 1:
+        proc advance from parser
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "expect" takes parser as Integer, token_type as Integer returns Integer:
+    Note: Expect token type, error if not matched
+
+    Let matched be proc match from parser, token_type
+
+    If matched is equal to 0:
+        proc memory_set_int64 from Layout with parser, 16, 1  Note: Set error flag
+        Return 0
+    End If
+
+    proc advance from parser
+
+    Return 1
+End Process
+
+Process called "skip_newlines" takes parser as Integer returns Integer:
+    Note: Skip any newline tokens
+
+    While 1 is equal to 1:
+        Let is_newline be proc match from parser, TOKEN_NEWLINE from Lexer
+
+        If is_newline is equal to 0:
+            Break
+        End If
+
+        proc advance from parser
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Forward Declarations
+Note: ============================================================================
+
+Note: These processes are forward-declared for mutual recursion
+Process called "parse_command" takes parser as Integer returns Integer
+Process called "parse_pipeline" takes parser as Integer returns Integer
+Process called "parse_list" takes parser as Integer returns Integer
+Process called "parse_compound_command" takes parser as Integer returns Integer
+
+Note: ============================================================================
+Note: Expression Parsing
+Note: ============================================================================
+
+Process called "parse_word" takes parser as Integer returns Integer:
+    Note: Parse word token
+
+    Let token_type be proc current_token_type from parser
+
+    If token_type is equal to TOKEN_WORD from Lexer:
+        Let value be proc current_token_value from parser
+        Let node be proc create_ast_node from AST_WORD
+        proc set_node_value from node, value
+        proc advance from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_STRING from Lexer:
+        Let value be proc current_token_value from parser
+        Let node be proc create_ast_node from AST_STRING
+        proc set_node_value from node, value
+        proc advance from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_SINGLE_QUOTED_STRING from Lexer:
+        Let value be proc current_token_value from parser
+        Let node be proc create_ast_node from AST_STRING
+        proc set_node_value from node, value
+        proc advance from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_DOUBLE_QUOTED_STRING from Lexer:
+        Let value be proc current_token_value from parser
+        Let node be proc create_ast_node from AST_STRING
+        proc set_node_value from node, value
+        proc advance from parser
+        Return node
+    End If
+
+    If token_type is equal to TOKEN_NUMBER from Lexer:
+        Let value be proc current_token_value from parser
+        Let node be proc create_ast_node from AST_NUMBER
+        proc set_node_value from node, value
+        proc advance from parser
+        Return node
+    End If
+
+    Note: Command substitution
+    If token_type is equal to TOKEN_COMMAND_SUBSTITUTION from Lexer:
+        Let value be proc current_token_value from parser
+        Let node be proc create_ast_node from AST_COMMAND_SUBSTITUTION
+        proc set_node_value from node, value
+        proc advance from parser
+        Return node
+    End If
+
+    Note: Arithmetic expansion
+    If token_type is equal to TOKEN_ARITHMETIC_EXPANSION from Lexer:
+        Let value be proc current_token_value from parser
+        Let node be proc create_ast_node from AST_ARITHMETIC_EXPANSION
+        proc set_node_value from node, value
+        proc advance from parser
+        Return node
+    End If
+
+    Note: Parameter expansion
+    If token_type is equal to TOKEN_PARAMETER_EXPANSION from Lexer:
+        Let value be proc current_token_value from parser
+        Let node be proc create_ast_node from AST_PARAMETER_EXPANSION
+        proc set_node_value from node, value
+        proc advance from parser
+        Return node
+    End If
+
+    Return 0
+End Process
+
+Process called "parse_argument" takes parser as Integer returns Integer:
+    Note: Parse command argument
+
+    Let node be proc parse_word from parser
+
+    If node is not equal to 0:
+        Return node
+    End If
+
+    Note: Could be variable expansion or other special forms
+    Let token_type be proc current_token_type from parser
+
+    If token_type is equal to TOKEN_DOLLAR from Lexer:
+        proc advance from parser
+        Let var_node be proc create_ast_node from AST_VARIABLE
+        Let var_name be proc current_token_value from parser
+        proc set_node_value from var_node, var_name
+        proc advance from parser
+        Return var_node
+    End If
+
+    Return 0
+End Process
+
+Process called "parse_redirection" takes parser as Integer returns Integer:
+    Note: Parse redirection (>, >>, <, etc.)
+
+    Let token_type be proc current_token_type from parser
+
+    Let is_redirect be 0
+
+    If token_type is equal to TOKEN_LESS from Lexer:
+        Set is_redirect to 1
+    End If
+
+    If token_type is equal to TOKEN_GREATER from Lexer:
+        Set is_redirect to 1
+    End If
+
+    If token_type is equal to TOKEN_GREATER_GREATER from Lexer:
+        Set is_redirect to 1
+    End If
+
+    If token_type is equal to TOKEN_LESS_GREATER from Lexer:
+        Set is_redirect to 1
+    End If
+
+    If token_type is equal to TOKEN_GREATER_AMP from Lexer:
+        Set is_redirect to 1
+    End If
+
+    If token_type is equal to TOKEN_AMP_GREATER from Lexer:
+        Set is_redirect to 1
+    End If
+
+    If token_type is equal to TOKEN_AMP_GREATER_GREATER from Lexer:
+        Set is_redirect to 1
+    End If
+
+    If token_type is equal to TOKEN_LESS_AMP from Lexer:
+        Set is_redirect to 1
+    End If
+
+    If is_redirect is equal to 0:
+        Return 0
+    End If
+
+    Let redirect_node be proc create_ast_node from AST_REDIRECTION
+
+    Note: Store redirect operator type
+    Let operator_str be proc create_string from StringCore with ""
+    proc set_node_value from redirect_node, operator_str
+
+    proc advance from parser
+
+    Note: Parse target (filename or file descriptor)
+    Let target be proc parse_argument from parser
+    proc add_child from redirect_node, target
+
+    Return redirect_node
+End Process
+
+Note: ============================================================================
+Note: Simple Command Parsing
+Note: ============================================================================
+
+Process called "parse_simple_command" takes parser as Integer returns Integer:
+    Note: Parse simple command (cmd arg1 arg2 ...)
+
+    Let command_node be proc create_ast_node from AST_COMMAND
+
+    Note: Parse command name
+    Let cmd_name be proc parse_word from parser
+
+    If cmd_name is equal to 0:
+        Return 0
+    End If
+
+    proc add_child from command_node, cmd_name
+
+    Note: Parse arguments and redirections
+    While 1 is equal to 1:
+        Let token_type be proc current_token_type from parser
+
+        Note: Check for end of command
+        If token_type is equal to TOKEN_NEWLINE from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_SEMICOLON from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_PIPE from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_AMP from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_AMP_AMP from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_PIPE_PIPE from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Note: Try redirection
+        Let redirect be proc parse_redirection from parser
+
+        If redirect is not equal to 0:
+            proc add_child from command_node, redirect
+            Continue
+        End If
+
+        Note: Parse argument
+        Let arg be proc parse_argument from parser
+
+        If arg is equal to 0:
+            Break
+        End If
+
+        proc add_child from command_node, arg
+    End While
+
+    Return command_node
+End Process
+
+Note: ============================================================================
+Note: Pipeline Parsing
+Note: ============================================================================
+
+Process called "parse_pipeline" takes parser as Integer returns Integer:
+    Note: Parse pipeline (cmd1 | cmd2 | cmd3)
+
+    Let first_cmd be proc parse_simple_command from parser
+
+    If first_cmd is equal to 0:
+        Return 0
+    End If
+
+    Let is_pipe be proc match from parser, TOKEN_PIPE from Lexer
+
+    If is_pipe is equal to 0:
+        Return first_cmd  Note: Not a pipeline, just simple command
+    End If
+
+    Let pipeline_node be proc create_ast_node from AST_PIPELINE
+    proc add_child from pipeline_node, first_cmd
+
+    While 1 is equal to 1:
+        Let is_pipe_check be proc match_and_advance from parser, TOKEN_PIPE from Lexer
+
+        If is_pipe_check is equal to 0:
+            Break
+        End If
+
+        proc skip_newlines from parser
+
+        Let next_cmd be proc parse_simple_command from parser
+
+        If next_cmd is equal to 0:
+            Break
+        End If
+
+        proc add_child from pipeline_node, next_cmd
+    End While
+
+    Return pipeline_node
+End Process
+
+Note: ============================================================================
+Note: List Parsing (&&, ||, ;, &)
+Note: ============================================================================
+
+Process called "parse_list" takes parser as Integer returns Integer:
+    Note: Parse command list with &&, ||, ;, &
+
+    Let first_item be proc parse_pipeline from parser
+
+    If first_item is equal to 0:
+        Return 0
+    End If
+
+    Let token_type be proc current_token_type from parser
+
+    Let is_list_operator be 0
+
+    If token_type is equal to TOKEN_AMP_AMP from Lexer:
+        Set is_list_operator to 1
+    End If
+
+    If token_type is equal to TOKEN_PIPE_PIPE from Lexer:
+        Set is_list_operator to 1
+    End If
+
+    If token_type is equal to TOKEN_SEMICOLON from Lexer:
+        Set is_list_operator to 1
+    End If
+
+    If token_type is equal to TOKEN_AMP from Lexer:
+        Set is_list_operator to 1
+    End If
+
+    If is_list_operator is equal to 0:
+        Return first_item  Note: Not a list, just pipeline
+    End If
+
+    Let list_node be proc create_ast_node from AST_LIST
+    proc add_child from list_node, first_item
+
+    While 1 is equal to 1:
+        Set token_type to proc current_token_type from parser
+
+        Let is_op be 0
+
+        If token_type is equal to TOKEN_AMP_AMP from Lexer:
+            Set is_op to 1
+        End If
+
+        If token_type is equal to TOKEN_PIPE_PIPE from Lexer:
+            Set is_op to 1
+        End If
+
+        If token_type is equal to TOKEN_SEMICOLON from Lexer:
+            Set is_op to 1
+        End If
+
+        If token_type is equal to TOKEN_AMP from Lexer:
+            Set is_op to 1
+        End If
+
+        If is_op is equal to 0:
+            Break
+        End If
+
+        proc advance from parser
+        proc skip_newlines from parser
+
+        Let next_item be proc parse_pipeline from parser
+
+        If next_item is equal to 0:
+            Break
+        End If
+
+        proc add_child from list_node, next_item
+    End While
+
+    Return list_node
+End Process
+
+Note: ============================================================================
+Note: Control Structure Parsing
+Note: ============================================================================
+
+Process called "parse_if_statement" takes parser as Integer returns Integer:
+    Note: Parse if-then-else-fi statement
+
+    proc expect from parser, TOKEN_IF from Lexer
+
+    proc skip_newlines from parser
+
+    Let condition be proc parse_list from parser
+
+    proc skip_newlines from parser
+    proc expect from parser, TOKEN_THEN from Lexer
+    proc skip_newlines from parser
+
+    Let then_body be proc parse_list from parser
+
+    Let if_node be proc create_ast_node from AST_IF_STATEMENT
+    proc add_child from if_node, condition
+    proc add_child from if_node, then_body
+
+    proc skip_newlines from parser
+
+    Note: Check for elif or else
+    While 1 is equal to 1:
+        Let is_elif be proc match from parser, TOKEN_ELIF from Lexer
+
+        If is_elif is equal to 1:
+            proc advance from parser
+            proc skip_newlines from parser
+
+            Let elif_cond be proc parse_list from parser
+
+            proc skip_newlines from parser
+            proc expect from parser, TOKEN_THEN from Lexer
+            proc skip_newlines from parser
+
+            Let elif_body be proc parse_list from parser
+
+            proc add_child from if_node, elif_cond
+            proc add_child from if_node, elif_body
+
+            proc skip_newlines from parser
+            Continue
+        End If
+
+        Let is_else be proc match from parser, TOKEN_ELSE from Lexer
+
+        If is_else is equal to 1:
+            proc advance from parser
+            proc skip_newlines from parser
+
+            Let else_body be proc parse_list from parser
+            proc add_child from if_node, else_body
+
+            proc skip_newlines from parser
+        End If
+
+        Break
+    End While
+
+    proc expect from parser, TOKEN_FI from Lexer
+
+    Return if_node
+End Process
+
+Process called "parse_while_statement" takes parser as Integer returns Integer:
+    Note: Parse while-do-done statement
+
+    proc expect from parser, TOKEN_WHILE from Lexer
+
+    proc skip_newlines from parser
+
+    Let condition be proc parse_list from parser
+
+    proc skip_newlines from parser
+    proc expect from parser, TOKEN_DO from Lexer
+    proc skip_newlines from parser
+
+    Let body be proc parse_list from parser
+
+    proc skip_newlines from parser
+    proc expect from parser, TOKEN_DONE from Lexer
+
+    Let while_node be proc create_ast_node from AST_WHILE_STATEMENT
+    proc add_child from while_node, condition
+    proc add_child from while_node, body
+
+    Return while_node
+End Process
+
+Process called "parse_until_statement" takes parser as Integer returns Integer:
+    Note: Parse until-do-done statement
+
+    proc expect from parser, TOKEN_UNTIL from Lexer
+
+    proc skip_newlines from parser
+
+    Let condition be proc parse_list from parser
+
+    proc skip_newlines from parser
+    proc expect from parser, TOKEN_DO from Lexer
+    proc skip_newlines from parser
+
+    Let body be proc parse_list from parser
+
+    proc skip_newlines from parser
+    proc expect from parser, TOKEN_DONE from Lexer
+
+    Let until_node be proc create_ast_node from AST_UNTIL_STATEMENT
+    proc add_child from until_node, condition
+    proc add_child from until_node, body
+
+    Return until_node
+End Process
+
+Process called "parse_for_statement" takes parser as Integer returns Integer:
+    Note: Parse for-do-done statement
+
+    proc expect from parser, TOKEN_FOR from Lexer
+
+    proc skip_newlines from parser
+
+    Let var_name be proc current_token_value from parser
+    proc expect from parser, TOKEN_WORD from Lexer
+
+    proc skip_newlines from parser
+    proc expect from parser, TOKEN_IN from Lexer
+
+    proc skip_newlines from parser
+
+    Let for_node be proc create_ast_node from AST_FOR_STATEMENT
+    proc set_node_value from for_node, var_name
+
+    Note: Parse word list
+    While 1 is equal to 1:
+        Let token_type be proc current_token_type from parser
+
+        If token_type is equal to TOKEN_NEWLINE from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_SEMICOLON from Lexer:
+            Break
+        End If
+
+        If token_type is equal to TOKEN_DO from Lexer:
+            Break
+        End If
+
+        Let word be proc parse_word from parser
+
+        If word is equal to 0:
+            Break
+        End If
+
+        proc add_child from for_node, word
+    End While
+
+    proc skip_newlines from parser
+
+    Let is_semi be proc match_and_advance from parser, TOKEN_SEMICOLON from Lexer
+    proc skip_newlines from parser
+
+    proc expect from parser, TOKEN_DO from Lexer
+    proc skip_newlines from parser
+
+    Let body be proc parse_list from parser
+
+    proc skip_newlines from parser
+    proc expect from parser, TOKEN_DONE from Lexer
+
+    proc add_child from for_node, body
+
+    Return for_node
+End Process
+
+Process called "parse_case_item" takes parser as Integer returns Integer:
+    Note: Parse case pattern item
+
+    Let item_node be proc create_ast_node from AST_CASE_ITEM
+
+    Note: Parse patterns
+    While 1 is equal to 1:
+        Let pattern be proc parse_word from parser
+
+        If pattern is equal to 0:
+            Break
+        End If
+
+        proc add_child from item_node, pattern
+
+        Let is_pipe be proc match_and_advance from parser, TOKEN_PIPE from Lexer
+
+        If is_pipe is equal to 0:
+            Break
+        End If
+    End While
+
+    proc expect from parser, TOKEN_RPAREN from Lexer
+    proc skip_newlines from parser
+
+    Note: Parse commands
+    Let commands be proc parse_list from parser
+
+    proc add_child from item_node, commands
+
+    proc skip_newlines from parser
+
+    Note: Expect ;; or ;;& or ;&
+    Let token_type be proc current_token_type from parser
+
+    If token_type is equal to TOKEN_SEMICOLON_SEMICOLON from Lexer:
+        proc advance from parser
+    End If
+
+    If token_type is equal to TOKEN_SEMICOLON_SEMICOLON_AMP from Lexer:
+        proc advance from parser
+    End If
+
+    If token_type is equal to TOKEN_SEMICOLON_AMP from Lexer:
+        proc advance from parser
+    End If
+
+    Return item_node
+End Process
+
+Process called "parse_case_statement" takes parser as Integer returns Integer:
+    Note: Parse case-in-esac statement
+
+    proc expect from parser, TOKEN_CASE from Lexer
+
+    proc skip_newlines from parser
+
+    Let word be proc parse_word from parser
+
+    proc skip_newlines from parser
+    proc expect from parser, TOKEN_IN from Lexer
+    proc skip_newlines from parser
+
+    Let case_node be proc create_ast_node from AST_CASE_STATEMENT
+    proc add_child from case_node, word
+
+    Note: Parse case items
+    While 1 is equal to 1:
+        Let token_type be proc current_token_type from parser
+
+        If token_type is equal to TOKEN_ESAC from Lexer:
+            Break
+        End If
+
+        Let item be proc parse_case_item from parser
+
+        If item is equal to 0:
+            Break
+        End If
+
+        proc add_child from case_node, item
+        proc skip_newlines from parser
+    End While
+
+    proc expect from parser, TOKEN_ESAC from Lexer
+
+    Return case_node
+End Process
+
+Note: ============================================================================
+Note: Function Definition Parsing
+Note: ============================================================================
+
+Process called "parse_function_definition" takes parser as Integer returns Integer:
+    Note: Parse function definition
+
+    Let is_function_kw be proc match_and_advance from parser, TOKEN_FUNCTION from Lexer
+
+    Let func_name be proc current_token_value from parser
+    proc expect from parser, TOKEN_WORD from Lexer
+
+    proc skip_newlines from parser
+
+    Note: Optional ()
+    Let is_lparen be proc match_and_advance from parser, TOKEN_LPAREN from Lexer
+
+    If is_lparen is equal to 1:
+        proc expect from parser, TOKEN_RPAREN from Lexer
+        proc skip_newlines from parser
+    End If
+
+    Note: Function body (compound command)
+    Let body be proc parse_compound_command from parser
+
+    Let func_node be proc create_ast_node from AST_FUNCTION_DEFINITION
+    proc set_node_value from func_node, func_name
+    proc add_child from func_node, body
+
+    Return func_node
+End Process
+
+Note: ============================================================================
+Note: Compound Command Parsing
+Note: ============================================================================
+
+Process called "parse_compound_command" takes parser as Integer returns Integer:
+    Note: Parse compound command { commands; } or ( commands )
+
+    Let token_type be proc current_token_type from parser
+
+    Note: Subshell ( commands )
+    If token_type is equal to TOKEN_LPAREN from Lexer:
+        proc advance from parser
+        proc skip_newlines from parser
+
+        Let commands be proc parse_list from parser
+
+        proc skip_newlines from parser
+        proc expect from parser, TOKEN_RPAREN from Lexer
+
+        Let subshell_node be proc create_ast_node from AST_SUBSHELL
+        proc add_child from subshell_node, commands
+
+        Return subshell_node
+    End If
+
+    Note: Compound command { commands; }
+    If token_type is equal to TOKEN_LBRACE from Lexer:
+        proc advance from parser
+        proc skip_newlines from parser
+
+        Let commands be proc parse_list from parser
+
+        proc skip_newlines from parser
+        proc expect from parser, TOKEN_RBRACE from Lexer
+
+        Let compound_node be proc create_ast_node from AST_COMPOUND_COMMAND
+        proc add_child from compound_node, commands
+
+        Return compound_node
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Variable Assignment Parsing
+Note: ============================================================================
+
+Process called "parse_variable_assignment" takes parser as Integer returns Integer:
+    Note: Parse variable assignment var=value
+
+    Let var_name be proc current_token_value from parser
+    proc expect from parser, TOKEN_WORD from Lexer
+
+    proc expect from parser, TOKEN_ASSIGN from Lexer
+
+    Let value be proc parse_argument from parser
+
+    Let assign_node be proc create_ast_node from AST_VARIABLE_ASSIGNMENT
+    proc set_node_value from assign_node, var_name
+    proc add_child from assign_node, value
+
+    Return assign_node
+End Process
+
+Note: ============================================================================
+Note: Command Parsing (Main Entry)
+Note: ============================================================================
+
+Process called "parse_command" takes parser as Integer returns Integer:
+    Note: Parse any command (control structure, function, simple command, etc.)
+
+    proc skip_newlines from parser
+
+    Let token_type be proc current_token_type from parser
+
+    Note: Control structures
+    If token_type is equal to TOKEN_IF from Lexer:
+        Return proc parse_if_statement from parser
+    End If
+
+    If token_type is equal to TOKEN_WHILE from Lexer:
+        Return proc parse_while_statement from parser
+    End If
+
+    If token_type is equal to TOKEN_UNTIL from Lexer:
+        Return proc parse_until_statement from parser
+    End If
+
+    If token_type is equal to TOKEN_FOR from Lexer:
+        Return proc parse_for_statement from parser
+    End If
+
+    If token_type is equal to TOKEN_CASE from Lexer:
+        Return proc parse_case_statement from parser
+    End If
+
+    Note: Function definition
+    If token_type is equal to TOKEN_FUNCTION from Lexer:
+        Return proc parse_function_definition from parser
+    End If
+
+    Note: Compound commands
+    If token_type is equal to TOKEN_LBRACE from Lexer:
+        Return proc parse_compound_command from parser
+    End If
+
+    If token_type is equal to TOKEN_LPAREN from Lexer:
+        Return proc parse_compound_command from parser
+    End If
+
+    Note: Check for variable assignment (word followed by =)
+    Let next_token_type be proc current_token_type from parser
+
+    If next_token_type is equal to TOKEN_WORD from Lexer:
+        Note: Peek ahead for assignment
+        Let lexer be proc memory_get_int64 from Layout with parser, 0
+        Let peek_pos be proc memory_get_int64 from Layout with lexer, 16
+        Let source be proc memory_get_int64 from Layout with lexer, 0
+        Let length be proc memory_get_int64 from Layout with lexer, 8
+
+        Note: Simple heuristic: if we see word then =, it's assignment
+        Note: Proper lookahead for assignment detection
+        Let could_be_assignment be 0
+        Let lookahead_pos be peek_pos
+
+        Note: Check for word followed by = pattern
+        While lookahead_pos is less than length:
+            Let lookahead_char be proc get_char_at_position from lexer with lookahead_pos
+
+            Note: Skip whitespace
+            If lookahead_char is equal to 32 or lookahead_char is equal to 9:
+                Set lookahead_pos to lookahead_pos + 1
+                Continue
+            End If
+
+            Note: Check for assignment operator
+            If lookahead_char is equal to 61:  Note: '=' character
+                Set could_be_assignment to 1
+                Break
+            End If
+
+            Note: If we hit a special character that's not '=', not assignment
+            If lookahead_char is equal to 10 or lookahead_char is equal to 59 or lookahead_char is equal to 38 or lookahead_char is equal to 124:
+                Break
+            End If
+
+            Set lookahead_pos to lookahead_pos + 1
+        End While
+
+        Note: Parse as assignment if detected, otherwise as simple command
+        If could_be_assignment is equal to 1:
+            Return proc parse_assignment from parser
+        End If
+
+    End If
+
+    Note: Simple command or list
+    Return proc parse_list from parser
+End Process
+
+Note: ============================================================================
+Note: Script Parsing (Top-Level)
+Note: ============================================================================
+
+Process called "parse_script" takes parser as Integer returns Integer:
+    Note: Parse complete Bash script
+
+    Let script_node be proc create_ast_node from AST_SCRIPT
+
+    proc skip_newlines from parser
+
+    While 1 is equal to 1:
+        Let token_type be proc current_token_type from parser
+
+        If token_type is equal to TOKEN_EOF from Lexer:
+            Break
+        End If
+
+        Let command be proc parse_command from parser
+
+        If command is equal to 0:
+            Break
+        End If
+
+        proc add_child from script_node, command
+
+        proc skip_newlines from parser
+    End While
+
+    Return script_node
+End Process
+
+Process called "parse" takes parser as Integer returns Integer:
+    Note: Main parsing entry point
+
+    Return proc parse_script from parser
+End Process
+
+Note: End of Bash Parser

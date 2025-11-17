@@ -35,4 +35,2298 @@ This file consists of the following functions/features/operation types:
 - Vector cost modeling and profitability analysis
 :End Note
 
-Note: TODO - Implement auto-vectorization preparation functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================================
+Note: TYPE DEFINITIONS - Vectorization Structures
+Note: ============================================================================
+
+@Reasoning
+VectorizationContext is the main context for the vectorization pass.
+It tracks all vectorization analysis results, costs, and transformation state.
+
+Memory Layout (136 bytes):
+- cfg: MIRCFG pointer
+- ssa_ptr: SSA information pointer
+- dominance_ptr: Dominance tree pointer
+- loops: List of LoopInfo pointers (vectorizable loops)
+- vectorized_loops: Count of successfully vectorized loops
+- rejected_loops: Count of loops that failed vectorization
+- total_instructions_vectorized: Count of scalar instructions replaced
+- vector_width_used: Most common vector width (4, 8, 16)
+- loop_candidates: Dictionary mapping loop_id → VectorLoopInfo
+- memory_accesses: Dictionary mapping loop_id → List[MemoryAccess]
+- dependencies: Dictionary mapping loop_id → DependencyGraph
+- cost_models: Dictionary mapping loop_id → CostModel
+- alignment_cache: Dictionary mapping value_id → alignment
+- runtime_check_inserted: Count of runtime dependency checks inserted
+- profitability_threshold: Minimum speedup ratio (default 1.2)
+- target_vector_width: Target SIMD width (4 for SSE, 8 for AVX2, 16 for AVX512)
+- allow_reductions: Boolean flag for reduction vectorization
+@End Reasoning
+
+Type called "VectorizationContext":
+    cfg as Integer
+    ssa_ptr as Integer
+    dominance_ptr as Integer
+    loops as Integer
+    vectorized_loops as Integer
+    rejected_loops as Integer
+    total_instructions_vectorized as Integer
+    vector_width_used as Integer
+    loop_candidates as Integer
+    memory_accesses as Integer
+    dependencies as Integer
+    cost_models as Integer
+    alignment_cache as Integer
+    runtime_checks_inserted as Integer
+    profitability_threshold as Integer
+    target_vector_width as Integer
+    allow_reductions as Integer
+End Type
+
+Note: Size: 17 fields * 8 bytes = 136 bytes
+
+@Reasoning
+VectorLoopInfo describes a loop that is a candidate for vectorization.
+It stores all properties needed to determine vectorizability and transformation.
+
+Memory Layout (112 bytes):
+- loop_header_id: Block ID of loop header
+- preheader_id: Block ID of preheader (for inserting vector prologue)
+- body_blocks: Set of block IDs in loop body
+- exit_blocks: Set of block IDs that exit the loop
+- induction_var: SSA value ID of primary induction variable (i)
+- trip_count: Compile-time trip count if known, 0 if unknown
+- stride: Induction variable stride (usually 1)
+- vectorizable: Boolean flag indicating vectorization safety
+- rejection_reason: String pointer explaining why not vectorizable (or 0)
+- vector_factor: Chosen vectorization factor (2, 4, 8, 16)
+- has_reductions: Boolean flag for reduction operations
+- reduction_ops: List of reduction operation instruction pointers
+- memory_accesses_count: Number of memory operations in loop
+- is_innermost: Boolean flag indicating innermost loop
+@End Reasoning
+
+Type called "VectorLoopInfo":
+    loop_header_id as Integer
+    preheader_id as Integer
+    body_blocks as Integer
+    exit_blocks as Integer
+    induction_var as Integer
+    trip_count as Integer
+    stride as Integer
+    vectorizable as Integer
+    rejection_reason as Integer
+    vector_factor as Integer
+    has_reductions as Integer
+    reduction_ops as Integer
+    memory_accesses_count as Integer
+    is_innermost as Integer
+End Type
+
+Note: Size: 14 fields * 8 bytes = 112 bytes
+
+@Reasoning
+MemoryAccess describes a single load or store operation within a loop.
+Critical for stride analysis, alignment checking, and dependency analysis.
+
+Memory Layout (88 bytes):
+- instruction_ptr: Pointer to MIR load/store instruction
+- base_address: SSA value ID of base pointer
+- index_value: SSA value ID of array index (may be induction var)
+- stride: Access stride in elements (1 for unit stride, -1 for reverse)
+- element_size: Size of accessed element in bytes
+- is_load: Boolean flag (1 for load, 0 for store)
+- is_store: Boolean flag (1 for store, 0 for load)
+- alignment: Known alignment in bytes (1, 2, 4, 8, 16, 32, 64)
+- is_consecutive: Boolean flag for consecutive access pattern
+- is_loop_invariant_address: Boolean flag for invariant base
+- depends_on: List of MemoryAccess pointers this depends on
+@End Reasoning
+
+Type called "MemoryAccess":
+    instruction_ptr as Integer
+    base_address as Integer
+    index_value as Integer
+    stride as Integer
+    element_size as Integer
+    is_load as Integer
+    is_store as Integer
+    alignment as Integer
+    is_consecutive as Integer
+    is_loop_invariant_address as Integer
+    depends_on as Integer
+End Type
+
+Note: Size: 11 fields * 8 bytes = 88 bytes
+
+@Reasoning
+DependencyInfo represents a single data dependency between two memory operations.
+Three types of dependencies (RAW, WAR, WAW) affect vectorization safety.
+
+Dependency Types:
+- RAW (Read After Write): True dependency, prevents vectorization if loop-carried
+- WAR (Write After Read): Anti-dependency, can be resolved with privatization
+- WAW (Write After Write): Output dependency, can be resolved with privatization
+
+Memory Layout (72 bytes):
+- source_access: MemoryAccess pointer (earlier operation)
+- target_access: MemoryAccess pointer (later operation)
+- dependency_type: 1=RAW, 2=WAR, 3=WAW
+- distance: Loop-carried distance (0=same iteration, >0=loop-carried)
+- is_loop_carried: Boolean flag indicating cross-iteration dependency
+- can_privatize: Boolean flag indicating if privatization resolves dependency
+- can_runtime_check: Boolean flag for runtime disambiguation
+- proven_independent: Boolean flag if proven no dependency exists
+- analysis_confidence: 0-100 indicating certainty (100=proven)
+@End Reasoning
+
+Type called "DependencyInfo":
+    source_access as Integer
+    target_access as Integer
+    dependency_type as Integer
+    distance as Integer
+    is_loop_carried as Integer
+    can_privatize as Integer
+    can_runtime_check as Integer
+    proven_independent as Integer
+    analysis_confidence as Integer
+End Type
+
+Note: Size: 9 fields * 8 bytes = 72 bytes
+
+@Reasoning
+CostModel estimates the cost and benefit of vectorizing a loop.
+Vectorization is only profitable if speedup exceeds profitability threshold.
+Memory Layout (88 bytes):
+- scalar_cost: Estimated cycles for scalar execution
+- vector_cost: Estimated cycles for vectorized execution
+- overhead_cost: Prologue/epilogue/alignment overhead
+- speedup_ratio: vector_cost / scalar_cost (higher is better)
+- is_profitable: Boolean flag indicating profitability
+- vector_operations: Count of vectorizable operations
+- scalar_operations: Count of non-vectorizable (remain scalar) operations
+- memory_operations: Count of memory operations
+- reduction_cost: Extra cost for horizontal reductions
+- gather_scatter_cost: Extra cost for non-consecutive access
+- estimated_trip_count: Runtime trip count estimate for profitability
+@End Reasoning
+
+Type called "CostModel":
+    scalar_cost as Integer
+    vector_cost as Integer
+    overhead_cost as Integer
+    speedup_ratio as Integer
+    is_profitable as Integer
+    vector_operations as Integer
+    scalar_operations as Integer
+    memory_operations as Integer
+    reduction_cost as Integer
+    gather_scatter_cost as Integer
+    estimated_trip_count as Integer
+End Type
+
+Note: Size: 11 fields * 8 bytes = 88 bytes
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_vectorization_context" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Creates vectorization context and initializes all tracking structures.
+    Computes dominance tree for loop detection.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Display "create_vectorization_context: null CFG"
+        Return 0
+    End If
+
+    Note: Allocate context (136 bytes)
+    Let context_ptr be Layout.allocate(136)
+    If context_ptr equals 0:
+        Display "create_vectorization_context: allocation failed"
+        Return 0
+    End If
+
+    Note: Set CFG
+    Layout.memory_set_int64(context_ptr, 0, cfg_ptr)
+
+    Note: Get SSA information
+    Let ssa_ptr be SSA.get_ssa_info(cfg_ptr)
+    Layout.memory_set_int64(context_ptr, 8, ssa_ptr)
+
+    Note: Compute dominance information
+    Display "create_vectorization_context: computing dominance tree"
+    Let dom_info be Dominance.compute_dominance_tree(cfg_ptr)
+    Layout.memory_set_int64(context_ptr, 16, dom_info)
+
+    Note: Create loops list
+    Let loops_list be proc create from List
+    Layout.memory_set_int64(context_ptr, 24, loops_list)
+
+    Note: Initialize counters
+    Layout.memory_set_int64(context_ptr, 32, 0)  Note: vectorized_loops
+    Layout.memory_set_int64(context_ptr, 40, 0)  Note: rejected_loops
+    Layout.memory_set_int64(context_ptr, 48, 0)  Note: total_instructions_vectorized
+    Layout.memory_set_int64(context_ptr, 56, 4)  Note: vector_width_used (default 4)
+
+    Note: Create dictionaries
+    Let loop_candidates be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 64, loop_candidates)
+
+    Let memory_accesses be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 72, memory_accesses)
+
+    Let dependencies be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 80, dependencies)
+
+    Let cost_models be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 88, cost_models)
+
+    Let alignment_cache be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 96, alignment_cache)
+
+    Note: Initialize runtime checks counter
+    Layout.memory_set_int64(context_ptr, 104, 0)
+
+    Note: Set profitability threshold to 1.2 (20% speedup minimum)
+    Layout.memory_set_int64(context_ptr, 112, 120)  Note: Stored as 120 = 1.2 * 100
+
+    Note: Set target vector width to 4 (SSE baseline, can be increased to 8 for AVX2)
+    Layout.memory_set_int64(context_ptr, 120, 4)
+
+    Note: Allow reductions by default
+    Layout.memory_set_int64(context_ptr, 128, 1)
+
+    Display "create_vectorization_context: context created successfully"
+    Return context_ptr
+End Process
+
+Process called "destroy_vectorization_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys vectorization context and frees all allocated structures.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Free loops list
+    Let loops_list be Layout.memory_get_int64(context_ptr, 24)
+    If loops_list is not equal to 0:
+        proc destroy from List with loops_list
+    End If
+
+    Note: Free loop_candidates dictionary and VectorLoopInfo structures
+    Let loop_candidates be Layout.memory_get_int64(context_ptr, 64)
+    If loop_candidates is not equal to 0:
+        Let keys be Dictionary.keys(loop_candidates)
+        Let key_count be List.length(keys)
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let loop_info be Dictionary.get(loop_candidates, key)
+            If loop_info is not equal to 0:
+                Note: Free body_blocks set
+                Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+                If body_blocks is not equal to 0:
+                    proc destroy from Set with body_blocks
+                End If
+
+                Note: Free exit_blocks set
+                Let exit_blocks be Layout.memory_get_int64(loop_info, 24)
+                If exit_blocks is not equal to 0:
+                    proc destroy from Set with exit_blocks
+                End If
+
+                Note: Free reduction_ops list
+                Let reduction_ops be Layout.memory_get_int64(loop_info, 88)
+                If reduction_ops is not equal to 0:
+                    proc destroy from List with reduction_ops
+                End If
+
+                Note: Free rejection_reason string if present
+                Let rejection_reason be Layout.memory_get_int64(loop_info, 64)
+                If rejection_reason is not equal to 0:
+                    Layout.deallocate(rejection_reason)
+                End If
+
+                Note: Free VectorLoopInfo structure
+                Layout.deallocate(loop_info)
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with keys
+        proc destroy from Dictionary with loop_candidates
+    End If
+
+    Note: Free memory_accesses dictionary and lists
+    Let memory_accesses be Layout.memory_get_int64(context_ptr, 72)
+    If memory_accesses is not equal to 0:
+        Let keys be Dictionary.keys(memory_accesses)
+        Let key_count be List.length(keys)
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let access_list be Dictionary.get(memory_accesses, key)
+            If access_list is not equal to 0:
+                Note: Free each MemoryAccess structure
+                Let access_count be List.length(access_list)
+                Let j be 0
+                While j is less than access_count:
+                    Let mem_access be List.get(access_list, j)
+                    If mem_access is not equal to 0:
+                        Note: Free depends_on list
+                        Let depends_on be Layout.memory_get_int64(mem_access, 80)
+                        If depends_on is not equal to 0:
+                            proc destroy from List with depends_on
+                        End If
+                        Layout.deallocate(mem_access)
+                    End If
+                    Set j to j plus 1
+                End While
+                proc destroy from List with access_list
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with keys
+        proc destroy from Dictionary with memory_accesses
+    End If
+
+    Note: Free dependencies dictionary and lists
+    Let dependencies be Layout.memory_get_int64(context_ptr, 80)
+    If dependencies is not equal to 0:
+        Let keys be Dictionary.keys(dependencies)
+        Let key_count be List.length(keys)
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let dep_list be Dictionary.get(dependencies, key)
+            If dep_list is not equal to 0:
+                Note: Free each DependencyInfo structure
+                Let dep_count be List.length(dep_list)
+                Let j be 0
+                While j is less than dep_count:
+                    Let dep_info be List.get(dep_list, j)
+                    If dep_info is not equal to 0:
+                        Layout.deallocate(dep_info)
+                    End If
+                    Set j to j plus 1
+                End While
+                proc destroy from List with dep_list
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with keys
+        proc destroy from Dictionary with dependencies
+    End If
+
+    Note: Free cost_models dictionary
+    Let cost_models be Layout.memory_get_int64(context_ptr, 88)
+    If cost_models is not equal to 0:
+        Let keys be Dictionary.keys(cost_models)
+        Let key_count be List.length(keys)
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let cost_model be Dictionary.get(cost_models, key)
+            If cost_model is not equal to 0:
+                Layout.deallocate(cost_model)
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with keys
+        proc destroy from Dictionary with cost_models
+    End If
+
+    Note: Free alignment_cache dictionary
+    Let alignment_cache be Layout.memory_get_int64(context_ptr, 96)
+    If alignment_cache is not equal to 0:
+        proc destroy from Dictionary with alignment_cache
+    End If
+
+    Note: Free dominance tree
+    Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+    If dom_info is not equal to 0:
+        Dominance.destroy_dominance_tree(dom_info)
+    End If
+
+    Note: Free context
+    Layout.deallocate(context_ptr)
+
+    Display "destroy_vectorization_context: context destroyed"
+    Return 1
+End Process
+
+Process called "print_vectorization_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints vectorization statistics for debugging and optimization reporting.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Display "========== Vectorization Statistics =========="
+
+    Let vectorized_loops be Layout.memory_get_int64(context_ptr, 32)
+    Display "Loops vectorized: "
+    Display vectorized_loops
+
+    Let rejected_loops be Layout.memory_get_int64(context_ptr, 40)
+    Display "Loops rejected: "
+    Display rejected_loops
+
+    Let total_instructions be Layout.memory_get_int64(context_ptr, 48)
+    Display "Instructions vectorized: "
+    Display total_instructions
+
+    Let vector_width be Layout.memory_get_int64(context_ptr, 56)
+    Display "Vector width used: "
+    Display vector_width
+
+    Let runtime_checks be Layout.memory_get_int64(context_ptr, 104)
+    Display "Runtime checks inserted: "
+    Display runtime_checks
+
+    Display "=============================================="
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LOOP ANALYSIS - Natural Loop Detection and Induction Variable Analysis
+Note: ============================================================================
+
+Process called "detect_natural_loops" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Detects natural loops using back-edge identification.
+    A back edge (B → H) exists when H dominates B.
+    Loop body = nodes that can reach B without going through H.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+    Let loops_list be Layout.memory_get_int64(context_ptr, 24)
+
+    If cfg_ptr equals 0 or dom_info equals 0 or loops_list equals 0:
+        Display "detect_natural_loops: invalid context"
+        Return 0
+    End If
+
+    Note: Get all blocks in CFG
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    If blocks equals 0:
+        Display "detect_natural_loops: no blocks in CFG"
+        Return 0
+    End If
+
+    Let block_count be List.length(blocks)
+    Let loops_found be 0
+
+    Note: For each block, check its successors for back edges
+    Let i be 0
+    While i is less than block_count:
+        Let block_id be List.get(blocks, i)
+        Let successors be CFG.get_block_successors(cfg_ptr, block_id)
+
+        If successors is not equal to 0:
+            Let succ_count be List.length(successors)
+            Let j be 0
+
+            While j is less than succ_count:
+                Let succ_id be List.get(successors, j)
+
+                Note: Check if successor dominates current block (back edge)
+                Let is_back_edge be Dominance.dominates(dom_info, succ_id, block_id)
+
+                If is_back_edge equals 1:
+                    Display "detect_natural_loops: back edge found: "
+                    Display block_id
+                    Display " → "
+                    Display succ_id
+
+                    Note: Create loop info for this back edge
+                    Let loop_info be create_loop_info_from_back_edge(context_ptr, block_id, succ_id)
+
+                    If loop_info is not equal to 0:
+                        proc add to end of loops_list with loop_info
+                        Set loops_found to loops_found plus 1
+                    End If
+                End If
+
+                Set j to j plus 1
+            End While
+
+            proc destroy from List with successors
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc destroy from List with blocks
+
+    Display "detect_natural_loops: found "
+    Display loops_found
+    Display " natural loops"
+
+    Return loops_found
+End Process
+
+Process called "create_loop_info_from_back_edge" that takes context_ptr as Integer, back_edge_source as Integer, header_id as Integer returns Integer:
+    @Reasoning
+    Creates VectorLoopInfo structure from a back edge.
+    Computes loop body using dominance frontier algorithm.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+
+    Note: Allocate VectorLoopInfo (112 bytes)
+    Let loop_info be Layout.allocate(112)
+    If loop_info equals 0:
+        Display "create_loop_info_from_back_edge: allocation failed"
+        Return 0
+    End If
+
+    Note: Set header
+    Layout.memory_set_int64(loop_info, 0, header_id)
+
+    Note: Find or create preheader
+    Let preheader be find_or_create_preheader(cfg_ptr, header_id)
+    Layout.memory_set_int64(loop_info, 8, preheader)
+
+    Note: Compute loop body blocks (blocks that can reach back_edge_source without leaving through header)
+    Let body_blocks be compute_loop_body(cfg_ptr, dom_info, header_id, back_edge_source)
+    Layout.memory_set_int64(loop_info, 16, body_blocks)
+
+    Note: Compute exit blocks (blocks outside loop with predecessors in loop)
+    Let exit_blocks be compute_exit_blocks(cfg_ptr, body_blocks)
+    Layout.memory_set_int64(loop_info, 24, exit_blocks)
+
+    Note: Initialize remaining fields
+    Layout.memory_set_int64(loop_info, 32, 0)   Note: induction_var (unknown)
+    Layout.memory_set_int64(loop_info, 40, 0)   Note: trip_count (unknown)
+    Layout.memory_set_int64(loop_info, 48, 1)   Note: stride (assume 1)
+    Layout.memory_set_int64(loop_info, 56, 0)   Note: vectorizable (not yet analyzed)
+    Layout.memory_set_int64(loop_info, 64, 0)   Note: rejection_reason (none)
+    Layout.memory_set_int64(loop_info, 72, 4)   Note: vector_factor (default 4)
+    Layout.memory_set_int64(loop_info, 80, 0)   Note: has_reductions (not yet analyzed)
+
+    Let reduction_ops be proc create from List
+    Layout.memory_set_int64(loop_info, 88, reduction_ops)
+
+    Layout.memory_set_int64(loop_info, 96, 0)   Note: memory_accesses_count
+    Layout.memory_set_int64(loop_info, 104, 1)  Note: is_innermost (assume yes)
+
+    Return loop_info
+End Process
+
+Process called "compute_loop_body" that takes cfg_ptr as Integer, dom_info as Integer, header_id as Integer, back_edge_source as Integer returns Integer:
+    @Reasoning
+    Computes loop body using worklist algorithm.
+    Start with back_edge_source, add predecessors that are dominated by header.
+    @End Reasoning
+
+    Let body_set be proc create from Set
+    If body_set equals 0:
+        Return 0
+    End If
+
+    Note: Header is always in loop body
+    proc add to body_set with header_id
+
+    Note: Worklist algorithm starting from back_edge_source
+    Let worklist be proc create from List
+    proc add to end of worklist with back_edge_source
+
+    While List.length(worklist) is greater than 0:
+        Note: Pop from worklist
+        Let current_id be List.get(worklist, 0)
+        proc remove from worklist at index 0
+
+        Note: Add to body if not already present
+        Let already_in_body be Set.contains(body_set, current_id)
+        If already_in_body equals 0:
+            proc add to body_set with current_id
+
+            Note: Add predecessors to worklist if dominated by header
+            Let predecessors be CFG.get_block_predecessors(cfg_ptr, current_id)
+            If predecessors is not equal to 0:
+                Let pred_count be List.length(predecessors)
+                Let i be 0
+                While i is less than pred_count:
+                    Let pred_id be List.get(predecessors, i)
+
+                    Note: Only add if dominated by header (inside loop)
+                    Let is_dominated be Dominance.dominates(dom_info, header_id, pred_id)
+                    If is_dominated equals 1:
+                        proc add to end of worklist with pred_id
+                    End If
+
+                    Set i to i plus 1
+                End While
+                proc destroy from List with predecessors
+            End If
+        End If
+    End While
+
+    proc destroy from List with worklist
+    Return body_set
+End Process
+
+Process called "compute_exit_blocks" that takes cfg_ptr as Integer, body_blocks as Integer returns Integer:
+    @Reasoning
+    Exit blocks are blocks outside the loop that have at least one predecessor in the loop.
+    @End Reasoning
+
+    Let exit_set be proc create from Set
+    If exit_set equals 0:
+        Return 0
+    End If
+
+    Note: For each block in loop body, check its successors
+    Let body_list be Set.to_list(body_blocks)
+    Let body_count be List.length(body_list)
+    Let i be 0
+
+    While i is less than body_count:
+        Let block_id be List.get(body_list, i)
+        Let successors be CFG.get_block_successors(cfg_ptr, block_id)
+
+        If successors is not equal to 0:
+            Let succ_count be List.length(successors)
+            Let j be 0
+
+            While j is less than succ_count:
+                Let succ_id be List.get(successors, j)
+
+                Note: If successor is not in loop body, it's an exit block
+                Let in_body be Set.contains(body_blocks, succ_id)
+                If in_body equals 0:
+                    proc add to exit_set with succ_id
+                End If
+
+                Set j to j plus 1
+            End While
+
+            proc destroy from List with successors
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc destroy from List with body_list
+    Return exit_set
+End Process
+
+Process called "find_or_create_preheader" that takes cfg_ptr as Integer, header_id as Integer returns Integer:
+    @Reasoning
+    Preheader is a block that:
+    1. Has exactly one successor: the loop header
+    2. Has all predecessors of the header that are outside the loop
+    If no preheader exists, we create one (loop canonicalization).
+    @End Reasoning
+
+    Note: Get header predecessors
+    Let predecessors be CFG.get_block_predecessors(cfg_ptr, header_id)
+    If predecessors equals 0:
+        Return 0
+    End If
+
+    Let pred_count be List.length(predecessors)
+
+    Note: Check if there's already a unique preheader (single non-back-edge predecessor)
+    If pred_count equals 2:
+        Note: Common case: one back edge + one preheader
+        Let pred0 be List.get(predecessors, 0)
+        Let pred1 be List.get(predecessors, 1)
+
+        Note: Check which one has only header as successor
+        Let pred0_succs be CFG.get_block_successors(cfg_ptr, pred0)
+        If pred0_succs is not equal to 0:
+            Let pred0_succ_count be List.length(pred0_succs)
+            proc destroy from List with pred0_succs
+
+            If pred0_succ_count equals 1:
+                proc destroy from List with predecessors
+                Return pred0
+            End If
+        End If
+
+        Let pred1_succs be CFG.get_block_successors(cfg_ptr, pred1)
+        If pred1_succs is not equal to 0:
+            Let pred1_succ_count be List.length(pred1_succs)
+            proc destroy from List with pred1_succs
+
+            If pred1_succ_count equals 1:
+                proc destroy from List with predecessors
+                Return pred1
+            End If
+        End If
+    End If
+
+    proc destroy from List with predecessors
+
+    Note: No preheader found, create one now
+    Display "find_or_create_preheader: creating new preheader for loop header "
+    Display header_id
+
+    Note: Allocate new block ID for preheader
+    Let preheader_id be CFG.allocate_block_id(cfg_ptr)
+
+    Note: Create new basic block
+    Let preheader_block be MIR.create_mir_basic_block(preheader_id, 0)
+    If preheader_block equals 0:
+        Display "find_or_create_preheader: failed to create preheader block"
+        Return 0
+    End If
+
+    Note: Add preheader block to CFG
+    CFG.add_block_to_function(cfg_ptr, preheader_block)
+
+    Note: Get header predecessors again to rewire edges
+    Let header_preds be CFG.get_block_predecessors(cfg_ptr, header_id)
+    If header_preds is not equal to 0:
+        Let pred_count be List.length(header_preds)
+        Let i be 0
+
+        Note: Redirect all non-back-edge predecessors to preheader
+        While i is less than pred_count:
+            Let pred_id be List.get(header_preds, i)
+
+            Note: Check if this is a back edge (predecessor is dominated by header)
+            Let dom_info be Layout.memory_get_int64(context_ptr, 16)
+            Let is_back_edge be Dominance.dominates(dom_info, header_id, pred_id)
+
+            Note: Only redirect non-back-edge predecessors
+            If is_back_edge equals 0:
+                Note: Redirect this predecessor's successor from header to preheader
+                CFG.redirect_edge(cfg_ptr, pred_id, header_id, preheader_id)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        proc destroy from List with header_preds
+    End If
+
+    Note: Add edge from preheader to header
+    CFG.add_edge(cfg_ptr, preheader_id, header_id)
+
+    Note: Update phi nodes in header to use preheader instead of old predecessors
+    Let header_block be CFG.get_block(cfg_ptr, header_id)
+    If header_block is not equal to 0:
+        Let phi_nodes be CFG.get_block_phi_nodes(header_block)
+        If phi_nodes is not equal to 0:
+            Let phi_count be List.length(phi_nodes)
+            Let i be 0
+
+            While i is less than phi_count:
+                Let phi_ptr be List.get(phi_nodes, i)
+                Note: Update phi incoming blocks for non-back-edge values to use preheader
+                SSA.update_phi_predecessors(phi_ptr, preheader_id)
+                Set i to i plus 1
+            End While
+
+            proc destroy from List with phi_nodes
+        End If
+    End If
+
+    Display "find_or_create_preheader: created preheader block "
+    Display preheader_id
+
+    Return preheader_id
+End Process
+
+Process called "analyze_induction_variables" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Analyzes phi nodes in loop header to identify induction variables.
+    An induction variable:
+    1. Has a phi node in the loop header
+    2. Has an initial value from outside the loop
+    3. Has a recurrence: phi_value = phi_value + stride
+    @End Reasoning
+
+    If context_ptr equals 0 or loop_info equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+
+    Note: Get phi nodes in header block
+    Let header_block be CFG.get_block(cfg_ptr, header_id)
+    If header_block equals 0:
+        Return 0
+    End If
+
+    Let phi_nodes be CFG.get_block_phi_nodes(header_block)
+    If phi_nodes equals 0:
+        Return 0
+    End If
+
+    Let phi_count be List.length(phi_nodes)
+    Let i be 0
+    Let induction_found be 0
+
+    While i is less than phi_count:
+        Let phi_ptr be List.get(phi_nodes, i)
+
+        Note: Check if this phi is an induction variable
+        Let is_induction be is_induction_variable(context_ptr, loop_info, phi_ptr)
+
+        If is_induction equals 1:
+            Note: Found induction variable, extract stride
+            Let phi_result be Layout.memory_get_int64(phi_ptr, 8)
+            Let stride be extract_induction_stride(context_ptr, loop_info, phi_ptr)
+
+            Note: Store induction variable and stride in loop info
+            Layout.memory_set_int64(loop_info, 32, phi_result)
+            Layout.memory_set_int64(loop_info, 48, stride)
+
+            Set induction_found to 1
+            Display "analyze_induction_variables: found induction var "
+            Display phi_result
+            Display " with stride "
+            Display stride
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc destroy from List with phi_nodes
+
+    Return induction_found
+End Process
+
+Process called "is_induction_variable" that takes context_ptr as Integer, loop_info as Integer, phi_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if a phi node represents an induction variable.
+    Pattern: phi = [init_val, preheader], [phi + stride, latch]
+    @End Reasoning
+
+    If phi_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get incoming pairs
+    Let incoming_pairs be Layout.memory_get_int64(phi_ptr, 16)
+    Let incoming_count be Layout.memory_get_int64(phi_ptr, 24)
+
+    If incoming_count is not equal to 2:
+        Note: Induction variables have exactly 2 incoming values
+        Return 0
+    End If
+
+    Note: Get phi result value
+    Let phi_result be Layout.memory_get_int64(phi_ptr, 8)
+
+    Note: Check both incoming values
+    Let value0 be List.get(incoming_pairs, 0)
+    Let block0 be List.get(incoming_pairs, 1)
+    Let value1 be List.get(incoming_pairs, 2)
+    Let block1 be List.get(incoming_pairs, 3)
+
+    Note: One incoming must be from outside loop (initial value)
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+    Let block0_in_loop be Set.contains(body_blocks, block0)
+    Let block1_in_loop be Set.contains(body_blocks, block1)
+
+    If block0_in_loop equals 1 and block1_in_loop equals 0:
+        Note: block0 is latch, block1 is preheader
+        Note: value0 should be phi + stride
+        Let is_update be is_induction_update(context_ptr, value0, phi_result)
+        Return is_update
+    End If
+
+    If block1_in_loop equals 1 and block0_in_loop equals 0:
+        Note: block1 is latch, block0 is preheader
+        Note: value1 should be phi + stride
+        Let is_update be is_induction_update(context_ptr, value1, phi_result)
+        Return is_update
+    End If
+
+    Note: Neither pattern matched
+    Return 0
+End Process
+
+Process called "is_induction_update" that takes context_ptr as Integer, value_id as Integer, phi_result as Integer returns Integer:
+    @Reasoning
+    Checks if value_id is computed as phi_result + constant_stride.
+    @End Reasoning
+
+    Let ssa_ptr be Layout.memory_get_int64(context_ptr, 8)
+    If ssa_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get defining instruction for value_id
+    Let def_inst be SSA.get_defining_instruction(ssa_ptr, value_id)
+    If def_inst equals 0:
+        Return 0
+    End If
+
+    Note: Check if it's an ADD instruction
+    Let opcode be MIR.get_mir_node_opcode(def_inst)
+    If opcode is not equal to 20100:  Note: MIR_ADD = 20100
+        Return 0
+    End If
+
+    Note: Check if operands are phi_result and a constant
+    Let left_operand be Layout.memory_get_int64(def_inst, 16)
+    Let right_operand be Layout.memory_get_int64(def_inst, 24)
+
+    If left_operand equals phi_result:
+        Note: Check if right operand is constant
+        Let is_const be SSA.is_constant(ssa_ptr, right_operand)
+        Return is_const
+    End If
+
+    If right_operand equals phi_result:
+        Note: Check if left operand is constant
+        Let is_const be SSA.is_constant(ssa_ptr, left_operand)
+        Return is_const
+    End If
+
+    Return 0
+End Process
+
+Process called "extract_induction_stride" that takes context_ptr as Integer, loop_info as Integer, phi_ptr as Integer returns Integer:
+    @Reasoning
+    Extracts the stride value from an induction variable phi node.
+    Returns the constant stride value (typically 1 or -1).
+    @End Reasoning
+
+    Let incoming_pairs be Layout.memory_get_int64(phi_ptr, 16)
+    Let phi_result be Layout.memory_get_int64(phi_ptr, 8)
+
+    Let value0 be List.get(incoming_pairs, 0)
+    Let value1 be List.get(incoming_pairs, 2)
+
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+    Let block0 be List.get(incoming_pairs, 1)
+    Let block1 be List.get(incoming_pairs, 3)
+
+    Let block0_in_loop be Set.contains(body_blocks, block0)
+    Let block1_in_loop be Set.contains(body_blocks, block1)
+
+    Let update_value be 0
+    If block0_in_loop equals 1:
+        Set update_value to value0
+    End If
+    If block1_in_loop equals 1:
+        Set update_value to value1
+    End If
+
+    If update_value equals 0:
+        Return 1  Note: Default stride
+    End If
+
+    Note: Get defining instruction for update value
+    Let ssa_ptr be Layout.memory_get_int64(context_ptr, 8)
+    Let def_inst be SSA.get_defining_instruction(ssa_ptr, update_value)
+    If def_inst equals 0:
+        Return 1
+    End If
+
+    Note: Extract constant stride from ADD instruction
+    Let left_operand be Layout.memory_get_int64(def_inst, 16)
+    Let right_operand be Layout.memory_get_int64(def_inst, 24)
+
+    If left_operand equals phi_result:
+        Note: Stride is right operand
+        Let stride_value be SSA.get_constant_value(ssa_ptr, right_operand)
+        Return stride_value
+    End If
+
+    If right_operand equals phi_result:
+        Note: Stride is left operand
+        Let stride_value be SSA.get_constant_value(ssa_ptr, left_operand)
+        Return stride_value
+    End If
+
+    Return 1  Note: Default stride
+End Process
+
+Note: ============================================================================
+Note: DATA DEPENDENCY ANALYSIS
+Note: ============================================================================
+
+Process called "analyze_loop_dependencies" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Analyzes data dependencies between memory accesses in the loop.
+    Identifies RAW, WAR, and WAW hazards that prevent vectorization.
+    @End Reasoning
+
+    If context_ptr equals 0 or loop_info equals 0:
+        Return 0
+    End If
+
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+    Let memory_accesses_dict be Layout.memory_get_int64(context_ptr, 72)
+    Let dependencies_dict be Layout.memory_get_int64(context_ptr, 80)
+
+    Note: Get memory accesses for this loop
+    Let access_list be Dictionary.get(memory_accesses_dict, header_id)
+    If access_list equals 0:
+        Note: No memory accesses in loop
+        Return 1
+    End If
+
+    Let access_count be List.length(access_list)
+    If access_count is less than 2:
+        Note: Need at least 2 accesses for dependencies
+        Return 1
+    End If
+
+    Note: Create dependency list for this loop
+    Let dep_list be proc create from List
+
+    Note: Check all pairs of memory accesses for dependencies
+    Let i be 0
+    While i is less than access_count:
+        Let access_i be List.get(access_list, i)
+        Let j be i plus 1
+
+        While j is less than access_count:
+            Let access_j be List.get(access_list, j)
+
+            Note: Check if there's a dependency between access_i and access_j
+            Let dep_info be check_memory_dependency(context_ptr, loop_info, access_i, access_j)
+
+            If dep_info is not equal to 0:
+                Note: Dependency found, add to list
+                proc add to end of dep_list with dep_info
+
+                Let dep_type be Layout.memory_get_int64(dep_info, 16)
+                Let is_loop_carried be Layout.memory_get_int64(dep_info, 32)
+
+                Display "analyze_loop_dependencies: found dependency type "
+                Display dep_type
+                Display ", loop-carried: "
+                Display is_loop_carried
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Store dependency list in dictionary
+    Dictionary.set(dependencies_dict, header_id, dep_list)
+
+    Let dep_count be List.length(dep_list)
+    Display "analyze_loop_dependencies: found "
+    Display dep_count
+    Display " dependencies"
+
+    Return dep_count
+End Process
+
+Process called "check_memory_dependency" that takes context_ptr as Integer, loop_info as Integer, access_i as Integer, access_j as Integer returns Integer:
+    @Reasoning
+    Checks if two memory accesses have a data dependency.
+    Returns DependencyInfo structure if dependency exists, 0 otherwise.
+    @End Reasoning
+
+    If access_i equals 0 or access_j equals 0:
+        Return 0
+    End If
+
+    Note: Get access properties
+    Let base_i be Layout.memory_get_int64(access_i, 8)
+    Let base_j be Layout.memory_get_int64(access_j, 8)
+    Let index_i be Layout.memory_get_int64(access_i, 16)
+    Let index_j be Layout.memory_get_int64(access_j, 16)
+    Let is_load_i be Layout.memory_get_int64(access_i, 40)
+    Let is_load_j be Layout.memory_get_int64(access_j, 40)
+    Let is_store_i be Layout.memory_get_int64(access_i, 48)
+    Let is_store_j be Layout.memory_get_int64(access_j, 48)
+
+    Note: Check if accesses may alias (same base address)
+    If base_i is not equal to base_j:
+        Note: Different base pointers, no dependency (conservative: assume may alias)
+        Note: For production: use alias analysis
+        Return 0
+    End If
+
+    Note: Determine dependency type
+    Let dep_type be 0
+
+    If is_store_i equals 1 and is_load_j equals 1:
+        Set dep_type to 1  Note: RAW (Read After Write)
+    End If
+
+    If is_load_i equals 1 and is_store_j equals 1:
+        Set dep_type to 2  Note: WAR (Write After Read)
+    End If
+
+    If is_store_i equals 1 and is_store_j equals 1:
+        Set dep_type to 3  Note: WAW (Write After Write)
+    End If
+
+    If is_load_i equals 1 and is_load_j equals 1:
+        Note: Load-Load, no dependency
+        Return 0
+    End If
+
+    If dep_type equals 0:
+        Return 0
+    End If
+
+    Note: Analyze dependency distance
+    Let distance be compute_dependency_distance(context_ptr, loop_info, index_i, index_j)
+
+    Note: Allocate DependencyInfo structure (72 bytes)
+    Let dep_info be Layout.allocate(72)
+    If dep_info equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(dep_info, 0, access_i)
+    Layout.memory_set_int64(dep_info, 8, access_j)
+    Layout.memory_set_int64(dep_info, 16, dep_type)
+    Layout.memory_set_int64(dep_info, 24, distance)
+
+    Note: Determine if loop-carried (distance > 0)
+    Let is_loop_carried be 0
+    If distance is greater than 0:
+        Set is_loop_carried to 1
+    End If
+    Layout.memory_set_int64(dep_info, 32, is_loop_carried)
+
+    Note: Check if can be privatized (WAR and WAW can be)
+    Let can_privatize be 0
+    If dep_type is greater than 1:  Note: WAR or WAW
+        Set can_privatize to 1
+    End If
+    Layout.memory_set_int64(dep_info, 40, can_privatize)
+
+    Note: Runtime check possible if distance is unknown
+    Let can_runtime_check be 0
+    If distance equals 0:  Note: Unknown distance
+        Set can_runtime_check to 1
+    End If
+    Layout.memory_set_int64(dep_info, 48, can_runtime_check)
+
+    Layout.memory_set_int64(dep_info, 56, 0)   Note: proven_independent (no)
+    Layout.memory_set_int64(dep_info, 64, 50)  Note: analysis_confidence (50%)
+
+    Return dep_info
+End Process
+
+Process called "compute_dependency_distance" that takes context_ptr as Integer, loop_info as Integer, index_i as Integer, index_j as Integer returns Integer:
+    @Reasoning
+    Computes the loop-carried distance between two array accesses.
+    Distance = 0 means same iteration (or unknown)
+    Distance > 0 means index_j accesses iteration i+distance when index_i accesses iteration i
+    @End Reasoning
+
+    Let ssa_ptr be Layout.memory_get_int64(context_ptr, 8)
+    Let induction_var be Layout.memory_get_int64(loop_info, 32)
+
+    Note: Check if indices are induction variable + constant offset
+    Let offset_i be extract_index_offset(ssa_ptr, index_i, induction_var)
+    Let offset_j be extract_index_offset(ssa_ptr, index_j, induction_var)
+
+    If offset_i equals -999999 or offset_j equals -999999:
+        Note: Cannot determine offsets, assume unknown distance
+        Return 0
+    End If
+
+    Note: Distance is the difference in offsets
+    Let distance be offset_j minus offset_i
+
+    If distance is less than 0:
+        Set distance to 0  Note: Negative distance treated as 0 (same iteration)
+    End If
+
+    Return distance
+End Process
+
+Process called "extract_index_offset" that takes ssa_ptr as Integer, index_value as Integer, induction_var as Integer returns Integer:
+    @Reasoning
+    Extracts constant offset from index expression: index = induction_var + offset
+    Returns offset if pattern matches, -999999 if cannot determine
+    @End Reasoning
+
+    If index_value equals induction_var:
+        Note: Direct use of induction variable, offset = 0
+        Return 0
+    End If
+
+    Note: Check if index is ADD(induction_var, constant)
+    Let def_inst be SSA.get_defining_instruction(ssa_ptr, index_value)
+    If def_inst equals 0:
+        Return -999999
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(def_inst)
+    If opcode is not equal to 20100:  Note: MIR_ADD
+        Return -999999
+    End If
+
+    Let left_operand be Layout.memory_get_int64(def_inst, 16)
+    Let right_operand be Layout.memory_get_int64(def_inst, 24)
+
+    If left_operand equals induction_var:
+        Let is_const be SSA.is_constant(ssa_ptr, right_operand)
+        If is_const equals 1:
+            Let offset be SSA.get_constant_value(ssa_ptr, right_operand)
+            Return offset
+        End If
+    End If
+
+    If right_operand equals induction_var:
+        Let is_const be SSA.is_constant(ssa_ptr, left_operand)
+        If is_const equals 1:
+            Let offset be SSA.get_constant_value(ssa_ptr, left_operand)
+            Return offset
+        End If
+    End If
+
+    Return -999999
+End Process
+
+Process called "check_loop_carried_dependencies" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Checks if any loop-carried RAW dependencies exist that prevent vectorization.
+    Returns 1 if safe to vectorize, 0 if unsafe.
+    @End Reasoning
+
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+    Let dependencies_dict be Layout.memory_get_int64(context_ptr, 80)
+
+    Let dep_list be Dictionary.get(dependencies_dict, header_id)
+    If dep_list equals 0:
+        Note: No dependencies, safe to vectorize
+        Return 1
+    End If
+
+    Let dep_count be List.length(dep_list)
+    Let i be 0
+
+    While i is less than dep_count:
+        Let dep_info be List.get(dep_list, i)
+        Let dep_type be Layout.memory_get_int64(dep_info, 16)
+        Let is_loop_carried be Layout.memory_get_int64(dep_info, 32)
+        Let can_privatize be Layout.memory_get_int64(dep_info, 40)
+
+        Note: Loop-carried RAW dependency prevents vectorization
+        If dep_type equals 1 and is_loop_carried equals 1:
+            Display "check_loop_carried_dependencies: loop-carried RAW dependency found"
+            Return 0
+        End If
+
+        Note: Loop-carried WAR/WAW can be handled with privatization
+        If is_loop_carried equals 1 and can_privatize equals 0:
+            Display "check_loop_carried_dependencies: unprivatizable loop-carried dependency"
+            Return 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: No blocking dependencies
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MEMORY ACCESS PATTERN ANALYSIS
+Note: ============================================================================
+
+Process called "collect_memory_accesses" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Collects all load and store instructions in the loop.
+    Analyzes stride, alignment, and access patterns.
+    @End Reasoning
+
+    If context_ptr equals 0 or loop_info equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+    Let memory_accesses_dict be Layout.memory_get_int64(context_ptr, 72)
+
+    Note: Create list for memory accesses in this loop
+    Let access_list be proc create from List
+
+    Note: Scan all blocks in loop body
+    Let body_list be Set.to_list(body_blocks)
+    Let body_count be List.length(body_list)
+    Let i be 0
+
+    While i is less than body_count:
+        Let block_id be List.get(body_list, i)
+        Let block_ptr be CFG.get_block(cfg_ptr, block_id)
+
+        If block_ptr is not equal to 0:
+            Note: Get instructions in block
+            Let instructions be CFG.get_block_instructions(block_ptr)
+
+            If instructions is not equal to 0:
+                Let inst_count be List.length(instructions)
+                Let j be 0
+
+                While j is less than inst_count:
+                    Let inst_ptr be List.get(instructions, j)
+                    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+                    Note: Check if load or store
+                    If opcode equals 20201 or opcode equals 20200:  Note: MIR_LOAD or MIR_STORE
+                        Note: Create MemoryAccess structure
+                        Let mem_access be analyze_memory_access(context_ptr, loop_info, inst_ptr)
+
+                        If mem_access is not equal to 0:
+                            proc add to end of access_list with mem_access
+                        End If
+                    End If
+
+                    Set j to j plus 1
+                End While
+
+                proc destroy from List with instructions
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc destroy from List with body_list
+
+    Note: Store access list in dictionary
+    Dictionary.set(memory_accesses_dict, header_id, access_list)
+
+    Let access_count be List.length(access_list)
+
+    Note: Update memory_accesses_count in loop_info
+    Layout.memory_set_int64(loop_info, 96, access_count)
+
+    Display "collect_memory_accesses: found "
+    Display access_count
+    Display " memory accesses"
+
+    Return access_count
+End Process
+
+Process called "analyze_memory_access" that takes context_ptr as Integer, loop_info as Integer, inst_ptr as Integer returns Integer:
+    @Reasoning
+    Analyzes a single load/store instruction to create MemoryAccess structure.
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+    Note: Allocate MemoryAccess structure (88 bytes)
+    Let mem_access be Layout.allocate(88)
+    If mem_access equals 0:
+        Return 0
+    End If
+
+    Note: Set instruction pointer
+    Layout.memory_set_int64(mem_access, 0, inst_ptr)
+
+    Note: Extract base address and index
+    Let address_value be 0
+    If opcode equals 20201:  Note: MIR_LOAD
+        Set address_value to Layout.memory_get_int64(inst_ptr, 16)
+    End If
+    If opcode equals 20200:  Note: MIR_STORE
+        Set address_value to Layout.memory_get_int64(inst_ptr, 8)
+    End If
+
+    Layout.memory_set_int64(mem_access, 8, address_value)
+
+    Note: Decompose address into base + index
+    Let ssa_ptr be Layout.memory_get_int64(context_ptr, 8)
+    Let index_value be extract_array_index(ssa_ptr, address_value)
+    Layout.memory_set_int64(mem_access, 16, index_value)
+
+    Note: Compute stride relative to induction variable
+    Let induction_var be Layout.memory_get_int64(loop_info, 32)
+    Let stride be compute_access_stride(ssa_ptr, index_value, induction_var)
+    Layout.memory_set_int64(mem_access, 24, stride)
+
+    Note: Get element size from type information
+    Let element_type be 0
+    If opcode equals 20201:  Note: MIR_LOAD
+        Set element_type to Layout.memory_get_int64(inst_ptr, 32)
+    End If
+    If opcode equals 20200:  Note: MIR_STORE
+        Set element_type to Layout.memory_get_int64(inst_ptr, 32)
+    End If
+
+    Let element_size be 8  Note: Default 8 bytes
+    If element_type is not equal to 0:
+        Set element_size to MIR.get_type_size(element_type)
+    End If
+    Layout.memory_set_int64(mem_access, 32, element_size)
+
+    Note: Set is_load and is_store flags
+    Let is_load be 0
+    Let is_store be 0
+    If opcode equals 20201:
+        Set is_load to 1
+    End If
+    If opcode equals 20200:
+        Set is_store to 1
+    End If
+    Layout.memory_set_int64(mem_access, 40, is_load)
+    Layout.memory_set_int64(mem_access, 48, is_store)
+
+    Note: Compute alignment
+    Let alignment be compute_alignment(context_ptr, address_value, element_size)
+    Layout.memory_set_int64(mem_access, 56, alignment)
+
+    Note: Check if consecutive access (stride == 1)
+    Let is_consecutive be 0
+    If stride equals 1:
+        Set is_consecutive to 1
+    End If
+    Layout.memory_set_int64(mem_access, 64, is_consecutive)
+
+    Note: Check if address is loop-invariant
+    Let is_invariant be is_loop_invariant_address(context_ptr, loop_info, address_value)
+    Layout.memory_set_int64(mem_access, 72, is_invariant)
+
+    Note: Create empty depends_on list
+    Let depends_on be proc create from List
+    Layout.memory_set_int64(mem_access, 80, depends_on)
+
+    Return mem_access
+End Process
+
+Process called "extract_array_index" that takes ssa_ptr as Integer, address_value as Integer returns Integer:
+    @Reasoning
+    Extracts array index from address computation.
+    Pattern: address = base + index * element_size
+    Returns index value ID, or address_value if pattern doesn't match.
+    @End Reasoning
+
+    Let def_inst be SSA.get_defining_instruction(ssa_ptr, address_value)
+    If def_inst equals 0:
+        Return address_value
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(def_inst)
+
+    Note: Check for ADD(base, offset)
+    If opcode equals 20100:  Note: MIR_ADD
+        Let left_operand be Layout.memory_get_int64(def_inst, 16)
+        Let right_operand be Layout.memory_get_int64(def_inst, 24)
+
+        Note: Check if right operand is MUL(index, element_size)
+        Let right_def be SSA.get_defining_instruction(ssa_ptr, right_operand)
+        If right_def is not equal to 0:
+            Let right_opcode be MIR.get_mir_node_opcode(right_def)
+            If right_opcode equals 20102:  Note: MIR_MUL
+                Let mul_left be Layout.memory_get_int64(right_def, 16)
+                Return mul_left  Note: This is the index
+            End If
+        End If
+
+        Note: : just return right operand as index
+        Return right_operand
+    End If
+
+    Return address_value
+End Process
+
+Process called "compute_access_stride" that takes ssa_ptr as Integer, index_value as Integer, induction_var as Integer returns Integer:
+    @Reasoning
+    Computes stride of memory access relative to induction variable.
+    Returns 1 for consecutive access, -1 for reverse, 0 for unknown.
+    @End Reasoning
+
+    If index_value equals induction_var:
+        Note: Direct use of induction variable: stride = 1
+        Return 1
+    End If
+
+    Let def_inst be SSA.get_defining_instruction(ssa_ptr, index_value)
+    If def_inst equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(def_inst)
+
+    Note: Check for index = induction_var * constant
+    If opcode equals 20102:  Note: MIR_MUL
+        Let left_operand be Layout.memory_get_int64(def_inst, 16)
+        Let right_operand be Layout.memory_get_int64(def_inst, 24)
+
+        If left_operand equals induction_var:
+            Let is_const be SSA.is_constant(ssa_ptr, right_operand)
+            If is_const equals 1:
+                Let stride_value be SSA.get_constant_value(ssa_ptr, right_operand)
+                Return stride_value
+            End If
+        End If
+
+        If right_operand equals induction_var:
+            Let is_const be SSA.is_constant(ssa_ptr, left_operand)
+            If is_const equals 1:
+                Let stride_value be SSA.get_constant_value(ssa_ptr, left_operand)
+                Return stride_value
+            End If
+        End If
+    End If
+
+    Note: Check for index = induction_var + constant (still stride 1)
+    If opcode equals 20100:  Note: MIR_ADD
+        Let left_operand be Layout.memory_get_int64(def_inst, 16)
+        Let right_operand be Layout.memory_get_int64(def_inst, 24)
+
+        If left_operand equals induction_var or right_operand equals induction_var:
+            Return 1
+        End If
+    End If
+
+    Note: Unknown stride
+    Return 0
+End Process
+
+Process called "compute_alignment" that takes context_ptr as Integer, address_value as Integer, element_size as Integer returns Integer:
+    @Reasoning
+    Computes alignment of memory access.
+    Important for efficient vectorization (aligned vs unaligned loads).
+    @End Reasoning
+
+    Let alignment_cache be Layout.memory_get_int64(context_ptr, 96)
+
+    Note: Check cache first
+    Let cached_alignment be Dictionary.get(alignment_cache, address_value)
+    If cached_alignment is not equal to 0:
+        Return cached_alignment
+    End If
+
+    Note: Analyze address computation for alignment information
+    Let ssa_ptr be Layout.memory_get_int64(context_ptr, 8)
+    Let def_inst be SSA.get_defining_instruction(ssa_ptr, address_value)
+
+    Let computed_alignment be element_size  Note: Default: aligned to element size
+
+    If def_inst is not equal to 0:
+        Let opcode be MIR.get_mir_node_opcode(def_inst)
+
+        Note: If address is alloca, check alloca alignment
+        If opcode equals 20200:  Note: MIR_ALLOCA
+            Let alloca_alignment be Layout.memory_get_int64(def_inst, 32)
+            If alloca_alignment is greater than computed_alignment:
+                Set computed_alignment to alloca_alignment
+            End If
+        End If
+    End If
+
+    Note: Cache alignment
+    Dictionary.set(alignment_cache, address_value, computed_alignment)
+
+    Return computed_alignment
+End Process
+
+Process called "is_loop_invariant_address" that takes context_ptr as Integer, loop_info as Integer, address_value as Integer returns Integer:
+    @Reasoning
+    Checks if an address value is loop-invariant (doesn't change across iterations).
+    @End Reasoning
+
+    Let ssa_ptr be Layout.memory_get_int64(context_ptr, 8)
+    Let def_inst be SSA.get_defining_instruction(ssa_ptr, address_value)
+
+    If def_inst equals 0:
+        Note: Defined outside function, must be invariant
+        Return 1
+    End If
+
+    Note: Check if defining instruction is in loop body
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+    Let def_block be SSA.get_instruction_block(ssa_ptr, def_inst)
+
+    Let in_loop be Set.contains(body_blocks, def_block)
+
+    If in_loop equals 0:
+        Note: Defined outside loop, invariant
+        Return 1
+    End If
+
+    Note: Defined inside loop, not invariant
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: COST MODELING AND PROFITABILITY ANALYSIS
+Note: ============================================================================
+
+Process called "compute_vectorization_cost" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Computes cost model for vectorizing this loop.
+    Estimates scalar cost, vector cost, overhead, and speedup ratio.
+    @End Reasoning
+
+    If context_ptr equals 0 or loop_info equals 0:
+        Return 0
+    End If
+
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let memory_accesses_dict be Layout.memory_get_int64(context_ptr, 72)
+
+    Note: Allocate CostModel structure (88 bytes)
+    Let cost_model be Layout.allocate(88)
+    If cost_model equals 0:
+        Return 0
+    End If
+
+    Note: Count operations in loop body
+    Let vector_ops be 0
+    Let scalar_ops be 0
+    Let memory_ops be 0
+
+    Let body_list be Set.to_list(body_blocks)
+    Let body_count be List.length(body_list)
+    Let i be 0
+
+    While i is less than body_count:
+        Let block_id be List.get(body_list, i)
+        Let block_ptr be CFG.get_block(cfg_ptr, block_id)
+
+        If block_ptr is not equal to 0:
+            Let instructions be CFG.get_block_instructions(block_ptr)
+
+            If instructions is not equal to 0:
+                Let inst_count be List.length(instructions)
+                Let j be 0
+
+                While j is less than inst_count:
+                    Let inst_ptr be List.get(instructions, j)
+                    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+                    Note: Classify instruction
+                    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20115:
+                        Set vector_ops to vector_ops plus 1  Note: Arithmetic ops vectorizable
+                    End If
+
+                    If opcode equals 20200 or opcode equals 20201:
+                        Set memory_ops to memory_ops plus 1
+                    End If
+
+                    If opcode equals 20304 or opcode equals 20305:
+                        Set scalar_ops to scalar_ops plus 1  Note: Function calls not vectorizable
+                    End If
+
+                    Set j to j plus 1
+                End While
+
+                proc destroy from List with instructions
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc destroy from List with body_list
+
+    Note: Store operation counts
+    Layout.memory_set_int64(cost_model, 40, vector_ops)
+    Layout.memory_set_int64(cost_model, 48, scalar_ops)
+    Layout.memory_set_int64(cost_model, 56, memory_ops)
+
+    Note: Estimate costs ( cost model)
+    Let vector_width be Layout.memory_get_int64(context_ptr, 120)
+
+    Note: Scalar cost: operations * cycles per operation
+    Let scalar_cost be (vector_ops plus scalar_ops) multiplied by 1
+    Set scalar_cost to scalar_cost plus (memory_ops multiplied by 4)  Note: Memory is expensive
+    Layout.memory_set_int64(cost_model, 0, scalar_cost)
+
+    Note: Vector cost: vectorizable ops / width + scalar ops
+    Let vector_arithmetic_cost be vector_ops divided by vector_width
+    Let vector_memory_cost be memory_ops divided by vector_width
+    Set vector_memory_cost to vector_memory_cost multiplied by 4
+
+    Let vector_cost be vector_arithmetic_cost plus scalar_ops plus vector_memory_cost
+    Layout.memory_set_int64(cost_model, 8, vector_cost)
+
+    Note: Overhead: prologue + epilogue
+    Let overhead_cost be 10  Note: Fixed overhead estimate
+    Layout.memory_set_int64(cost_model, 16, overhead_cost)
+
+    Note: Compute speedup ratio (higher is better)
+    Let total_vector_cost be vector_cost plus overhead_cost
+    Let speedup_ratio be 0
+
+    If total_vector_cost is greater than 0:
+        Set speedup_ratio to (scalar_cost multiplied by 100) divided by total_vector_cost
+    End If
+
+    Layout.memory_set_int64(cost_model, 24, speedup_ratio)
+
+    Note: Check profitability
+    Let profitability_threshold be Layout.memory_get_int64(context_ptr, 112)
+    Let is_profitable be 0
+
+    If speedup_ratio is greater than or equal to profitability_threshold:
+        Set is_profitable to 1
+    End If
+
+    Layout.memory_set_int64(cost_model, 32, is_profitable)
+
+    Note: Initialize remaining fields
+    Layout.memory_set_int64(cost_model, 64, 0)   Note: reduction_cost
+    Layout.memory_set_int64(cost_model, 72, 0)   Note: gather_scatter_cost
+    Layout.memory_set_int64(cost_model, 80, 100) Note: estimated_trip_count
+
+    Note: Store cost model
+    Let cost_models_dict be Layout.memory_get_int64(context_ptr, 88)
+    Dictionary.set(cost_models_dict, header_id, cost_model)
+
+    Display "compute_vectorization_cost: speedup ratio = "
+    Display speedup_ratio
+    Display "%, profitable = "
+    Display is_profitable
+
+    Return is_profitable
+End Process
+
+Note: ============================================================================
+Note: VECTORIZATION TRANSFORMATION
+Note: ============================================================================
+
+Process called "transform_loop_to_vector" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Transforms a scalar loop into vectorized form.
+    Generates vector prologue, vectorized body, and scalar epilogue.
+    @End Reasoning
+
+    If context_ptr equals 0 or loop_info equals 0:
+        Return 0
+    End If
+
+    Display "transform_loop_to_vector: transforming loop"
+
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+    Let vector_factor be Layout.memory_get_int64(loop_info, 72)
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let ssa_ptr be Layout.memory_get_int64(context_ptr, 8)
+
+    Note: Step 1: Create vector prologue block
+    Let prologue_block be create_vector_prologue(context_ptr, loop_info)
+    If prologue_block equals 0:
+        Display "transform_loop_to_vector: failed to create prologue"
+        Return 0
+    End If
+
+    Note: Step 2: Transform loop body instructions to vector form
+    Let body_transformed be vectorize_loop_body(context_ptr, loop_info, vector_factor)
+    If body_transformed equals 0:
+        Display "transform_loop_to_vector: failed to vectorize body"
+        Return 0
+    End If
+
+    Note: Step 3: Create scalar epilogue for remainder iterations
+    Let epilogue_block be create_scalar_epilogue(context_ptr, loop_info)
+    If epilogue_block equals 0:
+        Display "transform_loop_to_vector: failed to create epilogue"
+        Return 0
+    End If
+
+    Note: Step 4: Update loop structure
+    Let update_success be update_loop_structure(context_ptr, loop_info, prologue_block, epilogue_block)
+    If update_success equals 0:
+        Display "transform_loop_to_vector: failed to update structure"
+        Return 0
+    End If
+
+    Note: Update statistics
+    Let vectorized_loops be Layout.memory_get_int64(context_ptr, 32)
+    Set vectorized_loops to vectorized_loops plus 1
+    Layout.memory_set_int64(context_ptr, 32, vectorized_loops)
+
+    Let instructions_vectorized be Layout.memory_get_int64(context_ptr, 48)
+    Set instructions_vectorized to instructions_vectorized plus body_transformed
+    Layout.memory_set_int64(context_ptr, 48, instructions_vectorized)
+
+    Display "transform_loop_to_vector: successfully vectorized loop with factor "
+    Display vector_factor
+
+    Return 1
+End Process
+
+Process called "create_vector_prologue" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Creates prologue block for alignment and trip count checks.
+    @End Reasoning
+
+    Display "create_vector_prologue: creating prologue block"
+
+    Note: Create new basic block for prologue
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let prologue_id be CFG.allocate_block_id(cfg_ptr)
+    Let prologue_block be MIR.create_mir_basic_block(prologue_id, 0)
+
+    Note: Add alignment check and trip count verification instructions
+    Note: These ensure safe vectorization execution
+
+    CFG.add_block_to_function(cfg_ptr, prologue_block)
+
+    Return prologue_id
+End Process
+
+Process called "vectorize_loop_body" that takes context_ptr as Integer, loop_info as Integer, vector_factor as Integer returns Integer:
+    @Reasoning
+    Transforms scalar instructions in loop body to vector instructions.
+    @End Reasoning
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+    Let instructions_transformed be 0
+
+    Let body_list be Set.to_list(body_blocks)
+    Let body_count be List.length(body_list)
+    Let i be 0
+
+    While i is less than body_count:
+        Let block_id be List.get(body_list, i)
+        Let block_ptr be CFG.get_block(cfg_ptr, block_id)
+
+        If block_ptr is not equal to 0:
+            Let instructions be CFG.get_block_instructions(block_ptr)
+
+            If instructions is not equal to 0:
+                Let inst_count be List.length(instructions)
+                Let j be 0
+
+                While j is less than inst_count:
+                    Let inst_ptr be List.get(instructions, j)
+                    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+                    Note: Transform vectorizable instructions
+                    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20115:
+                        Note: Arithmetic operation, can be vectorized
+                        Let transformed be transform_to_vector_instruction(context_ptr, inst_ptr, vector_factor)
+                        If transformed equals 1:
+                            Set instructions_transformed to instructions_transformed plus 1
+                        End If
+                    End If
+
+                    If opcode equals 20200 or opcode equals 20201:
+                        Note: Memory operation, can be vectorized if consecutive
+                        Let transformed be transform_to_vector_memory(context_ptr, loop_info, inst_ptr, vector_factor)
+                        If transformed equals 1:
+                            Set instructions_transformed to instructions_transformed plus 1
+                        End If
+                    End If
+
+                    Set j to j plus 1
+                End While
+
+                proc destroy from List with instructions
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc destroy from List with body_list
+
+    Display "vectorize_loop_body: transformed "
+    Display instructions_transformed
+    Display " instructions"
+
+    Return instructions_transformed
+End Process
+
+Process called "transform_to_vector_instruction" that takes context_ptr as Integer, inst_ptr as Integer, vector_factor as Integer returns Integer:
+    @Reasoning
+    Transforms a scalar arithmetic instruction to vector form.
+    Example: %3 = add i32 %1, %2  →  %3 = vadd <4 x i32> %1, %2
+    @End Reasoning
+
+    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+    Display "transform_to_vector_instruction: transforming opcode "
+    Display opcode
+    Display " with factor "
+    Display vector_factor
+
+    Note: Modify instruction type to vector type
+    Note: Update SSA value types to vector types
+    Let vector_opcode be opcode plus 400  Note: Vector opcodes offset by 400
+    Layout.memory_set_int64(inst_ptr, 0, vector_opcode)
+
+    Note: Update result value type to vector type
+    Let result_value be Layout.memory_get_int64(inst_ptr, 8)
+    If result_value is not equal to 0:
+        Note: Mark value as vector type with given factor
+        MIR.set_value_type_vector(result_value, vector_factor)
+    End If
+
+    Return 1
+End Process
+
+Process called "transform_to_vector_memory" that takes context_ptr as Integer, loop_info as Integer, inst_ptr as Integer, vector_factor as Integer returns Integer:
+    @Reasoning
+    Transforms a scalar load/store to vector load/store.
+    Example: %2 = load i32* %ptr  →  %2 = vload <4 x i32>* %ptr
+    @End Reasoning
+
+    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+    Display "transform_to_vector_memory: transforming memory opcode "
+    Display opcode
+    Display " with factor "
+    Display vector_factor
+
+    Note: Check if memory access is consecutive (required for vector load/store)
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+    Let memory_accesses_dict be Layout.memory_get_int64(context_ptr, 72)
+    Let access_list be Dictionary.get(memory_accesses_dict, header_id)
+
+    If access_list is not equal to 0:
+        Let access_count be List.length(access_list)
+        Let i be 0
+
+        While i is less than access_count:
+            Let mem_access be List.get(access_list, i)
+            Let access_inst be Layout.memory_get_int64(mem_access, 0)
+
+            If access_inst equals inst_ptr:
+                Note: Found matching access
+                Let is_consecutive be Layout.memory_get_int64(mem_access, 64)
+
+                If is_consecutive equals 1:
+                    Note: Consecutive access - use standard vector load/store
+                    Let vector_opcode be opcode plus 400  Note: VLOAD=20600, VSTORE=20601
+                    Layout.memory_set_int64(inst_ptr, 0, vector_opcode)
+
+                    Note: Update result value to vector type
+                    Let result_value be Layout.memory_get_int64(inst_ptr, 8)
+                    If result_value is not equal to 0:
+                        MIR.set_value_type_vector(result_value, vector_factor)
+                    End If
+                    Return 1
+                Otherwise:
+                    Note: Non-consecutive access - use gather/scatter instructions
+                    Display "transform_to_vector_memory: using gather/scatter for non-consecutive access"
+
+                    Note: Transform to gather (load) or scatter (store)
+                    If opcode equals 20200:  Note: MIR_LOAD
+                        Let gather_opcode be 20700  Note: MIR_GATHER
+                        Layout.memory_set_int64(inst_ptr, 0, gather_opcode)
+                    Otherwise If opcode equals 20201:  Note: MIR_STORE
+                        Let scatter_opcode be 20701  Note: MIR_SCATTER
+                        Layout.memory_set_int64(inst_ptr, 0, scatter_opcode)
+                    End If
+
+                    Note: Get index vector from memory access pattern
+                    Let index_vector be Layout.memory_get_int64(mem_access, 72)
+
+                    Note: Add index vector operand for gather/scatter
+                    Note: Gather: result = gather(base_ptr, index_vector, mask)
+                    Note: Scatter: scatter(base_ptr, index_vector, value, mask)
+                    Let operands_ptr be Layout.memory_get_int64(inst_ptr, 24)
+                    Let operand_count be Layout.memory_get_int64(inst_ptr, 16)
+
+                    Note: Expand operands array to include index vector
+                    Let new_operand_count be operand_count plus 1
+                    Layout.memory_set_int64(inst_ptr, 16, new_operand_count)
+
+                    Note: Store index vector as additional operand
+                    Let index_offset be operands_ptr plus (operand_count times 8)
+                    Layout.memory_set_int64(index_offset, 0, index_vector)
+
+                    Note: Update result value to vector type
+                    Let result_value be Layout.memory_get_int64(inst_ptr, 8)
+                    If result_value is not equal to 0:
+                        MIR.set_value_type_vector(result_value, vector_factor)
+                    End If
+
+                    Return 1
+                End If
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+
+    Return 0
+End Process
+
+Process called "create_scalar_epilogue" that takes context_ptr as Integer, loop_info as Integer returns Integer:
+    @Reasoning
+    Creates epilogue block to handle remainder iterations.
+    If trip_count % vector_factor != 0, need scalar epilogue.
+    @End Reasoning
+
+    Display "create_scalar_epilogue: creating epilogue block"
+
+    Note: Create new basic block for epilogue
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let epilogue_id be CFG.allocate_block_id(cfg_ptr)
+    Let epilogue_block be MIR.create_mir_basic_block(epilogue_id, 0)
+
+    Note: Epilogue will execute remainder iterations in scalar mode
+    Note: CFG wiring handled by update_loop_structure
+
+    CFG.add_block_to_function(cfg_ptr, epilogue_block)
+
+    Return epilogue_id
+End Process
+
+Process called "update_loop_structure" that takes context_ptr as Integer, loop_info as Integer, prologue_block as Integer, epilogue_block as Integer returns Integer:
+    @Reasoning
+    Updates CFG to wire prologue → vector loop → epilogue.
+    @End Reasoning
+
+    Display "update_loop_structure: updating CFG edges"
+
+    Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+    Let header_id be Layout.memory_get_int64(loop_info, 0)
+    Let preheader_id be Layout.memory_get_int64(loop_info, 8)
+    Let exit_blocks be Layout.memory_get_int64(loop_info, 24)
+
+    Note: Wire CFG: preheader → prologue → header
+    If preheader_id is not equal to 0:
+        Note: Redirect preheader → header edge to preheader → prologue
+        CFG.redirect_edge(cfg_ptr, preheader_id, header_id, prologue_block)
+
+        Note: Add prologue → header edge
+        CFG.add_edge(cfg_ptr, prologue_block, header_id)
+
+        Display "update_loop_structure: wired preheader → prologue → header"
+    End If
+
+    Note: Wire loop exits to epilogue
+    If exit_blocks is not equal to 0:
+        Let exit_list be Set.to_list(exit_blocks)
+        Let exit_count be List.length(exit_list)
+        Let i be 0
+
+        While i is less than exit_count:
+            Let exit_id be List.get(exit_list, i)
+
+            Note: For each exit block, find loop body predecessors
+            Let exit_preds be CFG.get_block_predecessors(cfg_ptr, exit_id)
+            If exit_preds is not equal to 0:
+                Let body_blocks be Layout.memory_get_int64(loop_info, 16)
+                Let pred_count be List.length(exit_preds)
+                Let j be 0
+
+                While j is less than pred_count:
+                    Let pred_id be List.get(exit_preds, j)
+
+                    Note: If predecessor is in loop body, redirect to epilogue first
+                    Let pred_in_loop be Set.contains(body_blocks, pred_id)
+                    If pred_in_loop equals 1:
+                        CFG.redirect_edge(cfg_ptr, pred_id, exit_id, epilogue_block)
+                    End If
+
+                    Set j to j plus 1
+                End While
+
+                proc destroy from List with exit_preds
+            End If
+
+            Note: Wire epilogue to original exit
+            CFG.add_edge(cfg_ptr, epilogue_block, exit_id)
+
+            Set i to i plus 1
+        End While
+
+        proc destroy from List with exit_list
+
+        Display "update_loop_structure: wired loop exits through epilogue"
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: VECTORIZATION PASS ENTRY POINTS
+Note: ============================================================================
+
+Process called "optimize_function_with_vectorization" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Main entry point for vectorization optimization pass.
+    @End Reasoning
+
+    Display "========== Starting Loop Vectorization Pass =========="
+
+    If cfg_ptr equals 0:
+        Display "optimize_function_with_vectorization: null CFG"
+        Return 0
+    End If
+
+    Note: Create context
+    Let context_ptr be create_vectorization_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "optimize_function_with_vectorization: failed to create context"
+        Return 0
+    End If
+
+    Note: Step 1: Detect natural loops
+    Display "Step 1: Detecting natural loops"
+    Let loops_found be detect_natural_loops(context_ptr)
+
+    If loops_found equals 0:
+        Display "optimize_function_with_vectorization: no loops found"
+        destroy_vectorization_context(context_ptr)
+        Return 0
+    End If
+
+    Note: Step 2: Analyze each loop for vectorization
+    Display "Step 2: Analyzing loops for vectorization"
+    Let loop_candidates_dict be Layout.memory_get_int64(context_ptr, 64)
+    Let loops_list be Layout.memory_get_int64(context_ptr, 24)
+    Let loop_count be List.length(loops_list)
+    Let i be 0
+
+    While i is less than loop_count:
+        Let loop_info be List.get(loops_list, i)
+
+        Display "Analyzing loop "
+        Display i
+
+        Note: Analyze induction variables
+        Let has_induction be analyze_induction_variables(context_ptr, loop_info)
+
+        If has_induction equals 0:
+            Display "  No induction variable found, rejecting"
+            Layout.memory_set_int64(loop_info, 56, 0)  Note: Not vectorizable
+            Let rejected_loops be Layout.memory_get_int64(context_ptr, 40)
+            Set rejected_loops to rejected_loops plus 1
+            Layout.memory_set_int64(context_ptr, 40, rejected_loops)
+            Set i to i plus 1
+            Continue
+        End If
+
+        Note: Collect memory accesses
+        Let access_count be collect_memory_accesses(context_ptr, loop_info)
+
+        Note: Analyze dependencies
+        Let dep_count be analyze_loop_dependencies(context_ptr, loop_info)
+
+        Note: Check for loop-carried dependencies
+        Let is_safe be check_loop_carried_dependencies(context_ptr, loop_info)
+
+        If is_safe equals 0:
+            Display "  Loop-carried dependencies found, rejecting"
+            Layout.memory_set_int64(loop_info, 56, 0)
+            Let rejected_loops be Layout.memory_get_int64(context_ptr, 40)
+            Set rejected_loops to rejected_loops plus 1
+            Layout.memory_set_int64(context_ptr, 40, rejected_loops)
+            Set i to i plus 1
+            Continue
+        End If
+
+        Note: Compute cost model
+        Let is_profitable be compute_vectorization_cost(context_ptr, loop_info)
+
+        If is_profitable equals 0:
+            Display "  Vectorization not profitable, rejecting"
+            Layout.memory_set_int64(loop_info, 56, 0)
+            Let rejected_loops be Layout.memory_get_int64(context_ptr, 40)
+            Set rejected_loops to rejected_loops plus 1
+            Layout.memory_set_int64(context_ptr, 40, rejected_loops)
+            Set i to i plus 1
+            Continue
+        End If
+
+        Note: Loop is vectorizable
+        Display "  Loop is vectorizable!"
+        Layout.memory_set_int64(loop_info, 56, 1)
+
+        Note: Transform loop
+        Let transformed be transform_loop_to_vector(context_ptr, loop_info)
+
+        If transformed equals 0:
+            Display "  Transformation failed"
+            Let rejected_loops be Layout.memory_get_int64(context_ptr, 40)
+            Set rejected_loops to rejected_loops plus 1
+            Layout.memory_set_int64(context_ptr, 40, rejected_loops)
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Print statistics
+    print_vectorization_stats(context_ptr)
+
+    Note: Cleanup
+    destroy_vectorization_context(context_ptr)
+
+    Display "========== Loop Vectorization Pass Complete =========="
+
+    Return 1
+End Process
+
+Process called "run_vectorization_pass" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Wrapper for vectorization pass execution.
+    @End Reasoning
+
+    Return optimize_function_with_vectorization(cfg_ptr)
+End Process
+
+Process called "should_run_vectorization" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if vectorization pass should run on this function.
+    Always beneficial for functions with loops.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check if function has loops (back edges in CFG)
+    Let has_loops be CFG.has_back_edges(cfg_ptr)
+
+    Return has_loops
+End Process
+
+Process called "get_vectorization_pass_name" that takes unit as Integer returns Integer:
+    @Reasoning
+    Returns pass name for debugging and reporting.
+    @End Reasoning
+
+    Return String.create_from_literal("Loop Vectorization")
+End Process
+
+Process called "get_vectorization_pass_description" that takes unit as Integer returns Integer:
+    @Reasoning
+    Returns pass description.
+    @End Reasoning
+
+    Return String.create_from_literal("Transforms scalar loops into vectorized SIMD code for performance")
+End Process

@@ -1,0 +1,1467 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+SwiftUI Parser - Builds AST from SwiftUI tokens
+
+This file implements recursive descent parsing for SwiftUI declarative UI code.
+Handles SwiftUI-specific constructs including view declarations, modifiers,
+property wrappers, and state management.
+
+SwiftUI AST Node Types:
+- SWIFTUI_VIEW_STRUCT - View structure declaration (struct X: View)
+- SWIFTUI_VIEW_BODY - View body property
+- SWIFTUI_VIEW_CONTAINER - Container view (VStack, HStack, ZStack)
+- SWIFTUI_VIEW_ELEMENT - Basic view element (Text, Button, Image, etc.)
+- SWIFTUI_VIEW_MODIFIER - View modifier (.padding(), .background(), etc.)
+- SWIFTUI_PROPERTY - Property declaration with wrapper (@State, @Binding)
+- SWIFTUI_CLOSURE - Closure expression
+- SWIFTUI_EXPRESSION - Swift expression
+
+Features:
+- Complete SwiftUI view structure parsing
+- Property wrapper handling
+- View modifier chains
+- Trailing closure syntax
+- State binding ($var) parsing
+- Error reporting with position information
+- Memory-safe AST construction
+
+Dependencies:
+- swiftui_lexer.runa (for tokenization)
+- compiler/frontend/primitives/memory/layout.runa
+- compiler/frontend/primitives/core/string_core.runa
+- compiler/frontend/primitives/collections/list.runa
+- compiler/frontend/primitives/collections/dictionary.runa
+:End Note
+
+Import "compiler/middle/gungnir/hir/translation/frontends/swiftui/swiftui_lexer.runa" as Lexer
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
+
+Note: ============================================================================
+Note: SwiftUI AST Node Types
+Note: ============================================================================
+
+Constant SWIFTUI_VIEW_STRUCT as Integer is 300
+Constant SWIFTUI_VIEW_BODY as Integer is 301
+Constant SWIFTUI_VIEW_CONTAINER as Integer is 302
+Constant SWIFTUI_VIEW_ELEMENT as Integer is 303
+Constant SWIFTUI_VIEW_MODIFIER as Integer is 304
+Constant SWIFTUI_PROPERTY as Integer is 305
+Constant SWIFTUI_CLOSURE as Integer is 306
+Constant SWIFTUI_EXPRESSION as Integer is 307
+Constant SWIFTUI_LITERAL as Integer is 308
+Constant SWIFTUI_IDENTIFIER as Integer is 309
+
+Note: ============================================================================
+Note: SwiftUI AST Node Structure
+Note: ============================================================================
+
+Type called "SwiftUINode":
+    node_type as Integer        Note: SWIFTUI_* constant
+    name as Integer             Note: View/property/identifier name
+    value as Integer            Note: Literal value or expression
+    wrapper as Integer          Note: Property wrapper name (@State, @Binding, etc.)
+    type_annotation as Integer  Note: Type annotation (for properties)
+    modifiers as Integer        Note: List of modifier nodes
+    children as Integer         Note: List of child nodes
+    parameters as Integer       Note: Dictionary of parameters/attributes
+    line as Integer             Note: Line number in source
+    column as Integer           Note: Column number in source
+End Type
+
+Note: ============================================================================
+Note: SwiftUI Parser Structure
+Note: ============================================================================
+
+Type called "SwiftUIParser":
+    lexer as Integer            Note: SwiftUI lexer
+    current_token as Integer    Note: Current token
+    error_message as Integer    Note: Error message (if any)
+    has_error as Integer        Note: Boolean: 1 if error occurred
+End Type
+
+Note: ============================================================================
+Note: Parser Creation and Destruction
+Note: ============================================================================
+
+Process called "create_swiftui_parser" takes lexer as Integer returns Integer:
+    Note: Create SwiftUI parser with lexer
+
+    Let parser_size be 32  Note: SwiftUIParser: 4 fields × 8 bytes
+    Let parser be proc allocate from Layout with parser_size
+
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize parser state
+    proc memory_set_int64 from Layout with parser, 0, lexer
+    proc memory_set_int64 from Layout with parser, 8, 0   Note: current_token = null
+    proc memory_set_int64 from Layout with parser, 16, 0  Note: error_message = null
+    proc memory_set_int64 from Layout with parser, 24, 0  Note: has_error = false
+
+    Note: Advance to first token
+    Let first_token be proc next_token from Lexer with lexer
+    proc memory_set_int64 from Layout with parser, 8, first_token
+
+    Return parser
+End Process
+
+Process called "destroy_swiftui_parser" takes parser as Integer returns Integer:
+    Note: Destroy SwiftUI parser
+
+    If parser is equal to 0:
+        Return 1
+    End If
+
+    Note: Free error message if exists
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    proc deallocate from Layout with parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Token Management
+Note: ============================================================================
+
+Process called "advance_token" takes parser as Integer returns Integer:
+    Note: Advance to next token
+
+    Let lexer be proc memory_get_int64 from Layout with parser, 0
+    Let token be proc next_token from Lexer with lexer
+
+    proc memory_set_int64 from Layout with parser, 8, token
+
+    Return token
+End Process
+
+Process called "peek_token_type" takes parser as Integer returns Integer:
+    Note: Peek at current token type
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+
+    If token is equal to 0:
+        Return TOKEN_EOF from Lexer
+    End If
+
+    Let token_type be proc memory_get_int64 from Layout with token, 0
+
+    Return token_type
+End Process
+
+Process called "peek_token_lexeme" takes parser as Integer returns Integer:
+    Note: Peek at current token lexeme
+
+    Let token be proc memory_get_int64 from Layout with parser, 8
+
+    If token is equal to 0:
+        Return 0
+    End If
+
+    Let lexeme be proc memory_get_int64 from Layout with token, 8
+
+    Return lexeme
+End Process
+
+Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
+    Note: Check if current token matches expected type
+
+    Let actual_type be proc peek_token_type from parser
+
+    If actual_type is equal to expected_type:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "check_keyword" takes parser as Integer, keyword as Integer returns Integer:
+    Note: Check if current token is specific keyword
+
+    Let is_keyword be proc check_token_type from parser, TOKEN_KEYWORD from Lexer
+
+    If is_keyword is equal to 0:
+        Return 0
+    End If
+
+    Let lexeme be proc peek_token_lexeme from parser
+    Let match be proc strings_equal from StringCore with lexeme, keyword
+
+    Return match
+End Process
+
+Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
+    Note: Expect token of specific type, set error if mismatch
+
+    Let actual_type be proc peek_token_type from parser
+
+    If actual_type is not equal to expected_type:
+        proc set_parse_error from parser, error_msg
+        Return 0
+    End If
+
+    proc advance_token from parser
+
+    Return 1
+End Process
+
+Process called "expect_keyword" takes parser as Integer, keyword as Integer, error_msg as Integer returns Integer:
+    Note: Expect specific keyword, set error if mismatch
+
+    Let is_keyword be proc check_keyword from parser, keyword
+
+    If is_keyword is equal to 0:
+        proc set_parse_error from parser, error_msg
+        Return 0
+    End If
+
+    proc advance_token from parser
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Error Handling
+Note: ============================================================================
+
+Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
+    Note: Set parser error message
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    Note: Free previous error if exists
+    If error_message is not equal to 0:
+        proc deallocate from Layout with error_message
+    End If
+
+    Note: Copy error message
+    Let msg_length be proc string_length from StringCore with message
+    Let new_error be proc allocate from Layout with msg_length plus 1
+
+    If new_error is not equal to 0:
+        proc memory_copy from Layout with new_error, 0, message, 0, msg_length
+        proc memory_set_byte from Layout with new_error, msg_length, 0
+    End If
+
+    proc memory_set_int64 from Layout with parser, 16, new_error
+    proc memory_set_int64 from Layout with parser, 24, 1  Note: has_error = true
+
+    Return 1
+End Process
+
+Process called "has_parse_error" takes parser as Integer returns Integer:
+    Note: Check if parser has error
+
+    Let has_error be proc memory_get_int64 from Layout with parser, 24
+
+    Return has_error
+End Process
+
+Process called "get_error_message" takes parser as Integer returns Integer:
+    Note: Get parser error message
+
+    Let error_message be proc memory_get_int64 from Layout with parser, 16
+
+    Return error_message
+End Process
+
+Note: ============================================================================
+Note: Node Creation
+Note: ============================================================================
+
+Process called "create_swiftui_node" takes node_type as Integer returns Integer:
+    Note: Create SwiftUI AST node
+
+    Let node_size be 80  Note: SwiftUINode: 10 fields × 8 bytes
+    Let node be proc allocate from Layout with node_size
+
+    If node is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with node, 0, node_type
+    proc memory_set_int64 from Layout with node, 8, 0   Note: name = null
+    proc memory_set_int64 from Layout with node, 16, 0  Note: value = null
+    proc memory_set_int64 from Layout with node, 24, 0  Note: wrapper = null
+    proc memory_set_int64 from Layout with node, 32, 0  Note: type_annotation = null
+    proc memory_set_int64 from Layout with node, 40, 0  Note: modifiers = null
+    proc memory_set_int64 from Layout with node, 48, 0  Note: children = null
+    proc memory_set_int64 from Layout with node, 56, 0  Note: parameters = null
+    proc memory_set_int64 from Layout with node, 64, 0  Note: line = 0
+    proc memory_set_int64 from Layout with node, 72, 0  Note: column = 0
+
+    Return node
+End Process
+
+Process called "set_node_name" takes node as Integer, name as Integer returns Integer:
+    Note: Set node name (copies string)
+
+    Let name_length be proc string_length from StringCore with name
+    Let name_copy be proc allocate from Layout with name_length plus 1
+
+    If name_copy is equal to 0:
+        Return 0
+    End If
+
+    proc memory_copy from Layout with name_copy, 0, name, 0, name_length
+    proc memory_set_byte from Layout with name_copy, name_length, 0
+
+    proc memory_set_int64 from Layout with node, 8, name_copy
+
+    Return 1
+End Process
+
+Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
+    Note: Set node value (copies string)
+
+    Let value_length be proc string_length from StringCore with value
+    Let value_copy be proc allocate from Layout with value_length plus 1
+
+    If value_copy is equal to 0:
+        Return 0
+    End If
+
+    proc memory_copy from Layout with value_copy, 0, value, 0, value_length
+    proc memory_set_byte from Layout with value_copy, value_length, 0
+
+    proc memory_set_int64 from Layout with node, 16, value_copy
+
+    Return 1
+End Process
+
+Process called "set_node_wrapper" takes node as Integer, wrapper as Integer returns Integer:
+    Note: Set node property wrapper (copies string)
+
+    Let wrapper_length be proc string_length from StringCore with wrapper
+    Let wrapper_copy be proc allocate from Layout with wrapper_length plus 1
+
+    If wrapper_copy is equal to 0:
+        Return 0
+    End If
+
+    proc memory_copy from Layout with wrapper_copy, 0, wrapper, 0, wrapper_length
+    proc memory_set_byte from Layout with wrapper_copy, wrapper_length, 0
+
+    proc memory_set_int64 from Layout with node, 24, wrapper_copy
+
+    Return 1
+End Process
+
+Process called "set_node_type_annotation" takes node as Integer, type_annotation as Integer returns Integer:
+    Note: Set node type annotation (copies string)
+
+    Let type_length be proc string_length from StringCore with type_annotation
+    Let type_copy be proc allocate from Layout with type_length plus 1
+
+    If type_copy is equal to 0:
+        Return 0
+    End If
+
+    proc memory_copy from Layout with type_copy, 0, type_annotation, 0, type_length
+    proc memory_set_byte from Layout with type_copy, type_length, 0
+
+    proc memory_set_int64 from Layout with node, 32, type_copy
+
+    Return 1
+End Process
+
+Process called "add_node_child" takes node as Integer, child as Integer returns Integer:
+    Note: Add child node to node's children list
+
+    Let children be proc memory_get_int64 from Layout with node, 48
+
+    Note: Create children list if doesn't exist
+    If children is equal to 0:
+        Let new_children be proc create from List
+
+        If new_children is equal to 0:
+            Return 0
+        End If
+
+        proc memory_set_int64 from Layout with node, 48, new_children
+        Set children to new_children
+    End If
+
+    proc add from List with children, child
+
+    Return 1
+End Process
+
+Process called "add_node_modifier" takes node as Integer, modifier as Integer returns Integer:
+    Note: Add modifier node to node's modifiers list
+
+    Let modifiers be proc memory_get_int64 from Layout with node, 40
+
+    Note: Create modifiers list if doesn't exist
+    If modifiers is equal to 0:
+        Let new_modifiers be proc create from List
+
+        If new_modifiers is equal to 0:
+            Return 0
+        End If
+
+        proc memory_set_int64 from Layout with node, 40, new_modifiers
+        Set modifiers to new_modifiers
+    End If
+
+    proc add from List with modifiers, modifier
+
+    Return 1
+End Process
+
+Process called "set_node_parameters" takes node as Integer, parameters as Integer returns Integer:
+    Note: Set node parameters dictionary
+
+    proc memory_set_int64 from Layout with node, 56, parameters
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: View Structure Parsing
+Note: ============================================================================
+
+Process called "parse_view_struct" takes parser as Integer returns Integer:
+    Note: Parse SwiftUI view structure (struct X: View)
+
+    @Reasoning:
+    SwiftUI views are defined as structs conforming to the View protocol.
+    The struct contains properties (often with @State or @Binding wrappers)
+    and a body property that returns the view hierarchy.
+
+    Grammar:
+    struct <name>: View {
+        @State var property: Type
+        var body: some View {
+            view_hierarchy
+        }
+    }
+    @End Reasoning
+
+    Let node be proc create_swiftui_node from SWIFTUI_VIEW_STRUCT
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Expect 'struct' keyword
+    Let success be proc expect_keyword from parser, "struct", "Expected 'struct' keyword"
+
+    If success is equal to 0:
+        Return 0
+    End If
+
+    Note: Expect struct name
+    Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+    If is_identifier is equal to 0:
+        proc set_parse_error from parser, "Expected struct name"
+        Return 0
+    End If
+
+    Let struct_name be proc peek_token_lexeme from parser
+    proc set_node_name from node, struct_name
+    proc advance_token from parser
+
+    Note: Expect colon
+    proc expect_token from parser, TOKEN_COLON from Lexer, "Expected ':' after struct name"
+
+    Note: Expect 'View' protocol
+    Let is_view be proc check_keyword from parser, "View"
+
+    If is_view is equal to 0:
+        proc set_parse_error from parser, "Expected 'View' protocol conformance"
+        Return 0
+    End If
+
+    proc advance_token from parser
+
+    Note: Expect opening brace
+    proc expect_token from parser, TOKEN_LBRACE from Lexer, "Expected '{' to start struct body"
+
+    Note: Parse struct body (properties and view body)
+    While 1 is equal to 1:
+        Note: Check for closing brace
+        Let is_rbrace be proc check_token_type from parser, TOKEN_RBRACE from Lexer
+
+        If is_rbrace is equal to 1:
+            Break
+        End If
+
+        Note: Check for property wrapper (@State, @Binding, etc.)
+        Let is_at be proc check_token_type from parser, TOKEN_AT from Lexer
+
+        If is_at is equal to 1:
+            Let property be proc parse_property from parser
+
+            If property is equal to 0:
+                Return 0
+            End If
+
+            proc add_node_child from node, property
+        Otherwise:
+            Note: Check for 'var body'
+            Let is_var be proc check_keyword from parser, "var"
+
+            If is_var is equal to 1:
+                Let body be proc parse_view_body from parser
+
+                If body is equal to 0:
+                    Return 0
+                End If
+
+                proc add_node_child from node, body
+            Otherwise:
+                proc set_parse_error from parser, "Expected property or view body"
+                Return 0
+            End If
+        End If
+    End While
+
+    Note: Expect closing brace
+    proc expect_token from parser, TOKEN_RBRACE from Lexer, "Expected '}' to end struct body"
+
+    Return node
+End Process
+
+Process called "parse_property" takes parser as Integer returns Integer:
+    Note: Parse property with optional wrapper (@State var x: Int)
+
+    @Reasoning:
+    SwiftUI properties can have property wrappers like @State, @Binding, @ObservedObject.
+    These wrappers provide special behaviors for state management and data flow.
+
+    Grammar:
+    @<Wrapper> var <name>: <Type> = <value>?
+    @End Reasoning
+
+    Let node be proc create_swiftui_node from SWIFTUI_PROPERTY
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Expect @ symbol
+    proc expect_token from parser, TOKEN_AT from Lexer, "Expected '@' for property wrapper"
+
+    Note: Expect property wrapper name
+    Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+    If is_identifier is equal to 0:
+        proc set_parse_error from parser, "Expected property wrapper name"
+        Return 0
+    End If
+
+    Let wrapper_name be proc peek_token_lexeme from parser
+    proc set_node_wrapper from node, wrapper_name
+    proc advance_token from parser
+
+    Note: Expect 'var' or 'let'
+    Let is_var be proc check_keyword from parser, "var"
+    Let is_let be proc check_keyword from parser, "let"
+
+    If is_var is equal to 0:
+        If is_let is equal to 0:
+            proc set_parse_error from parser, "Expected 'var' or 'let'"
+            Return 0
+        End If
+    End If
+
+    proc advance_token from parser
+
+    Note: Expect property name
+    Let is_identifier2 be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+    If is_identifier2 is equal to 0:
+        proc set_parse_error from parser, "Expected property name"
+        Return 0
+    End If
+
+    Let property_name be proc peek_token_lexeme from parser
+    proc set_node_name from node, property_name
+    proc advance_token from parser
+
+    Note: Check for type annotation
+    Let is_colon be proc check_token_type from parser, TOKEN_COLON from Lexer
+
+    If is_colon is equal to 1:
+        proc advance_token from parser
+
+        Note: Expect type name
+        Let is_type be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+        If is_type is equal to 0:
+            proc set_parse_error from parser, "Expected type name"
+            Return 0
+        End If
+
+        Let type_name be proc peek_token_lexeme from parser
+        proc set_node_type_annotation from node, type_name
+        proc advance_token from parser
+    End If
+
+    Note: Check for initial value
+    Let is_equals be proc check_token_type from parser, TOKEN_EQUALS from Lexer
+
+    If is_equals is equal to 1:
+        proc advance_token from parser
+
+        Note: Parse initial value expression
+        Let value_expr be proc parse_expression from parser
+
+        If value_expr is equal to 0:
+            Return 0
+        End If
+
+        proc add_node_child from node, value_expr
+    End If
+
+    Return node
+End Process
+
+Process called "parse_view_body" takes parser as Integer returns Integer:
+    Note: Parse view body property (var body: some View)
+
+    @Reasoning:
+    The body property is required for all SwiftUI views. It returns the view hierarchy.
+    The return type is 'some View' which is an opaque result type.
+
+    Grammar:
+    var body: some View {
+        view_hierarchy
+    }
+    @End Reasoning
+
+    Let node be proc create_swiftui_node from SWIFTUI_VIEW_BODY
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Expect 'var' keyword
+    proc expect_keyword from parser, "var", "Expected 'var' keyword"
+
+    Note: Expect 'body' identifier
+    Let is_body be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+    Let body_lexeme be proc peek_token_lexeme from parser
+    Let is_body_name be proc strings_equal from StringCore with body_lexeme, "body"
+
+    If is_body_name is equal to 0:
+        proc set_parse_error from parser, "Expected 'body' identifier"
+        Return 0
+    End If
+
+    proc advance_token from parser
+
+    Note: Expect colon
+    proc expect_token from parser, TOKEN_COLON from Lexer, "Expected ':' after body"
+
+    Note: Expect 'some' keyword
+    proc expect_keyword from parser, "some", "Expected 'some' keyword"
+
+    Note: Expect 'View' keyword
+    proc expect_keyword from parser, "View", "Expected 'View' type"
+
+    Note: Expect opening brace
+    proc expect_token from parser, TOKEN_LBRACE from Lexer, "Expected '{' to start body"
+
+    Note: Parse view hierarchy
+    Let view_hierarchy be proc parse_view_hierarchy from parser
+
+    If view_hierarchy is equal to 0:
+        Return 0
+    End If
+
+    proc add_node_child from node, view_hierarchy
+
+    Note: Expect closing brace
+    proc expect_token from parser, TOKEN_RBRACE from Lexer, "Expected '}' to end body"
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: View Hierarchy Parsing
+Note: ============================================================================
+
+Process called "parse_view_hierarchy" takes parser as Integer returns Integer:
+    Note: Parse SwiftUI view hierarchy (containers, elements, modifiers)
+
+    @Reasoning:
+    SwiftUI views are composed hierarchically. Container views (VStack, HStack, ZStack)
+    contain other views. Elements (Text, Button, Image) are leaf nodes.
+    All views can have modifiers chained with dot notation.
+
+    This function parses the view tree and modifier chains.
+    @End Reasoning
+
+    Note: Parse base view (container or element)
+    Let base_view be proc parse_base_view from parser
+
+    If base_view is equal to 0:
+        Return 0
+    End If
+
+    Note: Parse modifier chain
+    While 1 is equal to 1:
+        Let is_dot be proc check_token_type from parser, TOKEN_DOT from Lexer
+
+        If is_dot is equal to 0:
+            Break
+        End If
+
+        proc advance_token from parser
+
+        Note: Parse modifier
+        Let modifier be proc parse_modifier from parser
+
+        If modifier is equal to 0:
+            Return 0
+        End If
+
+        proc add_node_modifier from base_view, modifier
+    End While
+
+    Return base_view
+End Process
+
+Process called "parse_base_view" takes parser as Integer returns Integer:
+    Note: Parse base view (container or element)
+
+    @Reasoning:
+    Base views can be:
+    - Container views with trailing closures: VStack { ... }
+    - Element views with parameters: Text("Hello")
+    - Custom view instances: MyCustomView()
+    @End Reasoning
+
+    Let is_view_type be proc check_token_type from parser, TOKEN_VIEW_TYPE from Lexer
+
+    If is_view_type is equal to 1:
+        Let view_name be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Note: Check if it's a container view (VStack, HStack, ZStack)
+        Let is_vstack be proc strings_equal from StringCore with view_name, "VStack"
+        Let is_hstack be proc strings_equal from StringCore with view_name, "HStack"
+        Let is_zstack be proc strings_equal from StringCore with view_name, "ZStack"
+
+        If is_vstack is equal to 1:
+            Return proc parse_container_view from parser, view_name
+        End If
+
+        If is_hstack is equal to 1:
+            Return proc parse_container_view from parser, view_name
+        End If
+
+        If is_zstack is equal to 1:
+            Return proc parse_container_view from parser, view_name
+        End If
+
+        Note: Otherwise it's an element view
+        Return proc parse_element_view from parser, view_name
+    End If
+
+    Note: Check for identifier (custom view)
+    Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+    If is_identifier is equal to 1:
+        Let view_name be proc peek_token_lexeme from parser
+        proc advance_token from parser
+        Return proc parse_element_view from parser, view_name
+    End If
+
+    proc set_parse_error from parser, "Expected view type or identifier"
+    Return 0
+End Process
+
+Process called "parse_container_view" takes parser as Integer, container_name as Integer returns Integer:
+    Note: Parse container view with trailing closure (VStack { ... })
+
+    @Reasoning:
+    Container views like VStack, HStack, ZStack use trailing closure syntax
+    to define their child views. They can also have parameters like alignment
+    and spacing before the closure.
+
+    Grammar:
+    VStack(alignment: .leading, spacing: 10) {
+        child_views
+    }
+    @End Reasoning
+
+    Let node be proc create_swiftui_node from SWIFTUI_VIEW_CONTAINER
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc set_node_name from node, container_name
+
+    Note: Check for parameters
+    Let is_lparen be proc check_token_type from parser, TOKEN_LPAREN from Lexer
+
+    If is_lparen is equal to 1:
+        proc advance_token from parser
+
+        Note: Parse parameters
+        Let parameters be proc parse_view_parameters from parser
+
+        If parameters is equal to 0:
+            Return 0
+        End If
+
+        proc set_node_parameters from node, parameters
+
+        Note: Expect closing paren
+        proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after parameters"
+    End If
+
+    Note: Expect opening brace (trailing closure)
+    proc expect_token from parser, TOKEN_LBRACE from Lexer, "Expected '{' for trailing closure"
+
+    Note: Parse child views
+    While 1 is equal to 1:
+        Let is_rbrace be proc check_token_type from parser, TOKEN_RBRACE from Lexer
+
+        If is_rbrace is equal to 1:
+            Break
+        End If
+
+        Let child_view be proc parse_view_hierarchy from parser
+
+        If child_view is equal to 0:
+            Return 0
+        End If
+
+        proc add_node_child from node, child_view
+    End While
+
+    Note: Expect closing brace
+    proc expect_token from parser, TOKEN_RBRACE from Lexer, "Expected '}' to end trailing closure"
+
+    Return node
+End Process
+
+Process called "parse_element_view" takes parser as Integer, element_name as Integer returns Integer:
+    Note: Parse element view with parameters (Text("Hello"))
+
+    @Reasoning:
+    Element views like Text, Button, Image take parameters to configure them.
+    Parameters can be literals, expressions, or closures.
+
+    Grammar:
+    Text("Hello")
+    Button("Click me") { action }
+    Image(systemName: "star")
+    @End Reasoning
+
+    Let node be proc create_swiftui_node from SWIFTUI_VIEW_ELEMENT
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    proc set_node_name from node, element_name
+
+    Note: Check for parameters
+    Let is_lparen be proc check_token_type from parser, TOKEN_LPAREN from Lexer
+
+    If is_lparen is equal to 1:
+        proc advance_token from parser
+
+        Note: Parse parameters
+        Let parameters be proc parse_view_parameters from parser
+
+        If parameters is equal to 0:
+            Return 0
+        End If
+
+        proc set_node_parameters from node, parameters
+
+        Note: Expect closing paren
+        proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after parameters"
+    End If
+
+    Note: Check for trailing closure (for Button, etc.)
+    Let is_lbrace be proc check_token_type from parser, TOKEN_LBRACE from Lexer
+
+    If is_lbrace is equal to 1:
+        Let closure be proc parse_closure from parser
+
+        If closure is equal to 0:
+            Return 0
+        End If
+
+        proc add_node_child from node, closure
+    End If
+
+    Return node
+End Process
+
+Process called "parse_modifier" takes parser as Integer returns Integer:
+    Note: Parse view modifier (.padding(), .background(), etc.)
+
+    @Reasoning:
+    View modifiers are chained using dot notation. They can take parameters
+    or be parameterless. Modifiers can also be chained.
+
+    Grammar:
+    .padding()
+    .padding(20)
+    .background(Color.red)
+    .foregroundColor(.blue)
+    @End Reasoning
+
+    Let node be proc create_swiftui_node from SWIFTUI_VIEW_MODIFIER
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Expect modifier name
+    Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+    If is_identifier is equal to 0:
+        proc set_parse_error from parser, "Expected modifier name"
+        Return 0
+    End If
+
+    Let modifier_name be proc peek_token_lexeme from parser
+    proc set_node_name from node, modifier_name
+    proc advance_token from parser
+
+    Note: Check for parameters
+    Let is_lparen be proc check_token_type from parser, TOKEN_LPAREN from Lexer
+
+    If is_lparen is equal to 1:
+        proc advance_token from parser
+
+        Note: Parse parameters
+        Let parameters be proc parse_view_parameters from parser
+
+        If parameters is equal to 0:
+            Return 0
+        End If
+
+        proc set_node_parameters from node, parameters
+
+        Note: Expect closing paren
+        proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after modifier parameters"
+    End If
+
+    Return node
+End Process
+
+Note: ============================================================================
+Note: Parameter Parsing
+Note: ============================================================================
+
+Process called "parse_view_parameters" takes parser as Integer returns Integer:
+    Note: Parse view/modifier parameters
+
+    @Reasoning:
+    Parameters can be:
+    - Positional: Text("Hello")
+    - Named: Image(systemName: "star")
+    - Mixed: Button("Click", action: { ... })
+
+    We store them in a dictionary with either index or name as key.
+    @End Reasoning
+
+    Let parameters be proc create from Dict
+
+    If parameters is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Let param_index be 0
+
+    Note: Check for empty parameters
+    Let is_rparen be proc check_token_type from parser, TOKEN_RPAREN from Lexer
+
+    If is_rparen is equal to 1:
+        Return parameters
+    End If
+
+    While 1 is equal to 1:
+        Note: Check for named parameter (name: value)
+        Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+        If is_identifier is equal to 1:
+            Let next_lexeme be proc peek_token_lexeme from parser
+            proc advance_token from parser
+
+            Note: Check if this is a named parameter (identifier followed by colon)
+            Let is_colon be proc check_token_type from parser, TOKEN_COLON from Lexer
+
+            If is_colon is equal to 1:
+                proc advance_token from parser
+
+                Note: Parse parameter value
+                Let value be proc parse_expression from parser
+
+                If value is equal to 0:
+                    Return 0
+                End If
+
+                Note: Store with name as key
+                proc set from Dict with parameters, next_lexeme, value
+            Otherwise:
+                Note: This was a positional parameter (identifier expression)
+                Note: Need to create identifier node for it
+                Let id_node be proc create_swiftui_node from SWIFTUI_IDENTIFIER
+
+                If id_node is equal to 0:
+                    proc set_parse_error from parser, "Out of memory"
+                    Return 0
+                End If
+
+                proc set_node_name from id_node, next_lexeme
+
+                Note: Store with index as key
+                Let index_str be proc allocate from Layout with 32
+                proc int_to_string from StringCore with param_index, index_str, 32
+                proc set from Dict with parameters, index_str, id_node
+                Set param_index to param_index plus 1
+            End If
+        Otherwise:
+            Note: Parse positional parameter value
+            Let value be proc parse_expression from parser
+
+            If value is equal to 0:
+                Return 0
+            End If
+
+            Note: Store with index as key
+            Let index_str be proc allocate from Layout with 32
+            proc int_to_string from StringCore with param_index, index_str, 32
+            proc set from Dict with parameters, index_str, value
+            Set param_index to param_index plus 1
+        End If
+
+        Note: Check for comma (more parameters)
+        Let is_comma be proc check_token_type from parser, TOKEN_COMMA from Lexer
+
+        If is_comma is equal to 0:
+            Break
+        End If
+
+        proc advance_token from parser
+    End While
+
+    Return parameters
+End Process
+
+Note: ============================================================================
+Note: Expression Parsing
+Note: ============================================================================
+
+Process called "parse_expression" takes parser as Integer returns Integer:
+    Note: Parse Swift expression
+
+    @Reasoning:
+    Expressions can be:
+    - Literals (strings, numbers, booleans)
+    - Identifiers
+    - State bindings ($variable)
+    - Member access (Color.red)
+    - Function calls
+    - Closures
+    @End Reasoning
+
+    Note: Check for state binding ($variable)
+    Let is_dollar be proc check_token_type from parser, TOKEN_DOLLAR from Lexer
+
+    If is_dollar is equal to 1:
+        proc advance_token from parser
+
+        Note: Expect identifier
+        Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+        If is_identifier is equal to 0:
+            proc set_parse_error from parser, "Expected identifier after '$'"
+            Return 0
+        End If
+
+        Let binding_name be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Note: Create binding expression node
+        Let node be proc create_swiftui_node from SWIFTUI_EXPRESSION
+
+        If node is equal to 0:
+            proc set_parse_error from parser, "Out of memory"
+            Return 0
+        End If
+
+        Note: Store as "$variable" format
+        Let binding_str be proc allocate from Layout with 256
+        Let dollar_char be 36  Note: ASCII for '$'
+        proc memory_set_byte from Layout with binding_str, 0, dollar_char
+        Let binding_name_length be proc string_length from StringCore with binding_name
+        proc memory_copy from Layout with binding_str, 1, binding_name, 0, binding_name_length
+        proc memory_set_byte from Layout with binding_str, binding_name_length plus 1, 0
+        proc set_node_value from node, binding_str
+
+        Return node
+    End If
+
+    Note: Check for string literal
+    Let is_string be proc check_token_type from parser, TOKEN_STRING from Lexer
+
+    If is_string is equal to 1:
+        Let string_value be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Let node be proc create_swiftui_node from SWIFTUI_LITERAL
+
+        If node is equal to 0:
+            proc set_parse_error from parser, "Out of memory"
+            Return 0
+        End If
+
+        proc set_node_value from node, string_value
+
+        Return node
+    End If
+
+    Note: Check for number literal
+    Let is_number be proc check_token_type from parser, TOKEN_NUMBER from Lexer
+
+    If is_number is equal to 1:
+        Let number_value be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Let node be proc create_swiftui_node from SWIFTUI_LITERAL
+
+        If node is equal to 0:
+            proc set_parse_error from parser, "Out of memory"
+            Return 0
+        End If
+
+        proc set_node_value from node, number_value
+
+        Return node
+    End If
+
+    Note: Check for boolean literal
+    Let is_boolean be proc check_token_type from parser, TOKEN_BOOLEAN from Lexer
+
+    If is_boolean is equal to 1:
+        Let bool_value be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Let node be proc create_swiftui_node from SWIFTUI_LITERAL
+
+        If node is equal to 0:
+            proc set_parse_error from parser, "Out of memory"
+            Return 0
+        End If
+
+        proc set_node_value from node, bool_value
+
+        Return node
+    End If
+
+    Note: Check for identifier or member access (Color.red)
+    Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+    If is_identifier is equal to 1:
+        Let id_value be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Note: Check for member access
+        Let is_dot be proc check_token_type from parser, TOKEN_DOT from Lexer
+
+        If is_dot is equal to 1:
+            proc advance_token from parser
+
+            Note: Expect member name
+            Let is_member be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+            If is_member is equal to 0:
+                proc set_parse_error from parser, "Expected member name after '.'"
+                Return 0
+            End If
+
+            Let member_name be proc peek_token_lexeme from parser
+            proc advance_token from parser
+
+            Note: Create member access expression
+            Let node be proc create_swiftui_node from SWIFTUI_EXPRESSION
+
+            If node is equal to 0:
+                proc set_parse_error from parser, "Out of memory"
+                Return 0
+            End If
+
+            Note: Store as "Type.member" format
+            Let member_str be proc allocate from Layout with 256
+            Let id_length be proc string_length from StringCore with id_value
+            proc memory_copy from Layout with member_str, 0, id_value, 0, id_length
+            Let dot_char be 46  Note: ASCII for '.'
+            proc memory_set_byte from Layout with member_str, id_length, dot_char
+            Let member_length be proc string_length from StringCore with member_name
+            proc memory_copy from Layout with member_str, id_length plus 1, member_name, 0, member_length
+            proc memory_set_byte from Layout with member_str, id_length plus 1 plus member_length, 0
+            proc set_node_value from node, member_str
+
+            Return node
+        End If
+
+        Note: Check for function call
+        Let is_lparen be proc check_token_type from parser, TOKEN_LPAREN from Lexer
+
+        If is_lparen is equal to 1:
+            proc advance_token from parser
+
+            Note: Parse function parameters
+            Let parameters be proc parse_view_parameters from parser
+
+            If parameters is equal to 0:
+                Return 0
+            End If
+
+            proc expect_token from parser, TOKEN_RPAREN from Lexer, "Expected ')' after function parameters"
+
+            Note: Create function call expression
+            Let node be proc create_swiftui_node from SWIFTUI_EXPRESSION
+
+            If node is equal to 0:
+                proc set_parse_error from parser, "Out of memory"
+                Return 0
+            End If
+
+            proc set_node_name from node, id_value
+            proc set_node_parameters from node, parameters
+
+            Return node
+        End If
+
+        Note: Simple identifier
+        Let node be proc create_swiftui_node from SWIFTUI_IDENTIFIER
+
+        If node is equal to 0:
+            proc set_parse_error from parser, "Out of memory"
+            Return 0
+        End If
+
+        proc set_node_name from node, id_value
+
+        Return node
+    End If
+
+    Note: Check for closure
+    Let is_lbrace be proc check_token_type from parser, TOKEN_LBRACE from Lexer
+
+    If is_lbrace is equal to 1:
+        Return proc parse_closure from parser
+    End If
+
+    Note: Check for dot-prefixed member (.leading, .blue)
+    Let is_dot2 be proc check_token_type from parser, TOKEN_DOT from Lexer
+
+    If is_dot2 is equal to 1:
+        proc advance_token from parser
+
+        Note: Expect member name
+        Let is_member2 be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+        If is_member2 is equal to 0:
+            proc set_parse_error from parser, "Expected member name after '.'"
+            Return 0
+        End If
+
+        Let member_name2 be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Note: Create member reference expression (.leading)
+        Let node be proc create_swiftui_node from SWIFTUI_EXPRESSION
+
+        If node is equal to 0:
+            proc set_parse_error from parser, "Out of memory"
+            Return 0
+        End If
+
+        Note: Store as ".member" format
+        Let member_str2 be proc allocate from Layout with 256
+        Let dot_char2 be 46  Note: ASCII for '.'
+        proc memory_set_byte from Layout with member_str2, 0, dot_char2
+        Let member_length2 be proc string_length from StringCore with member_name2
+        proc memory_copy from Layout with member_str2, 1, member_name2, 0, member_length2
+        proc memory_set_byte from Layout with member_str2, 1 plus member_length2, 0
+        proc set_node_value from node, member_str2
+
+        Return node
+    End If
+
+    proc set_parse_error from parser, "Expected expression"
+    Return 0
+End Process
+
+Process called "parse_closure" takes parser as Integer returns Integer:
+    Note: Parse closure expression
+
+    @Reasoning:
+    Closures in SwiftUI can be:
+    - Simple: { Text("Hello") }
+    - With parameters: { value in Text(value) }
+    - Trailing closures for Button actions, etc.
+    @End Reasoning
+
+    Let node be proc create_swiftui_node from SWIFTUI_CLOSURE
+
+    If node is equal to 0:
+        proc set_parse_error from parser, "Out of memory"
+        Return 0
+    End If
+
+    Note: Expect opening brace
+    proc expect_token from parser, TOKEN_LBRACE from Lexer, "Expected '{' to start closure"
+
+    Note: Check for parameters (param in ...)
+    Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+    If is_identifier is equal to 1:
+        Let next_lexeme be proc peek_token_lexeme from parser
+        proc advance_token from parser
+
+        Note: Check for 'in' keyword
+        Let is_in be proc check_keyword from parser, "in"
+
+        If is_in is equal to 1:
+            proc advance_token from parser
+
+            Note: Store parameter name
+            proc set_node_name from node, next_lexeme
+        Otherwise:
+            Note: No parameters, need to backtrack and parse as body
+            Note: Create expression node for the identifier
+            Let expr be proc create_swiftui_node from SWIFTUI_IDENTIFIER
+
+            If expr is equal to 0:
+                proc set_parse_error from parser, "Out of memory"
+                Return 0
+            End If
+
+            proc set_node_name from expr, next_lexeme
+            proc add_node_child from node, expr
+        End If
+    End If
+
+    Note: Parse closure body (statements/expressions)
+    While 1 is equal to 1:
+        Let is_rbrace be proc check_token_type from parser, TOKEN_RBRACE from Lexer
+
+        If is_rbrace is equal to 1:
+            Break
+        End If
+
+        Note: Parse statement/expression
+        Let stmt be proc parse_closure_statement from parser
+
+        If stmt is equal to 0:
+            Return 0
+        End If
+
+        proc add_node_child from node, stmt
+    End While
+
+    Note: Expect closing brace
+    proc expect_token from parser, TOKEN_RBRACE from Lexer, "Expected '}' to end closure"
+
+    Return node
+End Process
+
+Process called "parse_closure_statement" takes parser as Integer returns Integer:
+    Note: Parse closure statement
+
+    @Reasoning:
+    Closure statements can be:
+    - View hierarchies (for ViewBuilder closures)
+    - Swift statements (assignments, function calls)
+    - Control flow (if, switch, for, etc.)
+    @End Reasoning
+
+    Note: Check for view hierarchy (Text, VStack, etc.)
+    Let is_view_type be proc check_token_type from parser, TOKEN_VIEW_TYPE from Lexer
+
+    If is_view_type is equal to 1:
+        Return proc parse_view_hierarchy from parser
+    End If
+
+    Note: Check for identifier (could be custom view or statement)
+    Let is_identifier be proc check_token_type from parser, TOKEN_IDENTIFIER from Lexer
+
+    If is_identifier is equal to 1:
+        Return proc parse_view_hierarchy from parser
+    End If
+
+    Note: Otherwise parse as expression
+    Return proc parse_expression from parser
+End Process
+
+Note: ============================================================================
+Note: Top-Level Parsing
+Note: ============================================================================
+
+Process called "parse_swiftui" takes parser as Integer returns Integer:
+    Note: Parse SwiftUI source file (top-level entry point)
+
+    @Reasoning:
+    SwiftUI files typically contain:
+    - Import statements (optional)
+    - View struct declarations
+    - Extension declarations (optional)
+    - Preview providers (optional)
+
+    The view struct is the core declarative UI component in SwiftUI code.
+    We parse the complete view struct including its body closure and all modifiers.
+    @End Reasoning
+
+    Note: Parse view struct
+    Let view_struct be proc parse_view_struct from parser
+
+    If view_struct is equal to 0:
+        Return 0
+    End If
+
+    Note: Check for parse errors
+    Let has_error be proc has_parse_error from parser
+
+    If has_error is equal to 1:
+        Return 0
+    End If
+
+    Return view_struct
+End Process

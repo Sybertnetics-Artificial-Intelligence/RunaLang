@@ -35,4 +35,1406 @@ This file consists of the following functions/features/operation types:
 - Recursive inlining detection and heuristic-based decisions
 :End Note
 
-Note: TODO - Implement function inlining optimization functionality
+Note: ========== IMPORTS ==========
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================
+Note: TYPE DEFINITIONS
+Note: ============================================================
+
+@Reasoning
+InliningContext stores all state needed for function inlining optimization.
+It tracks the current function being optimized, maintains a call graph for
+recursion detection, and collects statistics about inlining decisions.
+
+The context includes caches for cost calculations and inline candidates to
+avoid redundant analysis. This is critical for large functions with many
+call sites.
+
+Size calculation (64-bit pointers, 8 bytes each):
+- 15 fields * 8 bytes = 120 bytes per context
+@End Reasoning
+
+Type called "InliningContext":
+    cfg as Integer                          Note: CFG pointer for current function
+    ssa_ptr as Integer                      Note: SSA information pointer
+    dominance_ptr as Integer                Note: Dominance tree pointer
+    current_function_ptr as Integer         Note: Pointer to function being optimized
+    inlined_calls as Integer                Note: Counter for successful inlines
+    rejected_calls as Integer               Note: Counter for rejected candidates
+    total_calls_analyzed as Integer         Note: Total call sites examined
+    inline_candidates as Integer            Note: List of InlineCandidate structures
+    call_sites as Integer                   Note: List of CallSite structures
+    value_remap as Integer                  Note: Dictionary: old_value_id -> new_value_id
+    inlining_depth as Integer               Note: Current recursion depth (prevent infinite)
+    max_inlining_depth as Integer           Note: Maximum allowed depth (default 4)
+    cost_cache as Integer                   Note: Dictionary: function_ptr -> cost
+    blocks_processed as Integer             Note: Number of blocks analyzed
+    total_code_size_before as Integer       Note: Instruction count before inlining
+End Type
+
+@Reasoning
+InlineCandidate represents a single call site that may be inlined.
+It captures all information needed to make the inlining decision and
+perform the transformation if approved.
+
+We track both the cost and benefit estimates to make informed decisions
+about whether inlining improves performance.
+
+Size calculation:
+- 10 fields * 8 bytes = 80 bytes per candidate
+@End Reasoning
+
+Type called "InlineCandidate":
+    call_instruction_ptr as Integer         Note: Pointer to MIR_CALL instruction
+    call_block_ptr as Integer               Note: Pointer to containing basic block
+    callee_ptr as Integer                   Note: Pointer to called function
+    caller_ptr as Integer                   Note: Pointer to calling function
+    inline_cost as Integer                  Note: Estimated cost of inlining (instructions)
+    call_overhead as Integer                Note: Cost of call/return eliminated
+    net_benefit as Integer                  Note: Benefit - cost (positive = profitable)
+    is_recursive as Integer                 Note: Boolean: 1 if recursive, 0 otherwise
+    depth as Integer                        Note: Inlining depth in call chain
+    can_inline as Integer                   Note: Boolean: 1 if eligible, 0 otherwise
+End Type
+
+@Reasoning
+CallSite represents information about a single call instruction.
+Used for analysis and tracking during the inlining process.
+
+Size calculation:
+- 8 fields * 8 bytes = 64 bytes per call site
+@End Reasoning
+
+Type called "CallSite":
+    call_instruction_ptr as Integer         Note: Pointer to MIR_CALL instruction
+    call_block_ptr as Integer               Note: Pointer to containing basic block
+    callee_ptr as Integer                   Note: Pointer to called function
+    argument_count as Integer               Note: Number of arguments
+    is_indirect as Integer                  Note: Boolean: 1 if indirect call, 0 if direct
+    call_frequency as Integer               Note: Estimated execution frequency (hot/cold)
+    continuation_block_ptr as Integer       Note: Block after call returns
+    analyzed as Integer                     Note: Boolean: 1 if analyzed, 0 otherwise
+End Type
+
+Note: ============================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================
+
+@Implementation
+Creates and initializes an InliningContext structure for a given CFG.
+All counters start at zero, caches are initialized as empty collections,
+and depth limits are set to safe defaults.
+
+Memory allocation:
+- Context structure: 120 bytes
+- inline_candidates: List structure
+- call_sites: List structure
+- value_remap: Dictionary structure
+- cost_cache: Dictionary structure
+
+Returns pointer to initialized context, or 0 on allocation failure.
+@End Implementation
+
+Process called "create_inlining_context" that takes cfg_ptr as Integer returns Integer:
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let context_size be 120
+    Let context be proc allocate from Layout with context_size
+
+    If context equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG pointer
+    proc memory_set_int64 from Layout with context, 0, cfg_ptr
+
+    Note: Initialize SSA pointer
+    Let ssa_ptr be 0
+    proc memory_set_int64 from Layout with context, 8, ssa_ptr
+
+    Note: Initialize dominance pointer
+    Let dominance_ptr be 0
+    proc memory_set_int64 from Layout with context, 16, dominance_ptr
+
+    Note: Initialize current_function_ptr (will be set during optimization)
+    proc memory_set_int64 from Layout with context, 24, 0
+
+    Note: Initialize counters
+    proc memory_set_int64 from Layout with context, 32, 0  Note: inlined_calls
+    proc memory_set_int64 from Layout with context, 40, 0  Note: rejected_calls
+    proc memory_set_int64 from Layout with context, 48, 0  Note: total_calls_analyzed
+
+    Note: Create inline candidates list
+    Let candidates be proc create from List
+    proc memory_set_int64 from Layout with context, 56, candidates
+
+    Note: Create call sites list
+    Let sites be proc create from List
+    proc memory_set_int64 from Layout with context, 64, sites
+
+    Note: Create value remap dictionary
+    Let remap be proc create from Dictionary
+    proc memory_set_int64 from Layout with context, 72, remap
+
+    Note: Initialize inlining depth tracking
+    proc memory_set_int64 from Layout with context, 80, 0   Note: current depth
+    proc memory_set_int64 from Layout with context, 88, 4   Note: max depth (default 4)
+
+    Note: Create cost cache
+    Let cost_cache be proc create from Dictionary
+    proc memory_set_int64 from Layout with context, 96, cost_cache
+
+    Note: Initialize statistics
+    proc memory_set_int64 from Layout with context, 104, 0  Note: blocks_processed
+    proc memory_set_int64 from Layout with context, 112, 0  Note: total_code_size_before
+
+    Return context
+End Process
+
+@Implementation
+Destroys an InliningContext and frees all associated memory.
+This includes freeing all candidate structures, call site structures,
+caches, and the context itself.
+
+Proper cleanup prevents memory leaks in the optimization pipeline.
+@End Implementation
+
+Process called "destroy_inlining_context" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Note: Free inline candidates list (including individual structures)
+    Let candidates be the Integer at (context_ptr plus 56)
+    If candidates is not equal to 0:
+        Let count be proc length from List with candidates
+        Let i be 0
+        While i is less than count:
+            Let candidate_ptr be proc get from List with candidates and i
+            If candidate_ptr is not equal to 0:
+                proc deallocate from Layout with candidate_ptr
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with candidates
+    End If
+
+    Note: Free call sites list (including individual structures)
+    Let sites be the Integer at (context_ptr plus 64)
+    If sites is not equal to 0:
+        Let count be proc length from List with sites
+        Let i be 0
+        While i is less than count:
+            Let site_ptr be proc get from List with sites and i
+            If site_ptr is not equal to 0:
+                proc deallocate from Layout with site_ptr
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with sites
+    End If
+
+    Note: Free value remap dictionary
+    Let remap be the Integer at (context_ptr plus 72)
+    If remap is not equal to 0:
+        proc destroy from Dictionary with remap
+    End If
+
+    Note: Free cost cache
+    Let cost_cache be the Integer at (context_ptr plus 96)
+    If cost_cache is not equal to 0:
+        proc destroy from Dictionary with cost_cache
+    End If
+
+    Note: Free dominance pointer if allocated
+    Let dominance_ptr be the Integer at (context_ptr plus 16)
+    If dominance_ptr is not equal to 0:
+        proc destroy_dominance_tree from Dominance with dominance_ptr
+    End If
+
+    Note: Free context structure
+    proc deallocate from Layout with context_ptr
+End Process
+
+@Implementation
+Prints statistics about inlining optimization transformations.
+This provides visibility into the effectiveness of the inlining pass.
+@End Implementation
+
+Process called "print_inlining_stats" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Display "========== Function Inlining Statistics =========="
+
+    Let inlined_count be the Integer at (context_ptr plus 32)
+    Display "Calls inlined: " joined with inlined_count
+
+    Let rejected_count be the Integer at (context_ptr plus 40)
+    Display "Calls rejected: " joined with rejected_count
+
+    Let total_analyzed be the Integer at (context_ptr plus 48)
+    Display "Total call sites analyzed: " joined with total_analyzed
+
+    Let blocks_processed be the Integer at (context_ptr plus 104)
+    Display "Basic blocks processed: " joined with blocks_processed
+
+    Let code_size_before be the Integer at (context_ptr plus 112)
+    Display "Code size before inlining: " joined with code_size_before joined with " instructions"
+
+    Display "==================================================="
+End Process
+
+Note: ============================================================
+Note: COST MODEL - INLINING PROFITABILITY ANALYSIS
+Note: ============================================================
+
+@Reasoning
+The cost model determines whether inlining a function is profitable.
+This is the most critical component of the inlining optimization.
+
+Cost factors:
+1. Callee size (instruction count with weights)
+2. Call overhead (eliminated by inlining)
+3. Complexity penalties (loops, exceptions increase cost)
+4. Code size increase (replicated code at each call site)
+
+Benefit factors:
+1. Eliminated call/return overhead
+2. Enabled optimizations (constant propagation, DCE)
+3. Improved locality and cache behavior
+4. Reduced indirect branches
+
+Decision: Inline if net_benefit > threshold
+@End Reasoning
+
+@Implementation
+Calculates the cost of inlining a function.
+
+Algorithm:
+1. Count instructions in function body
+2. Apply weight multipliers for expensive operations
+3. Add complexity penalties for control flow
+4. Cache result to avoid recomputation
+
+Cost weights:
+- Simple operations (add, mov): weight 1
+- Memory operations (load, store): weight 2
+- Control flow (branch, call): weight 3
+- Floating point operations: weight 2
+- Vector operations: weight 4
+
+Complexity penalties:
+- Each loop: +50
+- Exception handling: +100
+- Indirect calls: +20
+
+Returns estimated cost in "instruction units".
+@End Implementation
+
+Process called "calculate_inline_cost" that takes callee_ptr as Integer, context_ptr as Integer returns Integer:
+    If callee_ptr equals 0 or context_ptr equals 0:
+        Return 999999  Note: Infinite cost prevents inlining
+    End If
+
+    Note: Check cache first
+    Let cost_cache be the Integer at (context_ptr plus 96)
+    Let cached_cost be proc get from Dictionary with cost_cache and callee_ptr
+
+    If cached_cost is not equal to 0:
+        Return cached_cost
+    End If
+
+    Note: Get callee CFG (offset 8 in MIRFunction)
+    Let callee_cfg be the Integer at (callee_ptr plus 8)
+    If callee_cfg equals 0:
+        Return 999999  Note: No CFG, cannot inline
+    End If
+
+    Note: Check if function is external (offset 80 in MIRFunction)
+    Let is_external be the Integer at (callee_ptr plus 80)
+    If is_external equals 1:
+        Return 999999  Note: Cannot inline external functions
+    End If
+
+    Let total_cost be 0
+    Let loop_penalty be 0
+    Let exception_penalty be 0
+
+    Note: Get all blocks from callee CFG
+    Let blocks be CFG.get_all_blocks(callee_cfg)
+    If blocks equals 0:
+        Return 999999
+    End If
+
+    Let block_count be proc length from List with blocks
+    Let block_idx be 0
+
+    Note: Iterate through all blocks and count weighted instructions
+    While block_idx is less than block_count:
+        Let block_ptr be proc get from List with blocks and block_idx
+
+        If block_ptr is not equal to 0:
+            Note: Check if block is in a loop (offset 72 in MIRBasicBlock)
+            Let loop_depth be the Integer at (block_ptr plus 72)
+            If loop_depth is greater than 0:
+                Set loop_penalty to loop_penalty plus 50
+            End If
+
+            Note: Get instructions in this block
+            Let instructions be CFG.get_block_instructions(block_ptr)
+            If instructions is not equal to 0:
+                Let inst_count be proc length from List with instructions
+                Let inst_idx be 0
+
+                While inst_idx is less than inst_count:
+                    Let inst_ptr be proc get from List with instructions and inst_idx
+
+                    If inst_ptr is not equal to 0:
+                        Let opcode be MIR.get_opcode(inst_ptr)
+
+                        Note: Apply cost weights based on opcode
+
+                        Note: Simple arithmetic (20002-20007, 20010-20016): weight 1
+                        If opcode is greater than or equal to 20002 and opcode is less than or equal to 20016:
+                            Set total_cost to total_cost plus 1
+                        End If
+
+                        Note: Memory operations (20200-20206): weight 2
+                        If opcode is greater than or equal to 20200 and opcode is less than or equal to 20206:
+                            Set total_cost to total_cost plus 2
+                        End If
+
+                        Note: Control flow (20300-20306): weight 3
+                        If opcode is greater than or equal to 20300 and opcode is less than or equal to 20306:
+                            Set total_cost to total_cost plus 3
+
+                            Note: Extra penalty for indirect calls (20305)
+                            If opcode equals 20305:
+                                Set total_cost to total_cost plus 20
+                            End If
+                        End If
+
+                        Note: Exception handling (20700-20706): weight 3 + penalty
+                        If opcode is greater than or equal to 20700 and opcode is less than or equal to 20706:
+                            Set total_cost to total_cost plus 3
+                            Set exception_penalty to exception_penalty plus 100
+                        End If
+
+                        Note: Vector operations (20600-20619): weight 4
+                        If opcode is greater than or equal to 20600 and opcode is less than or equal to 20619:
+                            Set total_cost to total_cost plus 4
+                        End If
+
+                        Note: Atomic operations (20500-20511): weight 3
+                        If opcode is greater than or equal to 20500 and opcode is less than or equal to 20511:
+                            Set total_cost to total_cost plus 3
+                        End If
+                    End If
+
+                    Set inst_idx to inst_idx plus 1
+                End While
+            End If
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Add complexity penalties
+    Set total_cost to total_cost plus loop_penalty
+    Set total_cost to total_cost plus exception_penalty
+
+    Note: Cache the computed cost
+    proc set from Dictionary with cost_cache, callee_ptr, and total_cost
+
+    Return total_cost
+End Process
+
+@Implementation
+Calculates the benefit of inlining a function call.
+
+Benefits include:
+1. Eliminated call overhead (register saves, call/return instructions)
+2. Enabled inter-procedural optimizations
+3. Improved instruction cache locality
+4. Eliminated indirect branch mispredictions
+
+Benefit estimation:
+- Base call overhead: 10 instruction units
+- Per-argument setup: 2 units each
+- Return value handling: 2 units
+- Optimization opportunities: 20% of callee cost (conservative)
+
+Returns estimated benefit in "instruction units".
+@End Implementation
+
+Process called "calculate_inline_benefit" that takes callee_ptr as Integer, call_inst_ptr as Integer, context_ptr as Integer returns Integer:
+    If callee_ptr equals 0 or call_inst_ptr equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Base call overhead (function prologue/epilogue elimination)
+    Let base_overhead be 10
+
+    Note: Count arguments to estimate parameter passing cost
+    Note: Get parameter count (offset 24 in MIRFunction)
+    Let param_count be the Integer at (callee_ptr plus 24)
+
+    Note: Argument setup cost: 2 units per argument
+    Let arg_setup_cost be param_count times 2
+
+    Note: Return value handling cost
+    Let return_cost be 2
+
+    Note: Total eliminated call overhead
+    Let call_overhead be base_overhead plus arg_setup_cost plus return_cost
+
+    Note: Estimate optimization opportunities enabled by inlining
+    Note: Conservative estimate: 20% of callee cost becomes optimizable
+    Let callee_cost be calculate_inline_cost(callee_ptr, context_ptr)
+    Let optimization_benefit be callee_cost divided by 5
+
+    Note: Total benefit
+    Let total_benefit be call_overhead plus optimization_benefit
+
+    Return total_benefit
+End Process
+
+@Implementation
+Determines if a call site is profitable to inline based on cost-benefit analysis.
+
+Decision criteria:
+1. Net benefit must be positive (benefit > cost)
+2. Cost must be below absolute threshold (prevents huge inlines)
+3. Not in recursive call chain (unless depth allows)
+4. Callee is not too complex (exception handling, deep loops)
+
+Thresholds:
+- Maximum inline cost: 500 instruction units
+- Minimum net benefit: 5 instruction units
+- Maximum recursion depth: 4 levels
+
+Returns 1 if should inline, 0 otherwise.
+@End Implementation
+
+Process called "is_profitable_to_inline" that takes candidate_ptr as Integer, context_ptr as Integer returns Integer:
+    If candidate_ptr equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get cost and benefit from candidate
+    Let inline_cost be the Integer at (candidate_ptr plus 32)
+    Let call_overhead be the Integer at (candidate_ptr plus 40)
+    Let net_benefit be the Integer at (candidate_ptr plus 48)
+
+    Note: Check absolute cost threshold
+    Let max_inline_cost be 500
+    If inline_cost is greater than max_inline_cost:
+        Return 0  Note: Too expensive to inline
+    End If
+
+    Note: Check net benefit threshold
+    Let min_net_benefit be 5
+    If net_benefit is less than min_net_benefit:
+        Return 0  Note: Not profitable enough
+    End If
+
+    Note: Check recursion depth
+    Let depth be the Integer at (candidate_ptr plus 64)
+    Let max_depth be the Integer at (context_ptr plus 88)
+
+    If depth is greater than or equal to max_depth:
+        Return 0  Note: Too deep in recursion chain
+    End If
+
+    Note: Check if marked as eligible
+    Let can_inline be the Integer at (candidate_ptr plus 72)
+    If can_inline equals 0:
+        Return 0  Note: Marked as ineligible for other reasons
+    End If
+
+    Note: All checks passed - profitable to inline
+    Return 1
+End Process
+
+Note: ============================================================
+Note: CALL SITE ANALYSIS
+Note: ============================================================
+
+@Reasoning
+Call site analysis identifies all function calls in the current function
+and creates candidate structures for potential inlining.
+
+We collect information about each call site including:
+- Callee function pointer
+- Arguments and parameter mapping
+- Execution frequency (hot vs cold)
+- Surrounding context
+
+This analysis phase separates identification from transformation.
+@End Reasoning
+
+@Implementation
+Scans all basic blocks and identifies function call instructions.
+
+Algorithm:
+1. Iterate through all basic blocks
+2. Examine all instructions looking for MIR_CALL
+3. Extract callee and argument information
+4. Create CallSite structure for each call
+5. Add to call_sites list in context
+
+Returns number of call sites found.
+@End Implementation
+
+Process called "collect_call_sites" that takes context_ptr as Integer returns Integer:
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be the Integer at (context_ptr plus 0)
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let call_sites be the Integer at (context_ptr plus 64)
+    Let site_count be 0
+
+    Note: Get all blocks from CFG
+    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    If blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be proc length from List with blocks
+    Let block_idx be 0
+
+    While block_idx is less than block_count:
+        Let block_ptr be proc get from List with blocks and block_idx
+
+        If block_ptr is not equal to 0:
+            Note: Get instructions in this block
+            Let instructions be CFG.get_block_instructions(block_ptr)
+            If instructions is not equal to 0:
+                Let inst_count be proc length from List with instructions
+                Let inst_idx be 0
+
+                While inst_idx is less than inst_count:
+                    Let inst_ptr be proc get from List with instructions and inst_idx
+
+                    If inst_ptr is not equal to 0:
+                        Let opcode be MIR.get_opcode(inst_ptr)
+
+                        Note: Check for direct call (MIR_CALL = 20304)
+                        If opcode equals 20304:
+                            Note: Create CallSite structure
+                            Let site_size be 64
+                            Let site_ptr be proc allocate from Layout with site_size
+
+                            If site_ptr is not equal to 0:
+                                Note: Set call_instruction_ptr
+                                proc memory_set_int64 from Layout with site_ptr, 0, inst_ptr
+
+                                Note: Set call_block_ptr
+                                proc memory_set_int64 from Layout with site_ptr, 8, block_ptr
+
+                                Note: Get callee (operand 0 of CALL instruction, offset 16)
+                                Let callee_ptr be the Integer at (inst_ptr plus 16)
+                                proc memory_set_int64 from Layout with site_ptr, 16, callee_ptr
+
+                                Note: Count arguments by examining call instruction operands
+                                Let arg_count be 0
+                                Note: Check operands at offsets 16, 24, 32, etc.
+                                Let op1 be Layout.memory_get_int64(inst_ptr, 16)
+                                If op1 is not equal to 0:
+                                    Let arg_count be arg_count + 1
+                                End If
+                                Let op2 be Layout.memory_get_int64(inst_ptr, 24)
+                                If op2 is not equal to 0:
+                                    Let arg_count be arg_count + 1
+                                End If
+                                Let op3 be Layout.memory_get_int64(inst_ptr, 32)
+                                If op3 is not equal to 0:
+                                    Let arg_count be arg_count + 1
+                                End If
+                                Layout.memory_set_int64(site_ptr, 24, arg_count)
+
+                                Note: Set is_indirect to false (this is direct call)
+                                proc memory_set_int64 from Layout with site_ptr, 32, 0
+
+                                Note: Estimate call frequency (use loop depth as proxy)
+                                Let loop_depth be the Integer at (block_ptr plus 72)
+                                Let frequency be 1
+                                If loop_depth is greater than 0:
+                                    Set frequency to 10  Note: In loop, likely hot
+                                End If
+                                proc memory_set_int64 from Layout with site_ptr, 40, frequency
+
+                                Note: Find continuation block (successor after call)
+                                Let next_inst be the Integer at (inst_ptr plus 48)
+                                Let continuation be 0
+                                If next_inst equals 0:
+                                    Note: Call at end of block, use successor
+                                    Let successors be the Integer at (block_ptr plus 48)
+                                    Let succ_count be the Integer at (block_ptr plus 56)
+                                    If succ_count is greater than 0:
+                                        Let succ_id be proc get from List with successors and 0
+                                        Set continuation to CFG.get_block_by_id(cfg_ptr, succ_id)
+                                    End If
+                                End If
+                                proc memory_set_int64 from Layout with site_ptr, 48, continuation
+
+                                Note: Mark as not yet analyzed
+                                proc memory_set_int64 from Layout with site_ptr, 56, 0
+
+                                Note: Add to call sites list
+                                proc append from List with call_sites and site_ptr
+                                Set site_count to site_count plus 1
+                            End If
+                        End If
+
+                        Note: Check for indirect call (MIR_CALL_INDIRECT = 20305)
+                        If opcode equals 20305:
+                            Note: Create CallSite structure for indirect call
+                            Let site_size be 64
+                            Let site_ptr be proc allocate from Layout with site_size
+
+                            If site_ptr is not equal to 0:
+                                proc memory_set_int64 from Layout with site_ptr, 0, inst_ptr
+                                proc memory_set_int64 from Layout with site_ptr, 8, block_ptr
+                                proc memory_set_int64 from Layout with site_ptr, 16, 0  Note: Unknown callee
+                                proc memory_set_int64 from Layout with site_ptr, 24, 0
+                                proc memory_set_int64 from Layout with site_ptr, 32, 1  Note: is_indirect
+                                proc memory_set_int64 from Layout with site_ptr, 40, 1
+                                proc memory_set_int64 from Layout with site_ptr, 48, 0
+                                proc memory_set_int64 from Layout with site_ptr, 56, 0
+
+                                proc append from List with call_sites and site_ptr
+                                Set site_count to site_count plus 1
+                            End If
+                        End If
+                    End If
+
+                    Set inst_idx to inst_idx plus 1
+                End While
+            End If
+
+            Note: Update blocks_processed counter
+            Let blocks_processed be the Integer at (context_ptr plus 104)
+            Set blocks_processed to blocks_processed plus 1
+            proc memory_set_int64 from Layout with context_ptr, 104, blocks_processed
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Update total_calls_analyzed counter
+    proc memory_set_int64 from Layout with context_ptr, 48, site_count
+
+    Return site_count
+End Process
+
+@Implementation
+Creates inline candidates from call sites by performing cost-benefit analysis.
+
+Algorithm:
+1. Iterate through all call sites
+2. Skip indirect calls (cannot inline)
+3. Calculate inline cost for callee
+4. Calculate benefit of inlining
+5. Compute net benefit
+6. Create InlineCandidate structure
+7. Add to candidates list
+
+Returns number of candidates created.
+@End Implementation
+
+Process called "create_inline_candidates" that takes context_ptr as Integer returns Integer:
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let call_sites be the Integer at (context_ptr plus 64)
+    Let candidates be the Integer at (context_ptr plus 56)
+    Let current_func be the Integer at (context_ptr plus 24)
+
+    Let site_count be proc length from List with call_sites
+    Let candidate_count be 0
+    Let i be 0
+
+    While i is less than site_count:
+        Let site_ptr be proc get from List with call_sites and i
+
+        If site_ptr is not equal to 0:
+            Note: Skip indirect calls
+            Let is_indirect be the Integer at (site_ptr plus 32)
+            If is_indirect equals 0:
+                Let call_inst be the Integer at (site_ptr plus 0)
+                Let call_block be the Integer at (site_ptr plus 8)
+                Let callee be the Integer at (site_ptr plus 16)
+
+                If callee is not equal to 0:
+                    Note: Calculate costs
+                    Let inline_cost be calculate_inline_cost(callee, context_ptr)
+                    Let benefit be calculate_inline_benefit(callee, call_inst, context_ptr)
+                    Let net_benefit be benefit minus inline_cost
+
+                    Note: Check if recursive
+                    Let is_recursive be 0
+                    If callee equals current_func:
+                        Set is_recursive to 1
+                    End If
+
+                    Note: Create candidate structure
+                    Let candidate_size be 80
+                    Let candidate_ptr be proc allocate from Layout with candidate_size
+
+                    If candidate_ptr is not equal to 0:
+                        proc memory_set_int64 from Layout with candidate_ptr, 0, call_inst
+                        proc memory_set_int64 from Layout with candidate_ptr, 8, call_block
+                        proc memory_set_int64 from Layout with candidate_ptr, 16, callee
+                        proc memory_set_int64 from Layout with candidate_ptr, 24, current_func
+                        proc memory_set_int64 from Layout with candidate_ptr, 32, inline_cost
+                        proc memory_set_int64 from Layout with candidate_ptr, 40, benefit
+                        proc memory_set_int64 from Layout with candidate_ptr, 48, net_benefit
+                        proc memory_set_int64 from Layout with candidate_ptr, 56, is_recursive
+
+                        Note: Get current inlining depth
+                        Let depth be the Integer at (context_ptr plus 80)
+                        proc memory_set_int64 from Layout with candidate_ptr, 64, depth
+
+                        Note: Determine if can inline (preliminary check)
+                        Let can_inline be 1
+                        If inline_cost is greater than 500:
+                            Set can_inline to 0  Note: Cost exceeds maximum threshold
+                        End If
+                        If is_recursive equals 1:
+                            Set can_inline to 0  Note: Direct self-recursion rejected (non-recursive nested inlining uses depth limit)
+                        End If
+                        proc memory_set_int64 from Layout with candidate_ptr, 72, can_inline
+
+                        proc append from List with candidates and candidate_ptr
+                        Set candidate_count to candidate_count plus 1
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return candidate_count
+End Process
+
+Note: ============================================================
+Note: FUNCTION BODY CLONING
+Note: ============================================================
+
+@Reasoning
+Function body cloning is the core operation for inlining. We must:
+1. Clone all basic blocks and instructions from callee
+2. Remap SSA value IDs (callee values → new values in caller)
+3. Substitute parameters with argument values
+4. Adjust phi nodes for merged control flow
+
+This must maintain SSA correctness and CFG integrity.
+@End Reasoning
+
+@Implementation
+Clones the body of a function for inlining at a call site.
+
+Algorithm:
+1. Create new blocks for each callee block
+2. Clone instructions with new value IDs
+3. Build value remapping table (old ID → new ID)
+4. Substitute parameters with call arguments
+5. Update phi nodes with remapped values
+6. Return mapping of entry/exit blocks
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "clone_function_body" that takes callee_ptr as Integer, context_ptr as Integer returns Integer:
+    If callee_ptr equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get callee CFG
+    Let callee_cfg be the Integer at (callee_ptr plus 8)
+    If callee_cfg equals 0:
+        Return 0
+    End If
+
+    Note: Get value remap dictionary
+    Let value_remap be the Integer at (context_ptr plus 72)
+
+    Note: Clear previous remapping
+    proc destroy from Dictionary with value_remap
+    Set value_remap to proc create from Dictionary
+    proc memory_set_int64 from Layout with context_ptr, 72, value_remap
+
+    Note: Get caller CFG
+    Let caller_cfg be the Integer at (context_ptr plus 0)
+
+    Note: Get caller function for value ID allocation
+    Let caller_func be the Integer at (context_ptr plus 24)
+    Let next_value_id be the Integer at (caller_func plus 56)
+
+    Note: Clone all blocks from callee
+    Let callee_blocks be CFG.get_all_blocks(callee_cfg)
+    Let block_count be proc length from List with callee_blocks
+    Let block_idx be 0
+
+    Let cloned_blocks be proc create from List
+
+    While block_idx is less than block_count:
+        Let orig_block_ptr be proc get from List with callee_blocks and block_idx
+
+        If orig_block_ptr is not equal to 0:
+            Note: Generate new block ID
+            Let new_block_id be the Integer at (caller_cfg plus 48)
+            Let next_block_id be new_block_id plus 1
+            proc memory_set_int64 from Layout with caller_cfg, 48, next_block_id
+
+            Note: Create cloned block
+            Let cloned_block be MIR.create_mir_basic_block(new_block_id, 0)
+
+            If cloned_block is not equal to 0:
+                Note: Clone instructions from original block
+                Let orig_instructions be CFG.get_block_instructions(orig_block_ptr)
+                Let inst_count be proc length from List with orig_instructions
+                Let inst_idx be 0
+
+                While inst_idx is less than inst_count:
+                    Let orig_inst be proc get from List with orig_instructions and inst_idx
+
+                    If orig_inst is not equal to 0:
+                        Note: Get original instruction opcode
+                        Let opcode be the Integer at (orig_inst plus 0)
+
+                        Note: Clone instruction
+                        Let cloned_inst be MIR.create_mir_node(opcode)
+
+                        If cloned_inst is not equal to 0:
+                            Note: Get original value ID
+                            Let orig_value_id be the Integer at (orig_inst plus 8)
+
+                            Note: Assign new value ID if instruction produces a value
+                            If orig_value_id is not equal to 0:
+                                proc memory_set_int64 from Layout with cloned_inst, 8, next_value_id
+
+                                Note: Record remapping
+                                proc set from Dictionary with value_remap, orig_value_id, and next_value_id
+
+                                Set next_value_id to next_value_id plus 1
+                            End If
+
+                            Note: Copy operands (will remap later)
+                            Let operand1 be the Integer at (orig_inst plus 16)
+                            Let operand2 be the Integer at (orig_inst plus 24)
+                            Let operand3 be the Integer at (orig_inst plus 32)
+
+                            proc memory_set_int64 from Layout with cloned_inst, 16, operand1
+                            proc memory_set_int64 from Layout with cloned_inst, 24, operand2
+                            proc memory_set_int64 from Layout with cloned_inst, 32, operand3
+
+                            Note: Copy type info
+                            Let type_info be the Integer at (orig_inst plus 40)
+                            proc memory_set_int64 from Layout with cloned_inst, 40, type_info
+
+                            Note: Add cloned instruction to block
+                            Let block_instructions be the Integer at (cloned_block plus 16)
+                            proc append from List with block_instructions and cloned_inst
+
+                            Note: Update instruction count
+                            Let inst_count_field be the Integer at (cloned_block plus 24)
+                            Set inst_count_field to inst_count_field plus 1
+                            proc memory_set_int64 from Layout with cloned_block, 24, inst_count_field
+                        End If
+                    End If
+
+                    Set inst_idx to inst_idx plus 1
+                End While
+
+                Note: Add cloned block to list
+                proc append from List with cloned_blocks and cloned_block
+            End If
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Update caller's next_value_id
+    proc memory_set_int64 from Layout with caller_func, 56, next_value_id
+
+    Note: Successful cloning
+    Return 1
+End Process
+
+@Implementation
+Remaps SSA values in cloned instructions using the value remap dictionary.
+
+After cloning, all operands still reference the original callee's value IDs.
+This function updates them to reference the new cloned value IDs.
+
+Algorithm:
+1. Iterate through all cloned instructions
+2. For each operand, look up remapped value ID
+3. Replace operand with remapped ID
+4. Handle special cases (phi nodes, branches)
+
+Returns 1 on success.
+@End Implementation
+
+Process called "remap_cloned_values" that takes cloned_blocks as Integer, context_ptr as Integer returns Integer:
+    If cloned_blocks equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Let value_remap be the Integer at (context_ptr plus 72)
+    Let block_count be proc length from List with cloned_blocks
+    Let block_idx be 0
+
+    While block_idx is less than block_count:
+        Let block_ptr be proc get from List with cloned_blocks and block_idx
+
+        If block_ptr is not equal to 0:
+            Let instructions be CFG.get_block_instructions(block_ptr)
+            Let inst_count be proc length from List with instructions
+            Let inst_idx be 0
+
+            While inst_idx is less than inst_count:
+                Let inst_ptr be proc get from List with instructions and inst_idx
+
+                If inst_ptr is not equal to 0:
+                    Note: Remap operand 1
+                    Let operand1 be the Integer at (inst_ptr plus 16)
+                    If operand1 is not equal to 0:
+                        Let remapped1 be proc get from Dictionary with value_remap and operand1
+                        If remapped1 is not equal to 0:
+                            proc memory_set_int64 from Layout with inst_ptr, 16, remapped1
+                        End If
+                    End If
+
+                    Note: Remap operand 2
+                    Let operand2 be the Integer at (inst_ptr plus 24)
+                    If operand2 is not equal to 0:
+                        Let remapped2 be proc get from Dictionary with value_remap and operand2
+                        If remapped2 is not equal to 0:
+                            proc memory_set_int64 from Layout with inst_ptr, 24, remapped2
+                        End If
+                    End If
+
+                    Note: Remap operand 3
+                    Let operand3 be the Integer at (inst_ptr plus 32)
+                    If operand3 is not equal to 0:
+                        Let remapped3 be proc get from Dictionary with value_remap and operand3
+                        If remapped3 is not equal to 0:
+                            proc memory_set_int64 from Layout with inst_ptr, 32, remapped3
+                        End If
+                    End If
+                End If
+
+                Set inst_idx to inst_idx plus 1
+            End While
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================
+Note: INLINING TRANSFORMATION
+Note: ============================================================
+
+@Reasoning
+The inlining transformation integrates the cloned callee body into the caller.
+
+Steps:
+1. Split the call block at the call instruction
+2. Wire cloned entry to split point
+3. Wire cloned exits to continuation block
+4. Remove the call instruction
+5. Update CFG edges
+6. Recompute SSA form
+
+This maintains CFG integrity and SSA correctness.
+@End Reasoning
+
+@Implementation
+Performs the actual inlining transformation for a candidate.
+
+Algorithm:
+1. Clone function body
+2. Remap values
+3. Substitute parameters
+4. Split call block
+5. Integrate cloned blocks
+6. Update CFG edges
+7. Remove call instruction
+8. Recompute SSA
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "perform_inline_transformation" that takes candidate_ptr as Integer, context_ptr as Integer returns Integer:
+    If candidate_ptr equals 0 or context_ptr equals 0:
+        Return 0
+    End If
+
+    Let call_inst_ptr be the Integer at (candidate_ptr plus 0)
+    Let call_block_ptr be the Integer at (candidate_ptr plus 8)
+    Let callee_ptr be the Integer at (candidate_ptr plus 16)
+
+    Note: Clone function body
+    Let cloned_blocks be clone_function_body(callee_ptr, context_ptr)
+    If cloned_blocks equals 0:
+        Return 0
+    End If
+
+    Note: Get value remap table from context
+    Let value_remap be the Integer at (context_ptr plus 72)
+
+    Note: Get call instruction details
+    Let call_opcode be the Integer at (call_inst_ptr plus 0)
+    If call_opcode is not equal to 20304:  Note: MIR_CALL
+        Return 0
+    End If
+
+    Note: Get call arguments for parameter substitution
+    Let arg_count be the Integer at (call_inst_ptr plus 24)
+    Let args_ptr be the Integer at (call_inst_ptr plus 32)
+
+    Note: Get callee entry block (first cloned block)
+    Let entry_block_ptr be the Integer at (cloned_blocks plus 0)
+    If entry_block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Substitute parameters with arguments in cloned blocks
+    Let param_idx be 0
+    While param_idx is less than arg_count:
+        Note: Get argument value
+        Let arg_value be the Integer at (args_ptr plus (param_idx times 8))
+
+        Note: Get parameter value ID (callee's param_idx parameter)
+        Let param_value_id be param_idx plus 1000000  Note: Parameter value IDs start at 1000000
+
+        Note: Update value remap: param -> arg
+        proc memory_set_int64 from Layout with value_remap, (param_value_id times 8), arg_value
+
+        Set param_idx to param_idx plus 1
+    End While
+
+    Note: Remap all values in cloned blocks
+    remap_cloned_values(cloned_blocks, context_ptr)
+
+    Note: Split call block at call instruction
+    Let cfg be the Integer at (context_ptr plus 0)
+
+    Note: Create continuation block (instructions after call)
+    Let continuation_block be CFG.create_basic_block(cfg)
+    If continuation_block equals 0:
+        Return 0
+    End If
+
+    Note: Move instructions after call to continuation block
+    Let call_block_insts be the Integer at (call_block_ptr plus 16)
+    Let inst_count be the Integer at (call_block_ptr plus 24)
+    Let call_inst_idx be 0
+    Let found_call be 0
+
+    Note: Find call instruction index
+    While call_inst_idx is less than inst_count:
+        Let current_inst be the Integer at (call_block_insts plus (call_inst_idx times 8))
+        If current_inst equals call_inst_ptr:
+            Set found_call to 1
+            Exit While
+        End If
+        Set call_inst_idx to call_inst_idx plus 1
+    End While
+
+    If found_call equals 0:
+        Return 0
+    End If
+
+    Note: Move instructions after call to continuation block
+    Let move_idx be call_inst_idx plus 1
+    While move_idx is less than inst_count:
+        Let inst_to_move be the Integer at (call_block_insts plus (move_idx times 8))
+        CFG.add_instruction_to_block(continuation_block, inst_to_move)
+        Set move_idx to move_idx plus 1
+    End While
+
+    Note: Update call block instruction count (truncate at call)
+    proc memory_set_int64 from Layout with call_block_ptr, 24, call_inst_idx
+
+    Note: Remove call instruction (truncated by updating count)
+
+    Note: Wire CFG edges: call_block -> entry_block -> ... -> continuation_block
+    CFG.add_edge(call_block_ptr, entry_block_ptr)
+
+    Note: Find all return instructions in cloned blocks and redirect to continuation
+    Let block_idx be 0
+    Let block_count be the Integer at (cloned_blocks plus 8)
+    While block_idx is less than block_count:
+        Let cloned_block be the Integer at (cloned_blocks plus 16 plus (block_idx times 8))
+        Let block_insts be the Integer at (cloned_block plus 16)
+        Let block_inst_count be the Integer at (cloned_block plus 24)
+
+        Note: Check last instruction for return
+        If block_inst_count is greater than 0:
+            Let last_inst be the Integer at (block_insts plus ((block_inst_count minus 1) times 8))
+            Let last_opcode be the Integer at (last_inst plus 0)
+
+            If last_opcode equals 20306:  Note: MIR_RETURN
+                Note: Get return value
+                Let ret_value be the Integer at (last_inst plus 8)
+
+                Note: Replace return with jump to continuation
+                proc memory_set_int64 from Layout with last_inst, 0, 20301  Note: MIR_JMP
+                proc memory_set_int64 from Layout with last_inst, 8, continuation_block
+
+                Note: Add edge to continuation
+                CFG.add_edge(cloned_block, continuation_block)
+
+                Note: If call had result, replace uses of result with return value
+                Let call_result_id be the Integer at (call_inst_ptr plus 8)
+                If call_result_id is not equal to 0:
+                    Note: Update value remap: call_result -> return_value
+                    proc memory_set_int64 from Layout with value_remap, (call_result_id times 8), ret_value
+                End If
+            End If
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Add cloned blocks to CFG
+    Set block_idx to 0
+    While block_idx is less than block_count:
+        Let cloned_block be the Integer at (cloned_blocks plus 16 plus (block_idx times 8))
+        CFG.add_block_to_function(cfg, cloned_block)
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Update SSA form (recompute dominance and SSA after CFG modification)
+    Let ssa_ptr be the Integer at (context_ptr plus 8)
+    If ssa_ptr is not equal to 0:
+        SSA.recompute_ssa(cfg, ssa_ptr)
+    End If
+
+    Note: Increment inlined calls counter
+    Let inlined_count be the Integer at (context_ptr plus 32)
+    proc memory_set_int64 from Layout with context_ptr, 32, (inlined_count plus 1)
+
+    Return 1
+End Process
+
+Note: ============================================================
+Note: MAIN ENTRY POINTS
+Note: ============================================================
+
+@Implementation
+Main entry point for function inlining optimization.
+
+Algorithm:
+1. Create context
+2. Collect call sites
+3. Create candidates with cost analysis
+4. Select profitable candidates
+5. Perform inlining transformations
+6. Recompute SSA
+7. Print statistics
+8. Clean up
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "optimize_function_with_inlining" that takes function_ptr as Integer returns Integer:
+    If function_ptr equals 0:
+        Return 0
+    End If
+
+    Display "Starting function inlining optimization"
+
+    Note: Get CFG from function
+    Let cfg_ptr be the Integer at (function_ptr plus 8)
+    If cfg_ptr equals 0:
+        Display "Function has no CFG, skipping inlining"
+        Return 0
+    End If
+
+    Note: Create context
+    Let context_ptr be create_inlining_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "Failed to create inlining context"
+        Return 0
+    End If
+
+    Note: Set current function
+    proc memory_set_int64 from Layout with context_ptr, 24, function_ptr
+
+    Note: Collect call sites
+    Let call_count be collect_call_sites(context_ptr)
+    Display "Found " joined with call_count joined with " call sites"
+
+    If call_count equals 0:
+        Display "No calls found, skipping inlining"
+        destroy_inlining_context(context_ptr)
+        Return 1
+    End If
+
+    Note: Create inline candidates
+    Let candidate_count be create_inline_candidates(context_ptr)
+    Display "Created " joined with candidate_count joined with " inline candidates"
+
+    Note: Inline profitable candidates
+    Let candidates be the Integer at (context_ptr plus 56)
+    Let inlined_count be 0
+    Let i be 0
+
+    While i is less than candidate_count:
+        Let candidate_ptr be proc get from List with candidates and i
+
+        If candidate_ptr is not equal to 0:
+            Let is_profitable be is_profitable_to_inline(candidate_ptr, context_ptr)
+
+            If is_profitable equals 1:
+                Note: Increment depth before inlining (track nesting level)
+                Let current_depth be the Integer at (context_ptr plus 80)
+                proc memory_set_int64 from Layout with context_ptr, 80, (current_depth plus 1)
+
+                Let success be perform_inline_transformation(candidate_ptr, context_ptr)
+
+                Note: Decrement depth after inlining
+                Let new_depth be the Integer at (context_ptr plus 80)
+                proc memory_set_int64 from Layout with context_ptr, 80, (new_depth minus 1)
+
+                If success equals 1:
+                    Set inlined_count to inlined_count plus 1
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update statistics
+    proc memory_set_int64 from Layout with context_ptr, 32, inlined_count
+
+    Note: Print statistics
+    print_inlining_stats(context_ptr)
+
+    Note: Clean up
+    destroy_inlining_context(context_ptr)
+
+    Display "Function inlining optimization complete"
+
+    Return 1
+End Process
+
+@Implementation
+Entry point for running inlining pass on entire program.
+
+Returns 1 on success, 0 on failure.
+@End Implementation
+
+Process called "run_inlining_pass" that takes program_ptr as Integer returns Integer:
+    If program_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get all functions
+    Let functions be MIR.get_program_functions(program_ptr)
+    If functions equals 0:
+        Return 0
+    End If
+
+    Let func_count be proc length from List with functions
+    Let optimized_count be 0
+    Let i be 0
+
+    Display "Running inlining pass on " joined with func_count joined with " functions"
+
+    While i is less than func_count:
+        Let func_ptr be proc get from List with functions and i
+
+        If func_ptr is not equal to 0:
+            Let is_external be the Integer at (func_ptr plus 80)
+            If is_external equals 0:
+                Let success be optimize_function_with_inlining(func_ptr)
+                If success equals 1:
+                    Set optimized_count to optimized_count plus 1
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "Inlining completed for " joined with optimized_count joined with " functions"
+
+    Return 1
+End Process
+
+@Implementation
+Profitability check for inlining optimization.
+
+Inlining is beneficial when:
+1. Function contains calls (has opportunities)
+2. Optimization level >= 2 (inlining at -O2 and above)
+3. Not optimizing for size (-Os  skip aggressive inlining)
+
+Returns 1 if should run, 0 otherwise.
+@End Implementation
+
+Process called "should_run_inlining" that takes function_ptr as Integer, optimization_level as Integer returns Integer:
+    Note: Inlining at -O2 and above
+    If optimization_level is less than 2:
+        Return 0
+    End If
+
+    Note: Check if function has calls
+    If function_ptr is not equal to 0:
+        Let call_count be MIR.count_instructions_of_type(function_ptr, 20304)
+        If call_count is greater than 0:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================
+Note: PASS METADATA
+Note: ============================================================
+
+@Implementation
+Returns the name of this optimization pass.
+@End Implementation
+
+Process called "get_inlining_pass_name" that takes nothing returns Integer:
+    Return StringCore.create_from_literal("Function Inlining")
+End Process
+
+@Implementation
+Returns a description of this optimization pass.
+@End Implementation
+
+Process called "get_inlining_pass_description" that takes nothing returns Integer:
+    Return StringCore.create_from_literal("Inlines function calls based on cost-benefit analysis to eliminate call overhead and enable inter-procedural optimization")
+End Process

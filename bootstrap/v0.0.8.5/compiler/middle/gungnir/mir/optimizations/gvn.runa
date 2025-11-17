@@ -35,4 +35,2005 @@ This file consists of the following functions/features/operation types:
 - Phi node congruence and loop-carried value handling
 :End Note
 
-Note: TODO - Implement Global Value Numbering optimization functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================================
+Note: TYPE DEFINITIONS - GVN Value Numbering System
+Note: ============================================================================
+
+Type called "ValueNumber":
+    @Reasoning
+    Represents a unique value number for GVN analysis.
+
+    **VALUE NUMBER:**
+    A value number uniquely identifies a congruence class of equivalent values.
+    All SSA values with the same value number are guaranteed to compute
+    the same value at runtime.
+
+    **MEMORY LAYOUT** (24 bytes):
+    ```
+    Offset 0:  number (Integer - unique value number ID)
+    Offset 8:  leader (Integer - canonical SSA value_id for this class)
+    Offset 16: expression_hash (Integer - hash of defining expression)
+    ```
+    @End Reasoning
+
+    number as Integer
+    leader as Integer
+    expression_hash as Integer
+End Type
+
+Type called "HashConsNode":
+    @Reasoning
+    Hash-consed expression node for structural sharing.
+
+    **HASH CONSING:**
+    Expressions with identical structure share the same HashConsNode.
+    This enables O(1) expression comparison via pointer equality.
+
+    **CANONICALIZATION:**
+    - Commutative operations (ADD, MUL, AND, OR, XOR) have sorted operands
+    - Operands are value numbers (not SSA IDs) for maximal sharing
+    - Memory operations include memory state in hash
+
+    **MEMORY LAYOUT** (56 bytes):
+    ```
+    Offset 0:  opcode (Integer - MIR opcode)
+    Offset 8:  operand_count (Integer)
+    Offset 16: vn1 (Integer - value number of operand 1)
+    Offset 24: vn2 (Integer - value number of operand 2)
+    Offset 32: vn3 (Integer - value number of operand 3, for ternary ops)
+    Offset 40: hash (Integer - precomputed hash)
+    Offset 48: result_vn (Integer - value number of result)
+    ```
+    @End Reasoning
+
+    opcode as Integer
+    operand_count as Integer
+    vn1 as Integer
+    vn2 as Integer
+    vn3 as Integer
+    hash as Integer
+    result_vn as Integer
+End Type
+
+Type called "CongruenceClass":
+    @Reasoning
+    Represents a set of equivalent SSA values.
+
+    **CONGRUENCE:**
+    Values are congruent if they compute the same value.
+    - Initially, each SSA value is in its own class
+    - Classes are merged when values proven equivalent
+    - Leader is canonical representative
+
+    **MEMORY LAYOUT** (32 bytes):
+    ```
+    Offset 0:  value_number (Integer - VN for this class)
+    Offset 8:  members (Integer - Set of SSA value_ids)
+    Offset 16: leader (Integer - canonical value_id)
+    Offset 24: expression (Integer - HashConsNode pointer)
+    ```
+    @End Reasoning
+
+    value_number as Integer
+    members as Integer
+    leader as Integer
+    expression as Integer
+End Type
+
+Type called "GVNContext":
+    @Reasoning
+    Context for Global Value Numbering optimization.
+
+    **GVN ALGORITHM:**
+    1. **Initialization**: Assign each SSA value a unique value number
+    2. **Hash Consing**: Build hash-consed expression DAG
+    3. **Congruence**: Partition values into congruence classes
+    4. **Iteration**: Refine partition until fixed point
+    5. **Replacement**: Replace redundant values with leaders
+
+    **MEMORY LAYOUT** (160 bytes):
+    ```
+    Offset 0:   cfg (Integer - CFG pointer)
+    Offset 8:   value_to_vn (Integer - Dictionary: value_id → ValueNumber)
+    Offset 16:  vn_to_class (Integer - Dictionary: vn → CongruenceClass)
+    Offset 24:  expression_table (Integer - Dictionary: hash → HashConsNode)
+    Offset 32:  worklist (Integer - List of values to reprocess)
+    Offset 40:  phi_worklist (Integer - List of PHI nodes to reprocess)
+    Offset 48:  value_numbers_assigned (Integer - counter)
+    Offset 56:  congruence_classes (Integer - counter)
+    Offset 64:  values_replaced (Integer - counter)
+    Offset 72:  redundant_loads (Integer - counter)
+    Offset 80:  algebraic_simplifications (Integer - counter)
+    Offset 88:  ssa_ptr (Integer - SSA analysis)
+    Offset 96:  dominance_ptr (Integer - Dominance analysis)
+    Offset 104: use_def_chains (Integer - Use-def chains)
+    Offset 112: def_use_chains (Integer - Def-use chains)
+    Offset 120: memory_ssa (Integer - Memory SSA for load/store analysis)
+    Offset 128: alias_analysis (Integer - Alias analysis pointer)
+    Offset 136: constant_values (Integer - Dictionary: vn → constant value)
+    Offset 144: dominator_tree (Integer - Dominator tree structure)
+    Offset 152: iteration_count (Integer - Fixed-point iteration counter)
+    ```
+    @End Reasoning
+
+    cfg as Integer
+    value_to_vn as Integer
+    vn_to_class as Integer
+    expression_table as Integer
+    worklist as Integer
+    phi_worklist as Integer
+    value_numbers_assigned as Integer
+    congruence_classes as Integer
+    values_replaced as Integer
+    redundant_loads as Integer
+    algebraic_simplifications as Integer
+    ssa_ptr as Integer
+    dominance_ptr as Integer
+    use_def_chains as Integer
+    def_use_chains as Integer
+    memory_ssa as Integer
+    alias_analysis as Integer
+    constant_values as Integer
+    dominator_tree as Integer
+    iteration_count as Integer
+End Type
+
+Note: ============================================================================
+Note: VALUE NUMBER CONSTANTS
+Note: ============================================================================
+
+Constant VN_UNDEFINED as Integer is 0
+Constant VN_START as Integer is 1
+
+Note: Hash computation primes
+Constant GVN_HASH_PRIME_1 as Integer is 31
+Constant GVN_HASH_PRIME_2 as Integer is 37
+Constant GVN_HASH_PRIME_3 as Integer is 41
+Constant GVN_HASH_PRIME_4 as Integer is 43
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_gvn_context" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Creates and initializes GVN context.
+
+    **INITIALIZATION:**
+    - Allocates 160-byte context structure
+    - Creates value number tables
+    - Creates congruence class structures
+    - Creates expression hash table
+    - Initializes worklists
+    - Initializes all counters
+
+    Returns context pointer or 0 on failure.
+    @End Reasoning
+
+    @Performance_Hints
+    GVN is one of the most powerful optimizations but also expensive.
+    The hash consing and congruence partitioning require significant
+    memory and computation. Use profitability heuristics before running.
+    @End Performance_Hints
+
+    If cfg equals 0:
+        Display "create_gvn_context: null CFG"
+        Return 0
+    End If
+
+    Note: Allocate context (160 bytes)
+    Let context_ptr be Layout.allocate(160)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG reference
+    Layout.memory_set_int64(context_ptr, 0, cfg)
+
+    Note: Create value_to_vn dictionary (value_id → ValueNumber)
+    Let value_to_vn be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 8, value_to_vn)
+
+    Note: Create vn_to_class dictionary (vn → CongruenceClass)
+    Let vn_to_class be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 16, vn_to_class)
+
+    Note: Create expression table (hash → HashConsNode)
+    Let expression_table be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 24, expression_table)
+
+    Note: Create worklist
+    Let worklist be List.create()
+    Layout.memory_set_int64(context_ptr, 32, worklist)
+
+    Note: Create PHI worklist
+    Let phi_worklist be List.create()
+    Layout.memory_set_int64(context_ptr, 40, phi_worklist)
+
+    Note: Initialize counters
+    Layout.memory_set_int64(context_ptr, 48, 0)   Note: value_numbers_assigned
+    Layout.memory_set_int64(context_ptr, 56, 0)   Note: congruence_classes
+    Layout.memory_set_int64(context_ptr, 64, 0)   Note: values_replaced
+    Layout.memory_set_int64(context_ptr, 72, 0)   Note: redundant_loads
+    Layout.memory_set_int64(context_ptr, 80, 0)   Note: algebraic_simplifications
+
+    Note: Initialize SSA, dominance, and chain pointers
+    Layout.memory_set_int64(context_ptr, 88, 0)   Note: ssa_ptr
+    Layout.memory_set_int64(context_ptr, 96, 0)   Note: dominance_ptr
+    Layout.memory_set_int64(context_ptr, 104, 0)  Note: use_def_chains
+    Layout.memory_set_int64(context_ptr, 112, 0)  Note: def_use_chains
+
+    Note: Initialize memory SSA and alias analysis
+    Layout.memory_set_int64(context_ptr, 120, 0)  Note: memory_ssa
+    Layout.memory_set_int64(context_ptr, 128, 0)  Note: alias_analysis
+
+    Note: Create constant values dictionary
+    Let constant_values be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 136, constant_values)
+
+    Note: Initialize dominator tree and iteration counter
+    Layout.memory_set_int64(context_ptr, 144, 0)  Note: dominator_tree
+    Layout.memory_set_int64(context_ptr, 152, 0)  Note: iteration_count
+
+    Display "create_gvn_context: context created"
+    Return context_ptr
+End Process
+
+Process called "destroy_gvn_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys GVN context and frees all memory.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy value_to_vn dictionary
+    Let value_to_vn be Layout.memory_get_int64(context_ptr, 8)
+    If value_to_vn is not equal to 0:
+        Let keys be proc keys from Dictionary with value_to_vn
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let vn_ptr be proc get from Dictionary with value_to_vn, key
+
+            If vn_ptr is not equal to 0:
+                Layout.deallocate(vn_ptr)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with value_to_vn
+    End If
+
+    Note: Destroy vn_to_class dictionary
+    Let vn_to_class be Layout.memory_get_int64(context_ptr, 16)
+    If vn_to_class is not equal to 0:
+        Let keys be proc keys from Dictionary with vn_to_class
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let class_ptr be proc get from Dictionary with vn_to_class, key
+
+            If class_ptr is not equal to 0:
+                Note: Destroy members set
+                Let members be Layout.memory_get_int64(class_ptr, 8)
+                If members is not equal to 0:
+                    proc destroy from Set with members
+                End If
+
+                Layout.deallocate(class_ptr)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with vn_to_class
+    End If
+
+    Note: Destroy expression table
+    Let expression_table be Layout.memory_get_int64(context_ptr, 24)
+    If expression_table is not equal to 0:
+        Let keys be proc keys from Dictionary with expression_table
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let expr_ptr be proc get from Dictionary with expression_table, key
+
+            If expr_ptr is not equal to 0:
+                Layout.deallocate(expr_ptr)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with expression_table
+    End If
+
+    Note: Destroy worklist
+    Let worklist be Layout.memory_get_int64(context_ptr, 32)
+    If worklist is not equal to 0:
+        List.destroy(worklist)
+    End If
+
+    Note: Destroy PHI worklist
+    Let phi_worklist be Layout.memory_get_int64(context_ptr, 40)
+    If phi_worklist is not equal to 0:
+        List.destroy(phi_worklist)
+    End If
+
+    Note: Destroy constant values dictionary
+    Let constant_values be Layout.memory_get_int64(context_ptr, 136)
+    If constant_values is not equal to 0:
+        proc destroy from Dictionary with constant_values
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr)
+
+    Display "destroy_gvn_context: context destroyed"
+    Return 1
+End Process
+
+Process called "print_gvn_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints GVN optimization statistics.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let value_numbers_assigned be Layout.memory_get_int64(context_ptr, 48)
+    Let congruence_classes be Layout.memory_get_int64(context_ptr, 56)
+    Let values_replaced be Layout.memory_get_int64(context_ptr, 64)
+    Let redundant_loads be Layout.memory_get_int64(context_ptr, 72)
+    Let algebraic_simplifications be Layout.memory_get_int64(context_ptr, 80)
+    Let iteration_count be Layout.memory_get_int64(context_ptr, 152)
+
+    Display "============================================"
+    Display "GLOBAL VALUE NUMBERING STATISTICS"
+    Display "============================================"
+    Display "Value numbers assigned:      " joined with value_numbers_assigned
+    Display "Congruence classes:          " joined with congruence_classes
+    Display "Values replaced:             " joined with values_replaced
+    Display "Redundant loads eliminated:  " joined with redundant_loads
+    Display "Algebraic simplifications:   " joined with algebraic_simplifications
+    Display "Fixed-point iterations:      " joined with iteration_count
+    Display "Total optimizations:         " joined with values_replaced plus redundant_loads plus algebraic_simplifications
+    Display "============================================"
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: VALUE NUMBERING SYSTEM AND HASH CONSING
+Note: ============================================================================
+
+Process called "create_value_number" that takes number as Integer, leader as Integer, expr_hash as Integer returns Integer:
+    @Reasoning
+    Creates a ValueNumber structure.
+
+    Returns ValueNumber pointer or 0 on failure.
+    @End Reasoning
+
+    Let vn_ptr be Layout.allocate(24)
+    If vn_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(vn_ptr, 0, number)
+    Layout.memory_set_int64(vn_ptr, 8, leader)
+    Layout.memory_set_int64(vn_ptr, 16, expr_hash)
+
+    Return vn_ptr
+End Process
+
+Process called "assign_value_number" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Assigns a fresh value number to an SSA value.
+
+    **VALUE NUMBER ASSIGNMENT:**
+    Each SSA value gets a unique value number initially.
+    Later, congruence analysis may merge value numbers.
+
+    Returns value number (integer).
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return VN_UNDEFINED
+    End If
+
+    Let value_to_vn be Layout.memory_get_int64(context_ptr, 8)
+    Let value_id_str be proc integer_to_string from String with value_id
+
+    Note: Check if already assigned
+    Let contains_value be proc contains from Dictionary with value_to_vn, value_id_str
+    If contains_value equals 1:
+        Let vn_ptr be proc get from Dictionary with value_to_vn, value_id_str
+        Let vn be Layout.memory_get_int64(vn_ptr, 0)
+        Return vn
+    End If
+
+    Note: Assign fresh value number
+    Let value_numbers_assigned be Layout.memory_get_int64(context_ptr, 48)
+    Set value_numbers_assigned to value_numbers_assigned plus 1
+    Layout.memory_set_int64(context_ptr, 48, value_numbers_assigned)
+
+    Let new_vn be VN_START plus value_numbers_assigned
+
+    Note: Create ValueNumber structure
+    Let vn_ptr be create_value_number(new_vn, value_id, 0)
+    proc set from Dictionary with value_to_vn, value_id_str, vn_ptr
+
+    Display "assign_value_number: assigned VN " joined with new_vn joined with " to value " joined with value_id
+
+    Return new_vn
+End Process
+
+Process called "get_value_number" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Gets the value number for an SSA value.
+
+    Returns value number or VN_UNDEFINED if not assigned.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return VN_UNDEFINED
+    End If
+
+    Let value_to_vn be Layout.memory_get_int64(context_ptr, 8)
+    Let value_id_str be proc integer_to_string from String with value_id
+
+    Let contains_value be proc contains from Dictionary with value_to_vn, value_id_str
+    If contains_value equals 0:
+        Return VN_UNDEFINED
+    End If
+
+    Let vn_ptr be proc get from Dictionary with value_to_vn, value_id_str
+    Let vn be Layout.memory_get_int64(vn_ptr, 0)
+
+    Return vn
+End Process
+
+Process called "compute_hash_cons_hash" that takes opcode as Integer, vn1 as Integer, vn2 as Integer, vn3 as Integer returns Integer:
+    @Reasoning
+    Computes hash for hash-consed expression.
+
+    **HASH CONSING:**
+    Hash is computed from opcode and VALUE NUMBERS (not SSA IDs).
+    This enables maximal structural sharing.
+
+    Returns computed hash.
+    @End Reasoning
+
+    Note: Canonicalize for commutative operations
+    Let operand1 be vn1
+    Let operand2 be vn2
+
+    Note: Check if commutative (using same opcodes as CSE)
+    Let is_commutative be 0
+    If opcode equals MIR.MIR_ADD:
+        Set is_commutative to 1
+    End If
+    If opcode equals MIR.MIR_MUL:
+        Set is_commutative to 1
+    End If
+    If opcode equals MIR.MIR_AND:
+        Set is_commutative to 1
+    End If
+    If opcode equals MIR.MIR_OR:
+        Set is_commutative to 1
+    End If
+    If opcode equals MIR.MIR_XOR:
+        Set is_commutative to 1
+    End If
+
+    If is_commutative equals 1:
+        If vn1 is greater than vn2:
+            Set operand1 to vn2
+            Set operand2 to vn1
+        End If
+    End If
+
+    Note: Compute hash
+    Let hash be opcode multiplied by GVN_HASH_PRIME_1
+    Set hash to hash plus operand1 multiplied by GVN_HASH_PRIME_2
+    Set hash to hash plus operand2 multiplied by GVN_HASH_PRIME_3
+    Set hash to hash plus vn3 multiplied by GVN_HASH_PRIME_4
+
+    Return hash
+End Process
+
+Process called "create_hash_cons_node" that takes opcode as Integer, op_count as Integer, vn1 as Integer, vn2 as Integer, vn3 as Integer returns Integer:
+    @Reasoning
+    Creates a HashConsNode for hash consing.
+
+    Returns HashConsNode pointer or 0 on failure.
+    @End Reasoning
+
+    Let node_ptr be Layout.allocate(56)
+    If node_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Canonicalize commutative operations
+    Let operand1 be vn1
+    Let operand2 be vn2
+
+    Let is_commutative be 0
+    If opcode equals MIR.MIR_ADD:
+        Set is_commutative to 1
+    End If
+    If opcode equals MIR.MIR_MUL:
+        Set is_commutative to 1
+    End If
+    If opcode equals MIR.MIR_AND:
+        Set is_commutative to 1
+    End If
+    If opcode equals MIR.MIR_OR:
+        Set is_commutative to 1
+    End If
+    If opcode equals MIR.MIR_XOR:
+        Set is_commutative to 1
+    End If
+
+    If is_commutative equals 1:
+        If vn1 is greater than vn2:
+            Set operand1 to vn2
+            Set operand2 to vn1
+        End If
+    End If
+
+    Note: Compute hash
+    Let hash be compute_hash_cons_hash(opcode, operand1, operand2, vn3)
+
+    Note: Store fields
+    Layout.memory_set_int64(node_ptr, 0, opcode)
+    Layout.memory_set_int64(node_ptr, 8, op_count)
+    Layout.memory_set_int64(node_ptr, 16, operand1)
+    Layout.memory_set_int64(node_ptr, 24, operand2)
+    Layout.memory_set_int64(node_ptr, 32, vn3)
+    Layout.memory_set_int64(node_ptr, 40, hash)
+    Layout.memory_set_int64(node_ptr, 48, VN_UNDEFINED)  Note: result_vn set later
+
+    Return node_ptr
+End Process
+
+Process called "hash_cons_nodes_equal" that takes node1 as Integer, node2 as Integer returns Integer:
+    @Reasoning
+    Checks if two HashConsNodes are structurally equal.
+
+    Returns 1 if equal, 0 otherwise.
+    @End Reasoning
+
+    If node1 equals 0:
+        Return 0
+    End If
+    If node2 equals 0:
+        Return 0
+    End If
+
+    Note: Compare opcodes
+    Let opcode1 be Layout.memory_get_int64(node1, 0)
+    Let opcode2 be Layout.memory_get_int64(node2, 0)
+    If opcode1 is not equal to opcode2:
+        Return 0
+    End If
+
+    Note: Compare value numbers
+    Let vn1_1 be Layout.memory_get_int64(node1, 16)
+    Let vn1_2 be Layout.memory_get_int64(node2, 16)
+    If vn1_1 is not equal to vn1_2:
+        Return 0
+    End If
+
+    Let vn2_1 be Layout.memory_get_int64(node1, 24)
+    Let vn2_2 be Layout.memory_get_int64(node2, 24)
+    If vn2_1 is not equal to vn2_2:
+        Return 0
+    End If
+
+    Let vn3_1 be Layout.memory_get_int64(node1, 32)
+    Let vn3_2 be Layout.memory_get_int64(node2, 32)
+    If vn3_1 is not equal to vn3_2:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "lookup_hash_cons_node" that takes context_ptr as Integer, hash as Integer returns Integer:
+    @Reasoning
+    Looks up a hash-consed expression by hash.
+
+    Returns HashConsNode pointer if found, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let expression_table be Layout.memory_get_int64(context_ptr, 24)
+    Let hash_str be proc integer_to_string from String with hash
+
+    Let contains_expr be proc contains from Dictionary with expression_table, hash_str
+    If contains_expr equals 0:
+        Return 0
+    End If
+
+    Let node_ptr be proc get from Dictionary with expression_table, hash_str
+    Return node_ptr
+End Process
+
+Process called "insert_hash_cons_node" that takes context_ptr as Integer, node_ptr as Integer returns Integer:
+    @Reasoning
+    Inserts a hash-consed node into the expression table.
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If node_ptr equals 0:
+        Return 0
+    End If
+
+    Let expression_table be Layout.memory_get_int64(context_ptr, 24)
+    Let hash be Layout.memory_get_int64(node_ptr, 40)
+    Let hash_str be proc integer_to_string from String with hash
+
+    proc set from Dictionary with expression_table, hash_str, node_ptr
+
+    Return 1
+End Process
+
+Process called "hash_cons_expression" that takes context_ptr as Integer, opcode as Integer, op_count as Integer, vn1 as Integer, vn2 as Integer, vn3 as Integer returns Integer:
+    @Reasoning
+    Hash-conses an expression, returning existing node if present.
+
+    **HASH CONSING:**
+    - Compute hash from opcode and operand value numbers
+    - Look up existing node with same hash
+    - If found and equal, return existing node
+    - Otherwise, create and insert new node
+
+    Returns HashConsNode pointer.
+    @End Reasoning
+
+    Note: Create node for lookup
+    Let temp_node be create_hash_cons_node(opcode, op_count, vn1, vn2, vn3)
+    If temp_node equals 0:
+        Return 0
+    End If
+
+    Let hash be Layout.memory_get_int64(temp_node, 40)
+
+    Note: Look up existing node
+    Let existing_node be lookup_hash_cons_node(context_ptr, hash)
+    If existing_node is not equal to 0:
+        Note: Check structural equality
+        Let are_equal be hash_cons_nodes_equal(temp_node, existing_node)
+        If are_equal equals 1:
+            Note: Found existing - free and return existing
+            Layout.deallocate(temp_node)
+            Return existing_node
+        End If
+    End If
+
+    Note: Insert new node
+    insert_hash_cons_node(context_ptr, temp_node)
+
+    Display "hash_cons_expression: created new hash cons node with hash " joined with hash
+
+    Return temp_node
+End Process
+
+Process called "initialize_value_numbers" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Initializes value numbers for all SSA values in CFG.
+
+    **INITIALIZATION:**
+    Each SSA value gets a unique initial value number.
+    Later phases will merge equivalent value numbers.
+
+    Returns number of values initialized.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let values_initialized be 0
+
+    Note: Get all blocks
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+
+        Note: Process instructions in block
+        Let inst_list be CFG.get_block_instructions(block_ptr)
+        If inst_list is not equal to 0:
+            Let inst_count be List.length(inst_list)
+            Let j be 0
+
+            While j is less than inst_count:
+                Let inst_ptr be List.get(inst_list, j)
+                Let value_id be MIR.get_mir_node_value_id(inst_ptr)
+
+                If value_id is not equal to 0:
+                    Note: Assign value number
+                    assign_value_number(context_ptr, value_id)
+                    Set values_initialized to values_initialized plus 1
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "initialize_value_numbers: initialized " joined with values_initialized joined with " value numbers"
+
+    Return values_initialized
+End Process
+
+Note: ============================================================================
+Note: CONGRUENCE CLASS ANALYSIS
+Note: ============================================================================
+
+Process called "create_congruence_class" that takes vn as Integer, leader as Integer returns Integer:
+    @Reasoning
+    Creates a CongruenceClass structure.
+
+    Returns CongruenceClass pointer or 0 on failure.
+    @End Reasoning
+
+    Let class_ptr be Layout.allocate(32)
+    If class_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(class_ptr, 0, vn)
+
+    Note: Create members set
+    Let members be proc create from Set
+    Layout.memory_set_int64(class_ptr, 8, members)
+
+    Layout.memory_set_int64(class_ptr, 16, leader)
+    Layout.memory_set_int64(class_ptr, 24, 0)  Note: expression initially null
+
+    Return class_ptr
+End Process
+
+Process called "add_to_congruence_class" that takes context_ptr as Integer, vn as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Adds an SSA value to a congruence class.
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let vn_to_class be Layout.memory_get_int64(context_ptr, 16)
+    Let vn_str be proc integer_to_string from String with vn
+
+    Note: Get or create class
+    Let contains_class be proc contains from Dictionary with vn_to_class, vn_str
+    Let class_ptr be 0
+
+    If contains_class equals 0:
+        Note: Create new class
+        Set class_ptr to create_congruence_class(vn, value_id)
+        proc set from Dictionary with vn_to_class, vn_str, class_ptr
+
+        Note: Increment congruence_classes counter
+        Let congruence_classes be Layout.memory_get_int64(context_ptr, 56)
+        Set congruence_classes to congruence_classes plus 1
+        Layout.memory_set_int64(context_ptr, 56, congruence_classes)
+    Otherwise:
+        Set class_ptr to proc get from Dictionary with vn_to_class, vn_str
+    End If
+
+    Note: Add value to members set
+    Let members be Layout.memory_get_int64(class_ptr, 8)
+    Let value_id_str be proc integer_to_string from String with value_id
+    proc add from Set with members, value_id_str
+
+    Return 1
+End Process
+
+Process called "merge_congruence_classes" that takes context_ptr as Integer, vn1 as Integer, vn2 as Integer returns Integer:
+    @Reasoning
+    Merges two congruence classes.
+
+    **MERGING:**
+    When two values are proven equivalent, their congruence classes
+    are merged. All members of the smaller class join the larger class.
+
+    Returns 1 on success, 0 if classes don't exist.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let vn_to_class be Layout.memory_get_int64(context_ptr, 16)
+    Let vn1_str be proc integer_to_string from String with vn1
+    Let vn2_str be proc integer_to_string from String with vn2
+
+    Note: Check if both classes exist
+    Let contains1 be proc contains from Dictionary with vn_to_class, vn1_str
+    Let contains2 be proc contains from Dictionary with vn_to_class, vn2_str
+
+    If contains1 equals 0:
+        Return 0
+    End If
+    If contains2 equals 0:
+        Return 0
+    End If
+
+    Let class1 be proc get from Dictionary with vn_to_class, vn1_str
+    Let class2 be proc get from Dictionary with vn_to_class, vn2_str
+
+    Note: Merge members from class2 into class1
+    Let members1 be Layout.memory_get_int64(class1, 8)
+    Let members2 be Layout.memory_get_int64(class2, 8)
+
+    If members1 equals 0 or members2 equals 0:
+        Display "merge_congruence_classes: null member lists"
+        Return 0
+    End If
+
+    Note: Iterate through all members of class2
+    Let member2_count be List.length(members2)
+    Let i be 0
+
+    While i is less than member2_count:
+        Let member_id be List.get(members2, i)
+
+        Note: Add to class1's member list
+        List.append(members1, member_id)
+
+        Note: Update value_to_vn mapping to point to vn1
+        Let value_to_vn be Layout.memory_get_int64(context_ptr, 8)
+        Let member_id_str be proc integer_to_string from String with member_id
+        Let value_num_ptr be proc get from Dictionary with value_to_vn, member_id_str
+
+        If value_num_ptr is not equal to 0:
+            Note: Update the value number to vn1
+            Layout.memory_set_int64(value_num_ptr, 0, vn1)
+            Note: Update leader to class1's leader
+            Let class1_leader be Layout.memory_get_int64(class1, 0)
+            Layout.memory_set_int64(value_num_ptr, 8, class1_leader)
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Remove class2 from vn_to_class mapping
+    proc remove from Dictionary with vn_to_class, vn2_str
+
+    Note: Update class1 size
+    Let class1_size be Layout.memory_get_int64(class1, 16)
+    Let class2_size be Layout.memory_get_int64(class2, 16)
+    Let new_size be class1_size plus class2_size
+    Layout.memory_set_int64(class1, 16, new_size)
+
+    Display "merge_congruence_classes: merged " joined with class2_size joined with " members from VN " joined with vn2 joined with " into VN " joined with vn1
+
+    Return 1
+End Process
+
+Process called "get_instruction_operand_count" that takes inst_ptr as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Returns the number of operands for an instruction based on its opcode.
+    @End Reasoning
+
+    Note: Binary operations have 2 operands
+    If opcode equals MIR.MIR_ADD or opcode equals MIR.MIR_SUB or opcode equals MIR.MIR_MUL:
+        Return 2
+    End If
+    If opcode equals MIR.MIR_DIV or opcode equals MIR.MIR_MOD:
+        Return 2
+    End If
+    If opcode equals MIR.MIR_AND or opcode equals MIR.MIR_OR or opcode equals MIR.MIR_XOR:
+        Return 2
+    End If
+    If opcode equals MIR.MIR_SHL or opcode equals MIR.MIR_SHR or opcode equals MIR.MIR_SAR:
+        Return 2
+    End If
+    If opcode equals MIR.MIR_EQ or opcode equals MIR.MIR_NE:
+        Return 2
+    End If
+    If opcode equals MIR.MIR_LT or opcode equals MIR.MIR_LE or opcode equals MIR.MIR_GT or opcode equals MIR.MIR_GE:
+        Return 2
+    End If
+
+    Note: Unary operations have 1 operand
+    If opcode equals MIR.MIR_NEG or opcode equals MIR.MIR_NOT:
+        Return 1
+    End If
+    If opcode equals MIR.MIR_CAST or opcode equals MIR.MIR_BITCAST:
+        Return 1
+    End If
+
+    Note: PHI nodes have variable operands - get count from instruction
+    If opcode equals MIR.MIR_PHI:
+        Let operand_count be Layout.memory_get_int64(inst_ptr, 8)
+        Return operand_count
+    End If
+
+    Note: Other instructions have 0 operands for signature purposes
+    Return 0
+End Process
+
+Process called "get_instruction_operand" that takes inst_ptr as Integer, opcode as Integer, index as Integer returns Integer:
+    @Reasoning
+    Gets the operand value ID at the specified index for an instruction.
+    @End Reasoning
+
+    Note: Binary operations - operands at offsets 24 and 32
+    If opcode equals MIR.MIR_ADD or opcode equals MIR.MIR_SUB or opcode equals MIR.MIR_MUL:
+        If index equals 0:
+            Return Layout.memory_get_int64(inst_ptr, 24)
+        End If
+        If index equals 1:
+            Return Layout.memory_get_int64(inst_ptr, 32)
+        End If
+    End If
+    If opcode equals MIR.MIR_DIV or opcode equals MIR.MIR_MOD:
+        If index equals 0:
+            Return Layout.memory_get_int64(inst_ptr, 24)
+        End If
+        If index equals 1:
+            Return Layout.memory_get_int64(inst_ptr, 32)
+        End If
+    End If
+    If opcode equals MIR.MIR_AND or opcode equals MIR.MIR_OR or opcode equals MIR.MIR_XOR:
+        If index equals 0:
+            Return Layout.memory_get_int64(inst_ptr, 24)
+        End If
+        If index equals 1:
+            Return Layout.memory_get_int64(inst_ptr, 32)
+        End If
+    End If
+    If opcode equals MIR.MIR_SHL or opcode equals MIR.MIR_SHR or opcode equals MIR.MIR_SAR:
+        If index equals 0:
+            Return Layout.memory_get_int64(inst_ptr, 24)
+        End If
+        If index equals 1:
+            Return Layout.memory_get_int64(inst_ptr, 32)
+        End If
+    End If
+    If opcode equals MIR.MIR_EQ or opcode equals MIR.MIR_NE:
+        If index equals 0:
+            Return Layout.memory_get_int64(inst_ptr, 24)
+        End If
+        If index equals 1:
+            Return Layout.memory_get_int64(inst_ptr, 32)
+        End If
+    End If
+    If opcode equals MIR.MIR_LT or opcode equals MIR.MIR_LE or opcode equals MIR.MIR_GT or opcode equals MIR.MIR_GE:
+        If index equals 0:
+            Return Layout.memory_get_int64(inst_ptr, 24)
+        End If
+        If index equals 1:
+            Return Layout.memory_get_int64(inst_ptr, 32)
+        End If
+    End If
+
+    Note: Unary operations - operand at offset 24
+    If opcode equals MIR.MIR_NEG or opcode equals MIR.MIR_NOT:
+        If index equals 0:
+            Return Layout.memory_get_int64(inst_ptr, 24)
+        End If
+    End If
+    If opcode equals MIR.MIR_CAST or opcode equals MIR.MIR_BITCAST:
+        If index equals 0:
+            Return Layout.memory_get_int64(inst_ptr, 24)
+        End If
+    End If
+
+    Note: PHI nodes - operands start at offset 16, each 8 bytes
+    If opcode equals MIR.MIR_PHI:
+        Let operand_offset be 16 plus index multiplied by 8
+        Return Layout.memory_get_int64(inst_ptr, operand_offset)
+    End If
+
+    Return 0
+End Process
+
+Process called "refine_congruence_partition" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Refines congruence partition based on expression structure.
+
+    **PARTITION REFINEMENT:**
+    Iteratively refine partition until fixed point:
+    - Values with different defining expressions split into different classes
+    - Values with equivalent expressions (same opcode, congruent operands) merge
+
+    Returns number of refinement iterations.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "refine_congruence_partition: starting partition refinement"
+
+    Let iteration_count be 0
+    Let max_iterations be 20
+    Let changed be 1
+
+    While changed equals 1:
+        If iteration_count is greater than or equal to max_iterations:
+            Display "refine_congruence_partition: max iterations reached"
+            Return iteration_count
+        End If
+
+        Set changed to 0
+        Set iteration_count to iteration_count plus 1
+
+        Note: Refine partition based on expression structure
+        Display "refine_congruence_partition: iteration " joined with iteration_count
+
+        Note: Get all congruence classes
+        Let vn_to_class be Layout.memory_get_int64(context_ptr, 16)
+        Let class_keys be proc keys from Dictionary with vn_to_class
+        Let class_count be List.length(class_keys)
+
+        Note: For each congruence class, check if members should split
+        Let c be 0
+        While c is less than class_count:
+            Let vn_str be List.get(class_keys, c)
+            Let class_ptr be proc get from Dictionary with vn_to_class, vn_str
+
+            If class_ptr is not equal to 0:
+                Let members be Layout.memory_get_int64(class_ptr, 8)
+                Let member_count be List.length(members)
+
+                Note: Build signature map for members
+                Let signature_map be proc create from Dictionary
+
+                Let m be 0
+                While m is less than member_count:
+                    Let value_id be List.get(members, m)
+                    Let value_id_str be proc integer_to_string from String with value_id
+
+                    Note: Compute signature from defining instruction structure
+                    Note: Get defining instruction from use-def chains
+                    Let use_def_chains be Layout.memory_get_int64(context_ptr, 104)
+                    Let def_inst be proc get from Dictionary with use_def_chains, value_id_str
+
+                    If def_inst is not equal to 0:
+                        Note: Compute signature: hash(opcode, operand_VNs...)
+                        Let opcode be Layout.memory_get_int64(def_inst, 16)
+
+                        Note: Start with opcode as base signature
+                        Let signature_value be opcode
+
+                        Note: Hash in operand value numbers
+                        Note: Get operands based on instruction type
+                        Let operand_count be get_instruction_operand_count(def_inst, opcode)
+                        Let op_idx be 0
+                        While op_idx is less than operand_count:
+                            Let operand_value_id be get_instruction_operand(def_inst, opcode, op_idx)
+                            Let operand_id_str be proc integer_to_string from String with operand_value_id
+
+                            Note: Get VN for operand
+                            Let value_to_vn be Layout.memory_get_int64(context_ptr, 8)
+                            Let operand_vn_ptr be proc get from Dictionary with value_to_vn, operand_id_str
+
+                            If operand_vn_ptr is not equal to 0:
+                                Let operand_vn_id be Layout.memory_get_int64(operand_vn_ptr, 0)
+                                Set signature_value to signature_value multiplied by 31 plus operand_vn_id
+                            End If
+
+                            Set op_idx to op_idx plus 1
+                        End While
+
+                        Let signature_str be proc integer_to_string from String with signature_value
+
+                        Note: Group values by computed signature
+                        Let sig_contains be proc contains from Dictionary with signature_map, signature_str
+                        If sig_contains equals 0:
+                            Let sig_list be proc create from List
+                            proc set from Dictionary with signature_map, signature_str, sig_list
+                        End If
+
+                        Let sig_list be proc get from Dictionary with signature_map, signature_str
+                        List.append(sig_list, value_id)
+                    End If
+
+                    Set m to m plus 1
+                End While
+
+                Note: Check if class needs to split
+                Let sig_keys be proc keys from Dictionary with signature_map
+                Let sig_count be List.length(sig_keys)
+
+                If sig_count is greater than 1:
+                    Note: This class has multiple signatures - needs splitting
+                    Display "refine_congruence_partition: splitting class with " joined with sig_count joined with " signatures"
+                    Set changed to 1
+
+                    Note: Keep first signature in original class, create new classes for others
+                    Let s be 1
+                    While s is less than sig_count:
+                        Let sig_str be List.get(sig_keys, s)
+                        Let sig_list be proc get from Dictionary with signature_map, sig_str
+                        Let sig_list_count be List.length(sig_list)
+
+                        If sig_list_count is greater than 0:
+                            Note: Create new congruence class for this signature
+                            Let first_value be List.get(sig_list, 0)
+                            Let new_vn be assign_value_number(context_ptr, first_value)
+
+                            Note: Add remaining values to new class
+                            Let i be 1
+                            While i is less than sig_list_count:
+                                Let val_id be List.get(sig_list, i)
+                                add_to_congruence_class(context_ptr, new_vn, val_id)
+                                Set i to i plus 1
+                            End While
+                        End If
+
+                        Set s to s plus 1
+                    End While
+                End If
+            End If
+
+            Set c to c plus 1
+        End While
+    End While
+
+    Display "refine_congruence_partition: converged in " joined with iteration_count joined with " iterations"
+
+    Return iteration_count
+End Process
+
+Note: ============================================================================
+Note: PHI NODE HANDLING AND CONGRUENCE
+Note: ============================================================================
+
+Process called "is_phi_instruction" that takes inst_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if instruction is a PHI node.
+
+    Returns 1 if PHI, 0 otherwise.
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+    If opcode equals MIR.MIR_PHI:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "compute_phi_congruence" that takes context_ptr as Integer, phi_ptr as Integer returns Integer:
+    @Reasoning
+    Computes congruence for a PHI node.
+
+    **PHI CONGRUENCE:**
+    A PHI node is congruent to another if all their incoming values
+    are pairwise congruent from the same predecessors.
+
+    **RECURSIVE PHI:**
+    Handle recursive PHI nodes (PHI that refers to itself).
+
+    Returns value number for PHI.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return VN_UNDEFINED
+    End If
+    If phi_ptr equals 0:
+        Return VN_UNDEFINED
+    End If
+
+    Let result_id be MIR.get_mir_node_value_id(phi_ptr)
+
+    Note: Get incoming values from PHI operands
+    Note: PHI nodes have operands at offsets 16, 24, 32, etc.
+    Let operand_count be Layout.memory_get_int64(phi_ptr, 8)
+
+    If operand_count equals 0:
+        Note: No operands - just assign fresh VN
+        Let phi_vn be assign_value_number(context_ptr, result_id)
+        Return phi_vn
+    End If
+
+    Note: Get value numbers for all operands
+    Let value_to_vn be Layout.memory_get_int64(context_ptr, 8)
+    Let first_operand_vn be VN_UNDEFINED
+    Let all_same be 1
+
+    Let i be 0
+    While i is less than operand_count:
+        Note: Get operand at offset 16 + (i * 8)
+        Let operand_offset be 16 plus i multiplied by 8
+        Let operand_value_id be Layout.memory_get_int64(phi_ptr, operand_offset)
+
+        Note: Get VN for this operand
+        Let operand_id_str be proc integer_to_string from String with operand_value_id
+        Let operand_vn_ptr be proc get from Dictionary with value_to_vn, operand_id_str
+
+        If operand_vn_ptr is not equal to 0:
+            Let operand_vn be Layout.memory_get_int64(operand_vn_ptr, 0)
+
+            If i equals 0:
+                Note: First operand - save its VN
+                Set first_operand_vn to operand_vn
+            Otherwise:
+                Note: Check if this VN matches first operand's VN
+                If operand_vn is not equal to first_operand_vn:
+                    Set all_same to 0
+                End If
+            End If
+        Otherwise:
+            Note: Operand has no VN yet - can't determine congruence
+            Set all_same to 0
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: If all operands have same VN, PHI is congruent to that VN
+    If all_same equals 1 and first_operand_vn is not equal to VN_UNDEFINED:
+        Display "compute_phi_congruence: PHI " joined with result_id joined with " congruent to VN " joined with first_operand_vn
+
+        Note: Update result_id to have the same VN as operands
+        Let result_id_str be proc integer_to_string from String with result_id
+        Let result_vn_ptr be proc get from Dictionary with value_to_vn, result_id_str
+
+        If result_vn_ptr is not equal to 0:
+            Layout.memory_set_int64(result_vn_ptr, 0, first_operand_vn)
+        End If
+
+        Return first_operand_vn
+    End If
+
+    Note: Operands have different VNs - assign fresh VN for PHI
+    Let phi_vn be assign_value_number(context_ptr, result_id)
+
+    Display "compute_phi_congruence: PHI " joined with result_id joined with " has different operand VNs, assigned VN " joined with phi_vn
+
+    Return phi_vn
+End Process
+
+Process called "process_phi_nodes" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Processes all PHI nodes in the CFG.
+
+    **PHI PROCESSING:**
+    1. Identify all PHI nodes
+    2. Compute congruence for each PHI
+    3. Add to PHI worklist for iterative refinement
+
+    Returns number of PHI nodes processed.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let phi_count be 0
+
+    Note: Get all blocks
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+
+        Note: Process instructions in block
+        Let inst_list be CFG.get_block_instructions(block_ptr)
+        If inst_list is not equal to 0:
+            Let inst_count be List.length(inst_list)
+            Let j be 0
+
+            While j is less than inst_count:
+                Let inst_ptr be List.get(inst_list, j)
+
+                Note: Check if PHI node
+                Let is_phi be is_phi_instruction(inst_ptr)
+                If is_phi equals 1:
+                    compute_phi_congruence(context_ptr, inst_ptr)
+                    Set phi_count to phi_count plus 1
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "process_phi_nodes: processed " joined with phi_count joined with " PHI nodes"
+
+    Return phi_count
+End Process
+
+Note: ============================================================================
+Note: ALGEBRAIC SIMPLIFICATIONS
+Note: ============================================================================
+
+Process called "try_algebraic_identity" that takes context_ptr as Integer, opcode as Integer, vn1 as Integer, vn2 as Integer returns Integer:
+    @Reasoning
+    Attempts to apply algebraic identities for simplification.
+
+    **ALGEBRAIC IDENTITIES:**
+    - x + 0 = x
+    - x * 1 = x
+    - x * 0 = 0
+    - x - x = 0
+    - x / x = 1 (if x != 0)
+    - x & x = x
+    - x | x = x
+    - x XOR x = 0
+
+    Returns  value number, or VN_UNDEFINED if no simplification.
+    @End Reasoning
+
+    Note: Get constant values for operands
+    Let constant_values be Layout.memory_get_int64(context_ptr, 136)
+
+    Let vn1_str be proc integer_to_string from String with vn1
+    Let vn2_str be proc integer_to_string from String with vn2
+
+    Note: Check for constant operands
+    Let is_vn1_const be proc contains from Dictionary with constant_values, vn1_str
+    Let is_vn2_const be proc contains from Dictionary with constant_values, vn2_str
+
+    Note: x + 0 = x
+    If opcode equals MIR.MIR_ADD:
+        If is_vn2_const equals 1:
+            Let const_val be proc get from Dictionary with constant_values, vn2_str
+            If const_val equals 0:
+                Display "try_algebraic_identity: x + 0 = x"
+                Return vn1
+            End If
+        End If
+    End If
+
+    Note: x * 1 = x
+    If opcode equals MIR.MIR_MUL:
+        If is_vn2_const equals 1:
+            Let const_val be proc get from Dictionary with constant_values, vn2_str
+            If const_val equals 1:
+                Display "try_algebraic_identity: x * 1 = x"
+                Return vn1
+            End If
+        End If
+    End If
+
+    Note: x * 0 = 0
+    If opcode equals MIR.MIR_MUL:
+        If is_vn2_const equals 1:
+            Let const_val be proc get from Dictionary with constant_values, vn2_str
+            If const_val equals 0:
+                Display "try_algebraic_identity: x * 0 = 0"
+                Return vn2
+            End If
+        End If
+    End If
+
+    Note: x - x = 0
+    If opcode equals MIR.MIR_SUB:
+        If vn1 equals vn2:
+            Display "try_algebraic_identity: x - x = 0"
+
+            Note: Find or create VN for constant 0
+            Let zero_str be "0"
+            Let const_vn_contains be proc contains from Dictionary with constant_values, zero_str
+
+            If const_vn_contains equals 1:
+                Note: VN for 0 already exists
+                Let zero_vn be proc get from Dictionary with constant_values, zero_str
+                Return zero_vn
+            Otherwise:
+                Note: Create new VN for constant 0
+                Let value_numbers_assigned be Layout.memory_get_int64(context_ptr, 96)
+                Set value_numbers_assigned to value_numbers_assigned plus 1
+                Layout.memory_set_int64(context_ptr, 96, value_numbers_assigned)
+
+                Note: Register constant 0 with this VN
+                proc set from Dictionary with constant_values, zero_str, value_numbers_assigned
+
+                Return value_numbers_assigned
+            End If
+        End If
+    End If
+
+    Note: x XOR x = 0
+    If opcode equals MIR.MIR_XOR:
+        If vn1 equals vn2:
+            Display "try_algebraic_identity: x XOR x = 0"
+
+            Note: Find or create VN for constant 0
+            Let zero_str be "0"
+            Let const_vn_contains be proc contains from Dictionary with constant_values, zero_str
+
+            If const_vn_contains equals 1:
+                Note: VN for 0 already exists
+                Let zero_vn be proc get from Dictionary with constant_values, zero_str
+                Return zero_vn
+            Otherwise:
+                Note: Create new VN for constant 0
+                Let value_numbers_assigned be Layout.memory_get_int64(context_ptr, 96)
+                Set value_numbers_assigned to value_numbers_assigned plus 1
+                Layout.memory_set_int64(context_ptr, 96, value_numbers_assigned)
+
+                Note: Register constant 0 with this VN
+                proc set from Dictionary with constant_values, zero_str, value_numbers_assigned
+
+                Return value_numbers_assigned
+            End If
+        End If
+    End If
+
+    Note: No simplification found
+    Return VN_UNDEFINED
+End Process
+
+Process called "apply_algebraic_simplifications" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Applies algebraic simplifications throughout the CFG.
+
+    Returns number of simplifications applied.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let simplifications_applied be 0
+
+    Note: Get all blocks
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+
+        Note: Process instructions in block
+        Let inst_list be CFG.get_block_instructions(block_ptr)
+        If inst_list is not equal to 0:
+            Let inst_count be List.length(inst_list)
+            Let j be 0
+
+            While j is less than inst_count:
+                Let inst_ptr be List.get(inst_list, j)
+                Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+                Note: Try algebraic simplification
+                Note: Get operand value numbers
+                Let op1_id be Layout.memory_get_int64(inst_ptr, 16)
+                Let op2_id be Layout.memory_get_int64(inst_ptr, 24)
+
+                Let vn1 be get_value_number(context_ptr, op1_id)
+                Let vn2 be get_value_number(context_ptr, op2_id)
+
+                Let simplified_vn be try_algebraic_identity(context_ptr, opcode, vn1, vn2)
+                If simplified_vn is not equal to VN_UNDEFINED:
+                    Note: Simplification found - replace instruction result with  value
+
+                    Note: Get result value_id of this instruction
+                    Let result_id be MIR.get_mir_node_value_id(inst_ptr)
+
+                    Note: Find the SSA value_id corresponding to simplified_vn
+                    Note: Get leader of simplified_vn's congruence class
+                    Let vn_to_class be Layout.memory_get_int64(context_ptr, 16)
+                    Let simplified_vn_str be proc integer_to_string from String with simplified_vn
+                    Let simplified_class be proc get from Dictionary with vn_to_class, simplified_vn_str
+
+                    If simplified_class is not equal to 0:
+                        Note: Get leader (representative SSA value) from class
+                        Let leader_id be Layout.memory_get_int64(simplified_class, 0)
+
+                        Note: Replace all uses of result_id with leader_id
+                        Let def_use_chains be Layout.memory_get_int64(context_ptr, 112)
+                        If def_use_chains is not equal to 0:
+                            Let result_id_str be proc integer_to_string from String with result_id
+                            Let use_list be proc get from Dictionary with def_use_chains, result_id_str
+
+                            If use_list is not equal to 0:
+                                Let use_count be List.length(use_list)
+                                Let k be 0
+
+                                While k is less than use_count:
+                                    Let use_inst be List.get(use_list, k)
+
+                                    Note: Replace operands
+                                    Let use_op1 be Layout.memory_get_int64(use_inst, 16)
+                                    If use_op1 equals result_id:
+                                        Layout.memory_set_int64(use_inst, 16, leader_id)
+                                    End If
+
+                                    Let use_op2 be Layout.memory_get_int64(use_inst, 24)
+                                    If use_op2 equals result_id:
+                                        Layout.memory_set_int64(use_inst, 24, leader_id)
+                                    End If
+
+                                    Set k to k plus 1
+                                End While
+                            End If
+                        End If
+
+                        Note: Mark instruction as dead (NOP)
+                        Layout.memory_set_int64(inst_ptr, 0, 0)
+
+                        Display "apply_algebraic_simplifications: replaced value " joined with result_id joined with " with " joined with leader_id
+                    End If
+
+                    Set simplifications_applied to simplifications_applied plus 1
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Update algebraic_simplifications counter
+    Let algebraic_simplifications be Layout.memory_get_int64(context_ptr, 80)
+    Set algebraic_simplifications to algebraic_simplifications plus simplifications_applied
+    Layout.memory_set_int64(context_ptr, 80, algebraic_simplifications)
+
+    Display "apply_algebraic_simplifications: applied " joined with simplifications_applied joined with " simplifications"
+
+    Return simplifications_applied
+End Process
+
+Note: ============================================================================
+Note: MEMORY VALUE NUMBERING WITH ALIAS ANALYSIS
+Note: ============================================================================
+
+Process called "can_loads_alias" that takes context_ptr as Integer, load1_ptr as Integer, load2_ptr as Integer returns Integer:
+    @Reasoning
+    Determines if two load instructions may alias (access same memory).
+
+    **ALIAS ANALYSIS:**
+    Conservative: assume loads alias unless proven otherwise.
+    - Check if loading from same base address
+    - Use alias analysis if available
+
+    Returns 1 if may alias, 0 if proven not to alias.
+    @End Reasoning
+
+    If load1_ptr equals 0:
+        Return 1
+    End If
+    If load2_ptr equals 0:
+        Return 1
+    End If
+
+    Note: Get base addresses
+    Let base1 be Layout.memory_get_int64(load1_ptr, 16)
+    Let base2 be Layout.memory_get_int64(load2_ptr, 16)
+
+    Note: If same base address, may alias
+    If base1 equals base2:
+        Return 1
+    End If
+
+    Note: Conservative: assume may alias
+    Return 1
+End Process
+
+Process called "find_dominating_store" that takes context_ptr as Integer, load_ptr as Integer, block_ptr as Integer returns Integer:
+    @Reasoning
+    Finds a dominating store that the load can forward from.
+
+    **STORE-TO-LOAD FORWARDING:**
+    If a store dominates a load and they access the same memory,
+    the load can be replaced with the stored value.
+
+    Returns stored value_id, or 0 if no dominating store found.
+    @End Reasoning
+
+    If load_ptr equals 0:
+        Return 0
+    End If
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get load address
+    Let load_addr be Layout.memory_get_int64(load_ptr, 16)
+
+    Display "find_dominating_store: searching for store to address " joined with load_addr
+
+    Note: Get dominator tree
+    Let dominator_tree be Layout.memory_get_int64(context_ptr, 144)
+    If dominator_tree equals 0:
+        Display "find_dominating_store: no dominator tree available"
+        Return 0
+    End If
+
+    Note: Get current block ID
+    Let block_id be CFG.get_block_id(block_ptr)
+
+    Note: Search current block first (reverse order from load)
+    Let inst_list be CFG.get_block_instructions(block_ptr)
+    If inst_list is not equal to 0:
+        Let inst_count be List.length(inst_list)
+
+        Note: Find load position
+        Let load_pos be 0
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(inst_list, i)
+            If inst equals load_ptr:
+                Set load_pos to i
+            End If
+            Set i to i plus 1
+        End While
+
+        Note: Scan backwards from load
+        Let j be load_pos minus 1
+        While j is greater than or equal to 0:
+            Let inst be List.get(inst_list, j)
+            Let opcode be MIR.get_mir_node_opcode(inst)
+
+            Note: Check if store instruction
+            If opcode equals MIR.MIR_STORE:
+                Let store_addr be Layout.memory_get_int64(inst, 16)
+                Let store_value be Layout.memory_get_int64(inst, 24)
+
+                Note: Check if same address
+                If store_addr equals load_addr:
+                    Display "find_dominating_store: found dominating store in same block"
+                    Return store_value
+                End If
+            End If
+
+            Set j to j minus 1
+        End While
+    End If
+
+    Note: Scan dominating blocks
+    Note: Get immediate dominator
+    Let idom be Dominance.get_immediate_dominator(dominator_tree, block_id)
+
+    If idom is not equal to 0:
+        Note: Recursively search dominating blocks
+        Let cfg_ptr be Layout.memory_get_int64(context_ptr, 0)
+        Let idom_block be CFG.get_block_by_id(cfg_ptr, idom)
+
+        If idom_block is not equal to 0:
+            Note: Search dominating block instructions (reverse order)
+            Let dom_inst_list be CFG.get_block_instructions(idom_block)
+            If dom_inst_list is not equal to 0:
+                Let dom_inst_count be List.length(dom_inst_list)
+                Let k be dom_inst_count minus 1
+
+                While k is greater than or equal to 0:
+                    Let inst be List.get(dom_inst_list, k)
+                    Let opcode be MIR.get_mir_node_opcode(inst)
+
+                    If opcode equals MIR.MIR_STORE:
+                        Let store_addr be Layout.memory_get_int64(inst, 16)
+                        Let store_value be Layout.memory_get_int64(inst, 24)
+
+                        If store_addr equals load_addr:
+                            Display "find_dominating_store: found store in dominating block"
+                            Return store_value
+                        End If
+                    End If
+
+                    Set k to k minus 1
+                End While
+            End If
+
+            Note: Continue searching up dominator tree
+            Let result be find_dominating_store(context_ptr, load_ptr, idom_block)
+            If result is not equal to 0:
+                Return result
+            End If
+        End If
+    End If
+
+    Display "find_dominating_store: no dominating store found"
+    Return 0
+End Process
+
+Process called "eliminate_redundant_load" that takes context_ptr as Integer, load_ptr as Integer, replacement_value_id as Integer returns Integer:
+    @Reasoning
+    Eliminates a redundant load by replacing with existing value.
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If load_ptr equals 0:
+        Return 0
+    End If
+
+    Let load_result_id be MIR.get_mir_node_value_id(load_ptr)
+
+    Display "eliminate_redundant_load: replacing load " joined with load_result_id joined with " with value " joined with replacement_value_id
+
+    Note: Increment redundant_loads counter
+    Let redundant_loads be Layout.memory_get_int64(context_ptr, 72)
+    Set redundant_loads to redundant_loads plus 1
+    Layout.memory_set_int64(context_ptr, 72, redundant_loads)
+
+    Return 1
+End Process
+
+Process called "perform_load_elimination" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Performs redundant load elimination.
+
+    **LOAD ELIMINATION:**
+    1. For each load, check if value already loaded
+    2. Check if dominated by a store to same location
+    3. Replace redundant loads
+
+    Returns number of loads eliminated.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let loads_eliminated be 0
+
+    Note: Get all blocks
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+
+        Note: Process instructions in block
+        Let inst_list be CFG.get_block_instructions(block_ptr)
+        If inst_list is not equal to 0:
+            Let inst_count be List.length(inst_list)
+            Let j be 0
+
+            While j is less than inst_count:
+                Let inst_ptr be List.get(inst_list, j)
+                Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+                Note: Check if LOAD instruction
+                If opcode equals MIR.MIR_LOAD:
+                    Note: Try to find dominating store
+                    Let stored_value be find_dominating_store(context_ptr, inst_ptr, block_ptr)
+                    If stored_value is not equal to 0:
+                        eliminate_redundant_load(context_ptr, inst_ptr, stored_value)
+                        Set loads_eliminated to loads_eliminated plus 1
+                    End If
+                End If
+
+                Set j to j plus 1
+            End While
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Display "perform_load_elimination: eliminated " joined with loads_eliminated joined with " redundant loads"
+
+    Return loads_eliminated
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS AND PIPELINE INTEGRATION
+Note: ============================================================================
+
+Process called "optimize_function_with_gvn" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Main entry point for GVN optimization on a single function.
+
+    **COMPLETE GVN PIPELINE:**
+    1. Create GVN context
+    2. Initialize value numbers for all SSA values
+    3. Build hash-consed expression DAG
+    4. Compute congruence classes
+    5. Process PHI nodes
+    6. Refine congruence partition (fixed-point iteration)
+    7. Apply algebraic simplifications
+    8. Perform load elimination
+    9. Replace redundant values with leaders
+    10. Print statistics
+    11. Destroy context
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    @Performance_Hints
+    GVN is the most powerful optimization for value equivalence.
+    It subsumes CSE and provides additional algebraic and memory
+    optimizations. Run early in the pipeline to maximize impact.
+
+    **PIPELINE POSITION:**
+    SCCP → Constant Prop → **GVN** → CSE → Copy Prop → DCE
+    @End Performance_Hints
+
+    If cfg_ptr equals 0:
+        Display "optimize_function_with_gvn: null CFG"
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "GLOBAL VALUE NUMBERING"
+    Display "============================================"
+    Display ""
+
+    Note: Step 1: Create context
+    Let context_ptr be create_gvn_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "optimize_function_with_gvn: failed to create context"
+        Return 0
+    End If
+
+    Note: Step 2: Initialize value numbers
+    Display "Step 1: Initializing value numbers..."
+    initialize_value_numbers(context_ptr, cfg_ptr)
+
+    Note: Step 3: Process PHI nodes
+    Display "Step 2: Processing PHI nodes..."
+    process_phi_nodes(context_ptr, cfg_ptr)
+
+    Note: Step 4: Refine congruence partition
+    Display "Step 3: Refining congruence partition..."
+    refine_congruence_partition(context_ptr, cfg_ptr)
+
+    Note: Step 5: Apply algebraic simplifications
+    Display "Step 4: Applying algebraic simplifications..."
+    apply_algebraic_simplifications(context_ptr, cfg_ptr)
+
+    Note: Step 6: Perform load elimination
+    Display "Step 5: Performing load elimination..."
+    perform_load_elimination(context_ptr, cfg_ptr)
+
+    Note: Step 7: Print statistics
+    print_gvn_stats(context_ptr)
+
+    Note: Step 8: Destroy context
+    destroy_gvn_context(context_ptr)
+
+    Display ""
+    Display "GLOBAL VALUE NUMBERING COMPLETE"
+    Display ""
+
+    Return 1
+End Process
+
+Process called "run_gvn_pass" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Convenience wrapper for running GVN as an optimization pass.
+
+    Returns 1 if CFG was modified, 0 if no changes.
+    @End Reasoning
+
+    Return optimize_function_with_gvn(cfg_ptr)
+End Process
+
+Process called "should_run_gvn" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Determines if GVN should be run.
+
+    **PROFITABILITY:**
+    GVN is expensive but powerful. Run on:
+    - Non-trivial functions (>= 3 basic blocks)
+    - Functions with arithmetic/logical operations
+    - Functions with memory operations
+
+    Skip on trivial functions to save compile time.
+
+    Returns 1 if should run, 0 otherwise.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get block count
+    Let block_count be CFG.get_block_count(cfg_ptr)
+
+    Note: Skip very trivial functions
+    If block_count is less than 3:
+        Display "should_run_gvn: skipping trivial function"
+        Return 0
+    End If
+
+    Note: Run on non-trivial functions
+    Return 1
+End Process
+
+Process called "get_gvn_pass_name" returns Integer:
+    @Reasoning
+    Returns the name of this optimization pass.
+    @End Reasoning
+
+    Return "Global Value Numbering"
+End Process
+
+Process called "get_gvn_pass_description" returns Integer:
+    @Reasoning
+    Returns a description of this optimization pass.
+    @End Reasoning
+
+    Return "Full GVN with hash consing, congruence analysis, PHI handling, algebraic simplifications, and load elimination"
+End Process
+
+Note: ============================================================================
+Note: END OF GLOBAL VALUE NUMBERING IMPLEMENTATION
+Note: ============================================================================

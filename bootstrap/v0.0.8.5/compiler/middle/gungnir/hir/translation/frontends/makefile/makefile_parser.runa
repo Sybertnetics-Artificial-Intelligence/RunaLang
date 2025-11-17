@@ -1,0 +1,1106 @@
+Note: Makefile Parser - Parses tokenized Makefile into AST
+Note: Part of Translation universal language translation system
+Note: Handles variables, targets, recipes, conditionals, and directives
+
+Import "compiler/middle/gungnir/hir/translation/frontends/makefile/makefile_lexer.runa" as MakefileLexer
+Import "stdlib/core/string.runa" as StringCore
+Import "stdlib/core/memory.runa" as Memory
+Import "stdlib/core/list.runa" as ListCore
+
+Note: ============================================================================
+Note: AST Node Type Constants
+Note: ============================================================================
+
+Constant NODE_MAKEFILE as Integer is 1000
+Constant NODE_VARIABLE_ASSIGNMENT as Integer is 1001
+Constant NODE_TARGET_RULE as Integer is 1002
+Constant NODE_RECIPE_LINE as Integer is 1003
+Constant NODE_CONDITIONAL as Integer is 1004
+Constant NODE_INCLUDE_DIRECTIVE as Integer is 1005
+Constant NODE_EXPORT_DIRECTIVE as Integer is 1006
+Constant NODE_DEFINE_BLOCK as Integer is 1007
+Constant NODE_SPECIAL_TARGET as Integer is 1008
+Constant NODE_FUNCTION_CALL as Integer is 1009
+Constant NODE_VARIABLE_REFERENCE as Integer is 1010
+Constant NODE_TEXT as Integer is 1011
+
+Note: Assignment operator types
+Constant ASSIGN_SIMPLE as Integer is 1
+Constant ASSIGN_IMMEDIATE as Integer is 2
+Constant ASSIGN_APPEND as Integer is 3
+Constant ASSIGN_CONDITIONAL as Integer is 4
+
+Note: Conditional types
+Constant COND_IFEQ as Integer is 10
+Constant COND_IFNEQ as Integer is 11
+Constant COND_IFDEF as Integer is 12
+Constant COND_IFNDEF as Integer is 13
+
+Note: ============================================================================
+Note: AST Node Structures
+Note: ============================================================================
+
+Type called "MakefileAST":
+    node_type as Integer
+    statements as Integer  Note: Pointer to list of statement nodes
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "VariableAssignment":
+    node_type as Integer
+    variable_name as String
+    assignment_type as Integer  Note: ASSIGN_SIMPLE, etc.
+    value as String  Note: Or pointer to value AST for complex expressions
+    override_flag as Integer  Note: 1 if override directive used
+    export_flag as Integer  Note: 1 if export directive used
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "TargetRule":
+    node_type as Integer
+    targets as Integer  Note: Pointer to list of target names
+    dependencies as Integer  Note: Pointer to list of dependency names
+    order_only_deps as Integer  Note: Pointer to list of order-only dependencies (after |)
+    recipes as Integer  Note: Pointer to list of recipe line nodes
+    is_pattern_rule as Integer  Note: 1 if contains % pattern
+    is_double_colon as Integer  Note: 1 if :: rule
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "RecipeLine":
+    node_type as Integer
+    command as String
+    silent as Integer  Note: 1 if prefixed with @
+    ignore_errors as Integer  Note: 1 if prefixed with -
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "Conditional":
+    node_type as Integer
+    condition_type as Integer  Note: COND_IFEQ, etc.
+    operand1 as String
+    operand2 as String  Note: For ifeq/ifneq
+    then_block as Integer  Note: Pointer to list of statements
+    else_block as Integer  Note: Pointer to list of statements (0 if no else)
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "IncludeDirective":
+    node_type as Integer
+    filenames as Integer  Note: Pointer to list of file names to include
+    silent as Integer  Note: 1 for sinclude or -include
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "ExportDirective":
+    node_type as Integer
+    variables as Integer  Note: Pointer to list of variable names (0 if export all)
+    unexport as Integer  Note: 1 if unexport instead of export
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "DefineBlock":
+    node_type as Integer
+    variable_name as String
+    content as String  Note: Multi-line content between define and endef
+    assignment_type as Integer  Note: ASSIGN_SIMPLE or ASSIGN_IMMEDIATE
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "SpecialTarget":
+    node_type as Integer
+    target_name as String  Note: .PHONY, .SUFFIXES, etc.
+    dependencies as Integer  Note: Pointer to list of dependencies
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "FunctionCall":
+    node_type as Integer
+    function_name as String  Note: wildcard, patsubst, etc.
+    arguments as Integer  Note: Pointer to list of argument strings
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Type called "VariableReference":
+    node_type as Integer
+    variable_name as String
+    is_automatic as Integer  Note: 1 for $@, $<, etc.
+    line_number as Integer
+    column_number as Integer
+End Type
+
+Note: ============================================================================
+Note: Parser State
+Note: ============================================================================
+
+Type called "MakefileParser":
+    tokens as Integer  Note: Pointer to token list
+    current_position as Integer
+    error_message as String
+    has_error as Integer
+End Type
+
+Note: ============================================================================
+Note: Parser Creation and Management
+Note: ============================================================================
+
+Process called "create_parser" that takes tokens_ptr as Integer returns Integer:
+    @Reasoning
+    Create a new Makefile parser instance with the given token list.
+    @End Reasoning
+
+    @Implementation
+    Allocate parser structure and initialize with token list.
+    @End Implementation
+
+    Let parser_ptr be proc allocate from Memory with 32
+
+    proc write_integer from Memory at parser_ptr with 0, tokens_ptr
+    proc write_integer from Memory at parser_ptr with 8, 0  Note: current_position
+    proc write_string from Memory at parser_ptr with 16, ""  Note: error_message
+    proc write_integer from Memory at parser_ptr with 24, 0  Note: has_error
+
+    Return parser_ptr
+End Process
+
+Process called "free_parser" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Free the parser structure.
+    @End Reasoning
+
+    @Implementation
+    Deallocate parser memory.
+    @End Implementation
+
+    proc deallocate from Memory at parser_ptr
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Token Access Functions
+Note: ============================================================================
+
+Process called "current_token" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Get the current token without advancing.
+    @End Reasoning
+
+    @Implementation
+    Retrieve token at current position from token list.
+    @End Implementation
+
+    Let tokens_ptr be proc read_integer from Memory at parser_ptr with 0
+    Let position be proc read_integer from Memory at parser_ptr with 8
+
+    Let token_ptr be proc get_from_list from ListCore with tokens_ptr, position
+    Return token_ptr
+End Process
+
+Process called "peek_token" that takes parser_ptr as Integer, offset as Integer returns Integer:
+    @Reasoning
+    Look ahead at a token without advancing.
+    @End Reasoning
+
+    @Implementation
+    Retrieve token at current position + offset from token list.
+    @End Implementation
+
+    Let tokens_ptr be proc read_integer from Memory at parser_ptr with 0
+    Let position be proc read_integer from Memory at parser_ptr with 8
+    Let peek_pos be position plus offset
+
+    Let token_ptr be proc get_from_list from ListCore with tokens_ptr, peek_pos
+    Return token_ptr
+End Process
+
+Process called "advance" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Move to the next token in the stream.
+    @End Reasoning
+
+    @Implementation
+    Increment current position counter.
+    @End Implementation
+
+    Let position be proc read_integer from Memory at parser_ptr with 8
+    Set position to position plus 1
+    proc write_integer from Memory at parser_ptr with 8, position
+
+    Return 1
+End Process
+
+Process called "is_at_end" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Check if we have reached the end of the token stream.
+    @End Reasoning
+
+    @Implementation
+    Check if current token is EOF token.
+    @End Implementation
+
+    Let token_ptr be proc current_token from parser_ptr
+    If token_ptr is equal to 0:
+        Return 1
+    End If
+
+    Let token_type be proc read_integer from Memory at token_ptr with 0
+    If token_type is equal to MakefileLexer.TOKEN_EOF:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "expect" that takes parser_ptr as Integer, expected_type as Integer returns Integer:
+    @Reasoning
+    Verify current token matches expected type and consume it.
+    @End Reasoning
+
+    @Implementation
+    Check token type, set error if mismatch, advance if match.
+    @End Implementation
+
+    Let token_ptr be proc current_token from parser_ptr
+    If token_ptr is equal to 0:
+        proc set_error from parser_ptr, "Unexpected end of file"
+        Return 0
+    End If
+
+    Let token_type be proc read_integer from Memory at token_ptr with 0
+    If token_type is not equal to expected_type:
+        proc set_error from parser_ptr, "Unexpected token type"
+        Return 0
+    End If
+
+    proc advance from parser_ptr
+    Return 1
+End Process
+
+Process called "set_error" that takes parser_ptr as Integer, message as String returns Integer:
+    @Reasoning
+    Record a parser error message.
+    @End Reasoning
+
+    @Implementation
+    Store error message and set error flag.
+    @End Implementation
+
+    proc write_string from Memory at parser_ptr with 16, message
+    proc write_integer from Memory at parser_ptr with 24, 1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Utility Functions
+Note: ============================================================================
+
+Process called "skip_newlines" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Skip all consecutive newline tokens.
+    @End Reasoning
+
+    @Implementation
+    Loop through tokens consuming all newlines and comments.
+    @End Implementation
+
+    Let continue be 1
+    While continue is equal to 1:
+        Let is_end be proc is_at_end from parser_ptr
+        If is_end is equal to 1:
+            Set continue to 0
+        Otherwise:
+            Let token_ptr be proc current_token from parser_ptr
+            Let token_type be proc read_integer from Memory at token_ptr with 0
+
+            If token_type is equal to MakefileLexer.TOKEN_NEWLINE:
+                proc advance from parser_ptr
+            Otherwise:
+                If token_type is equal to MakefileLexer.TOKEN_COMMENT:
+                    proc advance from parser_ptr
+                Otherwise:
+                    Set continue to 0
+                End If
+            End If
+        End If
+    End While
+
+    Return 1
+End Process
+
+Process called "consume_until_newline" that takes parser_ptr as Integer returns String:
+    @Reasoning
+    Consume all tokens until newline and return as concatenated string.
+    @End Reasoning
+
+    @Implementation
+    Build string from all tokens until newline or EOF.
+    @End Implementation
+
+    Let result be ""
+
+    Let continue be 1
+    While continue is equal to 1:
+        Let is_end be proc is_at_end from parser_ptr
+        If is_end is equal to 1:
+            Set continue to 0
+        Otherwise:
+            Let token_ptr be proc current_token from parser_ptr
+            Let token_type be proc read_integer from Memory at token_ptr with 0
+
+            If token_type is equal to MakefileLexer.TOKEN_NEWLINE:
+                Set continue to 0
+            Otherwise:
+                Let lexeme be proc read_string from Memory at token_ptr with 8
+
+                Note: Add spacing between tokens
+                Let result_len be proc string_length from StringCore with result
+                If result_len is greater than 0:
+                    Set result to proc string_concat from StringCore with result, " "
+                End If
+
+                Set result to proc string_concat from StringCore with result, lexeme
+                proc advance from parser_ptr
+            End If
+        End If
+    End While
+
+    Return result
+End Process
+
+Process called "get_token_lexeme" that takes token_ptr as Integer returns String:
+    @Reasoning
+    Extract the lexeme string from a token.
+    @End Reasoning
+
+    @Implementation
+    Read lexeme field from token structure.
+    @End Implementation
+
+    If token_ptr is equal to 0:
+        Return ""
+    End If
+
+    Let lexeme be proc read_string from Memory at token_ptr with 8
+    Return lexeme
+End Process
+
+Note: ============================================================================
+Note: Statement Parsing Functions
+Note: ============================================================================
+
+Process called "parse_variable_assignment" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Parse a variable assignment: VAR = value, VAR := value, VAR += value, VAR ?= value.
+    @End Reasoning
+
+    @Implementation
+    Extract variable name, assignment operator, and value.
+    @End Implementation
+
+    Note: Check for override prefix
+    Let override_flag be 0
+    Let token_ptr be proc current_token from parser_ptr
+    Let token_type be proc read_integer from Memory at token_ptr with 0
+
+    If token_type is equal to MakefileLexer.TOKEN_OVERRIDE:
+        Set override_flag to 1
+        proc advance from parser_ptr
+    End If
+
+    Note: Get variable name
+    Set token_ptr to proc current_token from parser_ptr
+    Set token_type to proc read_integer from Memory at token_ptr with 0
+
+    If token_type is not equal to MakefileLexer.TOKEN_IDENTIFIER:
+        proc set_error from parser_ptr, "Expected variable name in assignment"
+        Return 0
+    End If
+
+    Let var_name be proc get_token_lexeme from token_ptr
+    Let line_num be proc read_integer from Memory at token_ptr with 24
+    Let col_num be proc read_integer from Memory at token_ptr with 32
+
+    proc advance from parser_ptr
+
+    Note: Get assignment operator
+    Set token_ptr to proc current_token from parser_ptr
+    Set token_type to proc read_integer from Memory at token_ptr with 0
+
+    Let assign_type be 0
+
+    If token_type is equal to MakefileLexer.TOKEN_ASSIGN:
+        Set assign_type to ASSIGN_SIMPLE
+        proc advance from parser_ptr
+    Otherwise:
+        If token_type is equal to MakefileLexer.TOKEN_IMMEDIATE_ASSIGN:
+            Set assign_type to ASSIGN_IMMEDIATE
+            proc advance from parser_ptr
+        Otherwise:
+            If token_type is equal to MakefileLexer.TOKEN_APPEND_ASSIGN:
+                Set assign_type to ASSIGN_APPEND
+                proc advance from parser_ptr
+            Otherwise:
+                If token_type is equal to MakefileLexer.TOKEN_CONDITIONAL_ASSIGN:
+                    Set assign_type to ASSIGN_CONDITIONAL
+                    proc advance from parser_ptr
+                Otherwise:
+                    proc set_error from parser_ptr, "Expected assignment operator"
+                    Return 0
+                End If
+            End If
+        End If
+    End If
+
+    Note: Get value (rest of line)
+    Let value be proc consume_until_newline from parser_ptr
+
+    Note: Create variable assignment node
+    Let node_ptr be proc allocate from Memory with 56
+    proc write_integer from Memory at node_ptr with 0, NODE_VARIABLE_ASSIGNMENT
+    proc write_string from Memory at node_ptr with 8, var_name
+    proc write_integer from Memory at node_ptr with 16, assign_type
+    proc write_string from Memory at node_ptr with 24, value
+    proc write_integer from Memory at node_ptr with 32, override_flag
+    proc write_integer from Memory at node_ptr with 40, 0  Note: export_flag (set by export directive)
+    proc write_integer from Memory at node_ptr with 48, line_num
+    proc write_integer from Memory at node_ptr with 52, col_num
+
+    Return node_ptr
+End Process
+
+Process called "parse_target_rule" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Parse a target rule: target [target2 ...]: [dependencies] [| order-only-deps]
+    @End Reasoning
+
+    @Implementation
+    Extract targets, dependencies, and check for double-colon rules.
+    @End Implementation
+
+    Let token_ptr be proc current_token from parser_ptr
+    Let line_num be proc read_integer from Memory at token_ptr with 24
+    Let col_num be proc read_integer from Memory at token_ptr with 32
+
+    Note: Parse targets (before colon)
+    Let targets_list be proc create_list from ListCore
+    Let is_pattern be 0
+
+    Let continue be 1
+    While continue is equal to 1:
+        Set token_ptr to proc current_token from parser_ptr
+        If token_ptr is equal to 0:
+            proc set_error from parser_ptr, "Unexpected end in target rule"
+            Return 0
+        End If
+
+        Let token_type be proc read_integer from Memory at token_ptr with 0
+
+        If token_type is equal to MakefileLexer.TOKEN_COLON or token_type is equal to MakefileLexer.TOKEN_DOUBLE_COLON:
+            Set continue to 0
+        Otherwise:
+            If token_type is equal to MakefileLexer.TOKEN_IDENTIFIER:
+                Let target be proc get_token_lexeme from token_ptr
+
+                Note: Check for pattern rule
+                Let has_percent be proc string_contains from StringCore with target, "%"
+                If has_percent is equal to 1:
+                    Set is_pattern to 1
+                End If
+
+                proc add_to_list from ListCore with targets_list, target
+                proc advance from parser_ptr
+            Otherwise:
+                If token_type is equal to MakefileLexer.TOKEN_PERCENT:
+                    Set is_pattern to 1
+                    proc add_to_list from ListCore with targets_list, "%"
+                    proc advance from parser_ptr
+                Otherwise:
+                    proc set_error from parser_ptr, "Unexpected token in target list"
+                    Return 0
+                End If
+            End If
+        End If
+    End While
+
+    Note: Check for double-colon rule
+    Set token_ptr to proc current_token from parser_ptr
+    Let token_type be proc read_integer from Memory at token_ptr with 0
+    Let is_double_colon be 0
+
+    If token_type is equal to MakefileLexer.TOKEN_DOUBLE_COLON:
+        Set is_double_colon to 1
+    End If
+
+    proc advance from parser_ptr  Note: Skip colon or double-colon
+
+    Note: Parse dependencies (after colon, before | or newline)
+    Let deps_list be proc create_list from ListCore
+    Let order_only_list be proc create_list from ListCore
+    Let in_order_only be 0
+
+    Set continue to 1
+    While continue is equal to 1:
+        Set token_ptr to proc current_token from parser_ptr
+        If token_ptr is equal to 0:
+            Set continue to 0
+        Otherwise:
+            Set token_type to proc read_integer from Memory at token_ptr with 0
+
+            If token_type is equal to MakefileLexer.TOKEN_NEWLINE or token_type is equal to MakefileLexer.TOKEN_SEMICOLON:
+                Set continue to 0
+            Otherwise:
+                If token_type is equal to MakefileLexer.TOKEN_PIPE:
+                    Set in_order_only to 1
+                    proc advance from parser_ptr
+                Otherwise:
+                    If token_type is equal to MakefileLexer.TOKEN_IDENTIFIER:
+                        Let dep be proc get_token_lexeme from token_ptr
+
+                        If in_order_only is equal to 1:
+                            proc add_to_list from ListCore with order_only_list, dep
+                        Otherwise:
+                            proc add_to_list from ListCore with deps_list, dep
+                        End If
+
+                        proc advance from parser_ptr
+                    Otherwise:
+                        proc advance from parser_ptr  Note: Skip unknown tokens
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Note: Check for inline recipe (after semicolon)
+    Let recipes_list be proc create_list from ListCore
+
+    Set token_ptr to proc current_token from parser_ptr
+    If token_ptr is not equal to 0:
+        Set token_type to proc read_integer from Memory at token_ptr with 0
+
+        If token_type is equal to MakefileLexer.TOKEN_SEMICOLON:
+            proc advance from parser_ptr
+
+            Note: Get inline recipe command
+            Let inline_cmd be proc consume_until_newline from parser_ptr
+
+            Let recipe_ptr be proc allocate from Memory with 24
+            proc write_integer from Memory at recipe_ptr with 0, NODE_RECIPE_LINE
+            proc write_string from Memory at recipe_ptr with 8, inline_cmd
+            proc write_integer from Memory at recipe_ptr with 16, 0  Note: silent
+            proc write_integer from Memory at recipe_ptr with 20, 0  Note: ignore_errors
+
+            proc add_to_list from ListCore with recipes_list, recipe_ptr
+        End If
+    End If
+
+    Note: Skip newline after target line
+    proc skip_newlines from parser_ptr
+
+    Note: Parse recipe lines (tab-indented commands)
+    Set continue to 1
+    While continue is equal to 1:
+        Set token_ptr to proc current_token from parser_ptr
+        If token_ptr is equal to 0:
+            Set continue to 0
+        Otherwise:
+            Set token_type to proc read_integer from Memory at token_ptr with 0
+
+            If token_type is equal to MakefileLexer.TOKEN_TAB:
+                proc advance from parser_ptr
+
+                Note: Check for silent (@) or ignore errors (-) prefixes
+                Let silent be 0
+                Let ignore_errors be 0
+
+                Set token_ptr to proc current_token from parser_ptr
+                If token_ptr is not equal to 0:
+                    Set token_type to proc read_integer from Memory at token_ptr with 0
+
+                    If token_type is equal to MakefileLexer.TOKEN_AT:
+                        Set silent to 1
+                        proc advance from parser_ptr
+                    End If
+                End If
+
+                Set token_ptr to proc current_token from parser_ptr
+                If token_ptr is not equal to 0:
+                    Set token_type to proc read_integer from Memory at token_ptr with 0
+
+                    If token_type is equal to MakefileLexer.TOKEN_IDENTIFIER:
+                        Let lexeme be proc get_token_lexeme from token_ptr
+                        Let starts_with_dash be proc string_starts_with from StringCore with lexeme, "-"
+                        If starts_with_dash is equal to 1:
+                            Set ignore_errors to 1
+                            Let lexeme_len be proc string_length from StringCore with lexeme
+                            Set lexeme to proc string_substring from StringCore with lexeme, 1, lexeme_len
+                            proc write_string from Memory at token_ptr with 8, lexeme
+                        End If
+                    End If
+                End If
+
+                Note: Get recipe command
+                Let recipe_cmd be proc consume_until_newline from parser_ptr
+
+                Let recipe_ptr be proc allocate from Memory with 24
+                proc write_integer from Memory at recipe_ptr with 0, NODE_RECIPE_LINE
+                proc write_string from Memory at recipe_ptr with 8, recipe_cmd
+                proc write_integer from Memory at recipe_ptr with 16, silent
+                proc write_integer from Memory at recipe_ptr with 20, ignore_errors
+
+                proc add_to_list from ListCore with recipes_list, recipe_ptr
+
+                proc skip_newlines from parser_ptr
+            Otherwise:
+                Set continue to 0
+            End If
+        End If
+    End While
+
+    Note: Create target rule node
+    Let node_ptr be proc allocate from Memory with 72
+    proc write_integer from Memory at node_ptr with 0, NODE_TARGET_RULE
+    proc write_integer from Memory at node_ptr with 8, targets_list
+    proc write_integer from Memory at node_ptr with 16, deps_list
+    proc write_integer from Memory at node_ptr with 24, order_only_list
+    proc write_integer from Memory at node_ptr with 32, recipes_list
+    proc write_integer from Memory at node_ptr with 40, is_pattern
+    proc write_integer from Memory at node_ptr with 48, is_double_colon
+    proc write_integer from Memory at node_ptr with 56, line_num
+    proc write_integer from Memory at node_ptr with 64, col_num
+
+    Return node_ptr
+End Process
+
+Process called "parse_conditional" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Parse a conditional: ifeq, ifneq, ifdef, ifndef with optional else.
+    @End Reasoning
+
+    @Implementation
+    Parse condition, then block, optional else block, and endif.
+    @End Implementation
+
+    Let token_ptr be proc current_token from parser_ptr
+    Let token_type be proc read_integer from Memory at token_ptr with 0
+    Let line_num be proc read_integer from Memory at token_ptr with 24
+    Let col_num be proc read_integer from Memory at token_ptr with 32
+
+    Note: Determine conditional type
+    Let cond_type be 0
+
+    If token_type is equal to MakefileLexer.TOKEN_IFEQ:
+        Set cond_type to COND_IFEQ
+    Otherwise:
+        If token_type is equal to MakefileLexer.TOKEN_IFNEQ:
+            Set cond_type to COND_IFNEQ
+        Otherwise:
+            If token_type is equal to MakefileLexer.TOKEN_IFDEF:
+                Set cond_type to COND_IFDEF
+            Otherwise:
+                If token_type is equal to MakefileLexer.TOKEN_IFNDEF:
+                    Set cond_type to COND_IFNDEF
+                Otherwise:
+                    proc set_error from parser_ptr, "Unknown conditional type"
+                    Return 0
+                End If
+            End If
+        End If
+    End If
+
+    proc advance from parser_ptr
+
+    Note: Parse operands (rest of line for ifeq/ifneq, single variable for ifdef/ifndef)
+    Let operand1 be ""
+    Let operand2 be ""
+
+    If cond_type is equal to COND_IFDEF or cond_type is equal to COND_IFNDEF:
+        Note: Single variable name
+        Set operand1 to proc consume_until_newline from parser_ptr
+    Otherwise:
+        Note: Two operands in parentheses or quotes (: take rest of line)
+        Let full_cond be proc consume_until_newline from parser_ptr
+        Set operand1 to full_cond
+    End If
+
+    proc skip_newlines from parser_ptr
+
+    Note: Parse then block (statements until else or endif)
+    Let then_list be proc create_list from ListCore
+
+    Let continue be 1
+    While continue is equal to 1:
+        Set token_ptr to proc current_token from parser_ptr
+        If token_ptr is equal to 0:
+            proc set_error from parser_ptr, "Unexpected end in conditional"
+            Return 0
+        End If
+
+        Set token_type to proc read_integer from Memory at token_ptr with 0
+
+        If token_type is equal to MakefileLexer.TOKEN_ELSE or token_type is equal to MakefileLexer.TOKEN_ENDIF:
+            Set continue to 0
+        Otherwise:
+            Let stmt_ptr be proc parse_statement from parser_ptr
+            If stmt_ptr is not equal to 0:
+                proc add_to_list from ListCore with then_list, stmt_ptr
+            End If
+        End If
+    End While
+
+    Note: Check for else block
+    Let else_list be 0
+
+    Set token_ptr to proc current_token from parser_ptr
+    Set token_type to proc read_integer from Memory at token_ptr with 0
+
+    If token_type is equal to MakefileLexer.TOKEN_ELSE:
+        proc advance from parser_ptr
+        proc skip_newlines from parser_ptr
+
+        Set else_list to proc create_list from ListCore
+
+        Set continue to 1
+        While continue is equal to 1:
+            Set token_ptr to proc current_token from parser_ptr
+            If token_ptr is equal to 0:
+                proc set_error from parser_ptr, "Unexpected end in else block"
+                Return 0
+            End If
+
+            Set token_type to proc read_integer from Memory at token_ptr with 0
+
+            If token_type is equal to MakefileLexer.TOKEN_ENDIF:
+                Set continue to 0
+            Otherwise:
+                Let stmt_ptr be proc parse_statement from parser_ptr
+                If stmt_ptr is not equal to 0:
+                    proc add_to_list from ListCore with else_list, stmt_ptr
+                End If
+            End If
+        End While
+    End If
+
+    Note: Expect endif
+    Let success be proc expect from parser_ptr, MakefileLexer.TOKEN_ENDIF
+    If success is equal to 0:
+        Return 0
+    End If
+
+    Note: Create conditional node
+    Let node_ptr be proc allocate from Memory with 56
+    proc write_integer from Memory at node_ptr with 0, NODE_CONDITIONAL
+    proc write_integer from Memory at node_ptr with 8, cond_type
+    proc write_string from Memory at node_ptr with 16, operand1
+    proc write_string from Memory at node_ptr with 24, operand2
+    proc write_integer from Memory at node_ptr with 32, then_list
+    proc write_integer from Memory at node_ptr with 40, else_list
+    proc write_integer from Memory at node_ptr with 48, line_num
+    proc write_integer from Memory at node_ptr with 52, col_num
+
+    Return node_ptr
+End Process
+
+Process called "parse_include_directive" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Parse an include directive: include filename or -include filename.
+    @End Reasoning
+
+    @Implementation
+    Extract include type and file names.
+    @End Implementation
+
+    Let token_ptr be proc current_token from parser_ptr
+    Let token_type be proc read_integer from Memory at token_ptr with 0
+    Let line_num be proc read_integer from Memory at token_ptr with 24
+    Let col_num be proc read_integer from Memory at token_ptr with 32
+
+    Let silent be 0
+
+    If token_type is equal to MakefileLexer.TOKEN_SINCLUDE or token_type is equal to MakefileLexer.TOKEN_DASH_INCLUDE:
+        Set silent to 1
+    End If
+
+    proc advance from parser_ptr
+
+    Note: Parse file names (rest of line)
+    Let filenames_str be proc consume_until_newline from parser_ptr
+
+    Note: Split by spaces ( - actual Make is more complex)
+    Let filenames_list be proc create_list from ListCore
+    proc add_to_list from ListCore with filenames_list, filenames_str
+
+    Note: Create include directive node
+    Let node_ptr be proc allocate from Memory with 32
+    proc write_integer from Memory at node_ptr with 0, NODE_INCLUDE_DIRECTIVE
+    proc write_integer from Memory at node_ptr with 8, filenames_list
+    proc write_integer from Memory at node_ptr with 16, silent
+    proc write_integer from Memory at node_ptr with 24, line_num
+    proc write_integer from Memory at node_ptr with 28, col_num
+
+    Return node_ptr
+End Process
+
+Process called "parse_export_directive" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Parse an export/unexport directive.
+    @End Reasoning
+
+    @Implementation
+    Extract export type and variable names.
+    @End Implementation
+
+    Let token_ptr be proc current_token from parser_ptr
+    Let token_type be proc read_integer from Memory at token_ptr with 0
+    Let line_num be proc read_integer from Memory at token_ptr with 24
+    Let col_num be proc read_integer from Memory at token_ptr with 32
+
+    Let unexport be 0
+
+    If token_type is equal to MakefileLexer.TOKEN_UNEXPORT:
+        Set unexport to 1
+    End If
+
+    proc advance from parser_ptr
+
+    Note: Parse variable names (rest of line, or empty for export all)
+    Let vars_str be proc consume_until_newline from parser_ptr
+
+    Let vars_list be 0
+    Let vars_len be proc string_length from StringCore with vars_str
+    If vars_len is greater than 0:
+        Set vars_list to proc create_list from ListCore
+        proc add_to_list from ListCore with vars_list, vars_str
+    End If
+
+    Note: Create export directive node
+    Let node_ptr be proc allocate from Memory with 32
+    proc write_integer from Memory at node_ptr with 0, NODE_EXPORT_DIRECTIVE
+    proc write_integer from Memory at node_ptr with 8, vars_list
+    proc write_integer from Memory at node_ptr with 16, unexport
+    proc write_integer from Memory at node_ptr with 24, line_num
+    proc write_integer from Memory at node_ptr with 28, col_num
+
+    Return node_ptr
+End Process
+
+Process called "parse_define_block" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Parse a define block: define VAR ... endef.
+    @End Reasoning
+
+    @Implementation
+    Extract variable name and multi-line content until endef.
+    @End Implementation
+
+    Let token_ptr be proc current_token from parser_ptr
+    Let line_num be proc read_integer from Memory at token_ptr with 24
+    Let col_num be proc read_integer from Memory at token_ptr with 32
+
+    proc advance from parser_ptr  Note: Skip 'define'
+
+    Note: Get variable name
+    Set token_ptr to proc current_token from parser_ptr
+    Let token_type be proc read_integer from Memory at token_ptr with 0
+
+    If token_type is not equal to MakefileLexer.TOKEN_IDENTIFIER:
+        proc set_error from parser_ptr, "Expected variable name after define"
+        Return 0
+    End If
+
+    Let var_name be proc get_token_lexeme from token_ptr
+    proc advance from parser_ptr
+
+    Note: Check for assignment operator (optional)
+    Let assign_type be ASSIGN_SIMPLE
+
+    Set token_ptr to proc current_token from parser_ptr
+    Set token_type to proc read_integer from Memory at token_ptr with 0
+
+    If token_type is equal to MakefileLexer.TOKEN_ASSIGN:
+        Set assign_type to ASSIGN_SIMPLE
+        proc advance from parser_ptr
+    Otherwise:
+        If token_type is equal to MakefileLexer.TOKEN_IMMEDIATE_ASSIGN:
+            Set assign_type to ASSIGN_IMMEDIATE
+            proc advance from parser_ptr
+        End If
+    End If
+
+    proc skip_newlines from parser_ptr
+
+    Note: Collect content until endef
+    Let content be ""
+
+    Let continue be 1
+    While continue is equal to 1:
+        Set token_ptr to proc current_token from parser_ptr
+        If token_ptr is equal to 0:
+            proc set_error from parser_ptr, "Unexpected end in define block"
+            Return 0
+        End If
+
+        Set token_type to proc read_integer from Memory at token_ptr with 0
+
+        If token_type is equal to MakefileLexer.TOKEN_ENDEF:
+            Set continue to 0
+        Otherwise:
+            Let line_content be proc consume_until_newline from parser_ptr
+            Set content to proc string_concat from StringCore with content, line_content
+            Set content to proc string_concat from StringCore with content, "\n"
+            proc skip_newlines from parser_ptr
+        End If
+    End While
+
+    Note: Expect endef
+    Let success be proc expect from parser_ptr, MakefileLexer.TOKEN_ENDEF
+    If success is equal to 0:
+        Return 0
+    End If
+
+    Note: Create define block node
+    Let node_ptr be proc allocate from Memory with 40
+    proc write_integer from Memory at node_ptr with 0, NODE_DEFINE_BLOCK
+    proc write_string from Memory at node_ptr with 8, var_name
+    proc write_string from Memory at node_ptr with 16, content
+    proc write_integer from Memory at node_ptr with 24, assign_type
+    proc write_integer from Memory at node_ptr with 32, line_num
+    proc write_integer from Memory at node_ptr with 36, col_num
+
+    Return node_ptr
+End Process
+
+Note: ============================================================================
+Note: Main Parsing Functions
+Note: ============================================================================
+
+Process called "parse_statement" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Parse a single Makefile statement (assignment, rule, directive, conditional).
+    @End Reasoning
+
+    @Implementation
+    Determine statement type and delegate to appropriate parser.
+    @End Implementation
+
+    proc skip_newlines from parser_ptr
+
+    Let is_end be proc is_at_end from parser_ptr
+    If is_end is equal to 1:
+        Return 0
+    End If
+
+    Let token_ptr be proc current_token from parser_ptr
+    Let token_type be proc read_integer from Memory at token_ptr with 0
+
+    Note: Conditionals
+    If token_type is equal to MakefileLexer.TOKEN_IFEQ or token_type is equal to MakefileLexer.TOKEN_IFNEQ or token_type is equal to MakefileLexer.TOKEN_IFDEF or token_type is equal to MakefileLexer.TOKEN_IFNDEF:
+        Let node_ptr be proc parse_conditional from parser_ptr
+        Return node_ptr
+    End If
+
+    Note: Directives
+    If token_type is equal to MakefileLexer.TOKEN_INCLUDE or token_type is equal to MakefileLexer.TOKEN_SINCLUDE or token_type is equal to MakefileLexer.TOKEN_DASH_INCLUDE:
+        Let node_ptr be proc parse_include_directive from parser_ptr
+        Return node_ptr
+    End If
+
+    If token_type is equal to MakefileLexer.TOKEN_EXPORT or token_type is equal to MakefileLexer.TOKEN_UNEXPORT:
+        Let node_ptr be proc parse_export_directive from parser_ptr
+        Return node_ptr
+    End If
+
+    If token_type is equal to MakefileLexer.TOKEN_DEFINE:
+        Let node_ptr be proc parse_define_block from parser_ptr
+        Return node_ptr
+    End If
+
+    If token_type is equal to MakefileLexer.TOKEN_OVERRIDE:
+        Let node_ptr be proc parse_variable_assignment from parser_ptr
+        Return node_ptr
+    End If
+
+    Note: Check for special targets (.PHONY, etc.)
+    If token_type is equal to MakefileLexer.TOKEN_PHONY or token_type is equal to MakefileLexer.TOKEN_SUFFIXES or token_type is equal to MakefileLexer.TOKEN_DEFAULT:
+        Note: Parse as target rule (special targets are just rules)
+        Let node_ptr be proc parse_target_rule from parser_ptr
+        Return node_ptr
+    End If
+
+    Note: Identifier could be variable assignment or target rule
+    If token_type is equal to MakefileLexer.TOKEN_IDENTIFIER:
+        Note: Look ahead to determine which it is
+        Let next_token_ptr be proc peek_token from parser_ptr, 1
+        If next_token_ptr is not equal to 0:
+            Let next_type be proc read_integer from Memory at next_token_ptr with 0
+
+            Note: Assignment operators
+            If next_type is equal to MakefileLexer.TOKEN_ASSIGN or next_type is equal to MakefileLexer.TOKEN_IMMEDIATE_ASSIGN or next_type is equal to MakefileLexer.TOKEN_APPEND_ASSIGN or next_type is equal to MakefileLexer.TOKEN_CONDITIONAL_ASSIGN:
+                Let node_ptr be proc parse_variable_assignment from parser_ptr
+                Return node_ptr
+            End If
+
+            Note: Colon indicates target rule
+            If next_type is equal to MakefileLexer.TOKEN_COLON or next_type is equal to MakefileLexer.TOKEN_DOUBLE_COLON:
+                Let node_ptr be proc parse_target_rule from parser_ptr
+                Return node_ptr
+            End If
+        End If
+    End If
+
+    Note: Unknown statement - skip line
+    proc consume_until_newline from parser_ptr
+    proc skip_newlines from parser_ptr
+    Return 0
+End Process
+
+Process called "parse_makefile" that takes parser_ptr as Integer returns Integer:
+    @Reasoning
+    Parse a complete Makefile into an AST.
+    @End Reasoning
+
+    @Implementation
+    Parse all statements and build root AST node.
+    @End Implementation
+
+    Let root_ptr be proc allocate from Memory with 32
+    proc write_integer from Memory at root_ptr with 0, NODE_MAKEFILE
+
+    Let statements_list be proc create_list from ListCore
+    proc write_integer from Memory at root_ptr with 8, statements_list
+    proc write_integer from Memory at root_ptr with 16, 1  Note: line_number
+    proc write_integer from Memory at root_ptr with 24, 1  Note: column_number
+
+    Note: Parse all statements
+    Let continue be 1
+    While continue is equal to 1:
+        proc skip_newlines from parser_ptr
+
+        Let is_end be proc is_at_end from parser_ptr
+        If is_end is equal to 1:
+            Set continue to 0
+        Otherwise:
+            Let statement_ptr be proc parse_statement from parser_ptr
+            If statement_ptr is equal to 0:
+                Let has_error be proc read_integer from Memory at parser_ptr with 24
+                If has_error is equal to 1:
+                    Return 0
+                End If
+            Otherwise:
+                proc add_to_list from ListCore with statements_list, statement_ptr
+            End If
+        End If
+    End While
+
+    Return root_ptr
+End Process

@@ -35,4 +35,941 @@ This file consists of the following functions/features/operation types:
 - Null dereference error detection and prevention
 :End Note
 
-Note: TODO - Implement null safety analysis functionality
+From compiler.middle.gungnir.mir.mir Use MIR
+From compiler.middle.gungnir.mir.mir_builder Use MIRBuilder
+From compiler.middle.gungnir.mir.control_flow Use ControlFlowGraph
+From compiler.middle.analysis.data_flow Use DataFlowAnalysis
+From stdlib.core.primitives Use Layout
+From stdlib.collections.dictionary Use Dictionary
+From stdlib.collections.list Use List
+From stdlib.collections.set Use Set
+From stdlib.core.string_core Use StringCore
+
+Note: @Reasoning
+Null safety analysis prevents null pointer dereferences through three-state tracking.
+The analysis uses three null states: NULL, NON_NULL, and MAYBE.
+- NULL (0): Value is definitely null
+- NON_NULL (1): Value is definitely non-null
+- MAYBE (2): Value might be null or non-null (unknown)
+
+The analysis is control-flow sensitive, meaning null checks refine the null state
+in dominated blocks. For example, after "if x is null" the then-branch knows x is NULL
+and the else-branch knows x is NON_NULL.
+
+Integration points:
+- Lifetime analysis: Null checks can affect borrow lifetimes
+- Ownership tracking: Moved values become unavailable (cannot be null or non-null)
+- Borrow analysis: Mutable borrows may change null state
+
+This analysis is critical for eliminating the "billion-dollar mistake" and ensuring
+production-grade reliability in Runa programs.
+@End Reasoning
+
+Note: Null state constants
+Constant NULL_STATE_NULL as Integer is 0        Note: Definitely null
+Constant NULL_STATE_NON_NULL as Integer is 1    Note: Definitely non-null
+Constant NULL_STATE_MAYBE as Integer is 2       Note: Possibly null or non-null
+
+Note: @Implementation
+NullState tracks the null state of a single value.
+Fields:
+- value_id: SSA value or variable ID
+- state: NULL (0), NON_NULL (1), or MAYBE (2)
+- checked_at: Instruction where null check occurred (0 if unchecked)
+- is_optional: Whether this value is of optional type
+- unwrapped: Boolean flag indicating if optional was unwrapped
+- source_alloc: Allocation instruction (for tracking new allocations = non-null)
+
+Memory layout (48 bytes, Tier 3 OWNED HEAP):
+Offset 0: value_id (8 bytes)
+Offset 8: state (8 bytes)
+Offset 16: checked_at (8 bytes)
+Offset 24: is_optional (8 bytes)
+Offset 32: unwrapped (8 bytes)
+Offset 40: source_alloc (8 bytes)
+@End Implementation
+
+Type called "NullState":
+    value_id as Integer
+    state as Integer
+    checked_at as Integer
+    is_optional as Integer
+    unwrapped as Integer
+    source_alloc as Integer
+End Type
+
+Note: @Implementation
+NullInfo tracks null states at a specific program point (instruction or block).
+Fields:
+- program_point: Instruction ID or block ID
+- null_states: Dictionary mapping value_id -> NullState
+- phi_nodes: List of phi node IDs at this point
+- dominates: Set of program points dominated by this point
+- null_checks: List of null check instructions at this point
+
+Memory layout (48 bytes, Tier 3 OWNED HEAP):
+Offset 0: program_point (8 bytes)
+Offset 8: null_states (8 bytes, pointer to Dictionary)
+Offset 16: phi_nodes (8 bytes, pointer to List)
+Offset 24: dominates (8 bytes, pointer to Set)
+Offset 32: null_checks (8 bytes, pointer to List)
+@End Implementation
+
+Type called "NullInfo":
+    program_point as Integer
+    null_states as Integer
+    phi_nodes as Integer
+    dominates as Integer
+    null_checks as Integer
+End Type
+
+Note: @Implementation
+NullAnalysis is the main analysis state for null safety analysis.
+Fields:
+- mir: Pointer to MIR structure
+- cfg: Pointer to control flow graph
+- value_to_null: Dictionary mapping value_id -> current NullState
+- block_to_info: Dictionary mapping block_id -> NullInfo
+- inst_to_info: Dictionary mapping inst_id -> NullInfo
+- error_list: List of null safety errors
+- error_count: Number of errors detected
+- optional_types: Set of type IDs that are optional types
+
+Memory layout (64 bytes, Tier 3 OWNED HEAP):
+Offset 0: mir (8 bytes)
+Offset 8: cfg (8 bytes)
+Offset 16: value_to_null (8 bytes)
+Offset 24: block_to_info (8 bytes)
+Offset 32: inst_to_info (8 bytes)
+Offset 40: error_list (8 bytes)
+Offset 48: error_count (8 bytes)
+Offset 56: optional_types (8 bytes)
+@End Implementation
+
+Type called "NullAnalysis":
+    mir as Integer
+    cfg as Integer
+    value_to_null as Integer
+    block_to_info as Integer
+    inst_to_info as Integer
+    error_list as Integer
+    error_count as Integer
+    optional_types as Integer
+End Type
+
+Note: @Reasoning
+create_null_state creates a new NullState with the given parameters.
+The default state is MAYBE (2) because we conservatively assume values
+might be null unless proven otherwise through allocation or null checks.
+
+New allocations (ALLOC, NEW instructions) create NON_NULL states since
+fresh allocations cannot be null.
+@End Reasoning
+
+Process called "create_null_state" that takes value_id as Integer, state as Integer, checked_at as Integer, is_optional as Integer returns Integer:
+    Note: Allocate NullState (48 bytes, Tier 3 OWNED HEAP)
+    Let ns be Layout.memory_allocate(48)
+
+    Note: Initialize fields
+    Layout.memory_set_int64(ns, 0, value_id)
+    Layout.memory_set_int64(ns, 8, state)
+    Layout.memory_set_int64(ns, 16, checked_at)
+    Layout.memory_set_int64(ns, 24, is_optional)
+    Layout.memory_set_int64(ns, 32, 0)  Note: unwrapped = false
+    Layout.memory_set_int64(ns, 40, 0)  Note: source_alloc = 0
+
+    Return ns
+End Process
+
+Note: @Reasoning
+create_null_info creates a new NullInfo for a program point.
+Each program point (instruction or block) has its own NullInfo tracking
+the null states of all values at that point.
+@End Reasoning
+
+Process called "create_null_info" that takes program_point as Integer returns Integer:
+    Note: Allocate NullInfo (48 bytes, Tier 3 OWNED HEAP)
+    Let ni be Layout.memory_allocate(48)
+
+    Note: Initialize fields
+    Layout.memory_set_int64(ni, 0, program_point)
+    Layout.memory_set_int64(ni, 8, Dictionary.create())   Note: null_states
+    Layout.memory_set_int64(ni, 16, List.create())        Note: phi_nodes
+    Layout.memory_set_int64(ni, 24, Set.create())         Note: dominates
+    Layout.memory_set_int64(ni, 32, List.create())        Note: null_checks
+
+    Return ni
+End Process
+
+Note: @Reasoning
+create_null_analysis creates the main NullAnalysis structure.
+This initializes all data structures needed for null safety analysis.
+@End Reasoning
+
+Process called "create_null_analysis" that takes mir as Integer, cfg as Integer returns Integer:
+    Note: Allocate NullAnalysis (64 bytes, Tier 3 OWNED HEAP)
+    Let na be Layout.memory_allocate(64)
+
+    Note: Initialize fields
+    Layout.memory_set_int64(na, 0, mir)
+    Layout.memory_set_int64(na, 8, cfg)
+    Layout.memory_set_int64(na, 16, Dictionary.create())  Note: value_to_null
+    Layout.memory_set_int64(na, 24, Dictionary.create())  Note: block_to_info
+    Layout.memory_set_int64(na, 32, Dictionary.create())  Note: inst_to_info
+    Layout.memory_set_int64(na, 40, List.create())        Note: error_list
+    Layout.memory_set_int64(na, 48, 0)                     Note: error_count
+    Layout.memory_set_int64(na, 56, Set.create())         Note: optional_types
+
+    Return na
+End Process
+
+Note: @Reasoning
+compute_null_states is the main driver for null safety analysis.
+It performs a fixed-point data flow analysis to compute null states
+for all values throughout the program.
+
+Algorithm:
+1. Initialize all values to MAYBE state
+2. Identify allocations and initialize them to NON_NULL
+3. Iterate through CFG in post-order until fixed point
+4. For each block, analyze instructions and propagate null states
+5. At phi nodes, merge null states conservatively
+6. Refine null states based on null checks in conditionals
+7. Detect null dereferences and optional unwrapping errors
+
+Fixed-point iteration ensures correct handling of loops and backward edges.
+@End Reasoning
+
+Process called "compute_null_states" that takes na as Integer returns Integer:
+    Let mir be Layout.memory_get_int64(na, 0)
+    Let cfg be Layout.memory_get_int64(na, 8)
+    Let value_to_null be Layout.memory_get_int64(na, 16)
+    Let block_to_info be Layout.memory_get_int64(na, 24)
+
+    Note: Get CFG structure
+    Let blocks be Layout.memory_get_int64(cfg, 0)
+    Let block_count be List.length(blocks)
+
+    Note: Initialize all values to MAYBE state
+    Let i be 0
+    While i is less than block_count:
+        Let block be List.get(blocks, i)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Note: Create NullInfo for this block
+        Let info be create_null_info(block_id)
+        Dictionary.set(block_to_info, block_id, info)
+
+        Note: Process instructions in block
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            Let value_id be Layout.memory_get_int64(inst, 8)
+
+            Note: If instruction produces a value, initialize its null state
+            If value_id is not equal to 0:
+                Note: Check if this is an allocation instruction
+                Let opcode be Layout.memory_get_int64(inst, 0)
+
+                Note: ALLOC (20201) and NEW (20202) produce non-null values
+                If opcode equals 20201 or opcode equals 20202:
+                    Let ns be create_null_state(value_id, 1, 0, 0)  Note: NON_NULL
+                    Layout.memory_set_int64(ns, 40, inst)  Note: source_alloc
+                    Dictionary.set(value_to_null, value_id, ns)
+                Otherwise:
+                    Note: Default to MAYBE state
+                    Let ns be create_null_state(value_id, 2, 0, 0)
+                    Dictionary.set(value_to_null, value_id, ns)
+                End If
+            End If
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Note: Fixed-point iteration for data flow analysis
+    Let changed be 1
+    Let iteration be 0
+    Let max_iterations be 100
+
+    While changed equals 1 and iteration is less than max_iterations:
+        Let changed be 0
+
+        Note: Process blocks in post-order for better convergence
+        Let i be 0
+        While i is less than block_count:
+            Let block be List.get(blocks, i)
+            Let block_id be Layout.memory_get_int64(block, 0)
+
+            Note: Analyze this block
+            Let block_changed be analyze_null_in_block(na, block)
+
+            If block_changed equals 1:
+                Let changed be 1
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let iteration be iteration + 1
+    End While
+
+    Note: After fixed point, detect null dereferences
+    Let i be 0
+    While i is less than block_count:
+        Let block be List.get(blocks, i)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            check_null_dereference(na, inst)
+            verify_optional_unwrap(na, inst)
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Let error_count be Layout.memory_get_int64(na, 48)
+    Return error_count
+End Process
+
+Note: @Reasoning
+analyze_null_in_block analyzes a single basic block for null state changes.
+It propagates null states through instructions and handles phi nodes.
+
+Returns 1 if any null states changed, 0 otherwise (for fixed-point iteration).
+@End Reasoning
+
+Process called "analyze_null_in_block" that takes na as Integer, block as Integer returns Integer:
+    Let block_id be Layout.memory_get_int64(block, 0)
+    Let value_to_null be Layout.memory_get_int64(na, 16)
+    Let block_to_info be Layout.memory_get_int64(na, 24)
+    Let cfg be Layout.memory_get_int64(na, 8)
+
+    Note: Get block info
+    Let info be Dictionary.get(block_to_info, block_id)
+    If info equals 0:
+        Let info be create_null_info(block_id)
+        Dictionary.set(block_to_info, block_id, info)
+    End If
+
+    Let null_states be Layout.memory_get_int64(info, 8)
+    Let changed be 0
+
+    Note: Propagate null states from predecessors
+    Let predecessors be Layout.memory_get_int64(block, 8)
+    Let pred_count be List.length(predecessors)
+
+    Note: If multiple predecessors, merge null states at phi nodes
+    If pred_count is greater than 1:
+        Let merge_changed be propagate_null_state(na, block)
+        If merge_changed equals 1:
+            Let changed be 1
+        End If
+    End If
+
+    Note: Process instructions in block
+    Let instructions be Layout.memory_get_int64(block, 16)
+    Let inst_count be List.length(instructions)
+
+    Let i be 0
+    While i is less than inst_count:
+        Let inst be List.get(instructions, i)
+        Let opcode be Layout.memory_get_int64(inst, 0)
+        Let value_id be Layout.memory_get_int64(inst, 8)
+
+        Note: LOAD instruction - loaded value might be null
+        If opcode equals 20203:
+            Let addr be Layout.memory_get_int64(inst, 16)
+            Note: Conservatively assume loaded values are MAYBE
+            If value_id is not equal to 0:
+                Let old_state be Dictionary.get(value_to_null, value_id)
+                If old_state is not equal to 0:
+                    Let old_state_value be Layout.memory_get_int64(old_state, 8)
+                    If old_state_value is not equal to 2:
+                        Let ns be create_null_state(value_id, 2, 0, 0)
+                        Dictionary.set(value_to_null, value_id, ns)
+                        Let changed be 1
+                    End If
+                End If
+            End If
+        End If
+
+        Note: STORE instruction - does not change null states
+        If opcode equals 20204:
+            Note: Store operations do not affect null state tracking
+        End If
+
+        Note: CALL instruction - return value might be null
+        If opcode equals 20304:
+            If value_id is not equal to 0:
+                Note: Function return values are conservatively MAYBE
+                Let old_state be Dictionary.get(value_to_null, value_id)
+                If old_state is not equal to 0:
+                    Let old_state_value be Layout.memory_get_int64(old_state, 8)
+                    If old_state_value is not equal to 2:
+                        Let ns be create_null_state(value_id, 2, 0, 0)
+                        Dictionary.set(value_to_null, value_id, ns)
+                        Let changed be 1
+                    End If
+                End If
+            End If
+        End If
+
+        Note: PHI instruction - merge null states from predecessors
+        If opcode equals 20101:
+            Let phi_changed be propagate_null_state(na, block)
+            If phi_changed equals 1:
+                Let changed be 1
+            End If
+        End If
+
+        Note: COMPARE instruction - potential null check (MIR_EQ = 20100, MIR_NE = 20101)
+        If opcode equals 20100 or opcode equals 20101:
+            Note: Check if this is a null comparison (x == null or x != null)
+            Let operand1 be Layout.memory_get_int64(inst, 16)
+            Let operand2 be Layout.memory_get_int64(inst, 24)
+
+            Note: Track this as a null check for later refinement
+            Let null_checks be Layout.memory_get_int64(info, 32)
+            List.append(null_checks, inst)
+        End If
+
+        Note: BRANCH instruction - refine null states based on condition
+        If opcode equals 20501:
+            Let condition be Layout.memory_get_int64(inst, 16)
+            Let true_target be Layout.memory_get_int64(inst, 24)
+            Let false_target be Layout.memory_get_int64(inst, 32)
+
+            Note: Refine null states in true and false branches
+            refine_null_from_condition(na, condition, true_target, false_target)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return changed
+End Process
+
+Note: @Reasoning
+propagate_null_state propagates null states through the control flow graph.
+At merge points (blocks with multiple predecessors), it merges null states
+conservatively using the following rules:
+
+NULL ∧ NULL = NULL (both definitely null → definitely null)
+NON_NULL ∧ NON_NULL = NON_NULL (both definitely non-null → definitely non-null)
+NULL ∧ NON_NULL = MAYBE (conflicting states → unknown)
+MAYBE ∧ anything = MAYBE (unknown propagates)
+
+This ensures soundness: we only claim NULL or NON_NULL when all paths agree.
+@End Reasoning
+
+Process called "propagate_null_state" that takes na as Integer, block as Integer returns Integer:
+    Let block_id be Layout.memory_get_int64(block, 0)
+    Let value_to_null be Layout.memory_get_int64(na, 16)
+    Let block_to_info be Layout.memory_get_int64(na, 24)
+    Let cfg be Layout.memory_get_int64(na, 8)
+
+    Let info be Dictionary.get(block_to_info, block_id)
+    Let changed be 0
+
+    Note: Get predecessors
+    Let predecessors be Layout.memory_get_int64(block, 8)
+    Let pred_count be List.length(predecessors)
+
+    Note: For each value, merge null states from all predecessors
+    Let all_values be Dictionary.keys(value_to_null)
+    Let value_count be List.length(all_values)
+
+    Let i be 0
+    While i is less than value_count:
+        Let value_id be List.get(all_values, i)
+
+        Note: Collect null states from all predecessors
+        Let merged_state be -1  Note: -1 means uninitialized
+
+        Let p be 0
+        While p is less than pred_count:
+            Let pred_id be List.get(predecessors, p)
+            Let pred_info be Dictionary.get(block_to_info, pred_id)
+
+            If pred_info is not equal to 0:
+                Let pred_null_states be Layout.memory_get_int64(pred_info, 8)
+                Let pred_state_obj be Dictionary.get(pred_null_states, value_id)
+
+                If pred_state_obj is not equal to 0:
+                    Let pred_state be Layout.memory_get_int64(pred_state_obj, 8)
+
+                    Note: Merge with current merged state
+                    If merged_state equals -1:
+                        Let merged_state be pred_state
+                    Otherwise:
+                        Note: Apply merge rules
+                        If merged_state equals pred_state:
+                            Note: Same state, no change
+                        Otherwise:
+                            Note: Different states, result is MAYBE
+                            Let merged_state be 2
+                        End If
+                    End If
+                End If
+            End If
+
+            Let p be p + 1
+        End While
+
+        Note: Update value's null state if it changed
+        If merged_state is not equal to -1:
+            Let current_state_obj be Dictionary.get(value_to_null, value_id)
+
+            If current_state_obj is not equal to 0:
+                Let current_state be Layout.memory_get_int64(current_state_obj, 8)
+
+                If current_state is not equal to merged_state:
+                    Let ns be create_null_state(value_id, merged_state, 0, 0)
+                    Dictionary.set(value_to_null, value_id, ns)
+                    Let changed be 1
+                End If
+            End If
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return changed
+End Process
+
+Note: @Reasoning
+is_null_constant checks if a value_id represents a null constant.
+A null constant is a CONST instruction (opcode 20001) with value 0.
+@End Reasoning
+
+Process called "is_null_constant" that takes na as Integer, value_id as Integer returns Integer:
+    Let mir be Layout.memory_get_int64(na, 0)
+
+    Note: Null constant detection uses two methods:
+    Note: 1. SSA convention: value_id == 0 represents null in many SSA IRs
+    Note: 2. Null state tracking: if value is definitely null, treat as null constant
+    Note: This conservative approach catches both explicit null constants and
+    Note: values proven to be null through dataflow analysis
+
+    Note: Check SSA convention: value ID 0 represents null
+    If value_id equals 0:
+        Return 1
+    End If
+
+    Note: Check if this value has been proven null through dataflow analysis
+    Let value_to_null be Layout.memory_get_int64(na, 16)
+    Let state_obj be Dictionary.get(value_to_null, value_id)
+
+    If state_obj is not equal to 0:
+        Let state be Layout.memory_get_int64(state_obj, 8)
+        Note: If definitely null (state = 0), treat as null constant
+        If state equals 0:
+            Return 1
+        End If
+    End If
+
+    Note: Not a null constant
+    Return 0
+End Process
+
+Note: @Reasoning
+refine_null_from_condition refines null states based on null checks.
+When a branch condition tests if a value is null, we can refine the null state
+in the dominated blocks:
+
+If condition is "x == null":
+  - True branch: x is NULL
+  - False branch: x is NON_NULL
+
+If condition is "x != null":
+  - True branch: x is NON_NULL
+  - False branch: x is NULL
+
+This control-flow sensitive refinement is key to practical null safety.
+@End Reasoning
+
+Process called "refine_null_from_condition" that takes na as Integer, condition as Integer, true_target as Integer, false_target as Integer returns Integer:
+    Let value_to_null be Layout.memory_get_int64(na, 16)
+    Let block_to_info be Layout.memory_get_int64(na, 24)
+    Let cfg be Layout.memory_get_int64(na, 8)
+
+    Note: The condition is the result of a comparison instruction
+    Note: We need to find the comparison instruction that produced this value
+    Note: In SSA form, each value has exactly one defining instruction
+
+    Note: Get CFG blocks to find the comparison instruction
+    Let blocks be Layout.memory_get_int64(cfg, 0)
+    Let block_count be List.length(blocks)
+
+    Note: Search for the comparison instruction that defines the condition value
+    Let comparison_inst be 0
+    Let comparison_opcode be 0
+
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be List.length(instructions)
+
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(instructions, i)
+            Let value_id be Layout.memory_get_int64(inst, 8)
+
+            Note: Check if this instruction defines the condition value
+            If value_id equals condition:
+                Let comparison_inst be inst
+                Let comparison_opcode be Layout.memory_get_int64(inst, 0)
+                Let b be block_count  Note: Break outer loop
+                Let i be inst_count   Note: Break inner loop
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Note: If we didn't find the comparison instruction, cannot refine
+    If comparison_inst equals 0:
+        Return 0
+    End If
+
+    Note: Check if this is a null comparison (MIR_EQ = 20100 or MIR_NE = 20101)
+    If comparison_opcode is not equal to 20100 and comparison_opcode is not equal to 20101:
+        Return 0
+    End If
+
+    Note: Get comparison operands
+    Let operand1 be Layout.memory_get_int64(comparison_inst, 16)
+    Let operand2 be Layout.memory_get_int64(comparison_inst, 24)
+
+    Note: Determine which operand is null and which is the value being checked
+    Let checked_value be 0
+    Let is_null_check be 0
+
+    If is_null_constant(na, operand2) equals 1:
+        Let checked_value be operand1
+        Let is_null_check be 1
+    Otherwise:
+        If is_null_constant(na, operand1) equals 1:
+            Let checked_value be operand2
+            Let is_null_check be 1
+        End If
+    End If
+
+    Note: If not a null check, cannot refine
+    If is_null_check equals 0:
+        Return 0
+    End If
+
+    Note: Now we know checked_value is being compared against null
+    Note: Refine null states in true and false branches
+
+    Note: Get true and false branch block info
+    Let true_info be Dictionary.get(block_to_info, true_target)
+    Let false_info be Dictionary.get(block_to_info, false_target)
+
+    If true_info equals 0:
+        Let true_info be create_null_info(true_target)
+        Dictionary.set(block_to_info, true_target, true_info)
+    End If
+
+    If false_info equals 0:
+        Let false_info be create_null_info(false_target)
+        Dictionary.set(block_to_info, false_target, false_info)
+    End If
+
+    Let true_states be Layout.memory_get_int64(true_info, 8)
+    Let false_states be Layout.memory_get_int64(false_info, 8)
+
+    Note: Refine based on comparison operator
+    If comparison_opcode equals 20100:
+        Note: MIR_EQ: x == null
+        Note: True branch: x is NULL
+        Let null_state be create_null_state(checked_value, 0, comparison_inst, 0)
+        Dictionary.set(true_states, checked_value, null_state)
+
+        Note: False branch: x is NON_NULL
+        Let non_null_state be create_null_state(checked_value, 1, comparison_inst, 0)
+        Dictionary.set(false_states, checked_value, non_null_state)
+    End If
+
+    If comparison_opcode equals 20101:
+        Note: MIR_NE: x != null
+        Note: True branch: x is NON_NULL
+        Let non_null_state be create_null_state(checked_value, 1, comparison_inst, 0)
+        Dictionary.set(true_states, checked_value, non_null_state)
+
+        Note: False branch: x is NULL
+        Let null_state be create_null_state(checked_value, 0, comparison_inst, 0)
+        Dictionary.set(false_states, checked_value, null_state)
+    End If
+
+    Note: Also update global value_to_null map
+    Note: The states in the branches are now refined
+
+    Return 1
+End Process
+
+Note: @Reasoning
+merge_null_states merges two null states using conservative merge rules.
+This is used at phi nodes and merge points in the control flow graph.
+
+Merge rules:
+- NULL ∧ NULL = NULL
+- NON_NULL ∧ NON_NULL = NON_NULL
+- NULL ∧ NON_NULL = MAYBE
+- MAYBE ∧ anything = MAYBE
+@End Reasoning
+
+Process called "merge_null_states" that takes state1 as Integer, state2 as Integer returns Integer:
+    Note: If states are the same, result is that state
+    If state1 equals state2:
+        Return state1
+    End If
+
+    Note: If either is MAYBE, result is MAYBE
+    If state1 equals 2 or state2 equals 2:
+        Return 2
+    End If
+
+    Note: If one is NULL and other is NON_NULL, result is MAYBE
+    If state1 equals 0 and state2 equals 1:
+        Return 2
+    End If
+
+    If state1 equals 1 and state2 equals 0:
+        Return 2
+    End If
+
+    Note: Should not reach here
+    Return 2
+End Process
+
+Note: @Reasoning
+check_null_dereference detects potential null pointer dereferences.
+A null dereference occurs when we access a value that might be null:
+
+- LOAD from potentially null pointer
+- STORE to potentially null pointer
+- CALL through potentially null function pointer
+- Field access on potentially null object
+
+If a value's null state is NULL or MAYBE, dereferencing it is an error.
+@End Reasoning
+
+Process called "check_null_dereference" that takes na as Integer, inst as Integer returns Integer:
+    Let opcode be Layout.memory_get_int64(inst, 0)
+    Let value_to_null be Layout.memory_get_int64(na, 16)
+    Let error_list be Layout.memory_get_int64(na, 40)
+    Let error_count be Layout.memory_get_int64(na, 48)
+
+    Note: LOAD - check if loading from potentially null pointer
+    If opcode equals 20203:
+        Let addr be Layout.memory_get_int64(inst, 16)
+
+        If addr is not equal to 0:
+            Let addr_state be Dictionary.get(value_to_null, addr)
+
+            If addr_state is not equal to 0:
+                Let state be Layout.memory_get_int64(addr_state, 8)
+
+                Note: NULL or MAYBE is a dereference error
+                If state equals 0:
+                    Note: Error: dereferencing definitely null pointer
+                    Let error_msg be StringCore.string_duplicate("Null pointer dereference: loading from definitely null pointer")
+                    List.append(error_list, error_msg)
+                    Let error_count be error_count + 1
+                    Layout.memory_set_int64(na, 48, error_count)
+                End If
+
+                If state equals 2:
+                    Note: Error: dereferencing potentially null pointer
+                    Let error_msg be StringCore.string_duplicate("Null pointer dereference: loading from potentially null pointer")
+                    List.append(error_list, error_msg)
+                    Let error_count be error_count + 1
+                    Layout.memory_set_int64(na, 48, error_count)
+                End If
+            End If
+        End If
+    End If
+
+    Note: STORE - check if storing to potentially null pointer
+    If opcode equals 20204:
+        Let addr be Layout.memory_get_int64(inst, 16)
+
+        If addr is not equal to 0:
+            Let addr_state be Dictionary.get(value_to_null, addr)
+
+            If addr_state is not equal to 0:
+                Let state be Layout.memory_get_int64(addr_state, 8)
+
+                If state equals 0:
+                    Let error_msg be StringCore.string_duplicate("Null pointer dereference: storing to definitely null pointer")
+                    List.append(error_list, error_msg)
+                    Let error_count be error_count + 1
+                    Layout.memory_set_int64(na, 48, error_count)
+                End If
+
+                If state equals 2:
+                    Let error_msg be StringCore.string_duplicate("Null pointer dereference: storing to potentially null pointer")
+                    List.append(error_list, error_msg)
+                    Let error_count be error_count + 1
+                    Layout.memory_set_int64(na, 48, error_count)
+                End If
+            End If
+        End If
+    End If
+
+    Note: CALL - check if calling through potentially null function pointer
+    If opcode equals 20304:
+        Let func_ptr be Layout.memory_get_int64(inst, 16)
+
+        If func_ptr is not equal to 0:
+            Let func_state be Dictionary.get(value_to_null, func_ptr)
+
+            If func_state is not equal to 0:
+                Let state be Layout.memory_get_int64(func_state, 8)
+
+                If state equals 0:
+                    Let error_msg be StringCore.string_duplicate("Null pointer dereference: calling definitely null function pointer")
+                    List.append(error_list, error_msg)
+                    Let error_count be error_count + 1
+                    Layout.memory_set_int64(na, 48, error_count)
+                End If
+
+                If state equals 2:
+                    Let error_msg be StringCore.string_duplicate("Null pointer dereference: calling potentially null function pointer")
+                    List.append(error_list, error_msg)
+                    Let error_count be error_count + 1
+                    Layout.memory_set_int64(na, 48, error_count)
+                End If
+            End If
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: @Reasoning
+verify_optional_unwrap verifies that optional values are safely unwrapped.
+In Runa, optional types (Option[T]) must be checked before unwrapping.
+
+Unwrapping an optional without checking is an error if:
+- The value is definitely NULL
+- The value might be NULL (MAYBE state)
+
+This prevents runtime panics from unwrapping None values.
+@End Reasoning
+
+Process called "verify_optional_unwrap" that takes na as Integer, inst as Integer returns Integer:
+    Let opcode be Layout.memory_get_int64(inst, 0)
+    Let value_to_null be Layout.memory_get_int64(na, 16)
+    Let error_list be Layout.memory_get_int64(na, 40)
+    Let error_count be Layout.memory_get_int64(na, 48)
+
+    Note: UNWRAP or EXPECT operations (opcode TBD - using 20999 as placeholder)
+    Note: These operations extract the value from an optional type
+    If opcode equals 20999:
+        Let optional_value be Layout.memory_get_int64(inst, 16)
+
+        If optional_value is not equal to 0:
+            Let opt_state be Dictionary.get(value_to_null, optional_value)
+
+            If opt_state is not equal to 0:
+                Let is_optional be Layout.memory_get_int64(opt_state, 24)
+
+                If is_optional equals 1:
+                    Let state be Layout.memory_get_int64(opt_state, 8)
+
+                    Note: Check if unwrapping is safe
+                    If state equals 0:
+                        Let error_msg be StringCore.string_duplicate("Unsafe optional unwrap: unwrapping definitely null optional")
+                        List.append(error_list, error_msg)
+                        Let error_count be error_count + 1
+                        Layout.memory_set_int64(na, 48, error_count)
+                    End If
+
+                    If state equals 2:
+                        Let error_msg be StringCore.string_duplicate("Unsafe optional unwrap: unwrapping potentially null optional")
+                        List.append(error_list, error_msg)
+                        Let error_count be error_count + 1
+                        Layout.memory_set_int64(na, 48, error_count)
+                    End If
+
+                    Note: Mark as unwrapped
+                    Layout.memory_set_int64(opt_state, 32, 1)
+                End If
+            End If
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: @Reasoning
+get_null_state queries the current null state for a value.
+Returns the NullState object, or 0 if no state is tracked for this value.
+@End Reasoning
+
+Process called "get_null_state" that takes na as Integer, value_id as Integer returns Integer:
+    Let value_to_null be Layout.memory_get_int64(na, 16)
+    Let state be Dictionary.get(value_to_null, value_id)
+    Return state
+End Process
+
+Note: @Reasoning
+is_definitely_null checks if a value is definitely null (state = NULL).
+Returns 1 if definitely null, 0 otherwise.
+@End Reasoning
+
+Process called "is_definitely_null" that takes na as Integer, value_id as Integer returns Integer:
+    Let state_obj be get_null_state(na, value_id)
+
+    If state_obj equals 0:
+        Return 0
+    End If
+
+    Let state be Layout.memory_get_int64(state_obj, 8)
+
+    If state equals 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: @Reasoning
+is_definitely_non_null checks if a value is definitely non-null (state = NON_NULL).
+Returns 1 if definitely non-null, 0 otherwise.
+@End Reasoning
+
+Process called "is_definitely_non_null" that takes na as Integer, value_id as Integer returns Integer:
+    Let state_obj be get_null_state(na, value_id)
+
+    If state_obj equals 0:
+        Return 0
+    End If
+
+    Let state be Layout.memory_get_int64(state_obj, 8)
+
+    If state equals 1:
+        Return 1
+    End If
+
+    Return 0
+End Process

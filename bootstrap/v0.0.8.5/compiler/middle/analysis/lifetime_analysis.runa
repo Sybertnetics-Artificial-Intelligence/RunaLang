@@ -33,6 +33,1185 @@ This file consists of the following functions/features/operation types:
 - Lifetime parameter inference for generic functions
 - Lifetime constraint generation from borrow operations
 - Lifetime subtyping and variance analysis
+
+Dependencies:
+- compiler/middle/gungnir/mir/mir.runa (MIR structures, instructions)
+- compiler/middle/gungnir/hir/hir.runa (HIR type info, scope information)
+- compiler/middle/analysis/control_flow.runa (CFG, dominance)
+- compiler/frontend/primitives/memory/layout.runa (OWNED HEAP allocation - Tier 3)
+- compiler/frontend/primitives/collections/list.runa (region lists)
+- compiler/frontend/primitives/collections/dictionary.runa (region mappings)
+- compiler/frontend/primitives/collections/set.runa (outlives sets)
+- compiler/frontend/primitives/core/string_core.runa (debug printing)
 :End Note
 
-Note: TODO - Implement lifetime analysis functionality
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/analysis/control_flow.runa" as CFG
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: LIFETIME CONSTRAINT TYPE CONSTANTS
+Note: ============================================================================
+
+Note: Constraint types for lifetime relationships
+Constant LIFETIME_OUTLIVES as Integer is 0      Note: 'a: 'b ('a outlives 'b)
+Constant LIFETIME_EQUAL as Integer is 1         Note: 'a = 'b (lifetimes equal)
+Constant LIFETIME_SUBSET as Integer is 2        Note: 'a ⊆ 'b (subset relationship)
+
+Note: Variance types for generic parameters
+Constant VARIANCE_COVARIANT as Integer is 0     Note: T<'a> → T<'b> if 'a: 'b
+Constant VARIANCE_CONTRAVARIANT as Integer is 1 Note: T<'a> → T<'b> if 'b: 'a
+Constant VARIANCE_INVARIANT as Integer is 2     Note: T<'a> ≠ T<'b> unless 'a = 'b
+Constant VARIANCE_BIVARIANT as Integer is 3     Note: T<'a> = T<'b> for all 'a, 'b
+
+Note: Special region IDs
+Constant REGION_STATIC as Integer is 0          Note: 'static lifetime (entire program)
+Constant REGION_ERROR as Integer is -1          Note: Error/unknown region
+
+Note: ============================================================================
+Note: LIFETIME ANALYSIS TYPE DEFINITIONS
+Note: ============================================================================
+
+@Reasoning
+LifetimeRegion represents a lexical scope or lifetime in the program.
+
+Lifetimes form a hierarchy based on scope nesting:
+- Function scope contains all local scopes
+- Block scope contains nested block scopes
+- Expression scopes are fine-grained
+
+Lifetime relationships:
+- Child regions are subsets of parent regions
+- 'static outlives all other regions
+- Regions can outlive each other based on control flow
+
+Fields:
+- region_id: Unique identifier for this region
+- region_name: Human-readable name (e.g., "'a", "'function", "'block_5")
+- parent_region: Parent region ID (enclosing scope)
+- start_point: Program point where region begins
+- end_point: Program point where region ends
+- nested_regions: List of child region IDs
+- outlives: Set of region IDs this region outlives
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 7 fields × 8 bytes = 56 bytes
+@End Reasoning
+
+Type called "LifetimeRegion":
+    region_id as Integer        Note: Unique region identifier
+    region_name as Integer      Note: Pointer to region name string
+    parent_region as Integer    Note: Pointer to parent region ID
+    start_point as Integer      Note: Program point where region begins
+    end_point as Integer        Note: Program point where region ends
+    nested_regions as Integer   Note: List of nested child region IDs
+    outlives as Integer         Note: Set of region IDs this region outlives
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40, 48
+
+@Reasoning
+LifetimeConstraint represents a relationship between two lifetime regions.
+
+Constraint types:
+1. OUTLIVES: 'a: 'b means 'a outlives 'b (lives at least as long)
+2. EQUAL: 'a = 'b means lifetimes are exactly the same
+3. SUBSET: 'a ⊆ 'b means 'a is a subset of 'b in scope
+
+Generated from:
+- Borrow operations: &'a T requires T: 'a
+- Function calls: Caller lifetime constraints
+- Return values: Return lifetime must outlive function
+- Assignments: Assignment unifies lifetimes
+
+Fields:
+- constraint_type: Type of constraint (OUTLIVES/EQUAL/SUBSET)
+- lhs_region: Left-hand side region ID
+- rhs_region: Right-hand side region ID
+- origin_location: Instruction that generated constraint
+- reason: Human-readable explanation
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 5 fields × 8 bytes = 40 bytes
+@End Reasoning
+
+Type called "LifetimeConstraint":
+    constraint_type as Integer  Note: Constraint type constant
+    lhs_region as Integer       Note: Left-hand side region ID
+    rhs_region as Integer       Note: Right-hand side region ID
+    origin_location as Integer  Note: Instruction causing constraint
+    reason as Integer           Note: Pointer to reason string
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32
+
+@Reasoning
+LifetimeInference tracks inferred lifetime information for values.
+
+Used for:
+- Function parameter lifetime inference
+- Return value lifetime inference
+- Generic lifetime parameter elision
+- Error reporting (which lifetimes need annotations)
+
+Variance determines how lifetimes interact with subtyping:
+- Covariant: T<'a> is subtype of T<'b> if 'a: 'b (e.g., &'a T)
+- Contravariant: T<'a> is subtype of T<'b> if 'b: 'a (e.g., fn(&'a T))
+- Invariant: T<'a> and T<'b> unrelated unless 'a = 'b (e.g., &'a mut T)
+- Bivariant: T<'a> and T<'b> always related (rare, mostly phantom data)
+
+Fields:
+- value_id: SSA value or variable being analyzed
+- inferred_region: Inferred lifetime region
+- borrow_region: Lifetime of borrow (if this is a reference)
+- constraint_list: List of constraints involving this value
+- is_parameter: Boolean: function parameter
+- is_return_value: Boolean: function return value
+- needs_explicit_lifetime: Boolean: requires user annotation
+- variance: Variance type for generic parameters
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 8 fields × 8 bytes = 64 bytes
+@End Reasoning
+
+Type called "LifetimeInference":
+    value_id as Integer             Note: SSA value ID or variable ID
+    inferred_region as Integer      Note: Inferred lifetime region
+    borrow_region as Integer        Note: Region of borrow (if reference)
+    constraint_list as Integer      Note: List of constraints on this value
+    is_parameter as Integer         Note: Boolean: function parameter
+    is_return_value as Integer      Note: Boolean: function return
+    needs_explicit_lifetime as Integer  Note: Boolean: requires annotation
+    variance as Integer             Note: Variance constant
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40, 48, 56
+
+@Reasoning
+LifetimeAnalysis is the main analysis state container.
+
+Contains:
+- All lifetime regions (scope hierarchy)
+- All lifetime constraints
+- Value-to-region mappings
+- Scope-to-region mappings
+- Inference information
+- Constraint graph for solving
+- Error list
+
+The analysis proceeds in phases:
+1. Region computation (from scopes and CFG)
+2. Constraint generation (from instructions)
+3. Constraint solving (fixed-point iteration)
+4. Inference (for generic functions)
+5. Verification (detect errors)
+
+Fields:
+- regions: Dictionary mapping region_id -> LifetimeRegion
+- constraints: List of LifetimeConstraint
+- value_to_region: Dictionary mapping value_id -> region_id
+- scope_to_region: Dictionary mapping scope_id -> region_id
+- next_region_id: Counter for unique region IDs
+- inference_map: Dictionary mapping value_id -> LifetimeInference
+- constraint_graph: Graph for constraint solving (adjacency list)
+- error_list: List of lifetime errors
+- cfg: Pointer to CFG for program point ordering
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 9 fields × 8 bytes = 72 bytes
+@End Reasoning
+
+Type called "LifetimeAnalysis":
+    regions as Integer              Note: Dictionary region_id -> LifetimeRegion
+    constraints as Integer          Note: List of LifetimeConstraint
+    value_to_region as Integer      Note: Dictionary value_id -> region_id
+    scope_to_region as Integer      Note: Dictionary scope_id -> region_id
+    next_region_id as Integer       Note: Counter for region IDs
+    inference_map as Integer        Note: Dictionary value_id -> LifetimeInference
+    constraint_graph as Integer     Note: Graph for constraint solving
+    error_list as Integer           Note: List of lifetime errors
+    cfg as Integer                  Note: Pointer to CFG
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40, 48, 56, 64
+
+Note: ============================================================================
+Note: LIFETIME REGION INITIALIZATION
+Note: ============================================================================
+
+@Reasoning
+Creates a LifetimeRegion representing a lexical scope or lifetime.
+
+Memory: Tier 3 (OWNED HEAP) - 56 bytes
+@End Reasoning
+
+Process called "create_lifetime_region" that takes region_id as Integer, region_name as Integer, parent_region as Integer returns Integer:
+    Note: Allocate LifetimeRegion structure (56 bytes)
+    Let region be Layout.allocate(56)
+    If region equals 0:
+        Display "create_lifetime_region: allocation failed"
+        Return 0
+    End If
+
+    Note: Set region ID and name
+    Layout.memory_set_int64(region, 0, region_id)
+    Layout.memory_set_int64(region, 8, region_name)
+
+    Note: Set parent region
+    Layout.memory_set_int64(region, 16, parent_region)
+
+    Note: Initialize program points (unknown initially)
+    Layout.memory_set_int64(region, 24, 0)  Note: start_point
+    Layout.memory_set_int64(region, 32, 0)  Note: end_point
+
+    Note: Create empty nested regions list
+    Let nested be List.create()
+    Layout.memory_set_int64(region, 40, nested)
+
+    Note: Create empty outlives set
+    Let outlives be Set.create()
+    Layout.memory_set_int64(region, 48, outlives)
+
+    Return region
+End Process
+
+@Reasoning
+Creates a LifetimeConstraint relating two regions.
+
+Memory: Tier 3 (OWNED HEAP) - 40 bytes
+@End Reasoning
+
+Process called "create_lifetime_constraint" that takes constraint_type as Integer, lhs_region as Integer, rhs_region as Integer, origin_location as Integer returns Integer:
+    Note: Allocate LifetimeConstraint structure (40 bytes)
+    Let constraint be Layout.allocate(40)
+    If constraint equals 0:
+        Display "create_lifetime_constraint: allocation failed"
+        Return 0
+    End If
+
+    Note: Set constraint type
+    Layout.memory_set_int64(constraint, 0, constraint_type)
+
+    Note: Set regions
+    Layout.memory_set_int64(constraint, 8, lhs_region)
+    Layout.memory_set_int64(constraint, 16, rhs_region)
+
+    Note: Set origin
+    Layout.memory_set_int64(constraint, 24, origin_location)
+
+    Note: Create reason string based on constraint type
+    Let reason be 0
+    If constraint_type equals 0:
+        Let reason be StringCore.from_c_string("lifetime outlives constraint")
+    Otherwise If constraint_type equals 1:
+        Let reason be StringCore.from_c_string("lifetime equality constraint")
+    Otherwise If constraint_type equals 2:
+        Let reason be StringCore.from_c_string("lifetime subset constraint")
+    End If
+    Layout.memory_set_int64(constraint, 32, reason)
+
+    Return constraint
+End Process
+
+@Reasoning
+Creates LifetimeInference for a value.
+
+Memory: Tier 3 (OWNED HEAP) - 64 bytes
+@End Reasoning
+
+Process called "create_lifetime_inference" that takes value_id as Integer returns Integer:
+    Note: Allocate LifetimeInference structure (64 bytes)
+    Let inference be Layout.allocate(64)
+    If inference equals 0:
+        Display "create_lifetime_inference: allocation failed"
+        Return 0
+    End If
+
+    Note: Set value ID
+    Layout.memory_set_int64(inference, 0, value_id)
+
+    Note: Initialize regions (unknown initially)
+    Layout.memory_set_int64(inference, 8, -1)   Note: inferred_region
+    Layout.memory_set_int64(inference, 16, -1)  Note: borrow_region
+
+    Note: Create empty constraint list
+    Let constraint_list be List.create()
+    Layout.memory_set_int64(inference, 24, constraint_list)
+
+    Note: Initialize flags
+    Layout.memory_set_int64(inference, 32, 0)  Note: is_parameter
+    Layout.memory_set_int64(inference, 40, 0)  Note: is_return_value
+    Layout.memory_set_int64(inference, 48, 0)  Note: needs_explicit_lifetime
+
+    Note: Default to covariant variance
+    Layout.memory_set_int64(inference, 56, 0)  Note: VARIANCE_COVARIANT
+
+    Return inference
+End Process
+
+@Reasoning
+Creates the main LifetimeAnalysis structure.
+
+Memory: Tier 3 (OWNED HEAP) - 72 bytes
+@End Reasoning
+
+Process called "create_lifetime_analysis" that takes cfg as Integer returns Integer:
+    Note: Allocate LifetimeAnalysis structure (72 bytes)
+    Let la be Layout.allocate(72)
+    If la equals 0:
+        Display "create_lifetime_analysis: allocation failed"
+        Return 0
+    End If
+
+    Note: Create regions dictionary
+    Let regions be Dictionary.create()
+    Layout.memory_set_int64(la, 0, regions)
+
+    Note: Create constraints list
+    Let constraints be List.create()
+    Layout.memory_set_int64(la, 8, constraints)
+
+    Note: Create value-to-region mapping
+    Let value_to_region be Dictionary.create()
+    Layout.memory_set_int64(la, 16, value_to_region)
+
+    Note: Create scope-to-region mapping
+    Let scope_to_region be Dictionary.create()
+    Layout.memory_set_int64(la, 24, scope_to_region)
+
+    Note: Initialize region counter (1 because 0 is 'static)
+    Layout.memory_set_int64(la, 32, 1)
+
+    Note: Create inference map
+    Let inference_map be Dictionary.create()
+    Layout.memory_set_int64(la, 40, inference_map)
+
+    Note: Create constraint graph
+    Let constraint_graph be Dictionary.create()
+    Layout.memory_set_int64(la, 48, constraint_graph)
+
+    Note: Create error list
+    Let error_list be List.create()
+    Layout.memory_set_int64(la, 56, error_list)
+
+    Note: Set CFG
+    Layout.memory_set_int64(la, 64, cfg)
+
+    Note: Create 'static region
+    Let static_name be StringCore.from_c_string("'static")
+    Let static_region be create_lifetime_region(0, static_name, -1)
+    Dictionary.set(regions, 0, static_region)
+
+    Return la
+End Process
+
+Note: ============================================================================
+Note: LIFETIME REGION COMPUTATION
+Note: ============================================================================
+
+@Reasoning
+Computes lifetime regions from CFG and scope information.
+
+Creates regions for:
+1. Function scope (entire function)
+2. Block scopes (each basic block)
+3. Expression scopes (fine-grained within blocks)
+
+Establishes parent-child relationships based on scope nesting.
+
+Returns: 1 if successful, 0 if error
+@End Reasoning
+
+Process called "compute_lifetime_regions" that takes la as Integer, mir_function as Integer returns Integer:
+    If la equals 0 or mir_function equals 0:
+        Display "compute_lifetime_regions: null inputs"
+        Return 0
+    End If
+
+    Note: Get CFG
+    Let cfg be Layout.memory_get_int64(la, 64)
+    If cfg equals 0:
+        Display "compute_lifetime_regions: no CFG"
+        Return 0
+    End If
+
+    Note: Get regions dictionary
+    Let regions be Layout.memory_get_int64(la, 0)
+    Let scope_to_region be Layout.memory_get_int64(la, 24)
+
+    Note: Get next region ID
+    Let next_id be Layout.memory_get_int64(la, 32)
+
+    Note: Create function scope region
+    Let func_name_ptr be Layout.memory_get_int64(mir_function, 0)
+    Let func_region_name be StringCore.from_c_string("'function")
+    Let func_region be create_lifetime_region(next_id, func_region_name, 0)
+    Dictionary.set(regions, next_id, func_region)
+    Let func_region_id be next_id
+    Let next_id be next_id + 1
+
+    Note: Get blocks from CFG
+    Let mir_cfg be Layout.memory_get_int64(mir_function, 8)
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Note: Create region for each basic block
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Note: Create block region name
+        Let block_name be StringCore.from_c_string("'block")
+
+        Note: Create block region (parent is function region)
+        Let block_region be create_lifetime_region(next_id, block_name, func_region_id)
+        Dictionary.set(regions, next_id, block_region)
+
+        Note: Map block_id to region_id
+        Dictionary.set(scope_to_region, block_id, next_id)
+
+        Note: Add to function region's nested regions
+        Let func_nested be Layout.memory_get_int64(func_region, 40)
+        List.append(func_nested, next_id)
+
+        Let next_id be next_id + 1
+        Let b be b + 1
+    End While
+
+    Note: Update next region ID
+    Layout.memory_set_int64(la, 32, next_id)
+
+    Note: Compute outlives relationships based on dominance
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let block_id be Layout.memory_get_int64(block, 0)
+        Let dominator_id be Layout.memory_get_int64(block, 64)
+
+        Note: If block has dominator, dominator region outlives block region
+        If dominator_id is not equal to -1:
+            Let block_region_id be Dictionary.get(scope_to_region, block_id)
+            Let dom_region_id be Dictionary.get(scope_to_region, dominator_id)
+
+            If block_region_id is not equal to 0 and dom_region_id is not equal to 0:
+                Note: Add outlives relationship
+                Let dom_region be Dictionary.get(regions, dom_region_id)
+                Let outlives_set be Layout.memory_get_int64(dom_region, 48)
+                Set.add(outlives_set, block_region_id)
+            End If
+        End If
+
+        Let b be b + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LIFETIME CONSTRAINT GENERATION
+Note: ============================================================================
+
+@Reasoning
+Generates lifetime constraints from MIR instructions.
+
+Generates constraints for:
+1. Borrow operations: &'a T requires T: 'a
+2. Function calls: Argument lifetimes vs parameter lifetimes
+3. Return values: Return lifetime must outlive call
+4. Assignments: Unify lifetimes
+5. Field access: Struct lifetime outlives field lifetime
+
+Returns: 1 if successful, 0 if error
+@End Reasoning
+
+Process called "generate_lifetime_constraints" that takes la as Integer, mir_function as Integer returns Integer:
+    If la equals 0 or mir_function equals 0:
+        Display "generate_lifetime_constraints: null inputs"
+        Return 0
+    End If
+
+    Note: Get CFG and blocks
+    Let mir_cfg be Layout.memory_get_int64(mir_function, 8)
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Note: Get analysis structures
+    Let constraints be Layout.memory_get_int64(la, 8)
+    Let value_to_region be Layout.memory_get_int64(la, 16)
+    Let scope_to_region be Layout.memory_get_int64(la, 24)
+
+    Note: Scan all instructions for lifetime-relevant operations
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let block_id be Layout.memory_get_int64(block, 0)
+        Let block_region_id be Dictionary.get(scope_to_region, block_id)
+
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be Layout.memory_get_int64(block, 24)
+
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(instructions, i)
+            Let opcode be Layout.memory_get_int64(inst, 0)
+
+            Note: ADDRESS_OF instruction creates borrow
+            If opcode equals 20205:
+                Note: Get operand (borrowed value)
+                Let operand1 be Layout.memory_get_int64(inst, 16)
+                Let value_id be Layout.memory_get_int64(inst, 8)
+
+                Note: Borrow lifetime must not outlive borrowed value lifetime
+                Note: Create constraint: borrowed_value: 'borrow
+                Let constraint be create_lifetime_constraint(0, operand1, value_id, inst)
+                List.append(constraints, constraint)
+
+                Note: Map borrow to block region
+                Dictionary.set(value_to_region, value_id, block_region_id)
+            End If
+
+            Note: LOAD instruction (potential borrow use)
+            If opcode equals 20200:
+                Let ptr be Layout.memory_get_int64(inst, 16)
+                Let value_id be Layout.memory_get_int64(inst, 8)
+
+                Note: Load from pointer requires pointer lifetime
+                Note: Create constraint: ptr: 'load
+                Let constraint be create_lifetime_constraint(0, ptr, value_id, inst)
+                List.append(constraints, constraint)
+
+                Dictionary.set(value_to_region, value_id, block_region_id)
+            End If
+
+            Note: STORE instruction (potential borrow use)
+            If opcode equals 20201:
+                Let ptr be Layout.memory_get_int64(inst, 16)
+                Let value be Layout.memory_get_int64(inst, 24)
+
+                Note: Storing requires pointer and value lifetimes compatible
+                Note: Create constraint: ptr: 'store AND value: 'store
+                Let constraint1 be create_lifetime_constraint(0, ptr, value, inst)
+                List.append(constraints, constraint1)
+            End If
+
+            Note: RETURN instruction
+            If opcode equals 20303:
+                Let operand1 be Layout.memory_get_int64(inst, 16)
+                If operand1 is not equal to 0:
+                    Note: Returned value lifetime must outlive function
+                    Note: Create constraint: return_value: 'function
+                    Note: Function region is always region 1
+                    Let constraint be create_lifetime_constraint(0, operand1, 1, inst)
+                    List.append(constraints, constraint)
+                End If
+            End If
+
+            Note: CALL instruction
+            If opcode equals 20304:
+                Note: For function calls, we need to ensure argument lifetimes
+                Note: match parameter lifetime requirements
+                Note: This requires inter-procedural analysis
+
+                Note: Get call result value (if any)
+                Let result_value_id be Layout.memory_get_int64(inst, 8)
+                If result_value_id is not equal to 0:
+                    Dictionary.set(value_to_region, result_value_id, block_region_id)
+                End If
+
+                Note: Process arguments - they must outlive the call site
+                Note: Arguments are at operand2 (offset 24) and operand3 (offset 32)
+                Let arg1 be Layout.memory_get_int64(inst, 24)
+                If arg1 is not equal to 0:
+                    Note: Get argument's region
+                    Let arg1_region be Dictionary.get(value_to_region, arg1)
+                    If arg1_region equals 0:
+                        Let arg1_region be block_region_id
+                        Dictionary.set(value_to_region, arg1, arg1_region)
+                    End If
+
+                    Note: Create constraint: arg_region must outlive call_region
+                    Note: This ensures argument lives long enough for the call
+                    Let constraint be create_lifetime_constraint(0, arg1_region, block_region_id, inst)
+                    List.append(constraints, constraint)
+                End If
+
+                Let arg2 be Layout.memory_get_int64(inst, 32)
+                If arg2 is not equal to 0:
+                    Let arg2_region be Dictionary.get(value_to_region, arg2)
+                    If arg2_region equals 0:
+                        Let arg2_region be block_region_id
+                        Dictionary.set(value_to_region, arg2, arg2_region)
+                    End If
+
+                    Let constraint be create_lifetime_constraint(0, arg2_region, block_region_id, inst)
+                    List.append(constraints, constraint)
+                End If
+
+                Note: Return value lifetime handling for function calls
+                Note: If the call returns a reference, the result lifetime is bounded
+                Note: by the argument lifetimes (for methods like iter(), as_ref(), etc.)
+                Note: Full inter-procedural analysis would examine function signatures to determine
+                Note: which arguments influence the return lifetime (lifetime elision rules)
+                Note: Conservative approach: assign return value to call-site lifetime region
+                Note: This ensures soundness - the return value cannot outlive the call site
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LIFETIME CONSTRAINT SOLVING
+Note: ============================================================================
+
+@Reasoning
+Solves lifetime constraints using fixed-point iteration.
+
+Algorithm:
+1. Initialize worklist with all constraints
+2. Process each constraint:
+   - OUTLIVES: Add transitive outlives relationships
+   - EQUAL: Unify regions
+   - SUBSET: Add subset relationships
+3. Propagate changes transitively
+4. Iterate until fixed point (no changes)
+5. Detect cycles (errors)
+
+Returns: 1 if successful, 0 if errors found
+@End Reasoning
+
+Process called "solve_lifetime_constraints" that takes la as Integer returns Integer:
+    If la equals 0:
+        Display "solve_lifetime_constraints: null analysis"
+        Return 0
+    End If
+
+    Note: Get constraints and regions
+    Let constraints be Layout.memory_get_int64(la, 8)
+    Let regions be Layout.memory_get_int64(la, 0)
+    Let error_list be Layout.memory_get_int64(la, 56)
+
+    Let constraint_count be List.length(constraints)
+
+    Note: Fixed-point iteration
+    Let changed be 1
+    Let iteration be 0
+    Let max_iterations be 1000
+
+    While changed equals 1 and iteration is less than max_iterations:
+        Let changed be 0
+        Let iteration be iteration + 1
+
+        Note: Process each constraint
+        Let c be 0
+        While c is less than constraint_count:
+            Let constraint be List.get(constraints, c)
+
+            Let constraint_type be Layout.memory_get_int64(constraint, 0)
+            Let lhs_region_id be Layout.memory_get_int64(constraint, 8)
+            Let rhs_region_id be Layout.memory_get_int64(constraint, 16)
+
+            Note: Get regions
+            Let lhs_region be Dictionary.get(regions, lhs_region_id)
+            Let rhs_region be Dictionary.get(regions, rhs_region_id)
+
+            If lhs_region equals 0 or rhs_region equals 0:
+                Note: Skip invalid regions
+                Let c be c + 1
+                Continue
+            End If
+
+            Note: OUTLIVES constraint: 'a: 'b
+            If constraint_type equals 0:
+                Note: Add rhs to lhs's outlives set
+                Let lhs_outlives be Layout.memory_get_int64(lhs_region, 48)
+                Let already_present be Set.contains(lhs_outlives, rhs_region_id)
+
+                If already_present equals 0:
+                    Set.add(lhs_outlives, rhs_region_id)
+                    Let changed be 1
+
+                    Note: Transitive closure: if 'a: 'b and 'b: 'c, then 'a: 'c
+                    Let rhs_outlives be Layout.memory_get_int64(rhs_region, 48)
+                    Let rhs_outlives_list be Set.to_list(rhs_outlives)
+                    Let rhs_count be List.length(rhs_outlives_list)
+
+                    Let j be 0
+                    While j is less than rhs_count:
+                        Let transitive_region_id be List.get(rhs_outlives_list, j)
+                        Let trans_present be Set.contains(lhs_outlives, transitive_region_id)
+                        If trans_present equals 0:
+                            Set.add(lhs_outlives, transitive_region_id)
+                        End If
+                        Let j be j + 1
+                    End While
+                End If
+            End If
+
+            Note: EQUAL constraint: 'a = 'b
+            If constraint_type equals 1:
+                Note: Both must outlive each other (symmetric)
+                Let lhs_outlives be Layout.memory_get_int64(lhs_region, 48)
+                Let rhs_outlives be Layout.memory_get_int64(rhs_region, 48)
+
+                Let lhs_has_rhs be Set.contains(lhs_outlives, rhs_region_id)
+                Let rhs_has_lhs be Set.contains(rhs_outlives, lhs_region_id)
+
+                If lhs_has_rhs equals 0:
+                    Set.add(lhs_outlives, rhs_region_id)
+                    Let changed be 1
+                End If
+
+                If rhs_has_lhs equals 0:
+                    Set.add(rhs_outlives, lhs_region_id)
+                    Let changed be 1
+                End If
+            End If
+
+            Note: SUBSET constraint: 'a ⊆ 'b
+            If constraint_type equals 2:
+                Note: All elements in 'a are also in 'b
+                Note: This is similar to outlives but stricter
+                Let lhs_outlives be Layout.memory_get_int64(lhs_region, 48)
+                Let already_present be Set.contains(lhs_outlives, rhs_region_id)
+
+                If already_present equals 0:
+                    Set.add(lhs_outlives, rhs_region_id)
+                    Let changed be 1
+                End If
+            End If
+
+            Let c be c + 1
+        End While
+    End While
+
+    Note: Check for maximum iterations (potential cycle)
+    If iteration equals max_iterations:
+        Display "solve_lifetime_constraints: maximum iterations reached (cycle?)"
+        Let error_msg be StringCore.from_c_string("Lifetime constraint cycle detected")
+        List.append(error_list, error_msg)
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LIFETIME QUERIES AND VERIFICATION
+Note: ============================================================================
+
+@Reasoning
+Checks if one lifetime outlives another.
+
+Returns: 1 if lhs_region outlives rhs_region, 0 otherwise
+@End Reasoning
+
+Process called "check_lifetime_outlives" that takes la as Integer, lhs_region_id as Integer, rhs_region_id as Integer returns Integer:
+    If la equals 0:
+        Return 0
+    End If
+
+    Note: Same region always outlives itself
+    If lhs_region_id equals rhs_region_id:
+        Return 1
+    End If
+
+    Note: 'static outlives everything
+    If lhs_region_id equals 0:
+        Return 1
+    End If
+
+    Note: Get regions
+    Let regions be Layout.memory_get_int64(la, 0)
+    Let lhs_region be Dictionary.get(regions, lhs_region_id)
+
+    If lhs_region equals 0:
+        Return 0
+    End If
+
+    Note: Check outlives set
+    Let outlives_set be Layout.memory_get_int64(lhs_region, 48)
+    Let outlives be Set.contains(outlives_set, rhs_region_id)
+
+    Return outlives
+End Process
+
+@Reasoning
+Infers lifetime parameters for generic functions.
+
+For each parameter and return value, determines:
+1. What lifetime region it belongs to
+2. Whether explicit lifetime annotation needed
+3. Variance of lifetime parameters
+
+Returns: 1 if successful
+@End Reasoning
+
+Process called "infer_function_lifetimes" that takes la as Integer, mir_function as Integer returns Integer:
+    If la equals 0 or mir_function equals 0:
+        Return 0
+    End If
+
+    Note: Get parameters
+    Let parameters be Layout.memory_get_int64(mir_function, 16)
+    Let param_count be Layout.memory_get_int64(mir_function, 24)
+
+    Note: Get inference map
+    Let inference_map be Layout.memory_get_int64(la, 40)
+    Let value_to_region be Layout.memory_get_int64(la, 16)
+
+    Note: Create inference for each parameter
+    Let p be 0
+    While p is less than param_count:
+        Let param_value_id be List.get(parameters, p)
+
+        Note: Create inference
+        Let inference be create_lifetime_inference(param_value_id)
+        Layout.memory_set_int64(inference, 32, 1)  Note: is_parameter = true
+
+        Note: Get region for this parameter
+        Let param_region_id be Dictionary.get(value_to_region, param_value_id)
+        Layout.memory_set_int64(inference, 8, param_region_id)
+
+        Note: Store inference
+        Dictionary.set(inference_map, param_value_id, inference)
+
+        Let p be p + 1
+    End While
+
+    Note: Check if explicit lifetime annotations needed
+    Note: If multiple parameters with different lifetimes, and return uses both,
+    Note: explicit annotations are required
+    If param_count is greater than 1:
+        Note: Check which parameters the return value depends on
+        Let ret_inference be Dictionary.get(inference_map, ret_value_id)
+        If ret_inference is not equal to 0:
+            Let ret_lifetime be Layout.memory_get_int64(ret_inference, 16)
+
+            Note: Count how many parameters share lifetime with return
+            Let params_used be 0
+            Let p be 0
+            While p is less than param_count:
+                Let param_value_id be List.get(parameters, p)
+                Let param_inference be Dictionary.get(inference_map, param_value_id)
+                If param_inference is not equal to 0:
+                    Let param_lifetime be Layout.memory_get_int64(param_inference, 16)
+                    If param_lifetime equals ret_lifetime:
+                        Let params_used be params_used + 1
+                    End If
+                End If
+                Let p be p + 1
+            End While
+
+            Note: If return uses multiple parameters, explicit annotations needed
+            If params_used is greater than 1:
+                Let p be 0
+                While p is less than param_count:
+                    Let param_value_id be List.get(parameters, p)
+                    Let inference be Dictionary.get(inference_map, param_value_id)
+                    Layout.memory_set_int64(inference, 48, 1)  Note: needs_explicit_lifetime
+                    Let p be p + 1
+                End While
+            End If
+        End If
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+Computes variance for generic lifetime parameters.
+
+Variance rules:
+- &'a T: Covariant in 'a (if 'a: 'b then &'a T <: &'b T)
+- &'a mut T: Invariant in 'a (no subtyping)
+- fn(&'a T): Contravariant in 'a (reverses subtyping)
+
+Returns: Variance constant (VARIANCE_*)
+@End Reasoning
+
+Process called "compute_lifetime_variance" that takes la as Integer, type_info as Integer returns Integer:
+    If la equals 0 or type_info equals 0:
+        Return 0  Note: VARIANCE_COVARIANT (default)
+    End If
+
+    Note: Get type kind
+    Let type_kind be Layout.memory_get_int64(type_info, 0)
+    Let is_mutable be Layout.memory_get_int64(type_info, 48)
+
+    Note: HIR_REFERENCE_TYPE (13011)
+    If type_kind equals 13011:
+        Note: &mut T is invariant, &T is covariant
+        If is_mutable equals 1:
+            Return 2  Note: VARIANCE_INVARIANT
+        Otherwise:
+            Return 0  Note: VARIANCE_COVARIANT
+        End If
+    End If
+
+    Note: HIR_FUNCTION_TYPE (13004)
+    If type_kind equals 13004:
+        Note: Function arguments are contravariant
+        Return 1  Note: VARIANCE_CONTRAVARIANT
+    End If
+
+    Note: Default to covariant
+    Return 0
+End Process
+
+@Reasoning
+Detects dangling reference errors (use-after-free).
+
+Checks that all borrows don't outlive their borrowed values.
+
+Returns: Number of errors found
+@End Reasoning
+
+Process called "detect_dangling_references" that takes la as Integer returns Integer:
+    If la equals 0:
+        Return 0
+    End If
+
+    Let error_count be 0
+
+    Note: Get value to region mapping
+    Let value_to_region be Layout.memory_get_int64(la, 16)
+    Let constraints be Layout.memory_get_int64(la, 8)
+    Let error_list be Layout.memory_get_int64(la, 56)
+
+    Let constraint_count be List.length(constraints)
+
+    Note: Check each OUTLIVES constraint
+    Let c be 0
+    While c is less than constraint_count:
+        Let constraint be List.get(constraints, c)
+        Let constraint_type be Layout.memory_get_int64(constraint, 0)
+
+        Note: Only check OUTLIVES constraints
+        If constraint_type equals 0:
+            Let lhs_region_id be Layout.memory_get_int64(constraint, 8)
+            Let rhs_region_id be Layout.memory_get_int64(constraint, 16)
+
+            Note: Check if constraint is satisfied
+            Let satisfied be check_lifetime_outlives(la, lhs_region_id, rhs_region_id)
+
+            If satisfied equals 0:
+                Note: Constraint violated - potential dangling reference
+                Let origin be Layout.memory_get_int64(constraint, 24)
+                Let error_msg be StringCore.from_c_string("Dangling reference: borrowed value does not live long enough")
+                List.append(error_list, error_msg)
+                Let error_count be error_count + 1
+            End If
+        End If
+
+        Let c be c + 1
+    End While
+
+    Return error_count
+End Process
+
+@Reasoning
+Verifies overall soundness of lifetime analysis.
+
+Checks:
+1. All regions have valid parent relationships
+2. No cycles in outlives graph
+3. All constraints are satisfied
+4. All borrows are valid
+
+Returns: 1 if sound, 0 if errors
+@End Reasoning
+
+Process called "verify_lifetime_soundness" that takes la as Integer returns Integer:
+    If la equals 0:
+        Return 0
+    End If
+
+    Display "=== Verifying Lifetime Analysis Soundness ==="
+
+    Note: Check for dangling references
+    Let dangling_count be detect_dangling_references(la)
+    If dangling_count is greater than 0:
+        Display "Found dangling references: "
+        Display dangling_count
+        Return 0
+    End If
+
+    Note: Verify region hierarchy (no cycles)
+    Let regions be Layout.memory_get_int64(la, 0)
+    Let region_keys be Dictionary.keys(regions)
+    Let region_count be List.length(region_keys)
+
+    Let r be 0
+    While r is less than region_count:
+        Let region_id be List.get(region_keys, r)
+        Let region be Dictionary.get(regions, region_id)
+
+        Note: Check for cycles by following parent chain
+        Let visited be Set.create()
+        Let current_id be region_id
+        Let cycle_detected be 0
+
+        While current_id is not equal to -1:
+            Let already_visited be Set.contains(visited, current_id)
+            If already_visited equals 1:
+                Let cycle_detected be 1
+                Break
+            End If
+
+            Set.add(visited, current_id)
+
+            Let current_region be Dictionary.get(regions, current_id)
+            If current_region equals 0:
+                Break
+            End If
+
+            Let current_id be Layout.memory_get_int64(current_region, 16)
+        End While
+
+        If cycle_detected equals 1:
+            Display "Cycle detected in region hierarchy at region: "
+            Display region_id
+            Return 0
+        End If
+
+        Let r be r + 1
+    End While
+
+    Display "Lifetime analysis is sound"
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DEBUG AND PRINTING
+Note: ============================================================================
+
+@Reasoning
+Prints lifetime analysis results for debugging.
+
+Displays:
+- All lifetime regions and their relationships
+- All lifetime constraints
+- Inference results
+- Any errors found
+@End Reasoning
+
+Process called "print_lifetime_analysis" that takes la as Integer returns Integer:
+    If la equals 0:
+        Display "print_lifetime_analysis: null analysis"
+        Return 0
+    End If
+
+    Display "=== Lifetime Analysis Results ==="
+
+    Note: Print regions
+    Display ""
+    Display "Lifetime Regions:"
+
+    Let regions be Layout.memory_get_int64(la, 0)
+    Let region_keys be Dictionary.keys(regions)
+    Let region_count be List.length(region_keys)
+
+    Let r be 0
+    While r is less than region_count:
+        Let region_id be List.get(region_keys, r)
+        Let region be Dictionary.get(regions, region_id)
+
+        Display "  Region "
+        Display region_id
+        Display ": "
+
+        Let region_name be Layout.memory_get_int64(region, 8)
+        Display region_name
+
+        Let parent_id be Layout.memory_get_int64(region, 16)
+        If parent_id is not equal to -1:
+            Display " (parent: "
+            Display parent_id
+            Display ")"
+        End If
+
+        Note: Print outlives relationships
+        Let outlives_set be Layout.memory_get_int64(region, 48)
+        Let outlives_list be Set.to_list(outlives_set)
+        Let outlives_count be List.length(outlives_list)
+
+        If outlives_count is greater than 0:
+            Display "    Outlives: "
+            Let o be 0
+            While o is less than outlives_count:
+                Let outlived_id be List.get(outlives_list, o)
+                Display outlived_id
+                Display " "
+                Let o be o + 1
+            End While
+        End If
+
+        Let r be r + 1
+    End While
+
+    Note: Print constraints
+    Display ""
+    Display "Lifetime Constraints:"
+
+    Let constraints be Layout.memory_get_int64(la, 8)
+    Let constraint_count be List.length(constraints)
+
+    Let c be 0
+    While c is less than constraint_count:
+        Let constraint be List.get(constraints, c)
+
+        Let constraint_type be Layout.memory_get_int64(constraint, 0)
+        Let lhs_id be Layout.memory_get_int64(constraint, 8)
+        Let rhs_id be Layout.memory_get_int64(constraint, 16)
+
+        Display "  '"
+        Display lhs_id
+
+        If constraint_type equals 0:
+            Display ": '"
+        Otherwise If constraint_type equals 1:
+            Display " = '"
+        Otherwise If constraint_type equals 2:
+            Display " ⊆ '"
+        End If
+
+        Display rhs_id
+
+        Let c be c + 1
+    End While
+
+    Note: Print errors
+    Let error_list be Layout.memory_get_int64(la, 56)
+    Let error_count be List.length(error_list)
+
+    If error_count is greater than 0:
+        Display ""
+        Display "Lifetime Errors: "
+        Display error_count
+
+        Let e be 0
+        While e is less than error_count:
+            Let error_msg be List.get(error_list, e)
+            Display "  - "
+            Display error_msg
+            Let e be e + 1
+        End While
+    Otherwise:
+        Display ""
+        Display "No lifetime errors detected"
+    End If
+
+    Return 1
+End Process

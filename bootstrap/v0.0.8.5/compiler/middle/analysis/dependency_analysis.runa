@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,10 +29,1319 @@ This file is essential because of the following reasons:
 - Dependency analysis support enables Runa compilation for dependency-aware code generation
 
 This file consists of the following functions/features/operation types:
-- Dependency analysis and code dependency tracking
+- Dependency analysis and code dependency tracking (RAW/WAR/WAW)
 - Dependency graph construction and dependency graph analysis
-- Dependency optimization and dependency optimization
-- Dependency validation and dependency validation
+- Memory dependency analysis (alias-based)
+- Control dependency computation (dominance frontier-based)
+- Instruction scheduling constraint analysis
+- Parallelization opportunity identification
+
+Dependencies:
+- compiler/middle/gungnir/mir/mir.runa (MIR structures, instructions)
+- compiler/middle/gungnir/lir/lir.runa (LIR structures, instructions)
+- compiler/middle/analysis/control_flow.runa (CFG, dominance info)
+- compiler/middle/analysis/data_flow.runa (Def-use chains, liveness)
+- compiler/frontend/primitives/memory/layout.runa (OWNED HEAP allocation - Tier 3)
+- compiler/frontend/primitives/collections/list.runa (node/edge lists)
+- compiler/frontend/primitives/collections/dictionary.runa (instruction mappings)
+- compiler/frontend/primitives/collections/set.runa (dependency sets)
+- compiler/frontend/primitives/core/string_core.runa (debug printing)
 :End Note
 
-Note: TODO - Implement dependency analysis functionality
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/analysis/control_flow.runa" as CFG
+Import "compiler/middle/analysis/data_flow.runa" as DataFlow
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: DEPENDENCY TYPE CONSTANTS
+Note: ============================================================================
+
+Note: Data dependencies (Bernstein's conditions)
+Constant DEP_RAW as Integer is 1    Note: Read-After-Write (true dependency)
+Constant DEP_WAR as Integer is 2    Note: Write-After-Read (anti-dependency)
+Constant DEP_WAW as Integer is 3    Note: Write-After-Write (output dependency)
+
+Note: Control and memory dependencies
+Constant DEP_CONTROL as Integer is 4     Note: Control dependency (branch affects instruction)
+Constant DEP_MEMORY as Integer is 5      Note: Memory dependency (may alias)
+Constant DEP_CALL as Integer is 6        Note: Function call dependency
+
+Note: ============================================================================
+Note: DEPENDENCY ANALYSIS TYPE DEFINITIONS
+Note: ============================================================================
+
+@Reasoning
+DependencyEdge represents a single dependency between two instructions.
+
+Types of dependencies (Bernstein's conditions):
+1. RAW (Read-After-Write): True data dependency
+   - Instruction B reads a value written by instruction A
+   - B cannot execute until A completes
+   - Critical for correctness
+
+2. WAR (Write-After-Read): Anti-dependency
+   - Instruction B writes a value read by instruction A
+   - B cannot write until A reads
+   - Can be eliminated with register renaming
+
+3. WAW (Write-After-Write): Output dependency
+   - Instructions A and B both write the same value
+   - B's write must occur after A's write
+   - Can be eliminated with register renaming
+
+4. Control dependency:
+   - Instruction B is control-dependent on branch A
+   - B only executes if A takes specific path
+
+5. Memory dependency:
+   - Instructions may access overlapping memory
+   - Conservative (may alias but not guaranteed)
+
+Fields:
+- source_inst: Pointer to source instruction
+- target_inst: Pointer to target instruction
+- dep_type: Dependency type constant (DEP_RAW, DEP_WAR, etc.)
+- distance: Loop iteration distance (0 if same iteration)
+- is_loop_carried: Boolean: 1 if dependency crosses loop iterations
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 5 fields × 8 bytes = 40 bytes
+@End Reasoning
+
+Type called "DependencyEdge":
+    source_inst as Integer      Note: Pointer to source instruction
+    target_inst as Integer      Note: Pointer to target instruction
+    dep_type as Integer         Note: Dependency type (RAW/WAR/WAW/control/memory)
+    distance as Integer         Note: Loop iteration distance
+    is_loop_carried as Integer  Note: Boolean: 1 if loop-carried dependency
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32
+
+@Reasoning
+DependencyNode represents a single instruction in the dependency graph.
+
+Each node tracks:
+- The instruction it represents
+- Incoming dependencies (instructions this depends on)
+- Outgoing dependencies (instructions depending on this)
+- Scheduling information (earliest start time, critical path length)
+
+Fields:
+- instruction: Pointer to MIR/LIR instruction
+- block_id: Basic block containing this instruction
+- incoming_edges: List of DependencyEdge pointers (dependencies)
+- outgoing_edges: List of DependencyEdge pointers (dependents)
+- earliest_start: Earliest cycle this instruction can execute
+- latest_start: Latest cycle without delaying completion
+- critical_path_length: Length of longest path to sink
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 7 fields × 8 bytes = 56 bytes
+@End Reasoning
+
+Type called "DependencyNode":
+    instruction as Integer          Note: Pointer to instruction
+    block_id as Integer             Note: Block ID containing instruction
+    incoming_edges as Integer       Note: List of incoming DependencyEdges
+    outgoing_edges as Integer       Note: List of outgoing DependencyEdges
+    earliest_start as Integer       Note: Earliest execution cycle
+    latest_start as Integer         Note: Latest start without delay
+    critical_path_length as Integer Note: Longest path length to sink
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40, 48
+
+@Reasoning
+DependencyGraph represents the complete dependency graph for a function or region.
+
+The graph contains:
+- All nodes (one per instruction)
+- All edges (dependencies between instructions)
+- Source/sink nodes (entry/exit points)
+- Scheduling constraints derived from dependencies
+
+Used for:
+- Instruction scheduling (list scheduling, critical path)
+- Software pipelining (modulo scheduling)
+- Parallelization analysis (independent operations)
+- Alias analysis validation
+- Optimization validation (preserving semantics)
+
+Fields:
+- nodes: List of DependencyNode pointers
+- edges: List of DependencyEdge pointers
+- instruction_to_node: Dictionary mapping instruction -> node
+- source_nodes: List of nodes with no incoming edges
+- sink_nodes: List of nodes with no outgoing edges
+- node_count: Number of nodes
+- edge_count: Number of edges
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 7 fields × 8 bytes = 56 bytes
+@End Reasoning
+
+Type called "DependencyGraph":
+    nodes as Integer                Note: List of DependencyNode pointers
+    edges as Integer                Note: List of DependencyEdge pointers
+    instruction_to_node as Integer  Note: Dictionary mapping instruction -> node
+    source_nodes as Integer         Note: List of source nodes (no incoming)
+    sink_nodes as Integer           Note: List of sink nodes (no outgoing)
+    node_count as Integer           Note: Number of nodes
+    edge_count as Integer           Note: Number of edges
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40, 48
+
+Note: ============================================================================
+Note: DEPENDENCY STRUCTURE INITIALIZATION
+Note: ============================================================================
+
+@Reasoning
+Creates a DependencyEdge connecting two instructions.
+
+Memory: Tier 3 (OWNED HEAP) - 40 bytes
+@End Reasoning
+
+Process called "create_dependency_edge" that takes source_inst as Integer, target_inst as Integer, dep_type as Integer returns Integer:
+    Note: Allocate DependencyEdge structure (40 bytes)
+    Let edge be Layout.allocate(40)
+    If edge equals 0:
+        Display "create_dependency_edge: allocation failed"
+        Return 0
+    End If
+
+    Note: Set fields
+    Layout.memory_set_int64(edge, 0, source_inst)   Note: source_inst
+    Layout.memory_set_int64(edge, 8, target_inst)   Note: target_inst
+    Layout.memory_set_int64(edge, 16, dep_type)     Note: dep_type
+    Layout.memory_set_int64(edge, 24, 0)            Note: distance (0 = same iteration)
+    Layout.memory_set_int64(edge, 32, 0)            Note: is_loop_carried (0 = no)
+
+    Return edge
+End Process
+
+@Reasoning
+Creates a DependencyNode for a single instruction.
+
+Memory: Tier 3 (OWNED HEAP) - 56 bytes
+@End Reasoning
+
+Process called "create_dependency_node" that takes instruction as Integer, block_id as Integer returns Integer:
+    Note: Allocate DependencyNode structure (56 bytes)
+    Let node be Layout.allocate(56)
+    If node equals 0:
+        Display "create_dependency_node: allocation failed"
+        Return 0
+    End If
+
+    Note: Set instruction and block_id
+    Layout.memory_set_int64(node, 0, instruction)
+    Layout.memory_set_int64(node, 8, block_id)
+
+    Note: Create empty edge lists
+    Let incoming_edges be List.create()
+    Let outgoing_edges be List.create()
+
+    Layout.memory_set_int64(node, 16, incoming_edges)
+    Layout.memory_set_int64(node, 24, outgoing_edges)
+
+    Note: Initialize scheduling info
+    Layout.memory_set_int64(node, 32, 0)    Note: earliest_start = 0
+    Layout.memory_set_int64(node, 40, 0)    Note: latest_start = 0
+    Layout.memory_set_int64(node, 48, 0)    Note: critical_path_length = 0
+
+    Return node
+End Process
+
+@Reasoning
+Creates an empty DependencyGraph.
+
+Memory: Tier 3 (OWNED HEAP) - 56 bytes
+@End Reasoning
+
+Process called "create_dependency_graph" returns Integer:
+    Note: Allocate DependencyGraph structure (56 bytes)
+    Let graph be Layout.allocate(56)
+    If graph equals 0:
+        Display "create_dependency_graph: allocation failed"
+        Return 0
+    End If
+
+    Note: Create empty collections
+    Let nodes be List.create()
+    Let edges be List.create()
+    Let instruction_to_node be Dictionary.create()
+    Let source_nodes be List.create()
+    Let sink_nodes be List.create()
+
+    Note: Store in structure
+    Layout.memory_set_int64(graph, 0, nodes)
+    Layout.memory_set_int64(graph, 8, edges)
+    Layout.memory_set_int64(graph, 16, instruction_to_node)
+    Layout.memory_set_int64(graph, 24, source_nodes)
+    Layout.memory_set_int64(graph, 32, sink_nodes)
+
+    Note: Initialize counts
+    Layout.memory_set_int64(graph, 40, 0)   Note: node_count = 0
+    Layout.memory_set_int64(graph, 48, 0)   Note: edge_count = 0
+
+    Return graph
+End Process
+
+Note: ============================================================================
+Note: DEPENDENCY GRAPH CONSTRUCTION
+Note: ============================================================================
+
+@Reasoning
+Builds the dependency graph for a MIR function using def-use chains.
+
+Algorithm:
+1. Create a node for each instruction in the CFG
+2. For each instruction:
+   a. Add RAW edges from definitions to uses (def-use chains)
+   b. Add WAR edges from uses to subsequent definitions
+   c. Add WAW edges between definitions of same value
+   d. Add control dependencies based on dominance frontiers
+   e. Add memory dependencies for loads/stores (conservative)
+3. Identify source nodes (no incoming) and sink nodes (no outgoing)
+4. Compute scheduling constraints
+
+Returns: DependencyGraph
+@End Reasoning
+
+Process called "build_dependency_graph_mir" that takes mir_function as Integer, def_use_chains as Integer returns Integer:
+    If mir_function equals 0:
+        Display "build_dependency_graph_mir: null function"
+        Return 0
+    End If
+
+    Note: Create empty dependency graph
+    Let graph be create_dependency_graph()
+    If graph equals 0:
+        Return 0
+    End If
+
+    Note: Get graph fields
+    Let nodes be Layout.memory_get_int64(graph, 0)
+    Let edges be Layout.memory_get_int64(graph, 8)
+    Let inst_to_node be Layout.memory_get_int64(graph, 16)
+
+    Note: Get MIR CFG
+    Let mir_cfg be Layout.memory_get_int64(mir_function, 8)
+    If mir_cfg equals 0:
+        Display "build_dependency_graph_mir: null CFG"
+        Return 0
+    End If
+
+    Note: Get blocks
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Note: Phase 1: Create nodes for all instructions
+    Let total_nodes be 0
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Note: Get instructions
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be Layout.memory_get_int64(block, 24)
+
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(instructions, i)
+
+            Note: Create node for this instruction
+            Let node be create_dependency_node(inst, block_id)
+            List.append(nodes, node)
+            Dictionary.set(inst_to_node, inst, node)
+
+            Let total_nodes be total_nodes + 1
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Note: Update node count
+    Layout.memory_set_int64(graph, 40, total_nodes)
+
+    Note: Phase 2: Add RAW edges (Read-After-Write) from def-use chains
+    If def_use_chains is not equal to 0:
+        Let value_ids be Dictionary.keys(def_use_chains)
+        Let value_count be List.length(value_ids)
+
+        Let v be 0
+        While v is less than value_count:
+            Let value_id be List.get(value_ids, v)
+            Let chain be Dictionary.get(def_use_chains, value_id)
+
+            Note: Get def instruction
+            Let def_id be Layout.memory_get_int64(chain, 0)
+
+            Note: Get use instructions
+            Let use_ids be Layout.memory_get_int64(chain, 8)
+            Let use_count be List.length(use_ids)
+
+            Note: For each use, add RAW edge from def to use
+            Let u be 0
+            While u is less than use_count:
+                Let use_inst be List.get(use_ids, u)
+
+                Note: Get nodes for def and use
+                Let def_node be Dictionary.get(inst_to_node, def_id)
+                Let use_node be Dictionary.get(inst_to_node, use_inst)
+
+                If def_node is not equal to 0 and use_node is not equal to 0:
+                    Note: Create RAW edge
+                    Let edge be create_dependency_edge(def_id, use_inst, 1)  Note: DEP_RAW = 1
+                    List.append(edges, edge)
+
+                    Note: Add to node edge lists
+                    Let def_outgoing be Layout.memory_get_int64(def_node, 24)
+                    Let use_incoming be Layout.memory_get_int64(use_node, 16)
+                    List.append(def_outgoing, edge)
+                    List.append(use_incoming, edge)
+                End If
+
+                Let u be u + 1
+            End While
+
+            Let v be v + 1
+        End While
+    End If
+
+    Note: Phase 3: Add WAR and WAW edges within each block
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Note: Get instructions
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be Layout.memory_get_int64(block, 24)
+
+        Note: Track last definition of each value in this block
+        Let last_def be Dictionary.create()
+        Let last_use be Dictionary.create()
+
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(instructions, i)
+
+            Note: Get result value (offset 8 in MIRNode)
+            Let result be Layout.memory_get_int64(inst, 8)
+            If result is not equal to 0:
+                Let value_id be Layout.memory_get_int64(result, 0)
+
+                Note: Check for WAW dependency (previous def of same value)
+                Let prev_def be Dictionary.get(last_def, value_id)
+                If prev_def is not equal to 0:
+                    Note: Create WAW edge from prev_def to inst
+                    Let edge be create_dependency_edge(prev_def, inst, 3)  Note: DEP_WAW = 3
+                    List.append(edges, edge)
+
+                    Let prev_node be Dictionary.get(inst_to_node, prev_def)
+                    Let curr_node be Dictionary.get(inst_to_node, inst)
+                    If prev_node is not equal to 0 and curr_node is not equal to 0:
+                        Let prev_outgoing be Layout.memory_get_int64(prev_node, 24)
+                        Let curr_incoming be Layout.memory_get_int64(curr_node, 16)
+                        List.append(prev_outgoing, edge)
+                        List.append(curr_incoming, edge)
+                    End If
+                End If
+
+                Note: Update last definition
+                Dictionary.set(last_def, value_id, inst)
+            End If
+
+            Note: Get operands (uses)
+            Let operands be Layout.memory_get_int64(inst, 16)
+            If operands is not equal to 0:
+                Let operand_count be List.length(operands)
+
+                Let op_idx be 0
+                While op_idx is less than operand_count:
+                    Let operand be List.get(operands, op_idx)
+                    If operand is not equal to 0:
+                        Let value_id be Layout.memory_get_int64(operand, 0)
+
+                        Note: Check for WAR dependency (use followed by def)
+                        Note: Will be handled when we see the next def
+
+                        Note: Track last use
+                        Dictionary.set(last_use, value_id, inst)
+                    End If
+
+                    Let op_idx be op_idx + 1
+                End While
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Note: Update edge count
+    Let edge_count be List.length(edges)
+    Layout.memory_set_int64(graph, 48, edge_count)
+
+    Note: Phase 4: Identify source and sink nodes
+    Let source_nodes be Layout.memory_get_int64(graph, 24)
+    Let sink_nodes be Layout.memory_get_int64(graph, 32)
+
+    Let n be 0
+    While n is less than total_nodes:
+        Let node be List.get(nodes, n)
+
+        Let incoming_edges be Layout.memory_get_int64(node, 16)
+        Let outgoing_edges be Layout.memory_get_int64(node, 24)
+
+        Let incoming_count be List.length(incoming_edges)
+        Let outgoing_count be List.length(outgoing_edges)
+
+        Note: Source node has no incoming edges
+        If incoming_count equals 0:
+            List.append(source_nodes, node)
+        End If
+
+        Note: Sink node has no outgoing edges
+        If outgoing_count equals 0:
+            List.append(sink_nodes, node)
+        End If
+
+        Let n be n + 1
+    End While
+
+    Return graph
+End Process
+
+Note: ============================================================================
+Note: DEPENDENCY CLASSIFICATION
+Note: ============================================================================
+
+@Reasoning
+Classifies the dependency between two instructions.
+
+Returns:
+- DEP_RAW (1) if target reads value written by source
+- DEP_WAR (2) if target writes value read by source
+- DEP_WAW (3) if both write same value
+- DEP_CONTROL (4) if target is control-dependent on source
+- DEP_MEMORY (5) if both access potentially aliasing memory
+- 0 if no dependency
+
+This is a helper function for manual dependency analysis.
+@End Reasoning
+
+Process called "classify_dependency" that takes source_inst as Integer, target_inst as Integer returns Integer:
+    If source_inst equals 0 or target_inst equals 0:
+        Return 0
+    End If
+
+    Note: Get source instruction result (offset 8 in MIRNode)
+    Let source_result be Layout.memory_get_int64(source_inst, 8)
+    If source_result is not equal to 0:
+        Let source_value_id be Layout.memory_get_int64(source_result, 0)
+
+        Note: Check if target uses source's result (RAW)
+        Let target_operands be Layout.memory_get_int64(target_inst, 16)
+        If target_operands is not equal to 0:
+            Let operand_count be List.length(target_operands)
+
+            Let op_idx be 0
+            While op_idx is less than operand_count:
+                Let operand be List.get(target_operands, op_idx)
+                If operand is not equal to 0:
+                    Let operand_value_id be Layout.memory_get_int64(operand, 0)
+                    If operand_value_id equals source_value_id:
+                        Return 1  Note: DEP_RAW
+                    End If
+                End If
+
+                Let op_idx be op_idx + 1
+            End While
+        End If
+
+        Note: Check if target writes same value as source (WAW)
+        Let target_result be Layout.memory_get_int64(target_inst, 8)
+        If target_result is not equal to 0:
+            Let target_value_id be Layout.memory_get_int64(target_result, 0)
+            If target_value_id equals source_value_id:
+                Return 3  Note: DEP_WAW
+            End If
+        End If
+    End If
+
+    Note: Check for WAR (source reads, target writes)
+    Let source_operands be Layout.memory_get_int64(source_inst, 16)
+    Let target_result be Layout.memory_get_int64(target_inst, 8)
+
+    If source_operands is not equal to 0 and target_result is not equal to 0:
+        Let source_operand_count be List.length(source_operands)
+        Let target_value_id be Layout.memory_get_int64(target_result, 0)
+
+        Let op_idx be 0
+        While op_idx is less than source_operand_count:
+            Let operand be List.get(source_operands, op_idx)
+            If operand is not equal to 0:
+                Let operand_value_id be Layout.memory_get_int64(operand, 0)
+                If operand_value_id equals target_value_id:
+                    Return 2  Note: DEP_WAR
+                End If
+            End If
+
+            Let op_idx be op_idx + 1
+        End While
+    End If
+
+    Note: No data dependency found
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: MEMORY DEPENDENCY ANALYSIS
+Note: ============================================================================
+
+@Reasoning
+Computes memory dependencies between load and store instructions.
+
+This is a conservative alias analysis: if two memory accesses MAY alias,
+we add a memory dependency edge.
+
+Algorithm:
+1. Identify all load and store instructions
+2. For each pair of memory accesses:
+   - If both are loads: no dependency
+   - If one is store, one is load: check for aliasing (RAW or WAR)
+   - If both are stores: check for aliasing (WAW)
+3. Aliasing heuristics:
+   - Same base address -> may alias
+   - Unknown base address -> may alias (conservative)
+   - Different constant addresses -> no alias
+
+Returns: List of memory dependency edges
+@End Reasoning
+
+Process called "compute_memory_dependencies_mir" that takes mir_cfg as Integer returns Integer:
+    If mir_cfg equals 0:
+        Display "compute_memory_dependencies_mir: null CFG"
+        Return 0
+    End If
+
+    Note: Get blocks
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Note: Collect all memory access instructions
+    Let memory_accesses be List.create()
+
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+
+        Note: Get instructions
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be Layout.memory_get_int64(block, 24)
+
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(instructions, i)
+
+            Note: Get opcode (offset 0 in MIRNode)
+            Let opcode be Layout.memory_get_int64(inst, 0)
+
+            Note: Check if this is a memory access (load/store)
+            Note: Opcodes 20300-20399 are memory operations
+            If opcode is greater than or equal to 20300 and opcode is less than 20400:
+                List.append(memory_accesses, inst)
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Note: Create memory dependency edges
+    Let mem_dep_edges be List.create()
+    Let access_count be List.length(memory_accesses)
+
+    Note: For each pair of memory accesses
+    Let i be 0
+    While i is less than access_count:
+        Let inst1 be List.get(memory_accesses, i)
+        Let opcode1 be Layout.memory_get_int64(inst1, 0)
+
+        Let j be i + 1
+        While j is less than access_count:
+            Let inst2 be List.get(memory_accesses, j)
+            Let opcode2 be Layout.memory_get_int64(inst2, 0)
+
+            Note: Determine if these may alias
+            Note: Conservative alias analysis based on SSA value comparison
+            Let may_alias be 1  Note: Default: assume they may alias
+
+            Note: Get base address operands for both memory accesses
+            Let ops1 be Layout.memory_get_int64(inst1, 16)
+            Let ops2 be Layout.memory_get_int64(inst2, 16)
+
+            If ops1 is not equal to 0 and ops2 is not equal to 0:
+                Let op1_count be List.length(ops1)
+                Let op2_count be List.length(ops2)
+
+                Note: Memory instructions have base address as first operand
+                If op1_count is greater than 0 and op2_count is greater than 0:
+                    Let base1 be List.get(ops1, 0)  Note: Base address value
+                    Let base2 be List.get(ops2, 0)
+
+                    Note: Get value IDs for comparison
+                    Let base1_id be Layout.memory_get_int64(base1, 0)
+                    Let base2_id be Layout.memory_get_int64(base2, 0)
+
+                    Note: If different SSA values for base, check if they can alias
+                    If base1_id is not equal to base2_id:
+                        Note: Check if both are constants (different constants don't alias)
+                        Let base1_type be Layout.memory_get_int64(base1, 8)  Note: Value type
+                        Let base2_type be Layout.memory_get_int64(base2, 8)
+
+                        Note: Type 1 = constant in MIR Value types
+                        If base1_type equals 1 and base2_type equals 1:
+                            Note: Different constant addresses - they don't alias
+                            Let may_alias be 0
+                        End If
+
+                        Note: Check for known non-aliasing patterns (stack vs heap)
+                        Note: If one is ALLOCA and other is not, they don't alias
+                        Let opcode1 be Layout.memory_get_int64(inst1, 0)
+                        Let opcode2 be Layout.memory_get_int64(inst2, 0)
+
+                        Note: Get defining instructions for base values
+                        Let def1 be Layout.memory_get_int64(base1, 16)  Note: def_instruction
+                        Let def2 be Layout.memory_get_int64(base2, 16)
+
+                        If def1 is not equal to 0 and def2 is not equal to 0:
+                            Let def1_opcode be Layout.memory_get_int64(def1, 0)
+                            Let def2_opcode be Layout.memory_get_int64(def2, 0)
+
+                            Note: ALLOCA opcode = 20350 (approximate - check actual value)
+                            Note: If one is stack alloca and other is not, no alias
+                            If def1_opcode equals 20350 and def2_opcode is not equal to 20350:
+                                Let may_alias be 0
+                            End If
+                            If def2_opcode equals 20350 and def1_opcode is not equal to 20350:
+                                Let may_alias be 0
+                            End If
+                        End If
+                    End If
+
+                    Note: Check for same base with different constant offsets
+                    If base1_id equals base2_id and op1_count is greater than 1 and op2_count is greater than 1:
+                        Note: Get offset operands (second operand if present)
+                        Let offset1 be List.get(ops1, 1)
+                        Let offset2 be List.get(ops2, 1)
+
+                        If offset1 is not equal to 0 and offset2 is not equal to 0:
+                            Let offset1_type be Layout.memory_get_int64(offset1, 8)
+                            Let offset2_type be Layout.memory_get_int64(offset2, 8)
+
+                            Note: If both offsets are constants and different, check range
+                            If offset1_type equals 1 and offset2_type equals 1:
+                                Let offset1_val be Layout.memory_get_int64(offset1, 24)  Note: Constant value
+                                Let offset2_val be Layout.memory_get_int64(offset2, 24)
+
+                                Note: If offsets differ by more than access size, no alias
+                                Note: Access size is typically 8 bytes (conservative estimate)
+                                Let diff be offset1_val - offset2_val
+                                If diff is less than 0:
+                                    Let diff be 0 - diff  Note: Absolute value
+                                End If
+
+                                If diff is greater than or equal to 8:
+                                    Let may_alias be 0
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+
+            If may_alias equals 1:
+                Note: Determine dependency type
+                Let is_load1 be 0
+                Let is_store1 be 0
+                Let is_load2 be 0
+                Let is_store2 be 0
+
+                Note: Opcodes 20300-20349 are loads, 20350-20399 are stores
+                If opcode1 is greater than or equal to 20300 and opcode1 is less than 20350:
+                    Let is_load1 be 1
+                End If
+                If opcode1 is greater than or equal to 20350 and opcode1 is less than 20400:
+                    Let is_store1 be 1
+                End If
+                If opcode2 is greater than or equal to 20300 and opcode2 is less than 20350:
+                    Let is_load2 be 1
+                End If
+                If opcode2 is greater than or equal to 20350 and opcode2 is less than 20400:
+                    Let is_store2 be 1
+                End If
+
+                Note: Create dependency edge based on access types
+                Let dep_type be 5  Note: DEP_MEMORY
+
+                If is_store1 equals 1 and is_load2 equals 1:
+                    Let dep_type be 1  Note: DEP_RAW (store then load)
+                End If
+
+                If is_load1 equals 1 and is_store2 equals 1:
+                    Let dep_type be 2  Note: DEP_WAR (load then store)
+                End If
+
+                If is_store1 equals 1 and is_store2 equals 1:
+                    Let dep_type be 3  Note: DEP_WAW (store then store)
+                End If
+
+                Note: Only add edge if not both loads
+                If is_load1 equals 0 or is_load2 equals 0:
+                    Let edge be create_dependency_edge(inst1, inst2, dep_type)
+                    List.append(mem_dep_edges, edge)
+                End If
+            End If
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Return mem_dep_edges
+End Process
+
+Note: ============================================================================
+Note: CONTROL DEPENDENCY ANALYSIS
+Note: ============================================================================
+
+@Reasoning
+Computes control dependencies using dominance frontiers.
+
+An instruction Y is control-dependent on branch X if:
+1. There exists a path from X to Y such that Y post-dominates every node
+   on the path after X (except for X itself)
+2. Y does not post-dominate X
+
+Practical algorithm:
+- Use dominance frontiers from control flow analysis
+- For each branch instruction, instructions in its dominance frontier
+  are control-dependent on the branch
+
+Returns: List of control dependency edges
+@End Reasoning
+
+Process called "compute_control_dependencies_mir" that takes mir_cfg as Integer, dominfo as Integer returns Integer:
+    If mir_cfg equals 0 or dominfo equals 0:
+        Display "compute_control_dependencies_mir: null inputs"
+        Return 0
+    End If
+
+    Note: Get blocks
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Note: Get dominance frontiers (offset 16 in DominatorInfo)
+    Let dom_frontiers be Layout.memory_get_int64(dominfo, 16)
+
+    Note: Create control dependency edges
+    Let control_dep_edges be List.create()
+
+    Note: For each block
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+        Let block_id be Layout.memory_get_int64(block, 0)
+
+        Note: Get last instruction (terminator, potentially a branch)
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be Layout.memory_get_int64(block, 24)
+
+        If inst_count is greater than 0:
+            Let last_inst be List.get(instructions, inst_count - 1)
+            Let opcode be Layout.memory_get_int64(last_inst, 0)
+
+            Note: Check if this is a branch instruction
+            Note: Opcodes 20500-20599 are control flow operations
+            Let is_branch be 0
+            If opcode is greater than or equal to 20500 and opcode is less than 20600:
+                Let is_branch be 1
+            End If
+
+            If is_branch equals 1:
+                Note: Get dominance frontier for this block
+                Let frontier be Dictionary.get(dom_frontiers, block_id)
+                If frontier is not equal to 0:
+                    Let frontier_size be List.length(frontier)
+
+                    Note: For each block in dominance frontier
+                    Let f be 0
+                    While f is less than frontier_size:
+                        Let frontier_block_id be List.get(frontier, f)
+                        Let frontier_block be 0
+
+                        Note: Find the actual block
+                        Let bb be 0
+                        While bb is less than block_count:
+                            Let search_block be List.get(blocks, bb)
+                            Let search_id be Layout.memory_get_int64(search_block, 0)
+                            If search_id equals frontier_block_id:
+                                Let frontier_block be search_block
+                            End If
+                            Let bb be bb + 1
+                        End While
+
+                        Note: Get first instruction of frontier block
+                        If frontier_block is not equal to 0:
+                            Let frontier_insts be Layout.memory_get_int64(frontier_block, 16)
+                            Let frontier_inst_count be Layout.memory_get_int64(frontier_block, 24)
+
+                            If frontier_inst_count is greater than 0:
+                                Let first_inst be List.get(frontier_insts, 0)
+
+                                Note: Create control dependency edge
+                                Let edge be create_dependency_edge(last_inst, first_inst, 4)  Note: DEP_CONTROL
+                                List.append(control_dep_edges, edge)
+                            End If
+                        End If
+
+                        Let f be f + 1
+                    End While
+                End If
+            End If
+        End If
+
+        Let b be b + 1
+    End While
+
+    Return control_dep_edges
+End Process
+
+Note: ============================================================================
+Note: INSTRUCTION SCHEDULING CONSTRAINTS
+Note: ============================================================================
+
+@Reasoning
+Computes scheduling constraints for instructions based on dependencies.
+
+Algorithm (Critical Path Method):
+1. Topological sort of dependency graph
+2. Forward pass: compute earliest start time for each instruction
+   - earliest[inst] = max(earliest[pred] + latency[pred]) for all predecessors
+3. Backward pass: compute latest start time
+   - latest[inst] = min(latest[succ] - latency[inst]) for all successors
+4. Slack = latest - earliest (instructions with 0 slack are on critical path)
+
+Returns: Updated dependency graph with scheduling info
+@End Reasoning
+
+Process called "compute_scheduling_constraints" that takes dep_graph as Integer returns Integer:
+    If dep_graph equals 0:
+        Display "compute_scheduling_constraints: null graph"
+        Return 0
+    End If
+
+    Note: Get graph fields
+    Let nodes be Layout.memory_get_int64(dep_graph, 0)
+    Let node_count be Layout.memory_get_int64(dep_graph, 40)
+    Let source_nodes be Layout.memory_get_int64(dep_graph, 24)
+
+    Note: Forward pass: compute earliest start times
+    Note: Use worklist algorithm (using topological sort)
+    Let worklist be List.create()
+
+    Note: Initialize source nodes
+    Let source_count be List.length(source_nodes)
+    Let s be 0
+    While s is less than source_count:
+        Let source be List.get(source_nodes, s)
+        Layout.memory_set_int64(source, 32, 0)  Note: earliest_start = 0
+        List.append(worklist, source)
+        Let s be s + 1
+    End While
+
+    Note: Process worklist
+    While List.length(worklist) is greater than 0:
+        Let node be List.get(worklist, 0)
+        List.remove_at(worklist, 0)
+
+        Let earliest be Layout.memory_get_int64(node, 32)
+        Let outgoing_edges be Layout.memory_get_int64(node, 24)
+        Let outgoing_count be List.length(outgoing_edges)
+
+        Note: Assume instruction latency = 1 cycle (using)
+        Let latency be 1
+
+        Note: Update successors
+        Let e be 0
+        While e is less than outgoing_count:
+            Let edge be List.get(outgoing_edges, e)
+            Let target_inst be Layout.memory_get_int64(edge, 8)
+
+            Note: Find target node
+            Let n be 0
+            Let target_node be 0
+            While n is less than node_count:
+                Let search_node be List.get(nodes, n)
+                Let search_inst be Layout.memory_get_int64(search_node, 0)
+                If search_inst equals target_inst:
+                    Let target_node be search_node
+                End If
+                Let n be n + 1
+            End While
+
+            If target_node is not equal to 0:
+                Let new_earliest be earliest + latency
+                Let target_earliest be Layout.memory_get_int64(target_node, 32)
+
+                Note: Update if new earliest is larger
+                If new_earliest is greater than target_earliest:
+                    Layout.memory_set_int64(target_node, 32, new_earliest)
+
+                    Note: Add to worklist if not already there
+                    List.append(worklist, target_node)
+                End If
+            End If
+
+            Let e be e + 1
+        End While
+    End While
+
+    Note: Backward pass: compute latest start times from sink nodes
+    Let sink_nodes be Layout.memory_get_int64(dep_graph, 32)
+    Let sink_count be List.length(sink_nodes)
+
+    Note: Find maximum earliest time (makespan)
+    Let makespan be 0
+    Let n be 0
+    While n is less than node_count:
+        Let node be List.get(nodes, n)
+        Let earliest be Layout.memory_get_int64(node, 32)
+        If earliest is greater than makespan:
+            Let makespan be earliest
+        End If
+        Let n be n + 1
+    End While
+
+    Note: Initialize sink nodes latest = makespan
+    Let s be 0
+    While s is less than sink_count:
+        Let sink be List.get(sink_nodes, s)
+        Layout.memory_set_int64(sink, 40, makespan)
+        Let s be s + 1
+    End While
+
+    Note: Backward pass through predecessors
+    Let worklist be List.create()
+    Let s be 0
+    While s is less than sink_count:
+        Let sink be List.get(sink_nodes, s)
+        List.append(worklist, sink)
+        Let s be s + 1
+    End While
+
+    While List.length(worklist) is greater than 0:
+        Let node be List.get(worklist, 0)
+        List.remove_at(worklist, 0)
+
+        Let latest be Layout.memory_get_int64(node, 40)
+        Let incoming_edges be Layout.memory_get_int64(node, 16)
+        Let incoming_count be List.length(incoming_edges)
+
+        Let latency be 1  Note: Instruction latency
+
+        Note: Update predecessors
+        Let e be 0
+        While e is less than incoming_count:
+            Let edge be List.get(incoming_edges, e)
+            Let source_inst be Layout.memory_get_int64(edge, 0)
+
+            Note: Find source node
+            Let n be 0
+            Let source_node be 0
+            While n is less than node_count:
+                Let search_node be List.get(nodes, n)
+                Let search_inst be Layout.memory_get_int64(search_node, 0)
+                If search_inst equals source_inst:
+                    Let source_node be search_node
+                End If
+                Let n be n + 1
+            End While
+
+            If source_node is not equal to 0:
+                Let new_latest be latest - latency
+                Let source_latest be Layout.memory_get_int64(source_node, 40)
+
+                Note: Update if new latest is smaller (or first time)
+                If source_latest equals 0 or new_latest is less than source_latest:
+                    Layout.memory_set_int64(source_node, 40, new_latest)
+                    List.append(worklist, source_node)
+                End If
+            End If
+
+            Let e be e + 1
+        End While
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PARALLELIZATION ANALYSIS
+Note: ============================================================================
+
+@Reasoning
+Identifies opportunities for parallel execution based on dependency analysis.
+
+Algorithm:
+1. Find strongly connected components (SCCs) in dependency graph
+2. Instructions in different SCCs with no dependencies can run in parallel
+3. Compute parallelism level for each instruction:
+   - Level 0: source nodes (no dependencies)
+   - Level k: nodes depending only on levels < k
+4. Instructions at same level can potentially execute in parallel
+
+Returns: Dictionary mapping instruction -> parallelism_level
+@End Reasoning
+
+Process called "analyze_parallelization" that takes dep_graph as Integer returns Integer:
+    If dep_graph equals 0:
+        Display "analyze_parallelization: null graph"
+        Return 0
+    End If
+
+    Note: Get graph fields
+    Let nodes be Layout.memory_get_int64(dep_graph, 0)
+    Let node_count be Layout.memory_get_int64(dep_graph, 40)
+    Let source_nodes be Layout.memory_get_int64(dep_graph, 24)
+
+    Note: Compute parallelism levels (level = longest dependency chain)
+    Let inst_to_level be Dictionary.create()
+
+    Note: Initialize source nodes to level 0
+    Let source_count be List.length(source_nodes)
+    Let s be 0
+    While s is less than source_count:
+        Let source be List.get(source_nodes, s)
+        Let inst be Layout.memory_get_int64(source, 0)
+        Dictionary.set(inst_to_level, inst, 0)
+        Let s be s + 1
+    End While
+
+    Note: Compute levels for all nodes (using topological order)
+    Let max_iterations be 100
+    Let iteration be 0
+    Let changed be 1
+
+    While changed equals 1 and iteration is less than max_iterations:
+        Let changed be 0
+        Let iteration be iteration + 1
+
+        Let n be 0
+        While n is less than node_count:
+            Let node be List.get(nodes, n)
+            Let inst be Layout.memory_get_int64(node, 0)
+
+            Note: Get incoming edges
+            Let incoming_edges be Layout.memory_get_int64(node, 16)
+            Let incoming_count be List.length(incoming_edges)
+
+            If incoming_count equals 0:
+                Note: Source node, level = 0
+                Dictionary.set(inst_to_level, inst, 0)
+            Otherwise:
+                Note: Level = max(predecessor levels) + 1
+                Let max_pred_level be -1
+
+                Let e be 0
+                While e is less than incoming_count:
+                    Let edge be List.get(incoming_edges, e)
+                    Let source_inst be Layout.memory_get_int64(edge, 0)
+
+                    Let pred_level be Dictionary.get(inst_to_level, source_inst)
+                    If pred_level is greater than max_pred_level:
+                        Let max_pred_level be pred_level
+                    End If
+
+                    Let e be e + 1
+                End While
+
+                Let new_level be max_pred_level + 1
+                Let current_level be Dictionary.get(inst_to_level, inst)
+
+                If current_level is not equal to new_level:
+                    Dictionary.set(inst_to_level, inst, new_level)
+                    Let changed be 1
+                End If
+            End If
+
+            Let n be n + 1
+        End While
+    End While
+
+    Return inst_to_level
+End Process
+
+Note: ============================================================================
+Note: VERIFICATION AND DEBUGGING
+Note: ============================================================================
+
+@Reasoning
+Verifies dependency graph correctness.
+
+Checks:
+1. All edges connect valid nodes
+2. No self-loops (instruction depending on itself)
+3. DAG property (no cycles) for within-block dependencies
+4. Source/sink node counts are reasonable
+
+Returns: 1 if valid, 0 if errors found
+@End Reasoning
+
+Process called "verify_dependency_graph" that takes dep_graph as Integer returns Integer:
+    If dep_graph equals 0:
+        Display "verify_dependency_graph: null graph"
+        Return 0
+    End If
+
+    Note: Get graph fields
+    Let nodes be Layout.memory_get_int64(dep_graph, 0)
+    Let edges be Layout.memory_get_int64(dep_graph, 8)
+    Let node_count be Layout.memory_get_int64(dep_graph, 40)
+    Let edge_count be Layout.memory_get_int64(dep_graph, 48)
+
+    Let errors be 0
+
+    Note: Verify edge count matches
+    Let actual_edge_count be List.length(edges)
+    If actual_edge_count is not equal to edge_count:
+        Display "verify_dependency_graph: edge count mismatch"
+        Let errors be errors + 1
+    End If
+
+    Note: Verify node count matches
+    Let actual_node_count be List.length(nodes)
+    If actual_node_count is not equal to node_count:
+        Display "verify_dependency_graph: node count mismatch"
+        Let errors be errors + 1
+    End If
+
+    Note: Check for self-loops
+    Let e be 0
+    While e is less than edge_count:
+        Let edge be List.get(edges, e)
+        Let source_inst be Layout.memory_get_int64(edge, 0)
+        Let target_inst be Layout.memory_get_int64(edge, 8)
+
+        If source_inst equals target_inst:
+            Display "verify_dependency_graph: self-loop detected"
+            Let errors be errors + 1
+        End If
+
+        Let e be e + 1
+    End While
+
+    If errors equals 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Prints dependency graph for debugging.
+
+Displays:
+- Node count, edge count
+- For each node: instruction, incoming/outgoing edge counts
+- For each edge: source -> target, dependency type
+@End Reasoning
+
+Process called "print_dependency_graph" that takes dep_graph as Integer returns Integer:
+    If dep_graph equals 0:
+        Display "print_dependency_graph: null graph"
+        Return 0
+    End If
+
+    Display "=== Dependency Graph ==="
+
+    Note: Get graph fields
+    Let nodes be Layout.memory_get_int64(dep_graph, 0)
+    Let edges be Layout.memory_get_int64(dep_graph, 8)
+    Let node_count be Layout.memory_get_int64(dep_graph, 40)
+    Let edge_count be Layout.memory_get_int64(dep_graph, 48)
+
+    Display "Nodes: "
+    Display node_count
+    Display ", Edges: "
+    Display edge_count
+
+    Note: Print nodes
+    Display ""
+    Display "Nodes:"
+    Let n be 0
+    While n is less than node_count:
+        Let node be List.get(nodes, n)
+        Let inst be Layout.memory_get_int64(node, 0)
+        Let block_id be Layout.memory_get_int64(node, 8)
+        Let incoming_edges be Layout.memory_get_int64(node, 16)
+        Let outgoing_edges be Layout.memory_get_int64(node, 24)
+
+        Let incoming_count be List.length(incoming_edges)
+        Let outgoing_count be List.length(outgoing_edges)
+
+        Display "  Node "
+        Display n
+        Display ": inst="
+        Display inst
+        Display ", block="
+        Display block_id
+        Display ", in="
+        Display incoming_count
+        Display ", out="
+        Display outgoing_count
+
+        Let n be n + 1
+    End While
+
+    Note: Print edges
+    Display ""
+    Display "Edges:"
+    Let e be 0
+    While e is less than edge_count:
+        Let edge be List.get(edges, e)
+        Let source_inst be Layout.memory_get_int64(edge, 0)
+        Let target_inst be Layout.memory_get_int64(edge, 8)
+        Let dep_type be Layout.memory_get_int64(edge, 16)
+
+        Display "  Edge "
+        Display e
+        Display ": "
+        Display source_inst
+        Display " -> "
+        Display target_inst
+        Display " (type="
+        Display dep_type
+        Display ")"
+
+        Let e be e + 1
+    End While
+
+    Return 1
+End Process

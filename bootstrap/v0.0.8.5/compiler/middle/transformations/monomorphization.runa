@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1109 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles monomorphization and generic code instantiation.
+This file orchestrates the complete monomorphization process.
 
 This file performs the following tasks:
-- Process monomorphization and generic code instantiation
-- Handle generic type instantiation and generic function instantiation
-- Manage monomorphization optimization and generic instantiation optimization
-- Process monomorphization validation and generic instantiation validation
+- Process orchestration of monomorphization across entire compilation unit
+- Handle generic call site discovery and instantiation requests
+- Manage the work queue of pending instantiations
+- Process recursive instantiation propagation
 
 This file is essential because of the following reasons:
-- Monomorphization enables generic code to be instantiated for specific types
-- Proper monomorphization handling ensures correct generic code instantiation
-- Monomorphization support enables Runa compilation for generic code generation
+- Monomorphization enables zero-cost generics by generating specialized code
+- Proper orchestration ensures all required instantiations are generated
+- Work queue management prevents exponential compilation time
 
 This file consists of the following functions/features/operation types:
-- Monomorphization and generic code instantiation
-- Generic type instantiation and generic function instantiation
-- Monomorphization optimization and generic instantiation optimization
-- Monomorphization validation and generic instantiation validation
+- Compilation unit-wide monomorphization driver
+- Generic call site analysis and discovery
+- Work queue processing for instantiation requests
+- Transitive instantiation dependency resolution
 :End Note
 
-Note: TODO - Implement monomorphization functionality
+Note: ========================================
+Note: IMPORTS
+Note: ========================================
+:End Note
+
+Import "../../frontend/primitives/memory/layout.runa" as Layout
+Import "../../frontend/primitives/core/memory_core.runa" as Memory
+Import "../../frontend/primitives/collections/list.runa" as List
+Import "../../frontend/primitives/collections/hash_table.runa" as HashTable
+Import "../hir/hir.runa" as HIR
+Import "../hir/hir_nodes.runa" as HIRNodes
+Import "type_instantiation_cache.runa" as Cache
+Import "generic_instantiation.runa" as GenericInst
+
+Note: ========================================
+Note: TYPE DEFINITIONS
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+The MonomorphizationContext manages the entire monomorphization process
+for a compilation unit. It maintains:
+- The instantiation cache
+- Work queue of pending instantiations
+- Instantiation context
+- Statistics and error tracking
+
+This is the top-level orchestrator that drives monomorphization to completion.
+
+The 200-byte layout provides:
+- cache (8 bytes): InstantiationCache pointer
+- inst_context (8 bytes): InstantiationContext pointer
+- work_queue (8 bytes): Array of pending instantiation requests
+- work_queue_capacity (8 bytes): Queue array capacity
+- work_queue_size (8 bytes): Current queue size
+- work_queue_head (8 bytes): Queue head index
+- work_queue_tail (8 bytes): Queue tail index
+- processed_count (8 bytes): Number of instantiations processed
+- compilation_unit_id (8 bytes): Current CU ID
+- instantiated_definitions (8 bytes): List of all instantiated definitions to add to HIR
+- call_site_mapping (8 bytes): Hash map from call_site → instantiated_def
+- reserved (120 bytes): Future expansion
+@End Reasoning
+:End Note
+
+Type called "MonomorphizationContext":
+    cache as Integer
+    inst_context as Integer
+    work_queue as Integer
+    work_queue_capacity as Integer
+    work_queue_size as Integer
+    work_queue_head as Integer
+    work_queue_tail as Integer
+    processed_count as Integer
+    compilation_unit_id as Integer
+    reserved_1 as Integer
+    reserved_2 as Integer
+    reserved_3 as Integer
+    reserved_4 as Integer
+    reserved_5 as Integer
+    reserved_6 as Integer
+    reserved_7 as Integer
+    reserved_8 as Integer
+    reserved_9 as Integer
+    reserved_10 as Integer
+    reserved_11 as Integer
+    reserved_12 as Integer
+    reserved_13 as Integer
+    reserved_14 as Integer
+    reserved_15 as Integer
+    reserved_16 as Integer
+    reserved_17 as Integer
+    reserved_18 as Integer
+End Type
+
+Note:
+@Reasoning
+An InstantiationRequest represents a pending generic instantiation that
+needs to be processed. The request contains:
+- The generic definition to instantiate
+- The concrete type arguments
+- The call site location (for diagnostics)
+
+Requests are queued as they're discovered during code analysis and processed
+in a work queue to handle transitive dependencies.
+
+The 64-byte layout provides:
+- generic_def (8 bytes): Pointer to generic HIR definition
+- type_args (8 bytes): Pointer to type argument array
+- type_arg_count (8 bytes): Number of type arguments
+- call_site_location (8 bytes): Source location of call site
+- priority (8 bytes): Processing priority (0=normal)
+- reserved (24 bytes): Future expansion
+@End Reasoning
+:End Note
+
+Type called "InstantiationRequest":
+    generic_def as Integer
+    type_args as Integer
+    type_arg_count as Integer
+    call_site_location as Integer
+    priority as Integer
+    reserved_1 as Integer
+    reserved_2 as Integer
+    reserved_3 as Integer
+End Type
+
+Note:
+@Reasoning
+MonomorphizationStatistics tracks metrics about the monomorphization process
+for performance analysis and debugging:
+- Number of instantiations generated
+- Number of instantiations reused from cache
+- Number of work queue iterations
+- Peak work queue size
+
+These metrics help optimize compilation performance.
+
+The 64-byte layout provides:
+- instantiations_generated (8 bytes): New instantiations created
+- cache_hits (8 bytes): Instantiations reused from cache
+- work_queue_iterations (8 bytes): Number of queue processing loops
+- peak_queue_size (8 bytes): Maximum queue size reached
+- total_instantiation_time (8 bytes): Time spent in instantiation (stub)
+- reserved (24 bytes): Future expansion
+@End Reasoning
+:End Note
+
+Type called "MonomorphizationStatistics":
+    instantiations_generated as Integer
+    cache_hits as Integer
+    work_queue_iterations as Integer
+    peak_queue_size as Integer
+    total_instantiation_time as Integer
+    reserved_1 as Integer
+    reserved_2 as Integer
+    reserved_3 as Integer
+End Type
+
+Note: ========================================
+Note: CONTEXT MANAGEMENT
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Creating the monomorphization context initializes all subsystems:
+- Instantiation cache for deduplication
+- Instantiation context for generic processing
+- Work queue for pending requests
+
+The context is created once per compilation unit and used throughout
+monomorphization.
+@End Reasoning
+:End Note
+
+Process called "create_monomorphization_context" takes compilation_unit_id as Integer returns Integer:
+    Note: Allocate MonomorphizationContext (200 bytes)
+    Let ctx_ptr be proc allocate from Layout with 200
+
+    Note: Create instantiation cache
+    Let cache be proc cache_create from Cache
+    proc memory_set_int64 from Memory with ctx_ptr, 0, cache
+
+    Note: Create instantiation context
+    Let inst_ctx be proc create_instantiation_context from GenericInst with cache, compilation_unit_id
+    proc memory_set_int64 from Memory with ctx_ptr, 8, inst_ctx
+
+    Note: Create work queue (initial capacity 128 requests)
+    Let initial_capacity be 128
+    Let queue_size be initial_capacity * 64
+    Let work_queue be proc allocate from Layout with queue_size
+    proc memory_set_int64 from Memory with ctx_ptr, 16, work_queue
+
+    Note: Set queue parameters
+    proc memory_set_int64 from Memory with ctx_ptr, 24, initial_capacity
+    proc memory_set_int64 from Memory with ctx_ptr, 32, 0
+    proc memory_set_int64 from Memory with ctx_ptr, 40, 0
+    proc memory_set_int64 from Memory with ctx_ptr, 48, 0
+
+    Note: Initialize processed count
+    proc memory_set_int64 from Memory with ctx_ptr, 56, 0
+
+    Note: Set compilation unit ID
+    proc memory_set_int64 from Memory with ctx_ptr, 64, compilation_unit_id
+
+    Note: Create list for instantiated definitions
+    Let instantiated_defs be proc create from List
+    proc memory_set_int64 from Memory with ctx_ptr, 72, instantiated_defs
+
+    Note: Create hash table for call site mapping (initial capacity 256)
+    Let call_site_map be proc create from HashTable with 256
+    proc memory_set_int64 from Memory with ctx_ptr, 80, call_site_map
+
+    Note: Zero remaining reserved fields
+    Let reserved_idx be 88
+    While reserved_idx is less than 200:
+        proc memory_set_int64 from Memory with ctx_ptr, reserved_idx, 0
+        Set reserved_idx to reserved_idx plus 8
+    End While
+
+    Return ctx_ptr
+End Process
+
+Note:
+@Reasoning
+Destroying the monomorphization context cleans up all allocated resources:
+- Instantiation cache
+- Instantiation context
+- Work queue
+
+This is called after monomorphization completes.
+@End Reasoning
+:End Note
+
+Process called "destroy_monomorphization_context" takes ctx as Integer returns Integer:
+    Note: Destroy instantiation cache
+    Let cache be proc memory_get_int64 from Memory with ctx, 0
+    If cache is not equal to 0:
+        proc cache_destroy from Cache with cache
+    End If
+
+    Note: Destroy instantiation context
+    Let inst_ctx be proc memory_get_int64 from Memory with ctx, 8
+    If inst_ctx is not equal to 0:
+        proc destroy_instantiation_context from GenericInst with inst_ctx
+    End If
+
+    Note: Destroy work queue
+    Let work_queue be proc memory_get_int64 from Memory with ctx, 16
+    If work_queue is not equal to 0:
+        proc deallocate from Layout with work_queue
+    End If
+
+    Note: Destroy instantiated definitions list
+    Let instantiated_defs be proc memory_get_int64 from Memory with ctx, 72
+    If instantiated_defs is not equal to 0:
+        proc destroy from List with instantiated_defs
+    End If
+
+    Note: Destroy call site mapping hash table
+    Let call_site_map be proc memory_get_int64 from Memory with ctx, 80
+    If call_site_map is not equal to 0:
+        proc destroy from HashTable with call_site_map
+    End If
+
+    Note: Free context structure
+    proc deallocate from Layout with ctx
+
+    Return 1
+End Process
+
+Note: ========================================
+Note: WORK QUEUE MANAGEMENT
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Enqueuing an instantiation request adds it to the work queue for processing.
+The queue uses a circular buffer for efficient FIFO processing.
+
+When the queue fills, it doubles in capacity to accommodate more requests.
+@End Reasoning
+:End Note
+
+Process called "enqueue_instantiation_request" takes ctx as Integer, generic_def as Integer, type_args as Integer, type_arg_count as Integer, call_site as Integer returns Integer:
+    Let work_queue be proc memory_get_int64 from Memory with ctx, 16
+    Let capacity be proc memory_get_int64 from Memory with ctx, 24
+    Let size be proc memory_get_int64 from Memory with ctx, 32
+    Let head be proc memory_get_int64 from Memory with ctx, 40
+    Let tail be proc memory_get_int64 from Memory with ctx, 48
+
+    Note: Check if queue is full
+    If size is greater than or equal to capacity:
+        Note: Grow queue
+        proc grow_work_queue with ctx
+        Set work_queue to proc memory_get_int64 from Memory with ctx, 16
+        Set capacity to proc memory_get_int64 from Memory with ctx, 24
+        Set head to proc memory_get_int64 from Memory with ctx, 40
+        Set tail to proc memory_get_int64 from Memory with ctx, 48
+    End If
+
+    Note: Calculate tail position in queue array
+    Let request_offset be tail * 64
+    Let request_ptr be work_queue plus request_offset
+
+    Note: Fill request
+    proc memory_set_int64 from Memory with request_ptr, 0, generic_def
+    proc memory_set_int64 from Memory with request_ptr, 8, type_args
+    proc memory_set_int64 from Memory with request_ptr, 16, type_arg_count
+    proc memory_set_int64 from Memory with request_ptr, 24, call_site
+    proc memory_set_int64 from Memory with request_ptr, 32, 0
+
+    Note: Zero reserved fields
+    proc memory_set_int64 from Memory with request_ptr, 40, 0
+    proc memory_set_int64 from Memory with request_ptr, 48, 0
+    proc memory_set_int64 from Memory with request_ptr, 56, 0
+
+    Note: Advance tail (circular)
+    Set tail to (tail plus 1) modulo by capacity
+    proc memory_set_int64 from Memory with ctx, 48, tail
+
+    Note: Increment size
+    Set size to size plus 1
+    proc memory_set_int64 from Memory with ctx, 32, size
+
+    Return 1
+End Process
+
+Note:
+@Reasoning
+Dequeuing removes and returns the next instantiation request from the queue.
+Returns null if queue is empty.
+@End Reasoning
+:End Note
+
+Process called "dequeue_instantiation_request" takes ctx as Integer returns Integer:
+    Let work_queue be proc memory_get_int64 from Memory with ctx, 16
+    Let capacity be proc memory_get_int64 from Memory with ctx, 24
+    Let size be proc memory_get_int64 from Memory with ctx, 32
+    Let head be proc memory_get_int64 from Memory with ctx, 40
+
+    Note: Check if queue is empty
+    If size is equal to 0:
+        Return 0
+    End If
+
+    Note: Calculate head position
+    Let request_offset be head * 64
+    Let request_ptr be work_queue plus request_offset
+
+    Note: Allocate request structure for return
+    Let returned_request be proc allocate from Layout with 64
+    proc memory_copy from Memory with returned_request, request_ptr, 64
+
+    Note: Advance head (circular)
+    Set head to (head plus 1) modulo by capacity
+    proc memory_set_int64 from Memory with ctx, 40, head
+
+    Note: Decrement size
+    Set size to size minus 1
+    proc memory_set_int64 from Memory with ctx, 32, size
+
+    Return returned_request
+End Process
+
+Note:
+@Reasoning
+Growing the work queue doubles its capacity and copies all existing requests
+to the new larger queue. This happens automatically when the queue fills.
+@End Reasoning
+:End Note
+
+Process called "grow_work_queue" takes ctx as Integer returns Integer:
+    Let old_queue be proc memory_get_int64 from Memory with ctx, 16
+    Let old_capacity be proc memory_get_int64 from Memory with ctx, 24
+    Let size be proc memory_get_int64 from Memory with ctx, 32
+    Let head be proc memory_get_int64 from Memory with ctx, 40
+
+    Note: Double capacity
+    Let new_capacity be old_capacity * 2
+    Let new_queue_size be new_capacity * 64
+    Let new_queue be proc allocate from Layout with new_queue_size
+
+    Note: Copy all elements from old queue to new queue (linearize circular buffer)
+    Let dst_idx be 0
+    Let src_idx be head
+
+    While dst_idx is less than size:
+        Let src_offset be src_idx * 64
+        Let dst_offset be dst_idx * 64
+
+        Let src_ptr be old_queue plus src_offset
+        Let dst_ptr be new_queue plus dst_offset
+
+        proc memory_copy from Memory with dst_ptr, src_ptr, 64
+
+        Set src_idx to (src_idx plus 1) modulo by old_capacity
+        Set dst_idx to dst_idx plus 1
+    End While
+
+    Note: Free old queue
+    proc deallocate from Layout with old_queue
+
+    Note: Update context
+    proc memory_set_int64 from Memory with ctx, 16, new_queue
+    proc memory_set_int64 from Memory with ctx, 24, new_capacity
+    proc memory_set_int64 from Memory with ctx, 40, 0
+    proc memory_set_int64 from Memory with ctx, 48, size
+
+    Return 1
+End Process
+
+Note: ========================================
+Note: MAIN MONOMORPHIZATION DRIVER
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+The main monomorphization driver orchestrates the entire process:
+1. Analyze HIR to find all generic call sites
+2. Queue instantiation requests for each call site
+3. Process work queue until empty
+4. Return monomorphized HIR
+
+This is the entry point for monomorphization of a compilation unit.
+@End Reasoning
+:End Note
+
+Process called "monomorphize_compilation_unit" takes hir as Integer, compilation_unit_id as Integer returns Integer:
+    Note: Create monomorphization context
+    Let ctx be proc create_monomorphization_context with compilation_unit_id
+
+    Note: Analyze HIR to discover all generic call sites
+    proc discover_generic_call_sites with ctx, hir
+
+    Note: Process work queue until empty
+    proc process_work_queue with ctx
+
+    Note: Build monomorphized HIR with all instantiated definitions and rewritten call sites
+    Let result be proc build_monomorphized_hir with ctx, hir
+
+    Note: Destroy context
+    proc destroy_monomorphization_context with ctx
+
+    Return result
+End Process
+
+Note:
+@Reasoning
+Processing the work queue is the core loop of monomorphization. It:
+1. Dequeues the next instantiation request
+2. Instantiates the generic definition
+3. Analyzes the instantiated code for new generic calls
+4. Queues any newly discovered instantiations
+5. Repeats until queue is empty
+
+This handles transitive dependencies - instantiating A<Integer> might require
+instantiating B<String> which might require C<Float>, etc.
+@End Reasoning
+:End Note
+
+Process called "process_work_queue" takes ctx as Integer returns Integer:
+    Let iteration_count be 0
+
+    Note: Process until work queue is empty
+    While 1 is equal to 1:
+        Note: Get next request
+        Let request be proc dequeue_instantiation_request with ctx
+
+        If request is equal to 0:
+            Note: Queue is empty - done
+            Return iteration_count
+        End If
+
+        Note: Extract request fields
+        Let generic_def be proc memory_get_int64 from Memory with request, 0
+        Let type_args be proc memory_get_int64 from Memory with request, 8
+        Let type_arg_count be proc memory_get_int64 from Memory with request, 16
+        Let call_site be proc memory_get_int64 from Memory with request, 24
+
+        Note: Perform instantiation
+        Let inst_ctx be proc memory_get_int64 from Memory with ctx, 8
+        Let instantiated_def be proc instantiate_generic from GenericInst with inst_ctx, generic_def, type_args, type_arg_count
+
+        Note: If instantiation succeeded, store mapping and analyze for new generic calls
+        If instantiated_def is not equal to 0:
+            Note: Add instantiated definition to list
+            Let instantiated_defs be proc memory_get_int64 from Memory with ctx, 72
+            proc append from List with instantiated_defs, instantiated_def
+
+            Note: Map call site to instantiated definition
+            If call_site is not equal to 0:
+                Let call_site_map be proc memory_get_int64 from Memory with ctx, 80
+                proc insert from HashTable with call_site_map, call_site, instantiated_def
+            End If
+
+            Note: Analyze instantiated definition for new generic calls
+            proc discover_generic_calls_in_definition with ctx, instantiated_def
+
+            Note: Increment processed count
+            Let processed be proc memory_get_int64 from Memory with ctx, 56
+            proc memory_set_int64 from Memory with ctx, 56, (processed plus 1)
+        End If
+
+        Note: Free request structure
+        proc deallocate from Layout with request
+
+        Set iteration_count to iteration_count plus 1
+    End While
+
+    Return iteration_count
+End Process
+
+Note: ========================================
+Note: GENERIC CALL SITE DISCOVERY
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Discovering generic call sites analyzes HIR to find all uses of generic
+types and functions. For each use, we queue an instantiation request with
+the concrete type arguments.
+
+This is a recursive tree traversal that examines expressions, type references,
+and calls.
+@End Reasoning
+:End Note
+
+Process called "discover_generic_call_sites" takes ctx as Integer, hir as Integer returns Integer:
+    Note: Get HIR module structure
+    Let module_count_offset be 8
+    Let modules_offset be 16
+    Let module_count be proc memory_get_int64 from Memory with hir, module_count_offset
+    Let modules be proc memory_get_int64 from Memory with hir, modules_offset
+
+    Note: Analyze each module
+    Let module_idx be 0
+    While module_idx is less than module_count:
+        Let module_ptr_offset be module_idx * 8
+        Let module be proc memory_get_int64 from Memory with modules, module_ptr_offset
+
+        If module is not equal to 0:
+            proc discover_calls_in_module with ctx, module
+        End If
+
+        Set module_idx to module_idx plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "discover_calls_in_module" takes ctx as Integer, module as Integer returns Integer:
+    Note: Get module functions
+    Let func_count_offset be 16
+    Let funcs_offset be 24
+    Let func_count be proc memory_get_int64 from Memory with module, func_count_offset
+    Let funcs be proc memory_get_int64 from Memory with module, funcs_offset
+
+    Note: Analyze each function
+    Let func_idx be 0
+    While func_idx is less than func_count:
+        Let func_ptr_offset be func_idx * 8
+        Let func be proc memory_get_int64 from Memory with funcs, func_ptr_offset
+
+        If func is not equal to 0:
+            proc discover_generic_calls_in_definition with ctx, func
+        End If
+
+        Set func_idx to func_idx plus 1
+    End While
+
+    Note: Get module types
+    Let type_count_offset be 32
+    Let types_offset be 40
+    Let type_count be proc memory_get_int64 from Memory with module, type_count_offset
+    Let types be proc memory_get_int64 from Memory with module, types_offset
+
+    Note: Analyze each type
+    Let type_idx be 0
+    While type_idx is less than type_count:
+        Let type_ptr_offset be type_idx * 8
+        Let type_def be proc memory_get_int64 from Memory with types, type_ptr_offset
+
+        If type_def is not equal to 0:
+            proc discover_calls_in_type_def with ctx, type_def
+        End If
+
+        Set type_idx to type_idx plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "discover_generic_calls_in_definition" takes ctx as Integer, definition as Integer returns Integer:
+    Note: Get definition kind
+    Let kind be proc memory_get_int64 from Memory with definition, 0
+
+    If kind is equal to 1:  Note: PROCESS_DEF
+        Note: Analyze process body for generic calls
+        Let body_offset be 48
+        Let body be proc memory_get_int64 from Memory with definition, body_offset
+        If body is not equal to 0:
+            proc discover_calls_in_statement with ctx, body
+        End If
+    End If
+
+    Return 1
+End Process
+
+Process called "discover_calls_in_type_def" takes ctx as Integer, type_def as Integer returns Integer:
+    Note: Analyze type methods
+    Let method_count_offset be 48
+    Let methods_offset be 56
+    Let method_count be proc memory_get_int64 from Memory with type_def, method_count_offset
+    Let methods be proc memory_get_int64 from Memory with type_def, methods_offset
+
+    Let method_idx be 0
+    While method_idx is less than method_count:
+        Let method_ptr_offset be method_idx * 8
+        Let method be proc memory_get_int64 from Memory with methods, method_ptr_offset
+        If method is not equal to 0:
+            proc discover_generic_calls_in_definition with ctx, method
+        End If
+        Set method_idx to method_idx plus 1
+    End While
+
+    Return 1
+End Process
+
+Process called "discover_calls_in_statement" takes ctx as Integer, stmt as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+
+    Note: Get statement kind
+    Let stmt_kind be proc memory_get_int64 from Memory with stmt, 0
+
+    If stmt_kind is equal to 1:  Note: LET_BINDING
+        Let value_offset be 24
+        Let value be proc memory_get_int64 from Memory with stmt, value_offset
+        proc discover_calls_in_expression with ctx, value
+    End If
+
+    If stmt_kind is equal to 2:  Note: RETURN
+        Let value_offset be 16
+        Let value be proc memory_get_int64 from Memory with stmt, value_offset
+        proc discover_calls_in_expression with ctx, value
+    End If
+
+    If stmt_kind is equal to 3:  Note: IF
+        Let condition_offset be 16
+        Let then_offset be 24
+        Let else_offset be 32
+        Let condition be proc memory_get_int64 from Memory with stmt, condition_offset
+        Let then_stmt be proc memory_get_int64 from Memory with stmt, then_offset
+        Let else_stmt be proc memory_get_int64 from Memory with stmt, else_offset
+
+        proc discover_calls_in_expression with ctx, condition
+        proc discover_calls_in_statement with ctx, then_stmt
+        If else_stmt is not equal to 0:
+            proc discover_calls_in_statement with ctx, else_stmt
+        End If
+    End If
+
+    If stmt_kind is equal to 4:  Note: WHILE
+        Let condition_offset be 16
+        Let body_offset be 24
+        Let condition be proc memory_get_int64 from Memory with stmt, condition_offset
+        Let body be proc memory_get_int64 from Memory with stmt, body_offset
+
+        proc discover_calls_in_expression with ctx, condition
+        proc discover_calls_in_statement with ctx, body
+    End If
+
+    If stmt_kind is equal to 5:  Note: BLOCK
+        Let stmt_count_offset be 16
+        Let stmts_offset be 24
+        Let stmt_count be proc memory_get_int64 from Memory with stmt, stmt_count_offset
+        Let stmts be proc memory_get_int64 from Memory with stmt, stmts_offset
+
+        Let stmt_idx be 0
+        While stmt_idx is less than stmt_count:
+            Let stmt_ptr_offset be stmt_idx * 8
+            Let inner_stmt be proc memory_get_int64 from Memory with stmts, stmt_ptr_offset
+            proc discover_calls_in_statement with ctx, inner_stmt
+            Set stmt_idx to stmt_idx plus 1
+        End While
+    End If
+
+    Return 1
+End Process
+
+Process called "discover_calls_in_expression" takes ctx as Integer, expr as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    Note: Get expression kind
+    Let expr_kind be proc memory_get_int64 from Memory with expr, 0
+
+    If expr_kind is equal to 1:  Note: BINARY_OP
+        Let left_offset be 24
+        Let right_offset be 32
+        Let left be proc memory_get_int64 from Memory with expr, left_offset
+        Let right be proc memory_get_int64 from Memory with expr, right_offset
+        proc discover_calls_in_expression with ctx, left
+        proc discover_calls_in_expression with ctx, right
+    End If
+
+    If expr_kind is equal to 2:  Note: UNARY_OP
+        Let operand_offset be 24
+        Let operand be proc memory_get_int64 from Memory with expr, operand_offset
+        proc discover_calls_in_expression with ctx, operand
+    End If
+
+    If expr_kind is equal to 3:  Note: CALL
+        Note: Check if this is a generic call
+        Let callee_offset be 24
+        Let type_args_offset be 32
+        Let arg_count_offset be 40
+        Let callee be proc memory_get_int64 from Memory with expr, callee_offset
+        Let args be proc memory_get_int64 from Memory with expr, type_args_offset
+        Let arg_count be proc memory_get_int64 from Memory with expr, arg_count_offset
+
+        Note: Check if callee is generic
+        Let is_generic be proc is_generic_definition with callee
+        If is_generic is equal to 1:
+            Note: Extract type arguments from call site
+            Let call_type_args be proc extract_type_arguments_from_call with expr
+            Let call_type_arg_count be proc get_type_argument_count with expr
+
+            If call_type_args is not equal to 0:
+                Note: Queue instantiation request
+                proc enqueue_instantiation_request with ctx, callee, call_type_args, call_type_arg_count, expr
+            End If
+        End If
+
+        Note: Recursively analyze arguments
+        Let arg_idx be 0
+        While arg_idx is less than arg_count:
+            Let arg_ptr_offset be arg_idx * 8
+            Let arg be proc memory_get_int64 from Memory with args, arg_ptr_offset
+            proc discover_calls_in_expression with ctx, arg
+            Set arg_idx to arg_idx plus 1
+        End While
+    End If
+
+    Return 1
+End Process
+
+Note: ========================================
+Note: UTILITIES
+Note: ========================================
+:End Note
+
+Process called "is_generic_definition" takes definition as Integer returns Integer:
+    If definition is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if definition has generic parameters
+    Let param_count_offset be 48
+    Let param_count be proc memory_get_int64 from Memory with definition, param_count_offset
+
+    If param_count is greater than 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "extract_type_arguments_from_call" takes call_expr as Integer returns Integer:
+    Note: Get type arguments from call expression
+    Let type_args_offset be 48
+    Let type_args be proc memory_get_int64 from Memory with call_expr, type_args_offset
+    Return type_args
+End Process
+
+Process called "get_type_argument_count" takes call_expr as Integer returns Integer:
+    Note: Get type argument count from call expression
+    Let type_arg_count_offset be 56
+    Let type_arg_count be proc memory_get_int64 from Memory with call_expr, type_arg_count_offset
+    Return type_arg_count
+End Process
+
+Note: ========================================
+Note: STATISTICS COLLECTION
+Note: ========================================
+:End Note
+
+Process called "get_monomorphization_statistics" takes ctx as Integer returns Integer:
+    Note: Allocate statistics structure (64 bytes)
+    Let stats be proc allocate from Layout with 64
+
+    Note: Get cache statistics
+    Let cache be proc memory_get_int64 from Memory with ctx, 0
+    Let hit_count_ptr be proc allocate from Layout with 8
+    Let miss_count_ptr be proc allocate from Layout with 8
+    Let entry_count_ptr be proc allocate from Layout with 8
+    Let eviction_count_ptr be proc allocate from Layout with 8
+    Let collision_count_ptr be proc allocate from Layout with 8
+
+    proc cache_get_statistics from Cache with cache, hit_count_ptr, miss_count_ptr, entry_count_ptr, eviction_count_ptr, collision_count_ptr
+
+    Let hit_count be proc memory_get_int64 from Memory with hit_count_ptr, 0
+    Let entry_count be proc memory_get_int64 from Memory with entry_count_ptr, 0
+
+    Note: Fill statistics
+    proc memory_set_int64 from Memory with stats, 0, entry_count
+    proc memory_set_int64 from Memory with stats, 8, hit_count
+    proc memory_set_int64 from Memory with stats, 16, 0
+    proc memory_set_int64 from Memory with stats, 24, 0
+    proc memory_set_int64 from Memory with stats, 32, 0
+
+    Note: Zero reserved
+    proc memory_set_int64 from Memory with stats, 40, 0
+    proc memory_set_int64 from Memory with stats, 48, 0
+    proc memory_set_int64 from Memory with stats, 56, 0
+
+    Note: Free temporary pointers
+    proc deallocate from Layout with hit_count_ptr
+    proc deallocate from Layout with miss_count_ptr
+    proc deallocate from Layout with entry_count_ptr
+    proc deallocate from Layout with eviction_count_ptr
+    proc deallocate from Layout with collision_count_ptr
+
+    Return stats
+End Process
+
+Note: ========================================
+Note: HIR RECONSTRUCTION
+Note: ========================================
+:End Note
+
+Note:
+@Reasoning
+Building the monomorphized HIR creates a new HIR tree with:
+1. All monomorphized function definitions added to the module
+2. All generic call sites rewritten to call monomorphized versions
+
+This transforms the generic HIR into a fully concrete, monomorphized HIR
+ready for lowering to MIR.
+
+The process:
+1. Get all instantiated definitions from context
+2. Add them to the first module's function list (expanded capacity as needed)
+3. Walk all statements/expressions and rewrite call sites using the call_site_mapping
+@End Reasoning
+:End Note
+
+Process called "build_monomorphized_hir" takes ctx as Integer, original_hir as Integer returns Integer:
+    Note: Get instantiated definitions list
+    Let instantiated_defs be proc memory_get_int64 from Memory with ctx, 72
+    Let instantiated_count be proc size from List with instantiated_defs
+
+    Note: Get call site mapping
+    Let call_site_map be proc memory_get_int64 from Memory with ctx, 80
+
+    Note: If no instantiations occurred, return original HIR
+    If instantiated_count is equal to 0:
+        Return original_hir
+    End If
+
+    Note: Get HIR structure (module_count at offset 8, modules at offset 16)
+    Let module_count be proc memory_get_int64 from Memory with original_hir, 8
+    Let modules_ptr be proc memory_get_int64 from Memory with original_hir, 16
+
+    Note: Get first module (assumption: single module for now)
+    If module_count is equal to 0:
+        Display "Warning: No modules in HIR during monomorphization"
+        Return original_hir
+    End If
+
+    Let first_module be proc memory_get_int64 from Memory with modules_ptr, 0
+
+    Note: Get module's function list (func_count at offset 16, funcs at offset 24)
+    Let func_count be proc memory_get_int64 from Memory with first_module, 16
+    Let funcs_ptr be proc memory_get_int64 from Memory with first_module, 24
+
+    Note: Create new expanded function array (original + instantiated)
+    Let new_func_count be func_count plus instantiated_count
+    Let new_funcs_size be new_func_count * 8
+    Let new_funcs be proc allocate from Layout with new_funcs_size
+
+    Note: Copy original functions to new array
+    Let copy_size be func_count * 8
+    proc memory_copy from Memory with new_funcs, funcs_ptr, copy_size
+
+    Note: Append instantiated definitions
+    Let inst_idx be 0
+    While inst_idx is less than instantiated_count:
+        Let instantiated_def be proc get from List with instantiated_defs, inst_idx
+        Let target_offset be (func_count plus inst_idx) * 8
+        proc memory_set_int64 from Memory with new_funcs, target_offset, instantiated_def
+        Set inst_idx to inst_idx plus 1
+    End While
+
+    Note: Update module with new function array
+    proc memory_set_int64 from Memory with first_module, 16, new_func_count
+    proc deallocate from Layout with funcs_ptr
+    proc memory_set_int64 from Memory with first_module, 24, new_funcs
+
+    Note: Rewrite all call sites in the HIR to use monomorphized versions
+    proc rewrite_call_sites_in_module with first_module, call_site_map
+
+    Return original_hir
+End Process
+
+Note:
+@Reasoning
+Rewriting call sites walks the entire HIR module and for each call expression,
+checks if it's in the call_site_mapping. If so, replaces the callee with the
+monomorphized version.
+
+This ensures all generic calls are replaced with calls to concrete instantiations.
+@End Reasoning
+:End Note
+
+Process called "rewrite_call_sites_in_module" takes module as Integer, call_site_map as Integer returns Integer:
+    Note: Get module functions (func_count at offset 16, funcs at offset 24)
+    Let func_count be proc memory_get_int64 from Memory with module, 16
+    Let funcs be proc memory_get_int64 from Memory with module, 24
+
+    Note: Rewrite call sites in each function
+    Let func_idx be 0
+    While func_idx is less than func_count:
+        Let func_ptr_offset be func_idx * 8
+        Let func be proc memory_get_int64 from Memory with funcs, func_ptr_offset
+
+        If func is not equal to 0:
+            Note: Get function body (body at offset 48)
+            Let body_offset be 48
+            Let body be proc memory_get_int64 from Memory with func, body_offset
+
+            If body is not equal to 0:
+                proc rewrite_call_sites_in_statement with body, call_site_map
+            End If
+        End If
+
+        Set func_idx to func_idx plus 1
+    End While
+
+    Return 1
+End Process
+
+Note:
+@Reasoning
+Recursively walks statements to find and rewrite call expressions.
+For each statement type, recursively processes nested statements and expressions.
+@End Reasoning
+:End Note
+
+Process called "rewrite_call_sites_in_statement" takes stmt as Integer, call_site_map as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+
+    Note: Get statement kind (at offset 0)
+    Let stmt_kind be proc memory_get_int64 from Memory with stmt, 0
+
+    If stmt_kind is equal to 11000:  Note: LET_BINDING
+        Let value_offset be 24
+        Let value be proc memory_get_int64 from Memory with stmt, value_offset
+        proc rewrite_call_sites_in_expression with value, call_site_map
+    End If
+
+    If stmt_kind is equal to 11010:  Note: RETURN
+        Let value_offset be 16
+        Let value be proc memory_get_int64 from Memory with stmt, value_offset
+        proc rewrite_call_sites_in_expression with value, call_site_map
+    End If
+
+    If stmt_kind is equal to 11003:  Note: IF
+        Let condition_offset be 16
+        Let then_offset be 24
+        Let else_offset be 32
+        Let condition be proc memory_get_int64 from Memory with stmt, condition_offset
+        Let then_stmt be proc memory_get_int64 from Memory with stmt, then_offset
+        Let else_stmt be proc memory_get_int64 from Memory with stmt, else_offset
+
+        proc rewrite_call_sites_in_expression with condition, call_site_map
+        proc rewrite_call_sites_in_statement with then_stmt, call_site_map
+        If else_stmt is not equal to 0:
+            proc rewrite_call_sites_in_statement with else_stmt, call_site_map
+        End If
+    End If
+
+    If stmt_kind is equal to 11008:  Note: WHILE
+        Let condition_offset be 16
+        Let body_offset be 24
+        Let condition be proc memory_get_int64 from Memory with stmt, condition_offset
+        Let body be proc memory_get_int64 from Memory with stmt, body_offset
+
+        proc rewrite_call_sites_in_expression with condition, call_site_map
+        proc rewrite_call_sites_in_statement with body, call_site_map
+    End If
+
+    If stmt_kind is equal to 11007:  Note: FOR
+        Let iterable_offset be 24
+        Let body_offset be 32
+        Let iterable be proc memory_get_int64 from Memory with stmt, iterable_offset
+        Let body be proc memory_get_int64 from Memory with stmt, body_offset
+
+        proc rewrite_call_sites_in_expression with iterable, call_site_map
+        proc rewrite_call_sites_in_statement with body, call_site_map
+    End If
+
+    If stmt_kind is equal to 11018:  Note: BLOCK_STATEMENT
+        Note: Block contains list of child statements
+        Let children_offset be 24
+        Let children be proc memory_get_int64 from Memory with stmt, children_offset
+        Let child_count be proc memory_get_int64 from Memory with stmt, 32
+
+        Let child_idx be 0
+        While child_idx is less than child_count:
+            Let child_offset be child_idx * 8
+            Let child be proc memory_get_int64 from Memory with children, child_offset
+            proc rewrite_call_sites_in_statement with child, call_site_map
+            Set child_idx to child_idx plus 1
+        End While
+    End If
+
+    Return 1
+End Process
+
+Note:
+@Reasoning
+Recursively walks expressions to find call expressions that need rewriting.
+When a call expression is found, checks if it's in the call_site_mapping.
+If mapped, replaces the callee with the monomorphized function.
+@End Reasoning
+:End Note
+
+Process called "rewrite_call_sites_in_expression" takes expr as Integer, call_site_map as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+
+    Note: Get expression kind (at offset 0)
+    Let expr_kind be proc memory_get_int64 from Memory with expr, 0
+
+    If expr_kind is equal to 10005:  Note: CALL_EXPRESSION
+        Note: Check if this call site has a monomorphized target
+        Let monomorphized_def be proc get from HashTable with call_site_map, expr
+
+        If monomorphized_def is not equal to 0:
+            Note: Replace callee with monomorphized function (callee at offset 8 in HIRCallExpression)
+            Note: Using offset 24 based on HIRNode base (96 bytes) then HIRCallExpression callee field
+            Let callee_offset be 24
+            proc memory_set_int64 from Memory with expr, callee_offset, monomorphized_def
+        End If
+
+        Note: Recursively process arguments
+        Let args_offset be 32
+        Let arg_count_offset be 40
+        Let args be proc memory_get_int64 from Memory with expr, args_offset
+        Let arg_count be proc memory_get_int64 from Memory with expr, arg_count_offset
+
+        Let arg_idx be 0
+        While arg_idx is less than arg_count:
+            Let arg_offset be arg_idx * 8
+            Let arg be proc memory_get_int64 from Memory with args, arg_offset
+            proc rewrite_call_sites_in_expression with arg, call_site_map
+            Set arg_idx to arg_idx plus 1
+        End While
+    End If
+
+    If expr_kind is equal to 10002:  Note: BINARY_EXPRESSION
+        Let left_offset be 16
+        Let right_offset be 24
+        Let left be proc memory_get_int64 from Memory with expr, left_offset
+        Let right be proc memory_get_int64 from Memory with expr, right_offset
+
+        proc rewrite_call_sites_in_expression with left, call_site_map
+        proc rewrite_call_sites_in_expression with right, call_site_map
+    End If
+
+    If expr_kind is equal to 10003:  Note: UNARY_EXPRESSION
+        Let operand_offset be 16
+        Let operand be proc memory_get_int64 from Memory with expr, operand_offset
+        proc rewrite_call_sites_in_expression with operand, call_site_map
+    End If
+
+    If expr_kind is equal to 10007:  Note: MEMBER_EXPRESSION
+        Let object_offset be 8
+        Let object be proc memory_get_int64 from Memory with expr, object_offset
+        proc rewrite_call_sites_in_expression with object, call_site_map
+    End If
+
+    If expr_kind is equal to 10006:  Note: INDEX_EXPRESSION
+        Let object_offset be 8
+        Let index_offset be 16
+        Let object be proc memory_get_int64 from Memory with expr, object_offset
+        Let index be proc memory_get_int64 from Memory with expr, index_offset
+
+        proc rewrite_call_sites_in_expression with object, call_site_map
+        proc rewrite_call_sites_in_expression with index, call_site_map
+    End If
+
+    Return 1
+End Process

@@ -1,0 +1,1179 @@
+Note: ================================================================
+Note: Bifrost Memory Access Analysis
+Note: ================================================================
+Note: Analyzes memory access patterns for GPU coalescing, cache locality,
+Note: and optimal data layout. Detects opportunities for shared memory,
+Note: identifies bank conflicts, and estimates bandwidth requirements.
+Note: ================================================================
+
+Import "../graph/graph.runa" as Graph
+Import "../graph/node.runa" as Node
+Import "../graph/edge.runa" as Edge
+Import "std/collections/list.runa" as List
+Import "std/collections/dict.runa" as Dict
+Import "std/core/string.runa" as String
+Import "std/core/math.runa" as Math
+
+Note: ================================================================
+Note: Access Pattern Constants
+Note: ================================================================
+
+Constant ACCESS_UNKNOWN as Integer is 0
+Constant ACCESS_CONTIGUOUS as Integer is 1       Note: Sequential, stride=1
+Constant ACCESS_STRIDED as Integer is 2          Note: Regular stride>1
+Constant ACCESS_RANDOM as Integer is 3           Note: Irregular pattern
+Constant ACCESS_BROADCAST as Integer is 4        Note: Same value to all threads
+Constant ACCESS_GATHER as Integer is 5           Note: Indexed read
+Constant ACCESS_SCATTER as Integer is 6          Note: Indexed write
+
+Note: ================================================================
+Note: Memory Space Constants
+Note: ================================================================
+
+Constant MEMORY_GLOBAL as Integer is 0           Note: Main device memory (slow, large)
+Constant MEMORY_SHARED as Integer is 1           Note: On-chip scratchpad (fast, small)
+Constant MEMORY_LOCAL as Integer is 2            Note: Thread-local registers (fastest)
+Constant MEMORY_CONSTANT as Integer is 3         Note: Read-only, cached, broadcast
+
+Note: ================================================================
+Note: Type Definitions
+Note: ================================================================
+
+Type AccessPattern is:
+    pattern_type as Integer         Note: ACCESS_* constant
+    stride as Integer               Note: Access stride in elements
+    element_size as Integer         Note: Size of each element in bytes
+    is_aligned as Boolean           Note: Whether accesses are aligned
+    is_coalesced as Boolean         Note: Whether GPU accesses coalesce
+End Type
+
+Type MemoryFootprint is:
+    total_bytes as Integer          Note: Total memory required
+    reads_bytes as Integer          Note: Bytes read
+    writes_bytes as Integer         Note: Bytes written
+    peak_usage as Integer           Note: Peak simultaneous usage
+End Type
+
+Type LocalityInfo is:
+    spatial_locality as Float       Note: 0.0-1.0, higher is better
+    temporal_locality as Float      Note: 0.0-1.0, higher is better
+    cache_reuse_distance as Integer Note: Average reuse distance in accesses
+    working_set_size as Integer     Note: Working set size in bytes
+End Type
+
+Type CoalescingInfo is:
+    is_coalesced as Boolean         Note: Whether accesses coalesce
+    coalescing_factor as Float      Note: 0.0-1.0, 1.0 is perfect
+    wasted_transactions as Integer  Note: Number of wasted memory transactions
+    optimal_transactions as Integer Note: Minimum possible transactions
+End Type
+
+Type BankConflictInfo is:
+    has_conflicts as Boolean        Note: Whether bank conflicts exist
+    conflict_degree as Integer      Note: Max serialization factor
+    conflict_pattern as Integer     Note: Pattern causing conflicts
+End Type
+
+Note: ================================================================
+Note: Access Pattern Classification
+Note: ================================================================
+
+Process called "analyze_access_pattern" that takes graph as Integer, node as Integer returns Integer:
+    @Reasoning
+    Classifies memory access patterns for optimization opportunities.
+
+    Patterns:
+    - CONTIGUOUS: Sequential access with stride=1 (best for caches/coalescing)
+    - STRIDED: Regular stride>1 (predictable, may benefit from prefetch)
+    - RANDOM: Irregular access (poor locality, hard to optimize)
+    - BROADCAST: Same value accessed by all threads (use constant memory)
+    - GATHER: Indirect reads via index array (scatter/gather instructions)
+    - SCATTER: Indirect writes via index array (requires atomics)
+
+    Analysis:
+    1. Examine the address computation for the memory operation
+    2. Determine if access is affine (base + constant*index)
+    3. Extract stride from affine form
+    4. Check for indirect indexing (gather/scatter)
+    5. Check for invariant address (broadcast)
+    @End Reasoning
+
+    @Implementation
+    1. Get node operation kind (Load or Store)
+    2. Get address computation subgraph
+    3. Analyze address expression for pattern
+    4. Classify as contiguous, strided, random, etc.
+    5. Compute stride and element size
+    6. Check alignment
+    7. Check coalescing potential
+    8. Return AccessPattern structure
+    @End Implementation
+
+    Let access_pattern be a value of type AccessPattern with
+        pattern_type as ACCESS_UNKNOWN,
+        stride as 1,
+        element_size as 0,
+        is_aligned as false,
+        is_coalesced as false
+
+    Note: Get operation kind
+    Let op_kind be Node.get_node_opkind(node)
+
+    Note: Load=40, Store=41
+    Let is_memory_op be false
+    If op_kind equals 40:
+        Let is_memory_op be true
+    End If
+    If op_kind equals 41:
+        Let is_memory_op be true
+    End If
+
+    If is_memory_op equals false:
+        Return access_pattern
+    End If
+
+    Note: Get address computation (first input is address)
+    Let inputs be Node.get_node_inputs(node)
+    If List.length(inputs) equals 0:
+        Return access_pattern
+    End If
+
+    Let address_node be List.get(inputs, 0)
+
+    Note: Get element size from data type
+    Let data_type be Node.get_node_output_type(node)
+    Let element_size be Node.get_type_size_bytes(data_type)
+    Set access_pattern.element_size to element_size
+
+    Note: Analyze address computation for pattern
+    Let pattern_info be classify_address_pattern(graph, address_node)
+
+    Note: Extract pattern type and stride
+    Let pattern_type be List.get(pattern_info, 0)
+    Let stride be List.get(pattern_info, 1)
+
+    Set access_pattern.pattern_type to pattern_type
+    Set access_pattern.stride to stride
+
+    Note: Check alignment (element size must be power of 2, address aligned)
+    Let is_aligned be check_alignment(address_node, element_size)
+    Set access_pattern.is_aligned to is_aligned
+
+    Note: Check coalescing (contiguous + aligned + element size suitable)
+    Let is_coalesced be false
+    If pattern_type equals ACCESS_CONTIGUOUS:
+        If is_aligned equals true:
+            Let is_coalesced be true
+        End If
+    End If
+    Set access_pattern.is_coalesced to is_coalesced
+
+    Return access_pattern
+End Process
+
+Process called "classify_address_pattern" that takes graph as Integer, address_node as Integer returns Integer:
+    @Reasoning
+    Classifies the address computation pattern.
+
+    Common patterns:
+    - base + index → CONTIGUOUS (stride=1)
+    - base + index*stride → STRIDED
+    - base + array[index] → GATHER/SCATTER (indirect)
+    - constant → BROADCAST (invariant)
+    - complex expression → RANDOM
+
+    Detection:
+    - Check if address is constant (broadcast)
+    - Check for affine form: base + coeff*index
+    - Extract coefficient as stride
+    - Check for indirect indexing (load in address computation)
+    @End Reasoning
+
+    @Implementation
+    1. Check if address node is constant → BROADCAST
+    2. Check if address is affine (base + coeff*index)
+    3. If affine, extract stride (coeff), return CONTIGUOUS or STRIDED
+    4. Check for load operation in address → GATHER/SCATTER
+    5. Otherwise return RANDOM
+    6. Return list [pattern_type, stride]
+    @End Implementation
+
+    Note: Check if address is constant (broadcast pattern)
+    Let is_constant be Node.is_node_constant(address_node)
+    If is_constant equals true:
+        Let result be List.create()
+        List.append(result, ACCESS_BROADCAST)
+        List.append(result, 0)
+        Return result
+    End If
+
+    Note: Try to extract affine form (base + stride*index)
+    Let affine_info be extract_affine_form(graph, address_node)
+    Let is_affine be List.get(affine_info, 0)
+
+    If is_affine equals true:
+        Let stride be List.get(affine_info, 1)
+
+        Note: Stride=1 is contiguous, stride>1 is strided
+        Let pattern_type be ACCESS_STRIDED
+        If stride equals 1:
+            Let pattern_type be ACCESS_CONTIGUOUS
+        End If
+
+        Let result be List.create()
+        List.append(result, pattern_type)
+        List.append(result, stride)
+        Return result
+    End If
+
+    Note: Check for indirect indexing (gather/scatter)
+    Let has_indirect be has_indirect_addressing(graph, address_node)
+    If has_indirect equals true:
+        Let op_kind be Node.get_node_opkind(address_node)
+
+        Note: Distinguish gather (load) vs scatter (store)
+        Let pattern_type be ACCESS_GATHER
+        If op_kind equals 41:
+            Let pattern_type be ACCESS_SCATTER
+        End If
+
+        Let result be List.create()
+        List.append(result, pattern_type)
+        List.append(result, 1)
+        Return result
+    End If
+
+    Note: Default to random access
+    Let result be List.create()
+    List.append(result, ACCESS_RANDOM)
+    List.append(result, 1)
+    Return result
+End Process
+
+Note: ================================================================
+Note: GPU Memory Coalescing Detection
+Note: ================================================================
+
+Process called "detect_memory_coalescing" that takes graph as Integer, memory_ops as Integer returns Integer:
+    @Reasoning
+    GPU memory coalescing occurs when threads in a warp access contiguous
+    memory addresses in a single transaction.
+
+    Requirements for coalescing:
+    1. Threads access consecutive addresses
+    2. Addresses are aligned to cache line (typically 128 bytes)
+    3. Access width matches transaction size (32, 64, 128 bytes)
+
+    Benefits:
+    - Single memory transaction instead of 32 (warp size)
+    - ~32x bandwidth improvement
+    - Critical for GPU performance
+
+    Analysis:
+    - Check if all ops access contiguous memory
+    - Verify alignment to cache line boundary
+    - Compute wasted vs optimal transactions
+    @End Reasoning
+
+    @Implementation
+    1. For each memory operation, get access pattern
+    2. Check if pattern is contiguous and aligned
+    3. Compute number of memory transactions needed
+    4. Compute optimal transaction count
+    5. Calculate coalescing factor = optimal / actual
+    6. Return CoalescingInfo structure
+    @End Implementation
+
+    Let coalescing_info be a value of type CoalescingInfo with
+        is_coalesced as true,
+        coalescing_factor as 1.0,
+        wasted_transactions as 0,
+        optimal_transactions as 0
+
+    Let op_count be List.length(memory_ops)
+    Let total_transactions be 0
+    Let optimal_transactions be 0
+    Let all_coalesced be true
+
+    Let i be 0
+    While i is less than op_count:
+        Let mem_op be List.get(memory_ops, i)
+
+        Note: Analyze access pattern
+        Let pattern be analyze_access_pattern(graph, mem_op)
+
+        Note: Extract pattern info
+        Let pattern_type be Layout.memory_get_int64(pattern, 0)
+        Let is_aligned be Layout.memory_get_int64(pattern, 24)
+        Let element_size be Layout.memory_get_int64(pattern, 16)
+
+        Note: Check if this operation coalesces
+        Let op_coalesced be false
+        If pattern_type equals ACCESS_CONTIGUOUS:
+            If is_aligned equals true:
+                Let op_coalesced be true
+            End If
+        End If
+
+        If op_coalesced equals false:
+            Let all_coalesced be false
+        End If
+
+        Note: Compute transaction count
+        Note: Assume warp size = 32 threads
+        Let warp_size be 32
+        Let cache_line_size be 128
+
+        If op_coalesced equals true:
+            Note: Coalesced access - one transaction per cache line
+            Let bytes_accessed be warp_size * element_size
+            Let transactions be bytes_accessed / cache_line_size
+            If bytes_accessed % cache_line_size is greater than 0:
+                Let transactions be transactions + 1
+            End If
+
+            Let total_transactions be total_transactions + transactions
+            Let optimal_transactions be optimal_transactions + transactions
+        End If
+
+        If op_coalesced equals false:
+            Note: Uncoalesced - one transaction per thread
+            Let total_transactions be total_transactions + warp_size
+            Let optimal_transactions be optimal_transactions + 1
+        End If
+
+        Let i be i + 1
+    End While
+
+    Set coalescing_info.is_coalesced to all_coalesced
+    Set coalescing_info.optimal_transactions to optimal_transactions
+
+    Note: Compute wasted transactions
+    Let wasted be total_transactions - optimal_transactions
+    Set coalescing_info.wasted_transactions to wasted
+
+    Note: Compute coalescing factor
+    Let factor be 1.0
+    If total_transactions is greater than 0:
+        Let optimal_float be Math.int_to_float(optimal_transactions)
+        Let total_float be Math.int_to_float(total_transactions)
+        Let factor be optimal_float / total_float
+    End If
+    Set coalescing_info.coalescing_factor to factor
+
+    Return coalescing_info
+End Process
+
+Note: ================================================================
+Note: Cache Locality Analysis
+Note: ================================================================
+
+Process called "compute_cache_locality" that takes graph as Integer, memory_ops as Integer returns Integer:
+    @Reasoning
+    Cache locality has two forms:
+    - Spatial locality: Accessing nearby memory addresses (same cache line)
+    - Temporal locality: Reusing same addresses over time (cache hits)
+
+    Measurement:
+    - Spatial: Ratio of unique cache lines to total accesses
+    - Temporal: Average reuse distance (accesses between reuses)
+    - Working set: Unique addresses accessed
+
+    Good locality:
+    - High spatial: Most accesses hit same cache lines (contiguous)
+    - High temporal: Addresses reused quickly (small reuse distance)
+    - Small working set: Fits in cache
+    @End Reasoning
+
+    @Implementation
+    1. Track unique cache lines accessed
+    2. Track access sequence for reuse distance
+    3. Compute spatial locality = unique_lines / total_accesses
+    4. Compute temporal locality from reuse distance
+    5. Compute working set size
+    6. Return LocalityInfo structure
+    @End Implementation
+
+    Let locality_info be a value of type LocalityInfo with
+        spatial_locality as 0.0,
+        temporal_locality as 0.0,
+        cache_reuse_distance as 0,
+        working_set_size as 0
+
+    Let cache_line_size be 64
+    Let unique_cache_lines be Dict.create()
+    Let access_sequence be List.create()
+    Let unique_addresses be Dict.create()
+
+    Let op_count be List.length(memory_ops)
+
+    Note: Analyze each memory operation
+    Let i be 0
+    While i is less than op_count:
+        Let mem_op be List.get(memory_ops, i)
+
+        Note: Get accessed address (simplified - use node pointer as proxy)
+        Let address be mem_op
+
+        Note: Track unique addresses for working set
+        Dict.set(unique_addresses, address, 1)
+
+        Note: Compute cache line (address / cache_line_size)
+        Let cache_line be address / cache_line_size
+
+        Note: Track unique cache lines
+        Dict.set(unique_cache_lines, cache_line, 1)
+
+        Note: Track access sequence for reuse analysis
+        List.append(access_sequence, address)
+
+        Let i be i + 1
+    End While
+
+    Note: Compute spatial locality
+    Let unique_line_count be Dict.size(unique_cache_lines)
+    Let total_accesses be op_count
+
+    Let spatial be 1.0
+    If total_accesses is greater than 0:
+        Let unique_float be Math.int_to_float(unique_line_count)
+        Let total_float be Math.int_to_float(total_accesses)
+        Let spatial be unique_float / total_float
+    End If
+    Set locality_info.spatial_locality to spatial
+
+    Note: Compute temporal locality from reuse distance
+    Let reuse_info be compute_reuse_distance(access_sequence)
+    Let avg_reuse_distance be List.get(reuse_info, 0)
+    Let temporal be List.get(reuse_info, 1)
+
+    Set locality_info.cache_reuse_distance to avg_reuse_distance
+    Set locality_info.temporal_locality to temporal
+
+    Note: Compute working set size
+    Let working_set_size be Dict.size(unique_addresses) * 8
+    Set locality_info.working_set_size to working_set_size
+
+    Return locality_info
+End Process
+
+Note: ================================================================
+Note: Shared Memory Opportunities
+Note: ================================================================
+
+Process called "detect_shared_memory_opportunity" that takes graph as Integer, memory_ops as Integer returns Boolean:
+    @Reasoning
+    Shared memory (GPU scratchpad) is beneficial when:
+    1. Data is reused multiple times (high temporal locality)
+    2. Multiple threads access same data (data sharing)
+    3. Working set fits in shared memory (~48KB typical)
+    4. Access pattern benefits from explicit control
+
+    Detection:
+    - Analyze reuse: same address accessed by multiple threads
+    - Check working set size < shared memory size
+    - Verify access pattern is regular (not completely random)
+    - Estimate benefit vs overhead of copying to shared memory
+    @End Reasoning
+
+    @Implementation
+    1. Analyze reuse across memory operations
+    2. Compute working set size
+    3. Check if working set fits in shared memory
+    4. Verify sufficient reuse to amortize copy cost
+    5. Return true if shared memory beneficial
+    @End Implementation
+
+    Note: Compute locality info
+    Let locality be compute_cache_locality(graph, memory_ops)
+
+    Note: Extract reuse distance and working set
+    Let reuse_distance be Layout.memory_get_int64(locality, 16)
+    Let working_set_size be Layout.memory_get_int64(locality, 24)
+
+    Note: Shared memory size limit (typical: 48KB)
+    Let shared_mem_limit be 49152
+
+    Note: Check if working set fits
+    If working_set_size is greater than shared_mem_limit:
+        Return false
+    End If
+
+    Note: Check for sufficient reuse (reuse distance < threshold)
+    Let reuse_threshold be 100
+    If reuse_distance is greater than reuse_threshold:
+        Return false
+    End If
+
+    Note: Check temporal locality (high reuse)
+    Let temporal_locality be Layout.memory_get_float64(locality, 8)
+    Let locality_threshold be 0.5
+
+    If temporal_locality is greater than locality_threshold:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Note: ================================================================
+Note: Bank Conflict Detection
+Note: ================================================================
+
+Process called "analyze_bank_conflicts" that takes graph as Integer, shared_mem_ops as Integer returns Integer:
+    @Reasoning
+    GPU shared memory is divided into banks (typically 32).
+    Bank conflicts occur when multiple threads access different addresses
+    in the same bank simultaneously, causing serialization.
+
+    Conflict detection:
+    - Address bank = (address / 4) % 32 (for 4-byte elements)
+    - Conflict if threads access different addresses in same bank
+    - Degree = max threads accessing same bank simultaneously
+
+    Patterns:
+    - Stride = bank_count → severe conflicts
+    - Stride = 1 → no conflicts (broadcast if same address)
+    - Stride power-of-2 → potential conflicts
+    @End Reasoning
+
+    @Implementation
+    1. For each shared memory access, extract address pattern
+    2. Compute bank index for each thread
+    3. Detect conflicts (different addresses, same bank)
+    4. Compute conflict degree (serialization factor)
+    5. Return BankConflictInfo structure
+    @End Implementation
+
+    Let conflict_info be a value of type BankConflictInfo with
+        has_conflicts as false,
+        conflict_degree as 1,
+        conflict_pattern as 0
+
+    Let bank_count be 32
+    Let element_size be 4
+
+    Let op_count be List.length(shared_mem_ops)
+
+    Let max_conflict_degree be 1
+    Let any_conflicts be false
+
+    Note: Analyze each shared memory operation
+    Let i be 0
+    While i is less than op_count:
+        Let mem_op be List.get(shared_mem_ops, i)
+
+        Note: Get access pattern
+        Let pattern be analyze_access_pattern(graph, mem_op)
+        Let stride be Layout.memory_get_int64(pattern, 8)
+
+        Note: Simulate warp access (32 threads)
+        Let warp_size be 32
+        Let bank_access_count be Dict.create()
+
+        Note: For each thread, compute bank
+        Let thread_id be 0
+        While thread_id is less than warp_size:
+            Note: Address for this thread = base + thread_id * stride * element_size
+            Let byte_offset be thread_id * stride * element_size
+
+            Note: Bank = (byte_offset / element_size) % bank_count
+            Let element_offset be byte_offset / element_size
+            Let bank be element_offset % bank_count
+
+            Note: Track accesses per bank
+            Let current_count be Dict.get(bank_access_count, bank)
+            If current_count equals 0:
+                Let current_count be 0
+            End If
+            Let current_count be current_count + 1
+            Dict.set(bank_access_count, bank, current_count)
+
+            Let thread_id be thread_id + 1
+        End While
+
+        Note: Find maximum accesses to any bank (conflict degree)
+        Let bank_keys be Dict.keys(bank_access_count)
+        Let bank_key_count be List.length(bank_keys)
+
+        Let j be 0
+        While j is less than bank_key_count:
+            Let bank be List.get(bank_keys, j)
+            Let access_count be Dict.get(bank_access_count, bank)
+
+            If access_count is greater than 1:
+                Let any_conflicts be true
+                If access_count is greater than max_conflict_degree:
+                    Let max_conflict_degree be access_count
+                End If
+            End If
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Set conflict_info.has_conflicts to any_conflicts
+    Set conflict_info.conflict_degree to max_conflict_degree
+
+    Return conflict_info
+End Process
+
+Note: ================================================================
+Note: Memory Footprint Calculation
+Note: ================================================================
+
+Process called "compute_memory_footprint" that takes graph as Integer, nodes as Integer returns Integer:
+    @Reasoning
+    Computes total memory requirements for a computation graph.
+
+    Calculation:
+    - Total bytes: Sum of all buffer sizes
+    - Read bytes: Total data read from memory
+    - Write bytes: Total data written to memory
+    - Peak usage: Maximum simultaneous live buffers
+
+    Uses:
+    - Resource allocation planning
+    - Determine if computation fits in device memory
+    - Estimate bandwidth requirements
+    @End Reasoning
+
+    @Implementation
+    1. For each node, compute output buffer size
+    2. Track read/write operations and sizes
+    3. Perform liveness analysis for peak usage
+    4. Sum all memory requirements
+    5. Return MemoryFootprint structure
+    @End Implementation
+
+    Let footprint be a value of type MemoryFootprint with
+        total_bytes as 0,
+        reads_bytes as 0,
+        writes_bytes as 0,
+        peak_usage as 0
+
+    Let node_count be List.length(nodes)
+
+    Let total_bytes be 0
+    Let reads_bytes be 0
+    Let writes_bytes be 0
+
+    Note: Compute total and read/write bytes
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(nodes, i)
+
+        Note: Get output type and size
+        Let output_type be Node.get_node_output_type(node)
+        Let type_size be Node.get_type_size_bytes(output_type)
+
+        Note: Add to total
+        Let total_bytes be total_bytes + type_size
+
+        Note: Check if load or store
+        Let op_kind be Node.get_node_opkind(node)
+
+        If op_kind equals 40:
+            Note: Load operation
+            Let reads_bytes be reads_bytes + type_size
+        End If
+
+        If op_kind equals 41:
+            Note: Store operation
+            Let writes_bytes be writes_bytes + type_size
+        End If
+
+        Let i be i + 1
+    End While
+
+    Set footprint.total_bytes to total_bytes
+    Set footprint.reads_bytes to reads_bytes
+    Set footprint.writes_bytes to writes_bytes
+
+    Note: Compute peak usage via liveness analysis
+    Let peak be compute_peak_memory_usage(graph, nodes)
+    Set footprint.peak_usage to peak
+
+    Return footprint
+End Process
+
+Note: ================================================================
+Note: Memory Space Inference
+Note: ================================================================
+
+Process called "infer_memory_space" that takes graph as Integer, node as Integer returns Integer:
+    @Reasoning
+    Automatically infers the best memory space for data.
+
+    Memory hierarchy:
+    - Local (registers): Thread-private, fastest, very limited (~64KB/SM)
+    - Shared (scratchpad): Block-shared, fast, limited (~48KB)
+    - Constant: Read-only, cached, good for broadcast (64KB)
+    - Global: Large, slow, but abundant (GBs)
+
+    Inference rules:
+    1. Constant data → CONSTANT memory
+    2. Thread-private, scalar → LOCAL (registers)
+    3. Shared across threads, high reuse → SHARED memory
+    4. Large buffers, no sharing → GLOBAL memory
+    @End Reasoning
+
+    @Implementation
+    1. Check if data is constant → CONSTANT
+    2. Check if data is thread-local → LOCAL
+    3. Check for sharing and reuse → SHARED
+    4. Default to GLOBAL
+    5. Return memory space constant
+    @End Implementation
+
+    Note: Check if node is constant
+    Let is_constant be Node.is_node_constant(node)
+    If is_constant equals true:
+        Return MEMORY_CONSTANT
+    End If
+
+    Note: Get output type and size
+    Let output_type be Node.get_node_output_type(node)
+    Let type_size be Node.get_type_size_bytes(output_type)
+
+    Note: Small scalars can go in registers (local memory)
+    Let register_limit be 16
+    If type_size is less than or equal to register_limit:
+        Let is_scalar be Node.is_primitive_type(output_type)
+        If is_scalar equals true:
+            Return MEMORY_LOCAL
+        End If
+    End If
+
+    Note: Check for sharing opportunity (high reuse, fits in shared mem)
+    Let shared_mem_limit be 49152
+    If type_size is less than shared_mem_limit:
+        Note: Would need full reuse analysis here
+        Note: Simplified: check if used by multiple nodes
+        Let users be Graph.get_node_successors(graph, node)
+        Let user_count be List.length(users)
+
+        If user_count is greater than 3:
+            Return MEMORY_SHARED
+        End If
+    End If
+
+    Note: Default to global memory
+    Return MEMORY_GLOBAL
+End Process
+
+Note: ================================================================
+Note: Streaming Pattern Detection
+Note: ================================================================
+
+Process called "detect_streaming_pattern" that takes graph as Integer, nodes as Integer returns Boolean:
+    @Reasoning
+    Streaming pattern: Data flows through pipeline stages with
+    limited reuse. Common in:
+    - Signal processing (filters, FFT)
+    - Video processing (frame pipeline)
+    - FPGA designs (dataflow architecture)
+
+    Characteristics:
+    - Linear data flow (inputs → stages → outputs)
+    - Limited working set per stage
+    - Sequential processing of data batches
+    - Minimal feedback loops
+
+    Detection:
+    - Check for linear chain structure
+    - Verify limited reuse (low temporal locality)
+    - Check for batch processing (array inputs/outputs)
+    @End Reasoning
+
+    @Implementation
+    1. Check if nodes form linear chain
+    2. Verify limited reuse (temporal locality < threshold)
+    3. Check for array/tensor data (batch processing)
+    4. Return true if streaming pattern detected
+    @End Implementation
+
+    Note: Create subgraph from nodes
+    Let subgraph be Graph.get_subgraph(graph, nodes)
+
+    Note: Check for linear chain structure
+    Let is_linear be check_linear_structure(subgraph)
+    If is_linear equals false:
+        Return false
+    End If
+
+    Note: Extract memory operations
+    Let memory_ops be extract_memory_operations_from_nodes(nodes)
+
+    Note: Analyze locality
+    Let locality be compute_cache_locality(graph, memory_ops)
+    Let temporal_locality be Layout.memory_get_float64(locality, 8)
+
+    Note: Streaming has low temporal locality (data used once)
+    Let streaming_threshold be 0.3
+    If temporal_locality is greater than streaming_threshold:
+        Return false
+    End If
+
+    Note: Check for batch processing (array data)
+    Let node_count be List.length(nodes)
+    Let array_count be 0
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(nodes, i)
+        Let output_type be Node.get_node_output_type(node)
+        Let is_array be is_array_type(output_type)
+
+        If is_array equals true:
+            Let array_count be array_count + 1
+        End If
+
+        Let i be i + 1
+    End While
+
+    Note: Most nodes should process arrays for streaming
+    Let array_ratio be Math.int_to_float(array_count) / Math.int_to_float(node_count)
+    If array_ratio is greater than 0.7:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Note: ================================================================
+Note: Alignment Analysis
+Note: ================================================================
+
+Process called "analyze_alignment" that takes graph as Integer, node as Integer returns Boolean:
+    @Reasoning
+    Memory alignment is critical for:
+    - GPU coalescing (128-byte alignment for optimal coalescing)
+    - SIMD loads (16-byte alignment for SSE/AVX)
+    - Atomic operations (natural alignment required)
+
+    Verification:
+    - Check base address alignment
+    - Verify stride preserves alignment
+    - Consider element size
+    @End Reasoning
+
+    @Implementation
+    1. Get address computation
+    2. Check if base address is aligned
+    3. Verify stride maintains alignment
+    4. Check element size is power-of-2
+    5. Return true if properly aligned
+    @End Implementation
+
+    Note: Get address computation
+    Let inputs be Node.get_node_inputs(node)
+    If List.length(inputs) equals 0:
+        Return false
+    End If
+
+    Let address_node be List.get(inputs, 0)
+
+    Note: Get element size
+    Let output_type be Node.get_node_output_type(node)
+    Let element_size be Node.get_type_size_bytes(output_type)
+
+    Note: Check if element size is power-of-2
+    Let is_pow2 be is_power_of_two(element_size)
+    If is_pow2 equals false:
+        Return false
+    End If
+
+    Note: Check alignment
+    Let is_aligned be check_alignment(address_node, element_size)
+
+    Return is_aligned
+End Process
+
+Note: ================================================================
+Note: Bandwidth Estimation
+Note: ================================================================
+
+Process called "compute_bandwidth_requirement" that takes graph as Integer, nodes as Integer returns Float:
+    @Reasoning
+    Estimates memory bandwidth required for computation.
+
+    Formula:
+    - Bandwidth (GB/s) = Total bytes transferred / Execution time
+    - Total bytes = Reads + Writes
+    - Execution time estimated from operation count and throughput
+
+    Uses:
+    - Determine if computation is memory-bound
+    - Verify device bandwidth is sufficient
+    - Guide optimization (reduce transfers vs improve compute)
+    @End Reasoning
+
+    @Implementation
+    1. Compute memory footprint (total reads + writes)
+    2. Estimate execution time from operation counts
+    3. Calculate bandwidth = bytes / time
+    4. Return bandwidth in GB/s
+    @End Implementation
+
+    Note: Compute memory footprint
+    Let footprint be compute_memory_footprint(graph, nodes)
+    Let reads be Layout.memory_get_int64(footprint, 8)
+    Let writes be Layout.memory_get_int64(footprint, 16)
+    Let total_bytes be reads + writes
+
+    Note: Estimate execution time
+    Let node_count be List.length(nodes)
+    Let estimated_time_ms be estimate_execution_time(nodes)
+
+    Note: Convert to seconds
+    Let estimated_time_s be Math.int_to_float(estimated_time_ms) / 1000.0
+
+    Note: Compute bandwidth in GB/s
+    Let bytes_float be Math.int_to_float(total_bytes)
+    Let bandwidth_bs be bytes_float / estimated_time_s
+    Let bandwidth_gbs be bandwidth_bs / 1000000000.0
+
+    Return bandwidth_gbs
+End Process
+
+Note: ================================================================
+Note: Helper Functions
+Note: ================================================================
+
+Process called "extract_affine_form" that takes graph as Integer, address_node as Integer returns Integer:
+    Note: Simplified affine extraction
+    Note: Real implementation would analyze arithmetic operations
+    Note: Return [is_affine (bool), stride]
+
+    Let result be List.create()
+    List.append(result, true)
+    List.append(result, 1)
+    Return result
+End Process
+
+Process called "has_indirect_addressing" that takes graph as Integer, address_node as Integer returns Boolean:
+    Note: Check if address computation contains load operation
+    Let op_kind be Node.get_node_opkind(address_node)
+
+    If op_kind equals 40:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "check_alignment" that takes address_node as Integer, element_size as Integer returns Boolean:
+    Note: Simplified alignment check
+    Note: Real implementation would analyze address arithmetic
+    Note: Assume aligned for now
+    Return true
+End Process
+
+Process called "compute_reuse_distance" that takes access_sequence as Integer returns Integer:
+    Note: Compute average reuse distance
+    Let reuse_distances be Dict.create()
+    Let last_access be Dict.create()
+
+    Let seq_length be List.length(access_sequence)
+
+    Let i be 0
+    While i is less than seq_length:
+        Let address be List.get(access_sequence, i)
+
+        Note: Check if address was accessed before
+        Let last_pos be Dict.get(last_access, address)
+
+        If last_pos is not equal to 0:
+            Note: Compute reuse distance
+            Let distance be i - last_pos
+            Dict.set(reuse_distances, address, distance)
+        End If
+
+        Note: Update last access position
+        Dict.set(last_access, address, i)
+
+        Let i be i + 1
+    End While
+
+    Note: Compute average reuse distance
+    Let total_distance be 0
+    let count be Dict.size(reuse_distances)
+
+    If count equals 0:
+        Let result be List.create()
+        List.append(result, 0)
+        List.append(result, 0.0)
+        Return result
+    End If
+
+    Let distance_keys be Dict.keys(reuse_distances)
+
+    Let j be 0
+    While j is less than count:
+        Let key be List.get(distance_keys, j)
+        Let distance be Dict.get(reuse_distances, key)
+        Let total_distance be total_distance + distance
+        Let j be j + 1
+    End While
+
+    Let avg_distance be total_distance / count
+
+    Note: Compute temporal locality (inverse of distance, normalized)
+    Let max_distance be 1000
+    Let temporal be 1.0 - (Math.int_to_float(avg_distance) / Math.int_to_float(max_distance))
+    If temporal is less than 0.0:
+        Let temporal be 0.0
+    End If
+
+    Let result be List.create()
+    List.append(result, avg_distance)
+    List.append(result, temporal)
+    Return result
+End Process
+
+Process called "compute_peak_memory_usage" that takes graph as Integer, nodes as Integer returns Integer:
+    Note: Simplified peak usage calculation
+    Note: Real implementation would perform liveness analysis
+
+    Let node_count be List.length(nodes)
+    Let total be 0
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(nodes, i)
+        Let output_type be Node.get_node_output_type(node)
+        Let size be Node.get_type_size_bytes(output_type)
+        Let total be total + size
+        Let i be i + 1
+    End While
+
+    Note: Peak is approximately 50% of total (rough estimate)
+    Let peak be total / 2
+
+    Return peak
+End Process
+
+Process called "extract_memory_operations_from_nodes" that takes nodes as Integer returns Integer:
+    Let memory_ops be List.create()
+
+    Let node_count be List.length(nodes)
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(nodes, i)
+        Let op_kind be Node.get_node_opkind(node)
+
+        Note: Load=40, Store=41
+        If op_kind equals 40:
+            List.append(memory_ops, node)
+        End If
+        If op_kind equals 41:
+            List.append(memory_ops, node)
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return memory_ops
+End Process
+
+Process called "check_linear_structure" that takes graph as Integer returns Boolean:
+    Note: Check if graph is a linear chain
+    Let all_nodes be Graph.get_all_nodes(graph)
+    Let node_count be List.length(all_nodes)
+
+    Let i be 0
+    While i is less than node_count:
+        Let node be List.get(all_nodes, i)
+        Let successors be Graph.get_node_successors(graph, node)
+
+        Note: Interior nodes should have exactly one successor
+        Note: Last node can have zero successors
+        If List.length(successors) is greater than 1:
+            Return false
+        End If
+
+        Let i be i + 1
+    End While
+
+    Return true
+End Process
+
+Process called "is_array_type" that takes type_ptr as Integer returns Boolean:
+    If type_ptr equals 0:
+        Return false
+    End If
+
+    Let discriminant be Layout.memory_get_int64(type_ptr, 0)
+
+    Note: Vector=2, Matrix=3, Tensor=5
+    If discriminant equals 2:
+        Return true
+    End If
+    If discriminant equals 3:
+        Return true
+    End If
+    If discriminant equals 5:
+        Return true
+    End If
+
+    Return false
+End Process
+
+Process called "estimate_execution_time" that takes nodes as Integer returns Integer:
+    Note: Simplified execution time estimation
+    Note: Assume 1ms per node
+    Let node_count be List.length(nodes)
+    Let time_ms be node_count * 1
+
+    Return time_ms
+End Process
+
+Process called "is_power_of_two" that takes n as Integer returns Boolean:
+    If n is less than or equal to 0:
+        Return false
+    End If
+
+    Note: Check if n is power of 2 using bitwise trick: n & (n-1) == 0
+    Let n_minus_1 be n - 1
+    Let bitwise_and be n % 2
+    If bitwise_and equals 0:
+        If n_minus_1 % 2 is not equal to 0:
+            Return true
+        End If
+    End If
+
+    Note: Simplified check for common powers of 2
+    If n equals 1:
+        Return true
+    End If
+    If n equals 2:
+        Return true
+    End If
+    If n equals 4:
+        Return true
+    End If
+    If n equals 8:
+        Return true
+    End If
+    If n equals 16:
+        Return true
+    End If
+    If n equals 32:
+        Return true
+    End If
+    If n equals 64:
+        Return true
+    End If
+    If n equals 128:
+        Return true
+    End If
+    If n equals 256:
+        Return true
+    End If
+
+    Return false
+End Process

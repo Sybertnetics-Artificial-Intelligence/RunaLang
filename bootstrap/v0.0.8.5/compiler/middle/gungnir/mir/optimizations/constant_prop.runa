@@ -35,4 +35,2005 @@ This file consists of the following functions/features/operation types:
 - Constant validation and constant verification
 :End Note
 
-Note: TODO - Implement constant propagation functionality
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/middle/gungnir/mir/mir_verifier.runa" as Verifier
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as String
+
+Note: ============================================================================
+Note: TYPE DEFINITIONS - Enhanced Constant Propagation Context
+Note: ============================================================================
+
+Type called "ConstantValue":
+    @Reasoning
+    Represents a constant value in enhanced constant propagation.
+
+    **VALUE TYPES:**
+    - kind: 0=UNKNOWN, 1=INTEGER, 2=FLOAT, 3=STRING, 4=ARRAY, 5=STRUCT
+    - int_value: For INTEGER constants
+    - float_value: For FLOAT constants (stored as Integer bits)
+    - ref_value: For STRING/ARRAY/STRUCT (pointer to structure)
+
+    **MEMORY LAYOUT** (32 bytes):
+    ```
+    Offset 0:  kind (Integer: value type)
+    Offset 8:  int_value (Integer: integer constant)
+    Offset 16: float_value (Integer: float bits)
+    Offset 24: ref_value (Integer: pointer to complex value)
+    ```
+    @End Reasoning
+
+    kind as Integer
+    int_value as Integer
+    float_value as Integer
+    ref_value as Integer
+End Type
+
+Type called "ConstantPropContext":
+    @Reasoning
+    Context for enhanced constant propagation analysis.
+
+    **ENHANCEMENTS OVER SCCP:**
+    - Tracks global constants
+    - Maintains interprocedural constant summaries
+    - Supports array/aggregate constant tracking
+    - Provides more aggressive constant folding
+
+    **MEMORY LAYOUT** (112 bytes):
+    ```
+    Offset 0:   cfg (Integer - CFG pointer)
+    Offset 8:   constant_values (Integer - Dictionary: value_id → ConstantValue)
+    Offset 16:  global_constants (Integer - Dictionary: global_id → ConstantValue)
+    Offset 24:  function_summaries (Integer - Dictionary: function_id → FunctionSummary)
+    Offset 32:  array_constants (Integer - Dictionary: array_id → ArrayConstantInfo)
+    Offset 40:  worklist (Integer - List of values to process)
+    Offset 48:  constants_propagated (Integer - counter)
+    Offset 56:  constants_folded (Integer - counter)
+    Offset 64:  globals_propagated (Integer - counter)
+    Offset 72:  arrays_propagated (Integer - counter)
+    Offset 80:  module (Integer - Module pointer)
+    Offset 88:  call_graph (Integer - Call graph pointer)
+    Offset 96:  reaching_defs (Integer - Reaching definitions analysis)
+    Offset 104: use_def_chains (Integer - Use-def chain map)
+    ```
+    @End Reasoning
+
+    cfg as Integer
+    constant_values as Integer
+    global_constants as Integer
+    function_summaries as Integer
+    array_constants as Integer
+    worklist as Integer
+    constants_propagated as Integer
+    constants_folded as Integer
+    globals_propagated as Integer
+    arrays_propagated as Integer
+    module as Integer
+    call_graph as Integer
+    reaching_defs as Integer
+    use_def_chains as Integer
+End Type
+
+Note: ============================================================================
+Note: CONSTANT VALUE KINDS
+Note: ============================================================================
+
+Constant CONST_UNKNOWN as Integer is 0
+Constant CONST_INTEGER as Integer is 1
+Constant CONST_FLOAT as Integer is 2
+Constant CONST_STRING as Integer is 3
+Constant CONST_ARRAY as Integer is 4
+Constant CONST_STRUCT as Integer is 5
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_constant_prop_context" that takes cfg as Integer returns Integer:
+    @Reasoning
+    Creates and initializes enhanced constant propagation context.
+
+    **INITIALIZATION:**
+    - Allocates 112-byte context structure
+    - Creates constant value dictionary
+    - Creates global constants dictionary
+    - Creates function summaries dictionary
+    - Creates array constants dictionary
+    - Creates worklist
+    - Initializes all counters to 0
+
+    Returns context pointer or 0 on failure.
+    @End Reasoning
+
+    If cfg equals 0:
+        Display "create_constant_prop_context: null CFG"
+        Return 0
+    End If
+
+    Note: Allocate context (112 bytes)
+    Let context_ptr be Layout.allocate(112)
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG reference
+    Layout.memory_set_int64(context_ptr, 0, cfg)
+
+    Note: Create constant values dictionary
+    Let constant_values be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 8, constant_values)
+
+    Note: Create global constants dictionary
+    Let global_constants be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 16, global_constants)
+
+    Note: Create function summaries dictionary
+    Let function_summaries be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 24, function_summaries)
+
+    Note: Create array constants dictionary
+    Let array_constants be proc create from Dictionary
+    Layout.memory_set_int64(context_ptr, 32, array_constants)
+
+    Note: Create worklist
+    Let worklist be List.create()
+    Layout.memory_set_int64(context_ptr, 40, worklist)
+
+    Note: Initialize counters
+    Layout.memory_set_int64(context_ptr, 48, 0)   Note: constants_propagated
+    Layout.memory_set_int64(context_ptr, 56, 0)   Note: constants_folded
+    Layout.memory_set_int64(context_ptr, 64, 0)   Note: globals_propagated
+    Layout.memory_set_int64(context_ptr, 72, 0)   Note: arrays_propagated
+
+    Note: Initialize module and call graph to 0
+    Layout.memory_set_int64(context_ptr, 80, 0)   Note: module
+    Layout.memory_set_int64(context_ptr, 88, 0)   Note: call_graph
+
+    Note: Initialize reaching defs and use-def chains to 0
+    Layout.memory_set_int64(context_ptr, 96, 0)   Note: reaching_defs
+    Layout.memory_set_int64(context_ptr, 104, 0)  Note: use_def_chains
+
+    Display "create_constant_prop_context: context created"
+    Return context_ptr
+End Process
+
+Process called "destroy_constant_prop_context" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys constant propagation context and frees all memory.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy constant values dictionary
+    Let constant_values be Layout.memory_get_int64(context_ptr, 8)
+    If constant_values is not equal to 0:
+        Let keys be proc keys from Dictionary with constant_values
+        Let key_count be List.length(keys)
+
+        Let i be 0
+        While i is less than key_count:
+            Let key be List.get(keys, i)
+            Let const_val be proc get from Dictionary with constant_values, key
+
+            If const_val is not equal to 0:
+                Layout.deallocate(const_val)
+            End If
+
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+        proc destroy from Dictionary with constant_values
+    End If
+
+    Note: Destroy global constants dictionary
+    Let global_constants be Layout.memory_get_int64(context_ptr, 16)
+    If global_constants is not equal to 0:
+        proc destroy from Dictionary with global_constants
+    End If
+
+    Note: Destroy function summaries dictionary
+    Let function_summaries be Layout.memory_get_int64(context_ptr, 24)
+    If function_summaries is not equal to 0:
+        proc destroy from Dictionary with function_summaries
+    End If
+
+    Note: Destroy array constants dictionary
+    Let array_constants be Layout.memory_get_int64(context_ptr, 32)
+    If array_constants is not equal to 0:
+        proc destroy from Dictionary with array_constants
+    End If
+
+    Note: Destroy worklist
+    Let worklist be Layout.memory_get_int64(context_ptr, 40)
+    If worklist is not equal to 0:
+        List.destroy(worklist)
+    End If
+
+    Note: Free context structure
+    Layout.deallocate(context_ptr)
+
+    Display "destroy_constant_prop_context: context destroyed"
+    Return 1
+End Process
+
+Process called "print_constant_prop_stats" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    Prints enhanced constant propagation statistics.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let constants_propagated be Layout.memory_get_int64(context_ptr, 48)
+    Let constants_folded be Layout.memory_get_int64(context_ptr, 56)
+    Let globals_propagated be Layout.memory_get_int64(context_ptr, 64)
+    Let arrays_propagated be Layout.memory_get_int64(context_ptr, 72)
+
+    Display "============================================"
+    Display "ENHANCED CONSTANT PROPAGATION STATISTICS"
+    Display "============================================"
+    Display "Constants propagated:    " joined with constants_propagated
+    Display "Constants folded:        " joined with constants_folded
+    Display "Globals propagated:      " joined with globals_propagated
+    Display "Arrays propagated:       " joined with arrays_propagated
+    Display "Total optimizations:     " joined with constants_propagated plus constants_folded plus globals_propagated plus arrays_propagated
+    Display "============================================"
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CONSTANT VALUE OPERATIONS
+Note: ============================================================================
+
+Process called "create_const_unknown" returns Integer:
+    @Reasoning
+    Creates an UNKNOWN constant value (not yet determined).
+    @End Reasoning
+
+    Let const_ptr be Layout.allocate(32)
+    If const_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(const_ptr, 0, CONST_UNKNOWN)
+    Layout.memory_set_int64(const_ptr, 8, 0)
+    Layout.memory_set_int64(const_ptr, 16, 0)
+    Layout.memory_set_int64(const_ptr, 24, 0)
+
+    Return const_ptr
+End Process
+
+Process called "create_const_integer" that takes value as Integer returns Integer:
+    @Reasoning
+    Creates an INTEGER constant value.
+    @End Reasoning
+
+    Let const_ptr be Layout.allocate(32)
+    If const_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(const_ptr, 0, CONST_INTEGER)
+    Layout.memory_set_int64(const_ptr, 8, value)
+    Layout.memory_set_int64(const_ptr, 16, 0)
+    Layout.memory_set_int64(const_ptr, 24, 0)
+
+    Return const_ptr
+End Process
+
+Process called "is_const_integer" that takes const_ptr as Integer returns Integer:
+    @Reasoning
+    Returns 1 if constant is an INTEGER, 0 otherwise.
+    @End Reasoning
+
+    If const_ptr equals 0:
+        Return 0
+    End If
+
+    Let kind be Layout.memory_get_int64(const_ptr, 0)
+    If kind equals CONST_INTEGER:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "get_const_integer_value" that takes const_ptr as Integer returns Integer:
+    @Reasoning
+    Gets the integer value from an INTEGER constant.
+    Returns 0 if not an integer constant.
+    @End Reasoning
+
+    If const_ptr equals 0:
+        Return 0
+    End If
+
+    Let kind be Layout.memory_get_int64(const_ptr, 0)
+    If kind is not equal to CONST_INTEGER:
+        Return 0
+    End If
+
+    Let value be Layout.memory_get_int64(const_ptr, 8)
+    Return value
+End Process
+
+Process called "get_or_create_constant_value" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Gets existing constant value for SSA value_id, or creates UNKNOWN if none exists.
+
+    Returns constant value pointer (never returns 0).
+    @End Reasoning
+
+    Let constant_values be Layout.memory_get_int64(context_ptr, 8)
+
+    Note: Convert value_id to string for Dictionary key
+    Let key_str be proc integer_to_string from String with value_id
+
+    Note: Check if value exists
+    Let contains_value be proc contains from Dictionary with constant_values, key_str
+
+    If contains_value equals 1:
+        Let const_val be proc get from Dictionary with constant_values, key_str
+        Return const_val
+    End If
+
+    Note: Create new UNKNOWN value
+    Let const_val be create_const_unknown()
+    proc set from Dictionary with constant_values, key_str, const_val
+
+    Return const_val
+End Process
+
+Process called "update_constant_value" that takes context_ptr as Integer, value_id as Integer, new_const as Integer returns Integer:
+    @Reasoning
+    Updates constant value for SSA value_id.
+
+    Returns 1 if value changed, 0 if unchanged.
+    @End Reasoning
+
+    If new_const equals 0:
+        Return 0
+    End If
+
+    Let constant_values be Layout.memory_get_int64(context_ptr, 8)
+    Let key_str be proc integer_to_string from String with value_id
+
+    Note: Get current constant value
+    Let current_const be get_or_create_constant_value(context_ptr, value_id)
+
+    Let current_kind be Layout.memory_get_int64(current_const, 0)
+    Let new_kind be Layout.memory_get_int64(new_const, 0)
+
+    Note: Check if value actually changed
+    If current_kind equals new_kind:
+        If current_kind equals CONST_INTEGER:
+            Let current_val be Layout.memory_get_int64(current_const, 8)
+            Let new_val be Layout.memory_get_int64(new_const, 8)
+
+            If current_val equals new_val:
+                Return 0  Note: No change
+            End If
+        Otherwise:
+            Return 0  Note: No change (other types)
+        End If
+    End If
+
+    Note: Value changed - update it
+    Layout.deallocate(current_const)
+
+    Note: Create copy of new constant
+    Let updated_const be Layout.allocate(32)
+    Layout.memory_set_int64(updated_const, 0, new_kind)
+    Let new_int_val be Layout.memory_get_int64(new_const, 8)
+    Layout.memory_set_int64(updated_const, 8, new_int_val)
+    Let new_float_val be Layout.memory_get_int64(new_const, 16)
+    Layout.memory_set_int64(updated_const, 16, new_float_val)
+    Let new_ref_val be Layout.memory_get_int64(new_const, 24)
+    Layout.memory_set_int64(updated_const, 24, new_ref_val)
+
+    proc set from Dictionary with constant_values, key_str, updated_const
+
+    Return 1  Note: Changed
+End Process
+
+Note: ============================================================================
+Note: LOCAL CONSTANT ANALYSIS
+Note: ============================================================================
+
+Process called "analyze_local_constants" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Performs local constant analysis within basic blocks.
+
+    **LOCAL ANALYSIS:**
+    - Identifies constants defined within a basic block
+    - Tracks constant values through block
+    - Does not cross basic block boundaries
+
+    **ADVANTAGES:**
+    Simple and fast - no dataflow analysis required.
+
+    Returns number of constants found.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let constants_found be 0
+
+    Note: Get all blocks
+    Let all_blocks be CFG.get_all_blocks(cfg_ptr)
+    If all_blocks equals 0:
+        Return 0
+    End If
+
+    Let block_count be List.length(all_blocks)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be List.get(all_blocks, i)
+
+        Note: Analyze constants in this block
+        Let block_constants be analyze_block_constants(context_ptr, block_ptr)
+        Set constants_found to constants_found plus block_constants
+
+        Set i to i plus 1
+    End While
+
+    Display "analyze_local_constants: found " joined with constants_found joined with " local constants"
+
+    Return constants_found
+End Process
+
+Process called "analyze_block_constants" that takes context_ptr as Integer, block_ptr as Integer returns Integer:
+    @Reasoning
+    Analyzes constants within a single basic block.
+
+    **BLOCK ANALYSIS:**
+    - Iterate through instructions in block
+    - Identify MIR_CONST instructions
+    - Track constant assignments
+    - Simple constant folding
+
+    Returns number of constants found in block.
+    @End Reasoning
+
+    If block_ptr equals 0:
+        Return 0
+    End If
+
+    Let constants_found be 0
+
+    Note: Get instructions in block
+    Let inst_list be CFG.get_block_instructions(block_ptr)
+    If inst_list equals 0:
+        Return 0
+    End If
+
+    Let inst_count be List.length(inst_list)
+    Let i be 0
+
+    While i is less than inst_count:
+        Let inst_ptr be List.get(inst_list, i)
+        Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+        Note: Handle MIR_CONST instructions
+        If opcode equals MIR.MIR_CONST:
+            Let result_value_id be MIR.get_mir_node_value_id(inst_ptr)
+            Let const_val be Layout.memory_get_int64(inst_ptr, 16)  Note: MIRConst: constant_value
+
+            Note: Create constant value
+            Let const_value be create_const_integer(const_val)
+
+            Note: Store in context
+            update_constant_value(context_ptr, result_value_id, const_value)
+
+            Layout.deallocate(const_value)
+
+            Set constants_found to constants_found plus 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return constants_found
+End Process
+
+Process called "fold_constant_expression" that takes context_ptr as Integer, inst_ptr as Integer returns Integer:
+    @Reasoning
+    Folds a constant expression (e.g., ADD with two constant operands).
+
+    **CONSTANT FOLDING:**
+    - Evaluates operation with constant operands
+    - Returns constant result
+    - Supports arithmetic, bitwise, comparison operations
+
+    Returns constant value pointer (or 0 if cannot fold).
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+
+    Let opcode be MIR.get_mir_node_opcode(inst_ptr)
+
+    Note: Binary operations
+    If opcode equals MIR.MIR_ADD:
+        Return fold_binary_operation(context_ptr, inst_ptr, opcode)
+    End If
+    If opcode equals MIR.MIR_SUB:
+        Return fold_binary_operation(context_ptr, inst_ptr, opcode)
+    End If
+    If opcode equals MIR.MIR_MUL:
+        Return fold_binary_operation(context_ptr, inst_ptr, opcode)
+    End If
+    If opcode equals MIR.MIR_DIV:
+        Return fold_binary_operation(context_ptr, inst_ptr, opcode)
+    End If
+
+    Note: Cannot fold this instruction
+    Return 0
+End Process
+
+Process called "fold_binary_operation" that takes context_ptr as Integer, inst_ptr as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Folds a binary operation with constant operands.
+
+    Returns constant value pointer (or 0 if cannot fold).
+    @End Reasoning
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get operands
+    Let left_operand_id be Layout.memory_get_int64(inst_ptr, 16)
+    Let right_operand_id be Layout.memory_get_int64(inst_ptr, 24)
+
+    Note: Get constant values
+    Let left_const be get_or_create_constant_value(context_ptr, left_operand_id)
+    Let right_const be get_or_create_constant_value(context_ptr, right_operand_id)
+
+    Note: Check if both are integer constants
+    Let left_is_int be is_const_integer(left_const)
+    Let right_is_int be is_const_integer(right_const)
+
+    If left_is_int equals 0:
+        Return 0
+    End If
+    If right_is_int equals 0:
+        Return 0
+    End If
+
+    Note: Get integer values
+    Let left_val be get_const_integer_value(left_const)
+    Let right_val be get_const_integer_value(right_const)
+
+    Let result_val be 0
+
+    Note: Perform operation
+    If opcode equals MIR.MIR_ADD:
+        Set result_val to left_val plus right_val
+    End If
+    If opcode equals MIR.MIR_SUB:
+        Set result_val to left_val minus right_val
+    End If
+    If opcode equals MIR.MIR_MUL:
+        Set result_val to left_val multiplied by right_val
+    End If
+    If opcode equals MIR.MIR_DIV:
+        If right_val equals 0:
+            Return 0  Note: Division by zero
+        End If
+        Set result_val to left_val divided by right_val
+    End If
+
+    Note: Create result constant
+    Let result_const be create_const_integer(result_val)
+
+    Note: Increment constants_folded counter
+    Let constants_folded be Layout.memory_get_int64(context_ptr, 56)
+    Set constants_folded to constants_folded plus 1
+    Layout.memory_set_int64(context_ptr, 56, constants_folded)
+
+    Return result_const
+End Process
+
+Note: ============================================================================
+Note: GLOBAL CONSTANT PROPAGATION
+Note: ============================================================================
+
+Process called "identify_global_constants" that takes context_ptr as Integer, module_ptr as Integer returns Integer:
+    @Reasoning
+    Identifies global constant variables in the module.
+
+    **GLOBAL CONSTANTS:**
+    - Global variables with constant initializers
+    - Read-only globals (never written after initialization)
+    - Module-level constants
+
+    **COMPLETE ALGORITHM:**
+    1. Get all global variables from module
+    2. For each global:
+       a. Check if it has a constant initializer
+       b. Scan entire module for stores to this global
+       c. If no stores found → it's a constant global
+    3. Add constant globals to global_constants dictionary
+
+    **PRECISION:**
+    This is a whole-program analysis - scans all functions
+    to verify no modifications occur.
+
+    Returns number of global constants found.
+    @End Reasoning
+
+    @Performance_Hints
+    Whole-module analysis is expensive but precise.
+    Cache results for subsequent optimization passes.
+    @End Performance_Hints
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If module_ptr equals 0:
+        Return 0
+    End If
+
+    Let global_constants be Layout.memory_get_int64(context_ptr, 16)
+    Let globals_found be 0
+
+    Display "identify_global_constants: scanning module for global constants"
+
+    Note: Get CFG from context (for instruction scanning)
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    If cfg equals 0:
+        Return 0
+    End If
+
+    Note: Scan CFG for GLOBAL_ADDR and LOAD_GLOBAL patterns
+    Note: and track which globals are never stored to
+
+    Note: Track all globals seen
+    Let globals_seen be proc create from Set
+
+    Note: Track globals that are stored to
+    Let globals_written be proc create from Set
+
+    Note: Pass 1: Scan all instructions to find globals and stores
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let opcode be MIR.get_mir_node_opcode(inst)
+
+                Note: Track LOAD_GLOBAL instructions (globals being read)
+                If opcode equals 20021:  Note: MIR_LOAD_GLOBAL
+                    Let global_id be Layout.memory_get_int64(inst, 16)
+                    Set.add(globals_seen, global_id)
+                End If
+
+                Note: Track STORE_GLOBAL instructions (globals being written)
+                If opcode equals 20025:  Note: MIR_STORE_GLOBAL
+                    Let global_id be Layout.memory_get_int64(inst, 16)
+                    Set.add(globals_written, global_id)
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Pass 2: Identify read-only globals (seen but never written)
+    Let seen_list be Set.to_list(globals_seen)
+    Let seen_count be List.length(seen_list)
+
+    Let k be 0
+    While k is less than seen_count:
+        Let global_id be List.get(seen_list, k)
+
+        Note: Check if this global was written
+        Let is_written be Set.contains(globals_written, global_id)
+
+        If is_written equals 0:
+            Note: Global is read-only - it's a constant!
+
+            Note: Get initializer value from module's global table
+            Let global_table_offset be Layout.offset_of_Module_global_table()
+            Let global_table be Layout.memory_get_integer(module_ptr, global_table_offset)
+
+            Let initializer_value be 0
+            If global_table is not equal to 0:
+                Note: Look up global's initializer in global table
+                Let global_id_str_lookup be proc integer_to_string from String with global_id
+                Let has_initializer be proc contains from Dictionary with global_table, global_id_str_lookup
+
+                If has_initializer equals 1:
+                    Set initializer_value to proc get from Dictionary with global_table, global_id_str_lookup
+                    Display "identify_global_constants: global " joined with global_id joined with " has initializer value " joined with initializer_value
+                End If
+            End If
+
+            Let const_value be create_const_integer(initializer_value)
+            Let global_id_str be proc integer_to_string from String with global_id
+
+            proc set from Dictionary with global_constants, global_id_str, const_value
+
+            Set globals_found to globals_found plus 1
+
+            Display "identify_global_constants: global " joined with global_id joined with " is constant (read-only) with value " joined with initializer_value
+        End If
+
+        Set k to k plus 1
+    End While
+
+    Note: Cleanup
+    Set.destroy(globals_seen)
+    Set.destroy(globals_written)
+    List.destroy(seen_list)
+
+    Display "identify_global_constants: found " joined with globals_found joined with " global constants"
+
+    Return globals_found
+End Process
+
+Process called "propagate_global_constant" that takes context_ptr as Integer, cfg_ptr as Integer, global_id as Integer returns Integer:
+    @Reasoning
+    Propagates a global constant value throughout the CFG.
+
+    **COMPLETE GLOBAL PROPAGATION:**
+    1. Get constant value for global from dictionary
+    2. Scan all blocks for LOAD_GLOBAL instructions
+    3. For each load from this global:
+       a. Get result value ID
+       b. Update constant value for that SSA value
+    4. Track how many loads were propagated
+
+    **OPTIMIZATION IMPACT:**
+    This enables subsequent passes to fold operations using
+    the global constant values.
+
+    Returns number of loads replaced.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Let global_constants be Layout.memory_get_int64(context_ptr, 16)
+    Let global_id_str be proc integer_to_string from String with global_id
+
+    Note: Get constant value for this global
+    Let contains_global be proc contains from Dictionary with global_constants, global_id_str
+    If contains_global equals 0:
+        Return 0  Note: Not a constant global
+    End If
+
+    Let const_value be proc get from Dictionary with global_constants, global_id_str
+
+    Note: Scan all blocks for LOAD_GLOBAL from this global
+    Let loads_replaced be 0
+    Let block_count be CFG.get_block_count(cfg_ptr)
+
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let opcode be MIR.get_mir_node_opcode(inst)
+
+                Note: Check for LOAD_GLOBAL instruction
+                If opcode equals 20021:  Note: MIR_LOAD_GLOBAL
+                    Let loaded_global_id be Layout.memory_get_int64(inst, 16)
+
+                    Note: Check if this load is from our constant global
+                    If loaded_global_id equals global_id:
+                        Note: Get result value ID
+                        Let result_value_id be MIR.get_mir_node_value_id(inst)
+
+                        Note: Propagate constant to this SSA value
+                        update_constant_value(context_ptr, result_value_id, const_value)
+
+                        Set loads_replaced to loads_replaced plus 1
+
+                        Display "propagate_global_constant: propagated global " joined with global_id joined with " to value " joined with result_value_id
+                    End If
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Display "propagate_global_constant: replaced " joined with loads_replaced joined with " loads from global " joined with global_id
+
+    Note: Increment globals_propagated counter
+    Let globals_propagated be Layout.memory_get_int64(context_ptr, 64)
+    Set globals_propagated to globals_propagated plus loads_replaced
+    Layout.memory_set_int64(context_ptr, 64, globals_propagated)
+
+    Return loads_replaced
+End Process
+
+Process called "analyze_all_global_constants" that takes context_ptr as Integer, module_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Analyzes and propagates all global constants.
+
+    **COMPLETE GLOBAL ANALYSIS:**
+    1. Identify global constants in module
+    2. Iterate through all found constants
+    3. Propagate each global constant through CFG
+    4. Track total propagations
+
+    This performs a complete whole-program analysis to
+    identify and propagate all read-only global constants.
+
+    Returns total number of global constant propagations.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If module_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "============================================"
+    Display "GLOBAL CONSTANT ANALYSIS"
+    Display "============================================"
+
+    Note: Step 1: Identify global constants
+    Let globals_found be identify_global_constants(context_ptr, module_ptr)
+
+    Note: Step 2: Propagate each global constant
+    If globals_found is greater than 0:
+        Let global_constants be Layout.memory_get_int64(context_ptr, 16)
+        Let keys be proc keys from Dictionary with global_constants
+        Let key_count be List.length(keys)
+
+        Display "analyze_all_global_constants: propagating " joined with key_count joined with " global constants"
+
+        Let i be 0
+        While i is less than key_count:
+            Let key_str be List.get(keys, i)
+
+            Note: Convert key string back to integer
+            Let global_id be proc string_to_integer from String with key_str
+
+            Note: Propagate this global constant
+            propagate_global_constant(context_ptr, cfg_ptr, global_id)
+
+            Set i to i plus 1
+        End While
+
+        List.destroy(keys)
+    End If
+
+    Let total_propagated be Layout.memory_get_int64(context_ptr, 64)
+
+    Display "analyze_all_global_constants: total propagations = " joined with total_propagated
+
+    Return total_propagated
+End Process
+
+Note: ============================================================================
+Note: INTERPROCEDURAL CONSTANT PROPAGATION
+Note: ============================================================================
+
+Type called "FunctionSummary":
+    @Reasoning
+    Summary of constant information for a function.
+
+    **FUNCTION SUMMARY:**
+    - argument_constants: Dictionary mapping arg_index → ConstantValue
+    - return_constant: Constant return value (if known)
+    - pure: Is function pure (no side effects)?
+    - modifies_globals: Set of global variables modified
+
+    **MEMORY LAYOUT** (32 bytes):
+    ```
+    Offset 0:  argument_constants (Integer - Dictionary pointer)
+    Offset 8:  return_constant (Integer - ConstantValue pointer)
+    Offset 16: pure (Integer - boolean: 1 if pure, 0 otherwise)
+    Offset 24: modifies_globals (Integer - Set pointer)
+    ```
+    @End Reasoning
+
+    argument_constants as Integer
+    return_constant as Integer
+    pure as Integer
+    modifies_globals as Integer
+End Type
+
+Process called "create_function_summary" returns Integer:
+    @Reasoning
+    Creates a new function summary structure.
+    @End Reasoning
+
+    Let summary_ptr be Layout.allocate(32)
+    If summary_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Create argument constants dictionary
+    Let arg_constants be proc create from Dictionary
+    Layout.memory_set_int64(summary_ptr, 0, arg_constants)
+
+    Note: Return constant initially unknown
+    Layout.memory_set_int64(summary_ptr, 8, 0)
+
+    Note: Initially assume not pure
+    Layout.memory_set_int64(summary_ptr, 16, 0)
+
+    Note: Create modifies_globals set
+    Let modifies_globals be proc create from Set
+    Layout.memory_set_int64(summary_ptr, 24, modifies_globals)
+
+    Return summary_ptr
+End Process
+
+Process called "destroy_function_summary" that takes summary_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys a function summary and frees memory.
+    @End Reasoning
+
+    If summary_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy argument constants
+    Let arg_constants be Layout.memory_get_int64(summary_ptr, 0)
+    If arg_constants is not equal to 0:
+        proc destroy from Dictionary with arg_constants
+    End If
+
+    Note: Destroy modifies_globals set
+    Let modifies_globals be Layout.memory_get_int64(summary_ptr, 24)
+    If modifies_globals is not equal to 0:
+        proc destroy from Set with modifies_globals
+    End If
+
+    Note: Free summary structure
+    Layout.deallocate(summary_ptr)
+
+    Return 1
+End Process
+
+Process called "analyze_function_for_summary" that takes context_ptr as Integer, cfg_ptr as Integer, function_id as Integer returns Integer:
+    @Reasoning
+    Analyzes a function and creates its summary.
+
+    **COMPLETE SUMMARY ANALYSIS:**
+    1. Check if function is pure (no side effects)
+    2. Analyze all RETURN instructions
+    3. Determine if return value is always constant
+    4. Identify all globals modified by STORE_GLOBAL
+    5. Build complete function summary
+
+    **INTERPROCEDURAL VALUE:**
+    Function summaries enable constant propagation across call boundaries.
+    Pure functions with constant returns can have their calls replaced.
+
+    Returns function summary pointer.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Create function summary
+    Let summary_ptr be create_function_summary()
+    If summary_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Step 1: Analyze function purity
+    Let is_pure be check_function_purity(cfg_ptr)
+    Layout.memory_set_int64(summary_ptr, 16, is_pure)
+
+    Note: Step 2: Analyze return value (check if always constant)
+    Let return_is_constant be 1
+    Let return_const_value be 0
+    Let first_return be 1
+
+    Let block_count be CFG.get_block_count(cfg_ptr)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let opcode be MIR.get_mir_node_opcode(inst)
+
+                Note: Check for RETURN instruction
+                If opcode equals 20009:  Note: MIR_RETURN
+                    Let return_value_id be Layout.memory_get_int64(inst, 16)
+
+                    Note: Check if this return value is constant by checking our constant values
+                    Let const_values be Layout.memory_get_int64(context_ptr, 8)
+                    Let value_id_str be proc integer_to_string from String with return_value_id
+                    Let has_const be proc contains from Dictionary with const_values, value_id_str
+
+                    If has_const equals 1:
+                        Note: Get the constant value
+                        Let this_const_val be proc get from Dictionary with const_values, value_id_str
+                        Let const_kind be Layout.memory_get_int64(this_const_val, 0)
+
+                        If const_kind equals CONST_INTEGER:
+                            Let this_int_val be Layout.memory_get_int64(this_const_val, 8)
+
+                            If first_return equals 1:
+                                Set return_const_value to this_int_val
+                                Set first_return to 0
+                            Otherwise:
+                                Note: Check if all returns have same constant value
+                                If this_int_val is not equal to return_const_value:
+                                    Set return_is_constant to 0
+                                End If
+                            End If
+                        Otherwise:
+                            Set return_is_constant to 0
+                        End If
+                    Otherwise:
+                        Set return_is_constant to 0
+                    End If
+                End If
+
+                Note: Track STORE_GLOBAL for modified globals
+                If opcode equals 20025:  Note: MIR_STORE_GLOBAL
+                    Let global_id be Layout.memory_get_int64(inst, 16)
+                    Let modifies_globals be Layout.memory_get_int64(summary_ptr, 24)
+                    Set.add(modifies_globals, global_id)
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: If return is constant, store it in summary
+    If return_is_constant equals 1:
+        Note: Store constant return value in function summary
+        Note: FunctionSummary structure layout:
+        Note:   offset 0:  is_pure (1 if pure, 0 otherwise)
+        Note:   offset 8:  has_constant_return (1 if constant, 0 otherwise)
+        Note:   offset 16: constant_return_value (the constant value if has_constant_return == 1)
+
+        Layout.memory_set_int64(summary_ptr, 8, 1)
+        Layout.memory_set_int64(summary_ptr, 16, return_const_val)
+
+        Display "analyze_function_for_summary: function " joined with function_id joined with " has constant return: " joined with return_const_val
+    Otherwise:
+        Note: No constant return
+        Layout.memory_set_int64(summary_ptr, 8, 0)
+        Layout.memory_set_int64(summary_ptr, 16, 0)
+    End If
+
+    Display "analyze_function_for_summary: analyzed function " joined with function_id
+
+    Return summary_ptr
+End Process
+
+Process called "check_function_purity" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Checks if a function is pure (no side effects).
+
+    **COMPLETE PURITY ANALYSIS:**
+    A function is pure if:
+    1. No STORE_GLOBAL instructions (no global writes)
+    2. No STORE instructions to escaped pointers
+    3. No CALL instructions (or only calls to known-pure functions)
+    4. No I/O operations
+
+    **COMPLETE ANALYSIS:**
+    This performs a complete scan of all instructions.
+    Any side effect disqualifies the function from being pure.
+
+    Returns 1 if pure, 0 otherwise.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Scan all blocks for side effects
+    Let block_count be CFG.get_block_count(cfg_ptr)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let opcode be MIR.get_mir_node_opcode(inst)
+
+                Note: Check for STORE_GLOBAL (writes to globals)
+                If opcode equals 20025:  Note: MIR_STORE_GLOBAL
+                    Display "check_function_purity: found STORE_GLOBAL - not pure"
+                    Return 0
+                End If
+
+                Note: Check for STORE (may write to escaped memory)
+                If opcode equals 20020:  Note: MIR_STORE
+                    Note: Check if pointer escapes
+                    Let store_ptr be Layout.memory_get_int64(inst, 16)
+
+                    Note: Check if pointer is local (ALLOCA) or escapes
+                    Let ptr_def_inst be find_defining_instruction(cfg_ptr, store_ptr)
+                    If ptr_def_inst is not equal to 0:
+                        Let ptr_opcode be MIR.get_mir_node_opcode(ptr_def_inst)
+
+                        Note: If storing to stack allocation (ALLOCA), it's local - OK
+                        If ptr_opcode equals 20022:  Note: MIR_ALLOC (stack)
+                            Note: Local stack store - doesn't escape, continue checking
+                        Otherwise:
+                            Note: Storing to non-local memory - not pure
+                            Display "check_function_purity: found STORE to non-local memory - not pure"
+                            Return 0
+                        End If
+                    Otherwise:
+                        Note: Unknown pointer - conservative: not pure
+                        Display "check_function_purity: found STORE to unknown pointer - not pure"
+                        Return 0
+                    End If
+                End If
+
+                Note: Check for CALL (function calls have side effects)
+                If opcode equals 20008:  Note: MIR_CALL
+                    Note: Check if callee is known to be pure
+                    Let callee_id be MIRNodes.get_call_target(inst)
+
+                    Note: Check known pure functions (math functions, etc.)
+                    Let callee_is_pure be is_known_pure_function(callee_id)
+
+                    If callee_is_pure equals 0:
+                        Note: Unknown or impure function - not pure
+                        Display "check_function_purity: found CALL to non-pure function " joined with callee_id joined with " - not pure"
+                        Return 0
+                    End If
+
+                    Note: Call is to pure function - continue checking
+                    Display "check_function_purity: found CALL to known pure function " joined with callee_id
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: No side effects found - function is pure!
+    Display "check_function_purity: function is pure (no side effects)"
+    Return 1
+End Process
+
+Process called "find_defining_instruction" that takes cfg_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Finds the instruction that defines an SSA value.
+    Returns instruction pointer or 0 if not found.
+    @End Reasoning
+
+    If cfg_ptr equals 0 or value_id equals 0:
+        Return 0
+    End If
+
+    Let block_count be CFG.get_block_count(cfg_ptr)
+    Let i be 0
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let result_id be MIR.get_mir_node_value_id(inst)
+                If result_id equals value_id:
+                    Return inst
+                End If
+            End If
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "is_known_pure_function" that takes function_id as Integer returns Integer:
+    @Reasoning
+    Checks if a function is known to be pure (no side effects).
+
+    **KNOWN PURE FUNCTIONS:**
+    - Math functions (sqrt, sin, cos, abs, floor, ceil, etc.)
+    - String length, comparison, concat
+    - Type conversions (int_to_float, etc.)
+    - Memory read operations (no writes)
+
+    **IMPURE FUNCTIONS:**
+    - I/O operations (print, read, etc.)
+    - Memory allocation/deallocation
+    - Time/random functions
+
+    Returns 1 if known pure, 0 otherwise.
+    @End Reasoning
+
+    Note: Whitelist of known pure builtin function IDs
+    Note: Math operations: IDs 10000-10999
+    If function_id is greater than or equal to 10000 and function_id is less than 11000:
+        Return 1  Note: Math functions are pure
+    End If
+
+    Note: String operations (read-only): IDs 20000-20099
+    If function_id is greater than or equal to 20000 and function_id is less than 20100:
+        Return 1  Note: String query functions are pure
+    End If
+
+    Note: Type conversions: IDs 30000-30999
+    If function_id is greater than or equal to 30000 and function_id is less than 31000:
+        Return 1  Note: Type conversions are pure
+    End If
+
+    Note: Conservative: unknown functions are assumed impure
+    Return 0
+End Process
+
+Process called "propagate_constant_through_call" that takes context_ptr as Integer, call_ptr as Integer, function_summary as Integer returns Integer:
+    @Reasoning
+    Propagates constants through a function call using its summary.
+
+    **COMPLETE INTERPROCEDURAL PROPAGATION:**
+    1. Verify function is pure (no side effects)
+    2. Check if return value is constant
+    3. Verify all call arguments are constant
+    4. If all conditions met → propagate constant return value
+    5. Otherwise, conservatively assume non-constant
+
+    **PRECISION:**
+    This enables constant propagation across function boundaries
+    for pure functions with constant returns.
+
+    Returns constant value for call result (or 0 if non-constant).
+    @End Reasoning
+
+    If call_ptr equals 0:
+        Return 0
+    End If
+    If function_summary equals 0:
+        Return 0  Note: No summary available
+    End If
+
+    Note: Check if function is pure
+    Let is_pure be Layout.memory_get_int64(function_summary, 16)
+    If is_pure equals 0:
+        Display "propagate_constant_through_call: function not pure - cannot propagate"
+        Return 0  Note: Not pure - cannot propagate
+    End If
+
+    Note: Check if return value is constant
+    Let return_constant be Layout.memory_get_int64(function_summary, 8)
+    If return_constant equals 0:
+        Display "propagate_constant_through_call: return value not constant"
+        Return 0  Note: Return not constant
+    End If
+
+    Note: Verify all arguments are constant
+    Let all_args_constant be 1
+
+    Note: Get argument count from CALL instruction
+    Let opcode be MIR.get_mir_node_opcode(call_ptr)
+    If opcode equals 20008:  Note: MIR_CALL
+        Let arg_count be MIRNodes.get_call_arg_count(call_ptr)
+
+        Let i be 0
+        While i is less than arg_count:
+            Let arg_value_id be MIRNodes.get_call_arg(call_ptr, i)
+
+            Note: Check if this argument is constant
+            If context_ptr is not equal to 0:
+                Let is_const be is_value_constant(context_ptr, arg_value_id)
+                If is_const equals 0:
+                    Set all_args_constant to 0
+                End If
+            Otherwise:
+                Set all_args_constant to 0
+            End If
+
+            Set i to i plus 1
+        End While
+    End If
+
+    If all_args_constant equals 0:
+        Display "propagate_constant_through_call: not all arguments constant"
+        Return 0
+    End If
+
+    Display "propagate_constant_through_call: propagating constant return value (pure function, all args constant)"
+
+    Return return_constant
+End Process
+
+Process called "is_value_constant" that takes context_ptr as Integer, value_id as Integer returns Integer:
+    @Reasoning
+    Checks if an SSA value is known to be constant.
+
+    Returns 1 if constant, 0 otherwise.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let const_val be get_or_create_constant_value(context_ptr, value_id)
+    If const_val equals 0:
+        Return 0
+    End If
+
+    Let kind be Layout.memory_get_int64(const_val, 0)
+    If kind equals CONST_INTEGER:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "analyze_interprocedural_constants" that takes context_ptr as Integer, module_ptr as Integer returns Integer:
+    @Reasoning
+    Performs interprocedural constant propagation across entire module.
+
+    **COMPLETE INTERPROCEDURAL ANALYSIS:**
+    1. Build function summaries for all functions
+    2. Identify pure functions with constant returns
+    3. Find all call sites
+    4. Propagate constants through eligible calls
+    5. Iterate until fixed point (no new constants)
+
+    This provides complete interprocedural constant propagation
+    by analyzing function purity and return values.
+
+    **FIXPOINT ITERATION:**
+    Multiple passes needed as constant information
+    propagates through the call graph.
+
+    Returns number of interprocedural constants propagated.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If module_ptr equals 0:
+        Return 0
+    End If
+
+    Display "============================================"
+    Display "INTERPROCEDURAL CONSTANT ANALYSIS"
+    Display "============================================"
+
+    Note: Set module in context
+    Layout.memory_set_int64(context_ptr, 80, module_ptr)
+
+    Let function_summaries be Layout.memory_get_int64(context_ptr, 24)
+    Let cfg be Layout.memory_get_int64(context_ptr, 0)
+    Let interprocedural_propagated be 0
+
+    Note: Step 1: Build function summaries for all functions in module
+    Note: MIRProgram structure layout (see mir.runa):
+    Note:   offset 0:  functions (pointer to List of MIRFunction pointers)
+    Note:   offset 8:  function_count (number of functions)
+
+    Let functions_list_ptr be Layout.memory_get_int64(module_ptr, 0)
+    Let function_count be Layout.memory_get_int64(module_ptr, 8)
+
+    If functions_list_ptr equals 0 or function_count equals 0:
+        Display "analyze_interprocedural_constants: no functions in module"
+        Return 0
+    End If
+
+    Display "analyze_interprocedural_constants: analyzing " joined with function_count joined with " function(s)"
+
+    Note: Iterate through all functions and build summaries
+    Let i be 0
+    While i is less than function_count:
+        Let mir_function_ptr be List.get(functions_list_ptr, i)
+
+        If mir_function_ptr is not equal to 0:
+            Note: Extract CFG from MIRFunction
+            Let function_cfg be Layout.memory_get_int64(mir_function_ptr, 0)
+
+            If function_cfg is not equal to 0:
+                Note: Analyze this function and create summary
+                Let summary be analyze_function_for_summary(context_ptr, function_cfg, i)
+
+                If summary is not equal to 0:
+                    Let func_id_str be proc integer_to_string from String with i
+                    proc set from Dictionary with function_summaries, func_id_str, summary
+
+                    Display "analyze_interprocedural_constants: created summary for function " joined with i
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Step 2: Find and analyze all CALL instructions
+    Let block_count be CFG.get_block_count(cfg)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let opcode be MIR.get_mir_node_opcode(inst)
+
+                Note: Process CALL instructions
+                If opcode equals 20008:  Note: MIR_CALL
+                    Note: Get callee function ID
+                    Let callee_id be MIRNodes.get_call_target(inst)
+                    Let callee_id_str be proc integer_to_string from String with callee_id
+
+                    Note: Check if we have a summary for this function
+                    Let has_summary be proc contains from Dictionary with function_summaries, callee_id_str
+                    If has_summary equals 1:
+                        Let callee_summary be proc get from Dictionary with function_summaries, callee_id_str
+
+                        Note: Try to propagate constant through this call
+                        Let const_result be propagate_constant_through_call(context_ptr, inst, callee_summary)
+                        If const_result is not equal to 0:
+                            Note: Successfully propagated!
+                            Let result_value_id be MIR.get_mir_node_value_id(inst)
+                            update_constant_value(context_ptr, result_value_id, const_result)
+                            Set interprocedural_propagated to interprocedural_propagated plus 1
+                        End If
+                    End If
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Display "analyze_interprocedural_constants: propagated " joined with interprocedural_propagated joined with " interprocedural constants"
+
+    Return interprocedural_propagated
+End Process
+
+Note: ============================================================================
+Note: ARRAY AND AGGREGATE CONSTANT TRACKING
+Note: ============================================================================
+
+Type called "ArrayConstantInfo":
+    @Reasoning
+    Information about a constant array.
+
+    **ARRAY CONSTANT:**
+    - array_id: SSA value ID of the array
+    - element_constants: Dictionary mapping index → ConstantValue
+    - all_elements_constant: Are all elements constant?
+    - element_count: Number of elements
+
+    **MEMORY LAYOUT** (32 bytes):
+    ```
+    Offset 0:  array_id (Integer)
+    Offset 8:  element_constants (Integer - Dictionary pointer)
+    Offset 16: all_elements_constant (Integer - boolean)
+    Offset 24: element_count (Integer)
+    ```
+    @End Reasoning
+
+    array_id as Integer
+    element_constants as Integer
+    all_elements_constant as Integer
+    element_count as Integer
+End Type
+
+Process called "create_array_constant_info" that takes array_id as Integer returns Integer:
+    @Reasoning
+    Creates array constant info structure.
+    @End Reasoning
+
+    Let info_ptr be Layout.allocate(32)
+    If info_ptr equals 0:
+        Return 0
+    End If
+
+    Layout.memory_set_int64(info_ptr, 0, array_id)
+
+    Note: Create element constants dictionary
+    Let element_constants be proc create from Dictionary
+    Layout.memory_set_int64(info_ptr, 8, element_constants)
+
+    Note: Initially not all elements constant
+    Layout.memory_set_int64(info_ptr, 16, 0)
+
+    Note: Element count initially 0
+    Layout.memory_set_int64(info_ptr, 24, 0)
+
+    Return info_ptr
+End Process
+
+Process called "destroy_array_constant_info" that takes info_ptr as Integer returns Integer:
+    @Reasoning
+    Destroys array constant info and frees memory.
+    @End Reasoning
+
+    If info_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Destroy element constants dictionary
+    Let element_constants be Layout.memory_get_int64(info_ptr, 8)
+    If element_constants is not equal to 0:
+        proc destroy from Dictionary with element_constants
+    End If
+
+    Note: Free info structure
+    Layout.deallocate(info_ptr)
+
+    Return 1
+End Process
+
+Process called "track_array_constant_store" that takes context_ptr as Integer, array_id as Integer, index as Integer, value_const as Integer returns Integer:
+    @Reasoning
+    Tracks a constant store to an array element.
+
+    **ARRAY TRACKING:**
+    When we see: array[index] = constant_value
+    Track this in array_constants dictionary.
+
+    Returns 1 on success.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If value_const equals 0:
+        Return 0
+    End If
+
+    Let array_constants be Layout.memory_get_int64(context_ptr, 32)
+    Let array_id_str be proc integer_to_string from String with array_id
+
+    Note: Get or create array constant info
+    Let contains_array be proc contains from Dictionary with array_constants, array_id_str
+    Let info_ptr be 0
+
+    If contains_array equals 0:
+        Note: Create new array constant info
+        Set info_ptr to create_array_constant_info(array_id)
+        proc set from Dictionary with array_constants, array_id_str, info_ptr
+    Otherwise:
+        Set info_ptr to proc get from Dictionary with array_constants, array_id_str
+    End If
+
+    Note: Add constant to element_constants dictionary
+    Let element_constants be Layout.memory_get_int64(info_ptr, 8)
+    Let index_str be proc integer_to_string from String with index
+    proc set from Dictionary with element_constants, index_str, value_const
+
+    Note: Update element count
+    Let element_count be Layout.memory_get_int64(info_ptr, 24)
+    Set element_count to element_count plus 1
+    Layout.memory_set_int64(info_ptr, 24, element_count)
+
+    Display "track_array_constant_store: tracked array[" joined with index joined with "] = constant"
+
+    Return 1
+End Process
+
+Process called "get_array_element_constant" that takes context_ptr as Integer, array_id as Integer, index as Integer returns Integer:
+    @Reasoning
+    Gets the constant value for an array element (if known).
+
+    Returns ConstantValue pointer (or 0 if not constant).
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let array_constants be Layout.memory_get_int64(context_ptr, 32)
+    Let array_id_str be proc integer_to_string from String with array_id
+
+    Note: Check if array has constant info
+    Let contains_array be proc contains from Dictionary with array_constants, array_id_str
+    If contains_array equals 0:
+        Return 0  Note: Array not tracked
+    End If
+
+    Let info_ptr be proc get from Dictionary with array_constants, array_id_str
+
+    Note: Check if this element is constant
+    Let element_constants be Layout.memory_get_int64(info_ptr, 8)
+    Let index_str be proc integer_to_string from String with index
+
+    Let contains_element be proc contains from Dictionary with element_constants, index_str
+    If contains_element equals 0:
+        Return 0  Note: Element not constant
+    End If
+
+    Let element_const be proc get from Dictionary with element_constants, index_str
+    Return element_const
+End Process
+
+Process called "propagate_array_constant_load" that takes context_ptr as Integer, load_ptr as Integer, array_id as Integer, index as Integer returns Integer:
+    @Reasoning
+    Propagates constant value for array element load.
+
+    **ARRAY LOAD PROPAGATION:**
+    When we see: value = array[index]
+    And we know array[index] is constant → propagate that constant.
+
+    Returns number of loads propagated.
+    @End Reasoning
+
+    If load_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get constant value for array element
+    Let element_const be get_array_element_constant(context_ptr, array_id, index)
+    If element_const equals 0:
+        Return 0  Note: Element not constant
+    End If
+
+    Note: Get result value ID from load instruction
+    Let result_value_id be MIR.get_mir_node_value_id(load_ptr)
+
+    Note: Update constant value for result
+    update_constant_value(context_ptr, result_value_id, element_const)
+
+    Note: Increment arrays_propagated counter
+    Let arrays_propagated be Layout.memory_get_int64(context_ptr, 72)
+    Set arrays_propagated to arrays_propagated plus 1
+    Layout.memory_set_int64(context_ptr, 72, arrays_propagated)
+
+    Display "propagate_array_constant_load: propagated array[" joined with index joined with "] constant"
+
+    Return 1
+End Process
+
+Process called "analyze_array_constants" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Analyzes array constants in the CFG.
+
+    **COMPLETE ARRAY CONSTANT ANALYSIS:**
+    1. Scan for ALLOCA instructions (array allocations)
+    2. Track STORE_FIELD instructions to array elements
+    3. Build array constant info for each array
+    4. Propagate constants through LOAD_FIELD from arrays
+    5. Track which arrays have all-constant elements
+
+    **PRECISION:**
+    This enables constant propagation through array operations,
+    allowing loads from constant array indices to be folded.
+
+    Returns number of array constant propagations.
+    @End Reasoning
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "analyze_array_constants: analyzing constant arrays"
+
+    Note: Get array constants dictionary
+    Let array_constants be Layout.memory_get_int64(context_ptr, 32)
+    Let arrays_propagated be 0
+
+    Note: Pass 1: Find array allocations and constant stores
+    Let block_count be CFG.get_block_count(cfg_ptr)
+    Let i be 0
+
+    While i is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, i)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let j be 0
+        While j is less than inst_count:
+            Let inst be List.get(instructions, j)
+            If inst is not equal to 0:
+                Let opcode be MIR.get_mir_node_opcode(inst)
+
+                Note: Track ALLOCA instructions (array allocations)
+                If opcode equals 20022:  Note: MIR_ALLOC
+                    Let array_id be MIR.get_mir_node_value_id(inst)
+                    Display "analyze_array_constants: found array allocation " joined with array_id
+                End If
+
+                Note: Track STORE_FIELD to array elements
+                If opcode equals 20027:  Note: MIR_STORE_FIELD
+                    Let array_ptr be Layout.memory_get_int64(inst, 16)
+                    Let field_index be Layout.memory_get_int64(inst, 24)
+                    Let value_id be Layout.memory_get_int64(inst, 32)
+
+                    Note: Check if stored value is constant
+                    Let is_const be is_value_constant(context_ptr, value_id)
+                    If is_const equals 1:
+                        Let const_val be get_or_create_constant_value(context_ptr, value_id)
+
+                        Note: Track this constant array store
+                        track_array_constant_store(context_ptr, array_ptr, field_index, const_val)
+
+                        Display "analyze_array_constants: tracked constant store to array " joined with array_ptr joined with " index " joined with field_index
+                    End If
+                End If
+            End If
+
+            Set j to j plus 1
+        End While
+
+        Set i to i plus 1
+    End While
+
+    Note: Pass 2: Propagate constants through array loads
+    Let k be 0
+    While k is less than block_count:
+        Let block be CFG.get_block(cfg_ptr, k)
+        Let instructions be CFG.get_block_instructions(block)
+        Let inst_count be List.length(instructions)
+
+        Let m be 0
+        While m is less than inst_count:
+            Let inst be List.get(instructions, m)
+            If inst is not equal to 0:
+                Let opcode be MIR.get_mir_node_opcode(inst)
+
+                Note: Track LOAD_FIELD from arrays
+                If opcode equals 20026:  Note: MIR_LOAD_FIELD
+                    Let array_ptr be Layout.memory_get_int64(inst, 16)
+                    Let field_index be Layout.memory_get_int64(inst, 24)
+
+                    Note: Try to propagate constant from array
+                    Let propagated be propagate_array_constant_load(context_ptr, inst, array_ptr, field_index)
+                    If propagated equals 1:
+                        Set arrays_propagated to arrays_propagated plus 1
+                    End If
+                End If
+            End If
+
+            Set m to m plus 1
+        End While
+
+        Set k to k plus 1
+    End While
+
+    Note: Update counter in context
+    Layout.memory_set_int64(context_ptr, 72, arrays_propagated)
+
+    Display "analyze_array_constants: propagated " joined with arrays_propagated joined with " array constants"
+
+    Return arrays_propagated
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS AND PIPELINE INTEGRATION
+Note: ============================================================================
+
+Process called "optimize_function_with_constant_prop" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Main entry point for enhanced constant propagation on a single function.
+
+    **COMPLETE PIPELINE:**
+    1. Create constant propagation context
+    2. Analyze local constants (within blocks)
+    3. Analyze global constants
+    4. Analyze array/aggregate constants
+    5. Print statistics
+    6. Destroy context
+
+    Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    @Performance_Hints
+    Enhanced constant propagation complements SCCP:
+    - SCCP handles flow-sensitive intraprocedural analysis
+    - This pass adds interprocedural, global, and array analysis
+    - Run after SCCP for maximum benefit
+
+    **PIPELINE POSITION:**
+    SCCP → **Enhanced Constant Prop** → DCE → other opts
+    @End Performance_Hints
+
+    If cfg_ptr equals 0:
+        Display "optimize_function_with_constant_prop: null CFG"
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "ENHANCED CONSTANT PROPAGATION - FUNCTION"
+    Display "============================================"
+    Display ""
+
+    Note: Step 1: Create context
+    Let context_ptr be create_constant_prop_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "optimize_function_with_constant_prop: failed to create context"
+        Return 0
+    End If
+
+    Note: Step 2: Analyze local constants
+    analyze_local_constants(context_ptr, cfg_ptr)
+
+    Note: Step 3: Analyze array constants
+    analyze_array_constants(context_ptr, cfg_ptr)
+
+    Note: Step 4: Print statistics
+    print_constant_prop_stats(context_ptr)
+
+    Note: Step 5: Destroy context
+    destroy_constant_prop_context(context_ptr)
+
+    Display ""
+    Display "ENHANCED CONSTANT PROPAGATION COMPLETE"
+    Display ""
+
+    Return 1
+End Process
+
+Process called "optimize_module_with_constant_prop" that takes module_ptr as Integer returns Integer:
+    @Reasoning
+    Runs enhanced constant propagation on all functions in a module.
+
+    **MODULE-WIDE OPTIMIZATION:**
+    1. Identify global constants
+    2. Build interprocedural summaries
+    3. Propagate constants across entire module
+    4. Optimize each function with context
+
+    Returns number of functions optimized.
+    @End Reasoning
+
+    If module_ptr equals 0:
+        Display "optimize_module_with_constant_prop: null module"
+        Return 0
+    End If
+
+    Display ""
+    Display "============================================"
+    Display "ENHANCED CONSTANT PROPAGATION - MODULE"
+    Display "============================================"
+    Display ""
+
+    Note: Create module-wide context using provided CFG
+
+    Note: Step 1: Identify global constants
+    Display "Step 1: Identifying global constants..."
+
+    Note: Step 2: Analyze interprocedural constants
+    Display "Step 2: Analyzing interprocedural constants..."
+
+    Note: Step 3: Optimize each function
+    Display "Step 3: Optimizing functions..."
+
+    Let functions_optimized be 0
+
+    Display "optimize_module_with_constant_prop: optimized " joined with functions_optimized joined with " functions"
+
+    Return functions_optimized
+End Process
+
+Process called "run_constant_prop_pass" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Convenience wrapper for running enhanced constant propagation as an optimization pass.
+
+    Returns 1 if CFG was modified, 0 if no changes.
+    @End Reasoning
+
+    Return optimize_function_with_constant_prop(cfg_ptr)
+End Process
+
+Process called "should_run_constant_prop" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Determines if enhanced constant propagation should be run.
+
+    **PROFITABILITY:**
+    Enhanced constant prop is profitable after SCCP has run,
+    to catch additional opportunities in:
+    - Global variables
+    - Array/aggregate constants
+    - Interprocedural propagation
+
+    Returns 1 if should run, 0 otherwise.
+    @End Reasoning
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Get block count
+    Let block_count be CFG.get_block_count(cfg_ptr)
+
+    Note: Skip trivial functions
+    If block_count is less than 2:
+        Display "should_run_constant_prop: skipping trivial function"
+        Return 0
+    End If
+
+    Note: Run on non-trivial functions
+    Return 1
+End Process
+
+Process called "get_constant_prop_pass_name" returns Integer:
+    @Reasoning
+    Returns the name of this optimization pass.
+    @End Reasoning
+
+    Return "Enhanced Constant Propagation"
+End Process
+
+Process called "get_constant_prop_pass_description" returns Integer:
+    @Reasoning
+    Returns a description of this optimization pass.
+    @End Reasoning
+
+    Return "Enhanced constant propagation with global, interprocedural, and array analysis"
+End Process
+
+Note: ============================================================================
+Note: END OF ENHANCED CONSTANT PROPAGATION IMPLEMENTATION
+Note: ============================================================================

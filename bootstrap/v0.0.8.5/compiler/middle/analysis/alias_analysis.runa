@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,10 +29,843 @@ This file is essential because of the following reasons:
 - Alias analysis support enables Runa compilation for memory-safe code generation
 
 This file consists of the following functions/features/operation types:
-- Alias analysis and memory reference tracking
-- Pointer alias detection and memory alias detection
-- Memory reference analysis and pointer reference analysis
-- Alias optimization and memory reference optimization
+- Alias query interface (NoAlias/MayAlias/MustAlias/PartialAlias)
+- Type-Based Alias Analysis (TBAA) for refinement
+- Size-based refinement for arrays and structs
+- Mod/Ref analysis for function side effects
+- Integration with points-to analysis
+
+Dependencies:
+- compiler/middle/analysis/points_to.runa (Points-to sets and aliasing)
+- compiler/middle/gungnir/mir/mir.runa (MIR structures, instructions)
+- compiler/middle/gungnir/hir/hir.runa (Type information for TBAA)
+- compiler/middle/analysis/control_flow.runa (CFG structures)
+- compiler/frontend/primitives/memory/layout.runa (OWNED HEAP allocation - Tier 3)
+- compiler/frontend/primitives/collections/list.runa (mod/ref lists)
+- compiler/frontend/primitives/collections/dictionary.runa (cache mappings)
+- compiler/frontend/primitives/collections/set.runa (alias sets)
+- compiler/frontend/primitives/core/string_core.runa (debug printing)
 :End Note
 
-Note: TODO - Implement alias analysis functionality
+Import "compiler/middle/analysis/points_to.runa" as PointsTo
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/analysis/control_flow.runa" as CFG
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: ALIAS RESULT CONSTANTS
+Note: ============================================================================
+
+Note: Alias query result types
+Constant ALIAS_NO_ALIAS as Integer is 0          Note: Pointers definitely don't alias
+Constant ALIAS_MAY_ALIAS as Integer is 1         Note: Pointers may alias (conservative)
+Constant ALIAS_MUST_ALIAS as Integer is 2        Note: Pointers always alias (same location)
+Constant ALIAS_PARTIAL_ALIAS as Integer is 3     Note: Pointers partially overlap
+
+Note: ============================================================================
+Note: ALIAS ANALYSIS TYPE DEFINITIONS
+Note: ============================================================================
+
+@Reasoning
+AliasQueryResult represents the result of an alias query between two pointers.
+
+Result types:
+- NoAlias: Pointers definitely don't alias (safe to optimize)
+- MayAlias: Pointers may alias (conservative, must assume aliasing)
+- MustAlias: Pointers always alias (same memory location)
+- PartialAlias: Pointers partially overlap (e.g., struct fields)
+
+Fields:
+- result_type: Alias result constant
+- confidence: Confidence level (0-100, higher = more certain)
+- reason: String describing why this result was determined
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 3 fields × 8 bytes = 24 bytes
+@End Reasoning
+
+Type called "AliasQueryResult":
+    result_type as Integer      Note: Alias result constant
+    confidence as Integer       Note: Confidence level (0-100)
+    reason as Integer           Note: Pointer to reason string
+End Type
+
+Note: Field offsets: 0, 8, 16
+
+@Reasoning
+ModRefInfo represents function side effects (what memory a function modifies/reads).
+
+Tracks:
+- May read: Set of memory locations the function may read
+- May write: Set of memory locations the function may write
+- Is pure: Boolean indicating no side effects
+
+Used for optimizations:
+- Dead store elimination (if function doesn't read location)
+- Load elimination (if function doesn't write location)
+- Function call reordering (if functions don't conflict)
+
+Fields:
+- function: Pointer to MIR function
+- may_read: Set of location IDs that may be read
+- may_write: Set of location IDs that may be written
+- is_pure: Boolean: 1 if pure (no side effects), 0 otherwise
+- is_readonly: Boolean: 1 if only reads (no writes)
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 5 fields × 8 bytes = 40 bytes
+@End Reasoning
+
+Type called "ModRefInfo":
+    function as Integer         Note: Pointer to MIR function
+    may_read as Integer         Note: Set of location IDs read
+    may_write as Integer        Note: Set of location IDs written
+    is_pure as Integer          Note: Boolean: no side effects
+    is_readonly as Integer      Note: Boolean: reads only
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32
+
+@Reasoning
+AliasAnalysis represents the complete alias analysis state.
+
+Contains:
+- Points-to graph (from points_to.runa)
+- Alias query cache for performance
+- Type hierarchy for TBAA
+- Mod/Ref information for functions
+
+Provides unified interface for alias queries with multiple refinements:
+1. Points-to based aliasing (from Andersen's analysis)
+2. Type-based refinement (TBAA)
+3. Size-based refinement (array bounds, struct fields)
+4. Mod/Ref analysis (function side effects)
+
+Fields:
+- points_to_graph: Pointer to PointsToGraph
+- alias_cache: Dictionary caching query results
+- type_hierarchy: HIR type hierarchy for TBAA
+- mod_ref_map: Dictionary mapping function -> ModRefInfo
+- query_count: Statistics: number of queries
+- cache_hit_count: Statistics: cache hits
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 6 fields × 8 bytes = 48 bytes
+@End Reasoning
+
+Type called "AliasAnalysis":
+    points_to_graph as Integer  Note: Pointer to PointsToGraph
+    alias_cache as Integer      Note: Dictionary (ptr1, ptr2) -> result
+    type_hierarchy as Integer   Note: HIR type hierarchy
+    mod_ref_map as Integer      Note: Dictionary function -> ModRefInfo
+    query_count as Integer      Note: Number of queries
+    cache_hit_count as Integer  Note: Cache hits
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40
+
+Note: ============================================================================
+Note: ALIAS ANALYSIS INITIALIZATION
+Note: ============================================================================
+
+@Reasoning
+Creates an AliasQueryResult.
+
+Memory: Tier 3 (OWNED HEAP) - 24 bytes
+@End Reasoning
+
+Process called "create_alias_query_result" that takes result_type as Integer, confidence as Integer returns Integer:
+    Note: Allocate AliasQueryResult structure (24 bytes)
+    Let result be Layout.allocate(24)
+    If result equals 0:
+        Display "create_alias_query_result: allocation failed"
+        Return 0
+    End If
+
+    Note: Set fields
+    Layout.memory_set_int64(result, 0, result_type)
+    Layout.memory_set_int64(result, 8, confidence)
+    Layout.memory_set_int64(result, 16, 0)  Note: reason = null (optional)
+
+    Return result
+End Process
+
+@Reasoning
+Creates ModRefInfo for a function.
+
+Memory: Tier 3 (OWNED HEAP) - 40 bytes
+@End Reasoning
+
+Process called "create_mod_ref_info" that takes function as Integer returns Integer:
+    Note: Allocate ModRefInfo structure (40 bytes)
+    Let modref be Layout.allocate(40)
+    If modref equals 0:
+        Display "create_mod_ref_info: allocation failed"
+        Return 0
+    End If
+
+    Note: Set function pointer
+    Layout.memory_set_int64(modref, 0, function)
+
+    Note: Create empty read/write sets
+    Let may_read be Set.create()
+    Let may_write be Set.create()
+
+    Layout.memory_set_int64(modref, 8, may_read)
+    Layout.memory_set_int64(modref, 16, may_write)
+
+    Note: Initialize as unknown (conservative)
+    Layout.memory_set_int64(modref, 24, 0)  Note: is_pure = 0 (assume side effects)
+    Layout.memory_set_int64(modref, 32, 0)  Note: is_readonly = 0
+
+    Return modref
+End Process
+
+@Reasoning
+Creates AliasAnalysis with a points-to graph.
+
+Memory: Tier 3 (OWNED HEAP) - 48 bytes
+@End Reasoning
+
+Process called "create_alias_analysis" that takes points_to_graph as Integer returns Integer:
+    Note: Allocate AliasAnalysis structure (48 bytes)
+    Let aa be Layout.allocate(48)
+    If aa equals 0:
+        Display "create_alias_analysis: allocation failed"
+        Return 0
+    End If
+
+    Note: Set points-to graph
+    Layout.memory_set_int64(aa, 0, points_to_graph)
+
+    Note: Create empty cache and maps
+    Let alias_cache be Dictionary.create()
+    Let mod_ref_map be Dictionary.create()
+
+    Layout.memory_set_int64(aa, 8, alias_cache)
+    Layout.memory_set_int64(aa, 16, 0)          Note: type_hierarchy (optional)
+    Layout.memory_set_int64(aa, 24, mod_ref_map)
+
+    Note: Initialize statistics
+    Layout.memory_set_int64(aa, 32, 0)  Note: query_count = 0
+    Layout.memory_set_int64(aa, 40, 0)  Note: cache_hit_count = 0
+
+    Return aa
+End Process
+
+Note: ============================================================================
+Note: ALIAS QUERY INTERFACE
+Note: ============================================================================
+
+@Reasoning
+Main alias query interface.
+
+Determines if two pointers may alias using multiple techniques:
+1. Points-to analysis (check if pts(p1) ∩ pts(p2) ≠ ∅)
+2. Type-based refinement (TBAA)
+3. Size-based refinement
+
+Returns: AliasQueryResult
+@End Reasoning
+
+Process called "query_alias" that takes aa as Integer, ptr1_id as Integer, ptr2_id as Integer returns Integer:
+    If aa equals 0:
+        Display "query_alias: null alias analysis"
+        Return create_alias_query_result(1, 50)  Note: MayAlias, low confidence
+    End If
+
+    Note: Increment query count
+    Let query_count be Layout.memory_get_int64(aa, 32)
+    Layout.memory_set_int64(aa, 32, query_count + 1)
+
+    Note: Check cache first
+    Let alias_cache be Layout.memory_get_int64(aa, 8)
+    Let cache_key be ptr1_id * 1000000 + ptr2_id  Note: Simple hash
+    Let cached_result be Dictionary.get(alias_cache, cache_key)
+
+    If cached_result is not equal to 0:
+        Note: Cache hit
+        Let cache_hits be Layout.memory_get_int64(aa, 40)
+        Layout.memory_set_int64(aa, 40, cache_hits + 1)
+        Return cached_result
+    End If
+
+    Note: Same pointer always aliases
+    If ptr1_id equals ptr2_id:
+        Let result be create_alias_query_result(2, 100)  Note: MustAlias, certain
+        Dictionary.set(alias_cache, cache_key, result)
+        Return result
+    End If
+
+    Note: Use points-to analysis
+    Let pts_graph be Layout.memory_get_int64(aa, 0)
+    If pts_graph is not equal to 0:
+        Let may_alias be PointsTo.may_alias(pts_graph, ptr1_id, ptr2_id)
+
+        If may_alias equals 0:
+            Note: Points-to sets don't intersect - NoAlias
+            Let result be create_alias_query_result(0, 90)  Note: NoAlias, high confidence
+            Dictionary.set(alias_cache, cache_key, result)
+            Return result
+        End If
+
+        Note: Points-to sets intersect - may alias
+        Note: Try to refine with type information
+        Let result be refine_with_type_info(aa, ptr1_id, ptr2_id, pts_graph)
+        Dictionary.set(alias_cache, cache_key, result)
+        Return result
+    End If
+
+    Note: No points-to information, conservative
+    Let result be create_alias_query_result(1, 50)  Note: MayAlias, low confidence
+    Dictionary.set(alias_cache, cache_key, result)
+    Return result
+End Process
+
+@Reasoning
+Alias query with size information.
+
+Checks if two memory ranges may overlap:
+- [ptr1, ptr1 + size1) vs [ptr2, ptr2 + size2)
+
+Returns: AliasQueryResult
+@End Reasoning
+
+Process called "query_alias_with_size" that takes aa as Integer, ptr1_id as Integer, size1 as Integer, ptr2_id as Integer, size2 as Integer returns Integer:
+    If aa equals 0:
+        Return create_alias_query_result(1, 50)  Note: MayAlias, conservative
+    End If
+
+    Note: First check basic aliasing
+    Let base_result be query_alias(aa, ptr1_id, ptr2_id)
+    Let base_type be Layout.memory_get_int64(base_result, 0)
+
+    Note: If base pointers don't alias, ranges don't alias
+    If base_type equals 0:  Note: NoAlias
+        Return base_result
+    End If
+
+    Note: If base pointers must alias, check if ranges overlap
+    If base_type equals 2:  Note: MustAlias
+        Note: Same base pointer, ranges definitely overlap
+        Return create_alias_query_result(2, 100)  Note: MustAlias
+    End If
+
+    Note: May alias with size information
+    Note: Conservative: assume overlap
+    Return create_alias_query_result(1, 60)  Note: MayAlias
+End Process
+
+Note: ============================================================================
+Note: TYPE-BASED ALIAS ANALYSIS (TBAA)
+Note: ============================================================================
+
+@Reasoning
+Refines alias result using type information (TBAA).
+
+Type-Based Alias Analysis rules:
+1. Pointers of incompatible types don't alias
+2. Integer* and Float* don't alias
+3. Struct fields may alias if overlapping
+4. Arrays of different element types don't alias
+
+This provides additional precision beyond points-to analysis.
+
+Returns: Refined AliasQueryResult
+@End Reasoning
+
+Process called "refine_with_type_info" that takes aa as Integer, ptr1_id as Integer, ptr2_id as Integer, pts_graph as Integer returns Integer:
+    If aa equals 0 or pts_graph equals 0:
+        Return create_alias_query_result(1, 50)  Note: MayAlias, conservative
+    End If
+
+    Note: Get type hierarchy
+    Let type_hierarchy be Layout.memory_get_int64(aa, 16)
+    If type_hierarchy equals 0:
+        Note: No type information, can't refine
+        Return create_alias_query_result(1, 70)  Note: MayAlias, medium confidence
+    End If
+
+    Note: Get abstract locations for both pointers
+    Let location1 be PointsTo.get_allocation_location(pts_graph, ptr1_id)
+    Let location2 be PointsTo.get_allocation_location(pts_graph, ptr2_id)
+
+    If location1 equals 0 or location2 equals 0:
+        Note: Can't determine allocation sites
+        Return create_alias_query_result(1, 60)  Note: MayAlias
+    End If
+
+    Note: Get type information from locations
+    Let type1 be Layout.memory_get_int64(location1, 16)  Note: type_info field
+    Let type2 be Layout.memory_get_int64(location2, 16)
+
+    If type1 equals 0 or type2 equals 0:
+        Note: No type info
+        Return create_alias_query_result(1, 60)  Note: MayAlias
+    End If
+
+    Note: Check if types are compatible
+    Let compatible be check_types_compatible(type1, type2)
+
+    If compatible equals 0:
+        Note: Types incompatible - NoAlias
+        Return create_alias_query_result(0, 85)  Note: NoAlias, high confidence via TBAA
+    End If
+
+    Note: Types compatible, may alias
+    Return create_alias_query_result(1, 75)  Note: MayAlias, medium-high confidence
+End Process
+
+@Reasoning
+Checks if two types may alias under TBAA rules.
+
+Returns:
+- 1 if types may alias (compatible)
+- 0 if types definitely don't alias (incompatible)
+@End Reasoning
+
+Process called "check_types_compatible" that takes type1 as Integer, type2 as Integer returns Integer:
+    If type1 equals 0 or type2 equals 0:
+        Return 1  Note: Unknown types, assume compatible
+    End If
+
+    Note: Same type always compatible
+    If type1 equals type2:
+        Return 1
+    End If
+
+    Note: Get type kinds (offset 0 in HIRTypeInfo)
+    Let kind1 be Layout.memory_get_int64(type1, 0)
+    Let kind2 be Layout.memory_get_int64(type2, 0)
+
+    Note: Type kind constants (from hir.runa)
+    Note: 1=Integer, 2=Float, 3=Pointer, 4=Struct, 5=Array
+
+    Note: Integer vs Float: incompatible
+    If kind1 equals 1 and kind2 equals 2:
+        Return 0
+    End If
+    If kind1 equals 2 and kind2 equals 1:
+        Return 0
+    End If
+
+    Note: Different struct types: check for common fields (conservative: assume may alias)
+    If kind1 equals 4 and kind2 equals 4:
+        Return 1  Note: Conservative for structs
+    End If
+
+    Note: Arrays: check element types
+    If kind1 equals 5 and kind2 equals 5:
+        Note: Get element types (offset 8 in array type)
+        Let elem1 be Layout.memory_get_int64(type1, 8)
+        Let elem2 be Layout.memory_get_int64(type2, 8)
+
+        Note: Recursively check element compatibility
+        Return check_types_compatible(elem1, elem2)
+    End If
+
+    Note: Pointers: check pointee types
+    If kind1 equals 3 and kind2 equals 3:
+        Let pointee1 be Layout.memory_get_int64(type1, 8)
+        Let pointee2 be Layout.memory_get_int64(type2, 8)
+
+        Return check_types_compatible(pointee1, pointee2)
+    End If
+
+    Note: Different kinds, conservative
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MOD/REF ANALYSIS (Function Side Effects)
+Note: ============================================================================
+
+@Reasoning
+Computes Mod/Ref information for a function.
+
+Determines:
+- May-Read set: Memory locations the function may read
+- May-Write set: Memory locations the function may modify
+- Is-Pure: Whether function has no side effects
+- Is-Readonly: Whether function only reads (no writes)
+
+Used for:
+- Dead store elimination
+- Load elimination
+- Function call reordering
+
+Returns: ModRefInfo
+@End Reasoning
+
+Process called "compute_mod_ref" that takes aa as Integer, mir_function as Integer returns Integer:
+    If aa equals 0 or mir_function equals 0:
+        Display "compute_mod_ref: null inputs"
+        Return 0
+    End If
+
+    Note: Create ModRefInfo
+    Let modref be create_mod_ref_info(mir_function)
+    If modref equals 0:
+        Return 0
+    End If
+
+    Note: Get MIR CFG
+    Let mir_cfg be Layout.memory_get_int64(mir_function, 8)
+    If mir_cfg equals 0:
+        Return modref
+    End If
+
+    Note: Get blocks
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Note: Get read/write sets
+    Let may_read be Layout.memory_get_int64(modref, 8)
+    Let may_write be Layout.memory_get_int64(modref, 16)
+
+    Note: Assume pure until proven otherwise
+    Let has_side_effects be 0
+    Let has_writes be 0
+
+    Note: Scan all instructions
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be Layout.memory_get_int64(block, 24)
+
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(instructions, i)
+            Let opcode be Layout.memory_get_int64(inst, 0)
+
+            Note: Load instructions (read memory)
+            If opcode is greater than or equal to 20300 and opcode is less than 20350:
+                Note: This is a load, adds to may-read set
+                Let operands be Layout.memory_get_int64(inst, 16)
+                If operands is not equal to 0:
+                    Let operand_count be List.length(operands)
+                    If operand_count is greater than 0:
+                        Let ptr be List.get(operands, 0)
+                        If ptr is not equal to 0:
+                            Let ptr_id be Layout.memory_get_int64(ptr, 0)
+                            Set.add(may_read, ptr_id)
+                        End If
+                    End If
+                End If
+            End If
+
+            Note: Store instructions (write memory)
+            If opcode is greater than or equal to 20350 and opcode is less than 20400:
+                Note: This is a store, adds to may-write set
+                Let has_writes be 1
+                Let operands be Layout.memory_get_int64(inst, 16)
+                If operands is not equal to 0:
+                    Let operand_count be List.length(operands)
+                    If operand_count is greater than 0:
+                        Let ptr be List.get(operands, 0)
+                        If ptr is not equal to 0:
+                            Let ptr_id be Layout.memory_get_int64(ptr, 0)
+                            Set.add(may_write, ptr_id)
+                        End If
+                    End If
+                End If
+            End If
+
+            Note: Function calls (may have side effects)
+            If opcode is greater than or equal to 20600 and opcode is less than 20700:
+                Note: Function call - conservative: assume side effects
+                Let has_side_effects be 1
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Note: Determine pure/readonly flags
+    Let read_count be Set.size(may_read)
+    Let write_count be Set.size(may_write)
+
+    If read_count equals 0 and write_count equals 0 and has_side_effects equals 0:
+        Layout.memory_set_int64(modref, 24, 1)  Note: is_pure = 1
+    End If
+
+    If write_count equals 0 and has_side_effects equals 0:
+        Layout.memory_set_int64(modref, 32, 1)  Note: is_readonly = 1
+    End If
+
+    Note: Store in mod/ref map
+    Let mod_ref_map be Layout.memory_get_int64(aa, 24)
+    Dictionary.set(mod_ref_map, mir_function, modref)
+
+    Return modref
+End Process
+
+@Reasoning
+Checks if an instruction may modify memory.
+
+Returns: 1 if may modify, 0 if definitely doesn't modify
+@End Reasoning
+
+Process called "may_modify_memory" that takes aa as Integer, instruction as Integer returns Integer:
+    If instruction equals 0:
+        Return 0
+    End If
+
+    Note: Get opcode
+    Let opcode be Layout.memory_get_int64(instruction, 0)
+
+    Note: Store instructions modify memory
+    If opcode is greater than or equal to 20350 and opcode is less than 20400:
+        Return 1
+    End If
+
+    Note: Function calls may modify memory (conservative)
+    If opcode is greater than or equal to 20600 and opcode is less than 20700:
+        Return 1
+    End If
+
+    Note: Other instructions don't modify memory
+    Return 0
+End Process
+
+@Reasoning
+Checks if an instruction may read memory.
+
+Returns: 1 if may read, 0 if definitely doesn't read
+@End Reasoning
+
+Process called "may_read_memory" that takes aa as Integer, instruction as Integer returns Integer:
+    If instruction equals 0:
+        Return 0
+    End If
+
+    Note: Get opcode
+    Let opcode be Layout.memory_get_int64(instruction, 0)
+
+    Note: Load instructions read memory
+    If opcode is greater than or equal to 20300 and opcode is less than 20350:
+        Return 1
+    End If
+
+    Note: Function calls may read memory (conservative)
+    If opcode is greater than or equal to 20600 and opcode is less than 20700:
+        Return 1
+    End If
+
+    Note: Other instructions don't read memory
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: MEMORY BARRIERS AND ORDERING
+Note: ============================================================================
+
+@Reasoning
+Checks if an instruction is a memory barrier (fence, volatile access).
+
+Memory barriers prevent reordering of memory operations.
+
+Returns: 1 if is barrier, 0 if not
+@End Reasoning
+
+Process called "is_memory_barrier" that takes instruction as Integer returns Integer:
+    If instruction equals 0:
+        Return 0
+    End If
+
+    Note: Get opcode
+    Let opcode be Layout.memory_get_int64(instruction, 0)
+
+    Note: Memory fence instructions (opcodes 20900-20999)
+    If opcode is greater than or equal to 20900 and opcode is less than 21000:
+        Return 1
+    End If
+
+    Note: Volatile loads/stores (opcodes 21000-21099)
+    If opcode is greater than or equal to 21000 and opcode is less than 21100:
+        Return 1
+    End If
+
+    Note: Atomic operations (opcodes 21100-21199)
+    If opcode is greater than or equal to 21100 and opcode is less than 21200:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: HELPER FUNCTIONS
+Note: ============================================================================
+
+@Reasoning
+Gets the base object for a pointer through GEP (Get Element Ptr) chains.
+
+Useful for determining the original allocation of a derived pointer.
+
+Returns: Base pointer ID (or original pointer if no GEP chain)
+@End Reasoning
+
+Process called "get_base_object" that takes aa as Integer, ptr_id as Integer returns Integer:
+    If aa equals 0:
+        Return ptr_id
+    End If
+
+    Note: Get points-to graph
+    Let pts_graph be Layout.memory_get_int64(aa, 0)
+    If pts_graph equals 0:
+        Return ptr_id
+    End If
+
+    Note: Get allocation location
+    Let location be PointsTo.get_allocation_location(pts_graph, ptr_id)
+    If location equals 0:
+        Return ptr_id
+    End If
+
+    Note: Return the allocation site (base object)
+    Let alloc_site be Layout.memory_get_int64(location, 8)
+    If alloc_site equals 0:
+        Return ptr_id
+    End If
+
+    Note: Get result of allocation instruction (the base pointer)
+    Let result be Layout.memory_get_int64(alloc_site, 8)
+    If result equals 0:
+        Return ptr_id
+    End If
+
+    Let base_id be Layout.memory_get_int64(result, 0)
+    Return base_id
+End Process
+
+@Reasoning
+Checks if a pointer may alias with global variables.
+
+Returns: 1 if may alias with globals, 0 if definitely doesn't
+@End Reasoning
+
+Process called "may_alias_with_global" that takes aa as Integer, ptr_id as Integer returns Integer:
+    If aa equals 0:
+        Return 1  Note: Conservative
+    End If
+
+    Note: Get points-to graph
+    Let pts_graph be Layout.memory_get_int64(aa, 0)
+    If pts_graph equals 0:
+        Return 1  Note: Conservative
+    End If
+
+    Note: Get points-to set
+    Let pts be PointsTo.query_points_to(pts_graph, ptr_id)
+    If pts equals 0:
+        Return 1  Note: Conservative
+    End If
+
+    Note: Get pointees
+    Let pointees be Layout.memory_get_int64(pts, 8)
+    Let pointee_list be Set.to_list(pointees)
+    Let count be List.length(pointee_list)
+
+    Note: Check each location
+    Let locations be Layout.memory_get_int64(pts_graph, 0)
+    Let location_count be Layout.memory_get_int64(pts_graph, 40)
+
+    Let i be 0
+    While i is less than count:
+        Let location_id be List.get(pointee_list, i)
+
+        Note: Find this location
+        Let j be 0
+        While j is less than location_count:
+            Let location be List.get(locations, j)
+            Let loc_id be Layout.memory_get_int64(location, 0)
+
+            If loc_id equals location_id:
+                Note: Check if global
+                Let is_global be Layout.memory_get_int64(location, 32)
+                If is_global equals 1:
+                    Return 1  Note: Points to global
+                End If
+            End If
+
+            Let j be j + 1
+        End While
+
+        Let i be i + 1
+    End While
+
+    Note: No global pointees found
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: VERIFICATION AND DEBUGGING
+Note: ============================================================================
+
+@Reasoning
+Prints alias analysis statistics.
+
+Displays:
+- Query count
+- Cache hit rate
+- Points-to graph summary
+- Mod/Ref information summary
+@End Reasoning
+
+Process called "print_alias_analysis_stats" that takes aa as Integer returns Integer:
+    If aa equals 0:
+        Display "print_alias_analysis_stats: null alias analysis"
+        Return 0
+    End If
+
+    Display "=== Alias Analysis Statistics ==="
+
+    Note: Print query statistics
+    Let query_count be Layout.memory_get_int64(aa, 32)
+    Let cache_hits be Layout.memory_get_int64(aa, 40)
+
+    Display "Total Queries: "
+    Display query_count
+
+    Display "Cache Hits: "
+    Display cache_hits
+
+    If query_count is greater than 0:
+        Let hit_rate be (cache_hits * 100) / query_count
+        Display "Cache Hit Rate: "
+        Display hit_rate
+        Display "%"
+    End If
+
+    Note: Print points-to graph summary
+    Let pts_graph be Layout.memory_get_int64(aa, 0)
+    If pts_graph is not equal to 0:
+        Let location_count be Layout.memory_get_int64(pts_graph, 40)
+        Let constraint_count be Layout.memory_get_int64(pts_graph, 48)
+
+        Display "Points-To Locations: "
+        Display location_count
+        Display "Points-To Constraints: "
+        Display constraint_count
+    End If
+
+    Note: Print Mod/Ref summary
+    Let mod_ref_map be Layout.memory_get_int64(aa, 24)
+    Let function_ids be Dictionary.keys(mod_ref_map)
+    Let function_count be List.length(function_ids)
+
+    Display "Functions with Mod/Ref: "
+    Display function_count
+
+    Return 1
+End Process

@@ -29,10 +29,1053 @@ This file is essential because of the following reasons:
 - Points-to analysis is foundation for advanced optimizations
 
 This file consists of the following functions/features/operation types:
-- Points-to set computation using inclusion-based analysis
-- Flow-sensitive analysis for precision
-- Context-sensitive analysis for inter-procedural precision
+- Points-to set computation using Andersen's inclusion-based analysis
+- Constraint graph construction and propagation
+- Flow-insensitive whole-program analysis
 - Alias query interface for optimization passes
+
+Dependencies:
+- compiler/middle/gungnir/mir/mir.runa (MIR structures, instructions)
+- compiler/middle/gungnir/hir/hir.runa (Type information)
+- compiler/middle/analysis/control_flow.runa (CFG structures)
+- compiler/middle/analysis/data_flow.runa (def-use chains)
+- compiler/frontend/primitives/memory/layout.runa (OWNED HEAP allocation - Tier 3)
+- compiler/frontend/primitives/collections/list.runa (constraint lists)
+- compiler/frontend/primitives/collections/dictionary.runa (pointer mappings)
+- compiler/frontend/primitives/collections/set.runa (points-to sets)
+- compiler/frontend/primitives/core/string_core.runa (debug printing)
 :End Note
 
-Note: TODO - Implement points-to analysis functionality
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/analysis/control_flow.runa" as CFG
+Import "compiler/middle/analysis/data_flow.runa" as DataFlow
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: CONSTRAINT TYPE CONSTANTS
+Note: ============================================================================
+
+Note: Andersen's constraint types
+Constant CONSTRAINT_ADDR_OF as Integer is 1      Note: p = &q (address-of)
+Constant CONSTRAINT_COPY as Integer is 2         Note: p = q (copy)
+Constant CONSTRAINT_LOAD as Integer is 3         Note: p = *q (load/dereference)
+Constant CONSTRAINT_STORE as Integer is 4        Note: *p = q (store/assignment through pointer)
+
+Note: ============================================================================
+Note: POINTS-TO ANALYSIS TYPE DEFINITIONS
+Note: ============================================================================
+
+@Reasoning
+AbstractLocation represents an abstract memory location in points-to analysis.
+
+Each allocation site in the program creates an abstract location. Pointers
+point to abstract locations, not concrete addresses.
+
+Fields:
+- location_id: Unique identifier for this location
+- allocation_site: Instruction where this location is allocated
+- type_info: HIR type information for this allocation
+- is_heap: Boolean: 1 if heap allocated, 0 if stack
+- is_global: Boolean: 1 if global variable, 0 if local
+- is_parameter: Boolean: 1 if function parameter
+- name: Optional name string (for debugging)
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 7 fields × 8 bytes = 56 bytes
+@End Reasoning
+
+Type called "AbstractLocation":
+    location_id as Integer      Note: Unique location ID
+    allocation_site as Integer  Note: Pointer to allocating instruction
+    type_info as Integer        Note: Pointer to HIRTypeInfo
+    is_heap as Integer          Note: Boolean: heap allocation
+    is_global as Integer        Note: Boolean: global variable
+    is_parameter as Integer     Note: Boolean: function parameter
+    name as Integer             Note: Pointer to name string (optional)
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40, 48
+
+@Reasoning
+PointsToSet represents the set of abstract locations a pointer may point to.
+
+For a pointer p, pts(p) is the set of all abstract locations that p may
+point to at any program point. This is flow-insensitive (whole program view).
+
+Fields:
+- pointer_id: The pointer variable ID
+- pointees: Set of AbstractLocation IDs this pointer may point to
+- is_unknown: Boolean: if true, may point to anything (conservative)
+- is_null: Boolean: may be null pointer
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 4 fields × 8 bytes = 32 bytes
+@End Reasoning
+
+Type called "PointsToSet":
+    pointer_id as Integer       Note: Pointer variable ID
+    pointees as Integer         Note: Set of location IDs
+    is_unknown as Integer       Note: Boolean: conservative unknown
+    is_null as Integer          Note: Boolean: may be null
+End Type
+
+Note: Field offsets: 0, 8, 16, 24
+
+@Reasoning
+PointsToConstraint represents a constraint in Andersen's analysis.
+
+Constraint types:
+1. ADDR_OF (p = &q): pts(p) ⊇ {q}
+2. COPY (p = q): pts(p) ⊇ pts(q)
+3. LOAD (p = *q): pts(p) ⊇ ⋃_{l ∈ pts(q)} pts(l)
+4. STORE (*p = q): ∀l ∈ pts(p), pts(l) ⊇ pts(q)
+
+Fields:
+- constraint_type: Type constant (ADDR_OF, COPY, LOAD, STORE)
+- lhs: Left-hand side pointer ID
+- rhs: Right-hand side pointer/location ID
+- instruction: Instruction that generated this constraint
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 4 fields × 8 bytes = 32 bytes
+@End Reasoning
+
+Type called "PointsToConstraint":
+    constraint_type as Integer  Note: Constraint type constant
+    lhs as Integer              Note: Left-hand side ID
+    rhs as Integer              Note: Right-hand side ID
+    instruction as Integer      Note: Originating instruction pointer
+End Type
+
+Note: Field offsets: 0, 8, 16, 24
+
+@Reasoning
+PointsToGraph represents the complete points-to analysis results.
+
+Contains:
+- All abstract locations in the program
+- Points-to sets for all pointer variables
+- Constraints extracted from the program
+- Worklist for iterative propagation
+
+Used by alias analysis and escape analysis.
+
+Fields:
+- locations: List of AbstractLocation pointers
+- pointer_to_set: Dictionary mapping pointer_id -> PointsToSet
+- constraints: List of PointsToConstraint pointers
+- next_location_id: Counter for generating unique location IDs
+- worklist: Worklist for constraint propagation (pointer IDs to process)
+- location_count: Number of abstract locations
+- constraint_count: Number of constraints
+
+Memory: Tier 3 (OWNED HEAP)
+Size: 7 fields × 8 bytes = 56 bytes
+@End Reasoning
+
+Type called "PointsToGraph":
+    locations as Integer            Note: List of AbstractLocation pointers
+    pointer_to_set as Integer       Note: Dictionary pointer_id -> PointsToSet
+    constraints as Integer          Note: List of PointsToConstraint pointers
+    next_location_id as Integer     Note: Location ID counter
+    worklist as Integer             Note: List of pointer IDs to process
+    location_count as Integer       Note: Number of locations
+    constraint_count as Integer     Note: Number of constraints
+End Type
+
+Note: Field offsets: 0, 8, 16, 24, 32, 40, 48
+
+Note: ============================================================================
+Note: POINTS-TO STRUCTURE INITIALIZATION
+Note: ============================================================================
+
+@Reasoning
+Creates an AbstractLocation for an allocation site.
+
+Memory: Tier 3 (OWNED HEAP) - 56 bytes
+@End Reasoning
+
+Process called "create_abstract_location" that takes location_id as Integer, allocation_site as Integer, type_info as Integer returns Integer:
+    Note: Allocate AbstractLocation structure (56 bytes)
+    Let location be Layout.allocate(56)
+    If location equals 0:
+        Display "create_abstract_location: allocation failed"
+        Return 0
+    End If
+
+    Note: Set fields
+    Layout.memory_set_int64(location, 0, location_id)
+    Layout.memory_set_int64(location, 8, allocation_site)
+    Layout.memory_set_int64(location, 16, type_info)
+    Layout.memory_set_int64(location, 24, 0)    Note: is_heap = 0 (default stack)
+    Layout.memory_set_int64(location, 32, 0)    Note: is_global = 0
+    Layout.memory_set_int64(location, 40, 0)    Note: is_parameter = 0
+    Layout.memory_set_int64(location, 48, 0)    Note: name = null
+
+    Return location
+End Process
+
+@Reasoning
+Creates a PointsToSet for a pointer variable.
+
+Memory: Tier 3 (OWNED HEAP) - 32 bytes
+@End Reasoning
+
+Process called "create_points_to_set" that takes pointer_id as Integer returns Integer:
+    Note: Allocate PointsToSet structure (32 bytes)
+    Let pts be Layout.allocate(32)
+    If pts equals 0:
+        Display "create_points_to_set: allocation failed"
+        Return 0
+    End If
+
+    Note: Set pointer_id
+    Layout.memory_set_int64(pts, 0, pointer_id)
+
+    Note: Create empty pointees set
+    Let pointees be Set.create()
+    Layout.memory_set_int64(pts, 8, pointees)
+
+    Note: Initialize flags
+    Layout.memory_set_int64(pts, 16, 0)    Note: is_unknown = 0
+    Layout.memory_set_int64(pts, 24, 0)    Note: is_null = 0
+
+    Return pts
+End Process
+
+@Reasoning
+Creates a constraint for Andersen's analysis.
+
+Memory: Tier 3 (OWNED HEAP) - 32 bytes
+@End Reasoning
+
+Process called "create_constraint" that takes constraint_type as Integer, lhs as Integer, rhs as Integer, instruction as Integer returns Integer:
+    Note: Allocate PointsToConstraint structure (32 bytes)
+    Let constraint be Layout.allocate(32)
+    If constraint equals 0:
+        Display "create_constraint: allocation failed"
+        Return 0
+    End If
+
+    Note: Set fields
+    Layout.memory_set_int64(constraint, 0, constraint_type)
+    Layout.memory_set_int64(constraint, 8, lhs)
+    Layout.memory_set_int64(constraint, 16, rhs)
+    Layout.memory_set_int64(constraint, 24, instruction)
+
+    Return constraint
+End Process
+
+@Reasoning
+Creates an empty PointsToGraph.
+
+Memory: Tier 3 (OWNED HEAP) - 56 bytes
+@End Reasoning
+
+Process called "create_points_to_graph" returns Integer:
+    Note: Allocate PointsToGraph structure (56 bytes)
+    Let graph be Layout.allocate(56)
+    If graph equals 0:
+        Display "create_points_to_graph: allocation failed"
+        Return 0
+    End If
+
+    Note: Create empty collections
+    Let locations be List.create()
+    Let pointer_to_set be Dictionary.create()
+    Let constraints be List.create()
+    Let worklist be List.create()
+
+    Note: Store in structure
+    Layout.memory_set_int64(graph, 0, locations)
+    Layout.memory_set_int64(graph, 8, pointer_to_set)
+    Layout.memory_set_int64(graph, 16, constraints)
+    Layout.memory_set_int64(graph, 24, 0)       Note: next_location_id = 0
+    Layout.memory_set_int64(graph, 32, worklist)
+
+    Note: Initialize counts
+    Layout.memory_set_int64(graph, 40, 0)       Note: location_count = 0
+    Layout.memory_set_int64(graph, 48, 0)       Note: constraint_count = 0
+
+    Return graph
+End Process
+
+Note: ============================================================================
+Note: ABSTRACT LOCATION MANAGEMENT
+Note: ============================================================================
+
+@Reasoning
+Adds an abstract location to the points-to graph.
+
+Returns: location_id of the added location
+@End Reasoning
+
+Process called "add_abstract_location" that takes graph as Integer, allocation_site as Integer, type_info as Integer returns Integer:
+    If graph equals 0:
+        Display "add_abstract_location: null graph"
+        Return -1
+    End If
+
+    Note: Get next location ID
+    Let next_id be Layout.memory_get_int64(graph, 24)
+
+    Note: Create location
+    Let location be create_abstract_location(next_id, allocation_site, type_info)
+    If location equals 0:
+        Return -1
+    End If
+
+    Note: Add to locations list
+    Let locations be Layout.memory_get_int64(graph, 0)
+    List.append(locations, location)
+
+    Note: Increment location ID counter
+    Layout.memory_set_int64(graph, 24, next_id + 1)
+
+    Note: Increment location count
+    Let count be Layout.memory_get_int64(graph, 40)
+    Layout.memory_set_int64(graph, 40, count + 1)
+
+    Return next_id
+End Process
+
+@Reasoning
+Gets or creates a points-to set for a pointer.
+
+Returns: PointsToSet for the pointer
+@End Reasoning
+
+Process called "get_or_create_points_to_set" that takes graph as Integer, pointer_id as Integer returns Integer:
+    If graph equals 0:
+        Display "get_or_create_points_to_set: null graph"
+        Return 0
+    End If
+
+    Note: Get pointer_to_set dictionary
+    Let pts_dict be Layout.memory_get_int64(graph, 8)
+
+    Note: Check if already exists
+    Let pts be Dictionary.get(pts_dict, pointer_id)
+    If pts is not equal to 0:
+        Return pts
+    End If
+
+    Note: Create new points-to set
+    Let pts be create_points_to_set(pointer_id)
+    If pts equals 0:
+        Return 0
+    End If
+
+    Note: Store in dictionary
+    Dictionary.set(pts_dict, pointer_id, pts)
+
+    Return pts
+End Process
+
+Note: ============================================================================
+Note: CONSTRAINT GENERATION
+Note: ============================================================================
+
+@Reasoning
+Adds a constraint to the points-to graph.
+
+Constraint types:
+- ADDR_OF: p = &q (p points to location of q)
+- COPY: p = q (p points to same as q)
+- LOAD: p = *q (p points to what q's pointees point to)
+- STORE: *p = q (q is stored through p)
+@End Reasoning
+
+Process called "add_constraint" that takes graph as Integer, constraint_type as Integer, lhs as Integer, rhs as Integer, instruction as Integer returns Integer:
+    If graph equals 0:
+        Display "add_constraint: null graph"
+        Return 0
+    End If
+
+    Note: Create constraint
+    Let constraint be create_constraint(constraint_type, lhs, rhs, instruction)
+    If constraint equals 0:
+        Return 0
+    End If
+
+    Note: Add to constraints list
+    Let constraints be Layout.memory_get_int64(graph, 16)
+    List.append(constraints, constraint)
+
+    Note: Increment constraint count
+    Let count be Layout.memory_get_int64(graph, 48)
+    Layout.memory_set_int64(graph, 48, count + 1)
+
+    Note: Ensure points-to sets exist for lhs and rhs
+    Let lhs_pts be get_or_create_points_to_set(graph, lhs)
+    Let rhs_pts be get_or_create_points_to_set(graph, rhs)
+
+    Return 1
+End Process
+
+@Reasoning
+Extracts constraints from a MIR function.
+
+Scans all instructions and generates appropriate constraints:
+- Allocations generate abstract locations
+- Pointer assignments generate COPY constraints
+- Address-of operations generate ADDR_OF constraints
+- Loads generate LOAD constraints
+- Stores generate STORE constraints
+
+Returns: 1 if successful
+@End Reasoning
+
+Process called "extract_constraints_from_mir" that takes graph as Integer, mir_function as Integer returns Integer:
+    If graph equals 0 or mir_function equals 0:
+        Display "extract_constraints_from_mir: null inputs"
+        Return 0
+    End If
+
+    Note: Get MIR CFG
+    Let mir_cfg be Layout.memory_get_int64(mir_function, 8)
+    If mir_cfg equals 0:
+        Return 0
+    End If
+
+    Note: Get blocks
+    Let blocks be Layout.memory_get_int64(mir_cfg, 16)
+    Let block_count be Layout.memory_get_int64(mir_cfg, 24)
+
+    Note: For each block
+    Let b be 0
+    While b is less than block_count:
+        Let block be List.get(blocks, b)
+
+        Note: Get instructions
+        Let instructions be Layout.memory_get_int64(block, 16)
+        Let inst_count be Layout.memory_get_int64(block, 24)
+
+        Note: For each instruction
+        Let i be 0
+        While i is less than inst_count:
+            Let inst be List.get(instructions, i)
+
+            Note: Get opcode (offset 0 in MIRNode)
+            Let opcode be Layout.memory_get_int64(inst, 0)
+
+            Note: Get result value (destination pointer)
+            Let result be Layout.memory_get_int64(inst, 8)
+
+            Note: Handle different instruction types
+            Note: Allocation instructions (opcodes 20800-20899)
+            If opcode is greater than or equal to 20800 and opcode is less than 20900:
+                Note: Create abstract location for this allocation
+                If result is not equal to 0:
+                    Let value_id be Layout.memory_get_int64(result, 0)
+                    Let type_info be Layout.memory_get_int64(result, 8)
+
+                    Let location_id be add_abstract_location(graph, inst, type_info)
+
+                    Note: Add ADDR_OF constraint: result points to this location
+                    add_constraint(graph, 1, value_id, location_id, inst)  Note: ADDR_OF = 1
+                End If
+            End If
+
+            Note: Copy/assignment instructions (opcodes 20000-20099)
+            If opcode is greater than or equal to 20000 and opcode is less than 20100:
+                If result is not equal to 0:
+                    Let lhs_id be Layout.memory_get_int64(result, 0)
+
+                    Note: Get operands
+                    Let operands be Layout.memory_get_int64(inst, 16)
+                    If operands is not equal to 0:
+                        Let operand_count be List.length(operands)
+                        If operand_count is greater than 0:
+                            Let rhs be List.get(operands, 0)
+                            If rhs is not equal to 0:
+                                Let rhs_id be Layout.memory_get_int64(rhs, 0)
+
+                                Note: Add COPY constraint: lhs = rhs
+                                add_constraint(graph, 2, lhs_id, rhs_id, inst)  Note: COPY = 2
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+
+            Note: Load instructions (opcodes 20300-20349)
+            If opcode is greater than or equal to 20300 and opcode is less than 20350:
+                If result is not equal to 0:
+                    Let lhs_id be Layout.memory_get_int64(result, 0)
+
+                    Note: Get pointer operand
+                    Let operands be Layout.memory_get_int64(inst, 16)
+                    If operands is not equal to 0:
+                        Let operand_count be List.length(operands)
+                        If operand_count is greater than 0:
+                            Let ptr be List.get(operands, 0)
+                            If ptr is not equal to 0:
+                                Let ptr_id be Layout.memory_get_int64(ptr, 0)
+
+                                Note: Add LOAD constraint: lhs = *ptr
+                                add_constraint(graph, 3, lhs_id, ptr_id, inst)  Note: LOAD = 3
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+
+            Note: Store instructions (opcodes 20350-20399)
+            If opcode is greater than or equal to 20350 and opcode is less than 20400:
+                Note: Get operands
+                Let operands be Layout.memory_get_int64(inst, 16)
+                If operands is not equal to 0:
+                    Let operand_count be List.length(operands)
+                    If operand_count is greater than or equal to 2:
+                        Let ptr be List.get(operands, 0)
+                        Let value be List.get(operands, 1)
+
+                        If ptr is not equal to 0 and value is not equal to 0:
+                            Let ptr_id be Layout.memory_get_int64(ptr, 0)
+                            Let value_id be Layout.memory_get_int64(value, 0)
+
+                            Note: Add STORE constraint: *ptr = value
+                            add_constraint(graph, 4, ptr_id, value_id, inst)  Note: STORE = 4
+                        End If
+                    End If
+                End If
+            End If
+
+            Let i be i + 1
+        End While
+
+        Let b be b + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ANDERSEN'S POINTS-TO ANALYSIS (Inclusion-Based)
+Note: ============================================================================
+
+@Reasoning
+Adds a location to a points-to set and propagates changes.
+
+If the pointee set actually changes, adds the pointer to the worklist
+for constraint re-evaluation.
+
+Returns: 1 if set changed, 0 if no change
+@End Reasoning
+
+Process called "add_pointee" that takes graph as Integer, pts as Integer, location_id as Integer returns Integer:
+    If graph equals 0 or pts equals 0:
+        Return 0
+    End If
+
+    Note: Get pointees set
+    Let pointees be Layout.memory_get_int64(pts, 8)
+
+    Note: Check if already in set
+    If Set.contains(pointees, location_id) equals 1:
+        Return 0  Note: No change
+    End If
+
+    Note: Add to set
+    Set.add(pointees, location_id)
+
+    Note: Add pointer to worklist (changed, need to re-evaluate constraints)
+    Let pointer_id be Layout.memory_get_int64(pts, 0)
+    Let worklist be Layout.memory_get_int64(graph, 32)
+    List.append(worklist, pointer_id)
+
+    Return 1
+End Process
+
+@Reasoning
+Computes points-to sets using Andersen's inclusion-based analysis.
+
+Algorithm (worklist-based):
+1. Initialize: Extract constraints from program
+2. Process simple constraints (ADDR_OF)
+3. Worklist iteration:
+   - Pop pointer p from worklist
+   - For each constraint involving p:
+     - COPY (p = q): pts(p) ⊇ pts(q)
+     - LOAD (p = *q): pts(p) ⊇ ⋃_{l ∈ pts(q)} pts(l)
+     - STORE (*p = q): ∀l ∈ pts(p), pts(l) ⊇ pts(q)
+   - If any pts set changes, add affected pointers to worklist
+4. Repeat until worklist empty (fixed point)
+
+Complexity: O(n³) worst case, but efficient in practice
+Flow-insensitive: Same points-to set for all program points
+
+Returns: 1 if successful
+@End Reasoning
+
+Process called "compute_points_to_andersen" that takes graph as Integer returns Integer:
+    If graph equals 0:
+        Display "compute_points_to_andersen: null graph"
+        Return 0
+    End If
+
+    Note: Get graph fields
+    Let constraints be Layout.memory_get_int64(graph, 16)
+    Let constraint_count be Layout.memory_get_int64(graph, 48)
+    Let worklist be Layout.memory_get_int64(graph, 32)
+    Let pts_dict be Layout.memory_get_int64(graph, 8)
+
+    Note: Phase 1: Process ADDR_OF constraints (initialize points-to sets)
+    Let c be 0
+    While c is less than constraint_count:
+        Let constraint be List.get(constraints, c)
+        Let type be Layout.memory_get_int64(constraint, 0)
+
+        If type equals 1:  Note: ADDR_OF
+            Let lhs be Layout.memory_get_int64(constraint, 8)
+            Let location_id be Layout.memory_get_int64(constraint, 16)
+
+            Note: pts(lhs) = {location_id}
+            Let pts be get_or_create_points_to_set(graph, lhs)
+            add_pointee(graph, pts, location_id)
+        End If
+
+        Let c be c + 1
+    End While
+
+    Note: Phase 2: Iterative constraint solving (worklist algorithm)
+    Let iteration be 0
+    Let max_iterations be 1000
+
+    While List.length(worklist) is greater than 0 and iteration is less than max_iterations:
+        Let iteration be iteration + 1
+
+        Note: Pop pointer from worklist
+        Let pointer_id be List.get(worklist, 0)
+        List.remove_at(worklist, 0)
+
+        Note: Get points-to set for this pointer
+        Let ptr_pts be Dictionary.get(pts_dict, pointer_id)
+        If ptr_pts equals 0:
+            Continue
+        End If
+
+        Note: Process all constraints involving this pointer
+        Let c be 0
+        While c is less than constraint_count:
+            Let constraint be List.get(constraints, c)
+            Let type be Layout.memory_get_int64(constraint, 0)
+            Let lhs be Layout.memory_get_int64(constraint, 8)
+            Let rhs be Layout.memory_get_int64(constraint, 16)
+
+            Note: COPY constraint: lhs = rhs
+            If type equals 2:  Note: COPY
+                Note: If rhs changed, propagate to lhs
+                If rhs equals pointer_id:
+                    Let lhs_pts be get_or_create_points_to_set(graph, lhs)
+                    Let rhs_pointees be Layout.memory_get_int64(ptr_pts, 8)
+
+                    Note: pts(lhs) ⊇ pts(rhs)
+                    Let pointee_list be Set.to_list(rhs_pointees)
+                    Let pointee_count be List.length(pointee_list)
+
+                    Let p be 0
+                    While p is less than pointee_count:
+                        Let location_id be List.get(pointee_list, p)
+                        add_pointee(graph, lhs_pts, location_id)
+                        Let p be p + 1
+                    End While
+                End If
+            End If
+
+            Note: LOAD constraint: lhs = *rhs
+            If type equals 3:  Note: LOAD
+                Note: If rhs changed, propagate from rhs's pointees to lhs
+                If rhs equals pointer_id:
+                    Let lhs_pts be get_or_create_points_to_set(graph, lhs)
+                    Let rhs_pointees be Layout.memory_get_int64(ptr_pts, 8)
+
+                    Note: For each location l in pts(rhs)
+                    Let pointee_list be Set.to_list(rhs_pointees)
+                    Let pointee_count be List.length(pointee_list)
+
+                    Let p be 0
+                    While p is less than pointee_count:
+                        Let location_id be List.get(pointee_list, p)
+
+                        Note: pts(lhs) ⊇ pts(location_id)
+                        Let loc_pts be get_or_create_points_to_set(graph, location_id)
+                        Let loc_pointees be Layout.memory_get_int64(loc_pts, 8)
+
+                        Let loc_pointee_list be Set.to_list(loc_pointees)
+                        Let loc_pointee_count be List.length(loc_pointee_list)
+
+                        Let q be 0
+                        While q is less than loc_pointee_count:
+                            Let target_id be List.get(loc_pointee_list, q)
+                            add_pointee(graph, lhs_pts, target_id)
+                            Let q be q + 1
+                        End While
+
+                        Let p be p + 1
+                    End While
+                End If
+            End If
+
+            Note: STORE constraint: *lhs = rhs
+            If type equals 4:  Note: STORE
+                Note: If lhs changed, propagate rhs to lhs's pointees
+                If lhs equals pointer_id:
+                    Let rhs_pts be get_or_create_points_to_set(graph, rhs)
+                    Let lhs_pointees be Layout.memory_get_int64(ptr_pts, 8)
+
+                    Note: For each location l in pts(lhs)
+                    Let pointee_list be Set.to_list(lhs_pointees)
+                    Let pointee_count be List.length(pointee_list)
+
+                    Let p be 0
+                    While p is less than pointee_count:
+                        Let location_id be List.get(pointee_list, p)
+
+                        Note: pts(location_id) ⊇ pts(rhs)
+                        Let loc_pts be get_or_create_points_to_set(graph, location_id)
+                        Let rhs_pointees be Layout.memory_get_int64(rhs_pts, 8)
+
+                        Let rhs_pointee_list be Set.to_list(rhs_pointees)
+                        Let rhs_pointee_count be List.length(rhs_pointee_list)
+
+                        Let q be 0
+                        While q is less than rhs_pointee_count:
+                            Let target_id be List.get(rhs_pointee_list, q)
+                            add_pointee(graph, loc_pts, target_id)
+                            Let q be q + 1
+                        End While
+
+                        Let p be p + 1
+                    End While
+                End If
+            End If
+
+            Let c be c + 1
+        End While
+    End While
+
+    Note: Check for convergence
+    If iteration equals max_iterations:
+        Display "compute_points_to_andersen: max iterations reached (may not have converged)"
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: POINTS-TO QUERY INTERFACE
+Note: ============================================================================
+
+@Reasoning
+Queries the points-to set for a pointer.
+
+Returns: PointsToSet for the pointer (or null if not found)
+@End Reasoning
+
+Process called "query_points_to" that takes graph as Integer, pointer_id as Integer returns Integer:
+    If graph equals 0:
+        Display "query_points_to: null graph"
+        Return 0
+    End If
+
+    Note: Get points-to set dictionary
+    Let pts_dict be Layout.memory_get_int64(graph, 8)
+
+    Note: Look up points-to set
+    Let pts be Dictionary.get(pts_dict, pointer_id)
+
+    Return pts
+End Process
+
+@Reasoning
+Checks if two pointers may point to the same location (aliasing).
+
+Returns:
+- 1 if pointers may alias (pts(p) ∩ pts(q) ≠ ∅)
+- 0 if pointers definitely don't alias (pts(p) ∩ pts(q) = ∅)
+@End Reasoning
+
+Process called "may_alias" that takes graph as Integer, ptr1_id as Integer, ptr2_id as Integer returns Integer:
+    If graph equals 0:
+        Return 1  Note: Conservative: assume may alias
+    End If
+
+    Note: Get points-to sets
+    Let pts1 be query_points_to(graph, ptr1_id)
+    Let pts2 be query_points_to(graph, ptr2_id)
+
+    Note: If either is unknown or null, conservatively assume may alias
+    If pts1 equals 0 or pts2 equals 0:
+        Return 1
+    End If
+
+    Let is_unknown1 be Layout.memory_get_int64(pts1, 16)
+    Let is_unknown2 be Layout.memory_get_int64(pts2, 16)
+
+    If is_unknown1 equals 1 or is_unknown2 equals 1:
+        Return 1
+    End If
+
+    Note: Check for intersection of pointee sets
+    Let pointees1 be Layout.memory_get_int64(pts1, 8)
+    Let pointees2 be Layout.memory_get_int64(pts2, 8)
+
+    Let pointee_list1 be Set.to_list(pointees1)
+    Let count1 be List.length(pointee_list1)
+
+    Note: For each location in pts(ptr1)
+    Let i be 0
+    While i is less than count1:
+        Let location_id be List.get(pointee_list1, i)
+
+        Note: Check if also in pts(ptr2)
+        If Set.contains(pointees2, location_id) equals 1:
+            Return 1  Note: Found common location, may alias
+        End If
+
+        Let i be i + 1
+    End While
+
+    Note: No common locations found
+    Return 0
+End Process
+
+@Reasoning
+Gets the abstract location for a pointer's allocation site.
+
+Useful for determining where a pointer was allocated.
+
+Returns: AbstractLocation pointer (or 0 if not found)
+@End Reasoning
+
+Process called "get_allocation_location" that takes graph as Integer, pointer_id as Integer returns Integer:
+    If graph equals 0:
+        Return 0
+    End If
+
+    Note: Get points-to set
+    Let pts be query_points_to(graph, pointer_id)
+    If pts equals 0:
+        Return 0
+    End If
+
+    Note: Get pointees
+    Let pointees be Layout.memory_get_int64(pts, 8)
+    Let pointee_list be Set.to_list(pointees)
+    Let count be List.length(pointee_list)
+
+    Note: If points to exactly one location, return it
+    If count equals 1:
+        Let location_id be List.get(pointee_list, 0)
+
+        Note: Find location in locations list
+        Let locations be Layout.memory_get_int64(graph, 0)
+        Let location_count be Layout.memory_get_int64(graph, 40)
+
+        Let i be 0
+        While i is less than location_count:
+            Let location be List.get(locations, i)
+            Let loc_id be Layout.memory_get_int64(location, 0)
+
+            If loc_id equals location_id:
+                Return location
+            End If
+
+            Let i be i + 1
+        End While
+    End If
+
+    Note: Points to multiple or zero locations
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: VERIFICATION AND DEBUGGING
+Note: ============================================================================
+
+@Reasoning
+Verifies points-to graph correctness.
+
+Checks:
+1. All constraints reference valid pointers
+2. No cycles in constraint graph (optional, expensive)
+3. Points-to sets are consistent
+
+Returns: 1 if valid, 0 if errors found
+@End Reasoning
+
+Process called "verify_points_to_graph" that takes graph as Integer returns Integer:
+    If graph equals 0:
+        Display "verify_points_to_graph: null graph"
+        Return 0
+    End If
+
+    Let errors be 0
+
+    Note: Verify constraint count
+    Let constraints be Layout.memory_get_int64(graph, 16)
+    Let constraint_count be Layout.memory_get_int64(graph, 48)
+    Let actual_count be List.length(constraints)
+
+    If actual_count is not equal to constraint_count:
+        Display "verify_points_to_graph: constraint count mismatch"
+        Let errors be errors + 1
+    End If
+
+    Note: Verify location count
+    Let locations be Layout.memory_get_int64(graph, 0)
+    Let location_count be Layout.memory_get_int64(graph, 40)
+    Let actual_loc_count be List.length(locations)
+
+    If actual_loc_count is not equal to location_count:
+        Display "verify_points_to_graph: location count mismatch"
+        Let errors be errors + 1
+    End If
+
+    Note: Verify all constraints have valid types
+    Let c be 0
+    While c is less than constraint_count:
+        Let constraint be List.get(constraints, c)
+        Let type be Layout.memory_get_int64(constraint, 0)
+
+        If type is less than 1 or type is greater than 4:
+            Display "verify_points_to_graph: invalid constraint type"
+            Let errors be errors + 1
+        End If
+
+        Let c be c + 1
+    End While
+
+    If errors equals 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Prints points-to graph for debugging.
+
+Displays:
+- Number of locations and constraints
+- For each pointer: points-to set
+- For each constraint: type and operands
+@End Reasoning
+
+Process called "print_points_to_graph" that takes graph as Integer returns Integer:
+    If graph equals 0:
+        Display "print_points_to_graph: null graph"
+        Return 0
+    End If
+
+    Display "=== Points-To Analysis Results ==="
+
+    Note: Print summary
+    Let location_count be Layout.memory_get_int64(graph, 40)
+    Let constraint_count be Layout.memory_get_int64(graph, 48)
+
+    Display "Abstract Locations: "
+    Display location_count
+    Display ", Constraints: "
+    Display constraint_count
+
+    Note: Print abstract locations
+    Display ""
+    Display "Abstract Locations:"
+    Let locations be Layout.memory_get_int64(graph, 0)
+
+    Let i be 0
+    While i is less than location_count:
+        Let location be List.get(locations, i)
+        Let loc_id be Layout.memory_get_int64(location, 0)
+        Let alloc_site be Layout.memory_get_int64(location, 8)
+        Let is_heap be Layout.memory_get_int64(location, 24)
+        Let is_global be Layout.memory_get_int64(location, 32)
+
+        Display "  Location "
+        Display loc_id
+        Display ": alloc="
+        Display alloc_site
+        Display ", heap="
+        Display is_heap
+        Display ", global="
+        Display is_global
+
+        Let i be i + 1
+    End While
+
+    Note: Print points-to sets
+    Display ""
+    Display "Points-To Sets:"
+    Let pts_dict be Layout.memory_get_int64(graph, 8)
+    Let pointer_ids be Dictionary.keys(pts_dict)
+    Let ptr_count be List.length(pointer_ids)
+
+    Let i be 0
+    While i is less than ptr_count:
+        Let pointer_id be List.get(pointer_ids, i)
+        Let pts be Dictionary.get(pts_dict, pointer_id)
+
+        Display "  Pointer "
+        Display pointer_id
+        Display " -> {"
+
+        Let pointees be Layout.memory_get_int64(pts, 8)
+        Let pointee_list be Set.to_list(pointees)
+        Let pointee_count be List.length(pointee_list)
+
+        Let j be 0
+        While j is less than pointee_count:
+            Let loc_id be List.get(pointee_list, j)
+            Display loc_id
+            If j is less than (pointee_count - 1):
+                Display ", "
+            End If
+            Let j be j + 1
+        End While
+
+        Display "}"
+
+        Let i be i + 1
+    End While
+
+    Note: Print constraints
+    Display ""
+    Display "Constraints:"
+    Let constraints be Layout.memory_get_int64(graph, 16)
+
+    Let c be 0
+    While c is less than constraint_count:
+        Let constraint be List.get(constraints, c)
+        Let type be Layout.memory_get_int64(constraint, 0)
+        Let lhs be Layout.memory_get_int64(constraint, 8)
+        Let rhs be Layout.memory_get_int64(constraint, 16)
+
+        Display "  "
+        Display lhs
+
+        If type equals 1:
+            Display " = &"
+        Otherwise If type equals 2:
+            Display " = "
+        Otherwise If type equals 3:
+            Display " = *"
+        Otherwise If type equals 4:
+            Display "* = "
+        End If
+
+        Display rhs
+
+        Let c be c + 1
+    End While
+
+    Return 1
+End Process

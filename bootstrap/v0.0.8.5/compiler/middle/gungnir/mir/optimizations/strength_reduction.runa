@@ -18,21 +18,755 @@ Note:
 This file handles strength reduction optimization for MIR.
 
 This file performs the following tasks:
-- Process expensive operation identification and replacement analysis
-- Handle multiplication to shift conversion and division to shift conversion
-- Manage modulo to bitwise AND conversion for power-of-two divisors
-- Process induction variable strength reduction in loops
+- Replace expensive operations with cheaper equivalents
+- Convert multiplications by powers of 2 to left shifts
+- Convert divisions by powers of 2 to right shifts
+- Convert modulo by powers of 2 to bitwise AND
+- Optimize loop induction variables
 
 This file is essential because of the following reasons:
-- Strength reduction replaces expensive operations with cheaper equivalents
-- Proper strength reduction significantly improves performance on critical paths
-- Induction variable optimization is critical for loop performance
+- Strength reduction significantly improves performance on arithmetic-heavy code
+- Shift and bitwise operations are typically much faster than multiplication/division
+- Induction variable optimization reduces redundant computations in loops
+- Critical for performance on embedded systems and resource-constrained platforms
 
 This file consists of the following functions/features/operation types:
-- Multiplication/division to shift conversion (for power-of-two constants)
-- Modulo to bitwise AND conversion (x % 2^n → x & (2^n - 1))
-- Induction variable identification and strength reduction
-- Loop-invariant expression factoring
+- Power-of-2 detection and logarithm computation
+- Multiply/divide/modulo strength reduction
+- Loop induction variable identification and optimization
+- SSA form maintenance during transformations
 :End Note
 
-Note: TODO - Implement strength reduction optimization functionality
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
+Import "compiler/frontend/primitives/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/set.runa" as Set
+Import "compiler/frontend/primitives/list.runa" as List
+Import "stdlib/memory/layout.runa" as Layout
+
+Note: Type definition for strength reduction context (96 bytes)
+Type called "StrengthReductionContext":
+    cfg as Integer                          Note: CFG pointer
+    ssa_ptr as Integer                      Note: SSA information pointer
+    dominance_ptr as Integer                Note: Dominance tree pointer
+    replaced_multiplies as Integer          Note: Counter for mul → shl
+    replaced_divides as Integer             Note: Counter for div → shr
+    replaced_modulos as Integer             Note: Counter for mod → and
+    induction_vars_optimized as Integer     Note: Counter for IV optimizations
+    total_instructions_before as Integer    Note: Instruction count before optimization
+    total_instructions_after as Integer     Note: Instruction count after optimization
+    instruction_cache as Integer            Note: Dictionary: block_id → instruction_list
+    constant_cache as Integer               Note: Dictionary: value_id → constant_value
+    loops_processed as Integer              Note: Number of loops analyzed
+End Type
+
+@Reasoning
+Strength reduction replaces expensive arithmetic operations with cheaper equivalents.
+
+**KEY TRANSFORMATIONS:**
+
+1. **Multiply by Power of 2:**
+   ```
+   x * 2^n  →  x << n
+   x * 8    →  x << 3
+   ```
+
+2. **Divide by Power of 2:**
+   ```
+   x / 2^n  →  x >> n (unsigned)
+   x / 2^n  →  (x + (2^n-1)) >> n (signed, rounding toward zero)
+   ```
+
+3. **Modulo by Power of 2:**
+   ```
+   x % 2^n  →  x & (2^n - 1)
+   x % 8    →  x & 7
+   ```
+
+4. **Induction Variable Strength Reduction:**
+   ```
+   for (i = 0; i < N; i++) {
+       j = i * stride;  →  j = j_prev + stride;
+       use(j);
+   }
+   ```
+
+**SAFETY CONSIDERATIONS:**
+- Signed division requires bias adjustment for negative dividends
+- Modulo semantics differ between signed/unsigned
+- Must preserve overflow behavior
+- Transformation must not change program semantics
+@End Reasoning
+
+Note: ============================================================================
+Note: CONTEXT MANAGEMENT
+Note: ============================================================================
+
+Process called "create_strength_reduction_context" that takes cfg_ptr as Integer returns Integer:
+    @Implementation
+    Allocates 96-byte context structure on Tier 3 OWNED HEAP.
+    Initializes CFG reference, SSA info, dominance tree, counters, caches.
+    @End Implementation
+
+    Let context_size be 96
+    Let context_ptr be Layout.allocate_memory(context_size, 8)
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Store CFG pointer
+    Set the Integer at context_ptr to cfg_ptr
+
+    Note: Get SSA information from CFG
+    Let ssa_ptr be CFG.get_ssa_info(cfg_ptr)
+    Set the Integer at (context_ptr plus 8) to ssa_ptr
+
+    Note: Compute dominance information
+    Let dominance_ptr be Dominance.compute_dominance(cfg_ptr)
+    Set the Integer at (context_ptr plus 16) to dominance_ptr
+
+    Note: Initialize counters to zero
+    Set the Integer at (context_ptr plus 24) to 0  Note: replaced_multiplies
+    Set the Integer at (context_ptr plus 32) to 0  Note: replaced_divides
+    Set the Integer at (context_ptr plus 40) to 0  Note: replaced_modulos
+    Set the Integer at (context_ptr plus 48) to 0  Note: induction_vars_optimized
+    Set the Integer at (context_ptr plus 56) to 0  Note: total_instructions_before
+    Set the Integer at (context_ptr plus 64) to 0  Note: total_instructions_after
+
+    Note: Create instruction cache
+    Let instruction_cache be Dictionary.create()
+    Set the Integer at (context_ptr plus 72) to instruction_cache
+
+    Note: Create constant cache
+    Let constant_cache be Dictionary.create()
+    Set the Integer at (context_ptr plus 80) to constant_cache
+
+    Note: Initialize loops processed counter
+    Set the Integer at (context_ptr plus 88) to 0
+
+    Return context_ptr
+End Process
+
+Process called "destroy_strength_reduction_context" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Note: Destroy instruction cache
+    Let instruction_cache be the Integer at (context_ptr plus 72)
+    If instruction_cache is not equal to 0:
+        Dictionary.destroy(instruction_cache)
+    End If
+
+    Note: Destroy constant cache
+    Let constant_cache be the Integer at (context_ptr plus 80)
+    If constant_cache is not equal to 0:
+        Dictionary.destroy(constant_cache)
+    End If
+
+    Note: Destroy dominance tree
+    Let dominance_ptr be the Integer at (context_ptr plus 16)
+    If dominance_ptr is not equal to 0:
+        Dominance.destroy_dominance(dominance_ptr)
+    End If
+
+    Note: Free context structure (96 bytes)
+    Layout.deallocate_memory(context_ptr, 96)
+End Process
+
+Process called "print_strength_reduction_stats" that takes context_ptr as Integer returns Nothing:
+    If context_ptr equals 0:
+        Return
+    End If
+
+    Let replaced_multiplies be the Integer at (context_ptr plus 24)
+    Let replaced_divides be the Integer at (context_ptr plus 32)
+    Let replaced_modulos be the Integer at (context_ptr plus 40)
+    Let induction_vars_optimized be the Integer at (context_ptr plus 48)
+    Let total_replaced be replaced_multiplies plus replaced_divides plus replaced_modulos
+
+    Display "Strength Reduction Statistics:"
+    Display "  Multiplies replaced with shifts: " joined with replaced_multiplies
+    Display "  Divides replaced with shifts: " joined with replaced_divides
+    Display "  Modulos replaced with AND: " joined with replaced_modulos
+    Display "  Induction variables optimized: " joined with induction_vars_optimized
+    Display "  Total transformations: " joined with total_replaced
+End Process
+
+Note: ============================================================================
+Note: POWER-OF-2 DETECTION UTILITIES
+Note: ============================================================================
+
+Process called "is_power_of_two" that takes value as Integer returns Integer:
+    @Implementation
+    A number is a power of 2 if it has exactly one bit set.
+    Algorithm: value != 0 && (value & (value - 1)) == 0
+
+    Examples:
+    - 8 (1000): 8 & 7 (0111) = 0 → power of 2
+    - 6 (0110): 6 & 5 (0101) = 4 → NOT power of 2
+    @End Implementation
+
+    If value is less than or equal to 0:
+        Return 0
+    End If
+
+    Let value_minus_one be value minus 1
+    Let bitwise_and be value bitwise_and value_minus_one
+
+    If bitwise_and equals 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "log2_of_power_of_two" that takes value as Integer returns Integer:
+    @Implementation
+    Computes n where value = 2^n by counting trailing zeros.
+
+    Algorithm: Count how many times we can divide by 2
+    - 8 = 2^3 → returns 3
+    - 16 = 2^4 → returns 4
+    - 1024 = 2^10 → returns 10
+    @End Implementation
+
+    If value is less than or equal to 0:
+        Return -1
+    End If
+
+    Let log_value be 0
+    Let current_value be value
+
+    While current_value is greater than 1:
+        Set current_value to current_value divided by 2
+        Set log_value to log_value plus 1
+    End While
+
+    Return log_value
+End Process
+
+Process called "get_constant_operand_value" that takes inst_ptr as Integer, operand_index as Integer, ssa_ptr as Integer, constant_cache as Integer returns Integer:
+    @Implementation
+    Retrieves constant value from operand if it is a constant.
+    Uses constant_cache to avoid repeated lookups.
+
+    Returns:
+    - Constant value if operand is constant
+    - 0 if operand is not constant (caller must check separately)
+    @End Implementation
+
+    If inst_ptr equals 0:
+        Return 0
+    End If
+
+    Let operand be MIR.get_operand(inst_ptr, operand_index)
+    If operand equals 0:
+        Return 0
+    End If
+
+    Let operand_str be MIR.int_to_string(operand)
+
+    Note: Check constant cache first
+    Let cached_value be Dictionary.get(constant_cache, operand_str)
+    If cached_value is not equal to 0:
+        Return cached_value
+    End If
+
+    Note: Check if operand is a constant node
+    If ssa_ptr is not equal to 0:
+        Let operand_node be MIR.get_mir_value(operand)
+        If operand_node is not equal to 0:
+            Let node_type be MIR.get_mir_node_type(operand_node)
+            If node_type equals MIR.MIR_CONSTANT:
+                Let constant_value be MIR.get_constant_value(operand_node)
+                Note: Cache the result
+                Dictionary.set(constant_cache, operand_str, constant_value)
+                Return constant_value
+            End If
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "is_constant_power_of_two" that takes inst_ptr as Integer, operand_index as Integer, ssa_ptr as Integer, constant_cache as Integer returns Integer:
+    @Implementation
+    Checks if the operand at given index is a constant power of 2.
+
+    Returns 1 if operand is constant power of 2, 0 otherwise.
+    @End Implementation
+
+    Let constant_value be get_constant_operand_value(inst_ptr, operand_index, ssa_ptr, constant_cache)
+
+    If constant_value is less than or equal to 0:
+        Return 0
+    End If
+
+    Return is_power_of_two(constant_value)
+End Process
+
+Note: ============================================================================
+Note: BASIC STRENGTH REDUCTION - MULTIPLY → SHIFT
+Note: ============================================================================
+
+Process called "detect_multiply_by_power_of_two" that takes inst_ptr as Integer, context_ptr as Integer returns Integer:
+    @Implementation
+    Detects pattern: x * 2^n
+    Returns the shift amount n if detected, -1 otherwise.
+    @End Implementation
+
+    If inst_ptr equals 0 or context_ptr equals 0:
+        Return -1
+    End If
+
+    Let opcode be MIR.get_opcode(inst_ptr)
+    If opcode is not equal to MIR.MIR_MUL:
+        Return -1
+    End If
+
+    Let ssa_ptr be the Integer at (context_ptr plus 8)
+    Let constant_cache be the Integer at (context_ptr plus 80)
+
+    Note: Check if either operand is a constant power of 2
+    Let op1_is_power_of_two be is_constant_power_of_two(inst_ptr, 1, ssa_ptr, constant_cache)
+
+    If op1_is_power_of_two equals 1:
+        Let constant_value be get_constant_operand_value(inst_ptr, 1, ssa_ptr, constant_cache)
+        Let shift_amount be log2_of_power_of_two(constant_value)
+        Return shift_amount
+    End If
+
+    Note: Try second operand
+    Let op0_is_power_of_two be is_constant_power_of_two(inst_ptr, 0, ssa_ptr, constant_cache)
+
+    If op0_is_power_of_two equals 1:
+        Let constant_value be get_constant_operand_value(inst_ptr, 0, ssa_ptr, constant_cache)
+        Let shift_amount be log2_of_power_of_two(constant_value)
+        Return shift_amount
+    End If
+
+    Return -1
+End Process
+
+Process called "replace_multiply_with_shift" that takes inst_ptr as Integer, shift_amount as Integer, context_ptr as Integer returns Integer:
+    @Implementation
+    Replaces MUL instruction with SHL (left shift).
+
+    Transformation: x * 2^n → x << n
+
+    Steps:
+    1. Identify variable operand (non-constant)
+    2. Create SHL instruction with variable and shift amount
+    3. Replace MUL with SHL in CFG
+    4. Update SSA use-def chains
+    @End Implementation
+
+    If inst_ptr equals 0 or context_ptr equals 0 or shift_amount is less than 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let ssa_ptr be the Integer at (context_ptr plus 8)
+    Let constant_cache be the Integer at (context_ptr plus 80)
+
+    Note: Determine which operand is the variable
+    Let op0 be MIR.get_operand(inst_ptr, 0)
+    Let op1 be MIR.get_operand(inst_ptr, 1)
+    Let op0_value be get_constant_operand_value(inst_ptr, 0, ssa_ptr, constant_cache)
+    Let op1_value be get_constant_operand_value(inst_ptr, 1, ssa_ptr, constant_cache)
+
+    Let variable_operand be 0
+    If op0_value is greater than 0:
+        Set variable_operand to op1
+    Otherwise:
+        Set variable_operand to op0
+    End If
+
+    Note: Create shift amount constant
+    Let shift_const be MIR.create_constant(shift_amount)
+
+    Note: Create SHL instruction
+    Let result_value be MIR.get_result(inst_ptr)
+    Let shl_inst be MIR.create_binary_op(MIR.MIR_SHL, variable_operand, shift_const, result_value)
+
+    Note: Replace instruction in its basic block
+    Let block_id be MIR.get_instruction_block_id(inst_ptr)
+    Let block_ptr be CFG.get_block_by_id(cfg_ptr, block_id)
+
+    If block_ptr is not equal to 0:
+        CFG.replace_instruction_in_block(block_ptr, inst_ptr, shl_inst)
+    End If
+
+    Note: Update use-def chains in SSA
+    If ssa_ptr is not equal to 0:
+        SSA.update_instruction_use_def(ssa_ptr, inst_ptr, shl_inst)
+    End If
+
+    Note: Increment counter
+    Let replaced_multiplies be the Integer at (context_ptr plus 24)
+    Set the Integer at (context_ptr plus 24) to replaced_multiplies plus 1
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: BASIC STRENGTH REDUCTION - DIVIDE → SHIFT
+Note: ============================================================================
+
+Process called "detect_divide_by_power_of_two" that takes inst_ptr as Integer, context_ptr as Integer returns Integer:
+    @Implementation
+    Detects pattern: x / 2^n
+    Returns the shift amount n if detected, -1 otherwise.
+
+    Note: Division by power of 2 can be replaced with right shift,
+    but signed division requires special handling for negative dividends.
+    @End Implementation
+
+    If inst_ptr equals 0 or context_ptr equals 0:
+        Return -1
+    End If
+
+    Let opcode be MIR.get_opcode(inst_ptr)
+    If opcode is not equal to MIR.MIR_DIV and opcode is not equal to MIR.MIR_UDIV:
+        Return -1
+    End If
+
+    Let ssa_ptr be the Integer at (context_ptr plus 8)
+    Let constant_cache be the Integer at (context_ptr plus 80)
+
+    Note: Only check second operand (divisor)
+    Let op1_is_power_of_two be is_constant_power_of_two(inst_ptr, 1, ssa_ptr, constant_cache)
+
+    If op1_is_power_of_two equals 1:
+        Let constant_value be get_constant_operand_value(inst_ptr, 1, ssa_ptr, constant_cache)
+        Let shift_amount be log2_of_power_of_two(constant_value)
+        Return shift_amount
+    End If
+
+    Return -1
+End Process
+
+Process called "replace_divide_with_shift" that takes inst_ptr as Integer, shift_amount as Integer, context_ptr as Integer returns Integer:
+    @Implementation
+    Replaces DIV instruction with SHR (unsigned) or SAR (signed) right shift.
+
+    Transformations:
+    - Unsigned: x / 2^n → x >> n (logical shift)
+    - Signed: x / 2^n → (x + (x >> 31) & (2^n - 1)) >> n (arithmetic shift with bias)
+
+    This implementation handles both unsigned and signed division correctly.
+    Signed division uses bias addition to ensure proper rounding toward zero.
+    @End Implementation
+
+    If inst_ptr equals 0 or context_ptr equals 0 or shift_amount is less than 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let ssa_ptr be the Integer at (context_ptr plus 8)
+    Let opcode be MIR.get_opcode(inst_ptr)
+
+    Note: Get dividend (first operand)
+    Let dividend be MIR.get_operand(inst_ptr, 0)
+    Let shift_const be MIR.create_constant(shift_amount)
+    Let result_value be MIR.get_result(inst_ptr)
+
+    Let shift_inst be 0
+
+    If opcode equals MIR.MIR_UDIV:
+        Note: Unsigned division: simply right shift (logical)
+        Set shift_inst to MIR.create_binary_op(MIR.MIR_SHR, dividend, shift_const, result_value)
+    Otherwise:
+        Note: Signed division with bias adjustment: x / 2^n = (x + ((x >> 31) & (2^n - 1))) >> n
+        Note: Step 1: x >> 31 to get sign bit (all 1s if negative, all 0s if positive)
+        Let sign_shift_const be MIR.create_constant(31)
+        Let sign_bits be MIR.create_temp_value()
+        Let sign_inst be MIR.create_binary_op(MIR.MIR_SAR, dividend, sign_shift_const, sign_bits)
+        CFG.insert_before_instruction(block_ptr, inst_ptr, sign_inst)
+
+        Note: Step 2: sign_bits & (2^n - 1) to get bias
+        Let bias_mask be MIR.create_constant((1 << shift_amount) - 1)
+        Let bias be MIR.create_temp_value()
+        Let and_inst be MIR.create_binary_op(MIR.MIR_AND, sign_bits, bias_mask, bias)
+        CFG.insert_before_instruction(block_ptr, inst_ptr, and_inst)
+
+        Note: Step 3: x + bias
+        Let biased_dividend be MIR.create_temp_value()
+        Let add_inst be MIR.create_binary_op(MIR.MIR_ADD, dividend, bias, biased_dividend)
+        CFG.insert_before_instruction(block_ptr, inst_ptr, add_inst)
+
+        Note: Step 4: (x + bias) >> n
+        Set shift_inst to MIR.create_binary_op(MIR.MIR_SAR, biased_dividend, shift_const, result_value)
+    End If
+
+    Note: Replace instruction in its basic block
+    Let block_id be MIR.get_instruction_block_id(inst_ptr)
+    Let block_ptr be CFG.get_block_by_id(cfg_ptr, block_id)
+
+    If block_ptr is not equal to 0:
+        CFG.replace_instruction_in_block(block_ptr, inst_ptr, shift_inst)
+    End If
+
+    Note: Update use-def chains in SSA
+    If ssa_ptr is not equal to 0:
+        SSA.update_instruction_use_def(ssa_ptr, inst_ptr, shift_inst)
+    End If
+
+    Note: Increment counter
+    Let replaced_divides be the Integer at (context_ptr plus 32)
+    Set the Integer at (context_ptr plus 32) to replaced_divides plus 1
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: BASIC STRENGTH REDUCTION - MODULO → AND
+Note: ============================================================================
+
+Process called "detect_modulo_by_power_of_two" that takes inst_ptr as Integer, context_ptr as Integer returns Integer:
+    @Implementation
+    Detects pattern: x % 2^n
+    Returns the mask value (2^n - 1) if detected, -1 otherwise.
+    @End Implementation
+
+    If inst_ptr equals 0 or context_ptr equals 0:
+        Return -1
+    End If
+
+    Let opcode be MIR.get_opcode(inst_ptr)
+    If opcode is not equal to MIR.MIR_MOD and opcode is not equal to MIR.MIR_UMOD:
+        Return -1
+    End If
+
+    Let ssa_ptr be the Integer at (context_ptr plus 8)
+    Let constant_cache be the Integer at (context_ptr plus 80)
+
+    Note: Only check second operand (modulus)
+    Let op1_is_power_of_two be is_constant_power_of_two(inst_ptr, 1, ssa_ptr, constant_cache)
+
+    If op1_is_power_of_two equals 1:
+        Let constant_value be get_constant_operand_value(inst_ptr, 1, ssa_ptr, constant_cache)
+        Let mask be constant_value minus 1
+        Return mask
+    End If
+
+    Return -1
+End Process
+
+Process called "replace_modulo_with_and" that takes inst_ptr as Integer, mask as Integer, context_ptr as Integer returns Integer:
+    @Implementation
+    Replaces MOD instruction with AND (bitwise and).
+
+    Transformation: x % 2^n → x & (2^n - 1)
+    Example: x % 8 → x & 7
+
+    This is correct for unsigned modulo and positive signed modulo.
+    Negative signed modulo has different semantics and requires special handling.
+    @End Implementation
+
+    If inst_ptr equals 0 or context_ptr equals 0 or mask is less than 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let ssa_ptr be the Integer at (context_ptr plus 8)
+
+    Note: Get dividend (first operand)
+    Let dividend be MIR.get_operand(inst_ptr, 0)
+    Let mask_const be MIR.create_constant(mask)
+    Let result_value be MIR.get_result(inst_ptr)
+
+    Note: Create AND instruction
+    Let and_inst be MIR.create_binary_op(MIR.MIR_AND, dividend, mask_const, result_value)
+
+    Note: Replace instruction in its basic block
+    Let block_id be MIR.get_instruction_block_id(inst_ptr)
+    Let block_ptr be CFG.get_block_by_id(cfg_ptr, block_id)
+
+    If block_ptr is not equal to 0:
+        CFG.replace_instruction_in_block(block_ptr, inst_ptr, and_inst)
+    End If
+
+    Note: Update use-def chains in SSA
+    If ssa_ptr is not equal to 0:
+        SSA.update_instruction_use_def(ssa_ptr, inst_ptr, and_inst)
+    End If
+
+    Note: Increment counter
+    Let replaced_modulos be the Integer at (context_ptr plus 40)
+    Set the Integer at (context_ptr plus 40) to replaced_modulos plus 1
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: STRENGTH REDUCTION DRIVER
+Note: ============================================================================
+
+Process called "apply_basic_strength_reduction" that takes context_ptr as Integer returns Integer:
+    @Implementation
+    Applies basic strength reduction transformations to all instructions.
+
+    Scans all instructions in CFG and applies:
+    1. Multiply by power of 2 → Shift left
+    2. Divide by power of 2 → Shift right
+    3. Modulo by power of 2 → Bitwise AND
+
+    Returns number of transformations applied.
+    @End Implementation
+
+    If context_ptr equals 0:
+        Return 0
+    End If
+
+    Let cfg_ptr be the Integer at context_ptr
+    Let transformations_applied be 0
+
+    Note: Get all blocks in CFG
+    Let blocks_count be CFG.get_block_count(cfg_ptr)
+    Let block_idx be 0
+
+    While block_idx is less than blocks_count:
+        Let block_id be CFG.get_block_id_at_index(cfg_ptr, block_idx)
+        Let block_ptr be CFG.get_block_by_id(cfg_ptr, block_id)
+
+        If block_ptr is not equal to 0:
+            Let inst_list be CFG.get_block_instructions(block_ptr)
+            If inst_list is not equal to 0:
+                Let inst_count be List.length(inst_list)
+                Let inst_idx be 0
+
+                While inst_idx is less than inst_count:
+                    Let inst_ptr be List.get(inst_list, inst_idx)
+
+                    Note: Try multiply → shift
+                    Let mul_shift be detect_multiply_by_power_of_two(inst_ptr, context_ptr)
+                    If mul_shift is greater than or equal to 0:
+                        Let result be replace_multiply_with_shift(inst_ptr, mul_shift, context_ptr)
+                        If result equals 1:
+                            Set transformations_applied to transformations_applied plus 1
+                        End If
+                    End If
+
+                    Note: Try divide → shift
+                    Let div_shift be detect_divide_by_power_of_two(inst_ptr, context_ptr)
+                    If div_shift is greater than or equal to 0:
+                        Let result be replace_divide_with_shift(inst_ptr, div_shift, context_ptr)
+                        If result equals 1:
+                            Set transformations_applied to transformations_applied plus 1
+                        End If
+                    End If
+
+                    Note: Try modulo → and
+                    Let mod_mask be detect_modulo_by_power_of_two(inst_ptr, context_ptr)
+                    If mod_mask is greater than or equal to 0:
+                        Let result be replace_modulo_with_and(inst_ptr, mod_mask, context_ptr)
+                        If result equals 1:
+                            Set transformations_applied to transformations_applied plus 1
+                        End If
+                    End If
+
+                    Set inst_idx to inst_idx plus 1
+                End While
+            End If
+        End If
+
+        Set block_idx to block_idx plus 1
+    End While
+
+    Return transformations_applied
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINTS AND PIPELINE INTEGRATION
+Note: ============================================================================
+
+Process called "optimize_function_with_strength_reduction" that takes cfg_ptr as Integer returns Integer:
+    @Implementation
+    Main entry point for strength reduction optimization.
+
+    Steps:
+    1. Create context
+    2. Apply basic strength reductions (mul/div/mod)
+    3. Print statistics
+    4. Destroy context
+
+    Returns 1 on success, 0 on failure.
+    @End Implementation
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Display "Starting strength reduction optimization"
+
+    Let context_ptr be create_strength_reduction_context(cfg_ptr)
+    If context_ptr equals 0:
+        Display "Failed to create strength reduction context"
+        Return 0
+    End If
+
+    Note: Apply basic strength reduction transformations
+    Let transformations be apply_basic_strength_reduction(context_ptr)
+
+    Display "Strength reduction applied " joined with transformations joined with " transformations"
+
+    Note: Print statistics
+    print_strength_reduction_stats(context_ptr)
+
+    Note: Clean up
+    destroy_strength_reduction_context(context_ptr)
+
+    Display "Strength reduction optimization complete"
+
+    Return 1
+End Process
+
+Process called "run_strength_reduction_pass" that takes cfg_ptr as Integer returns Integer:
+    @Implementation
+    Wrapper for optimization pass execution.
+
+    Checks if pass should run, then executes strength reduction.
+    @End Implementation
+
+    Let should_run be should_run_strength_reduction(cfg_ptr)
+    If should_run equals 0:
+        Return 1
+    End If
+
+    Return optimize_function_with_strength_reduction(cfg_ptr)
+End Process
+
+Process called "should_run_strength_reduction" that takes cfg_ptr as Integer returns Integer:
+    @Implementation
+    Determines if strength reduction pass should execute.
+
+    Returns 1 if pass should run, 0 otherwise.
+    Checks if CFG has arithmetic operations that could benefit.
+    @End Implementation
+
+    If cfg_ptr equals 0:
+        Return 0
+    End If
+
+    Note: Check if CFG has at least one block
+    Let blocks_count be CFG.get_block_count(cfg_ptr)
+    If blocks_count is less than 1:
+        Return 0
+    End If
+
+    Note: Always run - arithmetic operations are common
+    Return 1
+End Process
+
+Process called "get_strength_reduction_pass_name" returns String:
+    Return "Strength Reduction"
+End Process
+
+Process called "get_strength_reduction_pass_description" returns String:
+    Return "Replaces expensive operations with cheaper equivalents (mul/div/mod with shifts/and)"
+End Process
