@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1655 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles x86_64 optimization passes and code optimization.
+This file implements x86_64 peephole optimization passes for the Runa compiler backend.
 
 This file performs the following tasks:
-- Process x86_64 optimization passes and code optimization
-- Handle x86_64 instruction optimization and instruction selection
-- Manage x86_64 register optimization and register allocation optimization
-- Process x86_64 performance optimization and code performance optimization
+- Eliminate redundant MOV instructions (self-moves)
+- Strength-reduce IMUL by powers of two into SHL instructions
+- Optimize zeroing patterns (MOV $0 into XOR self)
+- Convert ADD/SUB by 1 into INC/DEC instructions
+- Eliminate dead stores (consecutive writes to the same register)
+- Thread jump chains to bypass trivial intermediate blocks
+- Fold constant arithmetic operations at compile time
+- Remove NOP instructions and renumber instruction indices
 
 This file is essential because of the following reasons:
-- x86_64 optimization enables high-performance x86_64 code generation
-- Proper optimization handling ensures optimal x86_64 code performance
-- x86_64 optimization support enables Runa compilation for high-performance x86_64 platforms
+- Peephole optimizations reduce instruction count and improve pipeline throughput
+- Strength reduction eliminates expensive multiply instructions where shifts suffice
+- Jump threading eliminates unnecessary control flow indirection
+- Constant folding evaluates compile-time-known arithmetic at compile time
+- NOP removal produces compact final instruction streams
 
 This file consists of the following functions/features/operation types:
-- x86_64 optimization passes and code optimization
-- x86_64 instruction optimization and instruction selection
-- x86_64 register optimization and register allocation optimization
-- x86_64 performance optimization and code performance optimization
+- run_x86_64_peephole: Main entry point orchestrating all optimization passes
+- eliminate_redundant_moves: Removes MOV reg, reg where source equals destination
+- strength_reduce_multiply: Replaces IMUL by power-of-2 with SHL
+- optimize_zeroing: Replaces MOV $0, reg with XOR reg, reg
+- optimize_inc_dec: Replaces ADD/SUB $1 with INC/DEC and ADD/SUB $-1 with DEC/INC
+- eliminate_dead_stores: Removes writes overwritten without intervening reads
+- thread_jumps: Redirects jumps through trivial forwarding blocks
+- fold_constant_operations: Evaluates constant arithmetic at compile time
+- remove_nops: Final cleanup removing NOP instructions and renumbering indices
+- is_power_of_two: Helper testing if a value has exactly one set bit
+- log2_of_power: Helper computing the bit position of the single set bit
+
+Dependencies:
+- Imports LIR core types for opcode constants, register constants, and type sizes
+- Imports LIR node definitions for instruction and operand memory layouts
+- Imports memory/layout for OWNED HEAP allocation (Tier 3)
+- Imports collections/list for instruction list management
 :End Note
 
-Note: TODO - Implement x86_64 optimization passes functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: LIR Opcode Constants (local aliases for readability)
+Note: ============================================================================
+
+Constant LIR_NOP as Integer is 30000
+Constant LIR_MOV as Integer is 30001
+Constant LIR_ADD as Integer is 30100
+Constant LIR_SUB as Integer is 30101
+Constant LIR_IMUL as Integer is 30102
+Constant LIR_NEG as Integer is 30106
+Constant LIR_INC as Integer is 30107
+Constant LIR_DEC as Integer is 30108
+Constant LIR_AND as Integer is 30200
+Constant LIR_OR as Integer is 30201
+Constant LIR_XOR as Integer is 30202
+Constant LIR_SHL as Integer is 30300
+Constant LIR_SHR as Integer is 30301
+Constant LIR_JMP as Integer is 30500
+Constant LIR_JZ as Integer is 30501
+Constant LIR_JNZ as Integer is 30502
+Constant LIR_JE as Integer is 30503
+Constant LIR_JNE as Integer is 30504
+Constant LIR_LABEL as Integer is 30900
+
+Note: ============================================================================
+Note: LIR Register Constants
+Note: ============================================================================
+
+Constant REG_RAX as Integer is 0
+Constant REG_RBX as Integer is 1
+Constant REG_RCX as Integer is 2
+Constant REG_RDX as Integer is 3
+Constant REG_RSI as Integer is 4
+Constant REG_RDI as Integer is 5
+Constant REG_RBP as Integer is 6
+Constant REG_RSP as Integer is 7
+Constant REG_R8 as Integer is 8
+Constant REG_R9 as Integer is 9
+Constant REG_R10 as Integer is 10
+Constant REG_R11 as Integer is 11
+Constant REG_R12 as Integer is 12
+Constant REG_R13 as Integer is 13
+Constant REG_R14 as Integer is 14
+Constant REG_R15 as Integer is 15
+
+Note: ============================================================================
+Note: LIR Operand Type Constants
+Note: ============================================================================
+
+Constant OPERAND_REGISTER as Integer is 1
+Constant OPERAND_IMMEDIATE as Integer is 2
+Constant OPERAND_MEMORY as Integer is 3
+
+Note: ============================================================================
+Note: Memory Layout Offsets
+Note: ============================================================================
+
+Note: LIRInstruction offsets (9 fields * 8 bytes = 72 bytes)
+Constant INSTR_OPCODE as Integer is 0
+Constant INSTR_RESULT as Integer is 8
+Constant INSTR_OP1 as Integer is 16
+Constant INSTR_OP2 as Integer is 24
+Constant INSTR_OP3 as Integer is 32
+Constant INSTR_NEXT as Integer is 40
+Constant INSTR_PARENT_BLOCK as Integer is 48
+Constant INSTR_METADATA as Integer is 56
+Constant INSTR_INDEX as Integer is 64
+
+Note: LIROperand offsets (8 fields * 8 bytes = 64 bytes)
+Constant OP_TYPE as Integer is 0
+Constant OP_REG_ID as Integer is 8
+Constant OP_IMM_VALUE as Integer is 16
+Constant OP_BASE_REG as Integer is 24
+Constant OP_INDEX_REG as Integer is 32
+Constant OP_SCALE as Integer is 40
+Constant OP_DISP as Integer is 48
+Constant OP_SIZE as Integer is 56
+
+Note: LIRBasicBlock offsets (12 fields * 8 bytes = 96 bytes)
+Constant BLOCK_ID as Integer is 0
+Constant BLOCK_LABEL as Integer is 8
+Constant BLOCK_INSTRUCTIONS as Integer is 16
+Constant BLOCK_INSTR_COUNT as Integer is 24
+
+Note: LIRFunction offsets (18 fields * 8 bytes = 144 bytes)
+Constant FUNC_BLOCKS as Integer is 32
+Constant FUNC_BLOCK_COUNT as Integer is 40
+
+Note: ============================================================================
+Note: OptimizationStats Type
+Note: ============================================================================
+
+@Reasoning
+Tracks the number of optimizations applied by each individual pass during a
+single invocation of the peephole optimizer. This provides visibility into which
+passes are most effective and allows callers to detect when the optimizer has
+reached a fixed point (no more optimizations possible).
+
+The stats structure is allocated on the owned heap (Tier 3) because it persists
+beyond the optimizer call and is returned to the caller.
+
+Layout (10 fields * 8 bytes = 80 bytes):
+  [0]  redundant_moves_eliminated
+  [8]  strength_reductions_applied
+  [16] zeroing_optimizations
+  [24] inc_dec_optimizations
+  [32] dead_stores_eliminated
+  [40] jumps_threaded
+  [48] constants_folded
+  [56] nops_removed
+  [64] total_optimizations
+  [72] passes_run
+@End Reasoning
+
+Type called "OptimizationStats":
+    redundant_moves_eliminated as Integer
+    strength_reductions_applied as Integer
+    zeroing_optimizations as Integer
+    inc_dec_optimizations as Integer
+    dead_stores_eliminated as Integer
+    jumps_threaded as Integer
+    constants_folded as Integer
+    nops_removed as Integer
+    total_optimizations as Integer
+    passes_run as Integer
+End Type
+
+Constant STATS_REDUNDANT_MOVES as Integer is 0
+Constant STATS_STRENGTH_REDUCTIONS as Integer is 8
+Constant STATS_ZEROING as Integer is 16
+Constant STATS_INC_DEC as Integer is 24
+Constant STATS_DEAD_STORES as Integer is 32
+Constant STATS_JUMPS_THREADED as Integer is 40
+Constant STATS_CONSTANTS_FOLDED as Integer is 48
+Constant STATS_NOPS_REMOVED as Integer is 56
+Constant STATS_TOTAL as Integer is 64
+Constant STATS_PASSES as Integer is 72
+Constant STATS_SIZE as Integer is 80
+
+Note: ============================================================================
+Note: Helper Functions
+Note: ============================================================================
+
+@Reasoning
+Tests whether a given integer value is an exact power of two. A positive integer
+is a power of two if and only if it has exactly one bit set in its binary
+representation. The expression (value & (value - 1)) clears the lowest set bit;
+if the result is zero and value is positive, then value had exactly one set bit.
+
+Returns 1 if value > 0 and value is a power of two, 0 otherwise.
+@End Reasoning
+
+Process called "is_power_of_two" that takes value as Integer returns Integer:
+    If value is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: value & (value - 1) clears the lowest set bit
+    Note: If the result is 0, value had exactly one bit set
+    Let cleared be value & (value - 1)
+    If cleared equals 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Computes the base-2 logarithm for values that are exact powers of two. This is
+equivalent to counting the number of trailing zero bits (the position of the
+single set bit). The function shifts right repeatedly until the value reaches 1,
+counting iterations.
+
+Precondition: value must be a positive power of two. If value is not a power of
+two, the result is the floor of log2(value).
+@End Reasoning
+
+Process called "log2_of_power" that takes value as Integer returns Integer:
+    If value is less than or equal to 0:
+        Return 0
+    End If
+
+    Let shift_count be 0
+    Let v be value
+
+    While v is greater than 1:
+        Let v be v / 2
+        Let shift_count be shift_count + 1
+    End While
+
+    Return shift_count
+End Process
+
+@Reasoning
+Helper to create an OptimizationStats structure on the owned heap, with all
+counters initialized to zero.
+@End Reasoning
+
+Process called "create_stats" returns Integer:
+    Let stats be Layout.allocate(STATS_SIZE)
+    If stats equals 0:
+        Display "create_stats: allocation failed"
+        Return 0
+    End If
+
+    __store(stats, STATS_REDUNDANT_MOVES, 0)
+    __store(stats, STATS_STRENGTH_REDUCTIONS, 0)
+    __store(stats, STATS_ZEROING, 0)
+    __store(stats, STATS_INC_DEC, 0)
+    __store(stats, STATS_DEAD_STORES, 0)
+    __store(stats, STATS_JUMPS_THREADED, 0)
+    __store(stats, STATS_CONSTANTS_FOLDED, 0)
+    __store(stats, STATS_NOPS_REMOVED, 0)
+    __store(stats, STATS_TOTAL, 0)
+    __store(stats, STATS_PASSES, 0)
+
+    Return stats
+End Process
+
+@Reasoning
+Helper to check whether an instruction opcode produces a register write. This is
+used by dead store elimination to determine if an instruction defines a value in
+its result operand. Data movement and arithmetic instructions all write their
+result register.
+@End Reasoning
+
+Process called "instruction_writes_register" that takes opcode as Integer returns Integer:
+    Note: Data movement
+    If opcode equals LIR_MOV:
+        Return 1
+    End If
+
+    Note: Arithmetic operations
+    If opcode equals LIR_ADD:
+        Return 1
+    End If
+    If opcode equals LIR_SUB:
+        Return 1
+    End If
+    If opcode equals LIR_IMUL:
+        Return 1
+    End If
+    If opcode equals LIR_NEG:
+        Return 1
+    End If
+    If opcode equals LIR_INC:
+        Return 1
+    End If
+    If opcode equals LIR_DEC:
+        Return 1
+    End If
+
+    Note: Logical operations
+    If opcode equals LIR_AND:
+        Return 1
+    End If
+    If opcode equals LIR_OR:
+        Return 1
+    End If
+    If opcode equals LIR_XOR:
+        Return 1
+    End If
+
+    Note: Shift operations
+    If opcode equals LIR_SHL:
+        Return 1
+    End If
+    If opcode equals LIR_SHR:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Helper to check whether an instruction reads from a given register. An
+instruction reads a register if it appears as operand1 or operand2 (and those
+operands are register-type operands with a matching register ID). This is used
+by dead store elimination to determine whether a value is consumed between two
+writes.
+@End Reasoning
+
+Process called "instruction_reads_register" that takes instr as Integer, reg_id as Integer returns Integer:
+    If instr equals 0:
+        Return 0
+    End If
+
+    Note: Check operand 1
+    Let op1_ptr be __load(instr, INSTR_OP1)
+    If op1_ptr is not equal to 0:
+        Let op1_type be __load(op1_ptr, OP_TYPE)
+        If op1_type equals OPERAND_REGISTER:
+            Let op1_reg be __load(op1_ptr, OP_REG_ID)
+            If op1_reg equals reg_id:
+                Return 1
+            End If
+        End If
+        Note: Memory operands can also read registers via base and index
+        If op1_type equals OPERAND_MEMORY:
+            Let op1_base be __load(op1_ptr, OP_BASE_REG)
+            If op1_base equals reg_id:
+                Return 1
+            End If
+            Let op1_index be __load(op1_ptr, OP_INDEX_REG)
+            If op1_index equals reg_id:
+                Return 1
+            End If
+        End If
+    End If
+
+    Note: Check operand 2
+    Let op2_ptr be __load(instr, INSTR_OP2)
+    If op2_ptr is not equal to 0:
+        Let op2_type be __load(op2_ptr, OP_TYPE)
+        If op2_type equals OPERAND_REGISTER:
+            Let op2_reg be __load(op2_ptr, OP_REG_ID)
+            If op2_reg equals reg_id:
+                Return 1
+            End If
+        End If
+        If op2_type equals OPERAND_MEMORY:
+            Let op2_base be __load(op2_ptr, OP_BASE_REG)
+            If op2_base equals reg_id:
+                Return 1
+            End If
+            Let op2_index be __load(op2_ptr, OP_INDEX_REG)
+            If op2_index equals reg_id:
+                Return 1
+            End If
+        End If
+    End If
+
+    Note: Check operand 3
+    Let op3_ptr be __load(instr, INSTR_OP3)
+    If op3_ptr is not equal to 0:
+        Let op3_type be __load(op3_ptr, OP_TYPE)
+        If op3_type equals OPERAND_REGISTER:
+            Let op3_reg be __load(op3_ptr, OP_REG_ID)
+            If op3_reg equals reg_id:
+                Return 1
+            End If
+        End If
+        If op3_type equals OPERAND_MEMORY:
+            Let op3_base be __load(op3_ptr, OP_BASE_REG)
+            If op3_base equals reg_id:
+                Return 1
+            End If
+            Let op3_index be __load(op3_ptr, OP_INDEX_REG)
+            If op3_index equals reg_id:
+                Return 1
+            End If
+        End If
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+Helper to extract the destination register ID from an instruction's result
+operand. Returns -1 if the instruction has no result operand or the result
+is not a register operand.
+@End Reasoning
+
+Process called "get_result_register" that takes instr as Integer returns Integer:
+    If instr equals 0:
+        Return 0 - 1
+    End If
+
+    Let result_ptr be __load(instr, INSTR_RESULT)
+    If result_ptr equals 0:
+        Return 0 - 1
+    End If
+
+    Let result_type be __load(result_ptr, OP_TYPE)
+    If result_type equals OPERAND_REGISTER:
+        Return __load(result_ptr, OP_REG_ID)
+    End If
+
+    Return 0 - 1
+End Process
+
+Note: ============================================================================
+Note: Main Entry Point
+Note: ============================================================================
+
+@Reasoning
+run_x86_64_peephole is the main entry point for x86_64 peephole optimizations.
+It orchestrates all optimization passes in a specific order chosen for maximum
+effectiveness:
+
+1. eliminate_redundant_moves - Remove self-moves first (cheapest pass, clears noise)
+2. strength_reduce_multiply - Replace IMUL with SHL where possible
+3. optimize_zeroing - Replace MOV $0 with XOR (shorter encoding, dependency break)
+4. optimize_inc_dec - Replace ADD/SUB $1/$-1 with INC/DEC
+5. fold_constant_operations - Evaluate constant arithmetic at compile time
+6. eliminate_dead_stores - Remove writes with no readers (depends on prior passes)
+7. thread_jumps - Redirect through trivial jump blocks
+8. remove_nops - Final cleanup, compact instruction lists
+
+The passes are run in a single sequence. Redundant move elimination and constant
+folding can create new NOP instructions, which are cleaned up by the final
+remove_nops pass.
+
+Returns a pointer to an OptimizationStats structure containing per-pass counts.
+@End Reasoning
+
+Process called "run_x86_64_peephole" that takes lir_function as Integer returns Integer:
+    If lir_function equals 0:
+        Display "run_x86_64_peephole: null function pointer"
+        Return 0
+    End If
+
+    Let stats be create_stats()
+    If stats equals 0:
+        Return 0
+    End If
+
+    Note: Pass 1 - Eliminate redundant self-moves
+    Let moves_eliminated be eliminate_redundant_moves(lir_function)
+    __store(stats, STATS_REDUNDANT_MOVES, moves_eliminated)
+
+    Note: Pass 2 - Strength-reduce multiplications by powers of two
+    Let strength_reduced be strength_reduce_multiply(lir_function)
+    __store(stats, STATS_STRENGTH_REDUCTIONS, strength_reduced)
+
+    Note: Pass 3 - Optimize zeroing patterns
+    Let zeroing_count be optimize_zeroing(lir_function)
+    __store(stats, STATS_ZEROING, zeroing_count)
+
+    Note: Pass 4 - Convert ADD/SUB $1 to INC/DEC
+    Let inc_dec_count be optimize_inc_dec(lir_function)
+    __store(stats, STATS_INC_DEC, inc_dec_count)
+
+    Note: Pass 5 - Fold constant operations
+    Let folded_count be fold_constant_operations(lir_function)
+    __store(stats, STATS_CONSTANTS_FOLDED, folded_count)
+
+    Note: Pass 6 - Eliminate dead stores
+    Let dead_stores be eliminate_dead_stores(lir_function)
+    __store(stats, STATS_DEAD_STORES, dead_stores)
+
+    Note: Pass 7 - Thread jump chains
+    Let threaded_count be thread_jumps(lir_function)
+    __store(stats, STATS_JUMPS_THREADED, threaded_count)
+
+    Note: Pass 8 - Remove NOP instructions (final cleanup)
+    Let nops_removed be remove_nops(lir_function)
+    __store(stats, STATS_NOPS_REMOVED, nops_removed)
+
+    Note: Compute totals
+    Let total be moves_eliminated + strength_reduced + zeroing_count + inc_dec_count + folded_count + dead_stores + threaded_count + nops_removed
+    __store(stats, STATS_TOTAL, total)
+    __store(stats, STATS_PASSES, 8)
+
+    Return stats
+End Process
+
+Note: ============================================================================
+Note: Pass 1: Eliminate Redundant Moves
+Note: ============================================================================
+
+@Reasoning
+Scans every instruction in every basic block of the function. When a MOV
+instruction is found where the source and destination are both register operands
+with the same register ID, the instruction is replaced with NOP (opcode 30000).
+
+This commonly arises after register allocation when a virtual register is
+assigned to the same physical register as its source. The move becomes a no-op
+and wastes a pipeline slot.
+
+The instruction is converted in-place by overwriting the opcode field to LIR_NOP,
+preserving all other fields for potential debugging use.
+
+Returns the number of redundant moves eliminated.
+@End Reasoning
+
+Process called "eliminate_redundant_moves" that takes lir_function as Integer returns Integer:
+    If lir_function equals 0:
+        Return 0
+    End If
+
+    Let eliminated_count be 0
+
+    Note: Iterate over all basic blocks
+    Let blocks_ptr be __load(lir_function, FUNC_BLOCKS)
+    Let block_count be __load(lir_function, FUNC_BLOCK_COUNT)
+
+    If blocks_ptr equals 0:
+        Return 0
+    End If
+    If block_count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block_ptr be List.list_get(blocks_ptr, block_idx)
+        If block_ptr is not equal to 0:
+            Let instr_list be __load(block_ptr, BLOCK_INSTRUCTIONS)
+            Let instr_count be __load(block_ptr, BLOCK_INSTR_COUNT)
+
+            If instr_list is not equal to 0:
+                Let instr_idx be 0
+                While instr_idx is less than instr_count:
+                    Let instr be List.list_get(instr_list, instr_idx)
+                    If instr is not equal to 0:
+                        Let opcode be __load(instr, INSTR_OPCODE)
+
+                        If opcode equals LIR_MOV:
+                            Note: Get result (destination) operand
+                            Let result_ptr be __load(instr, INSTR_RESULT)
+                            Note: Get source operand (operand1)
+                            Let src_ptr be __load(instr, INSTR_OP1)
+
+                            If result_ptr is not equal to 0:
+                                If src_ptr is not equal to 0:
+                                    Let result_type be __load(result_ptr, OP_TYPE)
+                                    Let src_type be __load(src_ptr, OP_TYPE)
+
+                                    Note: Both must be register operands
+                                    If result_type equals OPERAND_REGISTER:
+                                        If src_type equals OPERAND_REGISTER:
+                                            Let result_reg be __load(result_ptr, OP_REG_ID)
+                                            Let src_reg be __load(src_ptr, OP_REG_ID)
+
+                                            Note: Same register - this move is redundant
+                                            If result_reg equals src_reg:
+                                                __store(instr, INSTR_OPCODE, LIR_NOP)
+                                                Let eliminated_count be eliminated_count + 1
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Let instr_idx be instr_idx + 1
+                End While
+            End If
+        End If
+
+        Let block_idx be block_idx + 1
+    End While
+
+    Return eliminated_count
+End Process
+
+Note: ============================================================================
+Note: Pass 2: Strength-Reduce Multiply by Power of Two
+Note: ============================================================================
+
+@Reasoning
+Replaces IMUL instructions where one operand is an immediate power of two with
+equivalent SHL (shift left) instructions. Shifts are significantly faster than
+multiplications on all x86_64 microarchitectures:
+- IMUL has 3 cycle latency on modern cores (sometimes pipelined at 1/cycle)
+- SHL has 1 cycle latency
+
+Supported transformations:
+  imul $1, %reg   -> NOP (identity, multiplication by 1)
+  imul $2, %reg   -> shl $1, %reg
+  imul $4, %reg   -> shl $2, %reg
+  imul $8, %reg   -> shl $3, %reg
+  imul $16, %reg  -> shl $4, %reg
+  imul $32, %reg  -> shl $5, %reg
+  imul $64, %reg  -> shl $6, %reg
+  imul $128, %reg -> shl $7, %reg
+  imul $256, %reg -> shl $8, %reg
+  ... and any other power of two
+
+The power-of-two test uses the bit trick: val > 0 && (val & (val - 1)) == 0.
+The shift amount is computed by counting trailing zeros (log2 of the power).
+
+We check operand2 for an immediate power-of-two value. The result operand and
+operand1 are preserved, and the opcode is changed from LIR_IMUL to LIR_SHL.
+The immediate value in operand2 is replaced with the shift amount.
+
+Returns the number of strength reductions applied.
+@End Reasoning
+
+Process called "strength_reduce_multiply" that takes lir_function as Integer returns Integer:
+    If lir_function equals 0:
+        Return 0
+    End If
+
+    Let reduced_count be 0
+
+    Let blocks_ptr be __load(lir_function, FUNC_BLOCKS)
+    Let block_count be __load(lir_function, FUNC_BLOCK_COUNT)
+
+    If blocks_ptr equals 0:
+        Return 0
+    End If
+    If block_count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block_ptr be List.list_get(blocks_ptr, block_idx)
+        If block_ptr is not equal to 0:
+            Let instr_list be __load(block_ptr, BLOCK_INSTRUCTIONS)
+            Let instr_count be __load(block_ptr, BLOCK_INSTR_COUNT)
+
+            If instr_list is not equal to 0:
+                Let instr_idx be 0
+                While instr_idx is less than instr_count:
+                    Let instr be List.list_get(instr_list, instr_idx)
+                    If instr is not equal to 0:
+                        Let opcode be __load(instr, INSTR_OPCODE)
+
+                        If opcode equals LIR_IMUL:
+                            Note: Check if operand2 is an immediate
+                            Let op2_ptr be __load(instr, INSTR_OP2)
+                            If op2_ptr is not equal to 0:
+                                Let op2_type be __load(op2_ptr, OP_TYPE)
+
+                                If op2_type equals OPERAND_IMMEDIATE:
+                                    Let imm_value be __load(op2_ptr, OP_IMM_VALUE)
+
+                                    Note: Multiply by 1 is identity - convert to NOP
+                                    If imm_value equals 1:
+                                        __store(instr, INSTR_OPCODE, LIR_NOP)
+                                        Let reduced_count be reduced_count + 1
+                                    Otherwise:
+                                        Note: Check for power of two
+                                        If is_power_of_two(imm_value) equals 1:
+                                            Let shift_amount be log2_of_power(imm_value)
+
+                                            Note: Replace IMUL with SHL
+                                            __store(instr, INSTR_OPCODE, LIR_SHL)
+
+                                            Note: Replace immediate value with shift amount
+                                            __store(op2_ptr, OP_IMM_VALUE, shift_amount)
+
+                                            Let reduced_count be reduced_count + 1
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Let instr_idx be instr_idx + 1
+                End While
+            End If
+        End If
+
+        Let block_idx be block_idx + 1
+    End While
+
+    Return reduced_count
+End Process
+
+Note: ============================================================================
+Note: Pass 3: Optimize Zeroing Patterns
+Note: ============================================================================
+
+@Reasoning
+Replaces MOV $0, %reg with XOR %reg, %reg. On x86_64, the XOR-with-self idiom
+has two important advantages:
+
+1. Shorter encoding: xorl %eax, %eax is 2 bytes versus movl $0, %eax which is
+   5 bytes. Even though we operate on LIR (not raw bytes), the assembler will
+   produce shorter code from the XOR form.
+
+2. Dependency chain breaking: Modern x86_64 microarchitectures (Intel since
+   Ivy Bridge, AMD since Zen) recognize XOR-with-self as a zeroing idiom and
+   handle it in the rename stage without using an execution port. This breaks
+   false dependencies on the previous value of the register.
+
+The optimization only applies when:
+- The instruction is LIR_MOV
+- The source operand (operand1) is IMMEDIATE type with value 0
+- The destination operand (result) is REGISTER type
+- The operand size is 32 or 64 bits (XOR zeroing on 32-bit automatically
+  zero-extends to 64-bit on x86_64)
+
+The transformation replaces the opcode with LIR_XOR and sets both operand1 and
+operand2 to register operands with the same register ID as the destination.
+
+Returns the number of zeroing optimizations applied.
+@End Reasoning
+
+Process called "optimize_zeroing" that takes lir_function as Integer returns Integer:
+    If lir_function equals 0:
+        Return 0
+    End If
+
+    Let zeroing_count be 0
+
+    Let blocks_ptr be __load(lir_function, FUNC_BLOCKS)
+    Let block_count be __load(lir_function, FUNC_BLOCK_COUNT)
+
+    If blocks_ptr equals 0:
+        Return 0
+    End If
+    If block_count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block_ptr be List.list_get(blocks_ptr, block_idx)
+        If block_ptr is not equal to 0:
+            Let instr_list be __load(block_ptr, BLOCK_INSTRUCTIONS)
+            Let instr_count be __load(block_ptr, BLOCK_INSTR_COUNT)
+
+            If instr_list is not equal to 0:
+                Let instr_idx be 0
+                While instr_idx is less than instr_count:
+                    Let instr be List.list_get(instr_list, instr_idx)
+                    If instr is not equal to 0:
+                        Let opcode be __load(instr, INSTR_OPCODE)
+
+                        If opcode equals LIR_MOV:
+                            Note: Check if source operand is immediate 0
+                            Let src_ptr be __load(instr, INSTR_OP1)
+                            Let result_ptr be __load(instr, INSTR_RESULT)
+
+                            If src_ptr is not equal to 0:
+                                If result_ptr is not equal to 0:
+                                    Let src_type be __load(src_ptr, OP_TYPE)
+                                    Let result_type be __load(result_ptr, OP_TYPE)
+
+                                    If src_type equals OPERAND_IMMEDIATE:
+                                        If result_type equals OPERAND_REGISTER:
+                                            Let imm_value be __load(src_ptr, OP_IMM_VALUE)
+
+                                            If imm_value equals 0:
+                                                Note: Check operand size is 32 or 64 bits
+                                                Let op_size be __load(result_ptr, OP_SIZE)
+
+                                                If op_size equals 4:
+                                                    Note: 32-bit operand, eligible
+                                                    Let dest_reg be __load(result_ptr, OP_REG_ID)
+
+                                                    Note: Change opcode to XOR
+                                                    __store(instr, INSTR_OPCODE, LIR_XOR)
+
+                                                    Note: Set operand1 to register operand with same reg
+                                                    __store(src_ptr, OP_TYPE, OPERAND_REGISTER)
+                                                    __store(src_ptr, OP_REG_ID, dest_reg)
+                                                    __store(src_ptr, OP_IMM_VALUE, 0)
+                                                    __store(src_ptr, OP_SIZE, op_size)
+
+                                                    Note: Create operand2 as register with same reg
+                                                    Let op2_ptr be __load(instr, INSTR_OP2)
+                                                    If op2_ptr equals 0:
+                                                        Note: Allocate a new operand for op2
+                                                        Let new_op2 be Layout.allocate(64)
+                                                        If new_op2 is not equal to 0:
+                                                            __store(new_op2, OP_TYPE, OPERAND_REGISTER)
+                                                            __store(new_op2, OP_REG_ID, dest_reg)
+                                                            __store(new_op2, OP_IMM_VALUE, 0)
+                                                            __store(new_op2, OP_BASE_REG, 0)
+                                                            __store(new_op2, OP_INDEX_REG, 0)
+                                                            __store(new_op2, OP_SCALE, 0)
+                                                            __store(new_op2, OP_DISP, 0)
+                                                            __store(new_op2, OP_SIZE, op_size)
+                                                            __store(instr, INSTR_OP2, new_op2)
+                                                        End If
+                                                    Otherwise:
+                                                        __store(op2_ptr, OP_TYPE, OPERAND_REGISTER)
+                                                        __store(op2_ptr, OP_REG_ID, dest_reg)
+                                                        __store(op2_ptr, OP_IMM_VALUE, 0)
+                                                        __store(op2_ptr, OP_SIZE, op_size)
+                                                    End If
+
+                                                    Let zeroing_count be zeroing_count + 1
+                                                End If
+
+                                                If op_size equals 8:
+                                                    Note: 64-bit operand, eligible
+                                                    Let dest_reg be __load(result_ptr, OP_REG_ID)
+
+                                                    Note: Change opcode to XOR
+                                                    __store(instr, INSTR_OPCODE, LIR_XOR)
+
+                                                    Note: Set operand1 to register operand with same reg
+                                                    __store(src_ptr, OP_TYPE, OPERAND_REGISTER)
+                                                    __store(src_ptr, OP_REG_ID, dest_reg)
+                                                    __store(src_ptr, OP_IMM_VALUE, 0)
+                                                    __store(src_ptr, OP_SIZE, op_size)
+
+                                                    Note: Create or update operand2
+                                                    Let op2_ptr be __load(instr, INSTR_OP2)
+                                                    If op2_ptr equals 0:
+                                                        Let new_op2 be Layout.allocate(64)
+                                                        If new_op2 is not equal to 0:
+                                                            __store(new_op2, OP_TYPE, OPERAND_REGISTER)
+                                                            __store(new_op2, OP_REG_ID, dest_reg)
+                                                            __store(new_op2, OP_IMM_VALUE, 0)
+                                                            __store(new_op2, OP_BASE_REG, 0)
+                                                            __store(new_op2, OP_INDEX_REG, 0)
+                                                            __store(new_op2, OP_SCALE, 0)
+                                                            __store(new_op2, OP_DISP, 0)
+                                                            __store(new_op2, OP_SIZE, op_size)
+                                                            __store(instr, INSTR_OP2, new_op2)
+                                                        End If
+                                                    Otherwise:
+                                                        __store(op2_ptr, OP_TYPE, OPERAND_REGISTER)
+                                                        __store(op2_ptr, OP_REG_ID, dest_reg)
+                                                        __store(op2_ptr, OP_IMM_VALUE, 0)
+                                                        __store(op2_ptr, OP_SIZE, op_size)
+                                                    End If
+
+                                                    Let zeroing_count be zeroing_count + 1
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Let instr_idx be instr_idx + 1
+                End While
+            End If
+        End If
+
+        Let block_idx be block_idx + 1
+    End While
+
+    Return zeroing_count
+End Process
+
+Note: ============================================================================
+Note: Pass 4: Optimize INC/DEC Patterns
+Note: ============================================================================
+
+@Reasoning
+Replaces ADD $1, %reg with INC %reg, SUB $1, %reg with DEC %reg,
+ADD $-1, %reg with DEC %reg, and SUB $-1, %reg with INC %reg.
+
+INC and DEC are slightly more compact in encoding (1-2 bytes shorter) and
+express intent more clearly. On modern x86_64 microarchitectures, INC/DEC
+have the same latency as ADD/SUB but use fewer instruction bytes, improving
+instruction cache density.
+
+Note that INC/DEC do NOT update the carry flag (CF), while ADD/SUB do. This
+optimization is safe as long as the carry flag is not read between this
+instruction and the next instruction that sets flags. In LIR, we track flag
+usage explicitly, so this transformation is safe within basic blocks where
+flag liveness is known.
+
+The transformation modifies the instruction in-place:
+- Changes opcode to LIR_INC or LIR_DEC
+- The result operand (destination register) is preserved
+- The operand1 (source register) is preserved for the unary operation
+- The operand2 (immediate $1 or $-1) is no longer needed
+
+Returns the number of INC/DEC optimizations applied.
+@End Reasoning
+
+Process called "optimize_inc_dec" that takes lir_function as Integer returns Integer:
+    If lir_function equals 0:
+        Return 0
+    End If
+
+    Let opt_count be 0
+
+    Let blocks_ptr be __load(lir_function, FUNC_BLOCKS)
+    Let block_count be __load(lir_function, FUNC_BLOCK_COUNT)
+
+    If blocks_ptr equals 0:
+        Return 0
+    End If
+    If block_count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block_ptr be List.list_get(blocks_ptr, block_idx)
+        If block_ptr is not equal to 0:
+            Let instr_list be __load(block_ptr, BLOCK_INSTRUCTIONS)
+            Let instr_count be __load(block_ptr, BLOCK_INSTR_COUNT)
+
+            If instr_list is not equal to 0:
+                Let instr_idx be 0
+                While instr_idx is less than instr_count:
+                    Let instr be List.list_get(instr_list, instr_idx)
+                    If instr is not equal to 0:
+                        Let opcode be __load(instr, INSTR_OPCODE)
+
+                        Note: Check ADD instructions
+                        If opcode equals LIR_ADD:
+                            Let op2_ptr be __load(instr, INSTR_OP2)
+                            If op2_ptr is not equal to 0:
+                                Let op2_type be __load(op2_ptr, OP_TYPE)
+                                If op2_type equals OPERAND_IMMEDIATE:
+                                    Let imm_value be __load(op2_ptr, OP_IMM_VALUE)
+
+                                    Note: ADD $1, %reg -> INC %reg
+                                    If imm_value equals 1:
+                                        __store(instr, INSTR_OPCODE, LIR_INC)
+                                        __store(instr, INSTR_OP2, 0)
+                                        Let opt_count be opt_count + 1
+                                    End If
+
+                                    Note: ADD $-1, %reg -> DEC %reg
+                                    If imm_value equals 0 - 1:
+                                        __store(instr, INSTR_OPCODE, LIR_DEC)
+                                        __store(instr, INSTR_OP2, 0)
+                                        Let opt_count be opt_count + 1
+                                    End If
+                                End If
+                            End If
+                        End If
+
+                        Note: Check SUB instructions
+                        If opcode equals LIR_SUB:
+                            Let op2_ptr be __load(instr, INSTR_OP2)
+                            If op2_ptr is not equal to 0:
+                                Let op2_type be __load(op2_ptr, OP_TYPE)
+                                If op2_type equals OPERAND_IMMEDIATE:
+                                    Let imm_value be __load(op2_ptr, OP_IMM_VALUE)
+
+                                    Note: SUB $1, %reg -> DEC %reg
+                                    If imm_value equals 1:
+                                        __store(instr, INSTR_OPCODE, LIR_DEC)
+                                        __store(instr, INSTR_OP2, 0)
+                                        Let opt_count be opt_count + 1
+                                    End If
+
+                                    Note: SUB $-1, %reg -> INC %reg
+                                    If imm_value equals 0 - 1:
+                                        __store(instr, INSTR_OPCODE, LIR_INC)
+                                        __store(instr, INSTR_OP2, 0)
+                                        Let opt_count be opt_count + 1
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Let instr_idx be instr_idx + 1
+                End While
+            End If
+        End If
+
+        Let block_idx be block_idx + 1
+    End While
+
+    Return opt_count
+End Process
+
+Note: ============================================================================
+Note: Pass 5: Eliminate Dead Stores
+Note: ============================================================================
+
+@Reasoning
+Scans pairs of adjacent instructions within each basic block. If instruction I
+writes to a register R and the immediately following instruction I+1 also writes
+to register R, and I+1 does NOT read R in any of its source operands, then the
+write in instruction I is dead (its result is never consumed). In that case,
+instruction I is replaced with NOP.
+
+This is a conservative local analysis: we only consider adjacent instruction pairs
+within a single basic block. Cross-block dead store elimination requires full
+liveness analysis, which is handled by a separate pass (liveness.runa).
+
+The reason we check that I+1 does not read R is that in two-operand form
+instructions (e.g., ADD %rax, %rbx where %rax is both read and written), the
+destination register is also an implicit source. If I+1 reads R, then I's write
+is still live.
+
+Returns the number of dead stores eliminated.
+@End Reasoning
+
+Process called "eliminate_dead_stores" that takes lir_function as Integer returns Integer:
+    If lir_function equals 0:
+        Return 0
+    End If
+
+    Let eliminated_count be 0
+
+    Let blocks_ptr be __load(lir_function, FUNC_BLOCKS)
+    Let block_count be __load(lir_function, FUNC_BLOCK_COUNT)
+
+    If blocks_ptr equals 0:
+        Return 0
+    End If
+    If block_count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block_ptr be List.list_get(blocks_ptr, block_idx)
+        If block_ptr is not equal to 0:
+            Let instr_list be __load(block_ptr, BLOCK_INSTRUCTIONS)
+            Let instr_count be __load(block_ptr, BLOCK_INSTR_COUNT)
+
+            If instr_list is not equal to 0:
+                Note: Need at least 2 instructions to compare adjacent pairs
+                If instr_count is greater than or equal to 2:
+                    Let instr_idx be 0
+                    Let limit be instr_count - 1
+
+                    While instr_idx is less than limit:
+                        Let current_instr be List.list_get(instr_list, instr_idx)
+                        Let next_instr be List.list_get(instr_list, instr_idx + 1)
+
+                        If current_instr is not equal to 0:
+                            If next_instr is not equal to 0:
+                                Let curr_opcode be __load(current_instr, INSTR_OPCODE)
+                                Let next_opcode be __load(next_instr, INSTR_OPCODE)
+
+                                Note: Skip if current is already NOP or a non-writing instruction
+                                If instruction_writes_register(curr_opcode) equals 1:
+                                    Note: Check if next instruction also writes a register
+                                    If instruction_writes_register(next_opcode) equals 1:
+                                        Let curr_dest_reg be get_result_register(current_instr)
+                                        Let next_dest_reg be get_result_register(next_instr)
+
+                                        Note: Both write to the same register
+                                        If curr_dest_reg is not equal to 0 - 1:
+                                            If curr_dest_reg equals next_dest_reg:
+                                                Note: Verify next instruction does NOT read
+                                                Note: the same register in its source operands
+                                                If instruction_reads_register(next_instr, curr_dest_reg) equals 0:
+                                                    Note: The write in current_instr is dead
+                                                    __store(current_instr, INSTR_OPCODE, LIR_NOP)
+                                                    Let eliminated_count be eliminated_count + 1
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+
+                        Let instr_idx be instr_idx + 1
+                    End While
+                End If
+            End If
+        End If
+
+        Let block_idx be block_idx + 1
+    End While
+
+    Return eliminated_count
+End Process
+
+Note: ============================================================================
+Note: Pass 6: Thread Jumps
+Note: ============================================================================
+
+@Reasoning
+When a JMP instruction targets a basic block whose only content is another JMP,
+the first JMP can be redirected to the ultimate target, bypassing the trivial
+intermediate block. This eliminates unnecessary control flow indirection.
+
+The algorithm walks jump chains up to 10 levels deep to handle cascaded trivial
+blocks (block A jumps to B which jumps to C which jumps to D...) while also
+preventing infinite loops from cycles in the control flow graph.
+
+A block is considered "trivial" (a forwarding block) if:
+1. It contains exactly one instruction
+2. That instruction is an unconditional JMP (opcode 30500)
+
+For each JMP instruction in the function, we resolve its target block and check
+whether that block is trivial. If so, we follow the chain until we find a
+non-trivial target or exhaust the depth limit.
+
+The JMP target is stored in operand1 as the target block ID. We look up blocks
+by iterating the function's block list and matching block IDs.
+
+Returns the number of jumps threaded.
+@End Reasoning
+
+Process called "thread_jumps" that takes lir_function as Integer returns Integer:
+    If lir_function equals 0:
+        Return 0
+    End If
+
+    Let threaded_count be 0
+
+    Let blocks_ptr be __load(lir_function, FUNC_BLOCKS)
+    Let block_count be __load(lir_function, FUNC_BLOCK_COUNT)
+
+    If blocks_ptr equals 0:
+        Return 0
+    End If
+    If block_count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block_ptr be List.list_get(blocks_ptr, block_idx)
+        If block_ptr is not equal to 0:
+            Let instr_list be __load(block_ptr, BLOCK_INSTRUCTIONS)
+            Let instr_count be __load(block_ptr, BLOCK_INSTR_COUNT)
+
+            If instr_list is not equal to 0:
+                Let instr_idx be 0
+                While instr_idx is less than instr_count:
+                    Let instr be List.list_get(instr_list, instr_idx)
+                    If instr is not equal to 0:
+                        Let opcode be __load(instr, INSTR_OPCODE)
+
+                        If opcode equals LIR_JMP:
+                            Note: Get the target block ID from operand1
+                            Let op1_ptr be __load(instr, INSTR_OP1)
+                            If op1_ptr is not equal to 0:
+                                Let op1_type be __load(op1_ptr, OP_TYPE)
+                                If op1_type equals OPERAND_IMMEDIATE:
+                                    Let target_block_id be __load(op1_ptr, OP_IMM_VALUE)
+                                    Let original_target be target_block_id
+
+                                    Note: Walk the jump chain up to 10 levels deep
+                                    Let chain_depth be 0
+                                    Let chain_max be 10
+                                    Let keep_following be 1
+
+                                    While keep_following equals 1:
+                                        If chain_depth is greater than or equal to chain_max:
+                                            Let keep_following be 0
+                                        Otherwise:
+                                            Note: Find the target block by scanning the block list
+                                            Let target_block be find_block_by_id(blocks_ptr, block_count, target_block_id)
+
+                                            If target_block equals 0:
+                                                Note: Target block not found, stop following
+                                                Let keep_following be 0
+                                            Otherwise:
+                                                Note: Check if target block is trivial (single JMP)
+                                                Let target_instr_list be __load(target_block, BLOCK_INSTRUCTIONS)
+                                                Let target_instr_count be __load(target_block, BLOCK_INSTR_COUNT)
+
+                                                If target_instr_count equals 1:
+                                                    If target_instr_list is not equal to 0:
+                                                        Let target_instr be List.list_get(target_instr_list, 0)
+                                                        If target_instr is not equal to 0:
+                                                            Let target_opcode be __load(target_instr, INSTR_OPCODE)
+                                                            If target_opcode equals LIR_JMP:
+                                                                Note: This is a trivial forwarding block
+                                                                Let target_op1 be __load(target_instr, INSTR_OP1)
+                                                                If target_op1 is not equal to 0:
+                                                                    Let target_op1_type be __load(target_op1, OP_TYPE)
+                                                                    If target_op1_type equals OPERAND_IMMEDIATE:
+                                                                        Let next_target be __load(target_op1, OP_IMM_VALUE)
+
+                                                                        Note: Avoid self-loops
+                                                                        If next_target equals target_block_id:
+                                                                            Let keep_following be 0
+                                                                        Otherwise:
+                                                                            Let target_block_id be next_target
+                                                                            Let chain_depth be chain_depth + 1
+                                                                        End If
+                                                                    Otherwise:
+                                                                        Let keep_following be 0
+                                                                    End If
+                                                                Otherwise:
+                                                                    Let keep_following be 0
+                                                                End If
+                                                            Otherwise:
+                                                                Note: Not a JMP, stop following
+                                                                Let keep_following be 0
+                                                            End If
+                                                        Otherwise:
+                                                            Let keep_following be 0
+                                                        End If
+                                                    Otherwise:
+                                                        Let keep_following be 0
+                                                    End If
+                                                Otherwise:
+                                                    Note: Block has multiple instructions, not trivial
+                                                    Let keep_following be 0
+                                                End If
+                                            End If
+                                        End If
+                                    End While
+
+                                    Note: If target changed, update the JMP operand
+                                    If target_block_id is not equal to original_target:
+                                        __store(op1_ptr, OP_IMM_VALUE, target_block_id)
+                                        Let threaded_count be threaded_count + 1
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Let instr_idx be instr_idx + 1
+                End While
+            End If
+        End If
+
+        Let block_idx be block_idx + 1
+    End While
+
+    Return threaded_count
+End Process
+
+@Reasoning
+Helper to find a basic block by its block_id within the function's block list.
+Performs a linear scan since block lists are typically small (tens to hundreds
+of blocks per function). Returns the block pointer if found, 0 if not found.
+@End Reasoning
+
+Process called "find_block_by_id" that takes blocks_ptr as Integer, block_count as Integer, target_id as Integer returns Integer:
+    If blocks_ptr equals 0:
+        Return 0
+    End If
+
+    Let idx be 0
+    While idx is less than block_count:
+        Let block_ptr be List.list_get(blocks_ptr, idx)
+        If block_ptr is not equal to 0:
+            Let block_id be __load(block_ptr, BLOCK_ID)
+            If block_id equals target_id:
+                Return block_ptr
+            End If
+        End If
+        Let idx be idx + 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Pass 7: Fold Constant Operations
+Note: ============================================================================
+
+@Reasoning
+If both operands of an arithmetic or logical instruction are immediate constants,
+we can evaluate the operation at compile time and replace the instruction with a
+MOV of the computed result into the destination register.
+
+Supported operations for constant folding:
+- ADD: result = op1 + op2
+- SUB: result = op1 - op2
+- AND: result = op1 & op2
+- OR:  result = op1 | op2
+- XOR: result = op1 ^ op2
+- SHL: result = op1 << op2 (with shift amount bounds check)
+- SHR: result = op1 >> op2 (logical shift, with bounds check)
+
+The transformation replaces the instruction opcode with LIR_MOV and sets
+operand1 to an immediate operand carrying the computed result value. Operand2
+is cleared (set to 0).
+
+For shift operations, the shift amount is clamped to 0-63 to prevent undefined
+behavior on x86_64 (which masks shift amounts to 6 bits for 64-bit operands).
+
+Returns the number of constant operations folded.
+@End Reasoning
+
+Process called "fold_constant_operations" that takes lir_function as Integer returns Integer:
+    If lir_function equals 0:
+        Return 0
+    End If
+
+    Let folded_count be 0
+
+    Let blocks_ptr be __load(lir_function, FUNC_BLOCKS)
+    Let block_count be __load(lir_function, FUNC_BLOCK_COUNT)
+
+    If blocks_ptr equals 0:
+        Return 0
+    End If
+    If block_count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block_ptr be List.list_get(blocks_ptr, block_idx)
+        If block_ptr is not equal to 0:
+            Let instr_list be __load(block_ptr, BLOCK_INSTRUCTIONS)
+            Let instr_count be __load(block_ptr, BLOCK_INSTR_COUNT)
+
+            If instr_list is not equal to 0:
+                Let instr_idx be 0
+                While instr_idx is less than instr_count:
+                    Let instr be List.list_get(instr_list, instr_idx)
+                    If instr is not equal to 0:
+                        Let opcode be __load(instr, INSTR_OPCODE)
+
+                        Note: Only fold binary operations that take two operands
+                        Let is_foldable be 0
+                        If opcode equals LIR_ADD:
+                            Let is_foldable be 1
+                        End If
+                        If opcode equals LIR_SUB:
+                            Let is_foldable be 1
+                        End If
+                        If opcode equals LIR_AND:
+                            Let is_foldable be 1
+                        End If
+                        If opcode equals LIR_OR:
+                            Let is_foldable be 1
+                        End If
+                        If opcode equals LIR_XOR:
+                            Let is_foldable be 1
+                        End If
+                        If opcode equals LIR_SHL:
+                            Let is_foldable be 1
+                        End If
+                        If opcode equals LIR_SHR:
+                            Let is_foldable be 1
+                        End If
+
+                        If is_foldable equals 1:
+                            Let op1_ptr be __load(instr, INSTR_OP1)
+                            Let op2_ptr be __load(instr, INSTR_OP2)
+
+                            If op1_ptr is not equal to 0:
+                                If op2_ptr is not equal to 0:
+                                    Let op1_type be __load(op1_ptr, OP_TYPE)
+                                    Let op2_type be __load(op2_ptr, OP_TYPE)
+
+                                    Note: Both operands must be immediates
+                                    If op1_type equals OPERAND_IMMEDIATE:
+                                        If op2_type equals OPERAND_IMMEDIATE:
+                                            Let val1 be __load(op1_ptr, OP_IMM_VALUE)
+                                            Let val2 be __load(op2_ptr, OP_IMM_VALUE)
+                                            Let result_value be 0
+                                            Let fold_valid be 1
+
+                                            If opcode equals LIR_ADD:
+                                                Let result_value be val1 + val2
+                                            End If
+
+                                            If opcode equals LIR_SUB:
+                                                Let result_value be val1 - val2
+                                            End If
+
+                                            If opcode equals LIR_AND:
+                                                Let result_value be val1 & val2
+                                            End If
+
+                                            If opcode equals LIR_OR:
+                                                Let result_value be val1 | val2
+                                            End If
+
+                                            If opcode equals LIR_XOR:
+                                                Let result_value be val1 ^ val2
+                                            End If
+
+                                            If opcode equals LIR_SHL:
+                                                Note: Clamp shift amount to 0-63
+                                                Let shift_amt be val2
+                                                If shift_amt is less than 0:
+                                                    Let fold_valid be 0
+                                                Otherwise:
+                                                    If shift_amt is greater than 63:
+                                                        Let shift_amt be 63
+                                                    End If
+                                                    Note: Compute shift using iterative doubling
+                                                    Let result_value be val1
+                                                    Let shift_i be 0
+                                                    While shift_i is less than shift_amt:
+                                                        Let result_value be result_value * 2
+                                                        Let shift_i be shift_i + 1
+                                                    End While
+                                                End If
+                                            End If
+
+                                            If opcode equals LIR_SHR:
+                                                Note: Clamp shift amount to 0-63 (logical shift right)
+                                                Let shift_amt be val2
+                                                If shift_amt is less than 0:
+                                                    Let fold_valid be 0
+                                                Otherwise:
+                                                    If shift_amt is greater than 63:
+                                                        Let shift_amt be 63
+                                                    End If
+                                                    Note: Compute logical shift right using iterative halving
+                                                    Let result_value be val1
+                                                    Let shift_i be 0
+                                                    While shift_i is less than shift_amt:
+                                                        Let result_value be result_value / 2
+                                                        Let shift_i be shift_i + 1
+                                                    End While
+                                                End If
+                                            End If
+
+                                            If fold_valid equals 1:
+                                                Note: Replace instruction with MOV $result, %dest
+                                                __store(instr, INSTR_OPCODE, LIR_MOV)
+
+                                                Note: Set operand1 to the computed immediate result
+                                                __store(op1_ptr, OP_TYPE, OPERAND_IMMEDIATE)
+                                                __store(op1_ptr, OP_IMM_VALUE, result_value)
+
+                                                Note: Clear operand2
+                                                __store(instr, INSTR_OP2, 0)
+
+                                                Let folded_count be folded_count + 1
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Let instr_idx be instr_idx + 1
+                End While
+            End If
+        End If
+
+        Let block_idx be block_idx + 1
+    End While
+
+    Return folded_count
+End Process
+
+Note: ============================================================================
+Note: Pass 8: Remove NOPs
+Note: ============================================================================
+
+@Reasoning
+Final cleanup pass that removes all NOP instructions from every basic block's
+instruction list. Previous passes (redundant move elimination, strength reduction
+with identity case, dead store elimination) convert eliminated instructions to
+NOPs rather than removing them in-place, because removing from a list during
+iteration invalidates indices and causes skipped or double-processed entries.
+
+This pass performs the actual removal by building a new instruction list for each
+block containing only the non-NOP instructions, then replacing the block's
+instruction list with the compacted one. After compaction, instruction indices
+are renumbered sequentially starting from 0.
+
+Returns the total number of NOP instructions removed across all blocks.
+@End Reasoning
+
+Process called "remove_nops" that takes lir_function as Integer returns Integer:
+    If lir_function equals 0:
+        Return 0
+    End If
+
+    Let removed_count be 0
+
+    Let blocks_ptr be __load(lir_function, FUNC_BLOCKS)
+    Let block_count be __load(lir_function, FUNC_BLOCK_COUNT)
+
+    If blocks_ptr equals 0:
+        Return 0
+    End If
+    If block_count is less than or equal to 0:
+        Return 0
+    End If
+
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block_ptr be List.list_get(blocks_ptr, block_idx)
+        If block_ptr is not equal to 0:
+            Let instr_list be __load(block_ptr, BLOCK_INSTRUCTIONS)
+            Let instr_count be __load(block_ptr, BLOCK_INSTR_COUNT)
+
+            If instr_list is not equal to 0:
+                Note: Count how many NOPs exist in this block
+                Let nop_count be 0
+                Let scan_idx be 0
+                While scan_idx is less than instr_count:
+                    Let scan_instr be List.list_get(instr_list, scan_idx)
+                    If scan_instr is not equal to 0:
+                        Let scan_opcode be __load(scan_instr, INSTR_OPCODE)
+                        If scan_opcode equals LIR_NOP:
+                            Let nop_count be nop_count + 1
+                        End If
+                    End If
+                    Let scan_idx be scan_idx + 1
+                End While
+
+                Note: Only rebuild the list if there are NOPs to remove
+                If nop_count is greater than 0:
+                    Let new_list be List.list_create()
+                    If new_list is not equal to 0:
+                        Let new_index be 0
+                        Let copy_idx be 0
+
+                        While copy_idx is less than instr_count:
+                            Let copy_instr be List.list_get(instr_list, copy_idx)
+                            If copy_instr is not equal to 0:
+                                Let copy_opcode be __load(copy_instr, INSTR_OPCODE)
+                                If copy_opcode is not equal to LIR_NOP:
+                                    Note: Renumber the instruction index
+                                    __store(copy_instr, INSTR_INDEX, new_index)
+
+                                    Note: Add to new list
+                                    List.list_push(new_list, copy_instr)
+                                    Let new_index be new_index + 1
+                                End If
+                            End If
+                            Let copy_idx be copy_idx + 1
+                        End While
+
+                        Note: Update block to use the new compacted instruction list
+                        __store(block_ptr, BLOCK_INSTRUCTIONS, new_list)
+                        __store(block_ptr, BLOCK_INSTR_COUNT, new_index)
+
+                        Note: Update the linked list 'next' pointers for remaining instructions
+                        Let link_idx be 0
+                        Let new_count be List.list_length(new_list)
+                        While link_idx is less than new_count:
+                            Let link_instr be List.list_get(new_list, link_idx)
+                            If link_instr is not equal to 0:
+                                If link_idx is less than new_count - 1:
+                                    Let next_instr be List.list_get(new_list, link_idx + 1)
+                                    __store(link_instr, INSTR_NEXT, next_instr)
+                                Otherwise:
+                                    Note: Last instruction has no next
+                                    __store(link_instr, INSTR_NEXT, 0)
+                                End If
+                            End If
+                            Let link_idx be link_idx + 1
+                        End While
+
+                        Let removed_count be removed_count + nop_count
+                    End If
+                End If
+            End If
+        End If
+
+        Let block_idx be block_idx + 1
+    End While
+
+    Return removed_count
+End Process
+
+Note: ============================================================================
+Note: Statistics Query Functions
+Note: ============================================================================
+
+@Reasoning
+Provides accessor functions for reading individual fields from an
+OptimizationStats structure. These allow callers to query specific optimization
+counts without needing to know the internal memory layout.
+@End Reasoning
+
+Process called "stats_get_redundant_moves" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_REDUNDANT_MOVES)
+End Process
+
+Process called "stats_get_strength_reductions" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_STRENGTH_REDUCTIONS)
+End Process
+
+Process called "stats_get_zeroing_optimizations" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_ZEROING)
+End Process
+
+Process called "stats_get_inc_dec_optimizations" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_INC_DEC)
+End Process
+
+Process called "stats_get_dead_stores" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_DEAD_STORES)
+End Process
+
+Process called "stats_get_jumps_threaded" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_JUMPS_THREADED)
+End Process
+
+Process called "stats_get_constants_folded" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_CONSTANTS_FOLDED)
+End Process
+
+Process called "stats_get_nops_removed" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_NOPS_REMOVED)
+End Process
+
+Process called "stats_get_total" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_TOTAL)
+End Process
+
+Process called "stats_get_passes_run" that takes stats as Integer returns Integer:
+    If stats equals 0:
+        Return 0
+    End If
+    Return __load(stats, STATS_PASSES)
+End Process

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,800 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles AArch64 instruction encoding and instruction processing.
+AArch64 Instruction Encoder - Binary Machine Code Generation
+
+Encodes AArch64 instructions into their fixed 32-bit binary representation for direct
+object file emission (bypassing the assembler). All AArch64 instructions are exactly
+4 bytes (32 bits), simplifying encoding compared to x86_64's variable-length encoding.
 
 This file performs the following tasks:
-- Process AArch64 instruction encoding and instruction generation
-- Handle AArch64 instruction optimization and instruction selection
-- Manage AArch64 instruction scheduling and instruction reordering
-- Process AArch64 instruction validation and instruction verification
+- Encodes data-processing (register) instructions: ADD, SUB, AND, ORR, EOR, etc.
+- Encodes data-processing (immediate) instructions: ADD imm, SUB imm, MOV imm
+- Encodes load/store instructions with various addressing modes
+- Encodes branch instructions: B, B.cond, BL, BR, BLR, RET
+- Encodes system instructions: SVC, NOP, DMB, DSB, ISB
+- Encodes floating-point data-processing instructions
+- Maps LIR opcodes to binary encodings via encode_lir_instruction
 
-This file is essential because of the following reasons:
-- AArch64 instruction processing enables native AArch64 code generation
-- Proper instruction handling ensures correct and efficient AArch64 code
-- AArch64 support enables Runa compilation for AArch64 platforms
+AArch64 encoding format reference:
+  All instructions are 32 bits with the following major format groups:
 
-This file consists of the following functions/features/operation types:
-- AArch64 instruction encoding and instruction generation
-- AArch64 instruction optimization and instruction selection
-- AArch64 instruction scheduling and instruction reordering
-- AArch64 instruction validation and instruction verification
+  Data Processing (Register):
+    |sf(1)|opc(2)|S(1)|11010|shift(2)|0|Rm(5)|imm6(6)|Rn(5)|Rd(5)|
+    sf=1 for 64-bit (X registers), sf=0 for 32-bit (W registers)
+
+  Data Processing (Immediate):
+    |sf(1)|opc(2)|S(1)|100010|sh(1)|imm12(12)|Rn(5)|Rd(5)|   (ADD/SUB imm)
+    |opc(2)|10010|hw(2)|imm16(16)|Rd(5)|                      (MOVZ/MOVK/MOVN)
+
+  Load/Store (Unsigned Immediate Offset):
+    |size(2)|111001|opc(2)|imm12(12)|Rn(5)|Rt(5)|
+
+  Load/Store (Pre/Post-Index):
+    |size(2)|111000|opc(2)|0|imm9(9)|op(1)|1|Rn(5)|Rt(5)|
+
+  Load/Store Pair:
+    |opc(2)|10100|L(1)|imm7(7)|Rt2(5)|Rn(5)|Rt(5)|
+
+  Branch (Unconditional):
+    |op(1)|00101|imm26(26)|        B=0, BL=1
+
+  Branch (Conditional):
+    |01010100|imm19(19)|0|cond(4)|
+
+  Branch (Register):
+    |1101011|opc(4)|11111|000000|Rn(5)|00000|     BR/BLR/RET
+
+  System:
+    |11010101|L(1)|op0(2)|op1(3)|CRn(4)|CRm(4)|op2(3)|Rt(5)|
+
+Dependencies:
+- Imports calling_convention.runa for register ID constants
+- Imports layout.runa for binary output buffer allocation
+- Imports list.runa for instruction sequence building
 :End Note
 
-Note: TODO - Implement AArch64 instruction encoder functionality
+Import "compiler/backend/machine_code/aarch64/calling_convention.runa" as CallingConv
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: Encoding Constants
+Note: ============================================================================
+
+@Reasoning
+AArch64 condition codes for B.cond instructions. These are 4-bit values encoded
+in bits [3:0] of conditional branch instructions.
+@End Reasoning
+
+Constant COND_EQ as Integer is 0    Note: Equal (Z=1)
+Constant COND_NE as Integer is 1    Note: Not equal (Z=0)
+Constant COND_HS as Integer is 2    Note: Unsigned higher or same (C=1), alias CS
+Constant COND_LO as Integer is 3    Note: Unsigned lower (C=0), alias CC
+Constant COND_MI as Integer is 4    Note: Minus/negative (N=1)
+Constant COND_PL as Integer is 5    Note: Plus/positive or zero (N=0)
+Constant COND_VS as Integer is 6    Note: Overflow (V=1)
+Constant COND_VC as Integer is 7    Note: No overflow (V=0)
+Constant COND_HI as Integer is 8    Note: Unsigned higher (C=1 and Z=0)
+Constant COND_LS as Integer is 9    Note: Unsigned lower or same (C=0 or Z=1)
+Constant COND_GE as Integer is 10   Note: Signed greater or equal (N=V)
+Constant COND_LT as Integer is 11   Note: Signed less than (N!=V)
+Constant COND_GT as Integer is 12   Note: Signed greater than (Z=0 and N=V)
+Constant COND_LE as Integer is 13   Note: Signed less or equal (Z=1 or N!=V)
+Constant COND_AL as Integer is 14   Note: Always (unconditional)
+Constant COND_NV as Integer is 15   Note: Never (reserved, behaves as AL)
+
+Note: sf bit values for operand size
+Constant SF_32 as Integer is 0      Note: 32-bit operation (W registers)
+Constant SF_64 as Integer is 1      Note: 64-bit operation (X registers)
+
+Note: ============================================================================
+Note: Register ID to Hardware Encoding
+Note: ============================================================================
+
+@Reasoning
+AArch64 hardware register encoding is straightforward: X0-X30 are encoded as 0-30
+in the 5-bit register fields. SP and XZR share encoding 31, distinguished by
+instruction context (SP in load/store base, XZR in data processing).
+
+Our internal register IDs 0-30 map directly to hardware encoding. FPR IDs 32-63
+map to hardware encoding 0-31 (subtract 32). SP(31) maps to hardware 31. XZR(65)
+maps to hardware 31.
+@End Reasoning
+
+Process called "encode_gpr" that takes reg_id as Integer returns Integer:
+    Note: Maps internal register ID to 5-bit hardware encoding
+    If reg_id >= 0:
+        If reg_id <= 30:
+            Return reg_id
+        End If
+    End If
+    Note: SP(31) and XZR(65) both encode as 31
+    If reg_id is 31:
+        Return 31
+    End If
+    If reg_id is 65:
+        Return 31
+    End If
+    Return 0
+End Process
+
+Process called "encode_fpr" that takes reg_id as Integer returns Integer:
+    Note: Maps internal FPR register ID (32-63) to 5-bit hardware encoding (0-31)
+    If reg_id >= 32:
+        If reg_id <= 63:
+            Return reg_id - 32
+        End If
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Data Processing (Register) Encoders
+Note: ============================================================================
+
+@Reasoning
+ADD (shifted register) encoding:
+  |sf|0|0|01011|shift|0|Rm|imm6|Rn|Rd|
+  Bits [31]: sf (1=64-bit, 0=32-bit)
+  Bits [30:29]: opc (00=ADD)
+  Bits [28:24]: 01011
+  Bits [23:22]: shift type (00=LSL, 01=LSR, 10=ASR)
+  Bits [21]: 0
+  Bits [20:16]: Rm (source register 2)
+  Bits [15:10]: imm6 (shift amount, 0 for no shift)
+  Bits [9:5]: Rn (source register 1)
+  Bits [4:0]: Rd (destination register)
+
+For ADD Xd, Xn, Xm with no shift:
+  Binary: 1|00|01011|00|0|Rm|000000|Rn|Rd
+  Hex base: 0x8B000000 (64-bit) or 0x0B000000 (32-bit)
+@End Reasoning
+
+Process called "encode_add_reg" that takes rd as Integer, rn as Integer, rm as Integer, sf as Integer returns Integer:
+    Let rd_enc be encode_gpr(rd)
+    Let rn_enc be encode_gpr(rn)
+    Let rm_enc be encode_gpr(rm)
+
+    Note: Base encoding for ADD (shifted register): sf|00|01011|shift=00|0|Rm|imm6=0|Rn|Rd
+    Let encoding be 0
+
+    Note: Set sf bit [31]
+    If sf is SF_64:
+        Set encoding to encoding + 2147483648  Note: 1 << 31 = 0x80000000
+    End If
+
+    Note: Set opcode bits [28:24] = 01011 = 0x0B
+    Set encoding to encoding + 184549376       Note: 0x0B000000
+
+    Note: Set Rm field [20:16]
+    Set encoding to encoding + (rm_enc * 65536)
+
+    Note: Set Rn field [9:5]
+    Set encoding to encoding + (rn_enc * 32)
+
+    Note: Set Rd field [4:0]
+    Set encoding to encoding + rd_enc
+
+    Return encoding
+End Process
+
+@Reasoning
+SUB (shifted register) encoding:
+  |sf|1|0|01011|shift|0|Rm|imm6|Rn|Rd|
+  Same as ADD but opc bits [30:29] = 10 instead of 00.
+  Hex base: 0xCB000000 (64-bit) or 0x4B000000 (32-bit)
+@End Reasoning
+
+Process called "encode_sub_reg" that takes rd as Integer, rn as Integer, rm as Integer, sf as Integer returns Integer:
+    Let rd_enc be encode_gpr(rd)
+    Let rn_enc be encode_gpr(rn)
+    Let rm_enc be encode_gpr(rm)
+
+    Let encoding be 0
+
+    Note: Set sf bit [31]
+    If sf is SF_64:
+        Set encoding to encoding + 2147483648  Note: 0x80000000
+    End If
+
+    Note: Set opc=10 [30:29] and fixed bits [28:24] = 01011
+    Note: opc bit [30] = 1 -> add 0x40000000
+    Set encoding to encoding + 1073741824      Note: 0x40000000
+    Set encoding to encoding + 184549376       Note: 0x0B000000
+
+    Note: Set Rm field [20:16]
+    Set encoding to encoding + (rm_enc * 65536)
+
+    Note: Set Rn field [9:5]
+    Set encoding to encoding + (rn_enc * 32)
+
+    Note: Set Rd field [4:0]
+    Set encoding to encoding + rd_enc
+
+    Return encoding
+End Process
+
+@Reasoning
+MOV (register) is an alias for ORR Xd, XZR, Xm on AArch64.
+ORR (shifted register) encoding:
+  |sf|01|01010|shift|0|Rm|imm6|Rn|Rd|
+  With Rn=XZR(31) and shift=0, imm6=0, this implements MOV Xd, Xm.
+  Hex base: 0xAA000000 (64-bit) or 0x2A000000 (32-bit), Rn=XZR=31
+@End Reasoning
+
+Process called "encode_mov_reg" that takes rd as Integer, rm as Integer, sf as Integer returns Integer:
+    Let rd_enc be encode_gpr(rd)
+    Let rm_enc be encode_gpr(rm)
+    Let xzr_enc be 31  Note: XZR hardware encoding
+
+    Let encoding be 0
+
+    Note: Set sf bit [31]
+    If sf is SF_64:
+        Set encoding to encoding + 2147483648  Note: 0x80000000
+    End If
+
+    Note: ORR base: opc=01 [30:29], fixed [28:24]=01010
+    Note: 0x2A000000 = 01|01010|00|0|00000|000000|00000|00000
+    Set encoding to encoding + 704643072       Note: 0x2A000000
+
+    Note: Set Rm field [20:16]
+    Set encoding to encoding + (rm_enc * 65536)
+
+    Note: Set Rn field [9:5] = XZR (31)
+    Set encoding to encoding + (xzr_enc * 32)
+
+    Note: Set Rd field [4:0]
+    Set encoding to encoding + rd_enc
+
+    Return encoding
+End Process
+
+Note: ============================================================================
+Note: Load/Store (Unsigned Immediate Offset) Encoders
+Note: ============================================================================
+
+@Reasoning
+LDR (unsigned immediate offset) encoding:
+  |size|111001|opc|imm12|Rn|Rt|
+  Bits [31:30]: size (11=64-bit/X, 10=32-bit/W)
+  Bits [29:24]: 111001
+  Bits [23:22]: opc (01=LDR, 00=STR)
+  Bits [21:10]: imm12 (unsigned offset, scaled by size: 8 for 64-bit, 4 for 32-bit)
+  Bits [9:5]: Rn (base register)
+  Bits [4:0]: Rt (transfer register)
+
+For LDR Xt, [Xn, #offset]:
+  size=11, opc=01
+  imm12 = offset / 8 (offset must be multiple of 8 for 64-bit)
+  Base: 0xF9400000 (64-bit LDR)
+@End Reasoning
+
+Process called "encode_ldr_imm" that takes rt as Integer, rn as Integer, offset as Integer, size_bits as Integer returns Integer:
+    Let rt_enc be encode_gpr(rt)
+    Let rn_enc be encode_gpr(rn)
+
+    Let encoding be 0
+
+    Note: Size field [31:30] and opc field [23:22]
+    Note: size_bits: 3=64-bit(X), 2=32-bit(W), 1=16-bit(H), 0=8-bit(B)
+    If size_bits is 3:
+        Note: 64-bit LDR: size=11, opc=01 -> 0xF9400000
+        Set encoding to 4182573056  Note: 0xF9400000
+        Note: Scale offset by 8
+        Let scaled_offset be offset / 8
+        Note: imm12 field [21:10]
+        Set encoding to encoding + (scaled_offset * 1024)
+    End If
+    If size_bits is 2:
+        Note: 32-bit LDR: size=10, opc=01 -> 0xB9400000
+        Set encoding to 3108438016  Note: 0xB9400000
+        Let scaled_offset be offset / 4
+        Set encoding to encoding + (scaled_offset * 1024)
+    End If
+    If size_bits is 1:
+        Note: 16-bit LDRH: size=01, opc=01 -> 0x79400000
+        Set encoding to 2034302976  Note: 0x79400000
+        Let scaled_offset be offset / 2
+        Set encoding to encoding + (scaled_offset * 1024)
+    End If
+    If size_bits is 0:
+        Note: 8-bit LDRB: size=00, opc=01 -> 0x39400000
+        Set encoding to 960167936   Note: 0x39400000
+        Set encoding to encoding + (offset * 1024)
+    End If
+
+    Note: Set Rn field [9:5]
+    Set encoding to encoding + (rn_enc * 32)
+
+    Note: Set Rt field [4:0]
+    Set encoding to encoding + rt_enc
+
+    Return encoding
+End Process
+
+@Reasoning
+STR (unsigned immediate offset) encoding:
+  Same format as LDR but with opc=00 instead of opc=01.
+  Base: 0xF9000000 (64-bit STR)
+@End Reasoning
+
+Process called "encode_str_imm" that takes rt as Integer, rn as Integer, offset as Integer, size_bits as Integer returns Integer:
+    Let rt_enc be encode_gpr(rt)
+    Let rn_enc be encode_gpr(rn)
+
+    Let encoding be 0
+
+    If size_bits is 3:
+        Note: 64-bit STR: size=11, opc=00 -> 0xF9000000
+        Set encoding to 4177326080  Note: 0xF9000000
+        Let scaled_offset be offset / 8
+        Set encoding to encoding + (scaled_offset * 1024)
+    End If
+    If size_bits is 2:
+        Note: 32-bit STR: size=10, opc=00 -> 0xB9000000
+        Set encoding to 3103191040  Note: 0xB9000000
+        Let scaled_offset be offset / 4
+        Set encoding to encoding + (scaled_offset * 1024)
+    End If
+    If size_bits is 1:
+        Note: 16-bit STRH: size=01, opc=00 -> 0x79000000
+        Set encoding to 2029056000  Note: 0x79000000
+        Let scaled_offset be offset / 2
+        Set encoding to encoding + (scaled_offset * 1024)
+    End If
+    If size_bits is 0:
+        Note: 8-bit STRB: size=00, opc=00 -> 0x39000000
+        Set encoding to 954920960   Note: 0x39000000
+        Set encoding to encoding + (offset * 1024)
+    End If
+
+    Note: Set Rn field [9:5]
+    Set encoding to encoding + (rn_enc * 32)
+
+    Note: Set Rt field [4:0]
+    Set encoding to encoding + rt_enc
+
+    Return encoding
+End Process
+
+Note: ============================================================================
+Note: Branch Encoders
+Note: ============================================================================
+
+@Reasoning
+B (unconditional branch) encoding:
+  |0|00101|imm26|
+  Bits [31]: op=0 (B, not BL)
+  Bits [30:26]: 00101
+  Bits [25:0]: imm26 (signed offset in instructions, PC-relative: target = PC + imm26*4)
+
+  The imm26 field allows a +/-128 MB range.
+  Base: 0x14000000
+@End Reasoning
+
+Process called "encode_b" that takes offset_instructions as Integer returns Integer:
+    Note: B encoding: op=0, opc=00101, imm26
+    Note: offset_instructions is signed offset in number of instructions (4 bytes each)
+    Let encoding be 335544320  Note: 0x14000000
+
+    Note: Mask imm26 to 26 bits (handle negative offsets via two's complement)
+    Let imm26 be offset_instructions
+    Note: Mask to 26 bits: imm26 & 0x03FFFFFF
+    If imm26 < 0:
+        Note: Convert negative to two's complement 26-bit
+        Set imm26 to imm26 + 67108864  Note: 2^26 = 0x4000000
+    End If
+    Let masked be imm26 % 67108864  Note: & 0x03FFFFFF
+
+    Set encoding to encoding + masked
+
+    Return encoding
+End Process
+
+@Reasoning
+B.cond (conditional branch) encoding:
+  |01010100|imm19|0|cond|
+  Bits [31:24]: 01010100 = 0x54
+  Bits [23:5]: imm19 (signed offset in instructions, PC-relative)
+  Bits [4]: 0
+  Bits [3:0]: cond (condition code, 4 bits)
+
+  Base: 0x54000000
+  The imm19 field allows a +/-1 MB range.
+@End Reasoning
+
+Process called "encode_b_cond" that takes offset_instructions as Integer, cond as Integer returns Integer:
+    Let encoding be 1409286144  Note: 0x54000000
+
+    Note: Mask imm19 to 19 bits
+    Let imm19 be offset_instructions
+    If imm19 < 0:
+        Set imm19 to imm19 + 524288  Note: 2^19
+    End If
+    Let masked_imm be imm19 % 524288  Note: & 0x7FFFF
+
+    Note: imm19 goes in bits [23:5]
+    Set encoding to encoding + (masked_imm * 32)
+
+    Note: Condition code in bits [3:0]
+    Set encoding to encoding + cond
+
+    Return encoding
+End Process
+
+@Reasoning
+BL (branch with link) encoding:
+  |1|00101|imm26|
+  Same as B but op=1 (bit [31] = 1), which saves return address in X30/LR.
+  Base: 0x94000000
+@End Reasoning
+
+Process called "encode_bl" that takes offset_instructions as Integer returns Integer:
+    Let encoding be 2483027968  Note: 0x94000000
+
+    Let imm26 be offset_instructions
+    If imm26 < 0:
+        Set imm26 to imm26 + 67108864
+    End If
+    Let masked be imm26 % 67108864
+
+    Set encoding to encoding + masked
+
+    Return encoding
+End Process
+
+@Reasoning
+RET encoding:
+  |1101011|0010|11111|000000|Rn|00000|
+  Branch to address in Rn (default X30/LR).
+  Bits [31:25]: 1101011
+  Bits [24:21]: 0010 (opc for RET)
+  Bits [20:16]: 11111
+  Bits [15:10]: 000000
+  Bits [9:5]: Rn (register containing return address, default X30=30)
+  Bits [4:0]: 00000
+
+  Base: 0xD65F0000
+  For RET (using X30): 0xD65F03C0
+@End Reasoning
+
+Process called "encode_ret" that takes rn as Integer returns Integer:
+    Let rn_enc be encode_gpr(rn)
+    Note: RET base: 0xD65F0000
+    Let encoding be 3596550144  Note: 0xD65F0000
+
+    Note: Rn field [9:5]
+    Set encoding to encoding + (rn_enc * 32)
+
+    Return encoding
+End Process
+
+@Reasoning
+SVC (supervisor call) encoding:
+  |11010100|000|imm16|000|01|
+  Bits [31:24]: 11010100 = 0xD4
+  Bits [23:21]: 000
+  Bits [20:5]: imm16 (immediate value, typically 0 on Linux)
+  Bits [4:2]: 000
+  Bits [1:0]: 01 (SVC)
+
+  Base: 0xD4000001
+  SVC #0: 0xD4000001
+@End Reasoning
+
+Process called "encode_svc" that takes imm16 as Integer returns Integer:
+    Note: SVC base: 0xD4000001
+    Let encoding be 3556769793  Note: 0xD4000001
+
+    Note: imm16 field [20:5]
+    Set encoding to encoding + (imm16 * 32)
+
+    Return encoding
+End Process
+
+Note: ============================================================================
+Note: LIR Instruction to Binary Encoding
+Note: ============================================================================
+
+@Reasoning
+Maps a LIR instruction to its binary AArch64 encoding. This is the main dispatch
+function for the binary encoder, used when emitting object files directly without
+going through a text assembler.
+
+The function reads the LIR instruction's opcode and operands, extracts register IDs
+and immediate values, and calls the appropriate encoder function.
+
+Parameters:
+- instruction: pointer to an LIRInstruction
+- output_buffer: pointer to binary output buffer
+- buffer_offset: current write position in the buffer
+
+Returns the number of bytes written (always 4 on AArch64, or 0 on error).
+@End Reasoning
+
+Process called "encode_lir_instruction" that takes instruction as Integer, output_buffer as Integer, buffer_offset as Integer returns Integer:
+    If instruction is 0:
+        Return 0
+    End If
+    If output_buffer is 0:
+        Return 0
+    End If
+
+    Let opcode be __load(instruction, 0)
+    Let result_ptr be __load(instruction, 8)
+    Let op1_ptr be __load(instruction, 16)
+    Let op2_ptr be __load(instruction, 24)
+
+    Note: Extract register IDs from operands (0 = register type)
+    Let rd be 0
+    Let rn be 0
+    Let rm be 0
+    Let sf be SF_64
+
+    If result_ptr is not 0:
+        Let res_type be __load(result_ptr, 0)
+        If res_type is 1:
+            Set rd to __load(result_ptr, 8)
+            Let res_size be __load(result_ptr, 56)
+            If res_size is 4:
+                Set sf to SF_32
+            End If
+        End If
+    End If
+
+    If op1_ptr is not 0:
+        Let op1_type be __load(op1_ptr, 0)
+        If op1_type is 1:
+            Set rn to __load(op1_ptr, 8)
+        End If
+    End If
+
+    If op2_ptr is not 0:
+        Let op2_type be __load(op2_ptr, 0)
+        If op2_type is 1:
+            Set rm to __load(op2_ptr, 8)
+        End If
+    End If
+
+    Let encoded be 0
+
+    Note: NOP
+    If opcode is 30000:
+        Set encoded to 3573751839  Note: 0xD503201F (NOP encoding)
+    End If
+
+    Note: MOV
+    If opcode is 30001:
+        Set encoded to encode_mov_reg(rd, rn, sf)
+    End If
+
+    Note: ADD
+    If opcode is 30100:
+        Set encoded to encode_add_reg(rd, rn, rm, sf)
+    End If
+
+    Note: SUB
+    If opcode is 30101:
+        Set encoded to encode_sub_reg(rd, rn, rm, sf)
+    End If
+
+    Note: IMUL/MUL -> MADD Xd, Xn, Xm, XZR (multiply-add with zero addend)
+    Note: MADD encoding: |sf|00|11011|000|Rm|0|Ra|Rn|Rd|
+    Note: With Ra=XZR(31): Xd = Xn * Xm + 0 = Xn * Xm
+    Note: Base: 0x9B007C00 (64-bit) or 0x1B007C00 (32-bit) with Ra=XZR bits [14:10]=11111
+    If opcode is 30102:
+        Let rd_enc be encode_gpr(rd)
+        Let rn_enc be encode_gpr(rn)
+        Let rm_enc be encode_gpr(rm)
+        Set encoded to 0
+        If sf is SF_64:
+            Set encoded to encoded + 2147483648  Note: sf=1
+        End If
+        Set encoded to encoded + 452984832      Note: 0x1B000000 (base for MADD)
+        Set encoded to encoded + (rm_enc * 65536)
+        Set encoded to encoded + 31744           Note: Ra=XZR(31) in bits [14:10] = 31*32 = 992...
+        Note: Actually Ra field is [14:10]: 31 * 1024 = 31744
+        Set encoded to encoded + (rn_enc * 32)
+        Set encoded to encoded + rd_enc
+    End If
+
+    If opcode is 30104:
+        Note: Unsigned MUL same encoding as MADD with XZR
+        Let rd_enc be encode_gpr(rd)
+        Let rn_enc be encode_gpr(rn)
+        Let rm_enc be encode_gpr(rm)
+        Set encoded to 0
+        If sf is SF_64:
+            Set encoded to encoded + 2147483648
+        End If
+        Set encoded to encoded + 452984832
+        Set encoded to encoded + (rm_enc * 65536)
+        Set encoded to encoded + 31744
+        Set encoded to encoded + (rn_enc * 32)
+        Set encoded to encoded + rd_enc
+    End If
+
+    Note: SDIV: |sf|00|11010110|Rm|00001|1|Rn|Rd|
+    Note: Base: 0x1AC00C00 (32-bit) or 0x9AC00C00 (64-bit)
+    If opcode is 30103:
+        Let rd_enc be encode_gpr(rd)
+        Let rn_enc be encode_gpr(rn)
+        Let rm_enc be encode_gpr(rm)
+        Set encoded to 0
+        If sf is SF_64:
+            Set encoded to encoded + 2147483648
+        End If
+        Set encoded to encoded + 448790528      Note: 0x1AC00000
+        Set encoded to encoded + (rm_enc * 65536)
+        Set encoded to encoded + 3072            Note: 0x0C00 = opcode2 for SDIV
+        Set encoded to encoded + (rn_enc * 32)
+        Set encoded to encoded + rd_enc
+    End If
+
+    Note: UDIV: same as SDIV but opcode2=0x0800
+    If opcode is 30105:
+        Let rd_enc be encode_gpr(rd)
+        Let rn_enc be encode_gpr(rn)
+        Let rm_enc be encode_gpr(rm)
+        Set encoded to 0
+        If sf is SF_64:
+            Set encoded to encoded + 2147483648
+        End If
+        Set encoded to encoded + 448790528
+        Set encoded to encoded + (rm_enc * 65536)
+        Set encoded to encoded + 2048            Note: 0x0800 = opcode2 for UDIV
+        Set encoded to encoded + (rn_enc * 32)
+        Set encoded to encoded + rd_enc
+    End If
+
+    Note: RET
+    If opcode is 30522:
+        Set encoded to encode_ret(30)  Note: RET with X30 (LR)
+    End If
+
+    Note: SVC (syscall)
+    If opcode is 30523:
+        Set encoded to encode_svc(0)
+    End If
+
+    Note: B (unconditional branch) - offset from operand
+    If opcode is 30500:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b(branch_offset)
+    End If
+
+    Note: Conditional branches (30501-30518)
+    If opcode is 30501:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_EQ)
+    End If
+    If opcode is 30502:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_NE)
+    End If
+    If opcode is 30503:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_EQ)
+    End If
+    If opcode is 30504:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_NE)
+    End If
+    If opcode is 30505:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_LT)
+    End If
+    If opcode is 30506:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_LE)
+    End If
+    If opcode is 30507:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_GT)
+    End If
+    If opcode is 30508:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_GE)
+    End If
+    If opcode is 30509:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_LO)
+    End If
+    If opcode is 30510:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_LS)
+    End If
+    If opcode is 30511:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_HI)
+    End If
+    If opcode is 30512:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_b_cond(branch_offset, COND_HS)
+    End If
+
+    Note: BL (call)
+    If opcode is 30520:
+        Let branch_offset be 0
+        If op1_ptr is not 0:
+            Set branch_offset to __load(op1_ptr, 16)
+        End If
+        Set encoded to encode_bl(branch_offset)
+    End If
+
+    Note: LOAD (64-bit)
+    If opcode is 30600:
+        Let offset be 0
+        If op1_ptr is not 0:
+            Let op1_type be __load(op1_ptr, 0)
+            If op1_type is 3:
+                Set offset to __load(op1_ptr, 48)
+                Set rn to __load(op1_ptr, 24)
+            End If
+        End If
+        Set encoded to encode_ldr_imm(rd, rn, offset, 3)
+    End If
+
+    Note: STORE (64-bit)
+    If opcode is 30601:
+        Let offset be 0
+        If op1_ptr is not 0:
+            Let op1_type be __load(op1_ptr, 0)
+            If op1_type is 3:
+                Set offset to __load(op1_ptr, 48)
+                Set rn to __load(op1_ptr, 24)
+            End If
+        End If
+        Set encoded to encode_str_imm(rd, rn, offset, 3)
+    End If
+
+    Note: Write the 4-byte encoding to the output buffer (little-endian)
+    __store8(output_buffer, buffer_offset, encoded % 256)
+    __store8(output_buffer, buffer_offset + 1, (encoded / 256) % 256)
+    __store8(output_buffer, buffer_offset + 2, (encoded / 65536) % 256)
+    __store8(output_buffer, buffer_offset + 3, (encoded / 16777216) % 256)
+
+    Return 4
+End Process

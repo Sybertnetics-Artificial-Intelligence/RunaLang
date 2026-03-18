@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1425 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles system call generation and system call code generation for the compiler backend.
+Syscall Sequence Generator - Inline Syscall Code Generation
+
+Generates optimized inline assembly sequences for syscall invocation on each
+target platform. The generator translates abstract syscall requests into
+platform-specific instruction sequences that load the syscall number into the
+appropriate register, set up argument registers, invoke the syscall instruction,
+and handle the return value and error checking.
 
 This file performs the following tasks:
-- Process system call generation and system call code generation operations
-- Handle system call optimization and system call performance utilities
-- Manage system call validation and system call verification operations
-- Process system call monitoring and system call analysis operations
+- Generate inline assembly sequences for syscall invocation per platform
+- Optimize generated syscall sequences (register reuse, dead store elimination)
+- Handle platform-specific error checking (carry flag, negative return, CR0.SO)
+- Support both direct syscall emission and function-wrapped syscall generation
 
-This file is essential because of the following reasons:
-- System call generation is fundamental to compiler backend operation and system call implementation
-- Proper system call generation ensures correct system call code generation and platform-specific implementation
-- System call generation utilities support system call implementation, code generation, and platform-specific optimization
+This file is essential because:
+- The compiler needs to emit platform-specific syscall sequences inline
+- Each architecture has different register assignments and syscall instructions
+- Error handling differs across platforms (carry flag vs negative return vs CR0.SO)
+- Optimization of syscall sequences reduces code size and improves performance
 
-This file consists of the following functions/features/operation types:
-- System call generation and system call code generation operations
-- System call optimization and system call performance utilities
-- System call validation and system call verification operations
-- System call monitoring and system call analysis operations
+Dependencies:
+- platform_interface for SyscallConvention and PlatformInfo types
+- syscall_registry for syscall lookup
+- machine_code_interface for assembly instruction encoding
+- memory layout for buffer allocation
+- list for instruction sequence management
 :End Note
 
-Note: TODO - Implement syscalls generator functionality
+Import "compiler/backend/syscalls/platforms/platform_interface.runa" as PlatformInterface
+Import "compiler/backend/syscalls/syscall_registry.runa" as SyscallRegistry
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: Instruction Type Constants
+Note: ============================================================================
+
+@Reasoning
+Each generated instruction in the syscall sequence has a type that describes
+what kind of operation it performs. This enables the optimizer to reason about
+the instruction stream without parsing assembly text.
+@End Reasoning
+
+Constant INST_MOVE_IMM as Integer is 1      Note: Load immediate value into register
+Constant INST_MOVE_REG as Integer is 2      Note: Move value between registers
+Constant INST_SYSCALL as Integer is 3       Note: Execute syscall instruction
+Constant INST_COMPARE as Integer is 4       Note: Compare for error checking
+Constant INST_BRANCH as Integer is 5        Note: Conditional branch (error handling)
+Constant INST_NEGATE as Integer is 6        Note: Negate register (for errno extraction)
+Constant INST_TEST_CARRY as Integer is 7    Note: Test carry flag (BSD error handling)
+Constant INST_TEST_CR0_SO as Integer is 8   Note: Test CR0.SO bit (PowerPC error handling)
+Constant INST_LOAD_STACK as Integer is 9    Note: Load argument from stack (MIPS o32)
+Constant INST_STORE_STACK as Integer is 10  Note: Store argument to stack (MIPS o32)
+
+Note: ============================================================================
+Note: Instruction Node Type
+Note: ============================================================================
+
+@Reasoning
+Each node in the instruction sequence represents a single assembly operation
+with its operands. The dst_reg and src_reg fields hold register IDs, and the
+immediate field holds literal values (syscall numbers, argument values, etc.).
+
+The type field uses one of the INST_* constants above to classify the instruction
+for optimization purposes.
+@End Reasoning
+
+Type called "SyscallInstruction":
+    inst_type as Integer       Note: INST_* constant identifying the instruction kind
+    dst_reg as Integer         Note: Destination register ID (-1 if not applicable)
+    src_reg as Integer         Note: Source register ID (-1 if not applicable)
+    immediate as Integer       Note: Immediate value (syscall number, offset, etc.)
+    label as Integer           Note: Pointer to label string (for branches, 0 if none)
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per SyscallInstruction
+
+Note: ============================================================================
+Note: Instruction Creation Helpers
+Note: ============================================================================
+
+Process called "create_instruction" that takes inst_type as Integer, dst_reg as Integer, src_reg as Integer, immediate as Integer returns Integer:
+    Note: Allocates and initializes a SyscallInstruction node
+    Note: Returns pointer to instruction, or 0 on allocation failure
+
+    Let inst be Layout.allocate(40)
+    If inst is 0:
+        Return 0
+    End If
+
+    __store(inst, 0, inst_type)
+    __store(inst, 8, dst_reg)
+    __store(inst, 16, src_reg)
+    __store(inst, 24, immediate)
+    __store(inst, 32, 0)
+
+    Return inst
+End Process
+
+Process called "create_instruction_with_label" that takes inst_type as Integer, dst_reg as Integer, src_reg as Integer, immediate as Integer, label as Integer returns Integer:
+    Note: Allocates a SyscallInstruction with an associated label string
+    Note: Returns pointer to instruction, or 0 on allocation failure
+
+    Let inst be create_instruction(inst_type, dst_reg, src_reg, immediate)
+    If inst is 0:
+        Return 0
+    End If
+
+    __store(inst, 32, label)
+
+    Return inst
+End Process
+
+Note: ============================================================================
+Note: Syscall Inline Sequence Generation
+Note: ============================================================================
+
+@Reasoning
+generate_syscall_inline produces the full instruction sequence needed to invoke
+a specific syscall on a given platform. The sequence consists of:
+
+1. Loading the syscall number into the number register (with any platform offset)
+2. Setting up each argument in the correct register (or stack slot for MIPS o32)
+3. Executing the platform-specific syscall instruction
+4. Handling error detection (carry flag, negative return, or CR0.SO)
+
+The function takes:
+- platform_id: Identifies the target platform
+- convention: Pre-fetched SyscallConvention for the platform
+- syscall_number: The raw syscall number for this platform
+- arg_values: List of argument values (as register IDs or immediates)
+- arg_count: Number of arguments to pass
+
+It returns a List of SyscallInstruction pointers representing the complete
+inline sequence, or 0 on failure. The caller is responsible for translating
+these instructions into actual assembly text or machine code bytes.
+@End Reasoning
+
+Process called "generate_syscall_inline" that takes platform_id as Integer, convention as Integer, syscall_number as Integer, arg_values as Integer, arg_count as Integer returns Integer:
+    Note: Generates an inline syscall instruction sequence for the given platform
+    Note: Returns a list of SyscallInstruction pointers, or 0 on failure
+
+    If convention is 0:
+        Return 0
+    End If
+
+    Note: Create the instruction sequence list
+    Let sequence be List.list_create(16)
+    If sequence is 0:
+        Return 0
+    End If
+
+    Note: Step 1: Load syscall number into the number register
+    Note: Apply any platform-specific offset (e.g., 0x2000000 for Darwin)
+    Let number_reg be PlatformInterface.convention_get_number_register(convention)
+    Let offset be PlatformInterface.convention_get_syscall_offset(convention)
+    Let effective_number be syscall_number + offset
+
+    Let inst_number be create_instruction(INST_MOVE_IMM, number_reg, -1, effective_number)
+    If inst_number is 0:
+        Return 0
+    End If
+    List.list_append(sequence, inst_number)
+
+    Note: Step 2: Load each argument into the correct register
+    Note: For most platforms (x86_64, ARM64, RISC-V, PowerPC), all 6 args go in registers
+    Note: For MIPS32 o32, only 4 args go in registers; args 5-6 go on stack
+    Let arg_idx be 0
+    While arg_idx < arg_count:
+        If arg_idx < 6:
+            Let arg_reg be PlatformInterface.convention_get_arg_register(convention, arg_idx)
+
+            Note: Check if this is a stack argument (register ID 0 for MIPS o32 args 5-6)
+            If arg_reg is 0:
+                If arg_idx >= 4:
+                    Note: MIPS o32 stack argument: store at stack offset
+                    Note: Stack args start at offset 16 from $sp (after 4 saved arg slots)
+                    Let stack_offset be 16 + ((arg_idx - 4) * 4)
+                    Let arg_val be 0
+                    If arg_values is not 0:
+                        Set arg_val to List.list_get(arg_values, arg_idx)
+                    End If
+                    Let inst_stack be create_instruction(INST_STORE_STACK, -1, arg_val, stack_offset)
+                    If inst_stack is not 0:
+                        List.list_append(sequence, inst_stack)
+                    End If
+                End If
+            Otherwise:
+                Note: Register argument: move value into the argument register
+                Let arg_val be 0
+                If arg_values is not 0:
+                    Set arg_val to List.list_get(arg_values, arg_idx)
+                End If
+
+                Note: If the argument value is already in the correct register, skip the move
+                If arg_val is not arg_reg:
+                    Let inst_arg be create_instruction(INST_MOVE_REG, arg_reg, arg_val, 0)
+                    If inst_arg is not 0:
+                        List.list_append(sequence, inst_arg)
+                    End If
+                End If
+            End If
+        End If
+        Set arg_idx to arg_idx + 1
+    End While
+
+    Note: Step 3: Execute the syscall instruction
+    Let inst_syscall be create_instruction(INST_SYSCALL, -1, -1, platform_id)
+    If inst_syscall is not 0:
+        List.list_append(sequence, inst_syscall)
+    End If
+
+    Note: Step 4: Error handling
+    Note: Different platforms signal errors differently:
+    Note: - Linux x86_64/ARM64/RISC-V: negative return value in result register
+    Note: - BSD x86_64 / Darwin: carry flag set, result register has errno
+    Note: - PowerPC: CR0.SO bit set, result register has errno
+    Note: - MIPS: $a3 non-zero, $v0 has errno
+
+    Let uses_carry be PlatformInterface.convention_uses_carry_error(convention)
+
+    If uses_carry is 1:
+        Note: BSD/Darwin/PowerPC: test carry/CR0.SO flag
+        If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+            Note: PowerPC uses CR0.SO bit
+            Let inst_test be create_instruction(INST_TEST_CR0_SO, -1, -1, 0)
+            If inst_test is not 0:
+                List.list_append(sequence, inst_test)
+            End If
+        Otherwise:
+            Note: BSD/Darwin: test carry flag
+            Let inst_test be create_instruction(INST_TEST_CARRY, -1, -1, 0)
+            If inst_test is not 0:
+                List.list_append(sequence, inst_test)
+            End If
+        End If
+    Otherwise:
+        Note: Linux-style: check if return value is negative (indicating -errno)
+        Let return_reg be PlatformInterface.convention_get_return_register(convention)
+
+        Note: Check for MIPS error handling (error flag in separate register)
+        Let error_reg be __load(convention, 32)
+        If error_reg is not 0:
+            If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS32:
+                Note: MIPS: test $a3 for error
+                Let inst_cmp be create_instruction(INST_COMPARE, error_reg, -1, 0)
+                If inst_cmp is not 0:
+                    List.list_append(sequence, inst_cmp)
+                End If
+            End If
+            If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS64:
+                Note: MIPS64: test $a3 for error
+                Let inst_cmp be create_instruction(INST_COMPARE, error_reg, -1, 0)
+                If inst_cmp is not 0:
+                    List.list_append(sequence, inst_cmp)
+                End If
+            End If
+        Otherwise:
+            Note: Standard Linux: compare return value against -4096
+            Note: If return value > -4096 (unsigned), it is a negated errno
+            Let inst_cmp be create_instruction(INST_COMPARE, return_reg, -1, -4096)
+            If inst_cmp is not 0:
+                List.list_append(sequence, inst_cmp)
+            End If
+        End If
+    End If
+
+    Return sequence
+End Process
+
+Note: ============================================================================
+Note: Syscall Sequence Optimization
+Note: ============================================================================
+
+@Reasoning
+optimize_syscall_sequence performs peephole optimizations on a generated syscall
+instruction sequence. The optimizations include:
+
+1. Dead move elimination: If a register-to-register move has src == dst, remove it.
+   This occurs when the argument value is already in the correct register.
+
+2. Immediate folding: If a move-immediate is followed by a register move into
+   the same destination, fold them into a single move-immediate.
+
+3. Redundant load elimination: If the same value is loaded into the same register
+   twice in sequence, remove the duplicate.
+
+These optimizations reduce code size without changing semantics. The function
+modifies the sequence in-place and returns the number of instructions removed.
+@End Reasoning
+
+Process called "optimize_syscall_sequence" that takes sequence as Integer returns Integer:
+    Note: Optimizes a syscall instruction sequence in-place
+    Note: Returns the number of instructions removed, or -1 on error
+
+    If sequence is 0:
+        Return -1
+    End If
+
+    Let length be List.list_length(sequence)
+    If length <= 1:
+        Return 0
+    End If
+
+    Let removed be 0
+    Let idx be 0
+
+    Note: Pass 1: Eliminate self-moves (move reg to itself)
+    While idx < length:
+        Let inst be List.list_get(sequence, idx)
+        If inst is not 0:
+            Let inst_type be __load(inst, 0)
+            If inst_type is INST_MOVE_REG:
+                Let dst be __load(inst, 8)
+                Let src be __load(inst, 16)
+                If dst is src:
+                    Note: Self-move detected: mark for removal by setting type to 0
+                    __store(inst, 0, 0)
+                    Set removed to removed + 1
+                End If
+            End If
+        End If
+        Set idx to idx + 1
+    End While
+
+    Note: Pass 2: Eliminate redundant consecutive loads to the same register
+    Note: If instruction N loads register R with value V, and instruction N+1
+    Note: also loads register R with value V, remove instruction N
+    Set idx to 0
+    While idx < length - 1:
+        Let inst_a be List.list_get(sequence, idx)
+        Let inst_b be List.list_get(sequence, idx + 1)
+
+        If inst_a is not 0:
+            If inst_b is not 0:
+                Let type_a be __load(inst_a, 0)
+                Let type_b be __load(inst_b, 0)
+
+                Note: Check for consecutive identical move-immediate instructions
+                If type_a is INST_MOVE_IMM:
+                    If type_b is INST_MOVE_IMM:
+                        Let dst_a be __load(inst_a, 8)
+                        Let dst_b be __load(inst_b, 8)
+                        Let imm_a be __load(inst_a, 24)
+                        Let imm_b be __load(inst_b, 24)
+
+                        If dst_a is dst_b:
+                            If imm_a is imm_b:
+                                Note: Duplicate load: mark the first one for removal
+                                __store(inst_a, 0, 0)
+                                Set removed to removed + 1
+                            End If
+                        End If
+                    End If
+                End If
+
+                Note: Check for move-immediate followed by overwriting move-register
+                Note: to the same destination (the immediate is wasted)
+                If type_a is INST_MOVE_IMM:
+                    If type_b is INST_MOVE_REG:
+                        Let dst_a be __load(inst_a, 8)
+                        Let dst_b be __load(inst_b, 8)
+
+                        If dst_a is dst_b:
+                            Note: The immediate load is overwritten: mark for removal
+                            __store(inst_a, 0, 0)
+                            Set removed to removed + 1
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set idx to idx + 1
+    End While
+
+    Note: Pass 3: Compact the sequence by removing marked instructions (type == 0)
+    If removed > 0:
+        Let write_idx be 0
+        Let read_idx be 0
+        While read_idx < length:
+            Let inst be List.list_get(sequence, read_idx)
+            If inst is not 0:
+                Let inst_type be __load(inst, 0)
+                If inst_type is not 0:
+                    Note: Keep this instruction
+                    If write_idx is not read_idx:
+                        List.list_set(sequence, write_idx, inst)
+                    End If
+                    Set write_idx to write_idx + 1
+                End If
+            End If
+            Set read_idx to read_idx + 1
+        End While
+
+        Note: Truncate the list to the new length
+        Note: Set remaining slots to 0
+        While write_idx < length:
+            List.list_set(sequence, write_idx, 0)
+            Set write_idx to write_idx + 1
+        End While
+    End If
+
+    Return removed
+End Process
+
+Note: ============================================================================
+Note: Standalone Error Check Sequence Generation
+Note: ============================================================================
+
+@Reasoning
+generate_error_check_sequence produces the error-checking instruction subsequence
+that should follow a syscall instruction. This is extracted as a standalone function
+so that callers who build their own instruction sequences (rather than using
+generate_syscall_inline) can append proper error detection.
+
+The error-checking strategy differs by platform:
+- Linux x86_64/ARM64/RISC-V/ARM32: The return value is a negated errno if the
+  unsigned value exceeds (MAX - 4096). We emit INST_COMPARE against -4096.
+- BSD/Darwin x86_64/ARM64: The carry flag is set on error. We emit INST_TEST_CARRY.
+- Linux PowerPC: The CR0.SO (summary overflow) bit is set on error. We emit
+  INST_TEST_CR0_SO.
+- Linux MIPS32/MIPS64: A separate error register ($a3) is nonzero on error.
+  We emit INST_COMPARE on that register against 0.
+
+The function returns a List of SyscallInstruction pointers representing the error
+check sequence, or 0 on failure.
+@End Reasoning
+
+Process called "generate_error_check_sequence" that takes platform_id as Integer, convention as Integer returns Integer:
+    Note: Generates a standalone error-checking instruction sequence for the given platform
+    Note: Returns a list of SyscallInstruction pointers, or 0 on failure
+
+    If convention is 0:
+        Return 0
+    End If
+
+    Let sequence be List.list_create(4)
+    If sequence is 0:
+        Return 0
+    End If
+
+    Let uses_carry be PlatformInterface.convention_uses_carry_error(convention)
+
+    If uses_carry is 1:
+        Note: BSD/Darwin/PowerPC: test carry flag or CR0.SO
+        If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+            Note: PowerPC signals errors via the CR0.SO (summary overflow) bit
+            Let inst_test be create_instruction(INST_TEST_CR0_SO, -1, -1, 0)
+            If inst_test is not 0:
+                List.list_append(sequence, inst_test)
+            End If
+        Otherwise:
+            Note: BSD and Darwin platforms signal errors via the CPU carry flag
+            Let inst_test be create_instruction(INST_TEST_CARRY, -1, -1, 0)
+            If inst_test is not 0:
+                List.list_append(sequence, inst_test)
+            End If
+        End If
+    Otherwise:
+        Note: Non-carry-flag platforms: check return value or dedicated error register
+        Let return_reg be PlatformInterface.convention_get_return_register(convention)
+
+        Note: Check for MIPS-style error handling with a dedicated error register
+        Note: SyscallConvention offset 32 is the error_register field
+        Let error_reg be __load(convention, 32)
+
+        If error_reg is not 0:
+            Note: MIPS platforms: $a3 is nonzero when the syscall failed
+            If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS32:
+                Let inst_cmp be create_instruction(INST_COMPARE, error_reg, -1, 0)
+                If inst_cmp is not 0:
+                    List.list_append(sequence, inst_cmp)
+                End If
+                Note: Branch to error handler if error register is nonzero
+                Let inst_branch be create_instruction_with_label(INST_BRANCH, -1, -1, 1, ".Lsyscall_error")
+                If inst_branch is not 0:
+                    List.list_append(sequence, inst_branch)
+                End If
+            End If
+            If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS64:
+                Let inst_cmp be create_instruction(INST_COMPARE, error_reg, -1, 0)
+                If inst_cmp is not 0:
+                    List.list_append(sequence, inst_cmp)
+                End If
+                Let inst_branch be create_instruction_with_label(INST_BRANCH, -1, -1, 1, ".Lsyscall_error")
+                If inst_branch is not 0:
+                    List.list_append(sequence, inst_branch)
+                End If
+            End If
+        Otherwise:
+            Note: Standard Linux: compare return value against -4096
+            Note: If the unsigned return value is above (2^64 - 4096), it represents -errno
+            Let inst_cmp be create_instruction(INST_COMPARE, return_reg, -1, -4096)
+            If inst_cmp is not 0:
+                List.list_append(sequence, inst_cmp)
+            End If
+            Note: Branch to error handler if comparison indicates error
+            Let inst_branch be create_instruction_with_label(INST_BRANCH, -1, -1, 1, ".Lsyscall_error")
+            If inst_branch is not 0:
+                List.list_append(sequence, inst_branch)
+            End If
+        End If
+    End If
+
+    Return sequence
+End Process
+
+Note: ============================================================================
+Note: Instruction Sequence to Assembly Text Emission
+Note: ============================================================================
+
+@Reasoning
+emit_sequence_as_assembly converts a list of SyscallInstruction nodes into actual
+assembly text and appends it to the given AssemblyOutput's .text section. Each
+instruction type maps to a specific assembly pattern depending on the target
+architecture (derived from platform_id).
+
+Register IDs are translated to architecture-specific register name strings using
+a helper lookup. The function handles all INST_* types:
+
+- INST_MOVE_IMM: Load an immediate value into a register
+- INST_MOVE_REG: Move a value between two registers
+- INST_SYSCALL: Emit the platform's syscall instruction (syscall/svc/swi/ecall/sc)
+- INST_COMPARE: Compare a register against an immediate value
+- INST_BRANCH: Conditional branch to a label
+- INST_NEGATE: Negate a register value (for errno extraction)
+- INST_TEST_CARRY: Test the carry flag (BSD error detection)
+- INST_TEST_CR0_SO: Test the PowerPC CR0.SO bit
+- INST_LOAD_STACK: Load a value from a stack offset
+- INST_STORE_STACK: Store a value to a stack offset
+
+The function returns 1 on success, 0 on failure.
+@End Reasoning
+
+Process called "get_register_name_for_platform" that takes platform_id as Integer, reg_id as Integer returns Integer:
+    Note: Translates a numeric register ID to the architecture-specific register name string
+    Note: Returns pointer to register name string, or 0 if unknown
+
+    Note: Determine architecture from platform_id
+    Note: x86_64 platforms: 1 (Linux), 4 (Darwin), 6 (Windows), 8 (FreeBSD), 10 (OpenBSD), 12 (NetBSD)
+    If platform_id is PlatformInterface.PLATFORM_LINUX_X86_64:
+        Return get_x86_64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_DARWIN_X86_64:
+        Return get_x86_64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_WINDOWS_X86_64:
+        Return get_x86_64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_FREEBSD_X86_64:
+        Return get_x86_64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_OPENBSD_X86_64:
+        Return get_x86_64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_NETBSD_X86_64:
+        Return get_x86_64_register_name(reg_id)
+    End If
+
+    Note: AArch64 platforms: 2 (Linux), 5 (Darwin), 7 (Windows), 9 (FreeBSD), 11 (OpenBSD), 13 (NetBSD)
+    If platform_id is PlatformInterface.PLATFORM_LINUX_ARM64:
+        Return get_aarch64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_DARWIN_ARM64:
+        Return get_aarch64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_WINDOWS_ARM64:
+        Return get_aarch64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_FREEBSD_ARM64:
+        Return get_aarch64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_OPENBSD_ARM64:
+        Return get_aarch64_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_NETBSD_ARM64:
+        Return get_aarch64_register_name(reg_id)
+    End If
+
+    Note: ARM32: 3 (Linux)
+    If platform_id is PlatformInterface.PLATFORM_LINUX_ARM32:
+        Return get_arm32_register_name(reg_id)
+    End If
+
+    Note: RISC-V: 17 (RV32), 18 (RV64)
+    If platform_id is PlatformInterface.PLATFORM_LINUX_RISCV32:
+        Return get_riscv_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_LINUX_RISCV64:
+        Return get_riscv_register_name(reg_id)
+    End If
+
+    Note: MIPS: 14 (MIPS32), 15 (MIPS64)
+    If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS32:
+        Return get_mips_register_name(reg_id)
+    End If
+    If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS64:
+        Return get_mips_register_name(reg_id)
+    End If
+
+    Note: PowerPC: 16 (Linux)
+    If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+        Return get_powerpc_register_name(reg_id)
+    End If
+
+    Return 0
+End Process
+
+Process called "get_x86_64_register_name" that takes reg_id as Integer returns Integer:
+    Note: Returns x86_64 register name for the given register ID
+    Note: Register IDs follow the SyscallConvention assignments:
+    Note: 0=RAX, 1=RBX, 2=RCX, 3=RDX, 4=RSI, 5=RDI, 6=RSP, 7=RBP
+    Note: 8=R8, 9=R9, 10=R10, 11=R11, 12=R12, 13=R13, 14=R14, 15=R15
+    If reg_id is 0:
+        Return "%rax"
+    End If
+    If reg_id is 1:
+        Return "%rbx"
+    End If
+    If reg_id is 2:
+        Return "%rcx"
+    End If
+    If reg_id is 3:
+        Return "%rdx"
+    End If
+    If reg_id is 4:
+        Return "%rsi"
+    End If
+    If reg_id is 5:
+        Return "%rdi"
+    End If
+    If reg_id is 6:
+        Return "%rsp"
+    End If
+    If reg_id is 7:
+        Return "%rbp"
+    End If
+    If reg_id is 8:
+        Return "%r8"
+    End If
+    If reg_id is 9:
+        Return "%r9"
+    End If
+    If reg_id is 10:
+        Return "%r10"
+    End If
+    If reg_id is 11:
+        Return "%r11"
+    End If
+    If reg_id is 12:
+        Return "%r12"
+    End If
+    If reg_id is 13:
+        Return "%r13"
+    End If
+    If reg_id is 14:
+        Return "%r14"
+    End If
+    If reg_id is 15:
+        Return "%r15"
+    End If
+    Return "%rax"
+End Process
+
+Process called "get_aarch64_register_name" that takes reg_id as Integer returns Integer:
+    Note: Returns AArch64 register name for the given register ID
+    Note: Register IDs 0-30 map to x0-x30, 31 is SP
+    If reg_id < 0:
+        Return "x0"
+    End If
+    If reg_id is 0:
+        Return "x0"
+    End If
+    If reg_id is 1:
+        Return "x1"
+    End If
+    If reg_id is 2:
+        Return "x2"
+    End If
+    If reg_id is 3:
+        Return "x3"
+    End If
+    If reg_id is 4:
+        Return "x4"
+    End If
+    If reg_id is 5:
+        Return "x5"
+    End If
+    If reg_id is 6:
+        Return "x6"
+    End If
+    If reg_id is 7:
+        Return "x7"
+    End If
+    If reg_id is 8:
+        Return "x8"
+    End If
+    If reg_id is 9:
+        Return "x9"
+    End If
+    If reg_id is 10:
+        Return "x10"
+    End If
+    If reg_id is 11:
+        Return "x11"
+    End If
+    If reg_id is 12:
+        Return "x12"
+    End If
+    If reg_id is 13:
+        Return "x13"
+    End If
+    If reg_id is 14:
+        Return "x14"
+    End If
+    If reg_id is 15:
+        Return "x15"
+    End If
+    If reg_id is 16:
+        Return "x16"
+    End If
+    If reg_id is 17:
+        Return "x17"
+    End If
+    If reg_id is 18:
+        Return "x18"
+    End If
+    If reg_id is 19:
+        Return "x19"
+    End If
+    If reg_id is 20:
+        Return "x20"
+    End If
+    If reg_id is 29:
+        Return "x29"
+    End If
+    If reg_id is 30:
+        Return "x30"
+    End If
+    If reg_id is 31:
+        Return "sp"
+    End If
+    Return "x0"
+End Process
+
+Process called "get_arm32_register_name" that takes reg_id as Integer returns Integer:
+    Note: Returns ARM32 register name for the given register ID
+    Note: Register IDs 0-15 map to r0-r15
+    If reg_id is 0:
+        Return "r0"
+    End If
+    If reg_id is 1:
+        Return "r1"
+    End If
+    If reg_id is 2:
+        Return "r2"
+    End If
+    If reg_id is 3:
+        Return "r3"
+    End If
+    If reg_id is 4:
+        Return "r4"
+    End If
+    If reg_id is 5:
+        Return "r5"
+    End If
+    If reg_id is 6:
+        Return "r6"
+    End If
+    If reg_id is 7:
+        Return "r7"
+    End If
+    If reg_id is 8:
+        Return "r8"
+    End If
+    If reg_id is 9:
+        Return "r9"
+    End If
+    If reg_id is 10:
+        Return "r10"
+    End If
+    If reg_id is 11:
+        Return "r11"
+    End If
+    If reg_id is 12:
+        Return "r12"
+    End If
+    If reg_id is 13:
+        Return "sp"
+    End If
+    If reg_id is 14:
+        Return "lr"
+    End If
+    If reg_id is 15:
+        Return "pc"
+    End If
+    Return "r0"
+End Process
+
+Process called "get_riscv_register_name" that takes reg_id as Integer returns Integer:
+    Note: Returns RISC-V ABI register name for the given register ID
+    Note: Uses ABI names: a0-a7, t0-t6, s0-s11, etc.
+    If reg_id is 0:
+        Return "zero"
+    End If
+    If reg_id is 1:
+        Return "ra"
+    End If
+    If reg_id is 2:
+        Return "sp"
+    End If
+    If reg_id is 3:
+        Return "gp"
+    End If
+    If reg_id is 4:
+        Return "tp"
+    End If
+    If reg_id is 5:
+        Return "t0"
+    End If
+    If reg_id is 6:
+        Return "t1"
+    End If
+    If reg_id is 7:
+        Return "t2"
+    End If
+    If reg_id is 8:
+        Return "s0"
+    End If
+    If reg_id is 9:
+        Return "s1"
+    End If
+    If reg_id is 10:
+        Return "a0"
+    End If
+    If reg_id is 11:
+        Return "a1"
+    End If
+    If reg_id is 12:
+        Return "a2"
+    End If
+    If reg_id is 13:
+        Return "a3"
+    End If
+    If reg_id is 14:
+        Return "a4"
+    End If
+    If reg_id is 15:
+        Return "a5"
+    End If
+    If reg_id is 16:
+        Return "a6"
+    End If
+    If reg_id is 17:
+        Return "a7"
+    End If
+    Return "a0"
+End Process
+
+Process called "get_mips_register_name" that takes reg_id as Integer returns Integer:
+    Note: Returns MIPS register name for the given register ID
+    Note: Standard MIPS register numbering with ABI names
+    If reg_id is 0:
+        Return "$zero"
+    End If
+    If reg_id is 1:
+        Return "$at"
+    End If
+    If reg_id is 2:
+        Return "$v0"
+    End If
+    If reg_id is 3:
+        Return "$v1"
+    End If
+    If reg_id is 4:
+        Return "$a0"
+    End If
+    If reg_id is 5:
+        Return "$a1"
+    End If
+    If reg_id is 6:
+        Return "$a2"
+    End If
+    If reg_id is 7:
+        Return "$a3"
+    End If
+    If reg_id is 8:
+        Return "$t0"
+    End If
+    If reg_id is 9:
+        Return "$t1"
+    End If
+    If reg_id is 29:
+        Return "$sp"
+    End If
+    If reg_id is 31:
+        Return "$ra"
+    End If
+    Return "$v0"
+End Process
+
+Process called "get_powerpc_register_name" that takes reg_id as Integer returns Integer:
+    Note: Returns PowerPC register name for the given register ID
+    Note: Register IDs 0-31 map to r0-r31
+    If reg_id is 0:
+        Return "r0"
+    End If
+    If reg_id is 1:
+        Return "r1"
+    End If
+    If reg_id is 2:
+        Return "r2"
+    End If
+    If reg_id is 3:
+        Return "r3"
+    End If
+    If reg_id is 4:
+        Return "r4"
+    End If
+    If reg_id is 5:
+        Return "r5"
+    End If
+    If reg_id is 6:
+        Return "r6"
+    End If
+    If reg_id is 7:
+        Return "r7"
+    End If
+    If reg_id is 8:
+        Return "r8"
+    End If
+    If reg_id is 9:
+        Return "r9"
+    End If
+    If reg_id is 10:
+        Return "r10"
+    End If
+    If reg_id is 11:
+        Return "r11"
+    End If
+    If reg_id is 12:
+        Return "r12"
+    End If
+    Return "r0"
+End Process
+
+Process called "get_syscall_instruction_for_platform" that takes platform_id as Integer returns Integer:
+    Note: Returns the platform-specific syscall instruction mnemonic string
+    If platform_id is PlatformInterface.PLATFORM_LINUX_X86_64:
+        Return "\tsyscall"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_DARWIN_X86_64:
+        Return "\tsyscall"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_WINDOWS_X86_64:
+        Return "\tsyscall"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_FREEBSD_X86_64:
+        Return "\tsyscall"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_OPENBSD_X86_64:
+        Return "\tsyscall"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_NETBSD_X86_64:
+        Return "\tsyscall"
+    End If
+
+    If platform_id is PlatformInterface.PLATFORM_LINUX_ARM64:
+        Return "\tsvc\t#0"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_DARWIN_ARM64:
+        Return "\tsvc\t#0x80"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_WINDOWS_ARM64:
+        Return "\tsvc\t#0"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_FREEBSD_ARM64:
+        Return "\tsvc\t#0"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_OPENBSD_ARM64:
+        Return "\tsvc\t#0"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_NETBSD_ARM64:
+        Return "\tsvc\t#0"
+    End If
+
+    If platform_id is PlatformInterface.PLATFORM_LINUX_ARM32:
+        Return "\tswi\t#0"
+    End If
+
+    If platform_id is PlatformInterface.PLATFORM_LINUX_RISCV32:
+        Return "\tecall"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_LINUX_RISCV64:
+        Return "\tecall"
+    End If
+
+    If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS32:
+        Return "\tsyscall"
+    End If
+    If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS64:
+        Return "\tsyscall"
+    End If
+
+    If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+        Return "\tsc"
+    End If
+
+    Return "\tsyscall"
+End Process
+
+Process called "is_x86_64_platform" that takes platform_id as Integer returns Integer:
+    Note: Returns 1 if the platform uses x86_64 architecture, 0 otherwise
+    If platform_id is PlatformInterface.PLATFORM_LINUX_X86_64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_DARWIN_X86_64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_WINDOWS_X86_64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_FREEBSD_X86_64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_OPENBSD_X86_64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_NETBSD_X86_64:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "is_aarch64_platform" that takes platform_id as Integer returns Integer:
+    Note: Returns 1 if the platform uses AArch64 architecture, 0 otherwise
+    If platform_id is PlatformInterface.PLATFORM_LINUX_ARM64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_DARWIN_ARM64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_WINDOWS_ARM64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_FREEBSD_ARM64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_OPENBSD_ARM64:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_NETBSD_ARM64:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "is_riscv_platform" that takes platform_id as Integer returns Integer:
+    Note: Returns 1 if the platform uses RISC-V architecture, 0 otherwise
+    If platform_id is PlatformInterface.PLATFORM_LINUX_RISCV32:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_LINUX_RISCV64:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "is_mips_platform" that takes platform_id as Integer returns Integer:
+    Note: Returns 1 if the platform uses MIPS architecture, 0 otherwise
+    If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS32:
+        Return 1
+    End If
+    If platform_id is PlatformInterface.PLATFORM_LINUX_MIPS64:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "emit_sequence_as_assembly" that takes output as Integer, instructions as Integer, platform_id as Integer returns Integer:
+    Note: Converts a list of SyscallInstruction nodes into assembly text and appends
+    Note: it to the .text section of the given AssemblyOutput
+    Note: Returns 1 on success, 0 on failure
+
+    If output is 0:
+        Return 0
+    End If
+    If instructions is 0:
+        Return 0
+    End If
+
+    Let count be List.list_length(instructions)
+    If count is 0:
+        Return 1
+    End If
+
+    Let section be MachineCode.SECTION_TEXT
+
+    Let idx be 0
+    While idx < count:
+        Let inst be List.list_get(instructions, idx)
+        If inst is not 0:
+            Let inst_type be __load(inst, 0)
+            Let dst_reg be __load(inst, 8)
+            Let src_reg be __load(inst, 16)
+            Let immediate be __load(inst, 24)
+            Let label be __load(inst, 32)
+
+            Note: Skip removed instructions (type == 0)
+            If inst_type is not 0:
+                If inst_type is INST_MOVE_IMM:
+                    Note: Load immediate value into destination register
+                    Let dst_name be get_register_name_for_platform(platform_id, dst_reg)
+                    Let imm_str be StringCore.integer_to_string(immediate)
+
+                    If is_x86_64_platform(platform_id) is 1:
+                        Note: x86_64: movq $imm, %reg
+                        MachineCode.asm_emit_to_section(output, section, "\tmovq\t$")
+                        MachineCode.asm_emit_to_section(output, section, imm_str)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, dst_name)
+                    End If
+                    If is_aarch64_platform(platform_id) is 1:
+                        Note: AArch64: mov xN, #imm
+                        MachineCode.asm_emit_to_section(output, section, "\tmov\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", #")
+                        MachineCode.asm_emit_line(output, section, imm_str)
+                    End If
+                    If platform_id is PlatformInterface.PLATFORM_LINUX_ARM32:
+                        Note: ARM32: mov rN, #imm
+                        MachineCode.asm_emit_to_section(output, section, "\tmov\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", #")
+                        MachineCode.asm_emit_line(output, section, imm_str)
+                    End If
+                    If is_riscv_platform(platform_id) is 1:
+                        Note: RISC-V: li reg, imm
+                        MachineCode.asm_emit_to_section(output, section, "\tli\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, imm_str)
+                    End If
+                    If is_mips_platform(platform_id) is 1:
+                        Note: MIPS: li $reg, imm
+                        MachineCode.asm_emit_to_section(output, section, "\tli\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, imm_str)
+                    End If
+                    If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+                        Note: PowerPC: li rN, imm
+                        MachineCode.asm_emit_to_section(output, section, "\tli\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, imm_str)
+                    End If
+                End If
+
+                If inst_type is INST_MOVE_REG:
+                    Note: Move value between registers
+                    Let dst_name be get_register_name_for_platform(platform_id, dst_reg)
+                    Let src_name be get_register_name_for_platform(platform_id, src_reg)
+
+                    If is_x86_64_platform(platform_id) is 1:
+                        Note: x86_64: movq %src, %dst
+                        MachineCode.asm_emit_to_section(output, section, "\tmovq\t")
+                        MachineCode.asm_emit_to_section(output, section, src_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, dst_name)
+                    End If
+                    If is_aarch64_platform(platform_id) is 1:
+                        Note: AArch64: mov dst, src
+                        MachineCode.asm_emit_to_section(output, section, "\tmov\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, src_name)
+                    End If
+                    If platform_id is PlatformInterface.PLATFORM_LINUX_ARM32:
+                        Note: ARM32: mov dst, src
+                        MachineCode.asm_emit_to_section(output, section, "\tmov\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, src_name)
+                    End If
+                    If is_riscv_platform(platform_id) is 1:
+                        Note: RISC-V: mv dst, src
+                        MachineCode.asm_emit_to_section(output, section, "\tmv\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, src_name)
+                    End If
+                    If is_mips_platform(platform_id) is 1:
+                        Note: MIPS: move dst, src
+                        MachineCode.asm_emit_to_section(output, section, "\tmove\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, src_name)
+                    End If
+                    If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+                        Note: PowerPC: mr dst, src
+                        MachineCode.asm_emit_to_section(output, section, "\tmr\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, src_name)
+                    End If
+                End If
+
+                If inst_type is INST_SYSCALL:
+                    Note: Emit the platform-specific syscall instruction
+                    Let syscall_mnemonic be get_syscall_instruction_for_platform(platform_id)
+                    MachineCode.asm_emit_line(output, section, syscall_mnemonic)
+                End If
+
+                If inst_type is INST_COMPARE:
+                    Note: Compare register against immediate
+                    Let dst_name be get_register_name_for_platform(platform_id, dst_reg)
+                    Let imm_str be StringCore.integer_to_string(immediate)
+
+                    If is_x86_64_platform(platform_id) is 1:
+                        Note: x86_64: cmpq $imm, %reg
+                        MachineCode.asm_emit_to_section(output, section, "\tcmpq\t$")
+                        MachineCode.asm_emit_to_section(output, section, imm_str)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, dst_name)
+                    End If
+                    If is_aarch64_platform(platform_id) is 1:
+                        Note: AArch64: cmp xN, #imm
+                        MachineCode.asm_emit_to_section(output, section, "\tcmp\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", #")
+                        MachineCode.asm_emit_line(output, section, imm_str)
+                    End If
+                    If platform_id is PlatformInterface.PLATFORM_LINUX_ARM32:
+                        Note: ARM32: cmp rN, #imm
+                        MachineCode.asm_emit_to_section(output, section, "\tcmp\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", #")
+                        MachineCode.asm_emit_line(output, section, imm_str)
+                    End If
+                    If is_riscv_platform(platform_id) is 1:
+                        Note: RISC-V has no cmp instruction; use a branch-based comparison
+                        Note: Emit: li t0, imm; blt reg, t0, label (handled by INST_BRANCH)
+                        MachineCode.asm_emit_to_section(output, section, "\tli\tt0, ")
+                        MachineCode.asm_emit_line(output, section, imm_str)
+                    End If
+                    If is_mips_platform(platform_id) is 1:
+                        Note: MIPS: compare by branching; load immediate into $at for comparison
+                        Note: bnez $reg, label is used for error register check
+                        If immediate is 0:
+                            Note: Comparing against 0: the INST_BRANCH will use bnez
+                            MachineCode.asm_emit_to_section(output, section, "\tnop")
+                            MachineCode.asm_emit_line(output, section, "")
+                        Otherwise:
+                            MachineCode.asm_emit_to_section(output, section, "\tli\t$at, ")
+                            MachineCode.asm_emit_line(output, section, imm_str)
+                        End If
+                    End If
+                    If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+                        Note: PowerPC: cmpwi rN, imm
+                        MachineCode.asm_emit_to_section(output, section, "\tcmpwi\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, imm_str)
+                    End If
+                End If
+
+                If inst_type is INST_BRANCH:
+                    Note: Conditional branch to a label
+                    Note: The immediate field encodes the condition (1 = branch if error detected)
+                    If label is not 0:
+                        If is_x86_64_platform(platform_id) is 1:
+                            Note: x86_64: jae label (jump if above or equal, i.e., unsigned >= threshold)
+                            MachineCode.asm_emit_to_section(output, section, "\tjae\t")
+                            MachineCode.asm_emit_line(output, section, label)
+                        End If
+                        If is_aarch64_platform(platform_id) is 1:
+                            Note: AArch64: b.hs label (branch if higher or same, unsigned)
+                            MachineCode.asm_emit_to_section(output, section, "\tb.hs\t")
+                            MachineCode.asm_emit_line(output, section, label)
+                        End If
+                        If platform_id is PlatformInterface.PLATFORM_LINUX_ARM32:
+                            Note: ARM32: bhs label
+                            MachineCode.asm_emit_to_section(output, section, "\tbhs\t")
+                            MachineCode.asm_emit_line(output, section, label)
+                        End If
+                        If is_riscv_platform(platform_id) is 1:
+                            Note: RISC-V: bltu reg, t0, label
+                            Let dst_name be get_register_name_for_platform(platform_id, dst_reg)
+                            MachineCode.asm_emit_to_section(output, section, "\tbltu\t")
+                            MachineCode.asm_emit_to_section(output, section, dst_name)
+                            MachineCode.asm_emit_to_section(output, section, ", t0, ")
+                            MachineCode.asm_emit_line(output, section, label)
+                        End If
+                        If is_mips_platform(platform_id) is 1:
+                            Note: MIPS: bnez $reg, label (for error register check)
+                            Let dst_name be get_register_name_for_platform(platform_id, dst_reg)
+                            MachineCode.asm_emit_to_section(output, section, "\tbnez\t")
+                            MachineCode.asm_emit_to_section(output, section, dst_name)
+                            MachineCode.asm_emit_to_section(output, section, ", ")
+                            MachineCode.asm_emit_line(output, section, label)
+                            Note: MIPS branch delay slot: nop
+                            MachineCode.asm_emit_line(output, section, "\tnop")
+                        End If
+                        If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+                            Note: PowerPC: blt label (branch if less than)
+                            MachineCode.asm_emit_to_section(output, section, "\tblt\t")
+                            MachineCode.asm_emit_line(output, section, label)
+                        End If
+                    End If
+                End If
+
+                If inst_type is INST_NEGATE:
+                    Note: Negate register value (for extracting errno from negative return)
+                    Let dst_name be get_register_name_for_platform(platform_id, dst_reg)
+
+                    If is_x86_64_platform(platform_id) is 1:
+                        Note: x86_64: negq %reg
+                        MachineCode.asm_emit_to_section(output, section, "\tnegq\t")
+                        MachineCode.asm_emit_line(output, section, dst_name)
+                    End If
+                    If is_aarch64_platform(platform_id) is 1:
+                        Note: AArch64: neg xN, xN
+                        MachineCode.asm_emit_to_section(output, section, "\tneg\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, dst_name)
+                    End If
+                    If platform_id is PlatformInterface.PLATFORM_LINUX_ARM32:
+                        Note: ARM32: rsb rN, rN, #0
+                        MachineCode.asm_emit_to_section(output, section, "\trsb\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_line(output, section, ", #0")
+                    End If
+                    If is_riscv_platform(platform_id) is 1:
+                        Note: RISC-V: neg reg, reg (pseudo for sub reg, zero, reg)
+                        MachineCode.asm_emit_to_section(output, section, "\tneg\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, dst_name)
+                    End If
+                    If is_mips_platform(platform_id) is 1:
+                        Note: MIPS: negu $reg, $reg
+                        MachineCode.asm_emit_to_section(output, section, "\tnegu\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, dst_name)
+                    End If
+                    If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+                        Note: PowerPC: neg rN, rN
+                        MachineCode.asm_emit_to_section(output, section, "\tneg\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_line(output, section, dst_name)
+                    End If
+                End If
+
+                If inst_type is INST_TEST_CARRY:
+                    Note: Test carry flag for BSD-style error detection
+                    If is_x86_64_platform(platform_id) is 1:
+                        Note: x86_64: jc .Lsyscall_error (jump if carry set)
+                        MachineCode.asm_emit_line(output, section, "\tjc\t.Lsyscall_error")
+                    End If
+                    If is_aarch64_platform(platform_id) is 1:
+                        Note: AArch64: b.cs .Lsyscall_error (branch if carry set)
+                        MachineCode.asm_emit_line(output, section, "\tb.cs\t.Lsyscall_error")
+                    End If
+                End If
+
+                If inst_type is INST_TEST_CR0_SO:
+                    Note: Test PowerPC CR0.SO bit for error detection
+                    Note: PowerPC: mfcr rT; andis. rT, rT, 0x0200; bne .Lsyscall_error
+                    If platform_id is PlatformInterface.PLATFORM_LINUX_POWERPC:
+                        MachineCode.asm_emit_line(output, section, "\tmfcr\tr12")
+                        MachineCode.asm_emit_line(output, section, "\tandis.\tr12, r12, 0x0200")
+                        MachineCode.asm_emit_line(output, section, "\tbne\t.Lsyscall_error")
+                    End If
+                End If
+
+                If inst_type is INST_STORE_STACK:
+                    Note: Store a value to a stack offset (MIPS o32 style)
+                    Note: src_reg contains the value register, immediate is the stack offset
+                    Let src_name be get_register_name_for_platform(platform_id, src_reg)
+                    Let offset_str be StringCore.integer_to_string(immediate)
+
+                    If is_mips_platform(platform_id) is 1:
+                        Note: MIPS: sw $reg, offset($sp)
+                        MachineCode.asm_emit_to_section(output, section, "\tsw\t")
+                        MachineCode.asm_emit_to_section(output, section, src_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_to_section(output, section, offset_str)
+                        MachineCode.asm_emit_line(output, section, "($sp)")
+                    End If
+                End If
+
+                If inst_type is INST_LOAD_STACK:
+                    Note: Load a value from a stack offset
+                    Let dst_name be get_register_name_for_platform(platform_id, dst_reg)
+                    Let offset_str be StringCore.integer_to_string(immediate)
+
+                    If is_mips_platform(platform_id) is 1:
+                        Note: MIPS: lw $reg, offset($sp)
+                        MachineCode.asm_emit_to_section(output, section, "\tlw\t")
+                        MachineCode.asm_emit_to_section(output, section, dst_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_to_section(output, section, offset_str)
+                        MachineCode.asm_emit_line(output, section, "($sp)")
+                    End If
+                End If
+            End If
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return 1
+End Process

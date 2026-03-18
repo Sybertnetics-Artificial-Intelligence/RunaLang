@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,2510 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles x86_64 instruction encoding and instruction processing.
+x86_64 Instruction Encoder - Binary Machine Code Encoding
+
+This file handles direct binary encoding of x86_64 instructions for the native
+code output path that bypasses the system assembler. It encodes LIR instructions
+into their variable-length x86_64 binary representations according to the Intel
+Software Developer Manual encoding rules.
 
 This file performs the following tasks:
-- Process x86_64 instruction encoding and instruction generation
-- Handle x86_64 instruction optimization and instruction selection
-- Manage x86_64 instruction scheduling and instruction reordering
-- Process x86_64 instruction validation and instruction verification
+- Map LIR virtual register IDs to x86_64 physical register encoding values
+- Compute REX prefixes for 64-bit operands and extended registers (R8-R15)
+- Encode ModR/M and SIB bytes for register-register and memory addressing modes
+- Encode complete instructions: MOV, ALU (ADD/SUB/AND/OR/XOR/CMP), PUSH, POP,
+  CALL, JMP, Jcc, RET, SYSCALL, NOP
+- Dispatch LIR instruction opcodes to the appropriate binary encoder
 
 This file is essential because of the following reasons:
-- x86_64 instruction processing enables native x86_64 code generation
-- Proper instruction handling ensures correct and efficient x86_64 code
-- x86_64 support enables Runa compilation for x86_64 platforms
+- Direct binary encoding enables producing object files without invoking an
+  external assembler (as/gas), reducing compilation time and external dependencies
+- Correct encoding of REX prefixes, ModR/M, and SIB bytes is critical for
+  generating valid x86_64 machine code
+- The LIR register numbering differs from x86 physical encoding, requiring a
+  translation layer
 
 This file consists of the following functions/features/operation types:
-- x86_64 instruction encoding and instruction generation
-- x86_64 instruction optimization and instruction selection
-- x86_64 instruction scheduling and instruction reordering
-- x86_64 instruction validation and instruction verification
+- LIR-to-x86 register mapping tables and translation functions
+- REX prefix computation for 64-bit mode and extended register access
+- ModR/M and SIB byte encoding for all x86_64 addressing modes
+- Complete instruction encoders for MOV, ALU, PUSH, POP, CALL, JMP, Jcc, RET,
+  SYSCALL, and NOP
+- A top-level dispatcher that encodes any LIR instruction into binary
+
+Dependencies:
+- Imports LIR types for opcode constants and register ID definitions
+- Imports LIRNodes for operand inspection (register/immediate/memory accessors)
+- Imports MachineCode for BinaryOutput byte emission functions
+- Imports Layout for owned-heap allocation (Tier 3)
+- Imports List for collection operations
 :End Note
 
-Note: TODO - Implement x86_64 instruction encoder functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: x86_64 REGISTER ENCODING CONSTANTS
+Note: ============================================================================
+
+@Reasoning
+The LIR uses a logical register numbering that matches general familiarity
+(RAX=0, RBX=1, RCX=2, ...) but x86_64 ModR/M and SIB bytes encode registers
+in a different order inherited from the original 8086:
+
+  x86 encoding 0 = RAX   (LIR ID 0)
+  x86 encoding 1 = RCX   (LIR ID 2)
+  x86 encoding 2 = RDX   (LIR ID 3)
+  x86 encoding 3 = RBX   (LIR ID 1)
+  x86 encoding 4 = RSP   (LIR ID 7)
+  x86 encoding 5 = RBP   (LIR ID 6)
+  x86 encoding 6 = RSI   (LIR ID 4)
+  x86 encoding 7 = RDI   (LIR ID 5)
+
+For R8-R15 (LIR IDs 8-15), the low 3 bits of the x86 encoding are 0-7
+respectively, and the high bit is carried in the REX prefix (REX.B or REX.R).
+@End Reasoning
+
+Note: Lookup table stored in a 16-entry allocated buffer.
+Note: Index = LIR register ID, Value = x86 3-bit encoding (0-7).
+Note: For R8-R15 the encoding is (lir_id - 8), same as low 3 bits.
+Let lir_to_x86_table be 0
+Let lir_to_x86_table_initialized be 0
+
+Process called "init_lir_to_x86_table" returns Integer:
+    @Reasoning
+    Initializes the 16-entry mapping table from LIR register IDs to x86 3-bit
+    encoding values. This is called once on first use and cached. Each entry
+    is stored as a single byte in a 16-byte buffer.
+
+    LIR ID -> x86 encoding:
+      0 (RAX) -> 0,  1 (RBX) -> 3,  2 (RCX) -> 1,  3 (RDX) -> 2,
+      4 (RSI) -> 6,  5 (RDI) -> 7,  6 (RBP) -> 5,  7 (RSP) -> 4,
+      8 (R8)  -> 0,  9 (R9)  -> 1, 10 (R10) -> 2, 11 (R11) -> 3,
+     12 (R12) -> 4, 13 (R13) -> 5, 14 (R14) -> 6, 15 (R15) -> 7
+    @End Reasoning
+
+    If lir_to_x86_table_initialized equals 1:
+        Return 1
+    End If
+
+    Set lir_to_x86_table to Layout.allocate(16)
+    If lir_to_x86_table equals 0:
+        Display "init_lir_to_x86_table: allocation failed"
+        Return 0
+    End If
+
+    Note: RAX (LIR 0) -> x86 encoding 0
+    __store8(lir_to_x86_table, 0, 0)
+    Note: RBX (LIR 1) -> x86 encoding 3
+    __store8(lir_to_x86_table, 1, 3)
+    Note: RCX (LIR 2) -> x86 encoding 1
+    __store8(lir_to_x86_table, 2, 1)
+    Note: RDX (LIR 3) -> x86 encoding 2
+    __store8(lir_to_x86_table, 3, 2)
+    Note: RSI (LIR 4) -> x86 encoding 6
+    __store8(lir_to_x86_table, 4, 6)
+    Note: RDI (LIR 5) -> x86 encoding 7
+    __store8(lir_to_x86_table, 5, 7)
+    Note: RBP (LIR 6) -> x86 encoding 5
+    __store8(lir_to_x86_table, 6, 5)
+    Note: RSP (LIR 7) -> x86 encoding 4
+    __store8(lir_to_x86_table, 7, 4)
+    Note: R8  (LIR 8)  -> x86 encoding 0 (with REX.B/R)
+    __store8(lir_to_x86_table, 8, 0)
+    Note: R9  (LIR 9)  -> x86 encoding 1 (with REX.B/R)
+    __store8(lir_to_x86_table, 9, 1)
+    Note: R10 (LIR 10) -> x86 encoding 2 (with REX.B/R)
+    __store8(lir_to_x86_table, 10, 2)
+    Note: R11 (LIR 11) -> x86 encoding 3 (with REX.B/R)
+    __store8(lir_to_x86_table, 11, 3)
+    Note: R12 (LIR 12) -> x86 encoding 4 (with REX.B/R)
+    __store8(lir_to_x86_table, 12, 4)
+    Note: R13 (LIR 13) -> x86 encoding 5 (with REX.B/R)
+    __store8(lir_to_x86_table, 13, 5)
+    Note: R14 (LIR 14) -> x86 encoding 6 (with REX.B/R)
+    __store8(lir_to_x86_table, 14, 6)
+    Note: R15 (LIR 15) -> x86 encoding 7 (with REX.B/R)
+    __store8(lir_to_x86_table, 15, 7)
+
+    Set lir_to_x86_table_initialized to 1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: COMMON x86_64 OPCODE CONSTANTS
+Note: ============================================================================
+
+@Reasoning
+x86_64 ALU instructions share a regular encoding pattern. Each ALU operation
+(ADD, OR, ADC, SBB, AND, SUB, XOR, CMP) has a group code 0-7 that selects the
+operation within the ModR/M /r encoding space. The base opcode for reg-to-r/m
+is (group * 8 + 1) for 16/32/64-bit operands:
+
+  ADD = group 0: opcode 0x01 (r->r/m), 0x03 (r/m->r), 0x81 /0 (imm32)
+  OR  = group 1: opcode 0x09, 0x0B, 0x81 /1
+  ADC = group 2: opcode 0x11, 0x13, 0x81 /2
+  SBB = group 3: opcode 0x19, 0x1B, 0x81 /3
+  AND = group 4: opcode 0x21, 0x23, 0x81 /4
+  SUB = group 5: opcode 0x29, 0x2B, 0x81 /5
+  XOR = group 6: opcode 0x31, 0x33, 0x81 /6
+  CMP = group 7: opcode 0x39, 0x3B, 0x81 /7
+@End Reasoning
+
+Note: ALU opcode bases for reg-to-r/m direction (operand-size 16/32/64)
+Constant X86_OP_ADD_RM as Integer is 1       Note: 0x01: ADD r/m, reg
+Constant X86_OP_ADD_MR as Integer is 3       Note: 0x03: ADD reg, r/m
+Constant X86_OP_OR_RM as Integer is 9        Note: 0x09: OR r/m, reg
+Constant X86_OP_OR_MR as Integer is 11       Note: 0x0B: OR reg, r/m
+Constant X86_OP_ADC_RM as Integer is 17      Note: 0x11: ADC r/m, reg
+Constant X86_OP_ADC_MR as Integer is 19      Note: 0x13: ADC reg, r/m
+Constant X86_OP_SBB_RM as Integer is 25      Note: 0x19: SBB r/m, reg
+Constant X86_OP_SBB_MR as Integer is 27      Note: 0x1B: SBB reg, r/m
+Constant X86_OP_AND_RM as Integer is 33      Note: 0x21: AND r/m, reg
+Constant X86_OP_AND_MR as Integer is 35      Note: 0x23: AND reg, r/m
+Constant X86_OP_SUB_RM as Integer is 41      Note: 0x29: SUB r/m, reg
+Constant X86_OP_SUB_MR as Integer is 43      Note: 0x2B: SUB reg, r/m
+Constant X86_OP_XOR_RM as Integer is 49      Note: 0x31: XOR r/m, reg
+Constant X86_OP_XOR_MR as Integer is 51      Note: 0x33: XOR reg, r/m
+Constant X86_OP_CMP_RM as Integer is 57      Note: 0x39: CMP r/m, reg
+Constant X86_OP_CMP_MR as Integer is 59      Note: 0x3B: CMP reg, r/m
+
+Note: MOV opcodes
+Constant X86_OP_MOV_RM as Integer is 137     Note: 0x89: MOV r/m, reg (reg -> r/m)
+Constant X86_OP_MOV_MR as Integer is 139     Note: 0x8B: MOV reg, r/m (r/m -> reg)
+Constant X86_OP_MOV_IMM_REG_BASE as Integer is 184  Note: 0xB8: MOV reg, imm (base for +rd)
+Constant X86_OP_MOV_IMM_RM as Integer is 199 Note: 0xC7: MOV r/m, imm32 (with /0)
+
+Note: Stack operations
+Constant X86_OP_PUSH_REG_BASE as Integer is 80  Note: 0x50: PUSH reg (base for +rd)
+Constant X86_OP_POP_REG_BASE as Integer is 88   Note: 0x58: POP reg (base for +rd)
+
+Note: Control flow
+Constant X86_OP_RET as Integer is 195            Note: 0xC3: RET (near return)
+Constant X86_OP_CALL_REL32 as Integer is 232     Note: 0xE8: CALL rel32
+Constant X86_OP_JMP_REL32 as Integer is 233      Note: 0xE9: JMP rel32
+Constant X86_OP_NOP as Integer is 144            Note: 0x90: NOP
+
+Note: Two-byte opcode escape
+Constant X86_TWO_BYTE_ESCAPE as Integer is 15    Note: 0x0F prefix for two-byte opcodes
+
+Note: SYSCALL is 0x0F 0x05
+Constant X86_OP_SYSCALL_BYTE2 as Integer is 5    Note: 0x05: second byte of SYSCALL
+
+Note: Jcc rel32 second byte base (0x0F 0x80+cc)
+Constant X86_OP_JCC_REL32_BASE as Integer is 128 Note: 0x80: base for Jcc rel32
+
+Note: ALU immediate opcode (0x81 for imm32 to r/m)
+Constant X86_OP_ALU_IMM32 as Integer is 129      Note: 0x81: ALU r/m, imm32
+
+Note: ALU immediate short (0x83 for sign-extended imm8 to r/m)
+Constant X86_OP_ALU_IMM8 as Integer is 131       Note: 0x83: ALU r/m, imm8
+
+Note: Operand size override prefix
+Constant X86_PREFIX_OPERAND_SIZE as Integer is 102 Note: 0x66: 16-bit operand override
+
+Note: ============================================================================
+Note: x86_64 CONDITION CODE CONSTANTS
+Note: ============================================================================
+
+@Reasoning
+x86_64 Jcc instructions encode the condition in the low 4 bits of the opcode.
+The two-byte form is 0x0F 0x8x where x is the condition code:
+
+  0x0 = O  (overflow)          0x1 = NO (not overflow)
+  0x2 = B  (below/carry)       0x3 = AE (above or equal/not carry)
+  0x4 = E  (equal/zero)        0x5 = NE (not equal/not zero)
+  0x6 = BE (below or equal)    0x7 = A  (above)
+  0x8 = S  (sign)              0x9 = NS (not sign)
+  0xA = P  (parity)            0xB = NP (not parity)
+  0xC = L  (less)              0xD = GE (greater or equal)
+  0xE = LE (less or equal)     0xF = G  (greater)
+
+We map LIR condition codes (LIR_COND_*) to x86 condition codes (CC_*).
+@End Reasoning
+
+Constant X86_CC_O as Integer is 0              Note: Overflow
+Constant X86_CC_NO as Integer is 1             Note: Not overflow
+Constant X86_CC_B as Integer is 2              Note: Below (unsigned <)
+Constant X86_CC_AE as Integer is 3             Note: Above or equal (unsigned >=)
+Constant X86_CC_E as Integer is 4              Note: Equal / Zero
+Constant X86_CC_NE as Integer is 5             Note: Not equal / Not zero
+Constant X86_CC_BE as Integer is 6             Note: Below or equal (unsigned <=)
+Constant X86_CC_A as Integer is 7              Note: Above (unsigned >)
+Constant X86_CC_S as Integer is 8              Note: Sign (negative)
+Constant X86_CC_NS as Integer is 9             Note: Not sign (positive)
+Constant X86_CC_P as Integer is 10             Note: Parity even
+Constant X86_CC_NP as Integer is 11            Note: Parity odd
+Constant X86_CC_L as Integer is 12             Note: Less (signed <)
+Constant X86_CC_GE as Integer is 13            Note: Greater or equal (signed >=)
+Constant X86_CC_LE as Integer is 14            Note: Less or equal (signed <=)
+Constant X86_CC_G as Integer is 15             Note: Greater (signed >)
+
+Note: ============================================================================
+Note: ENCODED INSTRUCTION TYPE
+Note: ============================================================================
+
+@Reasoning
+EncodedInstruction holds the binary encoding result of a single x86_64
+instruction. x86_64 instructions can be 1-15 bytes long. We store the raw bytes
+in a 15-byte buffer along with the count and metadata flags that indicate which
+optional prefix/suffix components are present.
+
+Memory layout (40 bytes total):
+  offset 0:  bytes_ptr (pointer to 16-byte buffer holding raw encoded bytes)
+  offset 8:  byte_count (number of valid bytes, 0-15)
+  offset 16: has_rex (1 if a REX prefix was emitted)
+  offset 24: has_modrm (1 if a ModR/M byte was emitted)
+  offset 32: has_sib (1 if a SIB byte was emitted)
+@End Reasoning
+
+Type called "EncodedInstruction":
+    bytes_ptr as Integer          Note: Pointer to 16-byte buffer of encoded bytes
+    byte_count as Integer         Note: Number of valid encoded bytes (0-15)
+    has_rex as Integer            Note: 1 if REX prefix present
+    has_modrm as Integer          Note: 1 if ModR/M byte present
+    has_sib as Integer            Note: 1 if SIB byte present
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per EncodedInstruction
+
+Note: ============================================================================
+Note: REGISTER MAPPING FUNCTIONS
+Note: ============================================================================
+
+Process called "lir_reg_to_x86_encoding" that takes lir_reg_id as Integer returns Integer:
+    @Reasoning
+    Translates a LIR register ID (0-15) to the x86 3-bit register encoding used
+    in ModR/M and SIB bytes. This mapping is necessary because the LIR uses a
+    logical numbering (RAX=0, RBX=1, RCX=2, ...) that differs from x86 hardware
+    encoding (RAX=0, RCX=1, RDX=2, RBX=3, ...).
+
+    For extended registers R8-R15 (LIR IDs 8-15), this returns the low 3 bits
+    of the encoding (0-7). The high bit is carried separately in the REX prefix
+    via REX.B (for r/m or base) or REX.R (for reg).
+
+    If the LIR register ID is out of range, returns 0 (RAX encoding) as a safe
+    fallback and logs a warning.
+    @End Reasoning
+
+    Note: Ensure lookup table is initialized
+    If lir_to_x86_table_initialized equals 0:
+        init_lir_to_x86_table()
+    End If
+
+    Note: Validate register ID range
+    If lir_reg_id is less than 0:
+        Display "lir_reg_to_x86_encoding: negative register ID"
+        Return 0
+    End If
+    If lir_reg_id is greater than 15:
+        Display "lir_reg_to_x86_encoding: register ID out of range (>15)"
+        Return 0
+    End If
+
+    Let encoding be __load8(lir_to_x86_table, lir_reg_id)
+    Return encoding
+End Process
+
+Process called "needs_rex_for_register" that takes lir_reg_id as Integer returns Integer:
+    @Reasoning
+    Determines whether accessing a given register requires a REX prefix. A REX
+    prefix is needed when:
+    1. The register is R8-R15 (LIR IDs 8-15), because the high bit of the
+       register number must be encoded in REX.B, REX.R, or REX.X.
+    2. The instruction uses 64-bit operand size (REX.W=1), but that is handled
+       separately by compute_rex_prefix.
+
+    Returns 1 if the register needs a REX extension bit, 0 otherwise.
+    @End Reasoning
+
+    If lir_reg_id is greater than or equal to 8:
+        If lir_reg_id is less than or equal to 15:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: REX PREFIX COMPUTATION
+Note: ============================================================================
+
+Process called "compute_rex_prefix" that takes w as Integer, reg as Integer, index as Integer, base as Integer returns Integer:
+    @Reasoning
+    Computes the REX prefix byte for an x86_64 instruction. The REX prefix is a
+    single byte in the range 0x40-0x4F that encodes:
+
+      Bit 3 (W): 1 = 64-bit operand size (REX.W)
+      Bit 2 (R): Extension of ModR/M reg field (for registers R8-R15)
+      Bit 1 (X): Extension of SIB index field (for index registers R8-R15)
+      Bit 0 (B): Extension of ModR/M r/m field or SIB base (for R8-R15)
+
+    Parameters:
+      w     - 1 for 64-bit operand size, 0 for default (32-bit)
+      reg   - the LIR register ID used in the ModR/M reg field
+      index - the LIR register ID used in the SIB index field (0 if no SIB)
+      base  - the LIR register ID used in the ModR/M r/m or SIB base field
+
+    The R, X, B bits are set to 1 when the corresponding register has LIR ID >= 8
+    (meaning it is R8-R15 and needs the extension bit).
+
+    Returns the complete REX byte (0x40 | W<<3 | R<<2 | X<<1 | B), or 0 if no
+    REX prefix is needed (all extension bits are 0 and W is 0).
+    @End Reasoning
+
+    Let rex_w be 0
+    If w equals 1:
+        Set rex_w to 8
+    End If
+
+    Let rex_r be 0
+    If reg is greater than or equal to 8:
+        If reg is less than or equal to 15:
+            Set rex_r to 4
+        End If
+    End If
+
+    Let rex_x be 0
+    If index is greater than or equal to 8:
+        If index is less than or equal to 15:
+            Set rex_x to 2
+        End If
+    End If
+
+    Let rex_b be 0
+    If base is greater than or equal to 8:
+        If base is less than or equal to 15:
+            Set rex_b to 1
+        End If
+    End If
+
+    Let rex_byte be 64 | rex_w | rex_r | rex_x | rex_b
+    Note: 64 = 0x40 (REX prefix mandatory bits)
+
+    Note: Only return a REX byte if at least one extension bit or W is set
+    If rex_w equals 0:
+        If rex_r equals 0:
+            If rex_x equals 0:
+                If rex_b equals 0:
+                    Return 0
+                End If
+            End If
+        End If
+    End If
+
+    Return rex_byte
+End Process
+
+Note: ============================================================================
+Note: ModR/M AND SIB BYTE ENCODING
+Note: ============================================================================
+
+Process called "encode_modrm" that takes mod_val as Integer, reg as Integer, rm as Integer returns Integer:
+    @Reasoning
+    Encodes a ModR/M byte from its three fields:
+
+      Bits 7-6: mod  (addressing mode: 00=mem, 01=mem+disp8, 10=mem+disp32, 11=reg)
+      Bits 5-3: reg  (register operand or opcode extension /digit)
+      Bits 2-0: r/m  (register or memory operand)
+
+    Only the low 3 bits of reg and rm are used (the high bit, if any, goes into
+    the REX prefix). mod_val must be 0-3.
+
+    Returns the single ModR/M byte value.
+    @End Reasoning
+
+    Let mod_shifted be (mod_val & 3) << 6
+    Let reg_shifted be (reg & 7) << 3
+    Let rm_masked be rm & 7
+
+    Let modrm_byte be mod_shifted | reg_shifted | rm_masked
+    Return modrm_byte
+End Process
+
+Process called "encode_sib" that takes scale as Integer, index as Integer, base as Integer returns Integer:
+    @Reasoning
+    Encodes a SIB (Scale-Index-Base) byte for complex memory addressing modes.
+
+      Bits 7-6: scale (00=1, 01=2, 10=4, 11=8)
+      Bits 5-3: index register (low 3 bits; high bit in REX.X)
+      Bits 2-0: base register  (low 3 bits; high bit in REX.B)
+
+    The scale parameter is the actual multiplier (1, 2, 4, or 8) which this
+    function converts to the 2-bit encoding:
+      1 -> 0b00 (0)
+      2 -> 0b01 (1)
+      4 -> 0b10 (2)
+      8 -> 0b11 (3)
+
+    Returns the single SIB byte value.
+    @End Reasoning
+
+    Let scale_encoded be 0
+    If scale equals 1:
+        Set scale_encoded to 0
+    End If
+    If scale equals 2:
+        Set scale_encoded to 1
+    End If
+    If scale equals 4:
+        Set scale_encoded to 2
+    End If
+    If scale equals 8:
+        Set scale_encoded to 3
+    End If
+
+    Let scale_shifted be (scale_encoded & 3) << 6
+    Let index_shifted be (index & 7) << 3
+    Let base_masked be base & 7
+
+    Let sib_byte be scale_shifted | index_shifted | base_masked
+    Return sib_byte
+End Process
+
+Note: ============================================================================
+Note: DISPLACEMENT SIZE HELPERS
+Note: ============================================================================
+
+Process called "displacement_fits_in_8_bits" that takes displacement as Integer returns Integer:
+    @Reasoning
+    Checks whether a displacement value fits in a signed 8-bit field (-128..127).
+    If it does, we can use the shorter mod=01 encoding with disp8 instead of
+    mod=10 with disp32, saving 3 bytes per instruction.
+    @End Reasoning
+
+    If displacement is greater than or equal to -128:
+        If displacement is less than or equal to 127:
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "compute_mod_for_displacement" that takes displacement as Integer, base_x86 as Integer returns Integer:
+    @Reasoning
+    Determines the ModR/M mod field value based on the displacement and base
+    register. The rules are:
+
+    - If displacement is 0 and base is not RBP/R13 (x86 encoding 5):
+      mod=00 (no displacement). RBP/R13 with mod=00 is a special encoding that
+      means RIP-relative addressing, so RBP/R13 always needs at least disp8.
+    - If displacement fits in signed 8 bits and base is not RBP/R13 with disp=0:
+      mod=01 (8-bit displacement).
+    - Otherwise: mod=10 (32-bit displacement).
+
+    Returns the mod value (0, 1, or 2).
+    @End Reasoning
+
+    If displacement equals 0:
+        Note: x86 encoding 5 is RBP or R13 - these require explicit disp8(0)
+        If base_x86 equals 5:
+            Return 1
+        End If
+        Return 0
+    End If
+
+    If displacement_fits_in_8_bits(displacement) equals 1:
+        Return 1
+    End If
+
+    Return 2
+End Process
+
+Note: ============================================================================
+Note: MEMORY ADDRESSING MODE ENCODING HELPER
+Note: ============================================================================
+
+Process called "emit_memory_operand" that takes output as Integer, reg_field as Integer, base_lir as Integer, index_lir as Integer, scale as Integer, displacement as Integer returns Integer:
+    @Reasoning
+    Emits the ModR/M byte, optional SIB byte, and optional displacement bytes
+    for a memory operand. This handles all x86_64 addressing modes:
+
+    1. [reg] (no displacement, no index) -> ModR/M only
+    2. [reg + disp8] -> ModR/M + 1 byte displacement
+    3. [reg + disp32] -> ModR/M + 4 byte displacement
+    4. [base + index*scale + disp] -> ModR/M + SIB + displacement
+
+    Special cases handled:
+    - RSP/R12 (x86 encoding 4) as base always requires a SIB byte
+    - RBP/R13 (x86 encoding 5) as base with no displacement requires disp8(0)
+    - RSP (x86 encoding 4) cannot be used as SIB index; encoding 4 in index
+      means "no index"
+
+    reg_field is the x86 3-bit encoding of the reg field in ModR/M (the
+    register operand or opcode extension).
+
+    Returns the number of bytes emitted, or 0 on failure.
+    @End Reasoning
+
+    Let base_x86 be lir_reg_to_x86_encoding(base_lir)
+    Let bytes_emitted be 0
+
+    Note: Determine if we need a SIB byte
+    Let need_sib be 0
+
+    Note: If we have an index register, we need SIB
+    If index_lir is not equal to 0:
+        Set need_sib to 1
+    End If
+
+    Note: If base register has x86 encoding 4 (RSP/R12), SIB is mandatory
+    If base_x86 equals 4:
+        Set need_sib to 1
+    End If
+
+    Let mod_val be compute_mod_for_displacement(displacement, base_x86)
+
+    If need_sib equals 1:
+        Note: Emit ModR/M with r/m=100 (SIB follows)
+        Let modrm be encode_modrm(mod_val, reg_field, 4)
+        MachineCode.binary_emit_byte(output, modrm)
+        Set bytes_emitted to bytes_emitted + 1
+
+        Note: Compute SIB byte
+        Let index_x86 be 4  Note: Default 4 means "no index"
+        Let sib_scale be 1
+
+        If index_lir is not equal to 0:
+            Set index_x86 to lir_reg_to_x86_encoding(index_lir)
+            Set sib_scale to scale
+            Note: x86 encoding 4 in SIB index means "no index" -- cannot use RSP as index
+            If index_x86 equals 4:
+                Display "emit_memory_operand: RSP cannot be SIB index register"
+                Return 0
+            End If
+        End If
+
+        Let sib_byte be encode_sib(sib_scale, index_x86, base_x86)
+        MachineCode.binary_emit_byte(output, sib_byte)
+        Set bytes_emitted to bytes_emitted + 1
+    Otherwise:
+        Note: No SIB needed - use base register directly in r/m field
+        Let modrm be encode_modrm(mod_val, reg_field, base_x86)
+        MachineCode.binary_emit_byte(output, modrm)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Note: Emit displacement bytes based on mod
+    If mod_val equals 1:
+        Note: 8-bit signed displacement
+        MachineCode.binary_emit_byte(output, displacement & 255)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    If mod_val equals 2:
+        Note: 32-bit signed displacement (little-endian)
+        MachineCode.binary_emit_dword(output, displacement)
+        Set bytes_emitted to bytes_emitted + 4
+    End If
+
+    Return bytes_emitted
+End Process
+
+Note: ============================================================================
+Note: LIR CONDITION CODE TO x86 CONDITION CODE MAPPING
+Note: ============================================================================
+
+Process called "lir_cond_to_x86_cc" that takes lir_cond as Integer returns Integer:
+    @Reasoning
+    Maps LIR condition codes (LIR_COND_EQ=0, LIR_COND_NE=1, ...) to x86_64
+    condition codes used in Jcc and CMOVcc instructions.
+
+    LIR condition -> x86 CC:
+      EQ  (0) -> E   (0x4)   Equal / Zero
+      NE  (1) -> NE  (0x5)   Not equal / Not zero
+      LT  (2) -> L   (0xC)   Less (signed)
+      LE  (3) -> LE  (0xE)   Less or equal (signed)
+      GT  (4) -> G   (0xF)   Greater (signed)
+      GE  (5) -> GE  (0xD)   Greater or equal (signed)
+      ULT (6) -> B   (0x2)   Below (unsigned <)
+      ULE (7) -> BE  (0x6)   Below or equal (unsigned <=)
+      UGT (8) -> A   (0x7)   Above (unsigned >)
+      UGE (9) -> AE  (0x3)   Above or equal (unsigned >=)
+    @End Reasoning
+
+    If lir_cond equals 0:
+        Return X86_CC_E
+    End If
+    If lir_cond equals 1:
+        Return X86_CC_NE
+    End If
+    If lir_cond equals 2:
+        Return X86_CC_L
+    End If
+    If lir_cond equals 3:
+        Return X86_CC_LE
+    End If
+    If lir_cond equals 4:
+        Return X86_CC_G
+    End If
+    If lir_cond equals 5:
+        Return X86_CC_GE
+    End If
+    If lir_cond equals 6:
+        Return X86_CC_B
+    End If
+    If lir_cond equals 7:
+        Return X86_CC_BE
+    End If
+    If lir_cond equals 8:
+        Return X86_CC_A
+    End If
+    If lir_cond equals 9:
+        Return X86_CC_AE
+    End If
+
+    Note: Unknown condition code - default to E (equal)
+    Display "lir_cond_to_x86_cc: unknown LIR condition code"
+    Return X86_CC_E
+End Process
+
+Note: ============================================================================
+Note: REX PREFIX EMISSION HELPER
+Note: ============================================================================
+
+Process called "emit_rex_if_needed" that takes output as Integer, w as Integer, reg_lir as Integer, index_lir as Integer, base_lir as Integer returns Integer:
+    @Reasoning
+    Computes and emits a REX prefix byte to the output buffer if one is needed.
+    A REX prefix is needed when:
+    - 64-bit operand size is required (w=1)
+    - Any register operand is R8-R15 (needs extension bit)
+
+    Returns 1 if a REX byte was emitted, 0 if not.
+    @End Reasoning
+
+    Let rex be compute_rex_prefix(w, reg_lir, index_lir, base_lir)
+
+    If rex is not equal to 0:
+        MachineCode.binary_emit_byte(output, rex)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: INSTRUCTION ENCODERS
+Note: ============================================================================
+
+Note: ----------------------------------------------------------------------------
+Note: MOV reg, reg (register to register)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_mov_reg_reg" that takes output as Integer, dst_reg as Integer, src_reg as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes a MOV instruction between two registers.
+
+    For 64-bit (size=8): REX.W + 0x89 + ModR/M(11, src, dst)
+      We use opcode 0x89 which encodes as MOV r/m64, r64, so the src register
+      goes in the reg field and the dst register goes in the r/m field.
+
+    For 32-bit (size=4): 0x89 + ModR/M(11, src, dst) (no REX.W needed; 32-bit
+      is the default operand size in 64-bit mode). REX still needed if R8-R15.
+
+    For 16-bit (size=2): 0x66 prefix + 0x89 + ModR/M(11, src, dst)
+
+    For 8-bit (size=1): 0x88 + ModR/M(11, src, dst) (8-bit opcode)
+      REX needed if using SIL, DIL, BPL, SPL (registers that overlap with AH etc.)
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    Note: 16-bit operand size override prefix
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Note: Determine whether REX.W is needed
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Note: Emit REX prefix if needed (for 64-bit operand size or extended registers)
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, src_reg, 0, dst_reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    Note: Emit opcode
+    If size equals 1:
+        Note: 8-bit MOV uses opcode 0x88
+        MachineCode.binary_emit_byte(output, 136)
+    Otherwise:
+        Note: 16/32/64-bit MOV uses opcode 0x89
+        MachineCode.binary_emit_byte(output, X86_OP_MOV_RM)
+    End If
+    Set bytes_emitted to bytes_emitted + 1
+
+    Note: Emit ModR/M with mod=11 (register-to-register)
+    Let src_x86 be lir_reg_to_x86_encoding(src_reg)
+    Let dst_x86 be lir_reg_to_x86_encoding(dst_reg)
+    Let modrm be encode_modrm(3, src_x86, dst_x86)
+    MachineCode.binary_emit_byte(output, modrm)
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: MOV reg, imm (immediate to register)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_mov_imm_reg" that takes output as Integer, dst_reg as Integer, imm_value as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes a MOV immediate value into a register.
+
+    For 64-bit (size=8):
+      If the immediate fits in 32 bits (0x00000000..0xFFFFFFFF for unsigned, or
+      the sign-extended form -2^31..2^31-1): use 0xC7 /0 + imm32 with REX.W
+      (the processor sign-extends the 32-bit immediate to 64 bits).
+      Otherwise: use the 10-byte movabs form REX.W + 0xB8+rd + imm64.
+
+    For 32-bit (size=4): 0xB8+rd + imm32 (no REX.W; default 32-bit mode).
+      REX needed only if dst is R8-R15.
+
+    For 16-bit (size=2): 0x66 + 0xB8+rd + imm16
+
+    For 8-bit (size=1): 0xB0+rd + imm8
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+    Let dst_x86 be lir_reg_to_x86_encoding(dst_reg)
+
+    If size equals 1:
+        Note: 8-bit: REX if needed, then 0xB0+rd, then imm8
+        Let rex_emitted be emit_rex_if_needed(output, 0, 0, 0, dst_reg)
+        Set bytes_emitted to bytes_emitted + rex_emitted
+
+        Let opcode be 176 + dst_x86     Note: 0xB0 + rd
+        MachineCode.binary_emit_byte(output, opcode)
+        Set bytes_emitted to bytes_emitted + 1
+
+        MachineCode.binary_emit_byte(output, imm_value & 255)
+        Set bytes_emitted to bytes_emitted + 1
+
+        Return bytes_emitted
+    End If
+
+    If size equals 2:
+        Note: 16-bit: 0x66 prefix + REX if needed + 0xB8+rd + imm16
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+
+        Let rex_emitted be emit_rex_if_needed(output, 0, 0, 0, dst_reg)
+        Set bytes_emitted to bytes_emitted + rex_emitted
+
+        Let opcode be X86_OP_MOV_IMM_REG_BASE + dst_x86   Note: 0xB8 + rd
+        MachineCode.binary_emit_byte(output, opcode)
+        Set bytes_emitted to bytes_emitted + 1
+
+        MachineCode.binary_emit_word(output, imm_value)
+        Set bytes_emitted to bytes_emitted + 2
+
+        Return bytes_emitted
+    End If
+
+    If size equals 4:
+        Note: 32-bit: REX if needed (only for R8d-R15d) + 0xB8+rd + imm32
+        Let rex_emitted be emit_rex_if_needed(output, 0, 0, 0, dst_reg)
+        Set bytes_emitted to bytes_emitted + rex_emitted
+
+        Let opcode be X86_OP_MOV_IMM_REG_BASE + dst_x86   Note: 0xB8 + rd
+        MachineCode.binary_emit_byte(output, opcode)
+        Set bytes_emitted to bytes_emitted + 1
+
+        MachineCode.binary_emit_dword(output, imm_value)
+        Set bytes_emitted to bytes_emitted + 4
+
+        Return bytes_emitted
+    End If
+
+    Note: 64-bit (size=8)
+    Note: Check if immediate fits in sign-extended 32-bit
+    Let fits_32 be 0
+    If imm_value is greater than or equal to -2147483648:
+        If imm_value is less than or equal to 2147483647:
+            Set fits_32 to 1
+        End If
+    End If
+
+    If fits_32 equals 1:
+        Note: Use 0xC7 /0 with REX.W - sign-extends imm32 to 64 bits (7 bytes)
+        Let rex_emitted be emit_rex_if_needed(output, 1, 0, 0, dst_reg)
+        Set bytes_emitted to bytes_emitted + rex_emitted
+
+        Note: If no REX was emitted but we need REX.W, emit it manually
+        If rex_emitted equals 0:
+            MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+            Set bytes_emitted to bytes_emitted + 1
+        End If
+
+        MachineCode.binary_emit_byte(output, X86_OP_MOV_IMM_RM)  Note: 0xC7
+        Set bytes_emitted to bytes_emitted + 1
+
+        Note: ModR/M with mod=11, reg=/0, r/m=dst
+        Let modrm be encode_modrm(3, 0, dst_x86)
+        MachineCode.binary_emit_byte(output, modrm)
+        Set bytes_emitted to bytes_emitted + 1
+
+        MachineCode.binary_emit_dword(output, imm_value)
+        Set bytes_emitted to bytes_emitted + 4
+
+        Return bytes_emitted
+    End If
+
+    Note: Full 64-bit movabs: REX.W + 0xB8+rd + imm64 (10 bytes)
+    Let rex_emitted be emit_rex_if_needed(output, 1, 0, 0, dst_reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    Note: If no REX was emitted but we need REX.W, emit it manually
+    If rex_emitted equals 0:
+        MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Let opcode be X86_OP_MOV_IMM_REG_BASE + dst_x86   Note: 0xB8 + rd
+    MachineCode.binary_emit_byte(output, opcode)
+    Set bytes_emitted to bytes_emitted + 1
+
+    MachineCode.binary_emit_qword(output, imm_value)
+    Set bytes_emitted to bytes_emitted + 8
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: MOV reg, [base + disp] (memory to register - load)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_mov_mem_reg" that takes output as Integer, dst_reg as Integer, base_reg as Integer, displacement as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes a MOV from a memory location to a register (load).
+
+    Instruction form: MOV dst_reg, [base_reg + displacement]
+    Opcode: 0x8B (MOV reg, r/m) with REX.W for 64-bit, 0x66 prefix for 16-bit,
+    opcode 0x8A for 8-bit.
+
+    The base_reg and displacement are encoded in the ModR/M and optional SIB
+    and displacement bytes via emit_memory_operand.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    Note: 16-bit operand size override
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Note: Determine REX.W
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Note: Emit REX prefix (reg field = dst_reg, base field = base_reg)
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, dst_reg, 0, base_reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    Note: Emit opcode
+    If size equals 1:
+        MachineCode.binary_emit_byte(output, 138)  Note: 0x8A: MOV reg8, r/m8
+    Otherwise:
+        MachineCode.binary_emit_byte(output, X86_OP_MOV_MR)  Note: 0x8B
+    End If
+    Set bytes_emitted to bytes_emitted + 1
+
+    Note: Emit ModR/M + optional SIB + displacement
+    Let dst_x86 be lir_reg_to_x86_encoding(dst_reg)
+    Let mem_bytes be emit_memory_operand(output, dst_x86, base_reg, 0, 1, displacement)
+    Set bytes_emitted to bytes_emitted + mem_bytes
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: MOV [base + disp], reg (register to memory - store)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_mov_reg_mem" that takes output as Integer, src_reg as Integer, base_reg as Integer, displacement as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes a MOV from a register to a memory location (store).
+
+    Instruction form: MOV [base_reg + displacement], src_reg
+    Opcode: 0x89 (MOV r/m, reg) with REX.W for 64-bit, 0x66 prefix for 16-bit,
+    opcode 0x88 for 8-bit.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    Note: 16-bit operand size override
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Note: Determine REX.W
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Note: Emit REX prefix (reg field = src_reg, base field = base_reg)
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, src_reg, 0, base_reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    Note: Emit opcode
+    If size equals 1:
+        MachineCode.binary_emit_byte(output, 136)  Note: 0x88: MOV r/m8, reg8
+    Otherwise:
+        MachineCode.binary_emit_byte(output, X86_OP_MOV_RM)  Note: 0x89
+    End If
+    Set bytes_emitted to bytes_emitted + 1
+
+    Note: Emit ModR/M + optional SIB + displacement
+    Let src_x86 be lir_reg_to_x86_encoding(src_reg)
+    Let mem_bytes be emit_memory_operand(output, src_x86, base_reg, 0, 1, displacement)
+    Set bytes_emitted to bytes_emitted + mem_bytes
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: ALU reg, reg (generic arithmetic/logic register-to-register)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_alu_reg_reg" that takes output as Integer, opcode_base as Integer, dst_reg as Integer, src_reg as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes a generic ALU instruction between two registers. The opcode_base
+    parameter selects the operation:
+
+      ADD: opcode_base = 0x01  (X86_OP_ADD_RM)
+      OR:  opcode_base = 0x09  (X86_OP_OR_RM)
+      ADC: opcode_base = 0x11  (X86_OP_ADC_RM)
+      SBB: opcode_base = 0x19  (X86_OP_SBB_RM)
+      AND: opcode_base = 0x21  (X86_OP_AND_RM)
+      SUB: opcode_base = 0x29  (X86_OP_SUB_RM)
+      XOR: opcode_base = 0x31  (X86_OP_XOR_RM)
+      CMP: opcode_base = 0x39  (X86_OP_CMP_RM)
+
+    These opcodes use the form: OP r/m, reg (src in reg field, dst in r/m field).
+    The instruction modifies dst = dst OP src (except CMP which only sets flags).
+
+    Encoding: [REX] opcode ModR/M(11, src, dst)
+
+    For 8-bit operations, the opcode is (opcode_base - 1), e.g., ADD r/m8,r8 = 0x00.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    Note: 16-bit operand size override
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Note: REX prefix
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, src_reg, 0, dst_reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    Note: Emit opcode
+    If size equals 1:
+        Note: 8-bit ALU opcodes are one less than the 16/32/64-bit versions
+        MachineCode.binary_emit_byte(output, opcode_base - 1)
+    Otherwise:
+        MachineCode.binary_emit_byte(output, opcode_base)
+    End If
+    Set bytes_emitted to bytes_emitted + 1
+
+    Note: ModR/M with mod=11 (register-register), src in reg field, dst in r/m
+    Let src_x86 be lir_reg_to_x86_encoding(src_reg)
+    Let dst_x86 be lir_reg_to_x86_encoding(dst_reg)
+    Let modrm be encode_modrm(3, src_x86, dst_x86)
+    MachineCode.binary_emit_byte(output, modrm)
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: ALU r/m, imm (arithmetic/logic with immediate operand)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_alu_imm" that takes output as Integer, alu_group as Integer, dst_reg as Integer, imm_value as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes an ALU instruction with an immediate operand: OP dst_reg, imm_value.
+
+    The alu_group parameter selects the operation (placed in the reg field of
+    ModR/M as an opcode extension /digit):
+      0 = ADD, 1 = OR, 2 = ADC, 3 = SBB, 4 = AND, 5 = SUB, 6 = XOR, 7 = CMP
+
+    If the immediate fits in a signed 8-bit value (-128..127), we use opcode
+    0x83 (sign-extended imm8) which saves 3 bytes over 0x81 (imm32).
+    Otherwise we use opcode 0x81 with a full 32-bit immediate.
+
+    For 8-bit operand size, opcode 0x80 is used with an 8-bit immediate.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    Note: 16-bit operand size override
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Note: REX prefix
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, 0, 0, dst_reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    Note: For 64-bit, ensure REX.W is emitted even if no extended registers
+    If size equals 8:
+        If rex_emitted equals 0:
+            MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+            Set bytes_emitted to bytes_emitted + 1
+        End If
+    End If
+
+    Let dst_x86 be lir_reg_to_x86_encoding(dst_reg)
+
+    If size equals 1:
+        Note: 8-bit: opcode 0x80, ModR/M with /group, imm8
+        MachineCode.binary_emit_byte(output, 128)  Note: 0x80
+        Set bytes_emitted to bytes_emitted + 1
+
+        Let modrm be encode_modrm(3, alu_group, dst_x86)
+        MachineCode.binary_emit_byte(output, modrm)
+        Set bytes_emitted to bytes_emitted + 1
+
+        MachineCode.binary_emit_byte(output, imm_value & 255)
+        Set bytes_emitted to bytes_emitted + 1
+
+        Return bytes_emitted
+    End If
+
+    Note: Check if immediate fits in sign-extended 8 bits for compact encoding
+    Let use_imm8 be displacement_fits_in_8_bits(imm_value)
+
+    If use_imm8 equals 1:
+        Note: Use 0x83 (sign-extended imm8) for compact encoding
+        MachineCode.binary_emit_byte(output, X86_OP_ALU_IMM8)  Note: 0x83
+        Set bytes_emitted to bytes_emitted + 1
+
+        Let modrm be encode_modrm(3, alu_group, dst_x86)
+        MachineCode.binary_emit_byte(output, modrm)
+        Set bytes_emitted to bytes_emitted + 1
+
+        MachineCode.binary_emit_byte(output, imm_value & 255)
+        Set bytes_emitted to bytes_emitted + 1
+    Otherwise:
+        Note: Use 0x81 with full imm32
+        MachineCode.binary_emit_byte(output, X86_OP_ALU_IMM32)  Note: 0x81
+        Set bytes_emitted to bytes_emitted + 1
+
+        Let modrm be encode_modrm(3, alu_group, dst_x86)
+        MachineCode.binary_emit_byte(output, modrm)
+        Set bytes_emitted to bytes_emitted + 1
+
+        MachineCode.binary_emit_dword(output, imm_value)
+        Set bytes_emitted to bytes_emitted + 4
+    End If
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: PUSH reg
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_push_reg" that takes output as Integer, reg as Integer returns Integer:
+    @Reasoning
+    Encodes PUSH register. The opcode is 0x50+rd where rd is the low 3 bits of
+    the x86 register encoding. If the register is R8-R15, a REX.B prefix is
+    needed.
+
+    PUSH always operates on 64-bit values in 64-bit mode (no REX.W needed).
+
+    Returns the number of bytes emitted (1 or 2).
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    Note: REX.B if extended register (R8-R15)
+    If needs_rex_for_register(reg) equals 1:
+        MachineCode.binary_emit_byte(output, 65)  Note: 0x41 = REX.B
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Let reg_x86 be lir_reg_to_x86_encoding(reg)
+    Let opcode be X86_OP_PUSH_REG_BASE + reg_x86  Note: 0x50 + rd
+    MachineCode.binary_emit_byte(output, opcode)
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: POP reg
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_pop_reg" that takes output as Integer, reg as Integer returns Integer:
+    @Reasoning
+    Encodes POP register. The opcode is 0x58+rd where rd is the low 3 bits of
+    the x86 register encoding. If the register is R8-R15, a REX.B prefix is
+    needed.
+
+    POP always operates on 64-bit values in 64-bit mode (no REX.W needed).
+
+    Returns the number of bytes emitted (1 or 2).
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    Note: REX.B if extended register (R8-R15)
+    If needs_rex_for_register(reg) equals 1:
+        MachineCode.binary_emit_byte(output, 65)  Note: 0x41 = REX.B
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Let reg_x86 be lir_reg_to_x86_encoding(reg)
+    Let opcode be X86_OP_POP_REG_BASE + reg_x86  Note: 0x58 + rd
+    MachineCode.binary_emit_byte(output, opcode)
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: RET (near return)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_ret" that takes output as Integer returns Integer:
+    @Reasoning
+    Encodes the RET instruction (near return from function). This is a single
+    byte: 0xC3.
+
+    Returns the number of bytes emitted (always 1).
+    @End Reasoning
+
+    MachineCode.binary_emit_byte(output, X86_OP_RET)
+    Return 1
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: SYSCALL
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_syscall" that takes output as Integer returns Integer:
+    @Reasoning
+    Encodes the SYSCALL instruction which performs a system call in 64-bit mode.
+    This is a two-byte instruction: 0x0F 0x05.
+
+    Returns the number of bytes emitted (always 2).
+    @End Reasoning
+
+    MachineCode.binary_emit_byte(output, X86_TWO_BYTE_ESCAPE)   Note: 0x0F
+    MachineCode.binary_emit_byte(output, X86_OP_SYSCALL_BYTE2)  Note: 0x05
+    Return 2
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: CALL rel32 (direct call with 32-bit relative offset)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_call_relative" that takes output as Integer, rel32_offset as Integer returns Integer:
+    @Reasoning
+    Encodes a direct CALL with a 32-bit relative offset. The offset is relative
+    to the instruction pointer AFTER the CALL instruction (i.e., the address of
+    the next instruction).
+
+    Encoding: 0xE8 + 4-byte signed little-endian offset
+
+    The caller is responsible for computing the correct relative offset, which
+    is: target_address - (call_instruction_address + 5).
+
+    Returns the number of bytes emitted (always 5).
+    @End Reasoning
+
+    MachineCode.binary_emit_byte(output, X86_OP_CALL_REL32)  Note: 0xE8
+    MachineCode.binary_emit_dword(output, rel32_offset)
+    Return 5
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: JMP rel32 (unconditional jump with 32-bit relative offset)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_jmp_relative" that takes output as Integer, rel32_offset as Integer returns Integer:
+    @Reasoning
+    Encodes an unconditional JMP with a 32-bit relative offset. The offset is
+    relative to the instruction pointer AFTER the JMP instruction.
+
+    Encoding: 0xE9 + 4-byte signed little-endian offset
+
+    Returns the number of bytes emitted (always 5).
+    @End Reasoning
+
+    MachineCode.binary_emit_byte(output, X86_OP_JMP_REL32)  Note: 0xE9
+    MachineCode.binary_emit_dword(output, rel32_offset)
+    Return 5
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: Jcc rel32 (conditional jump with 32-bit relative offset)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_jcc_relative" that takes output as Integer, condition as Integer, rel32_offset as Integer returns Integer:
+    @Reasoning
+    Encodes a conditional jump (Jcc) with a 32-bit relative offset. The two-byte
+    opcode form is: 0x0F (0x80 + cc) where cc is the 4-bit condition code.
+
+    Encoding: 0x0F + (0x80 + condition_code) + 4-byte signed offset
+
+    The condition parameter is an x86 condition code (0-15), not a LIR condition
+    code. Use lir_cond_to_x86_cc() to convert LIR conditions first.
+
+    Returns the number of bytes emitted (always 6).
+    @End Reasoning
+
+    MachineCode.binary_emit_byte(output, X86_TWO_BYTE_ESCAPE)  Note: 0x0F
+    Let opcode_byte2 be X86_OP_JCC_REL32_BASE + (condition & 15)  Note: 0x80+cc
+    MachineCode.binary_emit_byte(output, opcode_byte2)
+    MachineCode.binary_emit_dword(output, rel32_offset)
+    Return 6
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: NOP
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_nop" that takes output as Integer returns Integer:
+    @Reasoning
+    Encodes a single-byte NOP instruction (0x90). This is equivalent to XCHG
+    EAX, EAX but is treated as a no-operation by the processor.
+
+    Returns the number of bytes emitted (always 1).
+    @End Reasoning
+
+    MachineCode.binary_emit_byte(output, X86_OP_NOP)
+    Return 1
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: Multi-byte NOP (for alignment padding)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_nop_multibyte" that takes output as Integer, length as Integer returns Integer:
+    @Reasoning
+    Encodes a multi-byte NOP of the specified length (1-9 bytes) for code
+    alignment. Intel recommends specific multi-byte NOP sequences for optimal
+    pipeline behavior:
+
+      1: 90                           NOP
+      2: 66 90                        66 NOP
+      3: 0F 1F 00                     NOP DWORD [rax]
+      4: 0F 1F 40 00                  NOP DWORD [rax+0]
+      5: 0F 1F 44 00 00              NOP DWORD [rax+rax*1+0]
+      6: 66 0F 1F 44 00 00           66 NOP DWORD [rax+rax*1+0]
+      7: 0F 1F 80 00 00 00 00        NOP DWORD [rax+0x00000000]
+      8: 0F 1F 84 00 00 00 00 00     NOP DWORD [rax+rax*1+0x00000000]
+      9: 66 0F 1F 84 00 00 00 00 00  66 NOP DWORD [rax+rax*1+0x00000000]
+
+    For lengths > 9, multiple NOP instructions are emitted.
+
+    Returns the total number of bytes emitted.
+    @End Reasoning
+
+    Let remaining be length
+    Let total_emitted be 0
+
+    While remaining is greater than 0:
+        If remaining equals 1:
+            MachineCode.binary_emit_byte(output, 144)  Note: 0x90
+            Set total_emitted to total_emitted + 1
+            Set remaining to 0
+        End If
+        If remaining equals 2:
+            MachineCode.binary_emit_byte(output, 102)  Note: 0x66
+            MachineCode.binary_emit_byte(output, 144)  Note: 0x90
+            Set total_emitted to total_emitted + 2
+            Set remaining to 0
+        End If
+        If remaining equals 3:
+            MachineCode.binary_emit_byte(output, 15)   Note: 0x0F
+            MachineCode.binary_emit_byte(output, 31)   Note: 0x1F
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            Set total_emitted to total_emitted + 3
+            Set remaining to 0
+        End If
+        If remaining equals 4:
+            MachineCode.binary_emit_byte(output, 15)   Note: 0x0F
+            MachineCode.binary_emit_byte(output, 31)   Note: 0x1F
+            MachineCode.binary_emit_byte(output, 64)   Note: 0x40
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            Set total_emitted to total_emitted + 4
+            Set remaining to 0
+        End If
+        If remaining equals 5:
+            MachineCode.binary_emit_byte(output, 15)   Note: 0x0F
+            MachineCode.binary_emit_byte(output, 31)   Note: 0x1F
+            MachineCode.binary_emit_byte(output, 68)   Note: 0x44
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            Set total_emitted to total_emitted + 5
+            Set remaining to 0
+        End If
+        If remaining equals 6:
+            MachineCode.binary_emit_byte(output, 102)  Note: 0x66
+            MachineCode.binary_emit_byte(output, 15)   Note: 0x0F
+            MachineCode.binary_emit_byte(output, 31)   Note: 0x1F
+            MachineCode.binary_emit_byte(output, 68)   Note: 0x44
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            Set total_emitted to total_emitted + 6
+            Set remaining to 0
+        End If
+        If remaining equals 7:
+            MachineCode.binary_emit_byte(output, 15)   Note: 0x0F
+            MachineCode.binary_emit_byte(output, 31)   Note: 0x1F
+            MachineCode.binary_emit_byte(output, 128)  Note: 0x80
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            Set total_emitted to total_emitted + 7
+            Set remaining to 0
+        End If
+        If remaining equals 8:
+            MachineCode.binary_emit_byte(output, 15)   Note: 0x0F
+            MachineCode.binary_emit_byte(output, 31)   Note: 0x1F
+            MachineCode.binary_emit_byte(output, 132)  Note: 0x84
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            Set total_emitted to total_emitted + 8
+            Set remaining to 0
+        End If
+        If remaining is greater than or equal to 9:
+            Note: Emit a 9-byte NOP and continue for the rest
+            MachineCode.binary_emit_byte(output, 102)  Note: 0x66
+            MachineCode.binary_emit_byte(output, 15)   Note: 0x0F
+            MachineCode.binary_emit_byte(output, 31)   Note: 0x1F
+            MachineCode.binary_emit_byte(output, 132)  Note: 0x84
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            MachineCode.binary_emit_byte(output, 0)    Note: 0x00
+            Set total_emitted to total_emitted + 9
+            Set remaining to remaining - 9
+        End If
+    End While
+
+    Return total_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: NEG r/m (two's complement negate)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_neg_reg" that takes output as Integer, reg as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes NEG r/m which computes the two's complement negation (0 - operand).
+    Opcode: 0xF7 /3 for 16/32/64-bit, 0xF6 /3 for 8-bit.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, 0, 0, reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    If size equals 8:
+        If rex_emitted equals 0:
+            MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+            Set bytes_emitted to bytes_emitted + 1
+        End If
+    End If
+
+    If size equals 1:
+        MachineCode.binary_emit_byte(output, 246)  Note: 0xF6
+    Otherwise:
+        MachineCode.binary_emit_byte(output, 247)  Note: 0xF7
+    End If
+    Set bytes_emitted to bytes_emitted + 1
+
+    Let reg_x86 be lir_reg_to_x86_encoding(reg)
+    Let modrm be encode_modrm(3, 3, reg_x86)  Note: /3 = NEG
+    MachineCode.binary_emit_byte(output, modrm)
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: NOT r/m (bitwise one's complement)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_not_reg" that takes output as Integer, reg as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes NOT r/m which computes the bitwise one's complement (flip all bits).
+    Opcode: 0xF7 /2 for 16/32/64-bit, 0xF6 /2 for 8-bit.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, 0, 0, reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    If size equals 8:
+        If rex_emitted equals 0:
+            MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+            Set bytes_emitted to bytes_emitted + 1
+        End If
+    End If
+
+    If size equals 1:
+        MachineCode.binary_emit_byte(output, 246)  Note: 0xF6
+    Otherwise:
+        MachineCode.binary_emit_byte(output, 247)  Note: 0xF7
+    End If
+    Set bytes_emitted to bytes_emitted + 1
+
+    Let reg_x86 be lir_reg_to_x86_encoding(reg)
+    Let modrm be encode_modrm(3, 2, reg_x86)  Note: /2 = NOT
+    MachineCode.binary_emit_byte(output, modrm)
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: IMUL r, r/m (signed multiplication, two-operand form)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_imul_reg_reg" that takes output as Integer, dst_reg as Integer, src_reg as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes IMUL in two-operand form: IMUL dst_reg, src_reg
+    Result: dst_reg = dst_reg * src_reg (truncated to operand size).
+
+    Opcode: 0x0F 0xAF (two-byte opcode) + ModR/M(11, dst, src)
+    Note: In this form, dst goes in the reg field and src in the r/m field.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, dst_reg, 0, src_reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    If size equals 8:
+        If rex_emitted equals 0:
+            MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+            Set bytes_emitted to bytes_emitted + 1
+        End If
+    End If
+
+    Note: Two-byte opcode: 0x0F 0xAF
+    MachineCode.binary_emit_byte(output, 15)    Note: 0x0F
+    MachineCode.binary_emit_byte(output, 175)   Note: 0xAF
+    Set bytes_emitted to bytes_emitted + 2
+
+    Let dst_x86 be lir_reg_to_x86_encoding(dst_reg)
+    Let src_x86 be lir_reg_to_x86_encoding(src_reg)
+    Let modrm be encode_modrm(3, dst_x86, src_x86)
+    MachineCode.binary_emit_byte(output, modrm)
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: SHIFT reg, CL or imm8
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_shift_reg_cl" that takes output as Integer, shift_type as Integer, reg as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes a shift instruction with the count in CL register:
+      SHL/SHR/SAR reg, CL
+
+    Opcode: 0xD3 for 16/32/64-bit, 0xD2 for 8-bit.
+    The shift_type is the ModR/M opcode extension:
+      4 = SHL (shift left)
+      5 = SHR (logical shift right)
+      7 = SAR (arithmetic shift right)
+      0 = ROL (rotate left)
+      1 = ROR (rotate right)
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, 0, 0, reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    If size equals 8:
+        If rex_emitted equals 0:
+            MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+            Set bytes_emitted to bytes_emitted + 1
+        End If
+    End If
+
+    If size equals 1:
+        MachineCode.binary_emit_byte(output, 210)  Note: 0xD2
+    Otherwise:
+        MachineCode.binary_emit_byte(output, 211)  Note: 0xD3
+    End If
+    Set bytes_emitted to bytes_emitted + 1
+
+    Let reg_x86 be lir_reg_to_x86_encoding(reg)
+    Let modrm be encode_modrm(3, shift_type, reg_x86)
+    MachineCode.binary_emit_byte(output, modrm)
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Process called "encode_shift_reg_imm8" that takes output as Integer, shift_type as Integer, reg as Integer, imm8 as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes a shift instruction with an immediate count:
+      SHL/SHR/SAR reg, imm8
+
+    If imm8 == 1, uses the special single-bit shift opcode (0xD1 for 16/32/64,
+    0xD0 for 8-bit) which is 1 byte shorter.
+    Otherwise uses opcode 0xC1 (16/32/64) or 0xC0 (8-bit) with an imm8 operand.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, 0, 0, reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    If size equals 8:
+        If rex_emitted equals 0:
+            MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+            Set bytes_emitted to bytes_emitted + 1
+        End If
+    End If
+
+    Let reg_x86 be lir_reg_to_x86_encoding(reg)
+
+    If imm8 equals 1:
+        Note: Special single-bit shift: 0xD1 (16/32/64) or 0xD0 (8-bit)
+        If size equals 1:
+            MachineCode.binary_emit_byte(output, 208)  Note: 0xD0
+        Otherwise:
+            MachineCode.binary_emit_byte(output, 209)  Note: 0xD1
+        End If
+        Set bytes_emitted to bytes_emitted + 1
+
+        Let modrm be encode_modrm(3, shift_type, reg_x86)
+        MachineCode.binary_emit_byte(output, modrm)
+        Set bytes_emitted to bytes_emitted + 1
+
+        Return bytes_emitted
+    End If
+
+    Note: General immediate shift: 0xC1 (16/32/64) or 0xC0 (8-bit)
+    If size equals 1:
+        MachineCode.binary_emit_byte(output, 192)  Note: 0xC0
+    Otherwise:
+        MachineCode.binary_emit_byte(output, 193)  Note: 0xC1
+    End If
+    Set bytes_emitted to bytes_emitted + 1
+
+    Let modrm be encode_modrm(3, shift_type, reg_x86)
+    MachineCode.binary_emit_byte(output, modrm)
+    Set bytes_emitted to bytes_emitted + 1
+
+    MachineCode.binary_emit_byte(output, imm8 & 63)  Note: Mask to 6 bits for x86_64
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: TEST r/m, reg (bitwise AND, flags only)
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_test_reg_reg" that takes output as Integer, reg1 as Integer, reg2 as Integer, size as Integer returns Integer:
+    @Reasoning
+    Encodes TEST reg1, reg2 which performs bitwise AND and sets flags but
+    discards the result. Useful for testing if a register is zero or checking
+    specific bits.
+
+    Opcode: 0x85 for 16/32/64-bit, 0x84 for 8-bit.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    If size equals 2:
+        MachineCode.binary_emit_byte(output, X86_PREFIX_OPERAND_SIZE)
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    Let need_rex_w be 0
+    If size equals 8:
+        Set need_rex_w to 1
+    End If
+
+    Let rex_emitted be emit_rex_if_needed(output, need_rex_w, reg2, 0, reg1)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    If size equals 8:
+        If rex_emitted equals 0:
+            MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+            Set bytes_emitted to bytes_emitted + 1
+        End If
+    End If
+
+    If size equals 1:
+        MachineCode.binary_emit_byte(output, 132)  Note: 0x84
+    Otherwise:
+        MachineCode.binary_emit_byte(output, 133)  Note: 0x85
+    End If
+    Set bytes_emitted to bytes_emitted + 1
+
+    Let reg2_x86 be lir_reg_to_x86_encoding(reg2)
+    Let reg1_x86 be lir_reg_to_x86_encoding(reg1)
+    Let modrm be encode_modrm(3, reg2_x86, reg1_x86)
+    MachineCode.binary_emit_byte(output, modrm)
+    Set bytes_emitted to bytes_emitted + 1
+
+    Return bytes_emitted
+End Process
+
+Note: ----------------------------------------------------------------------------
+Note: LEA reg, [base + index*scale + disp]
+Note: ----------------------------------------------------------------------------
+
+Process called "encode_lea" that takes output as Integer, dst_reg as Integer, base_reg as Integer, index_reg as Integer, scale as Integer, displacement as Integer returns Integer:
+    @Reasoning
+    Encodes LEA (Load Effective Address) which computes an address without
+    accessing memory. Always 64-bit in long mode.
+
+    Opcode: 0x8D with ModR/M and optional SIB.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    Let bytes_emitted be 0
+
+    Note: LEA always uses 64-bit operand size in long mode
+    Let rex_emitted be emit_rex_if_needed(output, 1, dst_reg, index_reg, base_reg)
+    Set bytes_emitted to bytes_emitted + rex_emitted
+
+    If rex_emitted equals 0:
+        MachineCode.binary_emit_byte(output, 72)  Note: 0x48 = REX.W
+        Set bytes_emitted to bytes_emitted + 1
+    End If
+
+    MachineCode.binary_emit_byte(output, 141)  Note: 0x8D = LEA
+    Set bytes_emitted to bytes_emitted + 1
+
+    Let dst_x86 be lir_reg_to_x86_encoding(dst_reg)
+    Let mem_bytes be emit_memory_operand(output, dst_x86, base_reg, index_reg, scale, displacement)
+    Set bytes_emitted to bytes_emitted + mem_bytes
+
+    Return bytes_emitted
+End Process
+
+Note: ============================================================================
+Note: LIR INSTRUCTION DISPATCH
+Note: ============================================================================
+
+Process called "encode_lir_instruction" that takes output as Integer, instr as Integer returns Integer:
+    @Reasoning
+    Main entry point for encoding a single LIR instruction into binary machine
+    code. This function reads the opcode from the LIR instruction structure,
+    extracts operands, and dispatches to the appropriate specific encoder.
+
+    The LIR instruction layout (from lir_nodes.runa LIRInstruction):
+      offset 0:  opcode (30000-30999)
+      offset 8:  result operand pointer (0 if none)
+      offset 16: operand1 pointer (0 if none)
+      offset 24: operand2 pointer (0 if none)
+      offset 32: operand3 pointer (0 if none)
+
+    Each LIR operand (from lir_nodes.runa LIROperand):
+      offset 0:  operand_type (1=register, 2=immediate, 3=memory)
+      offset 8:  register_id
+      offset 16: immediate_value
+      offset 24: base_register
+      offset 32: index_register
+      offset 40: scale
+      offset 48: displacement
+      offset 56: operand_size
+
+    Returns the number of bytes emitted, or 0 on failure/unrecognized opcode.
+    @End Reasoning
+
+    If instr equals 0:
+        Return 0
+    End If
+
+    Let opcode be __load(instr, 0)
+    Let result_op be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+    Let operand2 be __load(instr, 24)
+
+    Note: ---- NOP ----
+    If opcode equals LIR.LIR_NOP:
+        Return encode_nop(output)
+    End If
+
+    Note: ---- MOV ----
+    If opcode equals LIR.LIR_MOV:
+        Note: Determine move type from operand types
+        If result_op is not equal to 0:
+            If operand1 is not equal to 0:
+                Let dst_type be __load(result_op, 0)
+                Let src_type be __load(operand1, 0)
+                Let op_size be __load(result_op, 56)
+
+                Note: Register to register
+                If dst_type equals 1:
+                    If src_type equals 1:
+                        Let dst_id be __load(result_op, 8)
+                        Let src_id be __load(operand1, 8)
+                        Return encode_mov_reg_reg(output, dst_id, src_id, op_size)
+                    End If
+                End If
+
+                Note: Immediate to register
+                If dst_type equals 1:
+                    If src_type equals 2:
+                        Let dst_id be __load(result_op, 8)
+                        Let imm_val be __load(operand1, 16)
+                        Return encode_mov_imm_reg(output, dst_id, imm_val, op_size)
+                    End If
+                End If
+
+                Note: Memory to register (load)
+                If dst_type equals 1:
+                    If src_type equals 3:
+                        Let dst_id be __load(result_op, 8)
+                        Let base_id be __load(operand1, 24)
+                        Let disp be __load(operand1, 48)
+                        Return encode_mov_mem_reg(output, dst_id, base_id, disp, op_size)
+                    End If
+                End If
+
+                Note: Register to memory (store)
+                If dst_type equals 3:
+                    If src_type equals 1:
+                        Let src_id be __load(operand1, 8)
+                        Let base_id be __load(result_op, 24)
+                        Let disp be __load(result_op, 48)
+                        Return encode_mov_reg_mem(output, src_id, base_id, disp, op_size)
+                    End If
+                End If
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- LEA ----
+    If opcode equals LIR.LIR_LEA:
+        If result_op is not equal to 0:
+            If operand1 is not equal to 0:
+                Let dst_id be __load(result_op, 8)
+                Let base_id be __load(operand1, 24)
+                Let index_id be __load(operand1, 32)
+                Let scale_val be __load(operand1, 40)
+                Let disp be __load(operand1, 48)
+                Return encode_lea(output, dst_id, base_id, index_id, scale_val, disp)
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- PUSH ----
+    If opcode equals LIR.LIR_PUSH:
+        If operand1 is not equal to 0:
+            Let src_type be __load(operand1, 0)
+            If src_type equals 1:
+                Let reg_id be __load(operand1, 8)
+                Return encode_push_reg(output, reg_id)
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- POP ----
+    If opcode equals LIR.LIR_POP:
+        If result_op is not equal to 0:
+            Let dst_type be __load(result_op, 0)
+            If dst_type equals 1:
+                Let reg_id be __load(result_op, 8)
+                Return encode_pop_reg(output, reg_id)
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- ADD ----
+    If opcode equals LIR.LIR_ADD:
+        Return encode_lir_alu_dispatch(output, X86_OP_ADD_RM, 0, result_op, operand1, operand2)
+    End If
+
+    Note: ---- SUB ----
+    If opcode equals LIR.LIR_SUB:
+        Return encode_lir_alu_dispatch(output, X86_OP_SUB_RM, 5, result_op, operand1, operand2)
+    End If
+
+    Note: ---- AND ----
+    If opcode equals LIR.LIR_AND:
+        Return encode_lir_alu_dispatch(output, X86_OP_AND_RM, 4, result_op, operand1, operand2)
+    End If
+
+    Note: ---- OR ----
+    If opcode equals LIR.LIR_OR:
+        Return encode_lir_alu_dispatch(output, X86_OP_OR_RM, 1, result_op, operand1, operand2)
+    End If
+
+    Note: ---- XOR ----
+    If opcode equals LIR.LIR_XOR:
+        Return encode_lir_alu_dispatch(output, X86_OP_XOR_RM, 6, result_op, operand1, operand2)
+    End If
+
+    Note: ---- CMP ----
+    If opcode equals LIR.LIR_CMP:
+        Note: CMP uses operand1 and operand2 (no result)
+        If operand1 is not equal to 0:
+            If operand2 is not equal to 0:
+                Let left_type be __load(operand1, 0)
+                Let right_type be __load(operand2, 0)
+                Let op_size be __load(operand1, 56)
+
+                If left_type equals 1:
+                    If right_type equals 1:
+                        Let left_id be __load(operand1, 8)
+                        Let right_id be __load(operand2, 8)
+                        Return encode_alu_reg_reg(output, X86_OP_CMP_RM, left_id, right_id, op_size)
+                    End If
+                End If
+
+                If left_type equals 1:
+                    If right_type equals 2:
+                        Let left_id be __load(operand1, 8)
+                        Let right_val be __load(operand2, 16)
+                        Return encode_alu_imm(output, 7, left_id, right_val, op_size)
+                    End If
+                End If
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- TEST ----
+    If opcode equals LIR.LIR_TEST:
+        If operand1 is not equal to 0:
+            If operand2 is not equal to 0:
+                Let left_type be __load(operand1, 0)
+                Let right_type be __load(operand2, 0)
+                Let op_size be __load(operand1, 56)
+
+                If left_type equals 1:
+                    If right_type equals 1:
+                        Let left_id be __load(operand1, 8)
+                        Let right_id be __load(operand2, 8)
+                        Return encode_test_reg_reg(output, left_id, right_id, op_size)
+                    End If
+                End If
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- IMUL (two-operand form) ----
+    If opcode equals LIR.LIR_IMUL:
+        If result_op is not equal to 0:
+            If operand1 is not equal to 0:
+                Let dst_type be __load(result_op, 0)
+                Let src_type be __load(operand1, 0)
+                Let op_size be __load(result_op, 56)
+
+                If dst_type equals 1:
+                    If src_type equals 1:
+                        Let dst_id be __load(result_op, 8)
+                        Let src_id be __load(operand1, 8)
+                        Return encode_imul_reg_reg(output, dst_id, src_id, op_size)
+                    End If
+                End If
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- NEG ----
+    If opcode equals LIR.LIR_NEG:
+        If result_op is not equal to 0:
+            Let reg_type be __load(result_op, 0)
+            If reg_type equals 1:
+                Let reg_id be __load(result_op, 8)
+                Let op_size be __load(result_op, 56)
+                Return encode_neg_reg(output, reg_id, op_size)
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- NOT ----
+    If opcode equals LIR.LIR_NOT:
+        If result_op is not equal to 0:
+            Let reg_type be __load(result_op, 0)
+            If reg_type equals 1:
+                Let reg_id be __load(result_op, 8)
+                Let op_size be __load(result_op, 56)
+                Return encode_not_reg(output, reg_id, op_size)
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- SHL ----
+    If opcode equals LIR.LIR_SHL:
+        Return encode_lir_shift_dispatch(output, 4, result_op, operand1)
+    End If
+
+    Note: ---- SHR ----
+    If opcode equals LIR.LIR_SHR:
+        Return encode_lir_shift_dispatch(output, 5, result_op, operand1)
+    End If
+
+    Note: ---- SAR ----
+    If opcode equals LIR.LIR_SAR:
+        Return encode_lir_shift_dispatch(output, 7, result_op, operand1)
+    End If
+
+    Note: ---- ROL ----
+    If opcode equals LIR.LIR_ROL:
+        Return encode_lir_shift_dispatch(output, 0, result_op, operand1)
+    End If
+
+    Note: ---- ROR ----
+    If opcode equals LIR.LIR_ROR:
+        Return encode_lir_shift_dispatch(output, 1, result_op, operand1)
+    End If
+
+    Note: ---- LOAD (memory to register) ----
+    If opcode equals LIR.LIR_LOAD:
+        If result_op is not equal to 0:
+            If operand1 is not equal to 0:
+                Let dst_id be __load(result_op, 8)
+                Let src_type be __load(operand1, 0)
+                Let op_size be __load(result_op, 56)
+
+                If src_type equals 3:
+                    Let base_id be __load(operand1, 24)
+                    Let disp be __load(operand1, 48)
+                    Return encode_mov_mem_reg(output, dst_id, base_id, disp, op_size)
+                End If
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- STORE (register to memory) ----
+    If opcode equals LIR.LIR_STORE:
+        If operand1 is not equal to 0:
+            If operand2 is not equal to 0:
+                Let dst_type be __load(operand1, 0)
+                Let src_type be __load(operand2, 0)
+
+                If dst_type equals 3:
+                    Let base_id be __load(operand1, 24)
+                    Let disp be __load(operand1, 48)
+                    Let op_size be __load(operand1, 56)
+
+                    If src_type equals 1:
+                        Let src_id be __load(operand2, 8)
+                        Return encode_mov_reg_mem(output, src_id, base_id, disp, op_size)
+                    End If
+                End If
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: ---- JMP (unconditional jump) ----
+    If opcode equals LIR.LIR_JMP:
+        Note: The rel32 offset is stored in operand1 as an immediate
+        If operand1 is not equal to 0:
+            Let imm_val be __load(operand1, 16)
+            Return encode_jmp_relative(output, imm_val)
+        End If
+        Note: Jump with zero offset; relocation pass will fill the real target
+        Return encode_jmp_relative(output, 0)
+    End If
+
+    Note: ---- Conditional jumps (Jcc) ----
+    If opcode is greater than or equal to LIR.LIR_JZ:
+        If opcode is less than or equal to LIR.LIR_JNP:
+            Note: Compute x86 condition code from LIR jump opcode
+            Let x86_cc be lir_jmp_opcode_to_x86_cc(opcode)
+            Let offset_val be 0
+            If operand1 is not equal to 0:
+                Set offset_val to __load(operand1, 16)
+            End If
+            Return encode_jcc_relative(output, x86_cc, offset_val)
+        End If
+    End If
+
+    Note: ---- CALL ----
+    If opcode equals LIR.LIR_CALL:
+        If operand1 is not equal to 0:
+            Let imm_val be __load(operand1, 16)
+            Return encode_call_relative(output, imm_val)
+        End If
+        Return encode_call_relative(output, 0)
+    End If
+
+    Note: ---- RET ----
+    If opcode equals LIR.LIR_RET:
+        Return encode_ret(output)
+    End If
+
+    Note: ---- SYSCALL ----
+    If opcode equals LIR.LIR_SYSCALL:
+        Return encode_syscall(output)
+    End If
+
+    Note: ---- LABEL (no machine code emitted, but may be tracked) ----
+    If opcode equals LIR.LIR_LABEL:
+        Note: Labels do not emit machine code bytes; they mark positions
+        Return 0
+    End If
+
+    Note: ---- COMMENT / DEBUG_LOCATION (no machine code) ----
+    If opcode equals LIR.LIR_COMMENT:
+        Return 0
+    End If
+    If opcode equals LIR.LIR_DEBUG_LOCATION:
+        Return 0
+    End If
+
+    Note: Unrecognized opcode
+    Display "encode_lir_instruction: unrecognized LIR opcode "
+    Display opcode
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: ALU DISPATCH HELPER
+Note: ============================================================================
+
+Process called "encode_lir_alu_dispatch" that takes output as Integer, opcode_base as Integer, alu_group as Integer, result_op as Integer, operand1 as Integer, operand2 as Integer returns Integer:
+    @Reasoning
+    Helper that dispatches an ALU LIR instruction to either the register-register
+    encoder or the register-immediate encoder based on operand types.
+
+    For two-address form (x86 convention), the result register is the same as
+    the first source register: result = result OP operand2.
+
+    When the second operand (operand2 in the LIR instruction, or operand1 in some
+    layouts) is an immediate, we use the ALU immediate encoder. When both are
+    registers, we use the register-register encoder.
+
+    The LIR binary operation layout uses:
+      result_op = destination (and first source in two-address form)
+      operand1 = left operand (should match result for two-address)
+      operand2 = right operand
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    If result_op equals 0:
+        Return 0
+    End If
+
+    Let dst_type be __load(result_op, 0)
+    Let op_size be __load(result_op, 56)
+
+    If dst_type is not equal to 1:
+        Note: Destination must be a register for reg-reg and reg-imm ALU
+        Return 0
+    End If
+
+    Let dst_id be __load(result_op, 8)
+
+    Note: Check second operand (right-hand side of the operation)
+    Let rhs be operand2
+    If rhs equals 0:
+        Set rhs to operand1
+    End If
+
+    If rhs equals 0:
+        Return 0
+    End If
+
+    Let rhs_type be __load(rhs, 0)
+
+    Note: Register-register ALU
+    If rhs_type equals 1:
+        Let src_id be __load(rhs, 8)
+        Return encode_alu_reg_reg(output, opcode_base, dst_id, src_id, op_size)
+    End If
+
+    Note: Register-immediate ALU
+    If rhs_type equals 2:
+        Let imm_val be __load(rhs, 16)
+        Return encode_alu_imm(output, alu_group, dst_id, imm_val, op_size)
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: SHIFT DISPATCH HELPER
+Note: ============================================================================
+
+Process called "encode_lir_shift_dispatch" that takes output as Integer, shift_type as Integer, result_op as Integer, operand1 as Integer returns Integer:
+    @Reasoning
+    Helper that dispatches a shift LIR instruction to either the shift-by-CL
+    encoder or the shift-by-immediate encoder based on the operand type.
+
+    In two-address form: result = result SHIFT operand1
+    If operand1 is an immediate, we use shift-by-imm8.
+    If operand1 is a register (expected to be CL), we use shift-by-CL.
+
+    Returns the number of bytes emitted.
+    @End Reasoning
+
+    If result_op equals 0:
+        Return 0
+    End If
+
+    Let reg_type be __load(result_op, 0)
+    If reg_type is not equal to 1:
+        Return 0
+    End If
+
+    Let reg_id be __load(result_op, 8)
+    Let op_size be __load(result_op, 56)
+
+    If operand1 equals 0:
+        Note: Default to shift by 1
+        Return encode_shift_reg_imm8(output, shift_type, reg_id, 1, op_size)
+    End If
+
+    Let count_type be __load(operand1, 0)
+
+    If count_type equals 2:
+        Note: Immediate shift count
+        Let imm_val be __load(operand1, 16)
+        Return encode_shift_reg_imm8(output, shift_type, reg_id, imm_val, op_size)
+    End If
+
+    If count_type equals 1:
+        Note: Register shift count (must be CL)
+        Return encode_shift_reg_cl(output, shift_type, reg_id, op_size)
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: LIR JUMP OPCODE TO x86 CONDITION CODE MAPPING
+Note: ============================================================================
+
+Process called "lir_jmp_opcode_to_x86_cc" that takes opcode as Integer returns Integer:
+    @Reasoning
+    Maps a LIR conditional jump opcode (LIR_JZ..LIR_JNP) to the corresponding
+    x86 condition code byte value for Jcc encoding.
+
+    LIR_JZ   (30501) -> 0x4 (E/Z)     LIR_JNZ  (30502) -> 0x5 (NE/NZ)
+    LIR_JE   (30503) -> 0x4 (E)        LIR_JNE  (30504) -> 0x5 (NE)
+    LIR_JL   (30505) -> 0xC (L)        LIR_JLE  (30506) -> 0xE (LE)
+    LIR_JG   (30507) -> 0xF (G)        LIR_JGE  (30508) -> 0xD (GE)
+    LIR_JB   (30509) -> 0x2 (B)        LIR_JBE  (30510) -> 0x6 (BE)
+    LIR_JA   (30511) -> 0x7 (A)        LIR_JAE  (30512) -> 0x3 (AE)
+    LIR_JS   (30513) -> 0x8 (S)        LIR_JNS  (30514) -> 0x9 (NS)
+    LIR_JO   (30515) -> 0x0 (O)        LIR_JNO  (30516) -> 0x1 (NO)
+    LIR_JP   (30517) -> 0xA (P)        LIR_JNP  (30518) -> 0xB (NP)
+    @End Reasoning
+
+    If opcode equals LIR.LIR_JZ:
+        Return X86_CC_E
+    End If
+    If opcode equals LIR.LIR_JNZ:
+        Return X86_CC_NE
+    End If
+    If opcode equals LIR.LIR_JE:
+        Return X86_CC_E
+    End If
+    If opcode equals LIR.LIR_JNE:
+        Return X86_CC_NE
+    End If
+    If opcode equals LIR.LIR_JL:
+        Return X86_CC_L
+    End If
+    If opcode equals LIR.LIR_JLE:
+        Return X86_CC_LE
+    End If
+    If opcode equals LIR.LIR_JG:
+        Return X86_CC_G
+    End If
+    If opcode equals LIR.LIR_JGE:
+        Return X86_CC_GE
+    End If
+    If opcode equals LIR.LIR_JB:
+        Return X86_CC_B
+    End If
+    If opcode equals LIR.LIR_JBE:
+        Return X86_CC_BE
+    End If
+    If opcode equals LIR.LIR_JA:
+        Return X86_CC_A
+    End If
+    If opcode equals LIR.LIR_JAE:
+        Return X86_CC_AE
+    End If
+    If opcode equals LIR.LIR_JS:
+        Return X86_CC_S
+    End If
+    If opcode equals LIR.LIR_JNS:
+        Return X86_CC_NS
+    End If
+    If opcode equals LIR.LIR_JO:
+        Return X86_CC_O
+    End If
+    If opcode equals LIR.LIR_JNO:
+        Return X86_CC_NO
+    End If
+    If opcode equals LIR.LIR_JP:
+        Return X86_CC_P
+    End If
+    If opcode equals LIR.LIR_JNP:
+        Return X86_CC_NP
+    End If
+
+    Display "lir_jmp_opcode_to_x86_cc: unrecognized jump opcode"
+    Return X86_CC_E
+End Process
+
+Note: ============================================================================
+Note: FUNCTION-LEVEL ENCODING
+Note: ============================================================================
+
+Process called "encode_lir_basic_block" that takes output as Integer, block as Integer returns Integer:
+    @Reasoning
+    Encodes all instructions in a LIR basic block into binary machine code.
+    Iterates through the block's instruction list and encodes each instruction
+    sequentially.
+
+    LIRBasicBlock layout (from lir.runa):
+      offset 0:  block_id
+      offset 8:  label (string pointer)
+      offset 16: instructions (List pointer)
+      offset 24: instruction_count
+
+    Returns the total number of bytes emitted for the block.
+    @End Reasoning
+
+    If block equals 0:
+        Return 0
+    End If
+
+    Let instructions be __load(block, 16)
+    Let inst_count be __load(block, 24)
+
+    If instructions equals 0:
+        Return 0
+    End If
+
+    If inst_count equals 0:
+        Return 0
+    End If
+
+    Let total_bytes be 0
+    Let i be 0
+
+    While i is less than inst_count:
+        Let instr be List.list_get(instructions, i)
+        If instr is not equal to 0:
+            Let bytes be encode_lir_instruction(output, instr)
+            Set total_bytes to total_bytes + bytes
+        End If
+        Set i to i + 1
+    End While
+
+    Return total_bytes
+End Process
+
+Process called "encode_lir_function" that takes output as Integer, function_ptr as Integer returns Integer:
+    @Reasoning
+    Encodes a complete LIR function into binary machine code by iterating through
+    all of its basic blocks in order and encoding each one.
+
+    LIRFunction layout (from lir.runa):
+      offset 0:  name (string pointer)
+      offset 8:  mangled_name
+      offset 16: entry_block
+      offset 24: exit_block
+      offset 32: blocks (List pointer)
+      offset 40: block_count
+
+    Returns the total number of bytes emitted for the function.
+    @End Reasoning
+
+    If function_ptr equals 0:
+        Return 0
+    End If
+
+    Let blocks be __load(function_ptr, 32)
+    Let block_count be __load(function_ptr, 40)
+
+    If blocks equals 0:
+        Return 0
+    End If
+
+    If block_count equals 0:
+        Return 0
+    End If
+
+    Let total_bytes be 0
+    Let i be 0
+
+    While i is less than block_count:
+        Let block be List.list_get(blocks, i)
+        If block is not equal to 0:
+            Let bytes be encode_lir_basic_block(output, block)
+            Set total_bytes to total_bytes + bytes
+        End If
+        Set i to i + 1
+    End While
+
+    Return total_bytes
+End Process
+
+Process called "encode_lir_module" that takes output as Integer, module_ptr as Integer returns Integer:
+    @Reasoning
+    Encodes an entire LIR module (all functions) into binary machine code.
+
+    LIRModule layout (from lir.runa):
+      offset 0:  name (string pointer)
+      offset 8:  functions (List pointer)
+      offset 16: function_count
+
+    Returns the total number of bytes emitted for the module.
+    @End Reasoning
+
+    If module_ptr equals 0:
+        Return 0
+    End If
+
+    Let functions be __load(module_ptr, 8)
+    Let func_count be __load(module_ptr, 16)
+
+    If functions equals 0:
+        Return 0
+    End If
+
+    If func_count equals 0:
+        Return 0
+    End If
+
+    Let total_bytes be 0
+    Let i be 0
+
+    While i is less than func_count:
+        Let func be List.list_get(functions, i)
+        If func is not equal to 0:
+            Let bytes be encode_lir_function(output, func)
+            Set total_bytes to total_bytes + bytes
+        End If
+        Set i to i + 1
+    End While
+
+    Return total_bytes
+End Process

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,875 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles x86 register allocation and register management.
+x86 (IA-32) Register Allocator - Architecture-Specific Constraint Resolution
 
-This file performs the following tasks:
-- Process x86 register allocation and register management
-- Handle x86 register constraints and register usage optimization
-- Manage x86 register spilling and register optimization
-- Process x86 register-based operations and register optimization
+Resolves x86 32-bit register allocation constraints after middle-end graph coloring.
+x86 32-bit has only 8 general-purpose registers (EAX-EDI), no REX-extended registers.
+All constraints are identical to x86_64 (two-address form, IDIV, shift-CL) but
+operate within the restricted 8-register GPR file.
 
-This file is essential because of the following reasons:
-- x86 register management is crucial for efficient x86 code generation
-- Proper register handling ensures optimal x86 CPU resource utilization
-- x86 support enables Runa compilation for x86 platforms
+Key differences from x86_64:
+- Only 8 GPRs (0-7): EAX, EBX, ECX, EDX, ESI, EDI, EBP, ESP
+- No R8-R15 registers (no REX prefix available)
+- Higher register pressure leads to more frequent spills
+- 32-bit operand sizes instead of 64-bit
+- CDQ instead of CQO for sign extension before IDIV
 
-This file consists of the following functions/features/operation types:
-- x86 register allocation and register management
-- x86 register constraints and register usage optimization
-- x86 register spilling and register optimization
-- x86 register-based operations and register optimization
+Dependencies:
+- Imports LIR types for function, block, and instruction structures
+- Imports LIRNodes for operand creation and instruction construction
+- Imports memory/layout.runa for OWNED HEAP allocation (Tier 3)
+- Imports list.runa for collection manipulation
 :End Note
 
-Note: TODO - Implement x86 register allocator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: x86 32-bit Register Constants
+Note: Only 8 GPRs available - no REX-extended registers
+Note: ============================================================================
+
+Constant REG_EAX as Integer is 0
+Constant REG_EBX as Integer is 1
+Constant REG_ECX as Integer is 2
+Constant REG_EDX as Integer is 3
+Constant REG_ESI as Integer is 4
+Constant REG_EDI as Integer is 5
+Constant REG_EBP as Integer is 6
+Constant REG_ESP as Integer is 7
+
+Note: Total allocatable GPRs (EBP and ESP are reserved)
+Constant X86_GPR_COUNT as Integer is 8
+Constant X86_ALLOCATABLE_COUNT as Integer is 6
+
+Note: ============================================================================
+Note: LIR Opcode Constants (mirrored from LIR for local convenience)
+Note: ============================================================================
+
+Constant OP_MOV as Integer is 30001
+Constant OP_ADD as Integer is 30100
+Constant OP_SUB as Integer is 30101
+Constant OP_IMUL as Integer is 30102
+Constant OP_IDIV as Integer is 30103
+Constant OP_MUL as Integer is 30104
+Constant OP_DIV as Integer is 30105
+Constant OP_NEG as Integer is 30106
+Constant OP_ADC as Integer is 30109
+Constant OP_SBB as Integer is 30110
+Constant OP_AND as Integer is 30200
+Constant OP_OR as Integer is 30201
+Constant OP_XOR as Integer is 30202
+Constant OP_NOT as Integer is 30203
+Constant OP_SHL as Integer is 30300
+Constant OP_SHR as Integer is 30301
+Constant OP_SAR as Integer is 30302
+Constant OP_ROL as Integer is 30303
+Constant OP_ROR as Integer is 30304
+
+Note: ============================================================================
+Note: Constraint Type Constants
+Note: ============================================================================
+
+@Reasoning
+x86 32-bit shares the same instruction encoding constraints as x86_64:
+- Two-address form: dest overwrites first source operand (ADD, SUB, AND, OR, XOR, etc.)
+- IDIV/DIV: implicit EAX:EDX dividend pair (32-bit instead of 64-bit)
+- Shift/rotate with variable count: shift count must reside in CL (low byte of ECX)
+- Higher register pressure due to only 6 allocatable registers (EAX, EBX, ECX, EDX, ESI, EDI)
+@End Reasoning
+
+Constant CONSTRAINT_TWO_ADDRESS as Integer is 1
+Constant CONSTRAINT_FIXED_REG as Integer is 2
+Constant CONSTRAINT_CLOBBER as Integer is 3
+Constant CONSTRAINT_SHIFT_CL as Integer is 4
+Constant CONSTRAINT_DIV_EAX_EDX as Integer is 5
+
+Note: ============================================================================
+Note: X86AllocConstraint Type Definition
+Note: ============================================================================
+
+@Reasoning
+Each constraint record describes a single x86-specific register constraint.
+Identical layout to x86_64 constraints but operating on 32-bit register file.
+
+Fields:
+- instruction_index: position of the constrained instruction within its block
+- constraint_type: one of the CONSTRAINT_* constants
+- required_register: physical register an operand must reside in
+- operand_index: which operand is constrained (0=result, 1=op1, 2=op2, 3=op3)
+- block_index: index of the basic block containing the constrained instruction
+@End Reasoning
+
+Type called "X86AllocConstraint":
+    instruction_index as Integer
+    constraint_type as Integer
+    required_register as Integer
+    operand_index as Integer
+    block_index as Integer
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per X86AllocConstraint
+
+Note: ============================================================================
+Note: Register Information Queries
+Note: ============================================================================
+
+Process called "is_allocatable_register" that takes reg_id as Integer returns Integer:
+    Note: Returns 1 if the register is available for general allocation
+    Note: EBP (6) and ESP (7) are reserved for frame and stack pointer
+    If reg_id < 0:
+        Return 0
+    End If
+    If reg_id > 7:
+        Return 0
+    End If
+    If reg_id is 6:
+        Return 0
+    End If
+    If reg_id is 7:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "is_callee_saved" that takes reg_id as Integer returns Integer:
+    Note: cdecl calling convention: EBX, ESI, EDI, EBP are callee-saved
+    If reg_id is 1:
+        Return 1
+    End If
+    If reg_id is 4:
+        Return 1
+    End If
+    If reg_id is 5:
+        Return 1
+    End If
+    If reg_id is 6:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "is_caller_saved" that takes reg_id as Integer returns Integer:
+    Note: cdecl calling convention: EAX, ECX, EDX are caller-saved (scratch)
+    If reg_id is 0:
+        Return 1
+    End If
+    If reg_id is 2:
+        Return 1
+    End If
+    If reg_id is 3:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "get_allocatable_registers" returns Integer:
+    Note: Returns a List of allocatable register IDs for x86 32-bit
+    Note: Order is allocation preference: scratch registers first, then callee-saved
+    Let regs be List.list_create(8)
+    If regs is 0:
+        Return 0
+    End If
+    Note: Scratch registers preferred (no save/restore cost)
+    List.list_append(regs, REG_EAX)
+    List.list_append(regs, REG_ECX)
+    List.list_append(regs, REG_EDX)
+    Note: Callee-saved registers (require save/restore in prologue/epilogue)
+    List.list_append(regs, REG_EBX)
+    List.list_append(regs, REG_ESI)
+    List.list_append(regs, REG_EDI)
+    Return regs
+End Process
+
+Note: ============================================================================
+Note: Virtual-to-Physical Register Mapping
+Note: ============================================================================
+
+@Reasoning
+Maps LIR virtual register IDs to x86 32-bit physical registers.
+With only 6 allocatable registers, spilling is more frequent.
+Virtual register IDs 0-7 map directly to physical registers.
+Virtual register IDs >= 8 must be assigned through graph coloring
+or spilled to stack memory.
+
+The allocation priority favors scratch registers (EAX, ECX, EDX) over
+callee-saved registers (EBX, ESI, EDI) to minimize prologue/epilogue overhead.
+@End Reasoning
+
+Process called "map_virtual_to_physical" that takes virtual_reg as Integer returns Integer:
+    Note: Direct mapping for virtual registers 0-5 to allocatable physical registers
+    Note: Returns -1 if the virtual register must be spilled
+    If virtual_reg is 0:
+        Return REG_EAX
+    End If
+    If virtual_reg is 1:
+        Return REG_ECX
+    End If
+    If virtual_reg is 2:
+        Return REG_EDX
+    End If
+    If virtual_reg is 3:
+        Return REG_EBX
+    End If
+    If virtual_reg is 4:
+        Return REG_ESI
+    End If
+    If virtual_reg is 5:
+        Return REG_EDI
+    End If
+    Note: Virtual register exceeds physical register count; needs spill
+    Return 0 - 1
+End Process
+
+Note: ============================================================================
+Note: Constraint Collection
+Note: ============================================================================
+
+@Reasoning
+Scans every instruction in every basic block of the given LIR function and emits
+constraint descriptors for instructions requiring x86-specific register fixups.
+
+Identical constraint categories as x86_64:
+- Two-address: ADD, SUB, AND, OR, XOR, ADC, SBB, IMUL
+- Division: IDIV, DIV (uses EAX:EDX pair, 32-bit)
+- Shift/rotate: SHL, SHR, SAR, ROL, ROR with register count (requires CL)
+
+Returns a List of pointers to X86AllocConstraint structures.
+@End Reasoning
+
+Process called "collect_x86_constraints" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let constraints be List.list_create(32)
+    If constraints is 0:
+        Return 0
+    End If
+
+    Note: Retrieve basic blocks from the LIR function
+    Let blocks be __load(lir_function, 32)
+    Let block_count be __load(lir_function, 40)
+
+    If blocks is 0:
+        Return constraints
+    End If
+    If block_count is 0:
+        Return constraints
+    End If
+
+    Let b be 0
+    While b < block_count:
+        Let block be List.list_get(blocks, b)
+        If block is not 0:
+            Let instructions be __load(block, 16)
+            Let inst_count be __load(block, 24)
+
+            If instructions is not 0:
+                Let i be 0
+                While i < inst_count:
+                    Let instruction be List.list_get(instructions, i)
+                    If instruction is not 0:
+                        Let opcode be __load(instruction, 0)
+
+                        Note: ---- Two-address form constraints ----
+                        Note: ADD, SUB, AND, OR, XOR, ADC, SBB
+                        If opcode is OP_ADD:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+                        If opcode is OP_SUB:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+                        If opcode is OP_AND:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+                        If opcode is OP_OR:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+                        If opcode is OP_XOR:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+                        If opcode is OP_ADC:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+                        If opcode is OP_SBB:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+
+                        Note: IMUL two-operand form is also two-address
+                        If opcode is OP_IMUL:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+
+                        Note: ---- Division constraints ----
+                        If opcode is OP_IDIV:
+                            Let c be create_constraint(i, CONSTRAINT_DIV_EAX_EDX, REG_EAX, 1, b)
+                            List.list_append(constraints, c)
+                        End If
+                        If opcode is OP_DIV:
+                            Let c be create_constraint(i, CONSTRAINT_DIV_EAX_EDX, REG_EAX, 1, b)
+                            List.list_append(constraints, c)
+                        End If
+
+                        Note: ---- Shift/rotate CL constraints ----
+                        If opcode is OP_SHL:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                            check_shift_cl_constraint(instruction, i, b, constraints)
+                        End If
+                        If opcode is OP_SHR:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                            check_shift_cl_constraint(instruction, i, b, constraints)
+                        End If
+                        If opcode is OP_SAR:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                            check_shift_cl_constraint(instruction, i, b, constraints)
+                        End If
+                        If opcode is OP_ROL:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                            check_shift_cl_constraint(instruction, i, b, constraints)
+                        End If
+                        If opcode is OP_ROR:
+                            Let c be create_constraint(i, CONSTRAINT_TWO_ADDRESS, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                            check_shift_cl_constraint(instruction, i, b, constraints)
+                        End If
+                    End If
+
+                    Set i to i + 1
+                End While
+            End If
+        End If
+
+        Set b to b + 1
+    End While
+
+    Return constraints
+End Process
+
+Note: ============================================================================
+Note: Internal Helpers
+Note: ============================================================================
+
+Process called "create_constraint" that takes inst_idx as Integer, ctype as Integer, req_reg as Integer, op_idx as Integer, blk_idx as Integer returns Integer:
+    Note: Allocates and initializes a constraint record
+    Let c be Layout.allocate(40)
+    If c is 0:
+        Return 0
+    End If
+    __store(c, 0, inst_idx)
+    __store(c, 8, ctype)
+    __store(c, 16, req_reg)
+    __store(c, 24, op_idx)
+    __store(c, 32, blk_idx)
+    Return c
+End Process
+
+Process called "check_shift_cl_constraint" that takes instruction as Integer, inst_idx as Integer, blk_idx as Integer, constraints as Integer returns Integer:
+    Note: If operand2 (shift count) is a register operand, emit CONSTRAINT_SHIFT_CL
+    Let operand2_ptr be __load(instruction, 24)
+    If operand2_ptr is 0:
+        Return 0
+    End If
+    Let op2_type be __load(operand2_ptr, 0)
+    If op2_type is 1:
+        Note: Register operand - shift count must be in CL
+        Let c be create_constraint(inst_idx, CONSTRAINT_SHIFT_CL, REG_ECX, 2, blk_idx)
+        List.list_append(constraints, c)
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Register Copy Insertion
+Note: ============================================================================
+
+@Reasoning
+Creates a new LIR MOV instruction and inserts it into the given basic block's
+instruction list at the specified position (before the instruction at before_index).
+
+Identical to x86_64 register copy insertion but with 4-byte operand size default
+instead of 8-byte. Both operands are register operands.
+
+After insertion, instruction indices in the block are shifted.
+Returns 1 on success, 0 on failure.
+@End Reasoning
+
+Process called "insert_register_copy" that takes block as Integer, before_index as Integer, dest_reg as Integer, src_reg as Integer, size as Integer returns Integer:
+    If block is 0:
+        Return 0
+    End If
+
+    Note: Do not insert a copy if source and destination are the same register
+    If dest_reg is src_reg:
+        Return 1
+    End If
+
+    Note: Create the MOV instruction
+    Let mov_instruction be LIRNodes.create_lir_instruction(OP_MOV)
+    If mov_instruction is 0:
+        Return 0
+    End If
+
+    Note: Create register operands for destination and source
+    Let dest_operand be LIRNodes.create_register_operand(dest_reg, size)
+    If dest_operand is 0:
+        Return 0
+    End If
+
+    Let src_operand be LIRNodes.create_register_operand(src_reg, size)
+    If src_operand is 0:
+        Return 0
+    End If
+
+    Note: Wire up the MOV instruction: result = dest, operand1 = src
+    __store(mov_instruction, 8, dest_operand)
+    __store(mov_instruction, 16, src_operand)
+    __store(mov_instruction, 48, block)
+
+    Note: Insert into the block's instruction list at before_index
+    Let instructions be __load(block, 16)
+    If instructions is 0:
+        Return 0
+    End If
+
+    List.list_insert_at(instructions, before_index, mov_instruction)
+
+    Note: Update instruction count in the block
+    Let inst_count be __load(block, 24)
+    __store(block, 24, inst_count + 1)
+
+    Note: Update instruction_index for all instructions from before_index onward
+    Let new_count be inst_count + 1
+    Let idx be before_index
+    While idx < new_count:
+        Let inst be List.list_get(instructions, idx)
+        If inst is not 0:
+            __store(inst, 64, idx)
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Two-Address Form Resolution
+Note: ============================================================================
+
+@Reasoning
+Resolves two-address form constraint for a single instruction on x86.
+If dest register differs from src1 register, inserts MOV src1 -> dest
+before the instruction and rewrites operand1 to use dest register.
+
+Identical logic to x86_64 but constrained to registers 0-7.
+@End Reasoning
+
+Process called "handle_two_address_form" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer returns Integer:
+    If instruction is 0:
+        Return 0
+    End If
+    If block is 0:
+        Return 0
+    End If
+
+    Note: Read result operand pointer (offset 8) and operand1 pointer (offset 16)
+    Let result_ptr be __load(instruction, 8)
+    Let operand1_ptr be __load(instruction, 16)
+
+    If result_ptr is 0:
+        Return 0
+    End If
+    If operand1_ptr is 0:
+        Return 0
+    End If
+
+    Note: Both must be register operands
+    Let result_type be __load(result_ptr, 0)
+    Let op1_type be __load(operand1_ptr, 0)
+    If result_type is not 1:
+        Return 0
+    End If
+    If op1_type is not 1:
+        Return 0
+    End If
+
+    Let dest_reg be __load(result_ptr, 8)
+    Let src1_reg be __load(operand1_ptr, 8)
+    Let operand_size be __load(result_ptr, 56)
+
+    Note: Default to 4 bytes if size is unset (32-bit architecture)
+    If operand_size is 0:
+        Set operand_size to 4
+    End If
+
+    Note: If dest and src1 are the same register, constraint is satisfied
+    If dest_reg is src1_reg:
+        Return 0
+    End If
+
+    Note: Insert MOV src1 -> dest before this instruction
+    Let success be insert_register_copy(block, inst_index, dest_reg, src1_reg, operand_size)
+    If success is 0:
+        Return 0
+    End If
+
+    Note: Rewrite operand1 to use dest_reg (now contains src1 value)
+    __store(operand1_ptr, 8, dest_reg)
+
+    Note: One instruction was inserted
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Division Constraint Resolution
+Note: ============================================================================
+
+@Reasoning
+Resolves IDIV/DIV constraints on x86 32-bit.
+
+x86 32-bit integer division:
+  IDIV r/m32 => signed divide EDX:EAX by r/m32
+                quotient  -> EAX
+                remainder -> EDX
+
+  DIV  r/m32 => unsigned divide EDX:EAX by r/m32
+                quotient  -> EAX
+                remainder -> EDX
+
+For IDIV (signed), inserts before the IDIV:
+  MOV EAX, <dividend>       (move dividend to EAX)
+  CDQ                       (sign-extend EAX into EDX:EAX)
+
+For DIV (unsigned), inserts before the DIV:
+  MOV EAX, <dividend>       (move dividend to EAX)
+  XOR EDX, EDX              (zero EDX for unsigned division)
+
+After division, if result register is not EAX:
+  MOV <dest>, EAX           (copy quotient to destination)
+@End Reasoning
+
+Process called "handle_division_constraint" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer returns Integer:
+    If instruction is 0:
+        Return 0
+    End If
+    If block is 0:
+        Return 0
+    End If
+
+    Let opcode be __load(instruction, 0)
+    Let result_ptr be __load(instruction, 8)
+    Let operand1_ptr be __load(instruction, 16)
+
+    If operand1_ptr is 0:
+        Return 0
+    End If
+
+    Let inserted_count be 0
+
+    Note: Get the dividend register (operand1)
+    Let op1_type be __load(operand1_ptr, 0)
+    Let dividend_reg be 0
+    If op1_type is 1:
+        Set dividend_reg to __load(operand1_ptr, 8)
+    End If
+
+    Note: Step 1: Move dividend into EAX if not already there
+    If dividend_reg is not REG_EAX:
+        Let success be insert_register_copy(block, inst_index + inserted_count, REG_EAX, dividend_reg, 4)
+        If success is 1:
+            Set inserted_count to inserted_count + 1
+        End If
+    End If
+
+    Note: Step 2: Set up EDX (sign-extend or zero)
+    If opcode is OP_IDIV:
+        Note: For signed division, sign-extend EAX into EDX:EAX
+        Note: This is equivalent to CDQ: EDX = (EAX >> 31) ? 0xFFFFFFFF : 0x00000000
+        Note: Emit: MOV EDX, EAX then SAR EDX, 31
+        Let mov_inst be LIRNodes.create_lir_instruction(OP_MOV)
+        If mov_inst is not 0:
+            Let dest_op be LIRNodes.create_register_operand(REG_EDX, 4)
+            Let src_op be LIRNodes.create_register_operand(REG_EAX, 4)
+            __store(mov_inst, 8, dest_op)
+            __store(mov_inst, 16, src_op)
+            __store(mov_inst, 48, block)
+            Let instructions be __load(block, 16)
+            List.list_insert_at(instructions, inst_index + inserted_count, mov_inst)
+            Let ic be __load(block, 24)
+            __store(block, 24, ic + 1)
+            Set inserted_count to inserted_count + 1
+        End If
+
+        Note: SAR EDX, 31 for sign extension
+        Let sar_inst be LIRNodes.create_lir_instruction(OP_SAR)
+        If sar_inst is not 0:
+            Let sar_dest be LIRNodes.create_register_operand(REG_EDX, 4)
+            Let sar_src be LIRNodes.create_register_operand(REG_EDX, 4)
+            Let sar_imm be LIRNodes.create_immediate_operand(31, 4)
+            __store(sar_inst, 8, sar_dest)
+            __store(sar_inst, 16, sar_src)
+            __store(sar_inst, 24, sar_imm)
+            __store(sar_inst, 48, block)
+            Let instructions be __load(block, 16)
+            List.list_insert_at(instructions, inst_index + inserted_count, sar_inst)
+            Let ic be __load(block, 24)
+            __store(block, 24, ic + 1)
+            Set inserted_count to inserted_count + 1
+        End If
+    End If
+
+    If opcode is OP_DIV:
+        Note: For unsigned division, zero EDX via XOR EDX, EDX
+        Let xor_inst be LIRNodes.create_lir_instruction(OP_XOR)
+        If xor_inst is not 0:
+            Let xor_dest be LIRNodes.create_register_operand(REG_EDX, 4)
+            Let xor_src be LIRNodes.create_register_operand(REG_EDX, 4)
+            __store(xor_inst, 8, xor_dest)
+            __store(xor_inst, 16, xor_src)
+            __store(xor_inst, 24, xor_src)
+            __store(xor_inst, 48, block)
+            Let instructions be __load(block, 16)
+            List.list_insert_at(instructions, inst_index + inserted_count, xor_inst)
+            Let ic be __load(block, 24)
+            __store(block, 24, ic + 1)
+            Set inserted_count to inserted_count + 1
+        End If
+    End If
+
+    Note: Step 3: If the result register is not EAX, copy quotient from EAX to dest
+    If result_ptr is not 0:
+        Let result_type be __load(result_ptr, 0)
+        If result_type is 1:
+            Let dest_reg be __load(result_ptr, 8)
+            If dest_reg is not REG_EAX:
+                Note: Insert MOV after the IDIV/DIV instruction
+                Let after_idx be inst_index + inserted_count + 1
+                Let success be insert_register_copy(block, after_idx, dest_reg, REG_EAX, 4)
+                If success is 1:
+                    Set inserted_count to inserted_count + 1
+                End If
+            End If
+        End If
+    End If
+
+    Note: Reindex all instructions from the insertion point
+    Let instructions be __load(block, 16)
+    Let total_count be __load(block, 24)
+    Let idx be inst_index
+    While idx < total_count:
+        Let inst be List.list_get(instructions, idx)
+        If inst is not 0:
+            __store(inst, 64, idx)
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return inserted_count
+End Process
+
+Note: ============================================================================
+Note: Shift CL Constraint Resolution
+Note: ============================================================================
+
+@Reasoning
+Resolves the shift-CL constraint: variable-count shifts and rotates on x86
+require the shift count in the CL register (low byte of ECX).
+
+If the count operand is in a different register, inserts MOV to ECX before
+the instruction and rewrites operand2 to reference ECX.
+@End Reasoning
+
+Process called "handle_shift_cl_constraint" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer returns Integer:
+    If instruction is 0:
+        Return 0
+    End If
+    If block is 0:
+        Return 0
+    End If
+
+    Let operand2_ptr be __load(instruction, 24)
+    If operand2_ptr is 0:
+        Return 0
+    End If
+
+    Let op2_type be __load(operand2_ptr, 0)
+    Note: Only register operands need CL fixup; immediates are encoded directly
+    If op2_type is not 1:
+        Return 0
+    End If
+
+    Let count_reg be __load(operand2_ptr, 8)
+    Note: If already in ECX, no fixup needed
+    If count_reg is REG_ECX:
+        Return 0
+    End If
+
+    Note: Insert MOV count_reg -> ECX before the instruction
+    Let success be insert_register_copy(block, inst_index, REG_ECX, count_reg, 4)
+    If success is 0:
+        Return 0
+    End If
+
+    Note: Rewrite operand2 to reference ECX
+    __store(operand2_ptr, 8, REG_ECX)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Complete Constraint Resolution Pass
+Note: ============================================================================
+
+@Reasoning
+Main entry point for x86 32-bit register constraint resolution.
+Collects all constraints, then resolves them in reverse order (to avoid
+index invalidation when inserting instructions).
+
+Processing order:
+1. Collect all constraints for the function
+2. Sort by block_index then instruction_index (descending)
+3. Process each constraint:
+   - CONSTRAINT_TWO_ADDRESS -> handle_two_address_form
+   - CONSTRAINT_DIV_EAX_EDX -> handle_division_constraint
+   - CONSTRAINT_SHIFT_CL -> handle_shift_cl_constraint
+4. Run move coalescing to remove redundant MOV r, r instructions
+@End Reasoning
+
+Process called "resolve_x86_constraints" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let constraints be collect_x86_constraints(lir_function)
+    If constraints is 0:
+        Return 0
+    End If
+
+    Let constraint_count be List.list_length(constraints)
+    If constraint_count is 0:
+        Return 1
+    End If
+
+    Note: Process constraints in reverse order to preserve instruction indices
+    Let ci be constraint_count - 1
+    While ci >= 0:
+        Let constraint be List.list_get(constraints, ci)
+        If constraint is not 0:
+            Let inst_idx be __load(constraint, 0)
+            Let ctype be __load(constraint, 8)
+            Let blk_idx be __load(constraint, 32)
+
+            Note: Get the block and instruction
+            Let blocks be __load(lir_function, 32)
+            Let block be List.list_get(blocks, blk_idx)
+            If block is not 0:
+                Let instructions be __load(block, 16)
+                Let instruction be List.list_get(instructions, inst_idx)
+                If instruction is not 0:
+                    If ctype is CONSTRAINT_TWO_ADDRESS:
+                        handle_two_address_form(lir_function, instruction, block, inst_idx)
+                    End If
+                    If ctype is CONSTRAINT_DIV_EAX_EDX:
+                        handle_division_constraint(lir_function, instruction, block, inst_idx)
+                    End If
+                    If ctype is CONSTRAINT_SHIFT_CL:
+                        handle_shift_cl_constraint(lir_function, instruction, block, inst_idx)
+                    End If
+                End If
+            End If
+        End If
+        Set ci to ci - 1
+    End While
+
+    Note: Coalesce redundant moves
+    coalesce_moves(lir_function)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Move Coalescing
+Note: ============================================================================
+
+@Reasoning
+After constraint resolution, redundant MOV instructions may exist where
+source and destination are the same register (MOV EAX, EAX). This pass
+scans all blocks and removes such no-op moves.
+@End Reasoning
+
+Process called "coalesce_moves" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let blocks be __load(lir_function, 32)
+    Let block_count be __load(lir_function, 40)
+    If blocks is 0:
+        Return 0
+    End If
+
+    Let removed_count be 0
+    Let b be 0
+    While b < block_count:
+        Let block be List.list_get(blocks, b)
+        If block is not 0:
+            Let instructions be __load(block, 16)
+            Let inst_count be __load(block, 24)
+            If instructions is not 0:
+                Let i be inst_count - 1
+                While i >= 0:
+                    Let inst be List.list_get(instructions, i)
+                    If inst is not 0:
+                        Let opcode be __load(inst, 0)
+                        If opcode is OP_MOV:
+                            Let result_ptr be __load(inst, 8)
+                            Let operand1_ptr be __load(inst, 16)
+                            If result_ptr is not 0:
+                                If operand1_ptr is not 0:
+                                    Let r_type be __load(result_ptr, 0)
+                                    Let o_type be __load(operand1_ptr, 0)
+                                    If r_type is 1:
+                                        If o_type is 1:
+                                            Let r_reg be __load(result_ptr, 8)
+                                            Let o_reg be __load(operand1_ptr, 8)
+                                            If r_reg is o_reg:
+                                                Note: Remove this redundant MOV
+                                                List.list_remove_at(instructions, i)
+                                                Let new_count be __load(block, 24)
+                                                __store(block, 24, new_count - 1)
+                                                Set removed_count to removed_count + 1
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set i to i - 1
+                End While
+            End If
+        End If
+        Set b to b + 1
+    End While
+
+    Return removed_count
+End Process

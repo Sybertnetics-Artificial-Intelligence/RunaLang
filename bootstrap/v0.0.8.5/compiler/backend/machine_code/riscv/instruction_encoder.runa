@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,631 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles RISC-V instruction encoding and instruction processing.
+RISC-V Instruction Encoder - Binary Machine Code Encoding (RV64GC)
 
-This file performs the following tasks:
-- Process RISC-V instruction encoding and instruction generation
-- Handle RISC-V instruction optimization and instruction selection
-- Manage RISC-V instruction scheduling and instruction reordering
-- Process RISC-V instruction validation and instruction verification
+Encodes RISC-V instructions into 32-bit fixed-width binary format.
+RISC-V has six core instruction formats, all exactly 32 bits wide:
 
-This file is essential because of the following reasons:
-- RISC-V instruction processing enables native RISC-V code generation
-- Proper instruction handling ensures correct and efficient RISC-V code
-- RISC-V support enables Runa compilation for RISC-V platforms
+R-type: |funct7(7)|rs2(5)|rs1(5)|funct3(3)|rd(5)|opcode(7)|
+I-type: |imm[11:0](12)|rs1(5)|funct3(3)|rd(5)|opcode(7)|
+S-type: |imm[11:5](7)|rs2(5)|rs1(5)|funct3(3)|imm[4:0](5)|opcode(7)|
+B-type: |imm[12|10:5](7)|rs2(5)|rs1(5)|funct3(3)|imm[4:1|11](5)|opcode(7)|
+U-type: |imm[31:12](20)|rd(5)|opcode(7)|
+J-type: |imm[20|10:1|11|19:12](20)|rd(5)|opcode(7)|
 
-This file consists of the following functions/features/operation types:
-- RISC-V instruction encoding and instruction generation
-- RISC-V instruction optimization and instruction selection
-- RISC-V instruction scheduling and instruction reordering
-- RISC-V instruction validation and instruction verification
+The clean and regular encoding makes RISC-V the simplest architecture
+to encode, with no variable-length prefixes or special cases.
+
+Dependencies:
+- Imports LIR types for instruction definitions
+- Imports LIRNodes for operand type checking
+- Imports machine_code_interface for BinaryOutput buffer management
+- Imports memory/layout.runa for allocation
 :End Note
 
-Note: TODO - Implement RISC-V instruction encoder functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: RISC-V Opcode Constants (bits 6-0)
+Note: ============================================================================
+
+Constant OPCODE_LUI as Integer is 55        Note: 0110111 - Load upper immediate
+Constant OPCODE_AUIPC as Integer is 23      Note: 0010111 - Add upper immediate to PC
+Constant OPCODE_JAL as Integer is 111       Note: 1101111 - Jump and link
+Constant OPCODE_JALR as Integer is 103      Note: 1100111 - Jump and link register
+Constant OPCODE_BRANCH as Integer is 99     Note: 1100011 - Conditional branch
+Constant OPCODE_LOAD as Integer is 3        Note: 0000011 - Load from memory
+Constant OPCODE_STORE as Integer is 35      Note: 0100011 - Store to memory
+Constant OPCODE_OP_IMM as Integer is 19     Note: 0010011 - ALU immediate
+Constant OPCODE_OP as Integer is 51         Note: 0110011 - ALU register-register
+Constant OPCODE_OP_IMM_32 as Integer is 27  Note: 0011011 - ALU immediate (32-bit on RV64)
+Constant OPCODE_OP_32 as Integer is 59      Note: 0111011 - ALU register (32-bit on RV64)
+Constant OPCODE_SYSTEM as Integer is 115    Note: 1110011 - System (ecall, ebreak, CSR)
+
+Note: ============================================================================
+Note: Funct3 Constants for ALU Operations
+Note: ============================================================================
+
+Constant FUNCT3_ADD as Integer is 0         Note: ADD/SUB (funct7 distinguishes)
+Constant FUNCT3_SLL as Integer is 1         Note: Shift left logical
+Constant FUNCT3_SLT as Integer is 2         Note: Set less than (signed)
+Constant FUNCT3_SLTU as Integer is 3        Note: Set less than (unsigned)
+Constant FUNCT3_XOR as Integer is 4         Note: XOR
+Constant FUNCT3_SRL as Integer is 5         Note: Shift right logical/arithmetic (funct7 distinguishes)
+Constant FUNCT3_OR as Integer is 6          Note: OR
+Constant FUNCT3_AND as Integer is 7         Note: AND
+
+Note: Funct3 for branches
+Constant FUNCT3_BEQ as Integer is 0         Note: Branch if equal
+Constant FUNCT3_BNE as Integer is 1         Note: Branch if not equal
+Constant FUNCT3_BLT as Integer is 4         Note: Branch if less than (signed)
+Constant FUNCT3_BGE as Integer is 5         Note: Branch if greater or equal (signed)
+Constant FUNCT3_BLTU as Integer is 6        Note: Branch if less than (unsigned)
+Constant FUNCT3_BGEU as Integer is 7        Note: Branch if greater or equal (unsigned)
+
+Note: Funct3 for loads
+Constant FUNCT3_LB as Integer is 0          Note: Load byte (sign-extend)
+Constant FUNCT3_LH as Integer is 1          Note: Load halfword (sign-extend)
+Constant FUNCT3_LW as Integer is 2          Note: Load word (sign-extend on RV64)
+Constant FUNCT3_LD as Integer is 3          Note: Load doubleword (RV64 only)
+Constant FUNCT3_LBU as Integer is 4         Note: Load byte (zero-extend)
+Constant FUNCT3_LHU as Integer is 5         Note: Load halfword (zero-extend)
+Constant FUNCT3_LWU as Integer is 6         Note: Load word (zero-extend, RV64 only)
+
+Note: Funct3 for stores
+Constant FUNCT3_SB as Integer is 0          Note: Store byte
+Constant FUNCT3_SH as Integer is 1          Note: Store halfword
+Constant FUNCT3_SW as Integer is 2          Note: Store word
+Constant FUNCT3_SD as Integer is 3          Note: Store doubleword (RV64 only)
+
+Note: ============================================================================
+Note: Funct7 Constants
+Note: ============================================================================
+
+Constant FUNCT7_NORMAL as Integer is 0      Note: 0000000 - ADD, SRL, etc.
+Constant FUNCT7_ALT as Integer is 32        Note: 0100000 - SUB, SRA
+Constant FUNCT7_MULDIV as Integer is 1      Note: 0000001 - M extension (MUL, DIV, etc.)
+
+Note: ============================================================================
+Note: Encoder Context
+Note: ============================================================================
+
+Type called "RISCVEncoderContext":
+    output as Integer              Note: Pointer to BinaryOutput
+End Type
+
+Note: Size: 1 field * 8 bytes = 8 bytes
+
+Process called "create_encoder_context" that takes output as Integer returns Integer:
+    Let ctx be Layout.allocate(8)
+    If ctx is 0:
+        Return 0
+    End If
+    __store(ctx, 0, output)
+    Return ctx
+End Process
+
+Process called "emit_word" that takes ctx as Integer, word as Integer returns Integer:
+    Note: Emits a 32-bit instruction word to the binary output in little-endian
+    If ctx is 0:
+        Return 0
+    End If
+    Let output be __load(ctx, 0)
+    MachineCode.binary_emit_byte(output, word & 255)
+    MachineCode.binary_emit_byte(output, (word / 256) & 255)
+    MachineCode.binary_emit_byte(output, (word / 65536) & 255)
+    MachineCode.binary_emit_byte(output, (word / 16777216) & 255)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: R-type Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+R-type format: |funct7(7)|rs2(5)|rs1(5)|funct3(3)|rd(5)|opcode(7)|
+Used for register-register arithmetic/logic operations.
+Total: 32 bits
+@End Reasoning
+
+Process called "encode_r_type" that takes ctx as Integer, opcode as Integer, rd as Integer, funct3 as Integer, rs1 as Integer, rs2 as Integer, funct7 as Integer returns Integer:
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let instruction be 0
+
+    Note: opcode (bits 6-0)
+    Set instruction to instruction + (opcode & 127)
+
+    Note: rd (bits 11-7)
+    Set instruction to instruction + ((rd & 31) * 128)
+
+    Note: funct3 (bits 14-12)
+    Set instruction to instruction + ((funct3 & 7) * 4096)
+
+    Note: rs1 (bits 19-15)
+    Set instruction to instruction + ((rs1 & 31) * 32768)
+
+    Note: rs2 (bits 24-20)
+    Set instruction to instruction + ((rs2 & 31) * 1048576)
+
+    Note: funct7 (bits 31-25)
+    Set instruction to instruction + ((funct7 & 127) * 33554432)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: I-type Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+I-type format: |imm[11:0](12)|rs1(5)|funct3(3)|rd(5)|opcode(7)|
+Used for loads, ALU immediates, JALR, and system instructions.
+The immediate is 12-bit sign-extended.
+@End Reasoning
+
+Process called "encode_i_type" that takes ctx as Integer, opcode as Integer, rd as Integer, funct3 as Integer, rs1 as Integer, imm as Integer returns Integer:
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let instruction be 0
+
+    Note: opcode (bits 6-0)
+    Set instruction to instruction + (opcode & 127)
+
+    Note: rd (bits 11-7)
+    Set instruction to instruction + ((rd & 31) * 128)
+
+    Note: funct3 (bits 14-12)
+    Set instruction to instruction + ((funct3 & 7) * 4096)
+
+    Note: rs1 (bits 19-15)
+    Set instruction to instruction + ((rs1 & 31) * 32768)
+
+    Note: imm[11:0] (bits 31-20)
+    Set instruction to instruction + ((imm & 4095) * 1048576)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: S-type Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+S-type format: |imm[11:5](7)|rs2(5)|rs1(5)|funct3(3)|imm[4:0](5)|opcode(7)|
+Used for stores. The immediate is split: bits 11:5 in bits 31:25,
+bits 4:0 in bits 11:7.
+@End Reasoning
+
+Process called "encode_s_type" that takes ctx as Integer, opcode as Integer, funct3 as Integer, rs1 as Integer, rs2 as Integer, imm as Integer returns Integer:
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let instruction be 0
+
+    Note: opcode (bits 6-0)
+    Set instruction to instruction + (opcode & 127)
+
+    Note: imm[4:0] (bits 11-7)
+    Set instruction to instruction + ((imm & 31) * 128)
+
+    Note: funct3 (bits 14-12)
+    Set instruction to instruction + ((funct3 & 7) * 4096)
+
+    Note: rs1 (bits 19-15)
+    Set instruction to instruction + ((rs1 & 31) * 32768)
+
+    Note: rs2 (bits 24-20)
+    Set instruction to instruction + ((rs2 & 31) * 1048576)
+
+    Note: imm[11:5] (bits 31-25)
+    Let imm_high be (imm / 32) & 127
+    Set instruction to instruction + (imm_high * 33554432)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: B-type Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+B-type format: |imm[12|10:5](7)|rs2(5)|rs1(5)|funct3(3)|imm[4:1|11](5)|opcode(7)|
+Used for conditional branches. The immediate encodes a signed offset
+in multiples of 2 bytes (bit 0 is always 0, not stored).
+
+Bit mapping:
+  imm[12]   -> bit 31
+  imm[10:5] -> bits 30:25
+  imm[4:1]  -> bits 11:8
+  imm[11]   -> bit 7
+@End Reasoning
+
+Process called "encode_b_type" that takes ctx as Integer, opcode as Integer, funct3 as Integer, rs1 as Integer, rs2 as Integer, imm as Integer returns Integer:
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let instruction be 0
+
+    Note: opcode (bits 6-0)
+    Set instruction to instruction + (opcode & 127)
+
+    Note: imm[11] (bit 7)
+    Let bit11 be (imm / 2048) & 1
+    Set instruction to instruction + (bit11 * 128)
+
+    Note: imm[4:1] (bits 11-8)
+    Let bits4_1 be (imm / 2) & 15
+    Set instruction to instruction + (bits4_1 * 256)
+
+    Note: funct3 (bits 14-12)
+    Set instruction to instruction + ((funct3 & 7) * 4096)
+
+    Note: rs1 (bits 19-15)
+    Set instruction to instruction + ((rs1 & 31) * 32768)
+
+    Note: rs2 (bits 24-20)
+    Set instruction to instruction + ((rs2 & 31) * 1048576)
+
+    Note: imm[10:5] (bits 30-25)
+    Let bits10_5 be (imm / 32) & 63
+    Set instruction to instruction + (bits10_5 * 33554432)
+
+    Note: imm[12] (bit 31)
+    Let bit12 be (imm / 4096) & 1
+    Set instruction to instruction + (bit12 * 2147483648)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: U-type Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+U-type format: |imm[31:12](20)|rd(5)|opcode(7)|
+Used for LUI and AUIPC. The immediate is the upper 20 bits.
+@End Reasoning
+
+Process called "encode_u_type" that takes ctx as Integer, opcode as Integer, rd as Integer, imm as Integer returns Integer:
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let instruction be 0
+
+    Note: opcode (bits 6-0)
+    Set instruction to instruction + (opcode & 127)
+
+    Note: rd (bits 11-7)
+    Set instruction to instruction + ((rd & 31) * 128)
+
+    Note: imm[31:12] (bits 31-12)
+    Set instruction to instruction + ((imm & 1048575) * 4096)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: J-type Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+J-type format: |imm[20|10:1|11|19:12](20)|rd(5)|opcode(7)|
+Used for JAL. The immediate encodes a signed offset in multiples
+of 2 bytes with scrambled bit ordering.
+
+Bit mapping:
+  imm[20]    -> bit 31
+  imm[10:1]  -> bits 30:21
+  imm[11]    -> bit 20
+  imm[19:12] -> bits 19:12
+@End Reasoning
+
+Process called "encode_j_type" that takes ctx as Integer, opcode as Integer, rd as Integer, imm as Integer returns Integer:
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let instruction be 0
+
+    Note: opcode (bits 6-0)
+    Set instruction to instruction + (opcode & 127)
+
+    Note: rd (bits 11-7)
+    Set instruction to instruction + ((rd & 31) * 128)
+
+    Note: imm[19:12] (bits 19-12)
+    Let bits19_12 be (imm / 4096) & 255
+    Set instruction to instruction + (bits19_12 * 4096)
+
+    Note: imm[11] (bit 20)
+    Let bit11 be (imm / 2048) & 1
+    Set instruction to instruction + (bit11 * 1048576)
+
+    Note: imm[10:1] (bits 30-21)
+    Let bits10_1 be (imm / 2) & 1023
+    Set instruction to instruction + (bits10_1 * 2097152)
+
+    Note: imm[20] (bit 31)
+    Let bit20 be (imm / 1048576) & 1
+    Set instruction to instruction + (bit20 * 2147483648)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Convenience Wrappers - Arithmetic
+Note: ============================================================================
+
+Process called "encode_add" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_ADD, rs1, rs2, FUNCT7_NORMAL)
+End Process
+
+Process called "encode_sub" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_ADD, rs1, rs2, FUNCT7_ALT)
+End Process
+
+Process called "encode_addi" that takes ctx as Integer, rd as Integer, rs1 as Integer, imm as Integer returns Integer:
+    Return encode_i_type(ctx, OPCODE_OP_IMM, rd, FUNCT3_ADD, rs1, imm)
+End Process
+
+Process called "encode_and" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_AND, rs1, rs2, FUNCT7_NORMAL)
+End Process
+
+Process called "encode_or" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_OR, rs1, rs2, FUNCT7_NORMAL)
+End Process
+
+Process called "encode_xor" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_XOR, rs1, rs2, FUNCT7_NORMAL)
+End Process
+
+Process called "encode_sll" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_SLL, rs1, rs2, FUNCT7_NORMAL)
+End Process
+
+Process called "encode_srl" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_SRL, rs1, rs2, FUNCT7_NORMAL)
+End Process
+
+Process called "encode_sra" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_SRL, rs1, rs2, FUNCT7_ALT)
+End Process
+
+Process called "encode_slt" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_SLT, rs1, rs2, FUNCT7_NORMAL)
+End Process
+
+Process called "encode_sltu" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Return encode_r_type(ctx, OPCODE_OP, rd, FUNCT3_SLTU, rs1, rs2, FUNCT7_NORMAL)
+End Process
+
+Note: ============================================================================
+Note: Convenience Wrappers - M Extension (MUL/DIV)
+Note: ============================================================================
+
+Process called "encode_mul" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Note: MUL rd, rs1, rs2 (lower bits of product)
+    Return encode_r_type(ctx, OPCODE_OP, rd, 0, rs1, rs2, FUNCT7_MULDIV)
+End Process
+
+Process called "encode_mulh" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Note: MULH rd, rs1, rs2 (upper bits of signed*signed product)
+    Return encode_r_type(ctx, OPCODE_OP, rd, 1, rs1, rs2, FUNCT7_MULDIV)
+End Process
+
+Process called "encode_div" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Note: DIV rd, rs1, rs2 (signed division)
+    Return encode_r_type(ctx, OPCODE_OP, rd, 4, rs1, rs2, FUNCT7_MULDIV)
+End Process
+
+Process called "encode_divu" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Note: DIVU rd, rs1, rs2 (unsigned division)
+    Return encode_r_type(ctx, OPCODE_OP, rd, 5, rs1, rs2, FUNCT7_MULDIV)
+End Process
+
+Process called "encode_rem" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Note: REM rd, rs1, rs2 (signed remainder)
+    Return encode_r_type(ctx, OPCODE_OP, rd, 6, rs1, rs2, FUNCT7_MULDIV)
+End Process
+
+Process called "encode_remu" that takes ctx as Integer, rd as Integer, rs1 as Integer, rs2 as Integer returns Integer:
+    Note: REMU rd, rs1, rs2 (unsigned remainder)
+    Return encode_r_type(ctx, OPCODE_OP, rd, 7, rs1, rs2, FUNCT7_MULDIV)
+End Process
+
+Note: ============================================================================
+Note: Convenience Wrappers - Memory
+Note: ============================================================================
+
+Process called "encode_ld" that takes ctx as Integer, rd as Integer, rs1 as Integer, offset as Integer returns Integer:
+    Note: LD rd, offset(rs1) - load doubleword (RV64)
+    Return encode_i_type(ctx, OPCODE_LOAD, rd, FUNCT3_LD, rs1, offset)
+End Process
+
+Process called "encode_lw" that takes ctx as Integer, rd as Integer, rs1 as Integer, offset as Integer returns Integer:
+    Note: LW rd, offset(rs1) - load word
+    Return encode_i_type(ctx, OPCODE_LOAD, rd, FUNCT3_LW, rs1, offset)
+End Process
+
+Process called "encode_lb" that takes ctx as Integer, rd as Integer, rs1 as Integer, offset as Integer returns Integer:
+    Note: LB rd, offset(rs1) - load byte (sign-extend)
+    Return encode_i_type(ctx, OPCODE_LOAD, rd, FUNCT3_LB, rs1, offset)
+End Process
+
+Process called "encode_lbu" that takes ctx as Integer, rd as Integer, rs1 as Integer, offset as Integer returns Integer:
+    Note: LBU rd, offset(rs1) - load byte (zero-extend)
+    Return encode_i_type(ctx, OPCODE_LOAD, rd, FUNCT3_LBU, rs1, offset)
+End Process
+
+Process called "encode_sd" that takes ctx as Integer, rs2 as Integer, rs1 as Integer, offset as Integer returns Integer:
+    Note: SD rs2, offset(rs1) - store doubleword (RV64)
+    Return encode_s_type(ctx, OPCODE_STORE, FUNCT3_SD, rs1, rs2, offset)
+End Process
+
+Process called "encode_sw" that takes ctx as Integer, rs2 as Integer, rs1 as Integer, offset as Integer returns Integer:
+    Note: SW rs2, offset(rs1) - store word
+    Return encode_s_type(ctx, OPCODE_STORE, FUNCT3_SW, rs1, rs2, offset)
+End Process
+
+Process called "encode_sb" that takes ctx as Integer, rs2 as Integer, rs1 as Integer, offset as Integer returns Integer:
+    Note: SB rs2, offset(rs1) - store byte
+    Return encode_s_type(ctx, OPCODE_STORE, FUNCT3_SB, rs1, rs2, offset)
+End Process
+
+Note: ============================================================================
+Note: Convenience Wrappers - Branches
+Note: ============================================================================
+
+Process called "encode_beq" that takes ctx as Integer, rs1 as Integer, rs2 as Integer, offset as Integer returns Integer:
+    Return encode_b_type(ctx, OPCODE_BRANCH, FUNCT3_BEQ, rs1, rs2, offset)
+End Process
+
+Process called "encode_bne" that takes ctx as Integer, rs1 as Integer, rs2 as Integer, offset as Integer returns Integer:
+    Return encode_b_type(ctx, OPCODE_BRANCH, FUNCT3_BNE, rs1, rs2, offset)
+End Process
+
+Process called "encode_blt" that takes ctx as Integer, rs1 as Integer, rs2 as Integer, offset as Integer returns Integer:
+    Return encode_b_type(ctx, OPCODE_BRANCH, FUNCT3_BLT, rs1, rs2, offset)
+End Process
+
+Process called "encode_bge" that takes ctx as Integer, rs1 as Integer, rs2 as Integer, offset as Integer returns Integer:
+    Return encode_b_type(ctx, OPCODE_BRANCH, FUNCT3_BGE, rs1, rs2, offset)
+End Process
+
+Process called "encode_bltu" that takes ctx as Integer, rs1 as Integer, rs2 as Integer, offset as Integer returns Integer:
+    Return encode_b_type(ctx, OPCODE_BRANCH, FUNCT3_BLTU, rs1, rs2, offset)
+End Process
+
+Process called "encode_bgeu" that takes ctx as Integer, rs1 as Integer, rs2 as Integer, offset as Integer returns Integer:
+    Return encode_b_type(ctx, OPCODE_BRANCH, FUNCT3_BGEU, rs1, rs2, offset)
+End Process
+
+Note: ============================================================================
+Note: Convenience Wrappers - Jumps
+Note: ============================================================================
+
+Process called "encode_jal" that takes ctx as Integer, rd as Integer, offset as Integer returns Integer:
+    Note: JAL rd, offset - jump and link
+    Return encode_j_type(ctx, OPCODE_JAL, rd, offset)
+End Process
+
+Process called "encode_jalr" that takes ctx as Integer, rd as Integer, rs1 as Integer, offset as Integer returns Integer:
+    Note: JALR rd, rs1, offset - jump and link register
+    Return encode_i_type(ctx, OPCODE_JALR, rd, 0, rs1, offset)
+End Process
+
+Note: ============================================================================
+Note: Convenience Wrappers - Upper Immediate
+Note: ============================================================================
+
+Process called "encode_lui" that takes ctx as Integer, rd as Integer, imm as Integer returns Integer:
+    Note: LUI rd, imm - load upper immediate (bits 31:12)
+    Return encode_u_type(ctx, OPCODE_LUI, rd, imm)
+End Process
+
+Process called "encode_auipc" that takes ctx as Integer, rd as Integer, imm as Integer returns Integer:
+    Note: AUIPC rd, imm - add upper immediate to PC
+    Return encode_u_type(ctx, OPCODE_AUIPC, rd, imm)
+End Process
+
+Note: ============================================================================
+Note: System Instructions
+Note: ============================================================================
+
+Process called "encode_ecall" that takes ctx as Integer returns Integer:
+    Note: ECALL - environment call (system call)
+    Note: Encoding: imm=0, rs1=0, funct3=0, rd=0, opcode=SYSTEM
+    Return encode_i_type(ctx, OPCODE_SYSTEM, 0, 0, 0, 0)
+End Process
+
+Process called "encode_ebreak" that takes ctx as Integer returns Integer:
+    Note: EBREAK - breakpoint
+    Note: Encoding: imm=1, rs1=0, funct3=0, rd=0, opcode=SYSTEM
+    Return encode_i_type(ctx, OPCODE_SYSTEM, 0, 0, 0, 1)
+End Process
+
+Note: ============================================================================
+Note: Pseudo-instruction Encoding
+Note: ============================================================================
+
+Process called "encode_nop" that takes ctx as Integer returns Integer:
+    Note: NOP = ADDI x0, x0, 0
+    Return encode_addi(ctx, 0, 0, 0)
+End Process
+
+Process called "encode_li" that takes ctx as Integer, rd as Integer, imm as Integer returns Integer:
+    Note: LI rd, imm - load immediate
+    Note: For small immediates (fits in 12 bits), use ADDI
+    Note: For larger values, use LUI + ADDI
+    If imm >= (0 - 2048):
+        If imm <= 2047:
+            Return encode_addi(ctx, rd, 0, imm)
+        End If
+    End If
+
+    Note: Split into upper 20 bits and lower 12 bits
+    Let lower be imm & 4095
+    Let upper be (imm / 4096) & 1048575
+
+    Note: If lower 12 bits are sign-extended negative, adjust upper
+    If lower >= 2048:
+        Set upper to upper + 1
+    End If
+
+    encode_lui(ctx, rd, upper)
+    If lower is not 0:
+        encode_addi(ctx, rd, rd, lower)
+    End If
+    Return 1
+End Process
+
+Process called "encode_mv" that takes ctx as Integer, rd as Integer, rs as Integer returns Integer:
+    Note: MV rd, rs = ADDI rd, rs, 0
+    Return encode_addi(ctx, rd, rs, 0)
+End Process
+
+Process called "encode_neg" that takes ctx as Integer, rd as Integer, rs as Integer returns Integer:
+    Note: NEG rd, rs = SUB rd, x0, rs
+    Return encode_sub(ctx, rd, 0, rs)
+End Process
+
+Process called "encode_not" that takes ctx as Integer, rd as Integer, rs as Integer returns Integer:
+    Note: NOT rd, rs = XORI rd, rs, -1
+    Return encode_i_type(ctx, OPCODE_OP_IMM, rd, FUNCT3_XOR, rs, 4095)
+End Process
+
+Process called "encode_ret" that takes ctx as Integer returns Integer:
+    Note: RET = JALR x0, ra, 0
+    Return encode_jalr(ctx, 0, 1, 0)
+End Process
+
+Process called "encode_call_offset" that takes ctx as Integer, offset as Integer returns Integer:
+    Note: CALL offset = JAL ra, offset (for near calls)
+    Return encode_jal(ctx, 1, offset)
+End Process
+
+Process called "encode_j" that takes ctx as Integer, offset as Integer returns Integer:
+    Note: J offset = JAL x0, offset (unconditional jump, discard return)
+    Return encode_jal(ctx, 0, offset)
+End Process

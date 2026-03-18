@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,679 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles WebAssembly binary encoding and WebAssembly format generation.
+WebAssembly Binary Module Encoder - .wasm File Format
+
+This file encodes a complete WebAssembly binary module (.wasm file) following
+the WebAssembly 1.0 (MVP) binary format specification. A Wasm module consists
+of a magic number, version, and a sequence of typed sections.
+
+Module header:
+  bytes 0-3: magic number  0x00 0x61 0x73 0x6D  ("\0asm")
+  bytes 4-7: version       0x01 0x00 0x00 0x00  (version 1)
+
+Section IDs:
+  1 = Type     (function type declarations)
+  2 = Import   (imported functions, tables, memories, globals)
+  3 = Function (function type index declarations)
+  4 = Table    (table declarations)
+  5 = Memory   (memory declarations)
+  6 = Global   (global variable declarations)
+  7 = Export   (exported entities)
+  8 = Start    (start function index)
+  9 = Element  (table initialization data)
+  10 = Code    (function bodies)
+  11 = Data    (memory initialization data)
 
 This file performs the following tasks:
-- Process WebAssembly binary encoding and WebAssembly format generation
-- Handle WebAssembly module encoding and WebAssembly module generation
-- Manage WebAssembly section encoding and WebAssembly section generation
-- Process WebAssembly instruction encoding and WebAssembly instruction generation
+- Encode the Wasm module header (magic number and version)
+- Encode each section with proper section ID and LEB128 size prefix
+- Build the type section from function signatures
+- Build the function section mapping functions to their type indices
+- Build the export section for publicly visible functions
+- Build the code section containing function bodies
+- Build the memory section declaring linear memory
+- Build the data section for initialized memory segments
 
 This file is essential because of the following reasons:
-- WebAssembly binary encoding enables WebAssembly binary output generation
-- Proper WebAssembly encoding ensures correct WebAssembly binary format
-- WebAssembly encoding support enables Runa compilation for WebAssembly binary output
+- The binary .wasm format is the standard executable format for WebAssembly
+- Section ordering and size encoding must be correct for module validation
+- LEB128 encoding of all sizes and indices is required by the spec
+- Correct type section construction is fundamental to Wasm type safety
 
 This file consists of the following functions/features/operation types:
-- WebAssembly binary encoding and WebAssembly format generation
-- WebAssembly module encoding and WebAssembly module generation
-- WebAssembly section encoding and WebAssembly section generation
-- WebAssembly instruction encoding and WebAssembly instruction generation
+- Module-level encoding (header, section sequencing)
+- Type section encoding (function signatures)
+- Function, export, memory, code, and data section encoding
+- Section size computation and LEB128 prefixing
+
+Dependencies:
+- Imports instruction_encoder for LEB128 encoding utilities
+- Imports MachineCode for byte emission to output buffer
+- Imports Layout for memory allocation
 :End Note
 
-Note: TODO - Implement WebAssembly encoder functionality
+Import "compiler/backend/machine_code/wasm/instruction_encoder.runa" as WasmInstr
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: WASM SECTION ID CONSTANTS
+Note: ============================================================================
+
+Constant WASM_SECTION_CUSTOM as Integer is 0
+Constant WASM_SECTION_TYPE as Integer is 1
+Constant WASM_SECTION_IMPORT as Integer is 2
+Constant WASM_SECTION_FUNCTION as Integer is 3
+Constant WASM_SECTION_TABLE as Integer is 4
+Constant WASM_SECTION_MEMORY as Integer is 5
+Constant WASM_SECTION_GLOBAL as Integer is 6
+Constant WASM_SECTION_EXPORT as Integer is 7
+Constant WASM_SECTION_START as Integer is 8
+Constant WASM_SECTION_ELEMENT as Integer is 9
+Constant WASM_SECTION_CODE as Integer is 10
+Constant WASM_SECTION_DATA as Integer is 11
+
+Note: Wasm type constants
+Constant WASM_FUNCTYPE as Integer is 96  Note: 0x60 - function type marker
+
+Note: Export kind constants
+Constant WASM_EXPORT_FUNC as Integer is 0
+Constant WASM_EXPORT_TABLE as Integer is 1
+Constant WASM_EXPORT_MEMORY as Integer is 2
+Constant WASM_EXPORT_GLOBAL as Integer is 3
+
+Note: ============================================================================
+Note: WASM MODULE STATE
+Note: ============================================================================
+
+@Reasoning
+The WasmModuleState tracks all data needed to emit a complete .wasm binary module.
+It holds lists of function types, function bodies, exports, memory declarations,
+and data segments. Each is built up during compilation and then serialized to
+binary in the correct section order.
+
+We use a two-pass approach for section encoding:
+1. First pass: compute the section content into a temporary buffer
+2. Second pass: emit section ID + LEB128 size + content to the final output
+This is necessary because section sizes must be known before they are written.
+@End Reasoning
+
+Type called "WasmModuleState":
+    output as Integer               Note: Final output buffer
+    type_entries as Integer          Note: Pointer to list of function type entries
+    type_count as Integer            Note: Number of function types
+    func_type_indices as Integer     Note: Pointer to array of type indices per function
+    func_count as Integer            Note: Number of functions
+    export_entries as Integer        Note: Pointer to list of export entries
+    export_count as Integer          Note: Number of exports
+    code_bodies as Integer           Note: Pointer to list of encoded function bodies
+    memory_min_pages as Integer      Note: Minimum memory pages
+    memory_max_pages as Integer      Note: Maximum memory pages (-1 = no max)
+    data_segments as Integer         Note: Pointer to list of data segments
+    data_segment_count as Integer    Note: Number of data segments
+    start_func_idx as Integer        Note: Start function index (-1 = none)
+    temp_buffer as Integer           Note: Temporary buffer for section content
+    temp_buffer_size as Integer      Note: Size of temp buffer
+End Type
+
+Note: Size: 15 fields * 8 bytes = 120 bytes
+
+Note: ============================================================================
+Note: MODULE CREATION
+Note: ============================================================================
+
+Process called "create_wasm_module" that takes output as Integer returns Integer:
+    @Reasoning
+    Creates and initializes a WasmModuleState with default values.
+    Allocates the temporary buffer used for section content computation.
+    The output buffer must already be initialized by the caller.
+    @End Reasoning
+
+    Let state be Layout.allocate(120)
+    If state equals 0:
+        Display "create_wasm_module: allocation failed"
+        Return 0
+    End If
+
+    Note: Allocate type entry storage (max 256 types, each 64 bytes)
+    Let type_entries be Layout.allocate(16384)
+    Note: Allocate function type index array (max 1024 functions)
+    Let func_indices be Layout.allocate(8192)
+    Note: Allocate export entry storage (max 256 exports, each 64 bytes)
+    Let export_entries be Layout.allocate(16384)
+    Note: Allocate code body storage (max 1024 bodies, pointer per body)
+    Let code_bodies be Layout.allocate(8192)
+    Note: Allocate data segment storage (max 64 segments, each 32 bytes)
+    Let data_segments be Layout.allocate(2048)
+    Note: Allocate temporary buffer for section content (64 KB)
+    Let temp_buf be Layout.allocate(65536)
+
+    If type_entries equals 0:
+        Display "create_wasm_module: type entries allocation failed"
+        Return 0
+    End If
+    If func_indices equals 0:
+        Display "create_wasm_module: func indices allocation failed"
+        Return 0
+    End If
+    If export_entries equals 0:
+        Display "create_wasm_module: export entries allocation failed"
+        Return 0
+    End If
+    If code_bodies equals 0:
+        Display "create_wasm_module: code bodies allocation failed"
+        Return 0
+    End If
+    If data_segments equals 0:
+        Display "create_wasm_module: data segments allocation failed"
+        Return 0
+    End If
+    If temp_buf equals 0:
+        Display "create_wasm_module: temp buffer allocation failed"
+        Return 0
+    End If
+
+    __store(state, 0, output)
+    __store(state, 8, type_entries)
+    __store(state, 16, 0)            Note: type_count = 0
+    __store(state, 24, func_indices)
+    __store(state, 32, 0)            Note: func_count = 0
+    __store(state, 40, export_entries)
+    __store(state, 48, 0)            Note: export_count = 0
+    __store(state, 56, code_bodies)
+    __store(state, 64, 1)            Note: memory_min_pages = 1
+    __store(state, 72, -1)           Note: memory_max_pages = no max
+    __store(state, 80, data_segments)
+    __store(state, 88, 0)            Note: data_segment_count = 0
+    __store(state, 96, -1)           Note: start_func_idx = none
+    __store(state, 104, temp_buf)
+    __store(state, 112, 65536)
+
+    Return state
+End Process
+
+Note: ============================================================================
+Note: MODULE HEADER
+Note: ============================================================================
+
+Process called "emit_module_header" that takes output as Integer returns Integer:
+    @Reasoning
+    Writes the Wasm module header: magic number + version.
+    Magic: 0x00 0x61 0x73 0x6D ("\0asm")
+    Version: 0x01 0x00 0x00 0x00 (version 1)
+    @End Reasoning
+
+    Note: Magic number: \0asm
+    MachineCode.emit_byte(output, 0)     Note: 0x00
+    MachineCode.emit_byte(output, 97)    Note: 0x61 = 'a'
+    MachineCode.emit_byte(output, 115)   Note: 0x73 = 's'
+    MachineCode.emit_byte(output, 109)   Note: 0x6D = 'm'
+
+    Note: Version: 1
+    MachineCode.emit_byte(output, 1)     Note: 0x01
+    MachineCode.emit_byte(output, 0)     Note: 0x00
+    MachineCode.emit_byte(output, 0)     Note: 0x00
+    MachineCode.emit_byte(output, 0)     Note: 0x00
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SECTION HELPERS
+Note: ============================================================================
+
+Process called "write_section_header" that takes output as Integer, section_id as Integer, content_size as Integer returns Integer:
+    @Reasoning
+    Writes a section header: section ID byte followed by LEB128-encoded
+    content size. The content_size is the number of bytes in the section
+    content (not including the header itself).
+    @End Reasoning
+
+    MachineCode.emit_byte(output, section_id)
+    WasmInstr.encode_leb128_unsigned(output, content_size)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: TYPE SECTION
+Note: ============================================================================
+
+Process called "add_function_type" that takes state as Integer, param_count as Integer, param_types as Integer, result_count as Integer, result_types as Integer returns Integer:
+    @Reasoning
+    Adds a function type to the module's type section. Each function type
+    consists of a parameter vector and a result vector.
+
+    Type entry layout (64 bytes max):
+      Offset 0: param_count (8 bytes)
+      Offset 8: param_types pointer (8 bytes)
+      Offset 16: result_count (8 bytes)
+      Offset 24: result_types pointer (8 bytes)
+
+    Returns the type index assigned to this function type.
+    @End Reasoning
+
+    Let type_entries be __load(state, 8)
+    Let type_count be __load(state, 16)
+    Let entry_offset be type_count * 32
+
+    __store(type_entries, entry_offset, param_count)
+    __store(type_entries, entry_offset + 8, param_types)
+    __store(type_entries, entry_offset + 16, result_count)
+    __store(type_entries, entry_offset + 24, result_types)
+
+    __store(state, 16, type_count + 1)
+    Return type_count
+End Process
+
+Process called "add_type_section" that takes state as Integer returns Integer:
+    @Reasoning
+    Emits the type section (section ID 1) to the module output.
+    Encodes all registered function types as functype entries.
+
+    Each functype entry:
+      0x60 (functype marker)
+      vec(param_types)
+      vec(result_types)
+    @End Reasoning
+
+    Let type_count be __load(state, 16)
+    If type_count equals 0:
+        Return 1
+    End If
+
+    Let output be __load(state, 0)
+    Let temp be __load(state, 104)
+    Let type_entries be __load(state, 8)
+
+    Note: Build section content in temp buffer
+    Let temp_output be MachineCode.create_output_buffer(65536)
+    If temp_output equals 0:
+        Return 0
+    End If
+
+    Note: Number of types
+    WasmInstr.encode_leb128_unsigned(temp_output, type_count)
+
+    Note: Encode each type
+    Let ti be 0
+    While ti is less than type_count:
+        Let entry_offset be ti * 32
+        Let param_count be __load(type_entries, entry_offset)
+        Let param_types be __load(type_entries, entry_offset + 8)
+        Let result_count be __load(type_entries, entry_offset + 16)
+        Let result_types be __load(type_entries, entry_offset + 24)
+
+        Note: functype marker
+        MachineCode.emit_byte(temp_output, WASM_FUNCTYPE)
+
+        Note: Parameter vector
+        WasmInstr.encode_leb128_unsigned(temp_output, param_count)
+        Let pi be 0
+        While pi is less than param_count:
+            Let ptype be __load(param_types, pi * 8)
+            MachineCode.emit_byte(temp_output, ptype)
+            Set pi to pi + 1
+        End While
+
+        Note: Result vector
+        WasmInstr.encode_leb128_unsigned(temp_output, result_count)
+        Let ri be 0
+        While ri is less than result_count:
+            Let rtype be __load(result_types, ri * 8)
+            MachineCode.emit_byte(temp_output, rtype)
+            Set ri to ri + 1
+        End While
+
+        Set ti to ti + 1
+    End While
+
+    Note: Write section header and content
+    Let content_size be MachineCode.get_output_size(temp_output)
+    write_section_header(output, WASM_SECTION_TYPE, content_size)
+    MachineCode.copy_output(temp_output, output)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: FUNCTION SECTION
+Note: ============================================================================
+
+Process called "add_function" that takes state as Integer, type_idx as Integer returns Integer:
+    @Reasoning
+    Registers a function in the module, associating it with its type index.
+    Returns the function index.
+    @End Reasoning
+
+    Let func_indices be __load(state, 24)
+    Let func_count be __load(state, 32)
+
+    __store(func_indices, func_count * 8, type_idx)
+    __store(state, 32, func_count + 1)
+
+    Return func_count
+End Process
+
+Process called "add_function_section" that takes state as Integer returns Integer:
+    @Reasoning
+    Emits the function section (section ID 3). This section contains a
+    vector of type indices, one per function declared in the module.
+    The function bodies are in the separate code section.
+    @End Reasoning
+
+    Let func_count be __load(state, 32)
+    If func_count equals 0:
+        Return 1
+    End If
+
+    Let output be __load(state, 0)
+    Let func_indices be __load(state, 24)
+
+    Let temp_output be MachineCode.create_output_buffer(8192)
+    If temp_output equals 0:
+        Return 0
+    End If
+
+    WasmInstr.encode_leb128_unsigned(temp_output, func_count)
+    Let fi be 0
+    While fi is less than func_count:
+        Let type_idx be __load(func_indices, fi * 8)
+        WasmInstr.encode_leb128_unsigned(temp_output, type_idx)
+        Set fi to fi + 1
+    End While
+
+    Let content_size be MachineCode.get_output_size(temp_output)
+    write_section_header(output, WASM_SECTION_FUNCTION, content_size)
+    MachineCode.copy_output(temp_output, output)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MEMORY SECTION
+Note: ============================================================================
+
+Process called "set_memory" that takes state as Integer, min_pages as Integer, max_pages as Integer returns Integer:
+    __store(state, 64, min_pages)
+    __store(state, 72, max_pages)
+    Return 1
+End Process
+
+Process called "add_memory_section" that takes state as Integer returns Integer:
+    @Reasoning
+    Emits the memory section (section ID 5). Declares one linear memory
+    with minimum and optional maximum page counts. Each Wasm page is 64 KB.
+
+    Memory limits encoding:
+      0x00 min                (no maximum)
+      0x01 min max            (with maximum)
+    @End Reasoning
+
+    Let output be __load(state, 0)
+    Let min_pages be __load(state, 64)
+    Let max_pages be __load(state, 72)
+
+    Let temp_output be MachineCode.create_output_buffer(32)
+    If temp_output equals 0:
+        Return 0
+    End If
+
+    Note: One memory
+    WasmInstr.encode_leb128_unsigned(temp_output, 1)
+
+    If max_pages is less than 0:
+        Note: No maximum
+        MachineCode.emit_byte(temp_output, 0)
+        WasmInstr.encode_leb128_unsigned(temp_output, min_pages)
+    Otherwise:
+        Note: With maximum
+        MachineCode.emit_byte(temp_output, 1)
+        WasmInstr.encode_leb128_unsigned(temp_output, min_pages)
+        WasmInstr.encode_leb128_unsigned(temp_output, max_pages)
+    End If
+
+    Let content_size be MachineCode.get_output_size(temp_output)
+    write_section_header(output, WASM_SECTION_MEMORY, content_size)
+    MachineCode.copy_output(temp_output, output)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: EXPORT SECTION
+Note: ============================================================================
+
+Process called "add_export" that takes state as Integer, name as Integer, name_len as Integer, kind as Integer, idx as Integer returns Integer:
+    @Reasoning
+    Registers an export entry. Each export has a name, kind (function/table/
+    memory/global), and the index of the exported entity.
+
+    Export entry layout (64 bytes):
+      Offset 0: name pointer (8 bytes)
+      Offset 8: name_len (8 bytes)
+      Offset 16: kind (8 bytes)
+      Offset 24: index (8 bytes)
+    @End Reasoning
+
+    Let export_entries be __load(state, 40)
+    Let export_count be __load(state, 48)
+    Let entry_offset be export_count * 32
+
+    __store(export_entries, entry_offset, name)
+    __store(export_entries, entry_offset + 8, name_len)
+    __store(export_entries, entry_offset + 16, kind)
+    __store(export_entries, entry_offset + 24, idx)
+
+    __store(state, 48, export_count + 1)
+    Return export_count
+End Process
+
+Process called "add_export_section" that takes state as Integer returns Integer:
+    @Reasoning
+    Emits the export section (section ID 7). Each export entry encodes:
+      name (as vec(byte))
+      kind (1 byte: 0=func, 1=table, 2=memory, 3=global)
+      index (LEB128 unsigned)
+    @End Reasoning
+
+    Let export_count be __load(state, 48)
+    If export_count equals 0:
+        Return 1
+    End If
+
+    Let output be __load(state, 0)
+    Let export_entries be __load(state, 40)
+
+    Let temp_output be MachineCode.create_output_buffer(16384)
+    If temp_output equals 0:
+        Return 0
+    End If
+
+    WasmInstr.encode_leb128_unsigned(temp_output, export_count)
+
+    Let ei be 0
+    While ei is less than export_count:
+        Let entry_offset be ei * 32
+        Let name be __load(export_entries, entry_offset)
+        Let name_len be __load(export_entries, entry_offset + 8)
+        Let kind be __load(export_entries, entry_offset + 16)
+        Let idx be __load(export_entries, entry_offset + 24)
+
+        Note: Name as vec(byte)
+        WasmInstr.encode_leb128_unsigned(temp_output, name_len)
+        Let ni be 0
+        While ni is less than name_len:
+            Let ch be __load8(name, ni)
+            MachineCode.emit_byte(temp_output, ch)
+            Set ni to ni + 1
+        End While
+
+        Note: Export kind
+        MachineCode.emit_byte(temp_output, kind)
+
+        Note: Export index
+        WasmInstr.encode_leb128_unsigned(temp_output, idx)
+
+        Set ei to ei + 1
+    End While
+
+    Let content_size be MachineCode.get_output_size(temp_output)
+    write_section_header(output, WASM_SECTION_EXPORT, content_size)
+    MachineCode.copy_output(temp_output, output)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CODE SECTION
+Note: ============================================================================
+
+Process called "add_code_body" that takes state as Integer, body_buffer as Integer, body_size as Integer returns Integer:
+    @Reasoning
+    Registers a pre-encoded function body for the code section.
+    The body_buffer contains the already-encoded locals declaration
+    and instruction sequence for one function.
+    Returns the body index.
+    @End Reasoning
+
+    Let code_bodies be __load(state, 56)
+    Let func_count be __load(state, 32)
+
+    Note: Store body pointer and size as a pair
+    Let body_idx be func_count - 1
+    If body_idx is less than 0:
+        Set body_idx to 0
+    End If
+
+    __store(code_bodies, body_idx * 16, body_buffer)
+    __store(code_bodies, body_idx * 16 + 8, body_size)
+
+    Return body_idx
+End Process
+
+Process called "add_code_section" that takes state as Integer returns Integer:
+    @Reasoning
+    Emits the code section (section ID 10). Contains a vector of function
+    bodies, each prefixed with its size in bytes.
+
+    Code section format:
+      vec(code_entry)
+    Each code_entry:
+      size: u32 (LEB128 byte count of body)
+      body: locals_declaration + instruction_sequence + end
+    @End Reasoning
+
+    Let func_count be __load(state, 32)
+    If func_count equals 0:
+        Return 1
+    End If
+
+    Let output be __load(state, 0)
+    Let code_bodies be __load(state, 56)
+
+    Let temp_output be MachineCode.create_output_buffer(65536)
+    If temp_output equals 0:
+        Return 0
+    End If
+
+    WasmInstr.encode_leb128_unsigned(temp_output, func_count)
+
+    Let fi be 0
+    While fi is less than func_count:
+        Let body_buffer be __load(code_bodies, fi * 16)
+        Let body_size be __load(code_bodies, fi * 16 + 8)
+
+        Note: Each function body is prefixed with its size
+        WasmInstr.encode_leb128_unsigned(temp_output, body_size)
+
+        Note: Copy body bytes
+        Let bi be 0
+        While bi is less than body_size:
+            Let byte_val be __load8(body_buffer, bi)
+            MachineCode.emit_byte(temp_output, byte_val)
+            Set bi to bi + 1
+        End While
+
+        Set fi to fi + 1
+    End While
+
+    Let content_size be MachineCode.get_output_size(temp_output)
+    write_section_header(output, WASM_SECTION_CODE, content_size)
+    MachineCode.copy_output(temp_output, output)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DATA SECTION
+Note: ============================================================================
+
+Process called "add_data_segment" that takes state as Integer, memory_idx as Integer, offset_expr as Integer, data_ptr as Integer, data_len as Integer returns Integer:
+    @Reasoning
+    Adds a data segment that initializes a region of linear memory.
+
+    Data segment entry layout (32 bytes):
+      Offset 0: memory_idx (8 bytes)
+      Offset 8: offset expression value (8 bytes)
+      Offset 16: data pointer (8 bytes)
+      Offset 24: data length (8 bytes)
+    @End Reasoning
+
+    Let data_segments be __load(state, 80)
+    Let seg_count be __load(state, 88)
+    Let entry_offset be seg_count * 32
+
+    __store(data_segments, entry_offset, memory_idx)
+    __store(data_segments, entry_offset + 8, offset_expr)
+    __store(data_segments, entry_offset + 16, data_ptr)
+    __store(data_segments, entry_offset + 24, data_len)
+
+    __store(state, 88, seg_count + 1)
+    Return seg_count
+End Process
+
+Note: ============================================================================
+Note: COMPLETE MODULE ENCODING
+Note: ============================================================================
+
+Process called "encode_module" that takes state as Integer returns Integer:
+    @Reasoning
+    Encodes the complete .wasm binary module in section order:
+    1. Module header (magic + version)
+    2. Type section (function type declarations)
+    3. Function section (type index per function)
+    4. Memory section (linear memory declarations)
+    5. Export section (exported names)
+    6. Code section (function bodies)
+
+    Sections must appear in order of section ID. Empty sections are omitted.
+    @End Reasoning
+
+    Let output be __load(state, 0)
+
+    Note: Module header
+    emit_module_header(output)
+
+    Note: Sections in order
+    add_type_section(state)
+    add_function_section(state)
+    add_memory_section(state)
+    add_export_section(state)
+    add_code_section(state)
+
+    Return 1
+End Process
+
+Process called "set_start_function" that takes state as Integer, func_idx as Integer returns Integer:
+    __store(state, 96, func_idx)
+    Return 1
+End Process
+
+Process called "get_function_count" that takes state as Integer returns Integer:
+    Return __load(state, 32)
+End Process
+
+Process called "get_type_count" that takes state as Integer returns Integer:
+    Return __load(state, 16)
+End Process

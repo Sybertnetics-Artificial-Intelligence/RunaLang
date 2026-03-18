@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1026 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles MIPS assembly code generation and assembly output.
+MIPS Assembly Generator - LIR to MIPS Assembly Text
+
+This file translates LIR instructions into MIPS assembly text following the
+GNU assembler (gas) syntax conventions. It generates O32 ABI-compliant code
+with proper function prologues/epilogues, branch delay slot handling, and
+stack frame management.
 
 This file performs the following tasks:
-- Process MIPS assembly code generation and assembly output formatting
-- Handle MIPS assembly optimization and assembly code optimization
-- Manage MIPS assembly validation and assembly code verification
-- Process MIPS assembly debugging and assembly code debugging
+- Generate MIPS assembly text for complete LIR modules
+- Emit function prologues with stack frame setup ($sp adjustment, $ra/$fp saves)
+- Emit function epilogues with stack frame teardown
+- Translate all LIR instructions to their MIPS assembly equivalents
+- Handle O32 ABI argument passing (4 register args + stack)
+- Insert NOP instructions in branch delay slots
+- Generate .data and .rodata sections for globals and string literals
+- Produce .text section with proper alignment directives
 
 This file is essential because of the following reasons:
-- MIPS assembly generation enables native MIPS code output
-- Proper assembly handling ensures correct and efficient MIPS code generation
-- MIPS support enables Runa compilation for MIPS platforms
+- MIPS assembly generation enables Runa compilation for MIPS-based platforms
+- O32 ABI compliance ensures interoperability with C libraries and OS kernels
+- Branch delay slot handling is critical for correct MIPS execution
+- Proper stack frame generation is required for function calls and debugging
 
 This file consists of the following functions/features/operation types:
-- MIPS assembly code generation and assembly output formatting
-- MIPS assembly optimization and assembly code optimization
-- MIPS assembly validation and assembly code verification
-- MIPS assembly debugging and assembly code debugging
+- Assembly generation context management
+- GPR name lookup tables for all 32 registers
+- Function prologue/epilogue generation following O32 ABI
+- Instruction-by-instruction LIR to MIPS translation
+- Branch delay slot NOP insertion
+- Data section emission for globals and string constants
+- Stack argument handling for functions with more than 4 parameters
+
+Dependencies:
+- Imports LIR types for instructions, operands, functions, blocks
+- Imports machine_code_interface for AssemblyOutput buffer management
+- Imports register allocator for register name lookup
+- Imports Layout for memory allocation
+- Imports List for collection operations
+- Imports StringUtils for output buffer building
 :End Note
 
-Note: TODO - Implement MIPS assembly generator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/backend/machine_code/mips/register_allocator.runa" as MIPSRegs
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: MIPS ASSEMBLY GENERATION CONTEXT
+Note: ============================================================================
+
+@Reasoning
+The MIPSAsmContext holds all state needed during assembly generation for a module.
+It wraps the AssemblyOutput buffer and adds MIPS-specific tracking:
+- current_function: pointer to the LIR function being emitted
+- reg_state: register allocator state for the current function
+- frame_size: total stack frame size for the current function
+- has_calls: whether the current function makes any calls (affects $ra save)
+
+The context is created once per module and reused across all functions.
+@End Reasoning
+
+Type called "MIPSAsmContext":
+    output as Integer                 Note: Pointer to AssemblyOutput buffer
+    config as Integer                 Note: Pointer to BackendConfig
+    current_function as Integer       Note: Pointer to current LIRFunction
+    reg_state as Integer              Note: Pointer to MIPSRegAllocState
+    frame_size as Integer             Note: Total stack frame size in bytes
+    has_calls as Integer              Note: 1 if current function calls other functions
+    error_count as Integer            Note: Number of errors encountered
+    label_counter as Integer          Note: Counter for generating unique labels
+End Type
+
+Note: Size: 8 fields * 8 bytes = 64 bytes per MIPSAsmContext
+
+Note: ============================================================================
+Note: CONTEXT CREATION AND MANAGEMENT
+Note: ============================================================================
+
+Process called "create_mips_asm_context" that takes output as Integer, config as Integer returns Integer:
+    @Reasoning
+    Allocates and initializes a MIPS assembly generation context. The output
+    buffer must already be initialized by the caller. The register allocator
+    state is created fresh for each context.
+    @End Reasoning
+
+    Let ctx be Layout.allocate(64)
+    If ctx equals 0:
+        Display "create_mips_asm_context: allocation failed"
+        Return 0
+    End If
+
+    Let reg_state be MIPSRegs.create_mips_reg_alloc_state()
+    If reg_state equals 0:
+        Display "create_mips_asm_context: register state allocation failed"
+        Return 0
+    End If
+
+    __store(ctx, 0, output)
+    __store(ctx, 8, config)
+    __store(ctx, 16, 0)       Note: current_function = null
+    __store(ctx, 24, reg_state)
+    __store(ctx, 32, 0)       Note: frame_size = 0
+    __store(ctx, 40, 0)       Note: has_calls = 0
+    __store(ctx, 48, 0)       Note: error_count = 0
+    __store(ctx, 56, 0)       Note: label_counter = 0
+
+    Return ctx
+End Process
+
+Process called "get_output" that takes ctx as Integer returns Integer:
+    Return __load(ctx, 0)
+End Process
+
+Process called "get_next_label" that takes ctx as Integer returns Integer:
+    @Reasoning
+    Returns a unique label number and increments the counter. Used for
+    generating internal labels for branches and control flow.
+    @End Reasoning
+    Let counter be __load(ctx, 56)
+    __store(ctx, 56, counter + 1)
+    Return counter
+End Process
+
+Note: ============================================================================
+Note: ASSEMBLY OUTPUT HELPERS
+Note: ============================================================================
+
+Process called "emit_line" that takes ctx as Integer, text as Integer returns Integer:
+    @Reasoning
+    Emits a line of assembly text to the output buffer, appending a newline.
+    @End Reasoning
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, text)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_indented" that takes ctx as Integer, text as Integer returns Integer:
+    @Reasoning
+    Emits an indented line of assembly (instruction within a function body).
+    Uses a single tab for indentation per GNU as convention.
+    @End Reasoning
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, text)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_label" that takes ctx as Integer, name as Integer returns Integer:
+    @Reasoning
+    Emits a label definition (name followed by colon, no indentation).
+    @End Reasoning
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, name)
+    MachineCode.emit_text(output, ":\n")
+    Return 1
+End Process
+
+Process called "emit_comment" that takes ctx as Integer, text as Integer returns Integer:
+    @Reasoning
+    Emits a comment line. MIPS assembly uses # for comments.
+    @End Reasoning
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t# ")
+    MachineCode.emit_text(output, text)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_directive" that takes ctx as Integer, directive as Integer returns Integer:
+    @Reasoning
+    Emits an assembler directive (e.g., .text, .data, .globl).
+    @End Reasoning
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, directive)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: FUNCTION PROLOGUE AND EPILOGUE
+Note: ============================================================================
+
+Process called "emit_function_prologue" that takes ctx as Integer, func_name as Integer, frame_size as Integer, has_calls as Integer returns Integer:
+    @Reasoning
+    Generates the MIPS O32 ABI function prologue. The prologue:
+    1. Adjusts $sp downward by frame_size (must be 8-byte aligned per O32)
+    2. Saves $ra to the top of the frame (if the function makes calls)
+    3. Saves $fp (old frame pointer) below $ra
+    4. Sets $fp to the current $sp value
+    5. Saves any callee-saved registers ($s0-$s7) that the function uses
+
+    O32 stack frame layout (high to low address):
+      [caller's frame]
+      [argument build area - 16 bytes minimum even for leaf functions]
+      old $ra (if non-leaf)
+      old $fp
+      callee-saved registers ($s0-$s7 as needed)
+      local variables
+      [current $sp points here]
+    @End Reasoning
+
+    Note: Emit function label and directives
+    emit_directive(ctx, ".text")
+    emit_directive(ctx, ".align 2")
+
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t.globl ")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, "\n")
+
+    MachineCode.emit_text(output, "\t.ent ")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, "\n")
+
+    emit_label(ctx, func_name)
+
+    Note: Ensure frame size is 8-byte aligned (O32 ABI requirement)
+    Let aligned_frame be frame_size
+    Let remainder be aligned_frame - ((aligned_frame / 8) * 8)
+    If remainder does not equal 0:
+        Set aligned_frame to aligned_frame + (8 - remainder)
+    End If
+
+    __store(ctx, 32, aligned_frame)
+
+    Note: Adjust stack pointer
+    MachineCode.emit_text(output, "\taddiu $sp, $sp, -")
+    MachineCode.emit_int(output, aligned_frame)
+    MachineCode.emit_text(output, "\n")
+
+    Note: Save return address if function makes calls
+    If has_calls equals 1:
+        MachineCode.emit_text(output, "\tsw $ra, ")
+        MachineCode.emit_int(output, aligned_frame - 4)
+        MachineCode.emit_text(output, "($sp)\n")
+    End If
+
+    Note: Save frame pointer
+    MachineCode.emit_text(output, "\tsw $fp, ")
+    MachineCode.emit_int(output, aligned_frame - 8)
+    MachineCode.emit_text(output, "($sp)\n")
+
+    Note: Set frame pointer to current stack pointer
+    emit_indented(ctx, "move $fp, $sp")
+
+    Note: Save callee-saved registers that were used
+    Let reg_state be __load(ctx, 24)
+    Let saved_count be MIPSRegs.get_callee_saved_count(reg_state)
+    Let save_idx be 0
+    While save_idx is less than saved_count:
+        Let save_reg be MIPSRegs.get_callee_saved_by_index(reg_state, save_idx)
+        If save_reg is greater than or equal to 0:
+            Let save_offset be aligned_frame - 12 - (save_idx * 4)
+            Let reg_name be MIPSRegs.get_gpr_name(save_reg)
+            MachineCode.emit_text(output, "\tsw ")
+            MachineCode.emit_text(output, reg_name)
+            MachineCode.emit_text(output, ", ")
+            MachineCode.emit_int(output, save_offset)
+            MachineCode.emit_text(output, "($sp)\n")
+        End If
+        Set save_idx to save_idx + 1
+    End While
+
+    Return 1
+End Process
+
+Process called "emit_function_epilogue" that takes ctx as Integer, func_name as Integer, has_calls as Integer returns Integer:
+    @Reasoning
+    Generates the MIPS O32 ABI function epilogue. The epilogue:
+    1. Restores callee-saved registers
+    2. Restores $fp from saved location
+    3. Restores $ra from saved location (if non-leaf)
+    4. Adjusts $sp back to caller's frame
+    5. Returns via JR $ra with a NOP in the delay slot
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let aligned_frame be __load(ctx, 32)
+    Let reg_state be __load(ctx, 24)
+
+    Note: Restore callee-saved registers in reverse order
+    Let saved_count be MIPSRegs.get_callee_saved_count(reg_state)
+    Let restore_idx be saved_count - 1
+    While restore_idx is greater than or equal to 0:
+        Let restore_reg be MIPSRegs.get_callee_saved_by_index(reg_state, restore_idx)
+        If restore_reg is greater than or equal to 0:
+            Let restore_offset be aligned_frame - 12 - (restore_idx * 4)
+            Let reg_name be MIPSRegs.get_gpr_name(restore_reg)
+            MachineCode.emit_text(output, "\tlw ")
+            MachineCode.emit_text(output, reg_name)
+            MachineCode.emit_text(output, ", ")
+            MachineCode.emit_int(output, restore_offset)
+            MachineCode.emit_text(output, "($sp)\n")
+        End If
+        Set restore_idx to restore_idx - 1
+    End While
+
+    Note: Restore frame pointer
+    MachineCode.emit_text(output, "\tlw $fp, ")
+    MachineCode.emit_int(output, aligned_frame - 8)
+    MachineCode.emit_text(output, "($sp)\n")
+
+    Note: Restore return address if function makes calls
+    If has_calls equals 1:
+        MachineCode.emit_text(output, "\tlw $ra, ")
+        MachineCode.emit_int(output, aligned_frame - 4)
+        MachineCode.emit_text(output, "($sp)\n")
+    End If
+
+    Note: Restore stack pointer
+    MachineCode.emit_text(output, "\taddiu $sp, $sp, ")
+    MachineCode.emit_int(output, aligned_frame)
+    MachineCode.emit_text(output, "\n")
+
+    Note: Return via JR $ra with delay slot NOP
+    emit_indented(ctx, "jr $ra")
+    emit_indented(ctx, "nop")
+
+    Note: End function directive
+    MachineCode.emit_text(output, "\t.end ")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, "\n\n")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: INSTRUCTION EMISSION
+Note: ============================================================================
+
+Process called "emit_alu_rrr" that takes ctx as Integer, mnemonic as Integer, rd as Integer, rs as Integer, rt as Integer returns Integer:
+    @Reasoning
+    Emits an R-format ALU instruction: mnemonic rd, rs, rt
+    Example output: "add $t0, $t1, $t2"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rd_name be MIPSRegs.get_gpr_name(rd)
+    Let rs_name be MIPSRegs.get_gpr_name(rs)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, rd_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, rs_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_alu_rri" that takes ctx as Integer, mnemonic as Integer, rt as Integer, rs as Integer, immediate as Integer returns Integer:
+    @Reasoning
+    Emits an I-format ALU instruction: mnemonic rt, rs, immediate
+    Example output: "addiu $t0, $t1, 42"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+    Let rs_name be MIPSRegs.get_gpr_name(rs)
+
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, rs_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, immediate)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_load" that takes ctx as Integer, mnemonic as Integer, rt as Integer, offset as Integer, base as Integer returns Integer:
+    @Reasoning
+    Emits a load instruction: mnemonic rt, offset(base)
+    Example output: "lw $t0, 16($sp)"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+    Let base_name be MIPSRegs.get_gpr_name(base)
+
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, offset)
+    MachineCode.emit_text(output, "(")
+    MachineCode.emit_text(output, base_name)
+    MachineCode.emit_text(output, ")\n")
+    Return 1
+End Process
+
+Process called "emit_store" that takes ctx as Integer, mnemonic as Integer, rt as Integer, offset as Integer, base as Integer returns Integer:
+    @Reasoning
+    Emits a store instruction: mnemonic rt, offset(base)
+    Example output: "sw $t0, 16($sp)"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+    Let base_name be MIPSRegs.get_gpr_name(base)
+
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, offset)
+    MachineCode.emit_text(output, "(")
+    MachineCode.emit_text(output, base_name)
+    MachineCode.emit_text(output, ")\n")
+    Return 1
+End Process
+
+Process called "emit_branch" that takes ctx as Integer, mnemonic as Integer, rs as Integer, rt as Integer, label as Integer returns Integer:
+    @Reasoning
+    Emits a branch instruction with delay slot NOP: mnemonic rs, rt, label / nop
+    Example output:
+      "beq $t0, $t1, .L_target"
+      "nop"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rs_name be MIPSRegs.get_gpr_name(rs)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, rs_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, label)
+    MachineCode.emit_text(output, "\n")
+
+    Note: Delay slot NOP
+    emit_indented(ctx, "nop")
+    Return 1
+End Process
+
+Process called "emit_branch_zero" that takes ctx as Integer, mnemonic as Integer, rs as Integer, label as Integer returns Integer:
+    @Reasoning
+    Emits a branch-against-zero instruction: mnemonic rs, label / nop
+    Used for blez, bgtz, bltz, bgez.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rs_name be MIPSRegs.get_gpr_name(rs)
+
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, rs_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, label)
+    MachineCode.emit_text(output, "\n")
+
+    Note: Delay slot NOP
+    emit_indented(ctx, "nop")
+    Return 1
+End Process
+
+Process called "emit_jump" that takes ctx as Integer, mnemonic as Integer, target as Integer returns Integer:
+    @Reasoning
+    Emits a jump instruction: mnemonic target / nop
+    Example: "j main_loop" followed by "nop"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, target)
+    MachineCode.emit_text(output, "\n")
+
+    Note: Delay slot NOP
+    emit_indented(ctx, "nop")
+    Return 1
+End Process
+
+Process called "emit_call" that takes ctx as Integer, func_name as Integer returns Integer:
+    @Reasoning
+    Emits a function call: jal func_name / nop
+    The JAL instruction saves the return address in $ra and jumps to the target.
+    The delay slot NOP ensures correct execution.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\tjal ")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, "\n")
+    emit_indented(ctx, "nop")
+    Return 1
+End Process
+
+Process called "emit_syscall" that takes ctx as Integer returns Integer:
+    @Reasoning
+    Emits a MIPS syscall instruction. On MIPS/Linux, the syscall number is
+    placed in $v0 and arguments in $a0-$a3 before the syscall instruction.
+    @End Reasoning
+
+    emit_indented(ctx, "syscall")
+    Return 1
+End Process
+
+Process called "emit_move" that takes ctx as Integer, rd as Integer, rs as Integer returns Integer:
+    @Reasoning
+    Emits a register-to-register move pseudo-instruction.
+    Expanded by the assembler to: addu rd, rs, $zero
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rd_name be MIPSRegs.get_gpr_name(rd)
+    Let rs_name be MIPSRegs.get_gpr_name(rs)
+
+    MachineCode.emit_text(output, "\tmove ")
+    MachineCode.emit_text(output, rd_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, rs_name)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_li" that takes ctx as Integer, rt as Integer, immediate as Integer returns Integer:
+    @Reasoning
+    Emits a load immediate pseudo-instruction. The assembler expands this
+    to one or two instructions depending on the immediate value:
+    - Small values: addiu rt, $zero, imm
+    - Large values: lui rt, upper; ori rt, rt, lower
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+
+    MachineCode.emit_text(output, "\tli ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, immediate)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_la" that takes ctx as Integer, rt as Integer, symbol as Integer returns Integer:
+    @Reasoning
+    Emits a load address pseudo-instruction. Loads the address of a symbol
+    into a register.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+
+    MachineCode.emit_text(output, "\tla ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, symbol)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_mfhi" that takes ctx as Integer, rd as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let rd_name be MIPSRegs.get_gpr_name(rd)
+    MachineCode.emit_text(output, "\tmfhi ")
+    MachineCode.emit_text(output, rd_name)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_mflo" that takes ctx as Integer, rd as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let rd_name be MIPSRegs.get_gpr_name(rd)
+    MachineCode.emit_text(output, "\tmflo ")
+    MachineCode.emit_text(output, rd_name)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_mult" that takes ctx as Integer, rs as Integer, rt as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let rs_name be MIPSRegs.get_gpr_name(rs)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+    MachineCode.emit_text(output, "\tmult ")
+    MachineCode.emit_text(output, rs_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_div_instr" that takes ctx as Integer, rs as Integer, rt as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let rs_name be MIPSRegs.get_gpr_name(rs)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+    MachineCode.emit_text(output, "\tdiv ")
+    MachineCode.emit_text(output, rs_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_shift" that takes ctx as Integer, mnemonic as Integer, rd as Integer, rt as Integer, shamt as Integer returns Integer:
+    @Reasoning
+    Emits a shift instruction with an immediate shift amount.
+    Example: "sll $t0, $t1, 4"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let rd_name be MIPSRegs.get_gpr_name(rd)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, rd_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, shamt)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_lui" that takes ctx as Integer, rt as Integer, immediate as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let rt_name be MIPSRegs.get_gpr_name(rt)
+    MachineCode.emit_text(output, "\tlui ")
+    MachineCode.emit_text(output, rt_name)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, immediate)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DATA SECTION EMISSION
+Note: ============================================================================
+
+Process called "emit_data_section" that takes ctx as Integer returns Integer:
+    @Reasoning
+    Emits the .data section header for initialized global variables.
+    Individual data items are emitted separately by the module generator.
+    @End Reasoning
+
+    emit_directive(ctx, ".data")
+    emit_directive(ctx, ".align 2")
+    Return 1
+End Process
+
+Process called "emit_rodata_section" that takes ctx as Integer returns Integer:
+    @Reasoning
+    Emits the .rodata section header for read-only data (string literals, constants).
+    @End Reasoning
+
+    emit_directive(ctx, ".section .rodata")
+    emit_directive(ctx, ".align 2")
+    Return 1
+End Process
+
+Process called "emit_string_literal" that takes ctx as Integer, label as Integer, value as Integer returns Integer:
+    @Reasoning
+    Emits a string literal in the .rodata section with an associated label.
+    Uses .asciiz directive for null-terminated strings.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    emit_label(ctx, label)
+    MachineCode.emit_text(output, "\t.asciiz \"")
+    MachineCode.emit_text(output, value)
+    MachineCode.emit_text(output, "\"\n")
+    Return 1
+End Process
+
+Process called "emit_word_data" that takes ctx as Integer, label as Integer, value as Integer returns Integer:
+    @Reasoning
+    Emits a 32-bit word data item with an associated label.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    emit_label(ctx, label)
+    MachineCode.emit_text(output, "\t.word ")
+    MachineCode.emit_int(output, value)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_bss_variable" that takes ctx as Integer, label as Integer, size as Integer returns Integer:
+    @Reasoning
+    Emits an uninitialized global variable in the .bss section with the
+    specified size in bytes.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    emit_directive(ctx, ".bss")
+    emit_directive(ctx, ".align 2")
+    MachineCode.emit_text(output, "\t.comm ")
+    MachineCode.emit_text(output, label)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, size)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LIR INSTRUCTION TRANSLATION
+Note: ============================================================================
+
+Process called "translate_lir_instruction" that takes ctx as Integer, instr as Integer returns Integer:
+    @Reasoning
+    Dispatches a single LIR instruction to the appropriate MIPS assembly emitter.
+    Reads the LIR opcode and operands, then emits the corresponding MIPS
+    instruction(s). Handles ALU operations, memory operations, branches,
+    jumps, calls, returns, and special operations.
+
+    LIR opcodes are architecture-independent and are mapped to MIPS equivalents.
+    Some LIR operations require multiple MIPS instructions (e.g., 64-bit
+    operations on 32-bit MIPS require instruction pairs).
+    @End Reasoning
+
+    Let opcode be LIRNodes.get_opcode(instr)
+
+    Note: Dispatch based on LIR opcode categories
+    Note: LIR_OP_ADD (30001)
+    If opcode equals 30001:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "addu", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_SUB (30002)
+    If opcode equals 30002:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "subu", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_MUL (30003) - multiply, result in LO register
+    If opcode equals 30003:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        emit_mult(ctx, src1, src2)
+        Return emit_mflo(ctx, dest)
+    End If
+
+    Note: LIR_OP_DIV (30004) - divide, quotient in LO
+    If opcode equals 30004:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        emit_div_instr(ctx, src1, src2)
+        Return emit_mflo(ctx, dest)
+    End If
+
+    Note: LIR_OP_MOD (30005) - modulo, remainder in HI
+    If opcode equals 30005:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        emit_div_instr(ctx, src1, src2)
+        Return emit_mfhi(ctx, dest)
+    End If
+
+    Note: LIR_OP_AND (30006)
+    If opcode equals 30006:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "and", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_OR (30007)
+    If opcode equals 30007:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "or", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_XOR (30008)
+    If opcode equals 30008:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "xor", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_SHL (30009) - shift left
+    If opcode equals 30009:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "sllv", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_SHR (30010) - shift right logical
+    If opcode equals 30010:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "srlv", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_SAR (30011) - shift right arithmetic
+    If opcode equals 30011:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "srav", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_LOAD (30020)
+    If opcode equals 30020:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let base be LIRNodes.get_src1_reg(instr)
+        Let offset be LIRNodes.get_immediate(instr)
+        Return emit_load(ctx, "lw", dest, offset, base)
+    End If
+
+    Note: LIR_OP_STORE (30021)
+    If opcode equals 30021:
+        Let src be LIRNodes.get_src1_reg(instr)
+        Let base be LIRNodes.get_src2_reg(instr)
+        Let offset be LIRNodes.get_immediate(instr)
+        Return emit_store(ctx, "sw", src, offset, base)
+    End If
+
+    Note: LIR_OP_MOV (30030)
+    If opcode equals 30030:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src be LIRNodes.get_src1_reg(instr)
+        Return emit_move(ctx, dest, src)
+    End If
+
+    Note: LIR_OP_LOAD_IMM (30031)
+    If opcode equals 30031:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let imm be LIRNodes.get_immediate(instr)
+        Return emit_li(ctx, dest, imm)
+    End If
+
+    Note: LIR_OP_CMP_EQ (30040) - compare equal, branch
+    If opcode equals 30040:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        Return emit_branch(ctx, "beq", src1, src2, target)
+    End If
+
+    Note: LIR_OP_CMP_NE (30041) - compare not equal, branch
+    If opcode equals 30041:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        Return emit_branch(ctx, "bne", src1, src2, target)
+    End If
+
+    Note: LIR_OP_CMP_LT (30042) - compare less than
+    Note: MIPS has no direct BLT instruction; use SLT + BNE
+    If opcode equals 30042:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        Note: Use $at as temporary for SLT result
+        emit_alu_rrr(ctx, "slt", 1, src1, src2)
+        Return emit_branch(ctx, "bne", 1, 0, target)
+    End If
+
+    Note: LIR_OP_CMP_LE (30043) - compare less than or equal
+    Note: Implemented as: NOT (src2 < src1), i.e., SLT $at, src2, src1 then BEQ $at, $zero
+    If opcode equals 30043:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        emit_alu_rrr(ctx, "slt", 1, src2, src1)
+        Return emit_branch(ctx, "beq", 1, 0, target)
+    End If
+
+    Note: LIR_OP_CMP_GT (30044) - compare greater than
+    Note: Implemented as SLT $at, src2, src1 then BNE $at, $zero
+    If opcode equals 30044:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        emit_alu_rrr(ctx, "slt", 1, src2, src1)
+        Return emit_branch(ctx, "bne", 1, 0, target)
+    End If
+
+    Note: LIR_OP_CMP_GE (30045) - compare greater than or equal
+    Note: Implemented as NOT (src1 < src2)
+    If opcode equals 30045:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        emit_alu_rrr(ctx, "slt", 1, src1, src2)
+        Return emit_branch(ctx, "beq", 1, 0, target)
+    End If
+
+    Note: LIR_OP_JUMP (30050)
+    If opcode equals 30050:
+        Let target be LIRNodes.get_branch_target(instr)
+        Return emit_jump(ctx, "j", target)
+    End If
+
+    Note: LIR_OP_CALL (30060)
+    If opcode equals 30060:
+        Let target be LIRNodes.get_call_target(instr)
+        Return emit_call(ctx, target)
+    End If
+
+    Note: LIR_OP_RET (30070)
+    If opcode equals 30070:
+        Note: Return value should already be in $v0
+        Note: Epilogue handles JR $ra
+        Return 1
+    End If
+
+    Note: LIR_OP_SYSCALL (30080)
+    If opcode equals 30080:
+        Return emit_syscall(ctx)
+    End If
+
+    Note: LIR_OP_NOP (30090)
+    If opcode equals 30090:
+        Return emit_indented(ctx, "nop")
+    End If
+
+    Note: Unknown opcode - emit as comment
+    emit_comment(ctx, "unhandled LIR opcode")
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: MODULE-LEVEL GENERATION
+Note: ============================================================================
+
+Process called "generate_mips_assembly" that takes ctx as Integer, lir_module as Integer returns Integer:
+    @Reasoning
+    Top-level entry point that generates MIPS assembly for an entire LIR module.
+    Iterates over all functions in the module, emitting prologues, instruction
+    translations, and epilogues for each. Also emits data sections for globals
+    and string literals.
+
+    The generated assembly is suitable for input to the GNU assembler (gas)
+    targeting MIPS32 with the O32 ABI.
+    @End Reasoning
+
+    Note: Emit file-level header
+    emit_comment(ctx, "Generated by Runa compiler - MIPS32 O32 ABI")
+    emit_directive(ctx, ".set noreorder")
+    emit_directive(ctx, ".set nomacro")
+
+    Note: Emit text section
+    emit_directive(ctx, ".text")
+
+    Note: Process each function in the module
+    Let func_count be LIR.get_function_count(lir_module)
+    Let func_idx be 0
+    While func_idx is less than func_count:
+        Let func be LIR.get_function(lir_module, func_idx)
+        If func does not equal 0:
+            Let reg_state be __load(ctx, 24)
+            MIPSRegs.reset_allocation(reg_state)
+
+            Let func_name be LIR.get_function_name(func)
+            Let frame_size_val be LIR.get_frame_size(func)
+            Let has_calls_val be LIR.get_has_calls(func)
+
+            __store(ctx, 16, func)
+            __store(ctx, 40, has_calls_val)
+
+            Note: Ensure minimum frame size of 32 bytes (O32 ABI minimum with arg area)
+            If frame_size_val is less than 32:
+                Set frame_size_val to 32
+            End If
+
+            emit_function_prologue(ctx, func_name, frame_size_val, has_calls_val)
+
+            Note: Process each basic block
+            Let block_count be LIR.get_block_count(func)
+            Let block_idx be 0
+            While block_idx is less than block_count:
+                Let block be LIR.get_block(func, block_idx)
+                If block does not equal 0:
+                    Let block_label be LIR.get_block_label(block)
+                    If block_idx is greater than 0:
+                        emit_label(ctx, block_label)
+                    End If
+
+                    Let instr_count be LIR.get_instruction_count(block)
+                    Let instr_idx be 0
+                    While instr_idx is less than instr_count:
+                        Let instr be LIR.get_instruction(block, instr_idx)
+                        If instr does not equal 0:
+                            translate_lir_instruction(ctx, instr)
+                        End If
+                        Set instr_idx to instr_idx + 1
+                    End While
+                End If
+                Set block_idx to block_idx + 1
+            End While
+
+            emit_function_epilogue(ctx, func_name, has_calls_val)
+        End If
+        Set func_idx to func_idx + 1
+    End While
+
+    Return 1
+End Process

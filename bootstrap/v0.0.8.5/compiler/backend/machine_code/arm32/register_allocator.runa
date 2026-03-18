@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,683 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles ARM32 register allocation and register management.
+ARM32 Register Allocator - Architecture-Specific Constraint Resolution
 
-This file performs the following tasks:
-- Process ARM32 register allocation and register management
-- Handle ARM32 register constraints and register usage optimization
-- Manage ARM32 register spilling and register optimization
-- Process ARM32 register-based operations and register optimization
+Resolves ARM32 register allocation constraints after middle-end graph coloring.
+ARM32 has 16 general-purpose registers (R0-R15) where R13=SP, R14=LR, R15=PC
+are reserved, leaving R0-R12 for allocation.
 
-This file is essential because of the following reasons:
-- ARM32 register management is crucial for efficient ARM32 code generation
-- Proper register handling ensures optimal ARM32 CPU resource utilization
-- ARM32 support enables Runa compilation for ARM32 platforms
+ARM32 is a three-address architecture (unlike x86 two-address), so most
+instructions naturally support dest, src1, src2 form. However, there are
+specific constraints:
+- AAPCS calling convention: R0-R3 for arguments, R0-R1 for return values
+- R4-R11 are callee-saved
+- R12 (IP) is an intra-procedure-call scratch register
+- MUL/MLA: destination must differ from first operand on some ARM variants
+- SMULL/UMULL: use register pairs for 64-bit results
 
-This file consists of the following functions/features/operation types:
-- ARM32 register allocation and register management
-- ARM32 register constraints and register usage optimization
-- ARM32 register spilling and register optimization
-- ARM32 register-based operations and register optimization
+Dependencies:
+- Imports LIR types for function, block, and instruction structures
+- Imports LIRNodes for operand creation and instruction construction
+- Imports memory/layout.runa for OWNED HEAP allocation (Tier 3)
+- Imports list.runa for collection manipulation
 :End Note
 
-Note: TODO - Implement ARM32 register allocator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: ARM32 Register Constants
+Note: ============================================================================
+
+Constant REG_R0 as Integer is 0
+Constant REG_R1 as Integer is 1
+Constant REG_R2 as Integer is 2
+Constant REG_R3 as Integer is 3
+Constant REG_R4 as Integer is 4
+Constant REG_R5 as Integer is 5
+Constant REG_R6 as Integer is 6
+Constant REG_R7 as Integer is 7
+Constant REG_R8 as Integer is 8
+Constant REG_R9 as Integer is 9
+Constant REG_R10 as Integer is 10
+Constant REG_R11 as Integer is 11
+Constant REG_R12 as Integer is 12        Note: IP (intra-procedure-call scratch)
+Constant REG_SP as Integer is 13         Note: Stack Pointer
+Constant REG_LR as Integer is 14         Note: Link Register (return address)
+Constant REG_PC as Integer is 15         Note: Program Counter
+
+Note: Aliases
+Constant REG_FP as Integer is 11         Note: Frame Pointer (R11)
+Constant REG_IP as Integer is 12         Note: Intra-procedure-call scratch
+
+Note: Total registers and allocatable count
+Constant ARM32_GPR_COUNT as Integer is 16
+Constant ARM32_ALLOCATABLE_COUNT as Integer is 13   Note: R0-R12
+
+Note: ============================================================================
+Note: LIR Opcode Constants (mirrored from LIR for local convenience)
+Note: ============================================================================
+
+Constant OP_MOV as Integer is 30001
+Constant OP_ADD as Integer is 30100
+Constant OP_SUB as Integer is 30101
+Constant OP_IMUL as Integer is 30102
+Constant OP_IDIV as Integer is 30103
+Constant OP_MUL as Integer is 30104
+Constant OP_DIV as Integer is 30105
+Constant OP_NEG as Integer is 30106
+Constant OP_AND as Integer is 30200
+Constant OP_OR as Integer is 30201
+Constant OP_XOR as Integer is 30202
+Constant OP_NOT as Integer is 30203
+Constant OP_SHL as Integer is 30300
+Constant OP_SHR as Integer is 30301
+Constant OP_SAR as Integer is 30302
+Constant OP_CALL as Integer is 30520
+
+Note: ============================================================================
+Note: Constraint Type Constants
+Note: ============================================================================
+
+@Reasoning
+ARM32 constraints are different from x86:
+- ARM32 is three-address, so no two-address fixup needed for most instructions
+- Division on ARM32 (without hardware divide): requires library call (__aeabi_idiv)
+- MUL restriction: on ARMv5 and earlier, Rd must differ from Rm (first operand)
+- Calling convention: R0-R3 for arguments, R0-R1 for return
+- SMULL/UMULL: 64-bit result in two registers (RdLo, RdHi), must be distinct
+@End Reasoning
+
+Constant CONSTRAINT_FIXED_REG as Integer is 1       Note: Operand must be in specific register
+Constant CONSTRAINT_CLOBBER as Integer is 2          Note: Instruction clobbers specific registers
+Constant CONSTRAINT_MUL_DISTINCT as Integer is 3     Note: MUL dest must differ from first operand
+Constant CONSTRAINT_CALL_ARGS as Integer is 4        Note: Arguments in R0-R3
+Constant CONSTRAINT_CALL_RETURN as Integer is 5      Note: Return value in R0
+
+Note: ============================================================================
+Note: ARM32AllocConstraint Type Definition
+Note: ============================================================================
+
+Type called "ARM32AllocConstraint":
+    instruction_index as Integer
+    constraint_type as Integer
+    required_register as Integer
+    operand_index as Integer
+    block_index as Integer
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per ARM32AllocConstraint
+
+Note: ============================================================================
+Note: Register Information Queries
+Note: ============================================================================
+
+Process called "is_allocatable_register" that takes reg_id as Integer returns Integer:
+    Note: Returns 1 if the register is available for general allocation
+    Note: SP (13), LR (14), PC (15) are reserved
+    If reg_id < 0:
+        Return 0
+    End If
+    If reg_id > 12:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "is_callee_saved" that takes reg_id as Integer returns Integer:
+    Note: AAPCS: R4-R11 are callee-saved
+    If reg_id >= 4:
+        If reg_id <= 11:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "is_caller_saved" that takes reg_id as Integer returns Integer:
+    Note: AAPCS: R0-R3, R12 are caller-saved (scratch)
+    If reg_id >= 0:
+        If reg_id <= 3:
+            Return 1
+        End If
+    End If
+    If reg_id is 12:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "is_argument_register" that takes reg_id as Integer returns Integer:
+    Note: AAPCS: R0-R3 are used for first 4 integer arguments
+    If reg_id >= 0:
+        If reg_id <= 3:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "get_allocatable_registers" returns Integer:
+    Note: Returns a List of allocatable register IDs for ARM32
+    Note: Order: scratch first (R0-R3, R12), then callee-saved (R4-R11)
+    Let regs be List.list_create(16)
+    If regs is 0:
+        Return 0
+    End If
+    Note: Scratch registers (no save/restore cost)
+    List.list_append(regs, REG_R0)
+    List.list_append(regs, REG_R1)
+    List.list_append(regs, REG_R2)
+    List.list_append(regs, REG_R3)
+    List.list_append(regs, REG_R12)
+    Note: Callee-saved registers
+    List.list_append(regs, REG_R4)
+    List.list_append(regs, REG_R5)
+    List.list_append(regs, REG_R6)
+    List.list_append(regs, REG_R7)
+    List.list_append(regs, REG_R8)
+    List.list_append(regs, REG_R9)
+    List.list_append(regs, REG_R10)
+    List.list_append(regs, REG_R11)
+    Return regs
+End Process
+
+Note: ============================================================================
+Note: Virtual-to-Physical Register Mapping
+Note: ============================================================================
+
+Process called "map_virtual_to_physical" that takes virtual_reg as Integer returns Integer:
+    Note: Maps LIR virtual register IDs to ARM32 physical registers
+    Note: Returns -1 if the virtual register must be spilled
+    If virtual_reg < 0:
+        Return 0 - 1
+    End If
+    If virtual_reg <= 12:
+        Return virtual_reg
+    End If
+    Return 0 - 1
+End Process
+
+Note: ============================================================================
+Note: Constraint Collection
+Note: ============================================================================
+
+@Reasoning
+ARM32 has fewer architectural constraints than x86:
+1. Three-address form means no two-address fixups needed
+2. MUL restriction: on some ARM variants, Rd != Rm for MUL Rd, Rm, Rs
+3. Division: ARM32 may lack hardware IDIV; uses __aeabi_idiv library call
+4. Call convention: arguments must be in R0-R3 before CALL instructions
+5. Return values must be moved from R0 after CALL instructions
+
+The constraint collector scans for MUL and CALL instructions only,
+as most ARM32 ALU instructions have no register restrictions.
+@End Reasoning
+
+Process called "collect_arm32_constraints" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let constraints be List.list_create(32)
+    If constraints is 0:
+        Return 0
+    End If
+
+    Let blocks be __load(lir_function, 32)
+    Let block_count be __load(lir_function, 40)
+
+    If blocks is 0:
+        Return constraints
+    End If
+    If block_count is 0:
+        Return constraints
+    End If
+
+    Let b be 0
+    While b < block_count:
+        Let block be List.list_get(blocks, b)
+        If block is not 0:
+            Let instructions be __load(block, 16)
+            Let inst_count be __load(block, 24)
+
+            If instructions is not 0:
+                Let i be 0
+                While i < inst_count:
+                    Let instruction be List.list_get(instructions, i)
+                    If instruction is not 0:
+                        Let opcode be __load(instruction, 0)
+
+                        Note: MUL restriction: dest must differ from first operand
+                        If opcode is OP_MUL:
+                            Let c be create_constraint(i, CONSTRAINT_MUL_DISTINCT, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+                        If opcode is OP_IMUL:
+                            Let c be create_constraint(i, CONSTRAINT_MUL_DISTINCT, 0 - 1, 0, b)
+                            List.list_append(constraints, c)
+                        End If
+
+                        Note: CALL: arguments must be in R0-R3
+                        If opcode is OP_CALL:
+                            Let c be create_constraint(i, CONSTRAINT_CALL_ARGS, REG_R0, 1, b)
+                            List.list_append(constraints, c)
+                        End If
+
+                        Note: Division uses library call on most ARM32 variants
+                        If opcode is OP_IDIV:
+                            Note: __aeabi_idiv takes dividend in R0, divisor in R1, returns in R0
+                            Let c1 be create_constraint(i, CONSTRAINT_FIXED_REG, REG_R0, 1, b)
+                            List.list_append(constraints, c1)
+                            Let c2 be create_constraint(i, CONSTRAINT_FIXED_REG, REG_R1, 2, b)
+                            List.list_append(constraints, c2)
+                        End If
+                        If opcode is OP_DIV:
+                            Let c1 be create_constraint(i, CONSTRAINT_FIXED_REG, REG_R0, 1, b)
+                            List.list_append(constraints, c1)
+                            Let c2 be create_constraint(i, CONSTRAINT_FIXED_REG, REG_R1, 2, b)
+                            List.list_append(constraints, c2)
+                        End If
+                    End If
+
+                    Set i to i + 1
+                End While
+            End If
+        End If
+
+        Set b to b + 1
+    End While
+
+    Return constraints
+End Process
+
+Note: ============================================================================
+Note: Internal Helpers
+Note: ============================================================================
+
+Process called "create_constraint" that takes inst_idx as Integer, ctype as Integer, req_reg as Integer, op_idx as Integer, blk_idx as Integer returns Integer:
+    Let c be Layout.allocate(40)
+    If c is 0:
+        Return 0
+    End If
+    __store(c, 0, inst_idx)
+    __store(c, 8, ctype)
+    __store(c, 16, req_reg)
+    __store(c, 24, op_idx)
+    __store(c, 32, blk_idx)
+    Return c
+End Process
+
+Note: ============================================================================
+Note: Register Copy Insertion
+Note: ============================================================================
+
+Process called "insert_register_copy" that takes block as Integer, before_index as Integer, dest_reg as Integer, src_reg as Integer, size as Integer returns Integer:
+    If block is 0:
+        Return 0
+    End If
+    If dest_reg is src_reg:
+        Return 1
+    End If
+
+    Let mov_instruction be LIRNodes.create_lir_instruction(OP_MOV)
+    If mov_instruction is 0:
+        Return 0
+    End If
+
+    Let dest_operand be LIRNodes.create_register_operand(dest_reg, size)
+    If dest_operand is 0:
+        Return 0
+    End If
+
+    Let src_operand be LIRNodes.create_register_operand(src_reg, size)
+    If src_operand is 0:
+        Return 0
+    End If
+
+    __store(mov_instruction, 8, dest_operand)
+    __store(mov_instruction, 16, src_operand)
+    __store(mov_instruction, 48, block)
+
+    Let instructions be __load(block, 16)
+    If instructions is 0:
+        Return 0
+    End If
+
+    List.list_insert_at(instructions, before_index, mov_instruction)
+
+    Let inst_count be __load(block, 24)
+    __store(block, 24, inst_count + 1)
+
+    Let new_count be inst_count + 1
+    Let idx be before_index
+    While idx < new_count:
+        Let inst be List.list_get(instructions, idx)
+        If inst is not 0:
+            __store(inst, 64, idx)
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MUL Distinct Constraint Resolution
+Note: ============================================================================
+
+@Reasoning
+On ARMv5 and earlier, MUL Rd, Rm, Rs requires Rd != Rm.
+If the destination register equals the first source, we swap the operands
+(MUL is commutative) or insert a MOV to a temporary register.
+@End Reasoning
+
+Process called "handle_mul_distinct" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer returns Integer:
+    If instruction is 0:
+        Return 0
+    End If
+    If block is 0:
+        Return 0
+    End If
+
+    Let result_ptr be __load(instruction, 8)
+    Let operand1_ptr be __load(instruction, 16)
+    Let operand2_ptr be __load(instruction, 24)
+
+    If result_ptr is 0:
+        Return 0
+    End If
+    If operand1_ptr is 0:
+        Return 0
+    End If
+
+    Let result_type be __load(result_ptr, 0)
+    Let op1_type be __load(operand1_ptr, 0)
+    If result_type is not 1:
+        Return 0
+    End If
+    If op1_type is not 1:
+        Return 0
+    End If
+
+    Let dest_reg be __load(result_ptr, 8)
+    Let src1_reg be __load(operand1_ptr, 8)
+
+    Note: If dest != src1, constraint is satisfied
+    If dest_reg is not src1_reg:
+        Return 0
+    End If
+
+    Note: Try swapping operands since MUL is commutative
+    If operand2_ptr is not 0:
+        Let op2_type be __load(operand2_ptr, 0)
+        If op2_type is 1:
+            Let src2_reg be __load(operand2_ptr, 8)
+            If dest_reg is not src2_reg:
+                Note: Swap operand1 and operand2
+                __store(instruction, 16, operand2_ptr)
+                __store(instruction, 24, operand1_ptr)
+                Return 0
+            End If
+        End If
+    End If
+
+    Note: Both operands are the same as dest; use R12 (IP) as temp
+    Let success be insert_register_copy(block, inst_index, REG_IP, src1_reg, 4)
+    If success is 1:
+        __store(operand1_ptr, 8, REG_IP)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Division Constraint Resolution
+Note: ============================================================================
+
+@Reasoning
+ARM32 without hardware divide uses __aeabi_idiv (signed) or __aeabi_uidiv (unsigned).
+Arguments: dividend in R0, divisor in R1
+Return: quotient in R0, remainder in R1 (for __aeabi_idivmod)
+
+We insert MOV instructions to place dividend in R0 and divisor in R1, then
+replace the IDIV/DIV instruction with a BL __aeabi_idiv/__aeabi_uidiv call.
+@End Reasoning
+
+Process called "handle_division_constraint" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer returns Integer:
+    If instruction is 0:
+        Return 0
+    End If
+    If block is 0:
+        Return 0
+    End If
+
+    Let opcode be __load(instruction, 0)
+    Let result_ptr be __load(instruction, 8)
+    Let operand1_ptr be __load(instruction, 16)
+    Let operand2_ptr be __load(instruction, 24)
+
+    Let inserted_count be 0
+
+    Note: Move dividend to R0
+    If operand1_ptr is not 0:
+        Let op1_type be __load(operand1_ptr, 0)
+        If op1_type is 1:
+            Let dividend_reg be __load(operand1_ptr, 8)
+            If dividend_reg is not REG_R0:
+                Let s be insert_register_copy(block, inst_index + inserted_count, REG_R0, dividend_reg, 4)
+                If s is 1:
+                    Set inserted_count to inserted_count + 1
+                End If
+            End If
+        End If
+    End If
+
+    Note: Move divisor to R1
+    If operand2_ptr is not 0:
+        Let op2_type be __load(operand2_ptr, 0)
+        If op2_type is 1:
+            Let divisor_reg be __load(operand2_ptr, 8)
+            If divisor_reg is not REG_R1:
+                Let s be insert_register_copy(block, inst_index + inserted_count, REG_R1, divisor_reg, 4)
+                If s is 1:
+                    Set inserted_count to inserted_count + 1
+                End If
+            End If
+        End If
+    End If
+
+    Note: After the call, result is in R0. If dest != R0, insert MOV.
+    If result_ptr is not 0:
+        Let result_type be __load(result_ptr, 0)
+        If result_type is 1:
+            Let dest_reg be __load(result_ptr, 8)
+            If dest_reg is not REG_R0:
+                Let after_idx be inst_index + inserted_count + 1
+                Let s be insert_register_copy(block, after_idx, dest_reg, REG_R0, 4)
+                If s is 1:
+                    Set inserted_count to inserted_count + 1
+                End If
+            End If
+        End If
+    End If
+
+    Note: Reindex instructions
+    Let instructions be __load(block, 16)
+    Let total_count be __load(block, 24)
+    Let idx be inst_index
+    While idx < total_count:
+        Let inst be List.list_get(instructions, idx)
+        If inst is not 0:
+            __store(inst, 64, idx)
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return inserted_count
+End Process
+
+Note: ============================================================================
+Note: Complete Constraint Resolution Pass
+Note: ============================================================================
+
+Process called "resolve_arm32_constraints" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let constraints be collect_arm32_constraints(lir_function)
+    If constraints is 0:
+        Return 0
+    End If
+
+    Let constraint_count be List.list_length(constraints)
+    If constraint_count is 0:
+        Return 1
+    End If
+
+    Note: Process constraints in reverse order
+    Let ci be constraint_count - 1
+    While ci >= 0:
+        Let constraint be List.list_get(constraints, ci)
+        If constraint is not 0:
+            Let inst_idx be __load(constraint, 0)
+            Let ctype be __load(constraint, 8)
+            Let blk_idx be __load(constraint, 32)
+
+            Let blocks be __load(lir_function, 32)
+            Let block be List.list_get(blocks, blk_idx)
+            If block is not 0:
+                Let instructions be __load(block, 16)
+                Let instruction be List.list_get(instructions, inst_idx)
+                If instruction is not 0:
+                    If ctype is CONSTRAINT_MUL_DISTINCT:
+                        handle_mul_distinct(lir_function, instruction, block, inst_idx)
+                    End If
+                    If ctype is CONSTRAINT_FIXED_REG:
+                        Let req_reg be __load(constraint, 16)
+                        Let op_idx be __load(constraint, 24)
+                        handle_fixed_reg_constraint(instruction, block, inst_idx, req_reg, op_idx)
+                    End If
+                    If ctype is CONSTRAINT_CALL_ARGS:
+                        handle_call_args_constraint(lir_function, instruction, block, inst_idx)
+                    End If
+                End If
+            End If
+        End If
+        Set ci to ci - 1
+    End While
+
+    Note: Coalesce redundant moves
+    coalesce_moves(lir_function)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Fixed Register and Call Argument Constraint Handlers
+Note: ============================================================================
+
+Process called "handle_fixed_reg_constraint" that takes instruction as Integer, block as Integer, inst_index as Integer, required_reg as Integer, operand_index as Integer returns Integer:
+    Note: Moves the specified operand into the required physical register
+    Let operand_offset be 16 + (operand_index * 8)
+    If operand_index is 0:
+        Set operand_offset to 8
+    End If
+
+    Let operand_ptr be __load(instruction, operand_offset)
+    If operand_ptr is 0:
+        Return 0
+    End If
+
+    Let op_type be __load(operand_ptr, 0)
+    If op_type is not 1:
+        Return 0
+    End If
+
+    Let current_reg be __load(operand_ptr, 8)
+    If current_reg is required_reg:
+        Return 0
+    End If
+
+    Let success be insert_register_copy(block, inst_index, required_reg, current_reg, 4)
+    If success is 1:
+        __store(operand_ptr, 8, required_reg)
+    End If
+    Return success
+End Process
+
+Process called "handle_call_args_constraint" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer returns Integer:
+    Note: Moves call arguments into R0-R3 as required by AAPCS
+    Note: Arguments beyond 4 are pushed onto the stack
+    Note: This is handled at a higher level during instruction selection
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Move Coalescing
+Note: ============================================================================
+
+Process called "coalesce_moves" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let blocks be __load(lir_function, 32)
+    Let block_count be __load(lir_function, 40)
+    If blocks is 0:
+        Return 0
+    End If
+
+    Let removed_count be 0
+    Let b be 0
+    While b < block_count:
+        Let block be List.list_get(blocks, b)
+        If block is not 0:
+            Let instructions be __load(block, 16)
+            Let inst_count be __load(block, 24)
+            If instructions is not 0:
+                Let i be inst_count - 1
+                While i >= 0:
+                    Let inst be List.list_get(instructions, i)
+                    If inst is not 0:
+                        Let opcode be __load(inst, 0)
+                        If opcode is OP_MOV:
+                            Let result_ptr be __load(inst, 8)
+                            Let operand1_ptr be __load(inst, 16)
+                            If result_ptr is not 0:
+                                If operand1_ptr is not 0:
+                                    Let r_type be __load(result_ptr, 0)
+                                    Let o_type be __load(operand1_ptr, 0)
+                                    If r_type is 1:
+                                        If o_type is 1:
+                                            Let r_reg be __load(result_ptr, 8)
+                                            Let o_reg be __load(operand1_ptr, 8)
+                                            If r_reg is o_reg:
+                                                List.list_remove_at(instructions, i)
+                                                Let new_count be __load(block, 24)
+                                                __store(block, 24, new_count - 1)
+                                                Set removed_count to removed_count + 1
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set i to i - 1
+                End While
+            End If
+        End If
+        Set b to b + 1
+    End While
+
+    Return removed_count
+End Process

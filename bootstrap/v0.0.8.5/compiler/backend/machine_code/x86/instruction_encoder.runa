@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1107 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles x86 instruction encoding and instruction processing.
+x86 (IA-32) Instruction Encoder - Binary Machine Code Encoding
 
-This file performs the following tasks:
-- Process x86 instruction encoding and instruction generation
-- Handle x86 instruction optimization and instruction selection
-- Manage x86 instruction scheduling and instruction reordering
-- Process x86 instruction validation and instruction verification
+Encodes x86 32-bit instructions into binary machine code bytes. No REX prefix
+(that is x86_64 only). 32-bit addressing mode with ModR/M and optional SIB byte.
+Produces bytes suitable for direct object file emission or binary output.
 
-This file is essential because of the following reasons:
-- x86 instruction processing enables native x86 code generation
-- Proper instruction handling ensures correct and efficient x86 code
-- x86 support enables Runa compilation for x86 platforms
+x86 32-bit instruction format:
+  [Legacy Prefixes] [Opcode (1-3 bytes)] [ModR/M] [SIB] [Displacement] [Immediate]
 
-This file consists of the following functions/features/operation types:
-- x86 instruction encoding and instruction generation
-- x86 instruction optimization and instruction selection
-- x86 instruction scheduling and instruction reordering
-- x86 instruction validation and instruction verification
+No REX prefix exists on IA-32. Register encodings use 3-bit fields (0-7).
+ModR/M byte: [mod(2)|reg(3)|rm(3)]
+SIB byte:    [scale(2)|index(3)|base(3)]
+
+Dependencies:
+- Imports LIR types for instruction definitions
+- Imports LIRNodes for operand type checking
+- Imports machine_code_interface for BinaryOutput buffer management
+- Imports memory/layout.runa for allocation
 :End Note
 
-Note: TODO - Implement x86 instruction encoder functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: x86 32-bit Register Encoding Constants
+Note: ============================================================================
+
+@Reasoning
+x86 32-bit uses 3-bit register encoding in ModR/M and SIB bytes.
+Only 8 registers available (0-7), mapping directly to the encoding field.
+No REX prefix means no access to registers 8-15.
+@End Reasoning
+
+Constant ENC_EAX as Integer is 0
+Constant ENC_ECX as Integer is 1
+Constant ENC_EDX as Integer is 2
+Constant ENC_EBX as Integer is 3
+Constant ENC_ESP as Integer is 4
+Constant ENC_EBP as Integer is 5
+Constant ENC_ESI as Integer is 6
+Constant ENC_EDI as Integer is 7
+
+Note: ============================================================================
+Note: ModR/M Addressing Mode Constants
+Note: ============================================================================
+
+Constant MOD_INDIRECT as Integer is 0         Note: [reg] (register indirect)
+Constant MOD_DISP8 as Integer is 1            Note: [reg + disp8]
+Constant MOD_DISP32 as Integer is 2           Note: [reg + disp32]
+Constant MOD_REGISTER as Integer is 3         Note: reg (register direct)
+
+Note: SIB scale factors
+Constant SIB_SCALE_1 as Integer is 0          Note: *1
+Constant SIB_SCALE_2 as Integer is 1          Note: *2
+Constant SIB_SCALE_4 as Integer is 2          Note: *4
+Constant SIB_SCALE_8 as Integer is 3          Note: *8
+
+Note: ============================================================================
+Note: Encoder Context
+Note: ============================================================================
+
+Type called "X86EncoderContext":
+    output as Integer              Note: Pointer to BinaryOutput
+    code_buffer as Integer         Note: Local byte buffer for current instruction
+    code_pos as Integer            Note: Current position in code_buffer
+    buffer_capacity as Integer     Note: Capacity of code_buffer
+End Type
+
+Note: Size: 4 fields * 8 bytes = 32 bytes
+
+Process called "create_encoder_context" that takes output as Integer returns Integer:
+    Note: Creates a new encoder context with a 16-byte instruction buffer
+    Let ctx be Layout.allocate(32)
+    If ctx is 0:
+        Return 0
+    End If
+    __store(ctx, 0, output)
+    Let buf be Layout.allocate(16)
+    If buf is 0:
+        Return 0
+    End If
+    __store(ctx, 8, buf)
+    __store(ctx, 16, 0)
+    __store(ctx, 24, 16)
+    Return ctx
+End Process
+
+Process called "encoder_reset" that takes ctx as Integer returns Integer:
+    Note: Resets the instruction buffer position for a new instruction
+    If ctx is 0:
+        Return 0
+    End If
+    __store(ctx, 16, 0)
+    Return 1
+End Process
+
+Process called "encoder_emit_byte" that takes ctx as Integer, byte_val as Integer returns Integer:
+    Note: Appends a byte to the instruction buffer
+    If ctx is 0:
+        Return 0
+    End If
+    Let buf be __load(ctx, 8)
+    Let pos be __load(ctx, 16)
+    Let cap be __load(ctx, 24)
+    If pos >= cap:
+        Return 0
+    End If
+    __store8(buf, pos, byte_val & 255)
+    __store(ctx, 16, pos + 1)
+    Return 1
+End Process
+
+Process called "encoder_flush" that takes ctx as Integer returns Integer:
+    Note: Flushes the instruction buffer to the BinaryOutput
+    If ctx is 0:
+        Return 0
+    End If
+    Let output be __load(ctx, 0)
+    Let buf be __load(ctx, 8)
+    Let pos be __load(ctx, 16)
+    Let i be 0
+    While i < pos:
+        Let b be __load8(buf, i)
+        MachineCode.binary_emit_byte(output, b)
+        Set i to i + 1
+    End While
+    __store(ctx, 16, 0)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Register Encoding
+Note: ============================================================================
+
+Process called "encode_register" that takes reg_id as Integer returns Integer:
+    Note: Converts internal register ID to x86 encoding (3-bit value 0-7)
+    Note: x86 32-bit has a direct 1:1 mapping for registers 0-7
+    If reg_id < 0:
+        Return 0
+    End If
+    If reg_id > 7:
+        Return 0
+    End If
+    Return reg_id & 7
+End Process
+
+Note: ============================================================================
+Note: ModR/M Byte Construction
+Note: ============================================================================
+
+@Reasoning
+The ModR/M byte encodes the addressing mode and register operands.
+Layout: [mod(2)|reg/opcode(3)|rm(3)]
+
+mod: 00 = [rm], 01 = [rm+disp8], 10 = [rm+disp32], 11 = rm (register)
+reg: register operand or opcode extension
+rm:  register operand or memory base
+
+Special cases:
+- rm=4 (ESP encoding) requires SIB byte in memory modes
+- rm=5 (EBP encoding) with mod=00 means [disp32] (no base register)
+@End Reasoning
+
+Process called "build_modrm" that takes mod_val as Integer, reg_val as Integer, rm_val as Integer returns Integer:
+    Note: Constructs a ModR/M byte from mod, reg, and rm fields
+    Let result be ((mod_val & 3) * 64) + ((reg_val & 7) * 8) + (rm_val & 7)
+    Return result & 255
+End Process
+
+Process called "build_sib" that takes scale as Integer, index as Integer, base as Integer returns Integer:
+    Note: Constructs a SIB byte from scale, index, and base fields
+    Let result be ((scale & 3) * 64) + ((index & 7) * 8) + (base & 7)
+    Return result & 255
+End Process
+
+Note: ============================================================================
+Note: Displacement Encoding
+Note: ============================================================================
+
+Process called "fits_in_disp8" that takes value as Integer returns Integer:
+    Note: Returns 1 if the value fits in a signed 8-bit displacement (-128 to 127)
+    If value >= 0 - 128:
+        If value <= 127:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "emit_displacement" that takes ctx as Integer, disp as Integer, size as Integer returns Integer:
+    Note: Emits displacement bytes (1 or 4 bytes)
+    If size is 1:
+        encoder_emit_byte(ctx, disp & 255)
+        Return 1
+    End If
+    If size is 4:
+        encoder_emit_byte(ctx, disp & 255)
+        encoder_emit_byte(ctx, (disp / 256) & 255)
+        encoder_emit_byte(ctx, (disp / 65536) & 255)
+        encoder_emit_byte(ctx, (disp / 16777216) & 255)
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "emit_immediate32" that takes ctx as Integer, imm as Integer returns Integer:
+    Note: Emits a 32-bit immediate value in little-endian order
+    encoder_emit_byte(ctx, imm & 255)
+    encoder_emit_byte(ctx, (imm / 256) & 255)
+    encoder_emit_byte(ctx, (imm / 65536) & 255)
+    encoder_emit_byte(ctx, (imm / 16777216) & 255)
+    Return 1
+End Process
+
+Process called "emit_immediate16" that takes ctx as Integer, imm as Integer returns Integer:
+    Note: Emits a 16-bit immediate value in little-endian order
+    encoder_emit_byte(ctx, imm & 255)
+    encoder_emit_byte(ctx, (imm / 256) & 255)
+    Return 1
+End Process
+
+Process called "emit_immediate8" that takes ctx as Integer, imm as Integer returns Integer:
+    Note: Emits an 8-bit immediate value
+    encoder_emit_byte(ctx, imm & 255)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Memory Operand Encoding
+Note: ============================================================================
+
+@Reasoning
+Encodes a memory operand into ModR/M + optional SIB + displacement bytes.
+The reg_field parameter is the register or opcode extension for the ModR/M byte.
+
+Memory encoding rules for IA-32:
+1. [disp32] alone: mod=00, rm=5 (EBP encoding)
+2. [base]: mod=00, rm=base_enc (unless base is ESP or EBP)
+3. [base + disp8]: mod=01, rm=base_enc
+4. [base + disp32]: mod=10, rm=base_enc
+5. [base + index*scale]: requires SIB byte, rm=4
+6. [base + index*scale + disp]: SIB + displacement
+7. base=ESP always requires SIB byte (rm=4 triggers SIB)
+8. base=EBP with mod=00 means [disp32], so use mod=01 with disp8=0
+@End Reasoning
+
+Process called "encode_memory_operand" that takes ctx as Integer, reg_field as Integer, base_reg as Integer, index_reg as Integer, scale as Integer, displacement as Integer returns Integer:
+    Note: Encodes memory addressing into ModR/M + optional SIB + displacement
+    Let base_enc be encode_register(base_reg)
+    Let has_index be 0
+    If index_reg is not 0:
+        Set has_index to 1
+    End If
+
+    Note: Determine displacement size needed
+    Let needs_disp be 0
+    Let disp_size be 0
+    If displacement is not 0:
+        Set needs_disp to 1
+        If fits_in_disp8(displacement) is 1:
+            Set disp_size to 1
+        Otherwise:
+            Set disp_size to 4
+        End If
+    End If
+
+    Note: Determine mod field
+    Let mod_val be MOD_INDIRECT
+    If needs_disp is 1:
+        If disp_size is 1:
+            Set mod_val to MOD_DISP8
+        Otherwise:
+            Set mod_val to MOD_DISP32
+        End If
+    End If
+
+    Note: Special case: EBP as base with no displacement needs disp8=0
+    If base_enc is ENC_EBP:
+        If mod_val is MOD_INDIRECT:
+            Set mod_val to MOD_DISP8
+            Set needs_disp to 1
+            Set disp_size to 1
+        End If
+    End If
+
+    Note: Handle no-base case (displacement only)
+    If base_reg is 0:
+        If has_index is 0:
+            Note: [disp32] encoding: mod=00, rm=5
+            Let modrm be build_modrm(MOD_INDIRECT, reg_field, ENC_EBP)
+            encoder_emit_byte(ctx, modrm)
+            emit_immediate32(ctx, displacement)
+            Return 1
+        End If
+    End If
+
+    Note: Determine if SIB byte is needed
+    Let needs_sib be 0
+    If has_index is 1:
+        Set needs_sib to 1
+    End If
+    If base_enc is ENC_ESP:
+        Note: ESP encoding in rm field triggers SIB byte
+        Set needs_sib to 1
+    End If
+
+    If needs_sib is 1:
+        Note: Emit ModR/M with rm=4 (SIB follows)
+        Let modrm be build_modrm(mod_val, reg_field, 4)
+        encoder_emit_byte(ctx, modrm)
+
+        Note: Build SIB byte
+        Let scale_enc be SIB_SCALE_1
+        If scale is 2:
+            Set scale_enc to SIB_SCALE_2
+        End If
+        If scale is 4:
+            Set scale_enc to SIB_SCALE_4
+        End If
+        If scale is 8:
+            Set scale_enc to SIB_SCALE_8
+        End If
+
+        Let index_enc be ENC_ESP
+        If has_index is 1:
+            Set index_enc to encode_register(index_reg)
+        End If
+
+        Let sib be build_sib(scale_enc, index_enc, base_enc)
+        encoder_emit_byte(ctx, sib)
+    Otherwise:
+        Note: Simple ModR/M without SIB
+        Let modrm be build_modrm(mod_val, reg_field, base_enc)
+        encoder_emit_byte(ctx, modrm)
+    End If
+
+    Note: Emit displacement if needed
+    If needs_disp is 1:
+        emit_displacement(ctx, displacement, disp_size)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MOV Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+MOV is the most common instruction. x86 32-bit MOV encodings:
+
+Register-to-register:  89 /r          (MOV r/m32, r32) or 8B /r (MOV r32, r/m32)
+Immediate-to-register: B8+rd id       (MOV r32, imm32)
+Memory-to-register:    8B /r          (MOV r32, r/m32)
+Register-to-memory:    89 /r          (MOV r/m32, r32)
+Immediate-to-memory:   C7 /0 id       (MOV r/m32, imm32)
+@End Reasoning
+
+Process called "encode_mov" that takes ctx as Integer, dest as Integer, src as Integer returns Integer:
+    Note: Encodes a MOV instruction for x86 32-bit
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let dest_type be __load(dest, 0)
+    Let src_type be __load(src, 0)
+
+    Note: Register-to-register: MOV r/m32, r32 (opcode 0x89)
+    If dest_type is 1:
+        If src_type is 1:
+            Let dest_enc be encode_register(__load(dest, 8))
+            Let src_enc be encode_register(__load(src, 8))
+            encoder_emit_byte(ctx, 137)   Note: 0x89
+            Let modrm be build_modrm(MOD_REGISTER, src_enc, dest_enc)
+            encoder_emit_byte(ctx, modrm)
+            encoder_flush(ctx)
+            Return 1
+        End If
+    End If
+
+    Note: Immediate-to-register: MOV r32, imm32 (opcode 0xB8+rd)
+    If dest_type is 1:
+        If src_type is 2:
+            Let dest_enc be encode_register(__load(dest, 8))
+            Let imm_val be __load(src, 16)
+            encoder_emit_byte(ctx, 184 + dest_enc)   Note: 0xB8 + rd
+            emit_immediate32(ctx, imm_val)
+            encoder_flush(ctx)
+            Return 1
+        End If
+    End If
+
+    Note: Memory-to-register: MOV r32, r/m32 (opcode 0x8B)
+    If dest_type is 1:
+        If src_type is 3:
+            Let dest_enc be encode_register(__load(dest, 8))
+            encoder_emit_byte(ctx, 139)   Note: 0x8B
+            Let base be __load(src, 24)
+            Let index be __load(src, 32)
+            Let scale be __load(src, 40)
+            Let disp be __load(src, 48)
+            encode_memory_operand(ctx, dest_enc, base, index, scale, disp)
+            encoder_flush(ctx)
+            Return 1
+        End If
+    End If
+
+    Note: Register-to-memory: MOV r/m32, r32 (opcode 0x89)
+    If dest_type is 3:
+        If src_type is 1:
+            Let src_enc be encode_register(__load(src, 8))
+            encoder_emit_byte(ctx, 137)   Note: 0x89
+            Let base be __load(dest, 24)
+            Let index be __load(dest, 32)
+            Let scale be __load(dest, 40)
+            Let disp be __load(dest, 48)
+            encode_memory_operand(ctx, src_enc, base, index, scale, disp)
+            encoder_flush(ctx)
+            Return 1
+        End If
+    End If
+
+    Note: Immediate-to-memory: MOV r/m32, imm32 (opcode 0xC7 /0)
+    If dest_type is 3:
+        If src_type is 2:
+            Let imm_val be __load(src, 16)
+            encoder_emit_byte(ctx, 199)   Note: 0xC7
+            Let base be __load(dest, 24)
+            Let index be __load(dest, 32)
+            Let scale be __load(dest, 40)
+            Let disp be __load(dest, 48)
+            encode_memory_operand(ctx, 0, base, index, scale, disp)
+            emit_immediate32(ctx, imm_val)
+            encoder_flush(ctx)
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: ADD Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+x86 32-bit ADD encodings:
+Register-to-register:  01 /r     (ADD r/m32, r32)
+Immediate-to-register: 81 /0 id  (ADD r/m32, imm32) or 83 /0 ib (ADD r/m32, imm8)
+Immediate to EAX:      05 id     (ADD EAX, imm32) - short form
+@End Reasoning
+
+Process called "encode_add" that takes ctx as Integer, dest as Integer, src as Integer returns Integer:
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let dest_type be __load(dest, 0)
+    Let src_type be __load(src, 0)
+
+    Note: Register-to-register: ADD r/m32, r32 (opcode 0x01)
+    If dest_type is 1:
+        If src_type is 1:
+            Let dest_enc be encode_register(__load(dest, 8))
+            Let src_enc be encode_register(__load(src, 8))
+            encoder_emit_byte(ctx, 1)   Note: 0x01
+            Let modrm be build_modrm(MOD_REGISTER, src_enc, dest_enc)
+            encoder_emit_byte(ctx, modrm)
+            encoder_flush(ctx)
+            Return 1
+        End If
+    End If
+
+    Note: Immediate-to-register
+    If dest_type is 1:
+        If src_type is 2:
+            Let dest_enc be encode_register(__load(dest, 8))
+            Let imm_val be __load(src, 16)
+
+            Note: Short form for EAX: ADD EAX, imm32 (opcode 0x05)
+            If dest_enc is ENC_EAX:
+                encoder_emit_byte(ctx, 5)
+                emit_immediate32(ctx, imm_val)
+                encoder_flush(ctx)
+                Return 1
+            End If
+
+            Note: ADD r/m32, imm8 (opcode 0x83 /0) if fits in signed byte
+            If fits_in_disp8(imm_val) is 1:
+                encoder_emit_byte(ctx, 131)   Note: 0x83
+                Let modrm be build_modrm(MOD_REGISTER, 0, dest_enc)
+                encoder_emit_byte(ctx, modrm)
+                emit_immediate8(ctx, imm_val)
+                encoder_flush(ctx)
+                Return 1
+            End If
+
+            Note: ADD r/m32, imm32 (opcode 0x81 /0)
+            encoder_emit_byte(ctx, 129)   Note: 0x81
+            Let modrm be build_modrm(MOD_REGISTER, 0, dest_enc)
+            encoder_emit_byte(ctx, modrm)
+            emit_immediate32(ctx, imm_val)
+            encoder_flush(ctx)
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: PUSH / POP Instruction Encoding
+Note: ============================================================================
+
+Process called "encode_push" that takes ctx as Integer, operand as Integer returns Integer:
+    Note: PUSH r32: 50+rd (single byte, register direct)
+    Note: PUSH imm32: 68 id
+    Note: PUSH imm8: 6A ib
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let op_type be __load(operand, 0)
+
+    If op_type is 1:
+        Note: PUSH register: 50+rd
+        Let reg_enc be encode_register(__load(operand, 8))
+        encoder_emit_byte(ctx, 80 + reg_enc)   Note: 0x50 + rd
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    If op_type is 2:
+        Note: PUSH immediate
+        Let imm_val be __load(operand, 16)
+        If fits_in_disp8(imm_val) is 1:
+            encoder_emit_byte(ctx, 106)   Note: 0x6A
+            emit_immediate8(ctx, imm_val)
+        Otherwise:
+            encoder_emit_byte(ctx, 104)   Note: 0x68
+            emit_immediate32(ctx, imm_val)
+        End If
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "encode_pop" that takes ctx as Integer, operand as Integer returns Integer:
+    Note: POP r32: 58+rd (single byte, register direct)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let op_type be __load(operand, 0)
+    If op_type is 1:
+        Let reg_enc be encode_register(__load(operand, 8))
+        encoder_emit_byte(ctx, 88 + reg_enc)   Note: 0x58 + rd
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: CALL and RET Instruction Encoding
+Note: ============================================================================
+
+Process called "encode_call" that takes ctx as Integer, target as Integer returns Integer:
+    Note: CALL rel32: E8 cd (relative displacement, 32-bit)
+    Note: CALL r/m32: FF /2 (indirect call through register)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let target_type be __load(target, 0)
+
+    Note: Direct call with 32-bit relative displacement
+    If target_type is 2:
+        Let offset be __load(target, 16)
+        encoder_emit_byte(ctx, 232)   Note: 0xE8
+        emit_immediate32(ctx, offset)
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Note: Indirect call through register: CALL r/m32 (FF /2)
+    If target_type is 1:
+        Let reg_enc be encode_register(__load(target, 8))
+        encoder_emit_byte(ctx, 255)   Note: 0xFF
+        Let modrm be build_modrm(MOD_REGISTER, 2, reg_enc)
+        encoder_emit_byte(ctx, modrm)
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Note: Indirect call through memory: CALL m32 (FF /2)
+    If target_type is 3:
+        encoder_emit_byte(ctx, 255)   Note: 0xFF
+        Let base be __load(target, 24)
+        Let index be __load(target, 32)
+        Let scale be __load(target, 40)
+        Let disp be __load(target, 48)
+        encode_memory_operand(ctx, 2, base, index, scale, disp)
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "encode_ret" that takes ctx as Integer returns Integer:
+    Note: RET: C3 (near return)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    encoder_emit_byte(ctx, 195)   Note: 0xC3
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: JMP and Jcc Instruction Encoding
+Note: ============================================================================
+
+Process called "encode_jmp" that takes ctx as Integer, target as Integer returns Integer:
+    Note: JMP rel32: E9 cd (near jump, 32-bit displacement)
+    Note: JMP rel8: EB cb (short jump, 8-bit displacement)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let target_type be __load(target, 0)
+    If target_type is 2:
+        Let offset be __load(target, 16)
+        If fits_in_disp8(offset) is 1:
+            encoder_emit_byte(ctx, 235)   Note: 0xEB
+            emit_immediate8(ctx, offset)
+        Otherwise:
+            encoder_emit_byte(ctx, 233)   Note: 0xE9
+            emit_immediate32(ctx, offset)
+        End If
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Note: JMP r/m32: FF /4 (indirect jump)
+    If target_type is 1:
+        Let reg_enc be encode_register(__load(target, 8))
+        encoder_emit_byte(ctx, 255)   Note: 0xFF
+        Let modrm be build_modrm(MOD_REGISTER, 4, reg_enc)
+        encoder_emit_byte(ctx, modrm)
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "encode_jcc" that takes ctx as Integer, condition_code as Integer, offset as Integer returns Integer:
+    Note: Jcc rel32: 0F 8x cd (conditional jump, 32-bit displacement)
+    Note: Jcc rel8: 7x cb (conditional jump, 8-bit displacement)
+    Note: condition_code maps to x86 condition encoding:
+    Note:   0=JO, 1=JNO, 2=JB, 3=JNB, 4=JE/JZ, 5=JNE/JNZ,
+    Note:   6=JBE, 7=JA, 8=JS, 9=JNS, 10=JP, 11=JNP,
+    Note:   12=JL, 13=JGE, 14=JLE, 15=JG
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    If fits_in_disp8(offset) is 1:
+        Note: Short form: 7x cb
+        encoder_emit_byte(ctx, 112 + (condition_code & 15))   Note: 0x70 + cc
+        emit_immediate8(ctx, offset)
+    Otherwise:
+        Note: Near form: 0F 8x cd
+        encoder_emit_byte(ctx, 15)    Note: 0x0F
+        encoder_emit_byte(ctx, 128 + (condition_code & 15))   Note: 0x80 + cc
+        emit_immediate32(ctx, offset)
+    End If
+
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: ALU Instruction Encoding (Generic Two-Operand)
+Note: ============================================================================
+
+@Reasoning
+Most ALU instructions share the same encoding pattern with different opcode bytes.
+The opcode group number (0-7) determines both the primary opcode and the
+opcode extension in the immediate form:
+
+Group 0: ADD  (00-05, 80-83 /0)
+Group 1: OR   (08-0D, 80-83 /1)
+Group 2: ADC  (10-15, 80-83 /2)
+Group 3: SBB  (18-1D, 80-83 /3)
+Group 4: AND  (20-25, 80-83 /4)
+Group 5: SUB  (28-2D, 80-83 /5)
+Group 6: XOR  (30-35, 80-83 /6)
+Group 7: CMP  (38-3D, 80-83 /7)
+
+For reg,reg form: base_opcode + 1 = r/m32, r32
+For reg,imm form: 81 /n id or 83 /n ib
+@End Reasoning
+
+Process called "encode_alu_reg_reg" that takes ctx as Integer, group as Integer, dest as Integer, src as Integer returns Integer:
+    Note: Encodes ALU reg,reg instruction: opcode_base + 0x01, ModR/M
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let base_opcode be group * 8 + 1
+    Let dest_enc be encode_register(__load(dest, 8))
+    Let src_enc be encode_register(__load(src, 8))
+
+    encoder_emit_byte(ctx, base_opcode)
+    Let modrm be build_modrm(MOD_REGISTER, src_enc, dest_enc)
+    encoder_emit_byte(ctx, modrm)
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Process called "encode_alu_reg_imm" that takes ctx as Integer, group as Integer, dest as Integer, imm_val as Integer returns Integer:
+    Note: Encodes ALU reg,imm instruction
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let dest_enc be encode_register(__load(dest, 8))
+
+    Note: Short form for EAX: base_opcode + 0x05 id
+    If dest_enc is ENC_EAX:
+        Let short_opcode be group * 8 + 5
+        encoder_emit_byte(ctx, short_opcode)
+        emit_immediate32(ctx, imm_val)
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Note: imm8 form: 83 /group ib
+    If fits_in_disp8(imm_val) is 1:
+        encoder_emit_byte(ctx, 131)   Note: 0x83
+        Let modrm be build_modrm(MOD_REGISTER, group, dest_enc)
+        encoder_emit_byte(ctx, modrm)
+        emit_immediate8(ctx, imm_val)
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Note: imm32 form: 81 /group id
+    encoder_emit_byte(ctx, 129)   Note: 0x81
+    Let modrm be build_modrm(MOD_REGISTER, group, dest_enc)
+    encoder_emit_byte(ctx, modrm)
+    emit_immediate32(ctx, imm_val)
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Convenience Wrappers for Common ALU Instructions
+Note: ============================================================================
+
+Process called "encode_sub" that takes ctx as Integer, dest as Integer, src as Integer returns Integer:
+    Let src_type be __load(src, 0)
+    If src_type is 1:
+        Return encode_alu_reg_reg(ctx, 5, dest, src)
+    End If
+    If src_type is 2:
+        Let imm_val be __load(src, 16)
+        Return encode_alu_reg_imm(ctx, 5, dest, imm_val)
+    End If
+    Return 0
+End Process
+
+Process called "encode_and" that takes ctx as Integer, dest as Integer, src as Integer returns Integer:
+    Let src_type be __load(src, 0)
+    If src_type is 1:
+        Return encode_alu_reg_reg(ctx, 4, dest, src)
+    End If
+    If src_type is 2:
+        Let imm_val be __load(src, 16)
+        Return encode_alu_reg_imm(ctx, 4, dest, imm_val)
+    End If
+    Return 0
+End Process
+
+Process called "encode_or" that takes ctx as Integer, dest as Integer, src as Integer returns Integer:
+    Let src_type be __load(src, 0)
+    If src_type is 1:
+        Return encode_alu_reg_reg(ctx, 1, dest, src)
+    End If
+    If src_type is 2:
+        Let imm_val be __load(src, 16)
+        Return encode_alu_reg_imm(ctx, 1, dest, imm_val)
+    End If
+    Return 0
+End Process
+
+Process called "encode_xor" that takes ctx as Integer, dest as Integer, src as Integer returns Integer:
+    Let src_type be __load(src, 0)
+    If src_type is 1:
+        Return encode_alu_reg_reg(ctx, 6, dest, src)
+    End If
+    If src_type is 2:
+        Let imm_val be __load(src, 16)
+        Return encode_alu_reg_imm(ctx, 6, dest, imm_val)
+    End If
+    Return 0
+End Process
+
+Process called "encode_cmp" that takes ctx as Integer, dest as Integer, src as Integer returns Integer:
+    Let src_type be __load(src, 0)
+    If src_type is 1:
+        Return encode_alu_reg_reg(ctx, 7, dest, src)
+    End If
+    If src_type is 2:
+        Let imm_val be __load(src, 16)
+        Return encode_alu_reg_imm(ctx, 7, dest, imm_val)
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Unary Instruction Encoding (NOT, NEG, INC, DEC)
+Note: ============================================================================
+
+Process called "encode_not" that takes ctx as Integer, operand as Integer returns Integer:
+    Note: NOT r/m32: F7 /2
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    Let reg_enc be encode_register(__load(operand, 8))
+    encoder_emit_byte(ctx, 247)   Note: 0xF7
+    Let modrm be build_modrm(MOD_REGISTER, 2, reg_enc)
+    encoder_emit_byte(ctx, modrm)
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Process called "encode_neg" that takes ctx as Integer, operand as Integer returns Integer:
+    Note: NEG r/m32: F7 /3
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    Let reg_enc be encode_register(__load(operand, 8))
+    encoder_emit_byte(ctx, 247)   Note: 0xF7
+    Let modrm be build_modrm(MOD_REGISTER, 3, reg_enc)
+    encoder_emit_byte(ctx, modrm)
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Process called "encode_inc" that takes ctx as Integer, operand as Integer returns Integer:
+    Note: INC r32: 40+rd (single byte on IA-32, unlike x86_64 which uses FF /0)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    Let reg_enc be encode_register(__load(operand, 8))
+    encoder_emit_byte(ctx, 64 + reg_enc)   Note: 0x40 + rd
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Process called "encode_dec" that takes ctx as Integer, operand as Integer returns Integer:
+    Note: DEC r32: 48+rd (single byte on IA-32)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    Let reg_enc be encode_register(__load(operand, 8))
+    encoder_emit_byte(ctx, 72 + reg_enc)   Note: 0x48 + rd
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Shift Instruction Encoding
+Note: ============================================================================
+
+Process called "encode_shift" that takes ctx as Integer, shift_type as Integer, dest as Integer, count as Integer returns Integer:
+    Note: Shift/rotate instructions
+    Note: shift_type: 4=SHL, 5=SHR, 7=SAR, 0=ROL, 1=ROR
+    Note: Shift by imm8: C1 /type ib
+    Note: Shift by CL:   D3 /type
+    Note: Shift by 1:    D1 /type
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let dest_enc be encode_register(__load(dest, 8))
+    Let count_type be __load(count, 0)
+
+    If count_type is 2:
+        Note: Immediate shift count
+        Let shift_amount be __load(count, 16)
+        If shift_amount is 1:
+            Note: Shift by 1: D1 /type
+            encoder_emit_byte(ctx, 209)   Note: 0xD1
+            Let modrm be build_modrm(MOD_REGISTER, shift_type, dest_enc)
+            encoder_emit_byte(ctx, modrm)
+        Otherwise:
+            Note: Shift by imm8: C1 /type ib
+            encoder_emit_byte(ctx, 193)   Note: 0xC1
+            Let modrm be build_modrm(MOD_REGISTER, shift_type, dest_enc)
+            encoder_emit_byte(ctx, modrm)
+            emit_immediate8(ctx, shift_amount & 31)
+        End If
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    If count_type is 1:
+        Note: Shift by CL register: D3 /type
+        encoder_emit_byte(ctx, 211)   Note: 0xD3
+        Let modrm be build_modrm(MOD_REGISTER, shift_type, dest_enc)
+        encoder_emit_byte(ctx, modrm)
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: MUL/IMUL/IDIV/DIV Encoding
+Note: ============================================================================
+
+Process called "encode_imul_two_op" that takes ctx as Integer, dest as Integer, src as Integer returns Integer:
+    Note: IMUL r32, r/m32: 0F AF /r (two-operand signed multiply)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    Let dest_enc be encode_register(__load(dest, 8))
+    Let src_enc be encode_register(__load(src, 8))
+    encoder_emit_byte(ctx, 15)     Note: 0x0F
+    encoder_emit_byte(ctx, 175)    Note: 0xAF
+    Let modrm be build_modrm(MOD_REGISTER, dest_enc, src_enc)
+    encoder_emit_byte(ctx, modrm)
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Process called "encode_idiv" that takes ctx as Integer, divisor as Integer returns Integer:
+    Note: IDIV r/m32: F7 /7 (signed divide EDX:EAX by r/m32)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    Let div_type be __load(divisor, 0)
+    If div_type is 1:
+        Let div_enc be encode_register(__load(divisor, 8))
+        encoder_emit_byte(ctx, 247)   Note: 0xF7
+        Let modrm be build_modrm(MOD_REGISTER, 7, div_enc)
+        encoder_emit_byte(ctx, modrm)
+        encoder_flush(ctx)
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "encode_div" that takes ctx as Integer, divisor as Integer returns Integer:
+    Note: DIV r/m32: F7 /6 (unsigned divide EDX:EAX by r/m32)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    Let div_type be __load(divisor, 0)
+    If div_type is 1:
+        Let div_enc be encode_register(__load(divisor, 8))
+        encoder_emit_byte(ctx, 247)   Note: 0xF7
+        Let modrm be build_modrm(MOD_REGISTER, 6, div_enc)
+        encoder_emit_byte(ctx, modrm)
+        encoder_flush(ctx)
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: INT / NOP / CDQ Encoding
+Note: ============================================================================
+
+Process called "encode_nop" that takes ctx as Integer returns Integer:
+    Note: NOP: 90
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    encoder_emit_byte(ctx, 144)   Note: 0x90
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Process called "encode_cdq" that takes ctx as Integer returns Integer:
+    Note: CDQ: 99 (sign-extend EAX into EDX:EAX)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    encoder_emit_byte(ctx, 153)   Note: 0x99
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Process called "encode_int" that takes ctx as Integer, vector as Integer returns Integer:
+    Note: INT imm8: CD ib (software interrupt)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+    encoder_emit_byte(ctx, 205)   Note: 0xCD
+    emit_immediate8(ctx, vector)
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LEA Instruction Encoding
+Note: ============================================================================
+
+Process called "encode_lea" that takes ctx as Integer, dest as Integer, src_mem as Integer returns Integer:
+    Note: LEA r32, m: 8D /r (load effective address)
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let dest_enc be encode_register(__load(dest, 8))
+    encoder_emit_byte(ctx, 141)   Note: 0x8D
+    Let base be __load(src_mem, 24)
+    Let index be __load(src_mem, 32)
+    Let scale be __load(src_mem, 40)
+    Let disp be __load(src_mem, 48)
+    encode_memory_operand(ctx, dest_enc, base, index, scale, disp)
+    encoder_flush(ctx)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: TEST Instruction Encoding
+Note: ============================================================================
+
+Process called "encode_test" that takes ctx as Integer, op1 as Integer, op2 as Integer returns Integer:
+    Note: TEST r/m32, r32: 85 /r
+    Note: TEST r/m32, imm32: F7 /0 id
+    If ctx is 0:
+        Return 0
+    End If
+    encoder_reset(ctx)
+
+    Let op2_type be __load(op2, 0)
+
+    If op2_type is 1:
+        Let op1_enc be encode_register(__load(op1, 8))
+        Let op2_enc be encode_register(__load(op2, 8))
+        encoder_emit_byte(ctx, 133)   Note: 0x85
+        Let modrm be build_modrm(MOD_REGISTER, op2_enc, op1_enc)
+        encoder_emit_byte(ctx, modrm)
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    If op2_type is 2:
+        Let op1_enc be encode_register(__load(op1, 8))
+        Let imm_val be __load(op2, 16)
+        If op1_enc is ENC_EAX:
+            encoder_emit_byte(ctx, 169)   Note: 0xA9
+            emit_immediate32(ctx, imm_val)
+        Otherwise:
+            encoder_emit_byte(ctx, 247)   Note: 0xF7
+            Let modrm be build_modrm(MOD_REGISTER, 0, op1_enc)
+            encoder_emit_byte(ctx, modrm)
+            emit_immediate32(ctx, imm_val)
+        End If
+        encoder_flush(ctx)
+        Return 1
+    End If
+
+    Return 0
+End Process

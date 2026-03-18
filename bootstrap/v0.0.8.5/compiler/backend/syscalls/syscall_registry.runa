@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,395 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles system call registry and system call management for the compiler backend.
+Syscall Registry - Central Registry for Platform-Specific System Calls
 
-This file performs the following tasks:
-- Process system call registration and system call registry management
-- Handle system call lookup and system call resolution operations
-- Manage system call optimization and system call performance utilities
-- Process system call validation and system call verification operations
+Provides a centralized registry mapping platform IDs to their available syscall
+definitions. Each platform module registers its syscalls at initialization, and
+the code generator queries the registry to look up syscall numbers and calling
+conventions when emitting syscall instructions.
 
-This file is essential because of the following reasons:
-- System call registry is fundamental to system call management and system call resolution
-- Proper system call registry handling ensures correct system call lookup and system call management
-- System call registry utilities support system call registration, lookup, and system call management
+The registry supports:
+- Registration of syscall definitions per platform
+- Lookup by syscall name within a platform
+- Lookup by syscall number within a platform
+- Cross-platform syscall availability queries
+- Validation that required syscalls exist for a target platform
 
-This file consists of the following functions/features/operation types:
-- System call registration and system call registry management
-- System call lookup and system call resolution operations
-- System call optimization and system call performance utilities
-- System call validation and system call verification operations
+Dependencies:
+- Imports platform_interface for SyscallDefinition and platform constants
+- Imports list/dictionary for collection management
+- Imports memory layout for allocation
 :End Note
 
-Note: TODO - Implement syscall registry functionality
+Import "compiler/backend/syscalls/platforms/platform_interface.runa" as PlatformInterface
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: Syscall Registry Type
+Note: ============================================================================
+
+@Reasoning
+The SyscallRegistry maintains a two-level structure:
+- Level 1: Dictionary mapping platform_id (Integer) -> platform_entry (pointer)
+- Level 2: Each platform_entry contains:
+  - A dictionary mapping syscall_name (String) -> SyscallDefinition pointer
+  - A dictionary mapping syscall_number (Integer) -> SyscallDefinition pointer
+  - A PlatformInfo pointer
+  - A SyscallConvention pointer
+
+This two-level design enables both name-based lookup (for the compiler's abstract
+syscall references) and number-based lookup (for validation and debugging).
+@End Reasoning
+
+Type called "SyscallRegistry":
+    platforms as Integer              Note: Dictionary mapping platform_id -> PlatformRegistryEntry*
+    platform_count as Integer         Note: Number of registered platforms
+    conventions as Integer            Note: Dictionary mapping platform_id -> SyscallConvention*
+    convention_count as Integer       Note: Number of registered conventions
+End Type
+
+Note: Size: 4 fields * 8 bytes = 32 bytes per SyscallRegistry
+
+Type called "PlatformRegistryEntry":
+    platform_id as Integer            Note: PLATFORM_* constant
+    platform_info as Integer          Note: Pointer to PlatformInfo
+    by_name as Integer                Note: Dictionary mapping syscall name -> SyscallDefinition*
+    by_number as Integer              Note: Dictionary mapping syscall number -> SyscallDefinition*
+    syscall_count as Integer          Note: Number of registered syscalls for this platform
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per PlatformRegistryEntry
+
+Note: ============================================================================
+Note: Registry Creation and Management
+Note: ============================================================================
+
+Process called "create_registry" returns Integer:
+    Note: Creates a new empty SyscallRegistry
+    Let registry be Layout.allocate(32)
+    If registry is 0:
+        Return 0
+    End If
+
+    Let platforms be Dictionary.dictionary_create(32)
+    __store(registry, 0, platforms)
+    __store(registry, 8, 0)
+
+    Let conventions be Dictionary.dictionary_create(32)
+    __store(registry, 16, conventions)
+    __store(registry, 24, 0)
+
+    Return registry
+End Process
+
+Process called "registry_register_platform" that takes registry as Integer, platform_id as Integer, platform_info as Integer returns Integer:
+    Note: Registers a new platform in the registry
+    Note: Must be called before registering syscalls for this platform
+    Note: Returns 1 on success, 0 on failure
+    If registry is 0:
+        Return 0
+    End If
+
+    Let platforms be __load(registry, 0)
+    If platforms is 0:
+        Return 0
+    End If
+
+    Note: Check if platform is already registered
+    Let existing be Dictionary.dictionary_get(platforms, platform_id)
+    If existing is not 0:
+        Return 0
+    End If
+
+    Note: Create platform entry
+    Let entry be Layout.allocate(40)
+    If entry is 0:
+        Return 0
+    End If
+
+    __store(entry, 0, platform_id)
+    __store(entry, 8, platform_info)
+
+    Note: Create name and number lookup dictionaries
+    Let by_name be Dictionary.dictionary_create(64)
+    Let by_number be Dictionary.dictionary_create(64)
+    __store(entry, 16, by_name)
+    __store(entry, 24, by_number)
+    __store(entry, 32, 0)
+
+    Note: Store in registry
+    Dictionary.dictionary_set(platforms, platform_id, entry)
+
+    Let count be __load(registry, 8)
+    __store(registry, 8, count + 1)
+
+    Return 1
+End Process
+
+Process called "register_convention" that takes registry as Integer, platform_id as Integer, convention as Integer returns Integer:
+    Note: Registers a SyscallConvention for a platform
+    If registry is 0:
+        Return 0
+    End If
+    If convention is 0:
+        Return 0
+    End If
+
+    Let conventions be __load(registry, 16)
+    If conventions is 0:
+        Return 0
+    End If
+
+    Dictionary.dictionary_set(conventions, platform_id, convention)
+
+    Let count be __load(registry, 24)
+    __store(registry, 24, count + 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Syscall Registration
+Note: ============================================================================
+
+Process called "register_syscall" that takes registry as Integer, platform_id as Integer, syscall_def as Integer returns Integer:
+    Note: Registers a SyscallDefinition for a specific platform
+    Note: The platform must already be registered via registry_register_platform
+    Note: Returns 1 on success, 0 on failure
+    If registry is 0:
+        Return 0
+    End If
+    If syscall_def is 0:
+        Return 0
+    End If
+
+    Let platforms be __load(registry, 0)
+    If platforms is 0:
+        Return 0
+    End If
+
+    Note: Find the platform entry
+    Let entry be Dictionary.dictionary_get(platforms, platform_id)
+    If entry is 0:
+        Return 0
+    End If
+
+    Note: Get the name and number of the syscall
+    Let syscall_name be PlatformInterface.syscall_def_get_name(syscall_def)
+    Let syscall_number be PlatformInterface.syscall_def_get_number(syscall_def)
+
+    Note: Register by name
+    Let by_name be __load(entry, 16)
+    If by_name is not 0:
+        Dictionary.dictionary_set(by_name, syscall_name, syscall_def)
+    End If
+
+    Note: Register by number
+    Let by_number be __load(entry, 24)
+    If by_number is not 0:
+        Dictionary.dictionary_set(by_number, syscall_number, syscall_def)
+    End If
+
+    Note: Increment syscall count
+    Let count be __load(entry, 32)
+    __store(entry, 32, count + 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Syscall Lookup Operations
+Note: ============================================================================
+
+Process called "lookup_syscall_by_name" that takes registry as Integer, platform_id as Integer, name as Integer returns Integer:
+    Note: Looks up a SyscallDefinition by name for a specific platform
+    Note: Returns pointer to SyscallDefinition or 0 if not found
+    If registry is 0:
+        Return 0
+    End If
+
+    Let platforms be __load(registry, 0)
+    If platforms is 0:
+        Return 0
+    End If
+
+    Let entry be Dictionary.dictionary_get(platforms, platform_id)
+    If entry is 0:
+        Return 0
+    End If
+
+    Let by_name be __load(entry, 16)
+    If by_name is 0:
+        Return 0
+    End If
+
+    Return Dictionary.dictionary_get(by_name, name)
+End Process
+
+Process called "lookup_syscall_by_number" that takes registry as Integer, platform_id as Integer, number as Integer returns Integer:
+    Note: Looks up a SyscallDefinition by syscall number for a specific platform
+    Note: Returns pointer to SyscallDefinition or 0 if not found
+    If registry is 0:
+        Return 0
+    End If
+
+    Let platforms be __load(registry, 0)
+    If platforms is 0:
+        Return 0
+    End If
+
+    Let entry be Dictionary.dictionary_get(platforms, platform_id)
+    If entry is 0:
+        Return 0
+    End If
+
+    Let by_number be __load(entry, 24)
+    If by_number is 0:
+        Return 0
+    End If
+
+    Return Dictionary.dictionary_get(by_number, number)
+End Process
+
+Process called "get_convention" that takes registry as Integer, platform_id as Integer returns Integer:
+    Note: Returns the SyscallConvention for a platform, or 0 if not registered
+    If registry is 0:
+        Return 0
+    End If
+
+    Let conventions be __load(registry, 16)
+    If conventions is 0:
+        Return 0
+    End If
+
+    Return Dictionary.dictionary_get(conventions, platform_id)
+End Process
+
+Process called "get_platform_info" that takes registry as Integer, platform_id as Integer returns Integer:
+    Note: Returns the PlatformInfo for a registered platform, or 0 if not found
+    If registry is 0:
+        Return 0
+    End If
+
+    Let platforms be __load(registry, 0)
+    If platforms is 0:
+        Return 0
+    End If
+
+    Let entry be Dictionary.dictionary_get(platforms, platform_id)
+    If entry is 0:
+        Return 0
+    End If
+
+    Return __load(entry, 8)
+End Process
+
+Note: ============================================================================
+Note: Syscall Validation
+Note: ============================================================================
+
+Process called "validate_platform_syscalls" that takes registry as Integer, platform_id as Integer, required_names as Integer returns Integer:
+    Note: Validates that all required syscall names are registered for a platform
+    Note: required_names is a List of syscall name string pointers
+    Note: Returns 1 if all required syscalls exist, 0 if any are missing
+    If registry is 0:
+        Return 0
+    End If
+    If required_names is 0:
+        Return 0
+    End If
+
+    Let count be List.list_length(required_names)
+    Let i be 0
+    While i < count:
+        Let name be List.list_get(required_names, i)
+        Let def be lookup_syscall_by_name(registry, platform_id, name)
+        If def is 0:
+            Return 0
+        End If
+        Set i to i + 1
+    End While
+
+    Return 1
+End Process
+
+Process called "get_platform_syscall_count" that takes registry as Integer, platform_id as Integer returns Integer:
+    Note: Returns the number of syscalls registered for a platform
+    If registry is 0:
+        Return 0
+    End If
+
+    Let platforms be __load(registry, 0)
+    If platforms is 0:
+        Return 0
+    End If
+
+    Let entry be Dictionary.dictionary_get(platforms, platform_id)
+    If entry is 0:
+        Return 0
+    End If
+
+    Return __load(entry, 32)
+End Process
+
+Process called "is_platform_registered" that takes registry as Integer, platform_id as Integer returns Integer:
+    Note: Returns 1 if the platform is registered in the registry, 0 otherwise
+    If registry is 0:
+        Return 0
+    End If
+
+    Let platforms be __load(registry, 0)
+    If platforms is 0:
+        Return 0
+    End If
+
+    Let entry be Dictionary.dictionary_get(platforms, platform_id)
+    If entry is not 0:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Cross-Platform Syscall Query
+Note: ============================================================================
+
+Process called "find_syscall_across_platforms" that takes registry as Integer, name as Integer returns Integer:
+    Note: Searches all registered platforms for a syscall by name
+    Note: Returns a List of SyscallDefinition pointers (one per platform that has it)
+    Note: Useful for cross-platform compatibility checking
+    If registry is 0:
+        Return 0
+    End If
+
+    Let results be List.list_create(8)
+    Let platforms be __load(registry, 0)
+    If platforms is 0:
+        Return results
+    End If
+
+    Note: Iterate through all platform IDs (1-19)
+    Let pid be 1
+    While pid <= 19:
+        Let def be lookup_syscall_by_name(registry, pid, name)
+        If def is not 0:
+            List.list_append(results, def)
+        End If
+        Set pid to pid + 1
+    End While
+
+    Return results
+End Process
+
+Process called "get_syscall_number_for_platform" that takes registry as Integer, platform_id as Integer, name as Integer returns Integer:
+    Note: Convenience function: returns the syscall number for a named syscall on a platform
+    Note: Returns -1 if not found
+    Let def be lookup_syscall_by_name(registry, platform_id, name)
+    If def is 0:
+        Return -1
+    End If
+    Return PlatformInterface.syscall_def_get_number(def)
+End Process

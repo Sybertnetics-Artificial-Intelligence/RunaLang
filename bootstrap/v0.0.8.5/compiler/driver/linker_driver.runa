@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,8 @@ limitations under the License.
 :End Note
 
 Note:
+LINKER DRIVER - Linking Process Coordination and Executable Generation
+
 This file handles linking process coordination and executable generation for the compiler.
 
 This file performs the following tasks:
@@ -29,10 +31,620 @@ This file is essential because of the following reasons:
 - Linking utilities support library linking, symbol resolution, and executable generation
 
 This file consists of the following functions/features/operation types:
-- Linking process coordination and library resolution
-- Symbol resolution and symbol relocation operations
-- Executable generation and linking optimization
-- Linking validation and linking verification operations
+- LinkerContext type for managing linker state
+- create_linker_context for initializing linker configuration
+- add_object_file for registering object files to link
+- set_entry_point and set_output_path for configuring output
+- link for invoking the backend linker
+- link_executable convenience function for standard executables
+
+Dependencies:
+- Imports memory_utils.runa for memory allocation
+- Imports string_utils.runa for string operations
+- Imports file_utils.runa for file operations
+- Imports arena_utils.runa for arena-based allocation
+- Imports collections.runa for ArrayList
+- Delegates to backend/machine_code/common/linker.runa for actual linking
 :End Note
 
-Note: TODO - Implement linker driver functionality
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/file_utils.runa" as FileUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+Import "compiler/internal/collections.runa" as Collections
+
+Note: ============================================================================
+Note: Linker Constants
+Note: ============================================================================
+
+Note: Target executable formats
+Constant LINKER_FORMAT_ELF64 as Integer is 0    Note: Linux ELF64
+Constant LINKER_FORMAT_PE as Integer is 1       Note: Windows PE/COFF
+Constant LINKER_FORMAT_MACHO as Integer is 2    Note: macOS Mach-O
+Constant LINKER_FORMAT_RAW as Integer is 3      Note: Raw binary (no headers)
+
+Note: Linker result codes
+Constant LINKER_SUCCESS as Integer is 0
+Constant LINKER_ERROR_NO_OBJECTS as Integer is 1
+Constant LINKER_ERROR_MISSING_SYMBOL as Integer is 2
+Constant LINKER_ERROR_WRITE_FAILED as Integer is 3
+Constant LINKER_ERROR_INVALID_FORMAT as Integer is 4
+Constant LINKER_ERROR_NO_ENTRY_POINT as Integer is 5
+
+Constant LINKER_MAX_OBJECT_FILES as Integer is 1024
+Constant LINKER_MAX_LIBRARIES as Integer is 256
+
+Note: LinkerContext memory layout (120 bytes):
+Note: offset   0: object_files (8 bytes) - Pointer to ArrayList of object file path strings
+Note: offset   8: output_path (8 bytes) - Pointer to output executable path string
+Note: offset  16: entry_point (8 bytes) - Pointer to entry point symbol name string
+Note: offset  24: target_format (8 bytes) - Target executable format (LINKER_FORMAT_*)
+Note: offset  32: arena (8 bytes) - Pointer to arena for linker allocations
+Note: offset  40: library_paths (8 bytes) - Pointer to ArrayList of library search path strings
+Note: offset  48: libraries (8 bytes) - Pointer to ArrayList of library name strings
+Note: offset  56: is_static (8 bytes) - Boolean: 1 for static linking, 0 for dynamic
+Note: offset  64: is_verbose (8 bytes) - Boolean: 1 for verbose linker output
+Note: offset  72: strip_symbols (8 bytes) - Boolean: 1 to strip debug symbols
+Note: offset  80: text_base_address (8 bytes) - Base address for .text section
+Note: offset  88: error_count (8 bytes) - Number of linking errors encountered
+Note: offset  96: error_messages (8 bytes) - Pointer to ArrayList of error message strings
+Note: offset 104: backend_context (8 bytes) - Pointer to backend linker context (from linker.runa)
+Note: offset 112: total_object_size (8 bytes) - Total size of all object files combined
+
+Constant LINKER_CONTEXT_SIZE as Integer is 120
+
+Note: ============================================================================
+Note: Linker Context Creation and Destruction
+Note: ============================================================================
+
+Process called "create_linker_driver_context" takes arena as Integer returns Integer:
+    Note: Create a new LinkerContext for managing the linking process
+    Note: Returns pointer to context, or 0 on failure
+
+    If arena is equal to 0:
+        Alert "[LINKER ERROR] Cannot create linker context: arena is null"
+        Return 0
+    End If
+
+    Let ctx be arena_allocate(arena, LINKER_CONTEXT_SIZE, 8)
+    If ctx is equal to 0:
+        Alert "[LINKER ERROR] Failed to allocate linker context"
+        Return 0
+    End If
+
+    memory_zero(ctx, LINKER_CONTEXT_SIZE)
+
+    Note: Create object files list
+    Let object_files be arraylist_create(32, 8, arena)
+    If object_files is equal to 0:
+        Alert "[LINKER ERROR] Failed to create object files list"
+        Return 0
+    End If
+    memory_set_pointer(ctx, 0, object_files)
+
+    Note: No output path yet
+    memory_set_pointer(ctx, 8, 0)
+
+    Note: Default entry point is "_start"
+    Let default_entry be string_duplicate("_start")
+    memory_set_pointer(ctx, 16, default_entry)
+
+    Note: Default format is ELF64 (Linux)
+    memory_set_integer(ctx, 24, LINKER_FORMAT_ELF64)
+
+    Note: Store arena
+    memory_set_pointer(ctx, 32, arena)
+
+    Note: Create library paths list
+    Let library_paths be arraylist_create(8, 8, arena)
+    If library_paths is equal to 0:
+        Alert "[LINKER ERROR] Failed to create library paths list"
+        Return 0
+    End If
+    memory_set_pointer(ctx, 40, library_paths)
+
+    Note: Create libraries list
+    Let libraries be arraylist_create(8, 8, arena)
+    If libraries is equal to 0:
+        Alert "[LINKER ERROR] Failed to create libraries list"
+        Return 0
+    End If
+    memory_set_pointer(ctx, 48, libraries)
+
+    Note: Default to static linking
+    memory_set_integer(ctx, 56, 1)
+
+    Note: Verbose off by default
+    memory_set_integer(ctx, 64, 0)
+
+    Note: Don't strip symbols by default
+    memory_set_integer(ctx, 72, 0)
+
+    Note: Default text base address for ELF64
+    memory_set_integer(ctx, 80, 4194304)  Note: 0x400000 standard Linux base
+
+    Note: No errors yet
+    memory_set_integer(ctx, 88, 0)
+
+    Note: Create error messages list
+    Let error_messages be arraylist_create(16, 8, arena)
+    If error_messages is equal to 0:
+        Alert "[LINKER ERROR] Failed to create error messages list"
+        Return 0
+    End If
+    memory_set_pointer(ctx, 96, error_messages)
+
+    Note: No backend context yet (created at link time)
+    memory_set_pointer(ctx, 104, 0)
+
+    Note: Total object size = 0
+    memory_set_integer(ctx, 112, 0)
+
+    Return ctx
+End Process
+
+Process called "destroy_linker_driver_context" takes ctx as Integer returns Nothing:
+    Note: Clean up heap-allocated strings
+    If ctx is equal to 0:
+        Return
+    End If
+
+    Note: Free output_path
+    Let output_path be memory_get_pointer(ctx, 8)
+    If output_path is not equal to 0:
+        deallocate(output_path)
+        memory_set_pointer(ctx, 8, 0)
+    End If
+
+    Note: Free entry_point
+    Let entry_point be memory_get_pointer(ctx, 16)
+    If entry_point is not equal to 0:
+        deallocate(entry_point)
+        memory_set_pointer(ctx, 16, 0)
+    End If
+End Process
+
+Note: ============================================================================
+Note: Object File Management
+Note: ============================================================================
+
+Process called "linker_driver_add_object_file" takes ctx as Integer, file_path as Integer returns Integer:
+    Note: Add an object file to the linker context
+    Note: Returns 1 on success, 0 on failure
+
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If file_path is equal to 0:
+        Return 0
+    End If
+
+    Note: Verify the file exists
+    Let exists be file_exists(file_path)
+    If exists is equal to 0:
+        Let error_msg be string_concat("[LINKER ERROR] Object file not found: ", file_path)
+        Alert error_msg
+        linker_driver_record_error(ctx, error_msg)
+        deallocate(error_msg)
+        Return 0
+    End If
+
+    Let object_files be memory_get_pointer(ctx, 0)
+    If object_files is equal to 0:
+        Return 0
+    End If
+
+    Note: Check maximum count
+    Let current_count be arraylist_size(object_files)
+    If current_count is greater than or equal to LINKER_MAX_OBJECT_FILES:
+        Alert "[LINKER ERROR] Maximum object file count exceeded"
+        Return 0
+    End If
+
+    Note: Duplicate path and add to list
+    Let path_copy be string_duplicate(file_path)
+    If path_copy is equal to 0:
+        Return 0
+    End If
+
+    Let result be arraylist_add(object_files, path_copy)
+    If result is equal to 0:
+        deallocate(path_copy)
+        Return 0
+    End If
+
+    Note: Track total object file size
+    Let file_size be file_get_size(file_path)
+    Let total_size be memory_get_integer(ctx, 112)
+    memory_set_integer(ctx, 112, total_size plus file_size)
+
+    Let is_verbose be memory_get_integer(ctx, 64)
+    If is_verbose is equal to 1:
+        Let msg be string_concat("[LINKER] Added object file: ", file_path)
+        Display msg
+        deallocate(msg)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Linker Configuration
+Note: ============================================================================
+
+Process called "linker_driver_set_entry_point" takes ctx as Integer, symbol_name as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If symbol_name is equal to 0:
+        Return 0
+    End If
+
+    Let old_entry be memory_get_pointer(ctx, 16)
+    If old_entry is not equal to 0:
+        deallocate(old_entry)
+    End If
+
+    Let new_entry be string_duplicate(symbol_name)
+    If new_entry is equal to 0:
+        Return 0
+    End If
+
+    memory_set_pointer(ctx, 16, new_entry)
+    Return 1
+End Process
+
+Process called "linker_driver_set_output_path" takes ctx as Integer, path as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If path is equal to 0:
+        Return 0
+    End If
+
+    Let old_path be memory_get_pointer(ctx, 8)
+    If old_path is not equal to 0:
+        deallocate(old_path)
+    End If
+
+    Let new_path be string_duplicate(path)
+    If new_path is equal to 0:
+        Return 0
+    End If
+
+    memory_set_pointer(ctx, 8, new_path)
+    Return 1
+End Process
+
+Process called "linker_driver_set_format" takes ctx as Integer, format as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If format is less than LINKER_FORMAT_ELF64:
+        Return 0
+    End If
+    If format is greater than LINKER_FORMAT_RAW:
+        Return 0
+    End If
+    memory_set_integer(ctx, 24, format)
+    Return 1
+End Process
+
+Process called "linker_driver_set_verbose" takes ctx as Integer, enabled as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    memory_set_integer(ctx, 64, enabled)
+    Return 1
+End Process
+
+Process called "linker_driver_set_static" takes ctx as Integer, enabled as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    memory_set_integer(ctx, 56, enabled)
+    Return 1
+End Process
+
+Process called "linker_driver_set_strip" takes ctx as Integer, enabled as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    memory_set_integer(ctx, 72, enabled)
+    Return 1
+End Process
+
+Process called "linker_driver_set_base_address" takes ctx as Integer, base_addr as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    memory_set_integer(ctx, 80, base_addr)
+    Return 1
+End Process
+
+Process called "linker_driver_add_library_path" takes ctx as Integer, path as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If path is equal to 0:
+        Return 0
+    End If
+
+    Let library_paths be memory_get_pointer(ctx, 40)
+    If library_paths is equal to 0:
+        Return 0
+    End If
+
+    Let path_copy be string_duplicate(path)
+    If path_copy is equal to 0:
+        Return 0
+    End If
+
+    Return arraylist_add(library_paths, path_copy)
+End Process
+
+Process called "linker_driver_add_library" takes ctx as Integer, lib_name as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If lib_name is equal to 0:
+        Return 0
+    End If
+
+    Let libraries be memory_get_pointer(ctx, 48)
+    If libraries is equal to 0:
+        Return 0
+    End If
+
+    Let lib_copy be string_duplicate(lib_name)
+    If lib_copy is equal to 0:
+        Return 0
+    End If
+
+    Return arraylist_add(libraries, lib_copy)
+End Process
+
+Note: ============================================================================
+Note: Linking Execution
+Note: ============================================================================
+
+Process called "linker_driver_link" takes ctx as Integer returns Integer:
+    Note: Execute the linking process using the backend linker
+    Note: Returns LINKER_SUCCESS on success, or an error code on failure
+
+    If ctx is equal to 0:
+        Return LINKER_ERROR_NO_OBJECTS
+    End If
+
+    Note: Validate we have object files
+    Let object_files be memory_get_pointer(ctx, 0)
+    If object_files is equal to 0:
+        Alert "[LINKER ERROR] No object files list"
+        Return LINKER_ERROR_NO_OBJECTS
+    End If
+
+    Let obj_count be arraylist_size(object_files)
+    If obj_count is equal to 0:
+        Alert "[LINKER ERROR] No object files to link"
+        Return LINKER_ERROR_NO_OBJECTS
+    End If
+
+    Note: Validate output path
+    Let output_path be memory_get_pointer(ctx, 8)
+    If output_path is equal to 0:
+        Alert "[LINKER ERROR] No output path specified"
+        Return LINKER_ERROR_WRITE_FAILED
+    End If
+
+    Note: Validate entry point
+    Let entry_point be memory_get_pointer(ctx, 16)
+    If entry_point is equal to 0:
+        Alert "[LINKER ERROR] No entry point specified"
+        Return LINKER_ERROR_NO_ENTRY_POINT
+    End If
+
+    Let is_verbose be memory_get_integer(ctx, 64)
+    If is_verbose is equal to 1:
+        Let count_str be integer_to_string(obj_count)
+        Let msg be string_concat("[LINKER] Linking ", count_str)
+        deallocate(count_str)
+        Let msg2 be string_concat(msg, " object file(s)...")
+        deallocate(msg)
+        Display msg2
+        deallocate(msg2)
+    End If
+
+    Note: Create backend linker context
+    Let backend_ctx be create_linker_context()
+    If backend_ctx is equal to 0:
+        Alert "[LINKER ERROR] Failed to create backend linker context"
+        Return LINKER_ERROR_INVALID_FORMAT
+    End If
+
+    Note: Store backend context reference
+    memory_set_pointer(ctx, 104, backend_ctx)
+
+    Note: Set the entry point on the backend linker
+    linker_set_entry_point(backend_ctx, entry_point)
+
+    Note: Set the text base address
+    Let base_addr be memory_get_integer(ctx, 80)
+    linker_set_text_base_address(backend_ctx, base_addr)
+
+    Note: Add each object file to the backend linker
+    Note: The backend linker expects object file data, not paths
+    Note: We read each file and create an object representation
+    Let i be 0
+    While i is less than obj_count:
+        Let obj_path be arraylist_get(object_files, i)
+        If obj_path is not equal to 0:
+            Note: Read the object file
+            Let obj_content be runtime_read_file(obj_path)
+            If obj_content is equal to 0:
+                Let err_msg be string_concat("[LINKER ERROR] Failed to read object file: ", obj_path)
+                Alert err_msg
+                linker_driver_record_error(ctx, err_msg)
+                deallocate(err_msg)
+                Set i to i plus 1
+                Set i to i  Note: Continue to next file
+            Otherwise:
+                Note: Create a backend object file representation
+                Let obj_file be create_object_file(obj_path)
+                If obj_file is not equal to 0:
+                    Note: Set object content as text section
+                    Let content_len be string_length(obj_content)
+                    object_file_set_text(obj_file, obj_content, content_len)
+
+                    Note: Add to backend linker
+                    linker_add_object(backend_ctx, obj_file)
+                End If
+                deallocate(obj_content)
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Execute the actual link
+    Let link_result be linker_link(backend_ctx)
+    If link_result is not equal to 0:
+        Note: Check for unresolved symbols
+        Let unresolved_count be linker_get_unresolved_count(backend_ctx)
+        If unresolved_count is greater than 0:
+            Alert "[LINKER ERROR] Unresolved symbols found:"
+            Let j be 0
+            While j is less than unresolved_count:
+                Let sym_name be linker_get_unresolved_symbol(backend_ctx, j)
+                If sym_name is not equal to 0:
+                    Let sym_msg be string_concat("  - ", sym_name)
+                    Alert sym_msg
+                    deallocate(sym_msg)
+                End If
+                Set j to j plus 1
+            End While
+            Return LINKER_ERROR_MISSING_SYMBOL
+        End If
+        Return LINKER_ERROR_INVALID_FORMAT
+    End If
+
+    Note: Write the linked output
+    Note: Get merged sections from backend
+    Let merged_text be linker_get_merged_text(backend_ctx)
+    Let merged_text_size be linker_get_merged_text_size(backend_ctx)
+
+    Note: Write output file
+    Let arena be memory_get_pointer(ctx, 32)
+    Let out_handle be file_create(output_path, 1, arena)
+    If out_handle is equal to 0:
+        Alert "[LINKER ERROR] Failed to create output file"
+        Return LINKER_ERROR_WRITE_FAILED
+    End If
+
+    Let write_result be file_write(out_handle, merged_text, merged_text_size)
+    file_close(out_handle)
+
+    If write_result is equal to 0:
+        Alert "[LINKER ERROR] Failed to write output"
+        Return LINKER_ERROR_WRITE_FAILED
+    End If
+
+    If is_verbose is equal to 1:
+        Let success_msg be string_concat("[LINKER] Successfully linked to: ", output_path)
+        Display success_msg
+        deallocate(success_msg)
+    End If
+
+    Return LINKER_SUCCESS
+End Process
+
+Process called "linker_driver_link_executable" takes ctx as Integer, output_path as Integer returns Integer:
+    Note: Convenience function to link an executable
+    Note: Sets format based on target platform and links
+
+    If ctx is equal to 0:
+        Return LINKER_ERROR_NO_OBJECTS
+    End If
+    If output_path is equal to 0:
+        Return LINKER_ERROR_WRITE_FAILED
+    End If
+
+    Note: Set the output path
+    linker_driver_set_output_path(ctx, output_path)
+
+    Note: Ensure entry point is set (default _start for ELF)
+    Let entry_point be memory_get_pointer(ctx, 16)
+    If entry_point is equal to 0:
+        linker_driver_set_entry_point(ctx, "_start")
+    End If
+
+    Note: Execute linking
+    Return linker_driver_link(ctx)
+End Process
+
+Note: ============================================================================
+Note: Error Management
+Note: ============================================================================
+
+Process called "linker_driver_record_error" takes ctx as Integer, error_msg as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If error_msg is equal to 0:
+        Return 0
+    End If
+
+    Let error_messages be memory_get_pointer(ctx, 96)
+    If error_messages is equal to 0:
+        Return 0
+    End If
+
+    Let msg_copy be string_duplicate(error_msg)
+    If msg_copy is equal to 0:
+        Return 0
+    End If
+
+    arraylist_add(error_messages, msg_copy)
+
+    Let error_count be memory_get_integer(ctx, 88)
+    memory_set_integer(ctx, 88, error_count plus 1)
+
+    Return 1
+End Process
+
+Process called "linker_driver_get_error_count" takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(ctx, 88)
+End Process
+
+Process called "linker_driver_get_error_message" takes ctx as Integer, index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let error_messages be memory_get_pointer(ctx, 96)
+    If error_messages is equal to 0:
+        Return 0
+    End If
+
+    Let count be arraylist_size(error_messages)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+
+    Return arraylist_get(error_messages, index)
+End Process
+
+Process called "linker_driver_get_object_count" takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let object_files be memory_get_pointer(ctx, 0)
+    If object_files is equal to 0:
+        Return 0
+    End If
+    Return arraylist_size(object_files)
+End Process

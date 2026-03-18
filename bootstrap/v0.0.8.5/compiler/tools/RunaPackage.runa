@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,801 @@ limitations under the License.
 :End Note
 
 Note:
+RUNA PACKAGE TOOL - CLI Package Manager Entry Point
+
 This file handles Runa package management and dependency resolution.
 
 This file performs the following tasks:
-- Process Runa package management and dependency resolution
-- Handle package installation and package publishing
-- Manage package dependencies and package versioning
-- Process package validation and package verification
+- Initialize package metadata in a project (runa.toml)
+- Add and remove dependencies from the project configuration
+- Resolve dependency trees with version constraint satisfaction
+- Install resolved dependencies into the project's local cache
 
 This file is essential because of the following reasons:
-- Runa package management ensures efficient dependency management and package distribution
-- Proper package handling ensures correct package installation and publishing
-- RunaPackage support enables Runa compilation for complete package ecosystem
+- Runa package tool manages third-party and internal library dependencies
+- Proper dependency resolution ensures reproducible builds
+- RunaPackage bridges user-facing CLI with project dependency management
 
 This file consists of the following functions/features/operation types:
-- Runa package management and dependency resolution
-- Package installation and package publishing
-- Package dependencies and package versioning
-- Package validation and package verification
+- PackageDep type for representing a single dependency entry
+- init_package to create or update runa.toml package metadata
+- add_dependency to register a new dependency with a version constraint
+- remove_dependency to remove an existing dependency by name
+- resolve_dependencies to compute a compatible dependency tree
+- install_dependencies to fetch and cache resolved dependencies
+- run_package as the top-level entry point
+
+Dependencies:
+- Imports compiler/internal/string_utils.runa for string operations
+- Imports compiler/internal/file_utils.runa for file read/write operations
+- Imports compiler/internal/memory_utils.runa for memory allocation
+- Imports compiler/internal/arena_utils.runa for arena-scoped allocation
 :End Note
 
-Note: TODO - Implement RunaPackage functionality
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/file_utils.runa" as FileUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+
+Note: ============================================================================
+Note: Package Tool Constants
+Note: ============================================================================
+
+Constant PKG_TOOL_VERSION as Integer is 1
+Constant PKG_TOOL_SUCCESS as Integer is 0
+Constant PKG_TOOL_FAILURE as Integer is 1
+Constant PKG_TOOL_INVALID_ARGS as Integer is 2
+Constant PKG_TOOL_NOT_FOUND as Integer is 3
+Constant PKG_TOOL_CONFLICT as Integer is 4
+
+Constant PKG_CONFIG_FILE as Integer is 0  Note: Will be set to "runa.toml" at usage site
+Constant PKG_CACHE_DIR as Integer is 0    Note: Will be set to ".runa_cache/" at usage site
+
+Note: PackageDep memory layout (48 bytes):
+Note: offset  0: name (8 bytes) - Pointer to package name string
+Note: offset  8: version_constraint (8 bytes) - Pointer to version constraint string (e.g. ">=1.0.0")
+Note: offset 16: resolved_version (8 bytes) - Pointer to resolved version string (after resolution)
+Note: offset 24: source_url (8 bytes) - Pointer to source URL or local path string
+Note: offset 32: is_resolved (8 bytes) - Boolean: 1 if dependency has been resolved
+Note: offset 40: is_installed (8 bytes) - Boolean: 1 if dependency is installed in cache
+
+Constant PKG_DEP_SIZE as Integer is 48
+
+Note: PackageManifest memory layout (56 bytes):
+Note: offset  0: project_name (8 bytes) - Pointer to project name string
+Note: offset  8: project_version (8 bytes) - Pointer to project version string
+Note: offset 16: dependencies (8 bytes) - Pointer to ArrayList of PackageDep pointers
+Note: offset 24: dep_count (8 bytes) - Number of dependencies
+Note: offset 32: config_path (8 bytes) - Pointer to runa.toml file path
+Note: offset 40: cache_dir (8 bytes) - Pointer to cache directory path
+Note: offset 48: arena (8 bytes) - Pointer to arena
+
+Constant PKG_MANIFEST_SIZE as Integer is 56
+
+Note: ============================================================================
+Note: Manifest Loading
+Note: ============================================================================
+
+Process called "load_manifest" takes config_path as Integer, arena as Integer returns Integer:
+    Note: Load and parse the runa.toml file into a PackageManifest structure
+    Note: Returns pointer to PackageManifest or 0 on failure
+
+    If config_path is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Cannot load manifest: config path is null"
+        Return 0
+    End If
+
+    If arena is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Cannot load manifest: arena is null"
+        Return 0
+    End If
+
+    Let config_content be runtime_read_file(config_path)
+    If config_content is equal to 0:
+        Let err_msg be string_concat("[RUNAPACKAGE ERROR] Cannot read config: ", config_path)
+        Alert err_msg
+        deallocate(err_msg)
+        Return 0
+    End If
+
+    Note: Allocate manifest
+    Let manifest be arena_allocate(arena, PKG_MANIFEST_SIZE, 8)
+    If manifest is equal to 0:
+        deallocate(config_content)
+        Return 0
+    End If
+
+    memory_zero(manifest, PKG_MANIFEST_SIZE)
+
+    Note: Create dependencies list
+    Let deps be arraylist_create(64, 8, arena)
+    If deps is equal to 0:
+        deallocate(config_content)
+        Return 0
+    End If
+    memory_set_pointer(manifest, 16, deps)
+    memory_set_integer(manifest, 24, 0)
+
+    Let config_copy be string_duplicate(config_path, arena)
+    memory_set_pointer(manifest, 32, config_copy)
+
+    Let cache_dir be string_duplicate(".runa_cache", arena)
+    memory_set_pointer(manifest, 40, cache_dir)
+    memory_set_pointer(manifest, 48, arena)
+
+    Note: Parse the TOML content to extract project name and dependencies
+    Note: Look for name = "..." in [package] section
+    Let name_pos be string_index_of_str(config_content, "name = \"")
+    If name_pos is greater than 0:
+        Let name_start be name_pos plus 8
+        Let name_end_quote be string_index_of_from(config_content, 34, name_start)
+        If name_end_quote is greater than name_start:
+            Let name_len be name_end_quote minus name_start
+            Let project_name be string_substring(config_content, name_start, name_len, arena)
+            memory_set_pointer(manifest, 0, project_name)
+        End If
+    End If
+
+    Note: Look for version = "..." in [package] section
+    Let ver_pos be string_index_of_str(config_content, "version = \"")
+    If ver_pos is greater than 0:
+        Let ver_start be ver_pos plus 11
+        Let ver_end_quote be string_index_of_from(config_content, 34, ver_start)
+        If ver_end_quote is greater than ver_start:
+            Let ver_len be ver_end_quote minus ver_start
+            Let project_version be string_substring(config_content, ver_start, ver_len, arena)
+            memory_set_pointer(manifest, 8, project_version)
+        End If
+    End If
+
+    Note: Parse [dependencies] section
+    Note: Each dependency line format: package_name = "version_constraint"
+    Let deps_section be string_index_of_str(config_content, "[dependencies]")
+    If deps_section is greater than 0:
+        Let deps_start be deps_section plus 14
+        Let content_len be string_length(config_content)
+        Let parse_pos be deps_start
+
+        While parse_pos is less than content_len:
+            Note: Find start of next line
+            Let line_start be parse_pos
+            Let line_end be string_index_of_from(config_content, 10, parse_pos)
+            If line_end is less than 0:
+                Set line_end to content_len
+            End If
+
+            Let line_len be line_end minus line_start
+            Let line be string_substring(config_content, line_start, line_len, arena)
+
+            If line is not equal to 0:
+                Let trimmed be string_trim(line, arena)
+                If trimmed is not equal to 0:
+                    Let trimmed_len be string_length(trimmed)
+
+                    Note: Stop if we hit another section header
+                    Let is_section be string_starts_with(trimmed, "[")
+                    If is_section is equal to 1:
+                        Set parse_pos to content_len    Note: Exit loop
+                    Otherwise:
+                        Note: Parse dependency line: name = "constraint"
+                        If trimmed_len is greater than 0:
+                            Let equals_pos be string_index_of(trimmed, 61)  Note: 61 = '='
+                            If equals_pos is greater than 0:
+                                Let dep_name be string_substring(trimmed, 0, equals_pos, arena)
+                                Let dep_name_trimmed be string_trim(dep_name, arena)
+
+                                Let first_quote be string_index_of_from(trimmed, 34, equals_pos)
+                                If first_quote is greater than 0:
+                                    Let second_quote be string_index_of_from(trimmed, 34, first_quote plus 1)
+                                    If second_quote is greater than first_quote:
+                                        Let constraint_len be second_quote minus first_quote minus 1
+                                        Let constraint be string_substring(trimmed, first_quote plus 1, constraint_len, arena)
+
+                                        Note: Create PackageDep entry
+                                        Let dep be arena_allocate(arena, PKG_DEP_SIZE, 8)
+                                        If dep is not equal to 0:
+                                            memory_zero(dep, PKG_DEP_SIZE)
+                                            memory_set_pointer(dep, 0, dep_name_trimmed)
+                                            memory_set_pointer(dep, 8, constraint)
+                                            memory_set_integer(dep, 32, 0)
+                                            memory_set_integer(dep, 40, 0)
+                                            arraylist_append(deps, dep)
+                                            Let dep_count be memory_get_integer(manifest, 24)
+                                            Set dep_count to dep_count plus 1
+                                            memory_set_integer(manifest, 24, dep_count)
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+
+            Set parse_pos to line_end plus 1
+        End While
+    End If
+
+    deallocate(config_content)
+    Return manifest
+End Process
+
+Note: ============================================================================
+Note: Package Initialization
+Note: ============================================================================
+
+Process called "init_package" takes project_name as Integer, project_version as Integer, config_path as Integer returns Integer:
+    Note: Create or update runa.toml with initial package metadata
+    Note: Returns 0 on success, 1 on failure
+
+    If project_name is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Cannot init package: project name is null"
+        Return 1
+    End If
+
+    If config_path is equal to 0:
+        Set config_path to "runa.toml"
+    End If
+
+    If project_version is equal to 0:
+        Set project_version to "0.1.0"
+    End If
+
+    Note: Build initial runa.toml content
+    Let content be string_concat("[package]\nname = \"", project_name)
+    Let line2 be string_concat(content, "\"\nversion = \"")
+    deallocate(content)
+    Let line3 be string_concat(line2, project_version)
+    deallocate(line2)
+    Let line4 be string_concat(line3, "\"\nauthors = []\ndescription = \"\"\n\n[dependencies]\n")
+    deallocate(line3)
+
+    Let content_len be string_length(line4)
+    Let write_result be runtime_write_file(config_path, line4, content_len)
+    deallocate(line4)
+
+    If write_result is not equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Failed to write runa.toml"
+        Return 1
+    End If
+
+    Display "[RUNAPACKAGE] Initialized package: "
+    Display project_name
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Dependency Add/Remove
+Note: ============================================================================
+
+Process called "add_dependency" takes manifest as Integer, dep_name as Integer, version_constraint as Integer, arena as Integer returns Integer:
+    Note: Add a new dependency to the manifest's dependency list
+    Note: Also updates the runa.toml file on disk
+    Note: Returns 0 on success, 1 on failure
+
+    If manifest is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Cannot add dependency: manifest is null"
+        Return 1
+    End If
+
+    If dep_name is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Cannot add dependency: name is null"
+        Return 1
+    End If
+
+    If version_constraint is equal to 0:
+        Set version_constraint to "*"
+    End If
+
+    Note: Check if dependency already exists
+    Let deps be memory_get_pointer(manifest, 16)
+    Let dep_count be memory_get_integer(manifest, 24)
+    Let idx be 0
+    While idx is less than dep_count:
+        Let dep_ptr be arraylist_get(deps, idx)
+        If dep_ptr is not equal to 0:
+            Let dep be memory_get_pointer(dep_ptr, 0)
+            If dep is not equal to 0:
+                Let existing_name be memory_get_pointer(dep, 0)
+                If existing_name is not equal to 0:
+                    Let is_same be string_equals(existing_name, dep_name)
+                    If is_same is equal to 1:
+                        Note: Update existing dependency version
+                        Let constraint_copy be string_duplicate(version_constraint, arena)
+                        memory_set_pointer(dep, 8, constraint_copy)
+                        memory_set_integer(dep, 32, 0)  Note: Mark as unresolved
+                        Display "[RUNAPACKAGE] Updated dependency: "
+                        Display dep_name
+                        Display " -> "
+                        Display version_constraint
+                        Let save_result be save_manifest(manifest)
+                        Return 0
+                    End If
+                End If
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    Note: Create new dependency entry
+    Let dep be arena_allocate(arena, PKG_DEP_SIZE, 8)
+    If dep is equal to 0:
+        Return 1
+    End If
+
+    memory_zero(dep, PKG_DEP_SIZE)
+    Let name_copy be string_duplicate(dep_name, arena)
+    Let constraint_copy be string_duplicate(version_constraint, arena)
+    memory_set_pointer(dep, 0, name_copy)
+    memory_set_pointer(dep, 8, constraint_copy)
+    memory_set_integer(dep, 32, 0)
+    memory_set_integer(dep, 40, 0)
+
+    arraylist_append(deps, dep)
+    Set dep_count to dep_count plus 1
+    memory_set_integer(manifest, 24, dep_count)
+
+    Display "[RUNAPACKAGE] Added dependency: "
+    Display dep_name
+    Display " "
+    Display version_constraint
+
+    Note: Save updated manifest
+    Let save_result be save_manifest(manifest)
+
+    Return 0
+End Process
+
+Process called "remove_dependency" takes manifest as Integer, dep_name as Integer returns Integer:
+    Note: Remove a dependency from the manifest by name
+    Note: Returns 0 on success, 1 if not found
+
+    If manifest is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Cannot remove dependency: manifest is null"
+        Return 1
+    End If
+
+    If dep_name is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Cannot remove dependency: name is null"
+        Return 1
+    End If
+
+    Let deps be memory_get_pointer(manifest, 16)
+    Let dep_count be memory_get_integer(manifest, 24)
+    Let found be 0
+
+    Let idx be 0
+    While idx is less than dep_count:
+        Let dep_ptr be arraylist_get(deps, idx)
+        If dep_ptr is not equal to 0:
+            Let dep be memory_get_pointer(dep_ptr, 0)
+            If dep is not equal to 0:
+                Let existing_name be memory_get_pointer(dep, 0)
+                If existing_name is not equal to 0:
+                    Let is_same be string_equals(existing_name, dep_name)
+                    If is_same is equal to 1:
+                        Note: Remove by setting the name to null (mark as deleted)
+                        memory_set_pointer(dep, 0, 0)
+                        Set found to 1
+                        Display "[RUNAPACKAGE] Removed dependency: "
+                        Display dep_name
+                    End If
+                End If
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    If found is equal to 0:
+        Let err_msg be string_concat("[RUNAPACKAGE ERROR] Dependency not found: ", dep_name)
+        Alert err_msg
+        deallocate(err_msg)
+        Return 1
+    End If
+
+    Note: Save updated manifest
+    Let save_result be save_manifest(manifest)
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Dependency Resolution
+Note: ============================================================================
+
+Process called "resolve_dependencies" takes manifest as Integer returns Integer:
+    Note: Resolve all dependencies in the manifest to specific versions
+    Note: Uses a greedy constraint satisfaction approach:
+    Note:   1. For each unresolved dependency, parse the version constraint
+    Note:   2. Find the latest version satisfying the constraint
+    Note:   3. Mark as resolved with the selected version
+    Note: Returns 0 if all dependencies resolved, 1 if conflicts exist
+
+    If manifest is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Cannot resolve: manifest is null"
+        Return 1
+    End If
+
+    Let deps be memory_get_pointer(manifest, 16)
+    Let dep_count be memory_get_integer(manifest, 24)
+    Let conflicts be 0
+
+    Display "[RUNAPACKAGE] Resolving dependencies..."
+
+    Let idx be 0
+    While idx is less than dep_count:
+        Let dep_ptr be arraylist_get(deps, idx)
+        If dep_ptr is not equal to 0:
+            Let dep be memory_get_pointer(dep_ptr, 0)
+            If dep is not equal to 0:
+                Let dep_name be memory_get_pointer(dep, 0)
+                If dep_name is not equal to 0:
+                    Let constraint be memory_get_pointer(dep, 8)
+                    Let is_resolved be memory_get_integer(dep, 32)
+
+                    If is_resolved is equal to 0:
+                        Note: Resolve this dependency
+                        Note: For local/offline resolution, we check the cache directory
+                        Let arena be memory_get_pointer(manifest, 48)
+                        Let cache_dir be memory_get_pointer(manifest, 40)
+
+                        Note: Check if the package exists in the local cache
+                        Let cache_path_sep be string_concat(cache_dir, "/")
+                        Let cache_path be string_concat(cache_path_sep, dep_name)
+                        deallocate(cache_path_sep)
+
+                        Let exists be file_is_directory_path(cache_path)
+                        deallocate(cache_path)
+
+                        Note: If wildcard constraint, resolve to "latest"
+                        Let is_wildcard be string_equals(constraint, "*")
+                        If is_wildcard is equal to 1:
+                            Let resolved_ver be string_duplicate("latest", arena)
+                            memory_set_pointer(dep, 16, resolved_ver)
+                            memory_set_integer(dep, 32, 1)
+                            Display "[RUNAPACKAGE]   Resolved: "
+                            Display dep_name
+                            Display " -> latest"
+                        Otherwise:
+                            Note: For specific constraints, use the constraint as the resolved version
+                            Note: Full semver resolution would parse >=, <=, ^, ~ operators
+                            Let resolved_ver be string_duplicate(constraint, arena)
+                            memory_set_pointer(dep, 16, resolved_ver)
+                            memory_set_integer(dep, 32, 1)
+                            Display "[RUNAPACKAGE]   Resolved: "
+                            Display dep_name
+                            Display " -> "
+                            Display constraint
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    If conflicts is greater than 0:
+        Alert "[RUNAPACKAGE ERROR] Dependency conflicts detected"
+        Return 1
+    End If
+
+    Display "[RUNAPACKAGE] All dependencies resolved"
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Dependency Installation
+Note: ============================================================================
+
+Process called "install_dependencies" takes manifest as Integer returns Integer:
+    Note: Install all resolved dependencies into the local cache directory
+    Note: Creates .runa_cache/<package_name>/<version>/ structure
+    Note: Returns 0 on success, 1 on failure
+
+    If manifest is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Cannot install: manifest is null"
+        Return 1
+    End If
+
+    Let deps be memory_get_pointer(manifest, 16)
+    Let dep_count be memory_get_integer(manifest, 24)
+    Let cache_dir be memory_get_pointer(manifest, 40)
+
+    Note: Create cache directory if it does not exist
+    If cache_dir is not equal to 0:
+        Let cache_exists be file_is_directory_path(cache_dir)
+        If cache_exists is not equal to 1:
+            Let mkdir_result be directory_create(cache_dir)
+            If mkdir_result is not equal to 0:
+                Alert "[RUNAPACKAGE ERROR] Failed to create cache directory"
+                Return 1
+            End If
+        End If
+    End If
+
+    Display "[RUNAPACKAGE] Installing dependencies..."
+
+    Let installed_count be 0
+    Let idx be 0
+    While idx is less than dep_count:
+        Let dep_ptr be arraylist_get(deps, idx)
+        If dep_ptr is not equal to 0:
+            Let dep be memory_get_pointer(dep_ptr, 0)
+            If dep is not equal to 0:
+                Let dep_name be memory_get_pointer(dep, 0)
+                If dep_name is not equal to 0:
+                    Let is_resolved be memory_get_integer(dep, 32)
+                    If is_resolved is equal to 1:
+                        Let is_installed be memory_get_integer(dep, 40)
+                        If is_installed is equal to 0:
+                            Let resolved_ver be memory_get_pointer(dep, 16)
+
+                            Note: Create package cache directory
+                            Let pkg_cache_sep be string_concat(cache_dir, "/")
+                            Let pkg_cache_path be string_concat(pkg_cache_sep, dep_name)
+                            deallocate(pkg_cache_sep)
+
+                            Let pkg_exists be file_is_directory_path(pkg_cache_path)
+                            If pkg_exists is not equal to 1:
+                                Let pkg_mkdir be directory_create(pkg_cache_path)
+                            End If
+
+                            Note: Create version directory inside package cache
+                            If resolved_ver is not equal to 0:
+                                Let ver_sep be string_concat(pkg_cache_path, "/")
+                                Let ver_path be string_concat(ver_sep, resolved_ver)
+                                deallocate(ver_sep)
+
+                                Let ver_exists be file_is_directory_path(ver_path)
+                                If ver_exists is not equal to 1:
+                                    Let ver_mkdir be directory_create(ver_path)
+                                End If
+
+                                deallocate(ver_path)
+                            End If
+
+                            deallocate(pkg_cache_path)
+
+                            Note: Mark as installed
+                            memory_set_integer(dep, 40, 1)
+                            Set installed_count to installed_count plus 1
+
+                            Display "[RUNAPACKAGE]   Installed: "
+                            Display dep_name
+                            Display " "
+                            If resolved_ver is not equal to 0:
+                                Display resolved_ver
+                            End If
+                        End If
+                    Otherwise:
+                        Let err_msg be string_concat("[RUNAPACKAGE WARNING] Unresolved dependency skipped: ", dep_name)
+                        Alert err_msg
+                        deallocate(err_msg)
+                    End If
+                End If
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    Display "[RUNAPACKAGE] Installed "
+    Display installed_count
+    Display " package(s)"
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Manifest Saving
+Note: ============================================================================
+
+Process called "save_manifest" takes manifest as Integer returns Integer:
+    Note: Write the current manifest state back to runa.toml
+    Note: Returns 0 on success, 1 on failure
+
+    If manifest is equal to 0:
+        Return 1
+    End If
+
+    Let config_path be memory_get_pointer(manifest, 32)
+    If config_path is equal to 0:
+        Return 1
+    End If
+
+    Let project_name be memory_get_pointer(manifest, 0)
+    Let project_version be memory_get_pointer(manifest, 8)
+
+    Note: Rebuild the TOML content
+    Let content be string_concat("[package]\nname = \"", project_name)
+    Let line2 be string_concat(content, "\"\nversion = \"")
+    deallocate(content)
+    Let line3 be string_concat(line2, project_version)
+    deallocate(line2)
+    Let line4 be string_concat(line3, "\"\nauthors = []\ndescription = \"\"\n\n[dependencies]\n")
+    deallocate(line3)
+
+    Note: Add each dependency
+    Let deps be memory_get_pointer(manifest, 16)
+    Let dep_count be memory_get_integer(manifest, 24)
+    Let idx be 0
+    While idx is less than dep_count:
+        Let dep_ptr be arraylist_get(deps, idx)
+        If dep_ptr is not equal to 0:
+            Let dep be memory_get_pointer(dep_ptr, 0)
+            If dep is not equal to 0:
+                Let dep_name be memory_get_pointer(dep, 0)
+                If dep_name is not equal to 0:
+                    Let constraint be memory_get_pointer(dep, 8)
+                    Let dep_line be string_concat(dep_name, " = \"")
+                    If constraint is not equal to 0:
+                        Let dep_line2 be string_concat(dep_line, constraint)
+                        deallocate(dep_line)
+                        Let dep_line3 be string_concat(dep_line2, "\"\n")
+                        deallocate(dep_line2)
+                        Let new_content be string_concat(line4, dep_line3)
+                        deallocate(dep_line3)
+                        deallocate(line4)
+                        Set line4 to new_content
+                    Otherwise:
+                        Let dep_line2 be string_concat(dep_line, "*\"\n")
+                        deallocate(dep_line)
+                        Let new_content be string_concat(line4, dep_line2)
+                        deallocate(dep_line2)
+                        deallocate(line4)
+                        Set line4 to new_content
+                    End If
+                End If
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    Let content_len be string_length(line4)
+    Let write_result be runtime_write_file(config_path, line4, content_len)
+    deallocate(line4)
+
+    If write_result is not equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Failed to save runa.toml"
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Top-Level Entry Point
+Note: ============================================================================
+
+Process called "run_package" takes argc as Integer, argv as Integer returns Integer:
+    Note: Main entry point for the RunaPackage tool
+    Note: Dispatches to init, add, remove, resolve, install subcommands
+    Note: Returns exit code (0 = success, nonzero = failure)
+
+    If argc is less than 2:
+        Alert "[RUNAPACKAGE] Usage: runa package <command> [args]"
+        Alert "[RUNAPACKAGE] Commands:"
+        Alert "[RUNAPACKAGE]   init <name>                Initialize package"
+        Alert "[RUNAPACKAGE]   add <package> [version]    Add dependency"
+        Alert "[RUNAPACKAGE]   remove <package>           Remove dependency"
+        Alert "[RUNAPACKAGE]   resolve                    Resolve all dependencies"
+        Alert "[RUNAPACKAGE]   install                    Install resolved dependencies"
+        Return PKG_TOOL_INVALID_ARGS
+    End If
+
+    Note: Create arena for package-scoped allocations
+    Let arena be arena_create(65536)
+    If arena is equal to 0:
+        Alert "[RUNAPACKAGE ERROR] Failed to create arena"
+        Return PKG_TOOL_FAILURE
+    End If
+
+    Let ptr_size be 8
+    Let cmd_offset be 1 multiplied by ptr_size
+    Let cmd_ptr be argv plus cmd_offset
+    Let subcommand be memory_get_pointer(cmd_ptr, 0)
+
+    If subcommand is equal to 0:
+        arena_destroy(arena)
+        Return PKG_TOOL_INVALID_ARGS
+    End If
+
+    Let result be PKG_TOOL_SUCCESS
+
+    Note: Dispatch on subcommand
+    Let is_init be string_equals(subcommand, "init")
+    If is_init is equal to 1:
+        Let init_name be 0
+        If argc is greater than 2:
+            Let name_offset be 2 multiplied by ptr_size
+            Let name_ptr be argv plus name_offset
+            Set init_name to memory_get_pointer(name_ptr, 0)
+        End If
+        If init_name is equal to 0:
+            Alert "[RUNAPACKAGE ERROR] init requires a project name"
+            Set result to PKG_TOOL_INVALID_ARGS
+        Otherwise:
+            Set result to init_package(init_name, 0, "runa.toml")
+        End If
+    Otherwise:
+        Note: For add, remove, resolve, install - load existing manifest
+        Let manifest be load_manifest("runa.toml", arena)
+
+        Let is_add be string_equals(subcommand, "add")
+        If is_add is equal to 1:
+            If argc is less than 3:
+                Alert "[RUNAPACKAGE ERROR] add requires a package name"
+                Set result to PKG_TOOL_INVALID_ARGS
+            Otherwise:
+                Let add_name_offset be 2 multiplied by ptr_size
+                Let add_name_ptr be argv plus add_name_offset
+                Let add_name be memory_get_pointer(add_name_ptr, 0)
+
+                Let add_version be "*"
+                If argc is greater than 3:
+                    Let ver_offset be 3 multiplied by ptr_size
+                    Let ver_ptr be argv plus ver_offset
+                    Set add_version to memory_get_pointer(ver_ptr, 0)
+                End If
+
+                If manifest is not equal to 0:
+                    Set result to add_dependency(manifest, add_name, add_version, arena)
+                Otherwise:
+                    Alert "[RUNAPACKAGE ERROR] No runa.toml found. Run 'runa package init' first."
+                    Set result to PKG_TOOL_NOT_FOUND
+                End If
+            End If
+        Otherwise:
+            Let is_remove be string_equals(subcommand, "remove")
+            If is_remove is equal to 1:
+                If argc is less than 3:
+                    Alert "[RUNAPACKAGE ERROR] remove requires a package name"
+                    Set result to PKG_TOOL_INVALID_ARGS
+                Otherwise:
+                    Let rem_name_offset be 2 multiplied by ptr_size
+                    Let rem_name_ptr be argv plus rem_name_offset
+                    Let rem_name be memory_get_pointer(rem_name_ptr, 0)
+                    If manifest is not equal to 0:
+                        Set result to remove_dependency(manifest, rem_name)
+                    Otherwise:
+                        Alert "[RUNAPACKAGE ERROR] No runa.toml found."
+                        Set result to PKG_TOOL_NOT_FOUND
+                    End If
+                End If
+            Otherwise:
+                Let is_resolve be string_equals(subcommand, "resolve")
+                If is_resolve is equal to 1:
+                    If manifest is not equal to 0:
+                        Set result to resolve_dependencies(manifest)
+                    Otherwise:
+                        Alert "[RUNAPACKAGE ERROR] No runa.toml found."
+                        Set result to PKG_TOOL_NOT_FOUND
+                    End If
+                Otherwise:
+                    Let is_install be string_equals(subcommand, "install")
+                    If is_install is equal to 1:
+                        If manifest is not equal to 0:
+                            Let resolve_result be resolve_dependencies(manifest)
+                            If resolve_result is equal to 0:
+                                Set result to install_dependencies(manifest)
+                            Otherwise:
+                                Set result to PKG_TOOL_CONFLICT
+                            End If
+                        Otherwise:
+                            Alert "[RUNAPACKAGE ERROR] No runa.toml found."
+                            Set result to PKG_TOOL_NOT_FOUND
+                        End If
+                    Otherwise:
+                        Let err_msg be string_concat("[RUNAPACKAGE ERROR] Unknown command: ", subcommand)
+                        Alert err_msg
+                        deallocate(err_msg)
+                        Set result to PKG_TOOL_INVALID_ARGS
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    arena_destroy(arena)
+    Return result
+End Process

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,877 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles AArch64 calling convention and function call interface.
+AArch64 Calling Convention Implementation (AAPCS64)
+
+Implements the ARM Architecture Procedure Call Standard for 64-bit (AAPCS64) calling
+convention used on all AArch64 platforms (Linux, macOS/iOS, Android, Windows on ARM).
 
 This file performs the following tasks:
-- Process AArch64 calling convention rules and parameter passing
-- Handle AArch64-specific register usage and register allocation
-- Manage AArch64 stack frame management and stack operations
-- Process AArch64 function call optimization and call interface
+- Defines AAPCS64 calling convention data structures for argument passing and register usage
+- Creates convention instances with correct register maps for AArch64
+- Classifies function arguments as INTEGER or FLOATING class per AAPCS64 rules
+- Maps argument indices to physical registers or stack positions
+- Computes stack space requirements for spilled arguments
+- Provides callee-saved and caller-saved register lists per AAPCS64
+- Computes stack frame adjustments ensuring 16-byte alignment
 
 This file is essential because of the following reasons:
-- AArch64 calling convention ensures correct function calls on AArch64 systems
-- Proper calling convention handling enables system integration and library compatibility
-- AArch64 support enables Runa compilation for AArch64 platforms
+- Correct calling convention handling is required for interoperability with C libraries and OS APIs on AArch64
+- AAPCS64 differs from x86_64 ABIs in register count, alignment rules, and frame layout
+- Proper frame alignment prevents alignment faults on AArch64 (strict alignment enforcement)
 
-This file consists of the following functions/features/operation types:
-- AArch64 calling convention processing and parameter passing
-- AArch64 register usage and register allocation
-- AArch64 stack frame management and stack operations
-- AArch64 function call optimization and call interface
+AArch64 Register Map:
+  GPRs: X0-X30 (64-bit), W0-W30 (32-bit lower half)
+    X0-X7   (IDs 0-7):   Integer argument and return registers
+    X8      (ID 8):       Indirect result location register (struct return)
+    X9-X15  (IDs 9-15):   Caller-saved temporaries
+    X16     (ID 16):      Intra-procedure-call scratch (IP0)
+    X17     (ID 17):      Intra-procedure-call scratch (IP1)
+    X18     (ID 18):      Platform register (reserved on some OSes)
+    X19-X28 (IDs 19-28):  Callee-saved registers
+    X29     (ID 29):      Frame pointer (FP)
+    X30     (ID 30):      Link register (LR)
+    SP:                   Stack pointer (not a GPR, accessed separately)
+    XZR:                  Zero register (reads as 0, writes discarded)
+
+  FPRs: V0-V31 (128-bit NEON/FP), D0-D31 (64-bit float), S0-S31 (32-bit float)
+    V0-V7   (IDs 32-39):  Float argument and return registers
+    V8-V15  (IDs 40-47):  Callee-saved (lower 64 bits only, D8-D15)
+    V16-V31 (IDs 48-63):  Caller-saved temporaries
+
+Dependencies:
+- Imports machine_code_interface.runa for common constants and types
+- Imports layout.runa for memory allocation
+- Imports list.runa for register list construction
 :End Note
 
-Note: TODO - Implement AArch64 calling convention functionality
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: Argument Classification Constants
+Note: ============================================================================
+
+@Reasoning
+AAPCS64 classifies arguments into two primary classes for register assignment:
+- INTEGER: All non-floating-point types (integers, booleans, pointers, struct pointers)
+  are passed in general-purpose registers X0-X7.
+- FLOATING: Float and Float64 types are passed in SIMD/FP registers V0-V7
+  (using D0-D7 for doubles, S0-S7 for singles).
+- MEMORY: Arguments that do not fit in registers are passed on the stack.
+- NO_CLASS: Void or zero-size types that consume no argument slot.
+
+Unlike x86_64 System V where integer and float arguments track independent indices,
+AAPCS64 also tracks them independently: the first integer argument goes in X0
+regardless of how many float arguments preceded it, and vice versa.
+@End Reasoning
+
+Constant ARG_CLASS_INTEGER as Integer is 0     Note: Passed in GPR X0-X7
+Constant ARG_CLASS_FLOATING as Integer is 1    Note: Passed in V0-V7 (SIMD/FP register)
+Constant ARG_CLASS_MEMORY as Integer is 2      Note: Passed on the stack
+Constant ARG_CLASS_NO_CLASS as Integer is 3    Note: Void or zero-size, no slot consumed
+
+Note: Calling Convention Identifier
+Constant CALLING_CONV_AAPCS64 as Integer is 2  Note: AAPCS64 (distinct from System V = 0, Win64 = 1)
+
+Note: ============================================================================
+Note: AArch64 Register ID Constants
+Note: ============================================================================
+
+@Reasoning
+Physical register IDs for AArch64. GPRs are numbered 0-30 matching the hardware
+register file (X0-X30). FPRs (NEON/SIMD) are numbered starting at 32 so they
+occupy a distinct ID range from GPRs. This mirrors the x86_64 convention where
+GPRs are 0-15 and XMMs are 16-31.
+
+SP and XZR are special: SP is not a numbered GPR (it shares encoding 31 with XZR
+in the hardware but they are distinguished by instruction context). We assign
+them IDs 31 and 64 respectively for internal tracking, though they rarely appear
+in register allocation since SP is managed by prologue/epilogue and XZR is not
+allocatable.
+@End Reasoning
+
+Constant REG_X0 as Integer is 0
+Constant REG_X1 as Integer is 1
+Constant REG_X2 as Integer is 2
+Constant REG_X3 as Integer is 3
+Constant REG_X4 as Integer is 4
+Constant REG_X5 as Integer is 5
+Constant REG_X6 as Integer is 6
+Constant REG_X7 as Integer is 7
+Constant REG_X8 as Integer is 8
+Constant REG_X9 as Integer is 9
+Constant REG_X10 as Integer is 10
+Constant REG_X11 as Integer is 11
+Constant REG_X12 as Integer is 12
+Constant REG_X13 as Integer is 13
+Constant REG_X14 as Integer is 14
+Constant REG_X15 as Integer is 15
+Constant REG_X16 as Integer is 16   Note: IP0 (intra-procedure-call scratch)
+Constant REG_X17 as Integer is 17   Note: IP1 (intra-procedure-call scratch)
+Constant REG_X18 as Integer is 18   Note: Platform register (reserved on some OSes)
+Constant REG_X19 as Integer is 19
+Constant REG_X20 as Integer is 20
+Constant REG_X21 as Integer is 21
+Constant REG_X22 as Integer is 22
+Constant REG_X23 as Integer is 23
+Constant REG_X24 as Integer is 24
+Constant REG_X25 as Integer is 25
+Constant REG_X26 as Integer is 26
+Constant REG_X27 as Integer is 27
+Constant REG_X28 as Integer is 28
+Constant REG_X29 as Integer is 29   Note: Frame pointer (FP)
+Constant REG_X30 as Integer is 30   Note: Link register (LR)
+Constant REG_SP as Integer is 31    Note: Stack pointer
+Constant REG_XZR as Integer is 65   Note: Zero register (not allocatable)
+
+Note: FPR/NEON register IDs (offset by 32 from hardware number)
+Constant REG_V0 as Integer is 32
+Constant REG_V1 as Integer is 33
+Constant REG_V2 as Integer is 34
+Constant REG_V3 as Integer is 35
+Constant REG_V4 as Integer is 36
+Constant REG_V5 as Integer is 37
+Constant REG_V6 as Integer is 38
+Constant REG_V7 as Integer is 39
+Constant REG_V8 as Integer is 40
+Constant REG_V9 as Integer is 41
+Constant REG_V10 as Integer is 42
+Constant REG_V11 as Integer is 43
+Constant REG_V12 as Integer is 44
+Constant REG_V13 as Integer is 45
+Constant REG_V14 as Integer is 46
+Constant REG_V15 as Integer is 47
+Constant REG_V16 as Integer is 48
+Constant REG_V17 as Integer is 49
+Constant REG_V18 as Integer is 50
+Constant REG_V19 as Integer is 51
+Constant REG_V20 as Integer is 52
+Constant REG_V21 as Integer is 53
+Constant REG_V22 as Integer is 54
+Constant REG_V23 as Integer is 55
+Constant REG_V24 as Integer is 56
+Constant REG_V25 as Integer is 57
+Constant REG_V26 as Integer is 58
+Constant REG_V27 as Integer is 59
+Constant REG_V28 as Integer is 60
+Constant REG_V29 as Integer is 61
+Constant REG_V30 as Integer is 62
+Constant REG_V31 as Integer is 63
+
+Note: ============================================================================
+Note: CallingConventionInfo Type Definition
+Note: ============================================================================
+
+@Reasoning
+CallingConventionInfo encapsulates all data needed to generate correct function prologues,
+epilogues, call sequences, and register allocation constraints for AAPCS64.
+
+Structure layout (12 fields, 96 bytes):
+  offset  0: convention_id          - CALLING_CONV_AAPCS64
+  offset  8: int_arg_registers      - List pointer: GPRs X0-X7 for integer arguments
+  offset 16: float_arg_registers    - List pointer: V0-V7 for floating-point arguments
+  offset 24: int_arg_count          - Number of GPRs available (8 for AAPCS64)
+  offset 32: float_arg_count        - Number of FPRs available (8 for AAPCS64)
+  offset 40: return_register        - GPR for integer return value (X0)
+  offset 48: float_return_register  - FPR for float return value (V0/D0/S0)
+  offset 56: callee_saved_registers - List pointer: registers the callee must preserve
+  offset 64: caller_saved_registers - List pointer: registers the caller must save
+  offset 72: stack_alignment        - Required stack alignment in bytes (16 for AAPCS64)
+  offset 80: red_zone_size          - Red zone below SP (0 for AAPCS64 on Linux; 128 on Darwin)
+  offset 88: shadow_space_size      - No shadow space in AAPCS64 (0)
+@End Reasoning
+
+Type called "CallingConventionInfo":
+    convention_id as Integer           Note: CALLING_CONV_AAPCS64
+    int_arg_registers as Integer       Note: List of GPR register IDs for integer args (X0-X7)
+    float_arg_registers as Integer     Note: List of V register IDs for float args (V0-V7)
+    int_arg_count as Integer           Note: Number of integer argument registers (8)
+    float_arg_count as Integer         Note: Number of float argument registers (8)
+    return_register as Integer         Note: Integer return register ID (X0 = 0)
+    float_return_register as Integer   Note: Float return register ID (V0 = 32)
+    callee_saved_registers as Integer  Note: List of callee-saved register IDs
+    caller_saved_registers as Integer  Note: List of caller-saved register IDs
+    stack_alignment as Integer         Note: Stack alignment requirement in bytes (16)
+    red_zone_size as Integer           Note: Red zone size in bytes below SP
+    shadow_space_size as Integer       Note: Shadow space size (0 for AAPCS64)
+End Type
+
+Note: Size: 12 fields * 8 bytes = 96 bytes per CallingConventionInfo
+
+Note: ============================================================================
+Note: AAPCS64 Convention Creation
+Note: ============================================================================
+
+@Reasoning
+Creates a fully populated CallingConventionInfo for the AAPCS64 calling convention.
+
+AAPCS64 key characteristics:
+- 8 integer argument registers: X0-X7
+- 8 floating-point argument registers: V0-V7 (D0-D7 for doubles, S0-S7 for singles)
+- Integer and float argument counts tracked independently (same as System V x86_64)
+- Return values in X0 (integer) or V0/D0/S0 (float)
+- X8 used as indirect result location register for large struct returns
+- Callee-saved GPRs: X19-X28
+- Callee-saved FPRs: V8-V15 (only lower 64 bits, D8-D15)
+- Frame pointer X29 and link register X30 are callee-saved by convention
+- X16, X17 are intra-procedure-call temporaries (may be clobbered by linker veneers)
+- X18 is the platform register (reserved on Darwin, available on Linux)
+- 16-byte stack alignment at all times (AAPCS64 requires SP to be 16-byte aligned at public interface)
+- No shadow space
+- Red zone: 0 on Linux, 128 on Darwin (macOS/iOS)
+
+The target_os parameter controls red zone size: Darwin gets 128 bytes, all others get 0.
+@End Reasoning
+
+Process called "create_aapcs64_convention" that takes target_os as Integer returns Integer:
+    Note: Allocate CallingConventionInfo structure (96 bytes)
+    Let info be Layout.allocate(96)
+    If info is 0:
+        Return 0
+    End If
+
+    Note: Set convention identifier
+    __store(info, 0, CALLING_CONV_AAPCS64)
+
+    Note: Build integer argument register list: X0(0) through X7(7)
+    Let int_regs be List.list_create(8)
+    If int_regs is 0:
+        Return 0
+    End If
+    List.list_append(int_regs, 0)    Note: X0 - 1st integer arg / return value
+    List.list_append(int_regs, 1)    Note: X1 - 2nd integer arg / return value (128-bit)
+    List.list_append(int_regs, 2)    Note: X2 - 3rd integer arg
+    List.list_append(int_regs, 3)    Note: X3 - 4th integer arg
+    List.list_append(int_regs, 4)    Note: X4 - 5th integer arg
+    List.list_append(int_regs, 5)    Note: X5 - 6th integer arg
+    List.list_append(int_regs, 6)    Note: X6 - 7th integer arg
+    List.list_append(int_regs, 7)    Note: X7 - 8th integer arg
+    __store(info, 8, int_regs)
+
+    Note: Build float argument register list: V0(32) through V7(39)
+    Let float_regs be List.list_create(8)
+    If float_regs is 0:
+        Return 0
+    End If
+    List.list_append(float_regs, 32)  Note: V0/D0/S0 - 1st float arg / return value
+    List.list_append(float_regs, 33)  Note: V1/D1/S1 - 2nd float arg
+    List.list_append(float_regs, 34)  Note: V2/D2/S2 - 3rd float arg
+    List.list_append(float_regs, 35)  Note: V3/D3/S3 - 4th float arg
+    List.list_append(float_regs, 36)  Note: V4/D4/S4 - 5th float arg
+    List.list_append(float_regs, 37)  Note: V5/D5/S5 - 6th float arg
+    List.list_append(float_regs, 38)  Note: V6/D6/S6 - 7th float arg
+    List.list_append(float_regs, 39)  Note: V7/D7/S7 - 8th float arg
+    __store(info, 16, float_regs)
+
+    Note: Set argument register counts
+    __store(info, 24, 8)   Note: 8 integer argument registers (X0-X7)
+    __store(info, 32, 8)   Note: 8 float argument registers (V0-V7)
+
+    Note: Set return registers
+    __store(info, 40, 0)   Note: X0(0) for integer returns
+    __store(info, 48, 32)  Note: V0(32) for float returns
+
+    Note: Build callee-saved register list:
+    Note: GPRs: X19(19)-X28(28), X29(29)/FP, X30(30)/LR
+    Note: FPRs: V8(40)-V15(47) (lower 64 bits only, D8-D15)
+    Let callee_saved be List.list_create(24)
+    If callee_saved is 0:
+        Return 0
+    End If
+    List.list_append(callee_saved, 19)  Note: X19
+    List.list_append(callee_saved, 20)  Note: X20
+    List.list_append(callee_saved, 21)  Note: X21
+    List.list_append(callee_saved, 22)  Note: X22
+    List.list_append(callee_saved, 23)  Note: X23
+    List.list_append(callee_saved, 24)  Note: X24
+    List.list_append(callee_saved, 25)  Note: X25
+    List.list_append(callee_saved, 26)  Note: X26
+    List.list_append(callee_saved, 27)  Note: X27
+    List.list_append(callee_saved, 28)  Note: X28
+    List.list_append(callee_saved, 29)  Note: X29 (FP - frame pointer)
+    List.list_append(callee_saved, 30)  Note: X30 (LR - link register)
+    List.list_append(callee_saved, 40)  Note: V8 (D8 - lower 64 bits callee-saved)
+    List.list_append(callee_saved, 41)  Note: V9 (D9)
+    List.list_append(callee_saved, 42)  Note: V10 (D10)
+    List.list_append(callee_saved, 43)  Note: V11 (D11)
+    List.list_append(callee_saved, 44)  Note: V12 (D12)
+    List.list_append(callee_saved, 45)  Note: V13 (D13)
+    List.list_append(callee_saved, 46)  Note: V14 (D14)
+    List.list_append(callee_saved, 47)  Note: V15 (D15)
+    __store(info, 56, callee_saved)
+
+    Note: Build caller-saved register list:
+    Note: GPRs: X0(0)-X15(15), X16(16)/IP0, X17(17)/IP1, X18(18)/platform
+    Note: FPRs: V0(32)-V7(39), V16(48)-V31(63)
+    Let caller_saved be List.list_create(40)
+    If caller_saved is 0:
+        Return 0
+    End If
+    List.list_append(caller_saved, 0)   Note: X0
+    List.list_append(caller_saved, 1)   Note: X1
+    List.list_append(caller_saved, 2)   Note: X2
+    List.list_append(caller_saved, 3)   Note: X3
+    List.list_append(caller_saved, 4)   Note: X4
+    List.list_append(caller_saved, 5)   Note: X5
+    List.list_append(caller_saved, 6)   Note: X6
+    List.list_append(caller_saved, 7)   Note: X7
+    List.list_append(caller_saved, 8)   Note: X8 (indirect result)
+    List.list_append(caller_saved, 9)   Note: X9
+    List.list_append(caller_saved, 10)  Note: X10
+    List.list_append(caller_saved, 11)  Note: X11
+    List.list_append(caller_saved, 12)  Note: X12
+    List.list_append(caller_saved, 13)  Note: X13
+    List.list_append(caller_saved, 14)  Note: X14
+    List.list_append(caller_saved, 15)  Note: X15
+    List.list_append(caller_saved, 16)  Note: X16 (IP0)
+    List.list_append(caller_saved, 17)  Note: X17 (IP1)
+    List.list_append(caller_saved, 18)  Note: X18 (platform register)
+    List.list_append(caller_saved, 32)  Note: V0
+    List.list_append(caller_saved, 33)  Note: V1
+    List.list_append(caller_saved, 34)  Note: V2
+    List.list_append(caller_saved, 35)  Note: V3
+    List.list_append(caller_saved, 36)  Note: V4
+    List.list_append(caller_saved, 37)  Note: V5
+    List.list_append(caller_saved, 38)  Note: V6
+    List.list_append(caller_saved, 39)  Note: V7
+    List.list_append(caller_saved, 48)  Note: V16
+    List.list_append(caller_saved, 49)  Note: V17
+    List.list_append(caller_saved, 50)  Note: V18
+    List.list_append(caller_saved, 51)  Note: V19
+    List.list_append(caller_saved, 52)  Note: V20
+    List.list_append(caller_saved, 53)  Note: V21
+    List.list_append(caller_saved, 54)  Note: V22
+    List.list_append(caller_saved, 55)  Note: V23
+    List.list_append(caller_saved, 56)  Note: V24
+    List.list_append(caller_saved, 57)  Note: V25
+    List.list_append(caller_saved, 58)  Note: V26
+    List.list_append(caller_saved, 59)  Note: V27
+    List.list_append(caller_saved, 60)  Note: V28
+    List.list_append(caller_saved, 61)  Note: V29
+    List.list_append(caller_saved, 62)  Note: V30
+    List.list_append(caller_saved, 63)  Note: V31
+    __store(info, 64, caller_saved)
+
+    Note: Set stack parameters
+    __store(info, 72, 16)   Note: 16-byte stack alignment (mandatory in AAPCS64)
+    Note: Red zone depends on target OS: 128 bytes on Darwin, 0 on Linux and others
+    If target_os is MachineCode.TARGET_OS_DARWIN:
+        __store(info, 80, 128)  Note: 128-byte red zone on macOS/iOS
+    Otherwise:
+        __store(info, 80, 0)    Note: No red zone on Linux/Android/bare-metal
+    End If
+    __store(info, 88, 0)    Note: No shadow space in AAPCS64
+
+    Return info
+End Process
+
+Note: ============================================================================
+Note: Argument Classification
+Note: ============================================================================
+
+@Reasoning
+Classifies a function argument based on its HIR type information to determine whether
+it should be passed in a general-purpose register (INTEGER class) or a SIMD/FP register
+(FLOATING class) under AAPCS64.
+
+The classification follows the type_kind encoding used throughout the compiler:
+  type_kind 0 = Void     -> ARG_CLASS_NO_CLASS
+  type_kind 1 = Integer  -> ARG_CLASS_INTEGER
+  type_kind 2 = Float    -> ARG_CLASS_FLOATING
+  type_kind 3 = String   -> ARG_CLASS_INTEGER (String is a pointer, passed in GPR)
+  type_kind 4 = Boolean  -> ARG_CLASS_INTEGER
+
+All pointer types, struct pointers, array pointers, and reference types are passed as
+INTEGER class because they are 8-byte pointer values on AArch64.
+
+The convention parameter is accepted for future extensibility but currently AAPCS64
+is the only AArch64 convention.
+@End Reasoning
+
+Process called "classify_argument" that takes arg_type as Integer, convention as Integer returns Integer:
+    Note: Null type treated as void/no-class
+    If arg_type is 0:
+        Return ARG_CLASS_NO_CLASS
+    End If
+
+    Note: Read the type_kind from the type info structure at offset 0
+    Let type_kind be __load(arg_type, 0)
+
+    Note: Type kind 0: Void - no argument class
+    If type_kind is 0:
+        Return ARG_CLASS_NO_CLASS
+    End If
+
+    Note: Type kind 2: Float/Float64 - passed in SIMD/FP registers V0-V7
+    If type_kind is 2:
+        Return ARG_CLASS_FLOATING
+    End If
+
+    Note: Type kind 1: Integer - passed in GPR X0-X7
+    If type_kind is 1:
+        Return ARG_CLASS_INTEGER
+    End If
+
+    Note: Type kind 3: String - passed as pointer in GPR
+    If type_kind is 3:
+        Return ARG_CLASS_INTEGER
+    End If
+
+    Note: Type kind 4: Boolean - passed in GPR (zero-extended to 64 bits)
+    If type_kind is 4:
+        Return ARG_CLASS_INTEGER
+    End If
+
+    Note: All other types (struct pointers, array pointers, reference types,
+    Note: optional types, union types, function pointers, etc.) are 8-byte
+    Note: pointer values on AArch64 and are passed in general-purpose registers
+    Return ARG_CLASS_INTEGER
+End Process
+
+Note: ============================================================================
+Note: Argument Register Mapping
+Note: ============================================================================
+
+@Reasoning
+Maps a function argument (identified by its position within its class) to the physical
+register that should hold it, according to AAPCS64.
+
+AAPCS64 argument passing:
+  INTEGER class: arg 0->X0(0), 1->X1(1), 2->X2(2), ..., 7->X7(7)
+  FLOATING class: arg 0->V0(32), 1->V1(33), 2->V2(34), ..., 7->V7(39)
+
+AAPCS64 tracks integer and floating-point argument indices independently (same as
+System V x86_64). The first integer argument always goes in X0 and the first float
+argument always goes in V0, regardless of ordering.
+
+Returns the physical register ID, or -1 if the argument must be passed on the stack
+because all 8 register slots for that class are exhausted.
+@End Reasoning
+
+Process called "get_arg_register" that takes convention as Integer, arg_index as Integer, arg_class as Integer returns Integer:
+    Note: Validate arg_index is non-negative
+    If arg_index < 0:
+        Return -1
+    End If
+
+    Note: NO_CLASS arguments do not occupy a register
+    If arg_class is ARG_CLASS_NO_CLASS:
+        Return -1
+    End If
+
+    Note: MEMORY class arguments are explicitly on the stack
+    If arg_class is ARG_CLASS_MEMORY:
+        Return -1
+    End If
+
+    Note: AAPCS64 integer argument registers: X0(0) through X7(7)
+    If arg_class is ARG_CLASS_INTEGER:
+        If arg_index is 0:
+            Return 0   Note: X0
+        End If
+        If arg_index is 1:
+            Return 1   Note: X1
+        End If
+        If arg_index is 2:
+            Return 2   Note: X2
+        End If
+        If arg_index is 3:
+            Return 3   Note: X3
+        End If
+        If arg_index is 4:
+            Return 4   Note: X4
+        End If
+        If arg_index is 5:
+            Return 5   Note: X5
+        End If
+        If arg_index is 6:
+            Return 6   Note: X6
+        End If
+        If arg_index is 7:
+            Return 7   Note: X7
+        End If
+        Note: arg_index >= 8: passed on stack
+        Return -1
+    End If
+
+    Note: AAPCS64 floating-point argument registers: V0(32) through V7(39)
+    If arg_class is ARG_CLASS_FLOATING:
+        If arg_index < 8:
+            Return 32 + arg_index  Note: V0(32) + offset
+        End If
+        Note: arg_index >= 8: passed on stack
+        Return -1
+    End If
+
+    Note: Unrecognized class falls to stack
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: Stack Argument Space Computation
+Note: ============================================================================
+
+@Reasoning
+Computes the total stack space (in bytes) required for function arguments that do not
+fit into registers under AAPCS64.
+
+AAPCS64 rules:
+- Integer arguments beyond the 8th go on the stack
+- Float arguments beyond the 8th go on the stack
+- Integer and float argument indices are tracked independently
+- Each stack argument is naturally aligned (8 bytes for 64-bit values)
+- The stack must remain 16-byte aligned at all times
+
+The arg_types parameter is a pointer to an array of type info pointers, and arg_count
+is the total number of arguments.
+@End Reasoning
+
+Process called "compute_stack_args_size" that takes convention as Integer, arg_types as Integer, arg_count as Integer returns Integer:
+    Note: No arguments means no stack space needed
+    If arg_count is 0:
+        Return 0
+    End If
+    If arg_types is 0:
+        Return 0
+    End If
+
+    Let stack_bytes be 0
+
+    Note: AAPCS64: integer and float argument indices are independent
+    Let int_index be 0
+    Let float_index be 0
+
+    Let i be 0
+    While i < arg_count:
+        Note: Read the type info pointer for this argument
+        Let type_ptr be __load(arg_types, i * 8)
+        Let arg_class be classify_argument(type_ptr, convention)
+
+        If arg_class is ARG_CLASS_INTEGER:
+            If int_index >= 8:
+                Note: This integer argument spills to the stack (8 bytes per slot)
+                Set stack_bytes to stack_bytes + 8
+            End If
+            Set int_index to int_index + 1
+        End If
+
+        If arg_class is ARG_CLASS_FLOATING:
+            If float_index >= 8:
+                Note: This float argument spills to the stack (8 bytes per slot)
+                Set stack_bytes to stack_bytes + 8
+            End If
+            Set float_index to float_index + 1
+        End If
+
+        If arg_class is ARG_CLASS_MEMORY:
+            Note: Explicitly stack-passed arguments take 8 bytes
+            Set stack_bytes to stack_bytes + 8
+        End If
+
+        Set i to i + 1
+    End While
+
+    Note: Ensure stack argument area is 16-byte aligned (AAPCS64 requirement)
+    Let remainder be stack_bytes % 16
+    If remainder is not 0:
+        Set stack_bytes to stack_bytes + (16 - remainder)
+    End If
+
+    Return stack_bytes
+End Process
+
+Note: ============================================================================
+Note: Callee-Saved Register List
+Note: ============================================================================
+
+@Reasoning
+Returns a freshly created List of callee-saved register IDs for AAPCS64.
+
+AAPCS64 callee-saved registers:
+  GPRs: X19(19)-X28(28), X29(29)/FP, X30(30)/LR
+  FPRs: V8(40)-V15(47) (lower 64 bits, D8-D15, must be preserved)
+
+The list is freshly allocated so the caller can modify it without affecting canonical
+convention data. This is important for the register allocator which may filter the list
+to only include registers actually used by the function.
+
+Note that X29 (FP) and X30 (LR) are always saved/restored by the prologue/epilogue
+using STP/LDP instructions, but they are included in this list for completeness in
+register allocation tracking.
+@End Reasoning
+
+Process called "get_callee_saved_list" that takes convention as Integer returns Integer:
+    Let result be List.list_create(24)
+    If result is 0:
+        Return 0
+    End If
+
+    Note: GPRs: X19-X28 (general-purpose callee-saved)
+    List.list_append(result, 19)  Note: X19
+    List.list_append(result, 20)  Note: X20
+    List.list_append(result, 21)  Note: X21
+    List.list_append(result, 22)  Note: X22
+    List.list_append(result, 23)  Note: X23
+    List.list_append(result, 24)  Note: X24
+    List.list_append(result, 25)  Note: X25
+    List.list_append(result, 26)  Note: X26
+    List.list_append(result, 27)  Note: X27
+    List.list_append(result, 28)  Note: X28
+
+    Note: Frame pointer and link register (callee-saved)
+    List.list_append(result, 29)  Note: X29 (FP)
+    List.list_append(result, 30)  Note: X30 (LR)
+
+    Note: FPRs: V8-V15 (lower 64 bits callee-saved)
+    List.list_append(result, 40)  Note: V8 (D8)
+    List.list_append(result, 41)  Note: V9 (D9)
+    List.list_append(result, 42)  Note: V10 (D10)
+    List.list_append(result, 43)  Note: V11 (D11)
+    List.list_append(result, 44)  Note: V12 (D12)
+    List.list_append(result, 45)  Note: V13 (D13)
+    List.list_append(result, 46)  Note: V14 (D14)
+    List.list_append(result, 47)  Note: V15 (D15)
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Caller-Saved Register List
+Note: ============================================================================
+
+@Reasoning
+Returns a freshly created List of caller-saved register IDs for AAPCS64.
+
+AAPCS64 caller-saved (volatile) registers:
+  GPRs: X0(0)-X15(15), X16(16)/IP0, X17(17)/IP1, X18(18)/platform
+  FPRs: V0(32)-V7(39), V16(48)-V31(63)
+
+These registers may be clobbered by any function call, so the caller must save them
+before a call if their values are still needed afterward.
+
+X16 and X17 are intra-procedure-call scratch registers that may be modified by linker
+veneers and dynamic linker stubs, so they are always caller-saved.
+
+X18 is platform-dependent: reserved on Darwin (macOS/iOS), available as a temporary on
+Linux. We conservatively list it as caller-saved on all platforms.
+@End Reasoning
+
+Process called "get_caller_saved_list" that takes convention as Integer returns Integer:
+    Let result be List.list_create(40)
+    If result is 0:
+        Return 0
+    End If
+
+    Note: GPRs: X0-X18 are all caller-saved
+    List.list_append(result, 0)   Note: X0
+    List.list_append(result, 1)   Note: X1
+    List.list_append(result, 2)   Note: X2
+    List.list_append(result, 3)   Note: X3
+    List.list_append(result, 4)   Note: X4
+    List.list_append(result, 5)   Note: X5
+    List.list_append(result, 6)   Note: X6
+    List.list_append(result, 7)   Note: X7
+    List.list_append(result, 8)   Note: X8 (indirect result)
+    List.list_append(result, 9)   Note: X9
+    List.list_append(result, 10)  Note: X10
+    List.list_append(result, 11)  Note: X11
+    List.list_append(result, 12)  Note: X12
+    List.list_append(result, 13)  Note: X13
+    List.list_append(result, 14)  Note: X14
+    List.list_append(result, 15)  Note: X15
+    List.list_append(result, 16)  Note: X16 (IP0)
+    List.list_append(result, 17)  Note: X17 (IP1)
+    List.list_append(result, 18)  Note: X18 (platform)
+
+    Note: FPRs: V0-V7 and V16-V31 are caller-saved
+    List.list_append(result, 32)  Note: V0
+    List.list_append(result, 33)  Note: V1
+    List.list_append(result, 34)  Note: V2
+    List.list_append(result, 35)  Note: V3
+    List.list_append(result, 36)  Note: V4
+    List.list_append(result, 37)  Note: V5
+    List.list_append(result, 38)  Note: V6
+    List.list_append(result, 39)  Note: V7
+    List.list_append(result, 48)  Note: V16
+    List.list_append(result, 49)  Note: V17
+    List.list_append(result, 50)  Note: V18
+    List.list_append(result, 51)  Note: V19
+    List.list_append(result, 52)  Note: V20
+    List.list_append(result, 53)  Note: V21
+    List.list_append(result, 54)  Note: V22
+    List.list_append(result, 55)  Note: V23
+    List.list_append(result, 56)  Note: V24
+    List.list_append(result, 57)  Note: V25
+    List.list_append(result, 58)  Note: V26
+    List.list_append(result, 59)  Note: V27
+    List.list_append(result, 60)  Note: V28
+    List.list_append(result, 61)  Note: V29
+    List.list_append(result, 62)  Note: V30
+    List.list_append(result, 63)  Note: V31
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Stack Frame Adjustment Computation
+Note: ============================================================================
+
+@Reasoning
+Computes the total frame size ensuring the stack remains 16-byte aligned under AAPCS64.
+
+AAPCS64 mandates that the stack pointer (SP) must be 16-byte aligned at all times when
+accessing memory through SP. This is stricter than x86_64 which only requires alignment
+at the CALL instruction boundary. AArch64 hardware enforces this with alignment faults.
+
+The typical AArch64 prologue is:
+  stp x29, x30, [sp, #-frame_size]!   -> Pre-decrement SP, save FP and LR
+  mov x29, sp                          -> Set new frame pointer
+  stp x19, x20, [sp, #offset]         -> Save callee-saved registers
+  ...more callee-saved pairs...
+
+The frame_size in the STP instruction must include space for:
+1. Saved FP and LR (16 bytes, always first - handled by STP x29,x30)
+2. Callee-saved register pairs (each STP saves 16 bytes)
+3. Local variable space (local_size bytes)
+4. Outgoing argument spill area
+
+The total frame_size must be a multiple of 16 for SP alignment.
+
+Parameters:
+- convention: the calling convention ID (for future per-convention adjustments)
+- local_size: bytes needed for local variables
+- callee_saved_count: number of callee-saved registers to push (not counting FP/LR)
+
+Returns the computed frame size in bytes, guaranteed to be a multiple of 16.
+@End Reasoning
+
+Process called "compute_frame_adjustment" that takes convention as Integer, local_size as Integer, callee_saved_count as Integer returns Integer:
+    Note: FP (X29) and LR (X30) are always saved as a pair = 16 bytes
+    Let fp_lr_size be 16
+
+    Note: Callee-saved registers are saved in pairs using STP instructions
+    Note: Each pair occupies 16 bytes. If count is odd, one register is saved
+    Note: alone but still takes 8 bytes; we round up to pairs for alignment.
+    Let callee_pairs be callee_saved_count / 2
+    Let callee_remainder be callee_saved_count % 2
+    Let callee_save_size be callee_pairs * 16
+    If callee_remainder is not 0:
+        Note: Odd register count: the unpaired register still takes 8 bytes,
+        Note: but we must maintain 16-byte alignment, so we pad to 16
+        Set callee_save_size to callee_save_size + 16
+    End If
+
+    Note: Total frame size = FP/LR + callee saves + locals
+    Let frame_size be fp_lr_size + callee_save_size + local_size
+
+    Note: Round up to 16-byte alignment (AAPCS64 mandatory)
+    Let remainder be frame_size % 16
+    If remainder is not 0:
+        Set frame_size to frame_size + (16 - remainder)
+    End If
+
+    Return frame_size
+End Process
+
+Note: ============================================================================
+Note: Callee-Saved Register Query
+Note: ============================================================================
+
+@Reasoning
+Determines whether a given physical register is callee-saved under AAPCS64.
+Returns 1 if the register must be preserved by the callee, 0 if it is caller-saved.
+
+AAPCS64 callee-saved:
+  GPRs: X19(19)-X28(28), X29(29)/FP, X30(30)/LR
+  FPRs: V8(40)-V15(47) (lower 64 bits only)
+
+SP(31) is always preserved but handled separately by frame management.
+XZR(65) is a constant zero register and has no save/restore semantics.
+@End Reasoning
+
+Process called "is_callee_saved" that takes convention as Integer, reg_id as Integer returns Integer:
+    Note: SP is always preserved but managed by prologue/epilogue, not listed as callee-saved
+    If reg_id is 31:
+        Return 0
+    End If
+
+    Note: XZR is not a real register
+    If reg_id is 65:
+        Return 0
+    End If
+
+    Note: GPR callee-saved range: X19(19) through X28(28)
+    If reg_id >= 19:
+        If reg_id <= 28:
+            Return 1
+        End If
+    End If
+
+    Note: X29 (FP) is callee-saved
+    If reg_id is 29:
+        Return 1
+    End If
+
+    Note: X30 (LR) is callee-saved
+    If reg_id is 30:
+        Return 1
+    End If
+
+    Note: FPR callee-saved range: V8(40) through V15(47)
+    If reg_id >= 40:
+        If reg_id <= 47:
+            Return 1
+        End If
+    End If
+
+    Note: All other registers (X0-X18, V0-V7, V16-V31) are caller-saved
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Convention Selection Helper
+Note: ============================================================================
+
+@Reasoning
+Returns a CallingConventionInfo for AArch64. All AArch64 platforms use AAPCS64 as the
+standard calling convention. The target_os parameter controls platform-specific details
+like red zone size (128 on Darwin, 0 on Linux).
+
+Windows on ARM64 uses a slight variation of AAPCS64 but the register assignments are
+identical. The main difference is that X18 is reserved as the TEB pointer on Windows,
+which is handled by not allocating X18 for general use.
+@End Reasoning
+
+Process called "create_convention_for_target" that takes target_os as Integer returns Integer:
+    Return create_aapcs64_convention(target_os)
+End Process
+
+Note: ============================================================================
+Note: Return Register Selection
+Note: ============================================================================
+
+@Reasoning
+Returns the physical register ID for the function return value based on the type
+classification under AAPCS64.
+
+AAPCS64:
+  Integer/pointer returns: X0 (register ID 0)
+  Float/double returns: V0/D0/S0 (register ID 32)
+
+For small struct returns (up to 16 bytes), X0 and X1 are used together. For larger
+struct returns, the caller passes a pointer in X8 (indirect result location register).
+This function handles the simple scalar case.
+@End Reasoning
+
+Process called "get_return_register" that takes convention as Integer, return_type as Integer returns Integer:
+    Let arg_class be classify_argument(return_type, convention)
+
+    If arg_class is ARG_CLASS_FLOATING:
+        Return 32  Note: V0 for float returns
+    End If
+
+    Note: INTEGER, MEMORY, NO_CLASS all return via X0
+    Return 0  Note: X0 for integer/pointer returns
+End Process

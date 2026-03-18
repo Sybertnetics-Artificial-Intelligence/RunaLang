@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,626 @@ limitations under the License.
 :End Note
 
 Note:
+RUNA FORMAT TOOL - CLI Code Formatter Entry Point
+
 This file handles Runa code formatting and style enforcement.
 
 This file performs the following tasks:
-- Process Runa code formatting and style enforcement
-- Handle formatting rules and formatting configuration
-- Manage formatting validation and formatting verification
-- Process formatting optimization and formatting consistency
+- Format individual Runa source files according to canonical style rules
+- Format all Runa files in a directory recursively
+- Check formatting without modifying files (dry-run / --check mode)
+- Write formatted output back to files or to stdout
 
 This file is essential because of the following reasons:
-- Runa code formatting ensures consistent code style across projects
-- Proper formatting handling ensures correct code style enforcement
-- RunaFmt support enables Runa compilation for consistent code formatting
+- Runa format tool ensures consistent code style across all Runa projects
+- Proper formatting enforcement ensures readable, maintainable code
+- RunaFmt bridges user-facing CLI with compiler formatting subsystem
 
 This file consists of the following functions/features/operation types:
-- Runa code formatting and style enforcement
-- Formatting rules and formatting configuration
-- Formatting validation and formatting verification
-- Formatting optimization and formatting consistency
+- format_file to reformat a single Runa source file
+- format_directory to recursively format all .runa files in a directory
+- check_format to report formatting violations without modifying files
+- write_formatted to write formatted content back to disk
+- run_format as the top-level entry point orchestrating the formatting pipeline
+
+Dependencies:
+- Imports compiler/internal/string_utils.runa for string operations
+- Imports compiler/internal/file_utils.runa for file read/write operations
+- Imports compiler/internal/memory_utils.runa for memory allocation
+- Imports compiler/internal/arena_utils.runa for arena-scoped allocation
 :End Note
 
-Note: TODO - Implement RunaFmt functionality
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/file_utils.runa" as FileUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+
+Note: ============================================================================
+Note: Format Tool Constants
+Note: ============================================================================
+
+Constant FMT_TOOL_VERSION as Integer is 1
+Constant FMT_TOOL_SUCCESS as Integer is 0
+Constant FMT_TOOL_FAILURE as Integer is 1
+Constant FMT_TOOL_INVALID_ARGS as Integer is 2
+Constant FMT_TOOL_CHECK_FAILED as Integer is 3
+
+Constant FMT_INDENT_SPACES as Integer is 4
+Constant FMT_MAX_LINE_WIDTH as Integer is 120
+
+Note: Formatting mode constants
+Constant FMT_MODE_FORMAT as Integer is 0       Note: Format and overwrite
+Constant FMT_MODE_CHECK as Integer is 1        Note: Check only, no write
+Constant FMT_MODE_STDOUT as Integer is 2       Note: Format and print to stdout
+
+Note: FormatConfig memory layout (48 bytes):
+Note: offset  0: indent_width (8 bytes) - Number of spaces per indent level
+Note: offset  8: max_line_width (8 bytes) - Maximum line width before wrapping
+Note: offset 16: mode (8 bytes) - Formatting mode (FMT_MODE_*)
+Note: offset 24: is_verbose (8 bytes) - Boolean: 1 if verbose output requested
+Note: offset 32: files_formatted (8 bytes) - Counter: number of files formatted
+Note: offset 40: files_unchanged (8 bytes) - Counter: number of files already correct
+
+Constant FMT_CONFIG_SIZE as Integer is 48
+
+Note: ============================================================================
+Note: Format Config Creation
+Note: ============================================================================
+
+Process called "create_format_config" takes arena as Integer returns Integer:
+    Note: Allocate and initialize a FormatConfig structure
+    If arena is equal to 0:
+        Alert "[RUNAFMT ERROR] Cannot create format config: arena is null"
+        Return 0
+    End If
+
+    Let config be arena_allocate(arena, FMT_CONFIG_SIZE, 8)
+    If config is equal to 0:
+        Alert "[RUNAFMT ERROR] Failed to allocate format config"
+        Return 0
+    End If
+
+    memory_zero(config, FMT_CONFIG_SIZE)
+    memory_set_integer(config, 0, FMT_INDENT_SPACES)
+    memory_set_integer(config, 8, FMT_MAX_LINE_WIDTH)
+    memory_set_integer(config, 16, FMT_MODE_FORMAT)
+    memory_set_integer(config, 24, 0)
+    memory_set_integer(config, 32, 0)
+    memory_set_integer(config, 40, 0)
+
+    Return config
+End Process
+
+Note: ============================================================================
+Note: Single File Formatting
+Note: ============================================================================
+
+Process called "format_file" takes file_path as Integer, config as Integer, arena as Integer returns Integer:
+    Note: Read a single Runa source file, apply formatting rules, return formatted content pointer
+    Note: Returns pointer to formatted string, or 0 on failure
+
+    If file_path is equal to 0:
+        Alert "[RUNAFMT ERROR] Cannot format file: path is null"
+        Return 0
+    End If
+
+    If config is equal to 0:
+        Alert "[RUNAFMT ERROR] Cannot format file: config is null"
+        Return 0
+    End If
+
+    If arena is equal to 0:
+        Alert "[RUNAFMT ERROR] Cannot format file: arena is null"
+        Return 0
+    End If
+
+    Note: Read the source file
+    Let source be runtime_read_file(file_path)
+    If source is equal to 0:
+        Let err_msg be string_concat("[RUNAFMT ERROR] Cannot read file: ", file_path)
+        Alert err_msg
+        deallocate(err_msg)
+        Return 0
+    End If
+
+    Let indent_width be memory_get_integer(config, 0)
+    Let max_line_width be memory_get_integer(config, 8)
+
+    Note: Allocate output buffer (start with 2x source size for headroom)
+    Let source_len be string_length(source)
+    Let buffer_size be source_len multiplied by 2
+    If buffer_size is less than 1024:
+        Set buffer_size to 1024
+    End If
+
+    Let output_buffer be arena_allocate(arena, buffer_size, 1)
+    If output_buffer is equal to 0:
+        deallocate(source)
+        Return 0
+    End If
+
+    Let out_pos be 0
+    Let src_pos be 0
+    Let indent_level be 0
+    Let line_start be 1    Note: Boolean: at start of a new line
+    Let in_note_block be 0 Note: Boolean: inside a multi-line Note: block
+
+    Note: Process the source character by character, applying formatting rules
+    While src_pos is less than source_len:
+        Let ch be string_char_at(source, src_pos)
+
+        Note: Handle newline characters
+        If ch is equal to 10:
+            Note: Write newline to output
+            memory_set_byte(output_buffer, out_pos, 10)
+            Set out_pos to out_pos plus 1
+            Set line_start to 1
+            Set src_pos to src_pos plus 1
+        Otherwise:
+            Note: At the start of a line, apply indentation
+            If line_start is equal to 1:
+                Note: Skip existing whitespace in source
+                While src_pos is less than source_len:
+                    Let ws_ch be string_char_at(source, src_pos)
+                    If ws_ch is equal to 32:
+                        Set src_pos to src_pos plus 1
+                    Otherwise:
+                        If ws_ch is equal to 9:
+                            Set src_pos to src_pos plus 1
+                        Otherwise:
+                            Note: Break out of whitespace skip loop
+                            Set src_pos to src_pos
+                            Note: Force exit
+                            Let ws_ch be 0
+                        End If
+                    End If
+                    If ws_ch is equal to 0:
+                        Note: Exit whitespace skip loop
+                        Set src_pos to src_pos
+                    End If
+                End While
+
+                Note: Peek at this line to determine indent adjustments
+                Note: Lines starting with "End " or ":End " reduce indent before writing
+                Let peek_ch be string_char_at(source, src_pos)
+
+                Note: Check for "End " keyword at current position (dedent before writing)
+                Let is_end_keyword be 0
+                If peek_ch is equal to 69:    Note: 'E'
+                    Let is_end_kw be string_region_equals(source, src_pos, "End ", 4)
+                    If is_end_kw is equal to 1:
+                        Set is_end_keyword to 1
+                    End If
+                End If
+
+                Note: Check for ":End " block closer
+                If peek_ch is equal to 58:    Note: ':'
+                    Let is_colon_end be string_region_equals(source, src_pos, ":End ", 5)
+                    If is_colon_end is equal to 1:
+                        Set is_end_keyword to 1
+                    End If
+                End If
+
+                Note: Check for "Otherwise:" keyword (same indent as matching If)
+                Let is_otherwise be 0
+                If peek_ch is equal to 79:    Note: 'O'
+                    Let is_ow be string_region_equals(source, src_pos, "Otherwise", 9)
+                    If is_ow is equal to 1:
+                        Set is_otherwise to 1
+                    End If
+                End If
+
+                Note: Reduce indent for closing keywords
+                If is_end_keyword is equal to 1:
+                    If indent_level is greater than 0:
+                        Set indent_level to indent_level minus 1
+                    End If
+                End If
+
+                If is_otherwise is equal to 1:
+                    If indent_level is greater than 0:
+                        Set indent_level to indent_level minus 1
+                    End If
+                End If
+
+                Note: Write computed indentation
+                Let indent_chars be indent_level multiplied by indent_width
+                Let indent_i be 0
+                While indent_i is less than indent_chars:
+                    memory_set_byte(output_buffer, out_pos, 32)    Note: Space character
+                    Set out_pos to out_pos plus 1
+                    Set indent_i to indent_i plus 1
+                End While
+
+                Set line_start to 0
+
+                Note: Now copy the rest of the line to output, checking for indent-increase triggers
+                Note: Lines ending with ":" increase indent for next line
+                Note: (except "Note:" and ":End Note" lines)
+                Let line_end_colon be 0
+                Let line_copy_start be src_pos
+
+                Note: Copy characters until newline or end of source
+                While src_pos is less than source_len:
+                    Let line_ch be string_char_at(source, src_pos)
+                    If line_ch is equal to 10:
+                        Note: End of line reached, do not consume newline here
+                        Note: The outer loop will handle it
+                        Set src_pos to src_pos
+                        Note: Force break
+                        Let source_len_temp be source_len
+                        Set src_pos to src_pos
+                        Note: Check if the last non-whitespace char before newline was ':'
+                        Let check_pos be out_pos minus 1
+                        If check_pos is greater than 0:
+                            Let last_ch be memory_get_byte(output_buffer, check_pos)
+                            If last_ch is equal to 58:    Note: ':'
+                                Set line_end_colon to 1
+                            End If
+                        End If
+                        Note: Break out
+                        Set line_ch to 10
+                    Otherwise:
+                        memory_set_byte(output_buffer, out_pos, line_ch)
+                        Set out_pos to out_pos plus 1
+                        Set src_pos to src_pos plus 1
+                    End If
+                    If line_ch is equal to 10:
+                        Note: Exit inner while by re-testing condition
+                        Set src_pos to src_pos
+                    End If
+                End While
+
+                Note: If line ends with colon, increase indent for next line
+                Note: Except for Note: lines and :End Note lines
+                If line_end_colon is equal to 1:
+                    Note: Check if this is a Note: line (don't indent after Note: comments)
+                    Let is_note_line be string_region_equals(source, line_copy_start, "Note:", 5)
+                    Let is_end_note be string_region_equals(source, line_copy_start, ":End Note", 9)
+                    If is_note_line is equal to 0:
+                        If is_end_note is equal to 0:
+                            Set indent_level to indent_level plus 1
+                        End If
+                    End If
+                End If
+
+                Note: Otherwise keyword also increases indent after it
+                If is_otherwise is equal to 1:
+                    Set indent_level to indent_level plus 1
+                End If
+
+            Otherwise:
+                Note: Not at line start, just copy character
+                memory_set_byte(output_buffer, out_pos, ch)
+                Set out_pos to out_pos plus 1
+                Set src_pos to src_pos plus 1
+            End If
+        End If
+    End While
+
+    Note: Null-terminate the output
+    memory_set_byte(output_buffer, out_pos, 0)
+
+    Note: Free original source
+    deallocate(source)
+
+    Return output_buffer
+End Process
+
+Note: ============================================================================
+Note: Directory Formatting
+Note: ============================================================================
+
+Process called "format_directory" takes dir_path as Integer, config as Integer, arena as Integer returns Integer:
+    Note: Recursively format all .runa files in a directory
+    Note: Returns number of files processed, or -1 on failure
+
+    If dir_path is equal to 0:
+        Alert "[RUNAFMT ERROR] Cannot format directory: path is null"
+        Return -1
+    End If
+
+    If config is equal to 0:
+        Alert "[RUNAFMT ERROR] Cannot format directory: config is null"
+        Return -1
+    End If
+
+    Note: List all files in the directory
+    Let all_files be directory_list_files(dir_path, arena)
+    If all_files is equal to 0:
+        Let err_msg be string_concat("[RUNAFMT ERROR] Cannot list directory: ", dir_path)
+        Alert err_msg
+        deallocate(err_msg)
+        Return -1
+    End If
+
+    Let is_verbose be memory_get_integer(config, 24)
+    Let mode be memory_get_integer(config, 16)
+    Let file_count be arraylist_length(all_files)
+    Let processed be 0
+    Let idx be 0
+
+    While idx is less than file_count:
+        Let entry_ptr be arraylist_get(all_files, idx)
+        If entry_ptr is not equal to 0:
+            Let file_name be memory_get_pointer(entry_ptr, 0)
+            If file_name is not equal to 0:
+                Note: Check if this is a .runa file
+                Let is_runa be string_ends_with(file_name, ".runa")
+                If is_runa is equal to 1:
+                    Note: Build full path
+                    Let path_with_sep be string_concat(dir_path, "/")
+                    Let full_path be string_concat(path_with_sep, file_name)
+                    deallocate(path_with_sep)
+
+                    If is_verbose is equal to 1:
+                        Let fmt_msg be string_concat("[RUNAFMT] Formatting: ", full_path)
+                        Display fmt_msg
+                        deallocate(fmt_msg)
+                    End If
+
+                    Note: Format the file
+                    Let formatted be format_file(full_path, config, arena)
+                    If formatted is not equal to 0:
+                        If mode is equal to FMT_MODE_FORMAT:
+                            Let write_result be write_formatted(full_path, formatted)
+                            If write_result is equal to 0:
+                                Let fmt_count be memory_get_integer(config, 32)
+                                Set fmt_count to fmt_count plus 1
+                                memory_set_integer(config, 32, fmt_count)
+                            End If
+                        Otherwise:
+                            If mode is equal to FMT_MODE_CHECK:
+                                Note: Read original and compare
+                                Let original be runtime_read_file(full_path)
+                                If original is not equal to 0:
+                                    Let are_equal be string_equals(original, formatted)
+                                    If are_equal is equal to 1:
+                                        Let unch_count be memory_get_integer(config, 40)
+                                        Set unch_count to unch_count plus 1
+                                        memory_set_integer(config, 40, unch_count)
+                                    Otherwise:
+                                        Let diff_msg be string_concat("[RUNAFMT] Needs formatting: ", full_path)
+                                        Display diff_msg
+                                        deallocate(diff_msg)
+                                        Let fmt_count be memory_get_integer(config, 32)
+                                        Set fmt_count to fmt_count plus 1
+                                        memory_set_integer(config, 32, fmt_count)
+                                    End If
+                                    deallocate(original)
+                                End If
+                            Otherwise:
+                                Note: FMT_MODE_STDOUT - print to stdout
+                                Display formatted
+                            End If
+                        End If
+                        Set processed to processed plus 1
+                    End If
+
+                    deallocate(full_path)
+                End If
+
+                Note: Check if this is a subdirectory for recursive formatting
+                Let is_dir be file_is_directory(file_name, dir_path)
+                If is_dir is equal to 1:
+                    Let sub_path_sep be string_concat(dir_path, "/")
+                    Let sub_path be string_concat(sub_path_sep, file_name)
+                    deallocate(sub_path_sep)
+                    Let sub_count be format_directory(sub_path, config, arena)
+                    If sub_count is greater than 0:
+                        Set processed to processed plus sub_count
+                    End If
+                    deallocate(sub_path)
+                End If
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    Return processed
+End Process
+
+Note: ============================================================================
+Note: Format Check (Dry Run)
+Note: ============================================================================
+
+Process called "check_format" takes file_path as Integer, config as Integer, arena as Integer returns Integer:
+    Note: Check if a file is already properly formatted without modifying it
+    Note: Returns 1 if properly formatted, 0 if not, -1 on error
+
+    If file_path is equal to 0:
+        Return -1
+    End If
+
+    Note: Read original file
+    Let original be runtime_read_file(file_path)
+    If original is equal to 0:
+        Return -1
+    End If
+
+    Note: Format the file
+    Let formatted be format_file(file_path, config, arena)
+    If formatted is equal to 0:
+        deallocate(original)
+        Return -1
+    End If
+
+    Note: Compare original with formatted
+    Let are_equal be string_equals(original, formatted)
+
+    deallocate(original)
+
+    If are_equal is equal to 1:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Write Formatted Output
+Note: ============================================================================
+
+Process called "write_formatted" takes file_path as Integer, formatted_content as Integer returns Integer:
+    Note: Write formatted content back to the file
+    Note: Returns 0 on success, 1 on failure
+
+    If file_path is equal to 0:
+        Alert "[RUNAFMT ERROR] Cannot write: file path is null"
+        Return 1
+    End If
+
+    If formatted_content is equal to 0:
+        Alert "[RUNAFMT ERROR] Cannot write: formatted content is null"
+        Return 1
+    End If
+
+    Let content_len be string_length(formatted_content)
+    Let write_result be runtime_write_file(file_path, formatted_content, content_len)
+
+    If write_result is not equal to 0:
+        Let err_msg be string_concat("[RUNAFMT ERROR] Failed to write: ", file_path)
+        Alert err_msg
+        deallocate(err_msg)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Top-Level Entry Point
+Note: ============================================================================
+
+Process called "run_format" takes argc as Integer, argv as Integer returns Integer:
+    Note: Main entry point for the RunaFmt tool
+    Note: Parses CLI arguments, formats files/directories, reports results
+    Note: Returns exit code (0 = success, nonzero = failure)
+
+    Note: Create arena for format-scoped allocations
+    Let arena be arena_create(65536)
+    If arena is equal to 0:
+        Alert "[RUNAFMT ERROR] Failed to create arena"
+        Return FMT_TOOL_FAILURE
+    End If
+
+    Let config be create_format_config(arena)
+    If config is equal to 0:
+        arena_destroy(arena)
+        Return FMT_TOOL_FAILURE
+    End If
+
+    Note: Parse arguments
+    If argc is less than 2:
+        Alert "[RUNAFMT] Usage: runa fmt <file_or_directory> [options]"
+        Alert "[RUNAFMT] Options:"
+        Alert "[RUNAFMT]   --check     Check formatting without modifying files"
+        Alert "[RUNAFMT]   --stdout    Print formatted output to stdout"
+        Alert "[RUNAFMT]   --verbose   Enable verbose output"
+        Alert "[RUNAFMT]   --indent N  Set indent width (default: 4)"
+        arena_destroy(arena)
+        Return FMT_TOOL_INVALID_ARGS
+    End If
+
+    Let target_path be 0
+    Let ptr_size be 8
+    Let i be 1
+
+    While i is less than argc:
+        Let arg_offset be i multiplied by ptr_size
+        Let arg_ptr be argv plus arg_offset
+        Let arg be memory_get_pointer(arg_ptr, 0)
+
+        If arg is not equal to 0:
+            Let is_check be string_equals(arg, "--check")
+            If is_check is equal to 1:
+                memory_set_integer(config, 16, FMT_MODE_CHECK)
+            Otherwise:
+                Let is_stdout be string_equals(arg, "--stdout")
+                If is_stdout is equal to 1:
+                    memory_set_integer(config, 16, FMT_MODE_STDOUT)
+                Otherwise:
+                    Let is_verbose be string_equals(arg, "--verbose")
+                    If is_verbose is equal to 1:
+                        memory_set_integer(config, 24, 1)
+                    Otherwise:
+                        Let is_indent be string_equals(arg, "--indent")
+                        If is_indent is equal to 1:
+                            Set i to i plus 1
+                            If i is less than argc:
+                                Let next_offset be i multiplied by ptr_size
+                                Let next_ptr be argv plus next_offset
+                                Let indent_str be memory_get_pointer(next_ptr, 0)
+                                If indent_str is not equal to 0:
+                                    Let indent_val be string_to_integer(indent_str)
+                                    If indent_val is greater than 0:
+                                        memory_set_integer(config, 0, indent_val)
+                                    End If
+                                End If
+                            End If
+                        Otherwise:
+                            Note: Treat as target path
+                            Set target_path to arg
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    If target_path is equal to 0:
+        Alert "[RUNAFMT ERROR] No file or directory specified"
+        arena_destroy(arena)
+        Return FMT_TOOL_INVALID_ARGS
+    End If
+
+    Note: Determine if target is a file or directory
+    Let is_dir be file_is_directory_path(target_path)
+    Let result be FMT_TOOL_SUCCESS
+
+    If is_dir is equal to 1:
+        Let count be format_directory(target_path, config, arena)
+        If count is less than 0:
+            Set result to FMT_TOOL_FAILURE
+        End If
+    Otherwise:
+        Note: Single file mode
+        Let formatted be format_file(target_path, config, arena)
+        If formatted is equal to 0:
+            Set result to FMT_TOOL_FAILURE
+        Otherwise:
+            Let mode be memory_get_integer(config, 16)
+            If mode is equal to FMT_MODE_FORMAT:
+                Let write_res be write_formatted(target_path, formatted)
+                If write_res is not equal to 0:
+                    Set result to FMT_TOOL_FAILURE
+                End If
+            Otherwise:
+                If mode is equal to FMT_MODE_CHECK:
+                    Let check_res be check_format(target_path, config, arena)
+                    If check_res is equal to 0:
+                        Display "[RUNAFMT] Needs formatting: "
+                        Display target_path
+                        Set result to FMT_TOOL_CHECK_FAILED
+                    End If
+                Otherwise:
+                    Note: FMT_MODE_STDOUT
+                    Display formatted
+                End If
+            End If
+        End If
+    End If
+
+    Note: Report summary
+    Let files_formatted be memory_get_integer(config, 32)
+    Let files_unchanged be memory_get_integer(config, 40)
+    Display "[RUNAFMT] Files formatted: "
+    Display files_formatted
+    Display "[RUNAFMT] Files unchanged: "
+    Display files_unchanged
+
+    arena_destroy(arena)
+    Return result
+End Process

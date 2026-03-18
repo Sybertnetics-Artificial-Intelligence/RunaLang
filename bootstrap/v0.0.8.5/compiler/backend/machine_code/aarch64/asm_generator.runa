@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1677 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles AArch64 assembly code generation and assembly output.
+AArch64 Assembly Generator - LIR to AArch64 ARM Syntax Assembly
 
-This file performs the following tasks:
-- Process AArch64 assembly code generation and assembly output formatting
-- Handle AArch64 assembly optimization and assembly code optimization
-- Manage AArch64 assembly validation and assembly code verification
-- Process AArch64 assembly debugging and assembly code debugging
+THE MOST CRITICAL FILE IN THE AARCH64 BACKEND.
 
-This file is essential because of the following reasons:
-- AArch64 assembly generation enables native AArch64 code output
-- Proper assembly handling ensures correct and efficient AArch64 code generation
-- AArch64 support enables Runa compilation for AArch64 platforms
+Translates LIR instructions (opcodes 30000-30999) with physical register assignments
+into ARM syntax AArch64 assembly text. This is the primary code generation path for
+the Runa compiler on AArch64 (Linux on ARM, macOS on Apple Silicon, etc.).
 
-This file consists of the following functions/features/operation types:
-- AArch64 assembly code generation and assembly output formatting
-- AArch64 assembly optimization and assembly code optimization
-- AArch64 assembly validation and assembly code verification
-- AArch64 assembly debugging and assembly code debugging
+The generator processes an entire LIR module (collection of LIR functions), emitting:
+- Function prologues (stp x29, x30, [sp, #-size]! / mov x29, sp / save callee-saved)
+- Basic block labels
+- Instruction-by-instruction translation of all LIR opcodes to AArch64 instructions
+- Function epilogues (restore callee-saved / ldp x29, x30, [sp], #size / ret)
+- String literals in .rodata section
+- Global variable declarations in .data/.bss sections
+
+ARM syntax conventions (AArch64 uses ARM/UAL syntax, NOT AT&T):
+- Destination first: add x0, x1, x2 (x0 = x1 + x2)
+- Register names NOT prefixed: x0, w0, sp, xzr, wzr, v0, d0, s0
+- Immediates prefixed with #: #42, #0x1000
+- Memory: [x0], [x0, #16], [x0, x1, lsl #3]
+- No size suffixes (instruction mnemonic determines size: add for 64-bit, add w for 32-bit)
+
+LIR Opcode to AArch64 Instruction Mapping:
+  30000 NOP     -> nop
+  30001 MOV     -> mov Xd, Xn  (or movz/movk for large immediates)
+  30100 ADD     -> add Xd, Xn, Xm
+  30101 SUB     -> sub Xd, Xn, Xm
+  30102 IMUL    -> mul Xd, Xn, Xm
+  30103 IDIV    -> sdiv Xd, Xn, Xm
+  30104 MUL     -> mul Xd, Xn, Xm  (unsigned same as signed for lower result)
+  30105 DIV     -> udiv Xd, Xn, Xm
+  30106 NEG     -> neg Xd, Xn
+  30200 AND     -> and Xd, Xn, Xm
+  30201 OR      -> orr Xd, Xn, Xm
+  30202 XOR     -> eor Xd, Xn, Xm
+  30203 NOT     -> mvn Xd, Xn
+  30204 TEST    -> tst Xn, Xm
+  30300 SHL     -> lsl Xd, Xn, Xm
+  30301 SHR     -> lsr Xd, Xn, Xm
+  30302 SAR     -> asr Xd, Xn, Xm
+  30400 CMP     -> cmp Xn, Xm
+  30500 JMP     -> b label
+  30501 JZ      -> b.eq label (Zero flag = Equal flag after CMP)
+  30502 JNZ     -> b.ne label
+  30503 JE      -> b.eq label
+  30504 JNE     -> b.ne label
+  30505 JL      -> b.lt label
+  30506 JLE     -> b.le label
+  30507 JG      -> b.gt label
+  30508 JGE     -> b.ge label
+  30509 JB      -> b.lo label (unsigned below)
+  30510 JBE     -> b.ls label (unsigned below or same)
+  30511 JA      -> b.hi label (unsigned above)
+  30512 JAE     -> b.hs label (unsigned above or same)
+  30520 CALL    -> bl target
+  30521 CALL_I  -> blr Xn
+  30522 RET     -> ret (returns via LR/X30)
+  30523 SYSCALL -> svc #0
+  30600 LOAD    -> ldr Xd, [Xn, #offset]
+  30601 STORE   -> str Xs, [Xn, #offset]
+  30602 LOAD8   -> ldrb Wd, [Xn, #offset]
+  30603 LOAD16  -> ldrh Wd, [Xn, #offset]
+  30604 LOAD32  -> ldr Wd, [Xn, #offset]
+  30605 LOAD64  -> ldr Xd, [Xn, #offset]
+  30606 STORE8  -> strb Ws, [Xn, #offset]
+  30607 STORE16 -> strh Ws, [Xn, #offset]
+  30608 STORE32 -> str Ws, [Xn, #offset]
+  30609 STORE64 -> str Xs, [Xn, #offset]
+  30120 FADD    -> fadd Dd, Dn, Dm
+  30121 FSUB    -> fsub Dd, Dn, Dm
+  30122 FMUL    -> fmul Dd, Dn, Dm
+  30123 FDIV    -> fdiv Dd, Dn, Dm
+  30125 FSQRT   -> fsqrt Dd, Dn
+  30127 FMIN    -> fmin Dd, Dn, Dm
+  30128 FMAX    -> fmax Dd, Dn, Dm
+  30700 SEXT    -> sxtw Xd, Wn (sign extend 32->64) or sxtb/sxth
+  30701 ZEXT    -> uxtw Xd, Wn (zero extend) or mov Wd, Wn (implicit zero-extend)
+  30704 I2F     -> scvtf Dd, Xn
+  30706 F2I     -> fcvtzs Xd, Dn
+  30707 F32TOF64 -> fcvt Dd, Sn
+  30708 F64TOF32 -> fcvt Sd, Dn
+
+Dependencies:
+- Imports machine_code_interface.runa for common output types and section constants
+- Imports calling_convention.runa for AAPCS64 register info
+- Imports layout.runa for memory allocation
+- Imports list.runa for collection operations
+- Imports string_core.runa for integer-to-string conversion
+- Imports string_utils.runa for string building
 :End Note
 
-Note: TODO - Implement AArch64 assembly generator functionality
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/backend/machine_code/aarch64/calling_convention.runa" as CallingConv
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: AArch64 Assembly Generation Context
+Note: ============================================================================
+
+@Reasoning
+The AArch64AsmContext holds all state needed during assembly generation for a module.
+It wraps the AssemblyOutput buffer and adds AArch64-specific tracking.
+@End Reasoning
+
+Type called "AArch64AsmContext":
+    output as Integer                 Note: Pointer to AssemblyOutput
+    config as Integer                 Note: Pointer to BackendConfig
+    current_function as Integer       Note: Pointer to current LIRFunction being emitted
+    convention as Integer             Note: Pointer to CallingConventionInfo for current function
+    arena as Integer                  Note: Arena for temporary allocations during generation
+    error_count as Integer            Note: Number of errors encountered during generation
+    string_buffer as Integer          Note: Temporary string buffer for building instruction text
+End Type
+
+Note: Size: 7 fields * 8 bytes = 56 bytes per AArch64AsmContext
+
+Note: ============================================================================
+Note: AArch64 GPR Name Tables (ARM syntax - no prefix)
+Note: ============================================================================
+
+@Reasoning
+AArch64 uses two register naming schemes:
+- X0-X30 for 64-bit operations (full 64-bit register)
+- W0-W30 for 32-bit operations (lower 32 bits, upper 32 bits zeroed on write)
+- SP for the stack pointer
+- XZR/WZR for the zero register
+
+Unlike x86_64 AT&T syntax which uses % prefix, ARM syntax uses bare register names.
+@End Reasoning
+
+Process called "get_gpr_name_64" that takes reg_id as Integer returns Integer:
+    Note: Returns the 64-bit ARM register name for a GPR (0-31)
+    If reg_id is 0:
+        Return "x0"
+    End If
+    If reg_id is 1:
+        Return "x1"
+    End If
+    If reg_id is 2:
+        Return "x2"
+    End If
+    If reg_id is 3:
+        Return "x3"
+    End If
+    If reg_id is 4:
+        Return "x4"
+    End If
+    If reg_id is 5:
+        Return "x5"
+    End If
+    If reg_id is 6:
+        Return "x6"
+    End If
+    If reg_id is 7:
+        Return "x7"
+    End If
+    If reg_id is 8:
+        Return "x8"
+    End If
+    If reg_id is 9:
+        Return "x9"
+    End If
+    If reg_id is 10:
+        Return "x10"
+    End If
+    If reg_id is 11:
+        Return "x11"
+    End If
+    If reg_id is 12:
+        Return "x12"
+    End If
+    If reg_id is 13:
+        Return "x13"
+    End If
+    If reg_id is 14:
+        Return "x14"
+    End If
+    If reg_id is 15:
+        Return "x15"
+    End If
+    If reg_id is 16:
+        Return "x16"
+    End If
+    If reg_id is 17:
+        Return "x17"
+    End If
+    If reg_id is 18:
+        Return "x18"
+    End If
+    If reg_id is 19:
+        Return "x19"
+    End If
+    If reg_id is 20:
+        Return "x20"
+    End If
+    If reg_id is 21:
+        Return "x21"
+    End If
+    If reg_id is 22:
+        Return "x22"
+    End If
+    If reg_id is 23:
+        Return "x23"
+    End If
+    If reg_id is 24:
+        Return "x24"
+    End If
+    If reg_id is 25:
+        Return "x25"
+    End If
+    If reg_id is 26:
+        Return "x26"
+    End If
+    If reg_id is 27:
+        Return "x27"
+    End If
+    If reg_id is 28:
+        Return "x28"
+    End If
+    If reg_id is 29:
+        Return "x29"
+    End If
+    If reg_id is 30:
+        Return "x30"
+    End If
+    If reg_id is 31:
+        Return "sp"
+    End If
+    If reg_id is 65:
+        Return "xzr"
+    End If
+    Return "x0"
+End Process
+
+Process called "get_gpr_name_32" that takes reg_id as Integer returns Integer:
+    Note: Returns the 32-bit ARM register name for a GPR (0-31)
+    If reg_id is 0:
+        Return "w0"
+    End If
+    If reg_id is 1:
+        Return "w1"
+    End If
+    If reg_id is 2:
+        Return "w2"
+    End If
+    If reg_id is 3:
+        Return "w3"
+    End If
+    If reg_id is 4:
+        Return "w4"
+    End If
+    If reg_id is 5:
+        Return "w5"
+    End If
+    If reg_id is 6:
+        Return "w6"
+    End If
+    If reg_id is 7:
+        Return "w7"
+    End If
+    If reg_id is 8:
+        Return "w8"
+    End If
+    If reg_id is 9:
+        Return "w9"
+    End If
+    If reg_id is 10:
+        Return "w10"
+    End If
+    If reg_id is 11:
+        Return "w11"
+    End If
+    If reg_id is 12:
+        Return "w12"
+    End If
+    If reg_id is 13:
+        Return "w13"
+    End If
+    If reg_id is 14:
+        Return "w14"
+    End If
+    If reg_id is 15:
+        Return "w15"
+    End If
+    If reg_id is 16:
+        Return "w16"
+    End If
+    If reg_id is 17:
+        Return "w17"
+    End If
+    If reg_id is 18:
+        Return "w18"
+    End If
+    If reg_id is 19:
+        Return "w19"
+    End If
+    If reg_id is 20:
+        Return "w20"
+    End If
+    If reg_id is 21:
+        Return "w21"
+    End If
+    If reg_id is 22:
+        Return "w22"
+    End If
+    If reg_id is 23:
+        Return "w23"
+    End If
+    If reg_id is 24:
+        Return "w24"
+    End If
+    If reg_id is 25:
+        Return "w25"
+    End If
+    If reg_id is 26:
+        Return "w26"
+    End If
+    If reg_id is 27:
+        Return "w27"
+    End If
+    If reg_id is 28:
+        Return "w28"
+    End If
+    If reg_id is 29:
+        Return "w29"
+    End If
+    If reg_id is 30:
+        Return "w30"
+    End If
+    If reg_id is 31:
+        Return "wsp"
+    End If
+    If reg_id is 65:
+        Return "wzr"
+    End If
+    Return "w0"
+End Process
+
+Process called "get_fpr_name_double" that takes reg_id as Integer returns Integer:
+    Note: Returns the 64-bit FP register name (D register) for FPR IDs (32-63)
+    Let fpr_index be reg_id - 32
+    If fpr_index is 0:
+        Return "d0"
+    End If
+    If fpr_index is 1:
+        Return "d1"
+    End If
+    If fpr_index is 2:
+        Return "d2"
+    End If
+    If fpr_index is 3:
+        Return "d3"
+    End If
+    If fpr_index is 4:
+        Return "d4"
+    End If
+    If fpr_index is 5:
+        Return "d5"
+    End If
+    If fpr_index is 6:
+        Return "d6"
+    End If
+    If fpr_index is 7:
+        Return "d7"
+    End If
+    If fpr_index is 8:
+        Return "d8"
+    End If
+    If fpr_index is 9:
+        Return "d9"
+    End If
+    If fpr_index is 10:
+        Return "d10"
+    End If
+    If fpr_index is 11:
+        Return "d11"
+    End If
+    If fpr_index is 12:
+        Return "d12"
+    End If
+    If fpr_index is 13:
+        Return "d13"
+    End If
+    If fpr_index is 14:
+        Return "d14"
+    End If
+    If fpr_index is 15:
+        Return "d15"
+    End If
+    If fpr_index >= 16:
+        If fpr_index <= 31:
+            Note: Build "d<N>" string dynamically for d16-d31
+            Let buf be Layout.allocate(8)
+            __store8(buf, 0, 100)  Note: 'd'
+            Let num_str be StringCore.integer_to_string(fpr_index)
+            Let ni be 0
+            Let nc be __load8(num_str, ni)
+            While nc is not 0:
+                __store8(buf, ni + 1, nc)
+                Set ni to ni + 1
+                Set nc to __load8(num_str, ni)
+            End While
+            __store8(buf, ni + 1, 0)
+            Return buf
+        End If
+    End If
+    Return "d0"
+End Process
+
+Process called "get_fpr_name_single" that takes reg_id as Integer returns Integer:
+    Note: Returns the 32-bit FP register name (S register) for FPR IDs (32-63)
+    Let fpr_index be reg_id - 32
+    If fpr_index is 0:
+        Return "s0"
+    End If
+    If fpr_index is 1:
+        Return "s1"
+    End If
+    If fpr_index is 2:
+        Return "s2"
+    End If
+    If fpr_index is 3:
+        Return "s3"
+    End If
+    If fpr_index is 4:
+        Return "s4"
+    End If
+    If fpr_index is 5:
+        Return "s5"
+    End If
+    If fpr_index is 6:
+        Return "s6"
+    End If
+    If fpr_index is 7:
+        Return "s7"
+    End If
+    If fpr_index >= 8:
+        If fpr_index <= 31:
+            Let buf be Layout.allocate(8)
+            __store8(buf, 0, 115)  Note: 's'
+            Let num_str be StringCore.integer_to_string(fpr_index)
+            Let ni be 0
+            Let nc be __load8(num_str, ni)
+            While nc is not 0:
+                __store8(buf, ni + 1, nc)
+                Set ni to ni + 1
+                Set nc to __load8(num_str, ni)
+            End While
+            __store8(buf, ni + 1, 0)
+            Return buf
+        End If
+    End If
+    Return "s0"
+End Process
+
+Process called "get_fpr_name_vector" that takes reg_id as Integer returns Integer:
+    Note: Returns the 128-bit NEON register name (V register) for FPR IDs (32-63)
+    Let fpr_index be reg_id - 32
+    If fpr_index is 0:
+        Return "v0"
+    End If
+    If fpr_index is 1:
+        Return "v1"
+    End If
+    If fpr_index is 2:
+        Return "v2"
+    End If
+    If fpr_index is 3:
+        Return "v3"
+    End If
+    If fpr_index is 4:
+        Return "v4"
+    End If
+    If fpr_index is 5:
+        Return "v5"
+    End If
+    If fpr_index is 6:
+        Return "v6"
+    End If
+    If fpr_index is 7:
+        Return "v7"
+    End If
+    If fpr_index >= 8:
+        If fpr_index <= 31:
+            Let buf be Layout.allocate(8)
+            __store8(buf, 0, 118)  Note: 'v'
+            Let num_str be StringCore.integer_to_string(fpr_index)
+            Let ni be 0
+            Let nc be __load8(num_str, ni)
+            While nc is not 0:
+                __store8(buf, ni + 1, nc)
+                Set ni to ni + 1
+                Set nc to __load8(num_str, ni)
+            End While
+            __store8(buf, ni + 1, 0)
+            Return buf
+        End If
+    End If
+    Return "v0"
+End Process
+
+Note: ============================================================================
+Note: Register Name Selection by Size and Type
+Note: ============================================================================
+
+Process called "get_register_name" that takes reg_id as Integer, size as Integer returns Integer:
+    Note: Returns the ARM register name for the given register ID and operand size
+    Note: reg_id 0-31 = GPR, 32-63 = FPR/NEON, 65 = XZR
+
+    Note: FPR/NEON registers
+    If reg_id >= 32:
+        If reg_id <= 63:
+            If size is 4:
+                Return get_fpr_name_single(reg_id)
+            End If
+            If size is 8:
+                Return get_fpr_name_double(reg_id)
+            End If
+            If size is 16:
+                Return get_fpr_name_vector(reg_id)
+            End If
+            Note: Default to double precision
+            Return get_fpr_name_double(reg_id)
+        End If
+    End If
+
+    Note: Zero register
+    If reg_id is 65:
+        If size is 4:
+            Return "wzr"
+        End If
+        Return "xzr"
+    End If
+
+    Note: GPR registers
+    If size is 4:
+        Return get_gpr_name_32(reg_id)
+    End If
+
+    Note: Default to 64-bit
+    Return get_gpr_name_64(reg_id)
+End Process
+
+Note: ============================================================================
+Note: Operand Formatting
+Note: ============================================================================
+
+Process called "format_operand" that takes operand as Integer, size as Integer returns Integer:
+    Note: Formats an LIROperand into ARM syntax string
+    If operand is 0:
+        Return ""
+    End If
+
+    Let op_type be __load(operand, 0)
+
+    Note: Register operand: x0, w0, d0, s0, etc.
+    If op_type is 1:
+        Let reg_id be __load(operand, 8)
+        Let op_size be __load(operand, 56)
+        If op_size is 0:
+            Set op_size to size
+        End If
+        Return get_register_name(reg_id, op_size)
+    End If
+
+    Note: Immediate operand: #42, #0x1000
+    If op_type is 2:
+        Let imm_val be __load(operand, 16)
+        Let num_str be StringCore.integer_to_string(imm_val)
+        Note: Build "#<number>" string
+        Let result be Layout.allocate(32)
+        __store8(result, 0, 35)    Note: '#' character
+        Let ni be 0
+        Let ch be __load8(num_str, ni)
+        While ch is not 0:
+            __store8(result, ni + 1, ch)
+            Set ni to ni + 1
+            Set ch to __load8(num_str, ni)
+        End While
+        __store8(result, ni + 1, 0)
+        Return result
+    End If
+
+    Note: Memory operand: [base, #displacement] or [base, index, lsl #scale]
+    If op_type is 3:
+        Let base_reg be __load(operand, 24)
+        Let index_reg be __load(operand, 32)
+        Let scale be __load(operand, 40)
+        Let displacement be __load(operand, 48)
+
+        Let mem_buf be Layout.allocate(128)
+        Let pos be 0
+
+        Note: Open bracket
+        __store8(mem_buf, pos, 91)    Note: '['
+        Set pos to pos + 1
+
+        Note: Base register
+        If base_reg is not 0:
+            Let base_name be get_gpr_name_64(base_reg)
+            Let bi be 0
+            Let bc be __load8(base_name, bi)
+            While bc is not 0:
+                __store8(mem_buf, pos, bc)
+                Set pos to pos + 1
+                Set bi to bi + 1
+                Set bc to __load8(base_name, bi)
+            End While
+        Otherwise:
+            Note: No base register - use x29 (FP) as default
+            Let fp_name be "x29"
+            Let bi be 0
+            Let bc be __load8(fp_name, bi)
+            While bc is not 0:
+                __store8(mem_buf, pos, bc)
+                Set pos to pos + 1
+                Set bi to bi + 1
+                Set bc to __load8(fp_name, bi)
+            End While
+        End If
+
+        Note: Index register with optional shift
+        If index_reg is not 0:
+            Note: Emit ", Xindex"
+            __store8(mem_buf, pos, 44)    Note: ','
+            Set pos to pos + 1
+            __store8(mem_buf, pos, 32)    Note: ' '
+            Set pos to pos + 1
+
+            Let idx_name be get_gpr_name_64(index_reg)
+            Let ii be 0
+            Let ic be __load8(idx_name, ii)
+            While ic is not 0:
+                __store8(mem_buf, pos, ic)
+                Set pos to pos + 1
+                Set ii to ii + 1
+                Set ic to __load8(idx_name, ii)
+            End While
+
+            Note: Scale as lsl #N (only emit if scale > 1)
+            If scale > 1:
+                Note: Compute log2 of scale for lsl amount
+                Let shift_amount be 0
+                If scale is 2:
+                    Set shift_amount to 1
+                End If
+                If scale is 4:
+                    Set shift_amount to 2
+                End If
+                If scale is 8:
+                    Set shift_amount to 3
+                End If
+
+                Let lsl_str be ", lsl #"
+                Let li be 0
+                Let lc be __load8(lsl_str, li)
+                While lc is not 0:
+                    __store8(mem_buf, pos, lc)
+                    Set pos to pos + 1
+                    Set li to li + 1
+                    Set lc to __load8(lsl_str, li)
+                End While
+
+                Let shift_str be StringCore.integer_to_string(shift_amount)
+                Let si be 0
+                Let sc be __load8(shift_str, si)
+                While sc is not 0:
+                    __store8(mem_buf, pos, sc)
+                    Set pos to pos + 1
+                    Set si to si + 1
+                    Set sc to __load8(shift_str, si)
+                End While
+            End If
+        Otherwise:
+            Note: Displacement (immediate offset)
+            If displacement is not 0:
+                __store8(mem_buf, pos, 44)    Note: ','
+                Set pos to pos + 1
+                __store8(mem_buf, pos, 32)    Note: ' '
+                Set pos to pos + 1
+                __store8(mem_buf, pos, 35)    Note: '#'
+                Set pos to pos + 1
+
+                Let disp_str be StringCore.integer_to_string(displacement)
+                Let di be 0
+                Let dc be __load8(disp_str, di)
+                While dc is not 0:
+                    __store8(mem_buf, pos, dc)
+                    Set pos to pos + 1
+                    Set di to di + 1
+                    Set dc to __load8(disp_str, di)
+                End While
+            End If
+        End If
+
+        Note: Close bracket
+        __store8(mem_buf, pos, 93)    Note: ']'
+        Set pos to pos + 1
+        __store8(mem_buf, pos, 0)
+
+        Return mem_buf
+    End If
+
+    Return ""
+End Process
+
+Note: ============================================================================
+Note: Context Creation and Main Entry Point
+Note: ============================================================================
+
+Process called "create_asm_context" that takes config as Integer, arena as Integer returns Integer:
+    Note: Creates an AArch64AsmContext ready for assembly generation
+    Let ctx be Layout.allocate(56)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let output be MachineCode.create_assembly_output(arena)
+    __store(ctx, 0, output)
+    __store(ctx, 8, config)
+    __store(ctx, 16, 0)
+    __store(ctx, 24, 0)
+    __store(ctx, 32, arena)
+    __store(ctx, 40, 0)
+
+    Note: Create temporary string buffer for instruction building
+    Let str_buf be StringUtils.string_create(arena, 256)
+    __store(ctx, 48, str_buf)
+
+    Return ctx
+End Process
+
+Process called "generate_aarch64_assembly" that takes lir_module as Integer, config as Integer returns Integer:
+    Note: MAIN ENTRY POINT
+    Note: Generates complete AArch64 assembly for an entire LIR module
+    Note: lir_module is a List of LIRFunction pointers
+    Note: Returns pointer to AssemblyOutput
+    If lir_module is 0:
+        Return 0
+    End If
+
+    Note: Create arena for generation temporaries
+    Let arena be Layout.allocate(8)
+    Let ctx be create_asm_context(config, arena)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let output be __load(ctx, 0)
+    Let func_count be List.list_length(lir_module)
+
+    Note: Emit each function
+    Let fi be 0
+    While fi < func_count:
+        Let lir_func be List.list_get(lir_module, fi)
+        If lir_func is not 0:
+            emit_function(ctx, lir_func)
+        End If
+        Set fi to fi + 1
+    End While
+
+    Note: Emit string literals to .rodata
+    MachineCode.asm_emit_string_literals(output)
+
+    Note: Finalize and return
+    Return output
+End Process
+
+Note: ============================================================================
+Note: Function Emission
+Note: ============================================================================
+
+Process called "emit_function" that takes ctx as Integer, lir_func as Integer returns Integer:
+    Note: Emits a complete function: directive, prologue, blocks, epilogue
+    If ctx is 0:
+        Return 0
+    End If
+    If lir_func is 0:
+        Return 0
+    End If
+
+    __store(ctx, 16, lir_func)
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Note: Get function name
+    Let func_name be __load(lir_func, 0)
+    Let is_external be __load(lir_func, 112)
+
+    Note: Skip external (declaration-only) functions
+    If is_external is 1:
+        MachineCode.asm_add_external_symbol(output, func_name)
+        Return 1
+    End If
+
+    Note: Determine calling convention (always AAPCS64 on AArch64)
+    Let target_os be MachineCode.TARGET_OS_LINUX
+    Let convention be CallingConv.create_aapcs64_convention(target_os)
+    If convention is 0:
+        Set convention to CallingConv.create_aapcs64_convention(MachineCode.TARGET_OS_LINUX)
+    End If
+    __store(ctx, 24, convention)
+
+    Note: Emit function directives
+    MachineCode.asm_add_global_symbol(output, func_name)
+    MachineCode.asm_emit_to_section(output, section, "\t.type\t")
+    MachineCode.asm_emit_to_section(output, section, func_name)
+    MachineCode.asm_emit_line(output, section, ", %function")
+
+    Note: Emit function label
+    MachineCode.asm_emit_to_section(output, section, func_name)
+    MachineCode.asm_emit_line(output, section, ":")
+
+    Note: Emit prologue
+    emit_prologue(ctx, lir_func)
+
+    Note: Emit all basic blocks
+    Let blocks be __load(lir_func, 32)
+    Let block_count be __load(lir_func, 40)
+    Let bi be 0
+    While bi < block_count:
+        Let block be List.list_get(blocks, bi)
+        If block is not 0:
+            emit_basic_block(ctx, block)
+        End If
+        Set bi to bi + 1
+    End While
+
+    Note: Emit function size directive
+    MachineCode.asm_emit_to_section(output, section, "\t.size\t")
+    MachineCode.asm_emit_to_section(output, section, func_name)
+    MachineCode.asm_emit_to_section(output, section, ", .-")
+    MachineCode.asm_emit_line(output, section, func_name)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Function Prologue and Epilogue
+Note: ============================================================================
+
+@Reasoning
+AArch64 prologue differs significantly from x86_64:
+- Uses STP (Store Pair) to save X29/X30 with pre-indexed addressing that adjusts SP
+- Sets X29 as frame pointer with MOV
+- Saves callee-saved registers in pairs using STP with offset from SP
+- All frame sizes must be multiples of 16 (SP alignment requirement)
+
+Standard prologue sequence:
+  stp x29, x30, [sp, #-frame_size]!   Note: Pre-decrement SP and save FP/LR
+  mov x29, sp                          Note: Set frame pointer
+  stp x19, x20, [sp, #16]             Note: Save callee-saved regs at offsets
+  stp x21, x22, [sp, #32]             Note: Continue saving pairs
+  ...
+@End Reasoning
+
+Process called "emit_prologue" that takes ctx as Integer, lir_func as Integer returns Integer:
+    Note: Emits AArch64 function prologue
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let stack_frame be __load(lir_func, 72)
+
+    Note: Compute frame size
+    Let frame_size be 16  Note: Minimum: space for FP(X29) and LR(X30)
+    If stack_frame is not 0:
+        Let local_size be __load(stack_frame, 0)
+        Let callee_saved be __load(stack_frame, 48)
+        Let callee_count be __load(stack_frame, 56)
+        Set frame_size to CallingConv.compute_frame_adjustment(CallingConv.CALLING_CONV_AAPCS64, local_size, callee_count)
+    End If
+
+    Note: Ensure frame_size is at least 16 (for FP/LR) and 16-byte aligned
+    If frame_size < 16:
+        Set frame_size to 16
+    End If
+    Let remainder be frame_size % 16
+    If remainder is not 0:
+        Set frame_size to frame_size + (16 - remainder)
+    End If
+
+    Note: Emit: stp x29, x30, [sp, #-frame_size]!
+    MachineCode.asm_emit_to_section(output, section, "\tstp\tx29, x30, [sp, #-")
+    Let size_str be StringCore.integer_to_string(frame_size)
+    MachineCode.asm_emit_to_section(output, section, size_str)
+    MachineCode.asm_emit_line(output, section, "]!")
+
+    Note: Emit: mov x29, sp
+    MachineCode.asm_emit_line(output, section, "\tmov\tx29, sp")
+
+    Note: Save callee-saved registers in pairs at offsets from SP
+    If stack_frame is not 0:
+        Let callee_saved be __load(stack_frame, 48)
+        Let callee_count be __load(stack_frame, 56)
+        If callee_saved is not 0:
+            If callee_count > 0:
+                Note: Save registers in pairs using STP
+                Note: First pair saved at [sp, #16] (after FP/LR at [sp, #0])
+                Let offset be 16
+                Let ci be 0
+                While ci < callee_count:
+                    Let reg1_id be List.list_get(callee_saved, ci)
+                    Let reg1_name be get_gpr_name_64(reg1_id)
+
+                    If ci + 1 < callee_count:
+                        Note: Save a pair of registers
+                        Let reg2_id be List.list_get(callee_saved, ci + 1)
+                        Let reg2_name be get_gpr_name_64(reg2_id)
+
+                        MachineCode.asm_emit_to_section(output, section, "\tstp\t")
+                        MachineCode.asm_emit_to_section(output, section, reg1_name)
+                        MachineCode.asm_emit_to_section(output, section, ", ")
+                        MachineCode.asm_emit_to_section(output, section, reg2_name)
+                        MachineCode.asm_emit_to_section(output, section, ", [sp, #")
+                        Let off_str be StringCore.integer_to_string(offset)
+                        MachineCode.asm_emit_to_section(output, section, off_str)
+                        MachineCode.asm_emit_line(output, section, "]")
+
+                        Set offset to offset + 16
+                        Set ci to ci + 2
+                    Otherwise:
+                        Note: Odd register out - save single register with STR
+                        MachineCode.asm_emit_to_section(output, section, "\tstr\t")
+                        MachineCode.asm_emit_to_section(output, section, reg1_name)
+                        MachineCode.asm_emit_to_section(output, section, ", [sp, #")
+                        Let off_str be StringCore.integer_to_string(offset)
+                        MachineCode.asm_emit_to_section(output, section, off_str)
+                        MachineCode.asm_emit_line(output, section, "]")
+
+                        Set offset to offset + 8
+                        Set ci to ci + 1
+                    End If
+                End While
+            End If
+        End If
+    End If
+
+    Return 1
+End Process
+
+Process called "emit_epilogue" that takes ctx as Integer, lir_func as Integer returns Integer:
+    Note: Emits AArch64 function epilogue
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let stack_frame be __load(lir_func, 72)
+
+    Note: Compute frame size (must match prologue)
+    Let frame_size be 16
+    If stack_frame is not 0:
+        Let local_size be __load(stack_frame, 0)
+        Let callee_saved be __load(stack_frame, 48)
+        Let callee_count be __load(stack_frame, 56)
+        Set frame_size to CallingConv.compute_frame_adjustment(CallingConv.CALLING_CONV_AAPCS64, local_size, callee_count)
+    End If
+    If frame_size < 16:
+        Set frame_size to 16
+    End If
+    Let remainder be frame_size % 16
+    If remainder is not 0:
+        Set frame_size to frame_size + (16 - remainder)
+    End If
+
+    Note: Restore callee-saved registers in reverse order
+    If stack_frame is not 0:
+        Let callee_saved be __load(stack_frame, 48)
+        Let callee_count be __load(stack_frame, 56)
+        If callee_saved is not 0:
+            If callee_count > 0:
+                Note: Restore in reverse pair order
+                Note: Calculate the offset of the last pair
+                Let pairs be callee_count / 2
+                Let has_odd be callee_count % 2
+
+                Note: Restore odd register first if present
+                If has_odd is not 0:
+                    Let odd_idx be callee_count - 1
+                    Let odd_reg_id be List.list_get(callee_saved, odd_idx)
+                    Let odd_reg_name be get_gpr_name_64(odd_reg_id)
+                    Let odd_offset be 16 + (pairs * 16)
+
+                    MachineCode.asm_emit_to_section(output, section, "\tldr\t")
+                    MachineCode.asm_emit_to_section(output, section, odd_reg_name)
+                    MachineCode.asm_emit_to_section(output, section, ", [sp, #")
+                    Let off_str be StringCore.integer_to_string(odd_offset)
+                    MachineCode.asm_emit_to_section(output, section, off_str)
+                    MachineCode.asm_emit_line(output, section, "]")
+                End If
+
+                Note: Restore pairs in reverse order
+                Let pi be pairs - 1
+                While pi >= 0:
+                    Let pair_base be pi * 2
+                    Let reg1_id be List.list_get(callee_saved, pair_base)
+                    Let reg2_id be List.list_get(callee_saved, pair_base + 1)
+                    Let reg1_name be get_gpr_name_64(reg1_id)
+                    Let reg2_name be get_gpr_name_64(reg2_id)
+                    Let pair_offset be 16 + (pi * 16)
+
+                    MachineCode.asm_emit_to_section(output, section, "\tldp\t")
+                    MachineCode.asm_emit_to_section(output, section, reg1_name)
+                    MachineCode.asm_emit_to_section(output, section, ", ")
+                    MachineCode.asm_emit_to_section(output, section, reg2_name)
+                    MachineCode.asm_emit_to_section(output, section, ", [sp, #")
+                    Let off_str be StringCore.integer_to_string(pair_offset)
+                    MachineCode.asm_emit_to_section(output, section, off_str)
+                    MachineCode.asm_emit_line(output, section, "]")
+
+                    Set pi to pi - 1
+                End While
+            End If
+        End If
+    End If
+
+    Note: Emit: ldp x29, x30, [sp], #frame_size
+    MachineCode.asm_emit_to_section(output, section, "\tldp\tx29, x30, [sp], #")
+    Let size_str be StringCore.integer_to_string(frame_size)
+    MachineCode.asm_emit_line(output, section, size_str)
+
+    Note: Emit: ret
+    MachineCode.asm_emit_line(output, section, "\tret")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Basic Block Emission
+Note: ============================================================================
+
+Process called "emit_basic_block" that takes ctx as Integer, block as Integer returns Integer:
+    If block is 0:
+        Return 0
+    End If
+
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Let label be __load(block, 8)
+    If label is not 0:
+        MachineCode.asm_emit_to_section(output, section, label)
+        MachineCode.asm_emit_line(output, section, ":")
+    Otherwise:
+        Let block_id be __load(block, 0)
+        MachineCode.asm_emit_to_section(output, section, ".LBB")
+        Let id_str be StringCore.integer_to_string(block_id)
+        MachineCode.asm_emit_to_section(output, section, id_str)
+        MachineCode.asm_emit_line(output, section, ":")
+    End If
+
+    Let instructions be __load(block, 16)
+    Let instr_count be __load(block, 24)
+    Let ii be 0
+    While ii < instr_count:
+        Let instr be List.list_get(instructions, ii)
+        If instr is not 0:
+            emit_instruction(ctx, instr)
+        End If
+        Set ii to ii + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Instruction Emission Helpers
+Note: ============================================================================
+
+Process called "emit_alu_3op" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Emits a 3-operand ALU instruction: mnemonic Xd, Xn, Xm/imm
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Let result be __load(instr, 8)
+    Let op1 be __load(instr, 16)
+    Let op2 be __load(instr, 24)
+
+    Let dest_str be format_operand(result, 8)
+    Let src1_str be format_operand(op1, 8)
+    Let src2_str be format_operand(op2, 8)
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_to_section(output, section, src1_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src2_str)
+
+    Return 1
+End Process
+
+Process called "emit_alu_2op" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Emits a 2-operand ALU instruction: mnemonic Xd, Xn
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Let result be __load(instr, 8)
+    Let op1 be __load(instr, 16)
+
+    Let dest_str be format_operand(result, 8)
+    Let src_str be format_operand(op1, 8)
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src_str)
+
+    Return 1
+End Process
+
+Process called "emit_cmp_2op" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Emits a comparison instruction: mnemonic Xn, Xm (no destination, sets flags)
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Let op1 be __load(instr, 16)
+    Let op2 be __load(instr, 24)
+
+    Let src1_str be format_operand(op1, 8)
+    Let src2_str be format_operand(op2, 8)
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, src1_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src2_str)
+
+    Return 1
+End Process
+
+Process called "emit_fp_3op" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Emits a 3-operand FP instruction: mnemonic Dd, Dn, Dm
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Let result be __load(instr, 8)
+    Let op1 be __load(instr, 16)
+    Let op2 be __load(instr, 24)
+
+    Let dest_str be format_operand(result, 8)
+    Let src1_str be format_operand(op1, 8)
+    Let src2_str be format_operand(op2, 8)
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_to_section(output, section, src1_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src2_str)
+
+    Return 1
+End Process
+
+Process called "emit_fp_2op" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Emits a 2-operand FP instruction: mnemonic Dd, Dn
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Let result be __load(instr, 8)
+    Let op1 be __load(instr, 16)
+
+    Let dest_str be format_operand(result, 8)
+    Let src_str be format_operand(op1, 8)
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src_str)
+
+    Return 1
+End Process
+
+Process called "emit_branch" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Emits a branch instruction: mnemonic label
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Note: Branch target is stored in operand1 or as label string
+    Let target be __load(instr, 16)
+    Let target_str be ""
+    If target is not 0:
+        Let target_type be __load(target, 0)
+        If target_type is 4:
+            Note: Label operand - use the label string directly
+            Set target_str to __load(target, 16)
+        Otherwise:
+            Note: Block ID reference
+            Let block_id be __load(target, 16)
+            Let buf be Layout.allocate(16)
+            Let prefix be ".LBB"
+            Let pi be 0
+            Let pc be __load8(prefix, pi)
+            While pc is not 0:
+                __store8(buf, pi, pc)
+                Set pi to pi + 1
+                Set pc to __load8(prefix, pi)
+            End While
+            Let id_str be StringCore.integer_to_string(block_id)
+            Let ii be 0
+            Let ic be __load8(id_str, ii)
+            While ic is not 0:
+                __store8(buf, pi, ic)
+                Set pi to pi + 1
+                Set ii to ii + 1
+                Set ic to __load8(id_str, ii)
+            End While
+            __store8(buf, pi, 0)
+            Set target_str to buf
+        End If
+    End If
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_line(output, section, target_str)
+
+    Return 1
+End Process
+
+Process called "emit_load_store_aarch64" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Emits a load or store instruction: mnemonic Xt, [Xn, #offset]
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Let result be __load(instr, 8)
+    Let addr_op be __load(instr, 16)
+
+    Let reg_str be format_operand(result, 8)
+    Let addr_str be format_operand(addr_op, 8)
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, reg_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, addr_str)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Instruction Emission - Main Dispatch
+Note: ============================================================================
+
+Process called "emit_instruction" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Dispatches a single LIR instruction to the appropriate AArch64 emitter
+    If instr is 0:
+        Return 0
+    End If
+
+    Let opcode be __load(instr, 0)
+
+    Note: ---- Data Movement (30000-30099) ----
+    If opcode is 30000:
+        Note: NOP
+        Let output be __load(ctx, 0)
+        MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, "\tnop")
+        Return 1
+    End If
+    If opcode is 30001:
+        Note: MOV -> mov Xd, Xn or mov Xd, #imm
+        Return emit_alu_2op(ctx, instr, "mov")
+    End If
+    If opcode is 30002:
+        Note: LEA -> adr Xd, label (or add-based address computation)
+        Return emit_alu_2op(ctx, instr, "adr")
+    End If
+    If opcode is 30003:
+        Note: PUSH -> str Xn, [sp, #-8]! (pre-decrement)
+        Note: AArch64 has no native push; emulate with store-with-predecrement
+        Let output be __load(ctx, 0)
+        Let section be MachineCode.SECTION_TEXT
+        Let op1 be __load(instr, 16)
+        Let reg_str be format_operand(op1, 8)
+        MachineCode.asm_emit_to_section(output, section, "\tstr\t")
+        MachineCode.asm_emit_to_section(output, section, reg_str)
+        MachineCode.asm_emit_line(output, section, ", [sp, #-16]!")
+        Return 1
+    End If
+    If opcode is 30004:
+        Note: POP -> ldr Xd, [sp], #8 (post-increment)
+        Let output be __load(ctx, 0)
+        Let section be MachineCode.SECTION_TEXT
+        Let result be __load(instr, 8)
+        Let reg_str be format_operand(result, 8)
+        MachineCode.asm_emit_to_section(output, section, "\tldr\t")
+        MachineCode.asm_emit_to_section(output, section, reg_str)
+        MachineCode.asm_emit_line(output, section, ", [sp], #16")
+        Return 1
+    End If
+    If opcode is 30006:
+        Note: MOVSX -> sxtw Xd, Wn (sign extend 32->64)
+        Return emit_alu_2op(ctx, instr, "sxtw")
+    End If
+    If opcode is 30007:
+        Note: MOVZX -> uxtb/uxth/uxtw or mov Wd, Wn (zero extend implicit)
+        Return emit_alu_2op(ctx, instr, "uxtw")
+    End If
+    If opcode is 30008:
+        Note: CMOV -> csel Xd, Xn, Xm, cond (conditional select)
+        Return emit_alu_3op(ctx, instr, "csel")
+    End If
+
+    Note: ---- Arithmetic (30100-30110) ----
+    If opcode is 30100:
+        Return emit_alu_3op(ctx, instr, "add")
+    End If
+    If opcode is 30101:
+        Return emit_alu_3op(ctx, instr, "sub")
+    End If
+    If opcode is 30102:
+        Note: IMUL -> mul (signed multiply, lower 64 bits)
+        Return emit_alu_3op(ctx, instr, "mul")
+    End If
+    If opcode is 30103:
+        Note: IDIV -> sdiv (signed divide, clean 3-operand on AArch64)
+        Return emit_alu_3op(ctx, instr, "sdiv")
+    End If
+    If opcode is 30104:
+        Note: MUL -> mul (unsigned multiply, same instruction)
+        Return emit_alu_3op(ctx, instr, "mul")
+    End If
+    If opcode is 30105:
+        Note: DIV -> udiv (unsigned divide)
+        Return emit_alu_3op(ctx, instr, "udiv")
+    End If
+    If opcode is 30106:
+        Note: NEG -> neg Xd, Xn
+        Return emit_alu_2op(ctx, instr, "neg")
+    End If
+    If opcode is 30107:
+        Note: INC -> add Xd, Xn, #1 (no native INC on AArch64)
+        Let output be __load(ctx, 0)
+        Let section be MachineCode.SECTION_TEXT
+        Let result be __load(instr, 8)
+        Let op1 be __load(instr, 16)
+        Let dest_str be format_operand(result, 8)
+        Let src_str be format_operand(op1, 8)
+        MachineCode.asm_emit_to_section(output, section, "\tadd\t")
+        MachineCode.asm_emit_to_section(output, section, dest_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_to_section(output, section, src_str)
+        MachineCode.asm_emit_line(output, section, ", #1")
+        Return 1
+    End If
+    If opcode is 30108:
+        Note: DEC -> sub Xd, Xn, #1
+        Let output be __load(ctx, 0)
+        Let section be MachineCode.SECTION_TEXT
+        Let result be __load(instr, 8)
+        Let op1 be __load(instr, 16)
+        Let dest_str be format_operand(result, 8)
+        Let src_str be format_operand(op1, 8)
+        MachineCode.asm_emit_to_section(output, section, "\tsub\t")
+        MachineCode.asm_emit_to_section(output, section, dest_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_to_section(output, section, src_str)
+        MachineCode.asm_emit_line(output, section, ", #1")
+        Return 1
+    End If
+    If opcode is 30109:
+        Note: ADC -> adc Xd, Xn, Xm (add with carry)
+        Return emit_alu_3op(ctx, instr, "adc")
+    End If
+    If opcode is 30110:
+        Note: SBB -> sbc Xd, Xn, Xm (subtract with borrow/carry)
+        Return emit_alu_3op(ctx, instr, "sbc")
+    End If
+
+    Note: ---- Floating-Point (30120-30129) ----
+    If opcode is 30120:
+        Return emit_fp_3op(ctx, instr, "fadd")
+    End If
+    If opcode is 30121:
+        Return emit_fp_3op(ctx, instr, "fsub")
+    End If
+    If opcode is 30122:
+        Return emit_fp_3op(ctx, instr, "fmul")
+    End If
+    If opcode is 30123:
+        Return emit_fp_3op(ctx, instr, "fdiv")
+    End If
+    If opcode is 30125:
+        Return emit_fp_2op(ctx, instr, "fsqrt")
+    End If
+    If opcode is 30127:
+        Return emit_fp_3op(ctx, instr, "fmin")
+    End If
+    If opcode is 30128:
+        Return emit_fp_3op(ctx, instr, "fmax")
+    End If
+
+    Note: ---- Bitwise (30200-30204) ----
+    If opcode is 30200:
+        Return emit_alu_3op(ctx, instr, "and")
+    End If
+    If opcode is 30201:
+        Return emit_alu_3op(ctx, instr, "orr")
+    End If
+    If opcode is 30202:
+        Return emit_alu_3op(ctx, instr, "eor")
+    End If
+    If opcode is 30203:
+        Note: NOT -> mvn Xd, Xn (bitwise NOT)
+        Return emit_alu_2op(ctx, instr, "mvn")
+    End If
+    If opcode is 30204:
+        Note: TEST -> tst Xn, Xm (AND without storing result, sets flags)
+        Return emit_cmp_2op(ctx, instr, "tst")
+    End If
+
+    Note: ---- Shifts (30300-30306) ----
+    If opcode is 30300:
+        Return emit_alu_3op(ctx, instr, "lsl")
+    End If
+    If opcode is 30301:
+        Return emit_alu_3op(ctx, instr, "lsr")
+    End If
+    If opcode is 30302:
+        Return emit_alu_3op(ctx, instr, "asr")
+    End If
+    If opcode is 30303:
+        Note: ROL -> ror with (64 - count) on AArch64 (there is no direct ROL)
+        Note: Emit as: ror Xd, Xn, Xm with negated shift (compiler handles count transformation)
+        Return emit_alu_3op(ctx, instr, "ror")
+    End If
+    If opcode is 30304:
+        Return emit_alu_3op(ctx, instr, "ror")
+    End If
+
+    Note: ---- Comparisons (30400-30401) ----
+    If opcode is 30400:
+        Return emit_cmp_2op(ctx, instr, "cmp")
+    End If
+    If opcode is 30401:
+        Note: FCMP -> fcmp Dn, Dm
+        Return emit_cmp_2op(ctx, instr, "fcmp")
+    End If
+
+    Note: ---- Control Flow (30500-30523) ----
+    If opcode is 30500:
+        Return emit_branch(ctx, instr, "b")
+    End If
+    If opcode is 30501:
+        Note: JZ -> b.eq (zero flag = equal after CMP with 0)
+        Return emit_branch(ctx, instr, "b.eq")
+    End If
+    If opcode is 30502:
+        Return emit_branch(ctx, instr, "b.ne")
+    End If
+    If opcode is 30503:
+        Return emit_branch(ctx, instr, "b.eq")
+    End If
+    If opcode is 30504:
+        Return emit_branch(ctx, instr, "b.ne")
+    End If
+    If opcode is 30505:
+        Return emit_branch(ctx, instr, "b.lt")
+    End If
+    If opcode is 30506:
+        Return emit_branch(ctx, instr, "b.le")
+    End If
+    If opcode is 30507:
+        Return emit_branch(ctx, instr, "b.gt")
+    End If
+    If opcode is 30508:
+        Return emit_branch(ctx, instr, "b.ge")
+    End If
+    If opcode is 30509:
+        Note: JB (unsigned below) -> b.lo (lower)
+        Return emit_branch(ctx, instr, "b.lo")
+    End If
+    If opcode is 30510:
+        Note: JBE (unsigned below or equal) -> b.ls (lower or same)
+        Return emit_branch(ctx, instr, "b.ls")
+    End If
+    If opcode is 30511:
+        Note: JA (unsigned above) -> b.hi (higher)
+        Return emit_branch(ctx, instr, "b.hi")
+    End If
+    If opcode is 30512:
+        Note: JAE (unsigned above or equal) -> b.hs (higher or same)
+        Return emit_branch(ctx, instr, "b.hs")
+    End If
+    If opcode is 30513:
+        Note: JS (sign/negative) -> b.mi (minus)
+        Return emit_branch(ctx, instr, "b.mi")
+    End If
+    If opcode is 30514:
+        Note: JNS (not sign) -> b.pl (plus)
+        Return emit_branch(ctx, instr, "b.pl")
+    End If
+    If opcode is 30515:
+        Note: JO (overflow) -> b.vs (overflow set)
+        Return emit_branch(ctx, instr, "b.vs")
+    End If
+    If opcode is 30516:
+        Note: JNO (no overflow) -> b.vc (overflow clear)
+        Return emit_branch(ctx, instr, "b.vc")
+    End If
+    If opcode is 30520:
+        Note: CALL -> bl target
+        Let output be __load(ctx, 0)
+        Let section be MachineCode.SECTION_TEXT
+        Let target be __load(instr, 16)
+        Let target_str be ""
+        If target is not 0:
+            Let target_type be __load(target, 0)
+            If target_type is 4:
+                Set target_str to __load(target, 16)
+            Otherwise:
+                Set target_str to format_operand(target, 8)
+            End If
+        End If
+        MachineCode.asm_emit_to_section(output, section, "\tbl\t")
+        MachineCode.asm_emit_line(output, section, target_str)
+        Return 1
+    End If
+    If opcode is 30521:
+        Note: CALL_INDIRECT -> blr Xn
+        Let output be __load(ctx, 0)
+        Let section be MachineCode.SECTION_TEXT
+        Let target be __load(instr, 16)
+        Let target_str be format_operand(target, 8)
+        MachineCode.asm_emit_to_section(output, section, "\tblr\t")
+        MachineCode.asm_emit_line(output, section, target_str)
+        Return 1
+    End If
+    If opcode is 30522:
+        Note: RET -> emit epilogue then ret (epilogue handles LDP and ret)
+        Let lir_func be __load(ctx, 16)
+        Return emit_epilogue(ctx, lir_func)
+    End If
+    If opcode is 30523:
+        Note: SYSCALL -> svc #0
+        Let output be __load(ctx, 0)
+        MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, "\tsvc\t#0")
+        Return 1
+    End If
+
+    Note: ---- Memory Operations (30600-30609) ----
+    If opcode is 30600:
+        Note: LOAD -> ldr Xd, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "ldr")
+    End If
+    If opcode is 30601:
+        Note: STORE -> str Xs, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "str")
+    End If
+    If opcode is 30602:
+        Note: LOAD8 -> ldrb Wd, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "ldrb")
+    End If
+    If opcode is 30603:
+        Note: LOAD16 -> ldrh Wd, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "ldrh")
+    End If
+    If opcode is 30604:
+        Note: LOAD32 -> ldr Wd, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "ldr")
+    End If
+    If opcode is 30605:
+        Note: LOAD64 -> ldr Xd, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "ldr")
+    End If
+    If opcode is 30606:
+        Note: STORE8 -> strb Ws, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "strb")
+    End If
+    If opcode is 30607:
+        Note: STORE16 -> strh Ws, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "strh")
+    End If
+    If opcode is 30608:
+        Note: STORE32 -> str Ws, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "str")
+    End If
+    If opcode is 30609:
+        Note: STORE64 -> str Xs, [Xn, #offset]
+        Return emit_load_store_aarch64(ctx, instr, "str")
+    End If
+
+    Note: ---- Type Conversions (30700-30709) ----
+    If opcode is 30700:
+        Note: SEXT -> sxtw Xd, Wn (sign extend 32->64)
+        Return emit_alu_2op(ctx, instr, "sxtw")
+    End If
+    If opcode is 30701:
+        Note: ZEXT -> uxtw Xd, Wn (zero extend, or mov Wd, Wn for implicit)
+        Return emit_alu_2op(ctx, instr, "uxtw")
+    End If
+    If opcode is 30703:
+        Note: I2F (int to float32) -> scvtf Sd, Xn
+        Return emit_fp_2op(ctx, instr, "scvtf")
+    End If
+    If opcode is 30704:
+        Note: I2D (int to float64) -> scvtf Dd, Xn
+        Return emit_fp_2op(ctx, instr, "scvtf")
+    End If
+    If opcode is 30705:
+        Note: F2I (float32 to int) -> fcvtzs Xd, Sn (truncate toward zero)
+        Return emit_fp_2op(ctx, instr, "fcvtzs")
+    End If
+    If opcode is 30706:
+        Note: D2I (float64 to int) -> fcvtzs Xd, Dn
+        Return emit_fp_2op(ctx, instr, "fcvtzs")
+    End If
+    If opcode is 30707:
+        Note: F32TOOF64 -> fcvt Dd, Sn (convert single to double)
+        Return emit_fp_2op(ctx, instr, "fcvt")
+    End If
+    If opcode is 30708:
+        Note: F64TOF32 -> fcvt Sd, Dn (convert double to single)
+        Return emit_fp_2op(ctx, instr, "fcvt")
+    End If
+
+    Note: ---- Special (30900-30903) ----
+    If opcode is 30900:
+        Note: LABEL -> emit label
+        Let output be __load(ctx, 0)
+        Let section be MachineCode.SECTION_TEXT
+        Let label_op be __load(instr, 16)
+        If label_op is not 0:
+            Let label_str be __load(label_op, 16)
+            If label_str is not 0:
+                MachineCode.asm_emit_to_section(output, section, label_str)
+                MachineCode.asm_emit_line(output, section, ":")
+            End If
+        End If
+        Return 1
+    End If
+    If opcode is 30902:
+        Note: COMMENT -> emit as assembly comment
+        Let output be __load(ctx, 0)
+        Let section be MachineCode.SECTION_TEXT
+        Let comment_op be __load(instr, 16)
+        If comment_op is not 0:
+            Let comment_str be __load(comment_op, 16)
+            MachineCode.asm_emit_to_section(output, section, "\t// ")
+            MachineCode.asm_emit_line(output, section, comment_str)
+        End If
+        Return 1
+    End If
+    If opcode is 30903:
+        Note: INLINE_ASM -> emit raw assembly text
+        Let output be __load(ctx, 0)
+        Let section be MachineCode.SECTION_TEXT
+        Let asm_op be __load(instr, 16)
+        If asm_op is not 0:
+            Let asm_str be __load(asm_op, 16)
+            MachineCode.asm_emit_to_section(output, section, "\t")
+            MachineCode.asm_emit_line(output, section, asm_str)
+        End If
+        Return 1
+    End If
+
+    Note: Unknown opcode - emit as comment for debugging
+    Let output be __load(ctx, 0)
+    MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\t// unknown LIR opcode: ")
+    Let opcode_str be StringCore.integer_to_string(opcode)
+    MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, opcode_str)
+    Return 0
+End Process

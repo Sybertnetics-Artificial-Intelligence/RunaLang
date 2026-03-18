@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,863 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles MIPS register allocation and register management.
+MIPS Register Allocator - Register Allocation and Constraint Resolution
+
+This file maps LIR virtual registers to MIPS physical registers according to
+the O32 ABI calling convention. MIPS has 32 general-purpose registers ($0-$31)
+with specific ABI assignments, plus the HI and LO special registers used by
+multiply and divide instructions.
 
 This file performs the following tasks:
-- Process MIPS register allocation and register management
-- Handle MIPS register constraints and register usage optimization
-- Manage MIPS register spilling and register optimization
-- Process MIPS register-based operations and register optimization
+- Map LIR virtual registers to MIPS physical GPRs ($0-$31)
+- Enforce O32 ABI constraints for argument passing ($a0-$a3) and return ($v0-$v1)
+- Track callee-saved ($s0-$s7) and caller-saved ($t0-$t9, $a0-$a3) registers
+- Handle HI/LO register constraints for multiply/divide sequences
+- Insert spill/reload instructions when register pressure exceeds available GPRs
+- Resolve two-address constraints for MIPS pseudo-instructions
 
 This file is essential because of the following reasons:
 - MIPS register management is crucial for efficient MIPS code generation
-- Proper register handling ensures optimal MIPS CPU resource utilization
-- MIPS support enables Runa compilation for MIPS platforms
+- O32 ABI compliance ensures correct function calls and interop with C code
+- HI/LO register tracking prevents corruption during multiply/divide sequences
+- Register spilling strategy directly impacts generated code performance
 
 This file consists of the following functions/features/operation types:
-- MIPS register allocation and register management
-- MIPS register constraints and register usage optimization
-- MIPS register spilling and register optimization
-- MIPS register-based operations and register optimization
+- MIPS register definitions and ABI classification constants
+- Register allocation state tracking (free/used/spilled per register)
+- O32 ABI argument and return register assignment
+- HI/LO register lifetime tracking for multiply/divide
+- Spill slot management and stack frame integration
+- Post-allocation constraint resolution for MIPS-specific requirements
+
+Dependencies:
+- Imports LIR types for instruction and register definitions
+- Imports Layout for memory allocation
+- Imports List for collection operations
 :End Note
 
-Note: TODO - Implement MIPS register allocator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: MIPS REGISTER DEFINITIONS
+Note: ============================================================================
+
+@Reasoning
+MIPS has 32 general-purpose registers, each 32 bits wide (or 64 bits in MIPS64).
+The O32 ABI assigns specific roles to each register:
+
+  $0  ($zero) - Hardwired to zero, reads always return 0, writes are ignored
+  $1  ($at)   - Assembler temporary, reserved for pseudo-instruction expansion
+  $2-$3  ($v0-$v1) - Function return values
+  $4-$7  ($a0-$a3) - Function arguments (first 4)
+  $8-$15 ($t0-$t7) - Temporary registers, caller-saved
+  $16-$23 ($s0-$s7) - Saved registers, callee-saved
+  $24-$25 ($t8-$t9) - Additional temporaries, caller-saved
+  $26-$27 ($k0-$k1) - Kernel reserved, not available to user code
+  $28 ($gp) - Global pointer
+  $29 ($sp) - Stack pointer
+  $30 ($fp/$s8) - Frame pointer / additional saved register
+  $31 ($ra) - Return address
+
+Additionally, MIPS has two special-purpose registers:
+  HI - High 32 bits of multiply result, or remainder from divide
+  LO - Low 32 bits of multiply result, or quotient from divide
+@End Reasoning
+
+Note: Register indices matching hardware numbering ($0-$31)
+Constant MIPS_REG_ZERO as Integer is 0
+Constant MIPS_REG_AT as Integer is 1
+Constant MIPS_REG_V0 as Integer is 2
+Constant MIPS_REG_V1 as Integer is 3
+Constant MIPS_REG_A0 as Integer is 4
+Constant MIPS_REG_A1 as Integer is 5
+Constant MIPS_REG_A2 as Integer is 6
+Constant MIPS_REG_A3 as Integer is 7
+Constant MIPS_REG_T0 as Integer is 8
+Constant MIPS_REG_T1 as Integer is 9
+Constant MIPS_REG_T2 as Integer is 10
+Constant MIPS_REG_T3 as Integer is 11
+Constant MIPS_REG_T4 as Integer is 12
+Constant MIPS_REG_T5 as Integer is 13
+Constant MIPS_REG_T6 as Integer is 14
+Constant MIPS_REG_T7 as Integer is 15
+Constant MIPS_REG_S0 as Integer is 16
+Constant MIPS_REG_S1 as Integer is 17
+Constant MIPS_REG_S2 as Integer is 18
+Constant MIPS_REG_S3 as Integer is 19
+Constant MIPS_REG_S4 as Integer is 20
+Constant MIPS_REG_S5 as Integer is 21
+Constant MIPS_REG_S6 as Integer is 22
+Constant MIPS_REG_S7 as Integer is 23
+Constant MIPS_REG_T8 as Integer is 24
+Constant MIPS_REG_T9 as Integer is 25
+Constant MIPS_REG_K0 as Integer is 26
+Constant MIPS_REG_K1 as Integer is 27
+Constant MIPS_REG_GP as Integer is 28
+Constant MIPS_REG_SP as Integer is 29
+Constant MIPS_REG_FP as Integer is 30
+Constant MIPS_REG_RA as Integer is 31
+
+Note: Total physical register count
+Constant MIPS_GPR_COUNT as Integer is 32
+
+Note: Special pseudo-register IDs for HI and LO (not directly addressable)
+Constant MIPS_REG_HI as Integer is 32
+Constant MIPS_REG_LO as Integer is 33
+
+Note: Register allocation status values
+Constant REG_STATUS_FREE as Integer is 0
+Constant REG_STATUS_ALLOCATED as Integer is 1
+Constant REG_STATUS_RESERVED as Integer is 2
+Constant REG_STATUS_SPILLED as Integer is 3
+
+Note: Number of allocatable GPRs (excluding $zero, $at, $k0, $k1, $gp, $sp, $ra)
+Constant MIPS_ALLOCATABLE_COUNT as Integer is 25
+
+Note: ============================================================================
+Note: REGISTER ALLOCATOR STATE
+Note: ============================================================================
+
+@Reasoning
+The MIPSRegAllocState tracks the status of all 32 GPRs plus HI/LO. It maintains
+a bitmap-style array indicating whether each register is free, allocated, reserved,
+or spilled. The state also tracks the current spill offset within the stack frame
+and maps LIR virtual registers to physical MIPS registers.
+
+Memory layout (34 entries for 32 GPRs + HI + LO):
+  Offset 0..271:   reg_status[34]   - 8 bytes per entry (status code)
+  Offset 272..543: lir_mapping[34]  - 8 bytes per entry (LIR vreg mapped here, -1 if none)
+  Offset 544:      spill_count      - number of spilled registers
+  Offset 552:      spill_offset     - next available spill slot offset from $fp
+  Offset 560:      total_size       - 8 bytes
+@End Reasoning
+
+Type called "MIPSRegAllocState":
+    reg_status as Integer         Note: Pointer to array of 34 status entries (8 bytes each)
+    lir_mapping as Integer        Note: Pointer to array of 34 LIR vreg mappings (8 bytes each)
+    spill_count as Integer        Note: Number of currently spilled values
+    spill_offset as Integer       Note: Next spill slot offset from frame pointer
+    callee_saved_used as Integer  Note: Bitmask of callee-saved registers actually used
+    hi_in_use as Integer          Note: 1 if HI register contains a live value
+    lo_in_use as Integer          Note: 1 if LO register contains a live value
+End Type
+
+Note: Size: 7 fields * 8 bytes = 56 bytes per MIPSRegAllocState
+
+Note: ============================================================================
+Note: ALLOCATOR INITIALIZATION
+Note: ============================================================================
+
+Process called "create_mips_reg_alloc_state" returns Integer:
+    @Reasoning
+    Allocates and initializes the register allocation state. Marks reserved
+    registers ($zero, $at, $k0, $k1, $gp, $sp, $ra) as RESERVED so the
+    allocator never assigns them. All other registers start as FREE.
+    @End Reasoning
+
+    Let state be Layout.allocate(56)
+    If state equals 0:
+        Display "create_mips_reg_alloc_state: allocation failed"
+        Return 0
+    End If
+
+    Note: Allocate status array (34 entries * 8 bytes = 272 bytes)
+    Let status_array be Layout.allocate(272)
+    If status_array equals 0:
+        Display "create_mips_reg_alloc_state: status array allocation failed"
+        Return 0
+    End If
+
+    Note: Allocate LIR mapping array (34 entries * 8 bytes = 272 bytes)
+    Let mapping_array be Layout.allocate(272)
+    If mapping_array equals 0:
+        Display "create_mips_reg_alloc_state: mapping array allocation failed"
+        Return 0
+    End If
+
+    Note: Initialize all registers as FREE with no LIR mapping (-1)
+    Let i be 0
+    While i is less than 34:
+        __store(status_array, i * 8, REG_STATUS_FREE)
+        __store(mapping_array, i * 8, -1)
+        Set i to i + 1
+    End While
+
+    Note: Mark reserved registers that must never be allocated
+    Note: $zero ($0) - hardwired zero
+    __store(status_array, MIPS_REG_ZERO * 8, REG_STATUS_RESERVED)
+    Note: $at ($1) - assembler temporary
+    __store(status_array, MIPS_REG_AT * 8, REG_STATUS_RESERVED)
+    Note: $k0 ($26) - kernel reserved
+    __store(status_array, MIPS_REG_K0 * 8, REG_STATUS_RESERVED)
+    Note: $k1 ($27) - kernel reserved
+    __store(status_array, MIPS_REG_K1 * 8, REG_STATUS_RESERVED)
+    Note: $gp ($28) - global pointer
+    __store(status_array, MIPS_REG_GP * 8, REG_STATUS_RESERVED)
+    Note: $sp ($29) - stack pointer
+    __store(status_array, MIPS_REG_SP * 8, REG_STATUS_RESERVED)
+    Note: $ra ($31) - return address (managed by prologue/epilogue)
+    __store(status_array, MIPS_REG_RA * 8, REG_STATUS_RESERVED)
+
+    Note: Store pointers and initial values in state struct
+    __store(state, 0, status_array)
+    __store(state, 8, mapping_array)
+    __store(state, 16, 0)     Note: spill_count = 0
+    __store(state, 24, 0)     Note: spill_offset = 0
+    __store(state, 32, 0)     Note: callee_saved_used = 0
+    __store(state, 40, 0)     Note: hi_in_use = 0
+    __store(state, 48, 0)     Note: lo_in_use = 0
+
+    Return state
+End Process
+
+Note: ============================================================================
+Note: REGISTER CLASSIFICATION
+Note: ============================================================================
+
+Process called "is_callee_saved" that takes reg as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the given MIPS register is callee-saved per the O32 ABI.
+    Callee-saved registers: $s0-$s7 (16-23) and $fp/$s8 (30).
+    These must be saved in the function prologue and restored in the epilogue
+    if used by the function.
+    @End Reasoning
+
+    If reg is greater than or equal to MIPS_REG_S0:
+        If reg is less than or equal to MIPS_REG_S7:
+            Return 1
+        End If
+    End If
+    If reg equals MIPS_REG_FP:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "is_caller_saved" that takes reg as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the given MIPS register is caller-saved per the O32 ABI.
+    Caller-saved registers: $t0-$t7 (8-15), $t8-$t9 (24-25),
+    $a0-$a3 (4-7), $v0-$v1 (2-3).
+    These are not preserved across function calls.
+    @End Reasoning
+
+    Note: $v0-$v1 (2-3)
+    If reg is greater than or equal to MIPS_REG_V0:
+        If reg is less than or equal to MIPS_REG_V1:
+            Return 1
+        End If
+    End If
+    Note: $a0-$a3 (4-7)
+    If reg is greater than or equal to MIPS_REG_A0:
+        If reg is less than or equal to MIPS_REG_A3:
+            Return 1
+        End If
+    End If
+    Note: $t0-$t7 (8-15)
+    If reg is greater than or equal to MIPS_REG_T0:
+        If reg is less than or equal to MIPS_REG_T7:
+            Return 1
+        End If
+    End If
+    Note: $t8-$t9 (24-25)
+    If reg is greater than or equal to MIPS_REG_T8:
+        If reg is less than or equal to MIPS_REG_T9:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "is_allocatable" that takes reg as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the register can be assigned by the allocator. Excludes:
+    $zero (0), $at (1), $k0 (26), $k1 (27), $gp (28), $sp (29), $ra (31).
+    @End Reasoning
+
+    If reg equals MIPS_REG_ZERO:
+        Return 0
+    End If
+    If reg equals MIPS_REG_AT:
+        Return 0
+    End If
+    If reg equals MIPS_REG_K0:
+        Return 0
+    End If
+    If reg equals MIPS_REG_K1:
+        Return 0
+    End If
+    If reg equals MIPS_REG_GP:
+        Return 0
+    End If
+    If reg equals MIPS_REG_SP:
+        Return 0
+    End If
+    If reg equals MIPS_REG_RA:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "get_arg_register" that takes arg_index as Integer returns Integer:
+    @Reasoning
+    Returns the MIPS register used for the given argument index per the O32 ABI.
+    Arguments 0-3 go in $a0-$a3. Returns -1 if the argument must be passed on
+    the stack (index >= 4).
+    @End Reasoning
+
+    If arg_index equals 0:
+        Return MIPS_REG_A0
+    End If
+    If arg_index equals 1:
+        Return MIPS_REG_A1
+    End If
+    If arg_index equals 2:
+        Return MIPS_REG_A2
+    End If
+    If arg_index equals 3:
+        Return MIPS_REG_A3
+    End If
+    Return -1
+End Process
+
+Process called "get_return_register" that takes ret_index as Integer returns Integer:
+    @Reasoning
+    Returns the MIPS register used for the given return value index per O32 ABI.
+    Return values go in $v0 (index 0) and $v1 (index 1). Returns -1 for
+    invalid indices.
+    @End Reasoning
+
+    If ret_index equals 0:
+        Return MIPS_REG_V0
+    End If
+    If ret_index equals 1:
+        Return MIPS_REG_V1
+    End If
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: REGISTER ALLOCATION OPERATIONS
+Note: ============================================================================
+
+Process called "allocate_register" that takes state as Integer, lir_vreg as Integer returns Integer:
+    @Reasoning
+    Allocates a free physical MIPS register for the given LIR virtual register.
+    Allocation priority order:
+    1. Temporary registers ($t0-$t7, $t8-$t9) - preferred because caller-saved
+       means no save/restore overhead in the common case
+    2. Saved registers ($s0-$s7) - used when temporaries exhausted, requires
+       save/restore in prologue/epilogue
+    3. If no registers available, returns -1 indicating a spill is needed
+
+    The function updates both the status and mapping arrays and tracks which
+    callee-saved registers are used so the prologue generator knows what to save.
+    @End Reasoning
+
+    Let status_array be __load(state, 0)
+    Let mapping_array be __load(state, 8)
+
+    Note: First try: temporaries $t0-$t7 (registers 8-15)
+    Let reg be MIPS_REG_T0
+    While reg is less than or equal to MIPS_REG_T7:
+        Let status be __load(status_array, reg * 8)
+        If status equals REG_STATUS_FREE:
+            __store(status_array, reg * 8, REG_STATUS_ALLOCATED)
+            __store(mapping_array, reg * 8, lir_vreg)
+            Return reg
+        End If
+        Set reg to reg + 1
+    End While
+
+    Note: Second try: temporaries $t8-$t9 (registers 24-25)
+    Set reg to MIPS_REG_T8
+    While reg is less than or equal to MIPS_REG_T9:
+        Let status be __load(status_array, reg * 8)
+        If status equals REG_STATUS_FREE:
+            __store(status_array, reg * 8, REG_STATUS_ALLOCATED)
+            __store(mapping_array, reg * 8, lir_vreg)
+            Return reg
+        End If
+        Set reg to reg + 1
+    End While
+
+    Note: Third try: saved registers $s0-$s7 (registers 16-23)
+    Set reg to MIPS_REG_S0
+    While reg is less than or equal to MIPS_REG_S7:
+        Let status be __load(status_array, reg * 8)
+        If status equals REG_STATUS_FREE:
+            __store(status_array, reg * 8, REG_STATUS_ALLOCATED)
+            __store(mapping_array, reg * 8, lir_vreg)
+            Note: Mark this callee-saved register as used
+            Let used_mask be __load(state, 32)
+            Let bit be 1
+            Let shift be reg - MIPS_REG_S0
+            Let shift_i be 0
+            While shift_i is less than shift:
+                Set bit to bit * 2
+                Set shift_i to shift_i + 1
+            End While
+            Set used_mask to used_mask + bit
+            __store(state, 32, used_mask)
+            Return reg
+        End If
+        Set reg to reg + 1
+    End While
+
+    Note: Fourth try: frame pointer if not already reserved for frame addressing
+    Let fp_status be __load(status_array, MIPS_REG_FP * 8)
+    If fp_status equals REG_STATUS_FREE:
+        __store(status_array, MIPS_REG_FP * 8, REG_STATUS_ALLOCATED)
+        __store(mapping_array, MIPS_REG_FP * 8, lir_vreg)
+        Let used_mask be __load(state, 32)
+        Set used_mask to used_mask + 256
+        __store(state, 32, used_mask)
+        Return MIPS_REG_FP
+    End If
+
+    Note: No free register available - caller must spill
+    Return -1
+End Process
+
+Process called "free_register" that takes state as Integer, reg as Integer returns Integer:
+    @Reasoning
+    Releases a physical register back to the free pool. Clears the allocation
+    status and removes the LIR mapping. Returns 1 on success, 0 if the register
+    was not allocated or is reserved.
+    @End Reasoning
+
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to MIPS_GPR_COUNT:
+        Return 0
+    End If
+
+    Let status_array be __load(state, 0)
+    Let mapping_array be __load(state, 8)
+
+    Let status be __load(status_array, reg * 8)
+    If status equals REG_STATUS_RESERVED:
+        Return 0
+    End If
+
+    __store(status_array, reg * 8, REG_STATUS_FREE)
+    __store(mapping_array, reg * 8, -1)
+    Return 1
+End Process
+
+Process called "get_register_for_lir" that takes state as Integer, lir_vreg as Integer returns Integer:
+    @Reasoning
+    Looks up which physical MIPS register is currently holding the given LIR
+    virtual register. Scans the mapping array linearly. Returns the physical
+    register index, or -1 if the virtual register is not currently in any
+    physical register.
+    @End Reasoning
+
+    Let mapping_array be __load(state, 8)
+    Let reg be 0
+    While reg is less than 34:
+        Let mapped_vreg be __load(mapping_array, reg * 8)
+        If mapped_vreg equals lir_vreg:
+            Return reg
+        End If
+        Set reg to reg + 1
+    End While
+    Return -1
+End Process
+
+Process called "get_lir_for_register" that takes state as Integer, reg as Integer returns Integer:
+    @Reasoning
+    Returns the LIR virtual register currently mapped to the given physical
+    MIPS register, or -1 if the register is free or reserved.
+    @End Reasoning
+
+    If reg is less than 0:
+        Return -1
+    End If
+    If reg is greater than or equal to 34:
+        Return -1
+    End If
+
+    Let mapping_array be __load(state, 8)
+    Return __load(mapping_array, reg * 8)
+End Process
+
+Note: ============================================================================
+Note: SPILL MANAGEMENT
+Note: ============================================================================
+
+Process called "spill_register" that takes state as Integer, reg as Integer returns Integer:
+    @Reasoning
+    Spills the contents of a physical register to a stack slot. Returns the
+    spill slot offset (negative from $fp). The caller is responsible for
+    emitting the actual sw/lw instructions; this function only manages the
+    bookkeeping of spill slot assignment.
+
+    Spill slots are allocated in 4-byte increments (word-aligned for MIPS O32).
+    @End Reasoning
+
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to MIPS_GPR_COUNT:
+        Return 0
+    End If
+
+    Let status_array be __load(state, 0)
+    Let status be __load(status_array, reg * 8)
+    If status does not equal REG_STATUS_ALLOCATED:
+        Return 0
+    End If
+
+    Note: Assign next spill slot
+    Let spill_count be __load(state, 16)
+    Let spill_off be __load(state, 24)
+    Set spill_off to spill_off - 4
+    Set spill_count to spill_count + 1
+
+    __store(state, 16, spill_count)
+    __store(state, 24, spill_off)
+    __store(status_array, reg * 8, REG_STATUS_SPILLED)
+
+    Return spill_off
+End Process
+
+Process called "reload_register" that takes state as Integer, reg as Integer, spill_offset as Integer returns Integer:
+    @Reasoning
+    Marks a register as allocated again after a reload from its spill slot.
+    The caller emits the actual lw instruction; this function updates the
+    allocation status. Returns 1 on success, 0 on failure.
+    @End Reasoning
+
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to MIPS_GPR_COUNT:
+        Return 0
+    End If
+
+    Let status_array be __load(state, 0)
+    __store(status_array, reg * 8, REG_STATUS_ALLOCATED)
+    Return 1
+End Process
+
+Process called "get_spill_count" that takes state as Integer returns Integer:
+    Return __load(state, 16)
+End Process
+
+Process called "get_total_spill_size" that takes state as Integer returns Integer:
+    @Reasoning
+    Returns the total number of bytes needed for spill slots. This is used
+    to compute the stack frame size. Each spill slot is 4 bytes on MIPS O32.
+    @End Reasoning
+
+    Let count be __load(state, 16)
+    Return count * 4
+End Process
+
+Note: ============================================================================
+Note: HI/LO REGISTER MANAGEMENT
+Note: ============================================================================
+
+Process called "mark_hi_in_use" that takes state as Integer returns Integer:
+    @Reasoning
+    Marks the HI register as containing a live value. Called after mult or div
+    instructions that write to HI. The allocator must not insert any instructions
+    between a mult/div and the mfhi that reads the result if HI is live.
+    @End Reasoning
+
+    __store(state, 40, 1)
+    Return 1
+End Process
+
+Process called "mark_lo_in_use" that takes state as Integer returns Integer:
+    @Reasoning
+    Marks the LO register as containing a live value. Called after mult or div
+    instructions that write to LO.
+    @End Reasoning
+
+    __store(state, 48, 1)
+    Return 1
+End Process
+
+Process called "mark_hi_free" that takes state as Integer returns Integer:
+    __store(state, 40, 0)
+    Return 1
+End Process
+
+Process called "mark_lo_free" that takes state as Integer returns Integer:
+    __store(state, 48, 0)
+    Return 1
+End Process
+
+Process called "is_hi_in_use" that takes state as Integer returns Integer:
+    Return __load(state, 40)
+End Process
+
+Process called "is_lo_in_use" that takes state as Integer returns Integer:
+    Return __load(state, 48)
+End Process
+
+Note: ============================================================================
+Note: CALLEE-SAVED REGISTER TRACKING
+Note: ============================================================================
+
+Process called "get_callee_saved_used_mask" that takes state as Integer returns Integer:
+    @Reasoning
+    Returns a bitmask of callee-saved registers that were allocated during
+    this function. Bit 0 = $s0, bit 1 = $s1, ..., bit 7 = $s7, bit 8 = $fp.
+    The prologue generator uses this to determine which registers to save/restore.
+    @End Reasoning
+
+    Return __load(state, 32)
+End Process
+
+Process called "get_callee_saved_count" that takes state as Integer returns Integer:
+    @Reasoning
+    Counts the number of callee-saved registers that were used. This determines
+    how many extra stack slots the prologue needs to allocate for register saves.
+    @End Reasoning
+
+    Let mask be __load(state, 32)
+    Let count be 0
+    While mask is greater than 0:
+        Let bit be mask - ((mask / 2) * 2)
+        Set count to count + bit
+        Set mask to mask / 2
+    End While
+    Return count
+End Process
+
+Process called "get_callee_saved_by_index" that takes state as Integer, index as Integer returns Integer:
+    @Reasoning
+    Returns the physical register number of the Nth callee-saved register that
+    was used (0-indexed). This is used by the prologue/epilogue generator to
+    iterate over callee-saved registers in order.
+    @End Reasoning
+
+    Let mask be __load(state, 32)
+    Let count be 0
+    Let bit_pos be 0
+    While bit_pos is less than 9:
+        Let bit be mask - ((mask / 2) * 2)
+        If bit equals 1:
+            If count equals index:
+                Note: Map bit position back to register number
+                If bit_pos is less than 8:
+                    Return MIPS_REG_S0 + bit_pos
+                End If
+                Return MIPS_REG_FP
+            End If
+            Set count to count + 1
+        End If
+        Set mask to mask / 2
+        Set bit_pos to bit_pos + 1
+    End While
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: REGISTER NAME LOOKUP
+Note: ============================================================================
+
+Process called "get_gpr_name" that takes reg as Integer returns Integer:
+    @Reasoning
+    Returns the string name of a MIPS GPR by its hardware number.
+    Uses standard MIPS register naming: $zero, $at, $v0-$v1, $a0-$a3,
+    $t0-$t7, $s0-$s7, $t8-$t9, $k0-$k1, $gp, $sp, $fp, $ra.
+    @End Reasoning
+
+    If reg equals 0:
+        Return "$zero"
+    End If
+    If reg equals 1:
+        Return "$at"
+    End If
+    If reg equals 2:
+        Return "$v0"
+    End If
+    If reg equals 3:
+        Return "$v1"
+    End If
+    If reg equals 4:
+        Return "$a0"
+    End If
+    If reg equals 5:
+        Return "$a1"
+    End If
+    If reg equals 6:
+        Return "$a2"
+    End If
+    If reg equals 7:
+        Return "$a3"
+    End If
+    If reg equals 8:
+        Return "$t0"
+    End If
+    If reg equals 9:
+        Return "$t1"
+    End If
+    If reg equals 10:
+        Return "$t2"
+    End If
+    If reg equals 11:
+        Return "$t3"
+    End If
+    If reg equals 12:
+        Return "$t4"
+    End If
+    If reg equals 13:
+        Return "$t5"
+    End If
+    If reg equals 14:
+        Return "$t6"
+    End If
+    If reg equals 15:
+        Return "$t7"
+    End If
+    If reg equals 16:
+        Return "$s0"
+    End If
+    If reg equals 17:
+        Return "$s1"
+    End If
+    If reg equals 18:
+        Return "$s2"
+    End If
+    If reg equals 19:
+        Return "$s3"
+    End If
+    If reg equals 20:
+        Return "$s4"
+    End If
+    If reg equals 21:
+        Return "$s5"
+    End If
+    If reg equals 22:
+        Return "$s6"
+    End If
+    If reg equals 23:
+        Return "$s7"
+    End If
+    If reg equals 24:
+        Return "$t8"
+    End If
+    If reg equals 25:
+        Return "$t9"
+    End If
+    If reg equals 26:
+        Return "$k0"
+    End If
+    If reg equals 27:
+        Return "$k1"
+    End If
+    If reg equals 28:
+        Return "$gp"
+    End If
+    If reg equals 29:
+        Return "$sp"
+    End If
+    If reg equals 30:
+        Return "$fp"
+    End If
+    If reg equals 31:
+        Return "$ra"
+    End If
+    Return "$zero"
+End Process
+
+Note: ============================================================================
+Note: FULL ALLOCATION RESET
+Note: ============================================================================
+
+Process called "reset_allocation" that takes state as Integer returns Integer:
+    @Reasoning
+    Resets the allocation state for a new function. Clears all register
+    allocations but preserves the reserved register markings. Resets
+    spill counters and HI/LO usage flags.
+    @End Reasoning
+
+    Let status_array be __load(state, 0)
+    Let mapping_array be __load(state, 8)
+
+    Let reg be 0
+    While reg is less than 34:
+        Let status be __load(status_array, reg * 8)
+        If status does not equal REG_STATUS_RESERVED:
+            __store(status_array, reg * 8, REG_STATUS_FREE)
+        End If
+        __store(mapping_array, reg * 8, -1)
+        Set reg to reg + 1
+    End While
+
+    __store(state, 16, 0)  Note: spill_count = 0
+    __store(state, 24, 0)  Note: spill_offset = 0
+    __store(state, 32, 0)  Note: callee_saved_used = 0
+    __store(state, 40, 0)  Note: hi_in_use = 0
+    __store(state, 48, 0)  Note: lo_in_use = 0
+
+    Return 1
+End Process
+
+Process called "assign_specific_register" that takes state as Integer, reg as Integer, lir_vreg as Integer returns Integer:
+    @Reasoning
+    Forces a specific physical register to be assigned to a LIR virtual register.
+    Used for ABI-required assignments (e.g., $a0 for first argument, $v0 for
+    return value). If the register is already allocated to a different vreg,
+    the existing mapping is evicted (caller must handle spilling if needed).
+    Returns 1 on success, 0 if the register is reserved.
+    @End Reasoning
+
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to MIPS_GPR_COUNT:
+        Return 0
+    End If
+
+    Let status_array be __load(state, 0)
+    Let mapping_array be __load(state, 8)
+
+    Let status be __load(status_array, reg * 8)
+    If status equals REG_STATUS_RESERVED:
+        Return 0
+    End If
+
+    __store(status_array, reg * 8, REG_STATUS_ALLOCATED)
+    __store(mapping_array, reg * 8, lir_vreg)
+
+    Note: Track callee-saved usage
+    If is_callee_saved(reg) equals 1:
+        Let used_mask be __load(state, 32)
+        Let bit_pos be 0
+        If reg is greater than or equal to MIPS_REG_S0:
+            If reg is less than or equal to MIPS_REG_S7:
+                Set bit_pos to reg - MIPS_REG_S0
+            End If
+        End If
+        If reg equals MIPS_REG_FP:
+            Set bit_pos to 8
+        End If
+        Let bit be 1
+        Let shift_i be 0
+        While shift_i is less than bit_pos:
+            Set bit to bit * 2
+            Set shift_i to shift_i + 1
+        End While
+        Note: Only set the bit if not already set (avoid double-counting)
+        Let test_val be used_mask / bit
+        Let test_bit be test_val - ((test_val / 2) * 2)
+        If test_bit equals 0:
+            Set used_mask to used_mask + bit
+            __store(state, 32, used_mask)
+        End If
+    End If
+
+    Return 1
+End Process

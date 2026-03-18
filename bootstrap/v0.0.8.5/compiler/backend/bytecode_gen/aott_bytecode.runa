@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,796 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles AOTT (All Of The Time) bytecode generation and bytecode optimization for the compiler.
+AOTT (All-Of-The-Time) Bytecode Generator - Compiler Backend Component
 
-This file performs the following tasks:
-- Process AOTT bytecode generation and bytecode compilation
-- Handle bytecode optimization and bytecode performance utilities
-- Manage bytecode validation and bytecode verification operations
-- Process bytecode metadata and bytecode analysis operations
+This file is the COMPILER-SIDE bytecode emitter for Runa's AOTT system. It produces
+the initial bytecode output that the AOTT runtime (runtime/aott/) consumes and
+continuously optimizes throughout a program's lifetime.
 
-This file is essential because of the following reasons:
-- AOTT bytecode generation is fundamental to compiler output and runtime performance
-- Proper bytecode handling ensures efficient code generation and optimized execution
-- Bytecode utilities support ahead-of-time compilation, optimization, and code generation
+AOTT is "All-Of-The-Time" - a continuous optimization system that replaces
+traditional AOT (compile once, run forever) and JIT (compile at runtime) with a
+5-tier progressive optimization model:
 
-This file consists of the following functions/features/operation types:
-- AOTT bytecode generation and bytecode compilation
-- Bytecode optimization and bytecode performance utilities
-- Bytecode validation and bytecode verification operations
-- Bytecode metadata and bytecode analysis operations
+  Tier 0: Lightning Interpreter  (zero-cost startup, immediate execution)
+  Tier 1: Bytecode Execution     (smart bytecode with basic optimizations)
+  Tier 2: Native Execution       (native compilation for warm code)
+  Tier 3: Optimized Native       (advanced optimizations for hot code)
+  Tier 4: Speculative Execution  (maximum performance through speculation)
+
+Code evolves throughout its lifetime: the runtime profiles execution, detects hot
+paths, and progressively promotes code to higher optimization tiers. Profile data
+(execution counters, type feedback, branch prediction, memory access patterns)
+drives all optimization decisions.
+
+THIS FILE (compiler/backend/bytecode_gen/aott_bytecode.runa) handles:
+- Emitting the initial bytecode that Tier 0/1 interpreters execute
+- Embedding profiling hooks so the runtime can collect execution data
+- Inserting speculation points for future Tier 4 optimization
+- Generating deoptimization metadata for speculation failure recovery
+
+The RUNTIME AOTT system (runtime/aott/, 126+ files) handles:
+- The 5-tier execution engine
+- Profile collection and analysis
+- Dynamic native code generation from bytecode
+- Speculative optimization with guards and deoptimization
+- Code cache management for compiled hot paths
+
+Reference: docs/dev/RUNA_AOTT_ARCHITECTURE_PLAN_V2.md
+
+Bytecode module format:
+  Header (32 bytes):
+    magic:              4 bytes  "AOTT" (0x414F5454)
+    version:            4 bytes  (major.minor.patch as u32)
+    constant_pool_off:  4 bytes  Offset to constant pool section
+    function_table_off: 4 bytes  Offset to function table section
+    bytecode_off:       4 bytes  Offset to bytecode section
+    entry_point:        4 bytes  Index of main/entry function
+    flags:              4 bytes  Module flags (debug, optimize, profile)
+    checksum:           4 bytes  CRC32 of all sections
+
+  Constant Pool:
+    count:      4 bytes  Number of entries
+    entries[]:  Variable-length tagged values:
+      tag (1 byte): 0=Integer, 1=Float, 2=String, 3=Type
+      data: varies by tag
+
+  Function Table:
+    count:          4 bytes  Number of functions
+    entries[]:      Fixed-size entries (24 bytes each):
+      name_idx:     4 bytes  Index into constant pool (string)
+      bytecode_off: 4 bytes  Offset into bytecode section
+      bytecode_len: 4 bytes  Length of bytecode in bytes
+      local_count:  4 bytes  Number of local variables
+      arg_count:    4 bytes  Number of function arguments
+      flags:        4 bytes  Function flags (export, inline, etc.)
+
+  Bytecode Section:
+    Sequence of AOTT bytecode instructions, each 1-9 bytes:
+      opcode (1 byte) + optional operands (0-8 bytes)
+
+Dependencies:
+- Imports LIR types for opcode mapping
+- Imports MachineCode for byte emission
+- Imports Layout for memory allocation
 :End Note
 
-Note: TODO - Implement AOTT bytecode functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: AOTT MODULE CONSTANTS
+Note: ============================================================================
+
+Note: Magic number bytes: 'A' 'O' 'T' 'T'
+Constant AOTT_MAGIC_0 as Integer is 65     Note: 'A' = 0x41
+Constant AOTT_MAGIC_1 as Integer is 79     Note: 'O' = 0x4F
+Constant AOTT_MAGIC_2 as Integer is 84     Note: 'T' = 0x54
+Constant AOTT_MAGIC_3 as Integer is 84     Note: 'T' = 0x54
+
+Note: Version encoding: major * 10000 + minor * 100 + patch
+Constant AOTT_VERSION as Integer is 10000  Note: v1.0.0
+
+Note: Module header size
+Constant AOTT_HEADER_SIZE as Integer is 32
+
+Note: Constant pool entry tags
+Constant CONST_TAG_INTEGER as Integer is 0
+Constant CONST_TAG_FLOAT as Integer is 1
+Constant CONST_TAG_STRING as Integer is 2
+Constant CONST_TAG_TYPE as Integer is 3
+
+Note: Function flags
+Constant FUNC_FLAG_EXPORT as Integer is 1
+Constant FUNC_FLAG_INLINE as Integer is 2
+Constant FUNC_FLAG_VARARGS as Integer is 4
+Constant FUNC_FLAG_ENTRY as Integer is 8
+
+Note: Module flags
+Constant MOD_FLAG_DEBUG as Integer is 1
+Constant MOD_FLAG_OPTIMIZE as Integer is 2
+Constant MOD_FLAG_CHECKED as Integer is 4
+
+Note: ============================================================================
+Note: AOTT BYTECODE OPCODES
+Note: ============================================================================
+
+@Reasoning
+AOTT bytecode uses a compact opcode encoding designed for rapid decoding
+during native code generation. Opcodes are organized by category:
+
+  0x00-0x0F: Control flow (nop, halt, ret, call, br, br_if, etc.)
+  0x10-0x1F: Stack operations (push, pop, dup, swap)
+  0x20-0x2F: Local variable access (load_local, store_local)
+  0x30-0x3F: Memory operations (load_mem, store_mem)
+  0x40-0x5F: Integer arithmetic (add, sub, mul, div, mod, neg)
+  0x60-0x6F: Bitwise operations (and, or, xor, shl, shr, sar)
+  0x70-0x7F: Comparison operations (eq, ne, lt, le, gt, ge)
+  0x80-0x8F: Constant loading (const_i32, const_i64, const_f32, const_f64)
+  0x90-0x9F: Type conversion (i32_to_i64, i64_to_i32, etc.)
+  0xA0-0xAF: Function operations (call_indirect, tail_call)
+@End Reasoning
+
+Note: Control flow opcodes
+Constant AOTT_OP_NOP as Integer is 0        Note: 0x00
+Constant AOTT_OP_HALT as Integer is 1       Note: 0x01
+Constant AOTT_OP_RET as Integer is 2        Note: 0x02
+Constant AOTT_OP_CALL as Integer is 3       Note: 0x03 + u32 func_idx
+Constant AOTT_OP_BR as Integer is 4         Note: 0x04 + i32 offset
+Constant AOTT_OP_BR_IF as Integer is 5      Note: 0x05 + i32 offset
+Constant AOTT_OP_BR_TABLE as Integer is 6   Note: 0x06 + table_data
+Constant AOTT_OP_SYSCALL as Integer is 7    Note: 0x07 + u32 syscall_num
+
+Note: Stack operations
+Constant AOTT_OP_PUSH as Integer is 16      Note: 0x10
+Constant AOTT_OP_POP as Integer is 17       Note: 0x11
+Constant AOTT_OP_DUP as Integer is 18       Note: 0x12
+Constant AOTT_OP_SWAP as Integer is 19      Note: 0x13
+
+Note: Local variable access
+Constant AOTT_OP_LOAD_LOCAL as Integer is 32     Note: 0x20 + u16 local_idx
+Constant AOTT_OP_STORE_LOCAL as Integer is 33    Note: 0x21 + u16 local_idx
+Constant AOTT_OP_LOAD_ARG as Integer is 34       Note: 0x22 + u16 arg_idx
+
+Note: Memory operations
+Constant AOTT_OP_LOAD_MEM as Integer is 48       Note: 0x30 + u32 offset
+Constant AOTT_OP_STORE_MEM as Integer is 49      Note: 0x31 + u32 offset
+Constant AOTT_OP_LOAD_MEM8 as Integer is 50      Note: 0x32
+Constant AOTT_OP_STORE_MEM8 as Integer is 51     Note: 0x33
+
+Note: Integer arithmetic opcodes
+Constant AOTT_OP_ADD as Integer is 64       Note: 0x40
+Constant AOTT_OP_SUB as Integer is 65       Note: 0x41
+Constant AOTT_OP_MUL as Integer is 66       Note: 0x42
+Constant AOTT_OP_DIV as Integer is 67       Note: 0x43
+Constant AOTT_OP_MOD as Integer is 68       Note: 0x44
+Constant AOTT_OP_NEG as Integer is 69       Note: 0x45
+
+Note: Bitwise opcodes
+Constant AOTT_OP_AND as Integer is 96       Note: 0x60
+Constant AOTT_OP_OR as Integer is 97        Note: 0x61
+Constant AOTT_OP_XOR as Integer is 98       Note: 0x62
+Constant AOTT_OP_SHL as Integer is 99       Note: 0x63
+Constant AOTT_OP_SHR as Integer is 100      Note: 0x64
+Constant AOTT_OP_SAR as Integer is 101      Note: 0x65
+Constant AOTT_OP_NOT as Integer is 102      Note: 0x66
+
+Note: Comparison opcodes
+Constant AOTT_OP_EQ as Integer is 112       Note: 0x70
+Constant AOTT_OP_NE as Integer is 113       Note: 0x71
+Constant AOTT_OP_LT as Integer is 114       Note: 0x72
+Constant AOTT_OP_LE as Integer is 115       Note: 0x73
+Constant AOTT_OP_GT as Integer is 116       Note: 0x74
+Constant AOTT_OP_GE as Integer is 117       Note: 0x75
+
+Note: Constant loading opcodes
+Constant AOTT_OP_CONST_I32 as Integer is 128    Note: 0x80 + i32 value
+Constant AOTT_OP_CONST_I64 as Integer is 129    Note: 0x81 + i64 value
+Constant AOTT_OP_CONST_F32 as Integer is 130    Note: 0x82 + f32 value
+Constant AOTT_OP_CONST_F64 as Integer is 131    Note: 0x83 + f64 value
+Constant AOTT_OP_CONST_POOL as Integer is 132   Note: 0x84 + u32 pool_idx
+
+Note: MOV/COPY opcode
+Constant AOTT_OP_MOV as Integer is 144          Note: 0x90 + u16 dest + u16 src
+
+Note: ============================================================================
+Note: AOTT MODULE STATE
+Note: ============================================================================
+
+Type called "AOTTModule":
+    output as Integer              Note: Pointer to output buffer
+    const_pool as Integer          Note: Pointer to constant pool buffer
+    const_pool_count as Integer    Note: Number of constant pool entries
+    const_pool_size as Integer     Note: Current byte size of constant pool
+    func_table as Integer          Note: Pointer to function table buffer
+    func_count as Integer          Note: Number of functions
+    bytecode_buf as Integer        Note: Pointer to bytecode buffer
+    bytecode_size as Integer       Note: Current byte size of bytecode
+    entry_point as Integer         Note: Index of entry function (-1 = none)
+    flags as Integer               Note: Module flags
+End Type
+
+Note: Size: 10 fields * 8 bytes = 80 bytes
+
+Note: ============================================================================
+Note: MODULE CREATION
+Note: ============================================================================
+
+Process called "create_bytecode_module" that takes output as Integer returns Integer:
+    @Reasoning
+    Creates and initializes an AOTT bytecode module. Allocates buffers for
+    the constant pool, function table, and bytecode section. Initial buffer
+    sizes are generous to avoid reallocation.
+    @End Reasoning
+
+    Let module be Layout.allocate(80)
+    If module equals 0:
+        Display "create_bytecode_module: allocation failed"
+        Return 0
+    End If
+
+    Note: Allocate constant pool buffer (64 KB)
+    Let const_pool be Layout.allocate(65536)
+    If const_pool equals 0:
+        Display "create_bytecode_module: constant pool allocation failed"
+        Return 0
+    End If
+
+    Note: Allocate function table (256 entries * 24 bytes = 6144 bytes)
+    Let func_table be Layout.allocate(6144)
+    If func_table equals 0:
+        Display "create_bytecode_module: function table allocation failed"
+        Return 0
+    End If
+
+    Note: Allocate bytecode buffer (256 KB)
+    Let bytecode be Layout.allocate(262144)
+    If bytecode equals 0:
+        Display "create_bytecode_module: bytecode buffer allocation failed"
+        Return 0
+    End If
+
+    __store(module, 0, output)
+    __store(module, 8, const_pool)
+    __store(module, 16, 0)        Note: const_pool_count = 0
+    __store(module, 24, 0)        Note: const_pool_size = 0
+    __store(module, 32, func_table)
+    __store(module, 40, 0)        Note: func_count = 0
+    __store(module, 48, bytecode)
+    __store(module, 56, 0)        Note: bytecode_size = 0
+    __store(module, 64, -1)       Note: entry_point = none
+    __store(module, 72, 0)        Note: flags = 0
+
+    Return module
+End Process
+
+Note: ============================================================================
+Note: MODULE HEADER
+Note: ============================================================================
+
+Process called "emit_bytecode_header" that takes module as Integer returns Integer:
+    @Reasoning
+    Emits the 32-byte AOTT module header to the output buffer. Section
+    offsets are computed based on the sizes of each section:
+      constant_pool_off = HEADER_SIZE
+      function_table_off = HEADER_SIZE + constant_pool_size
+      bytecode_off = function_table_off + function_table_size
+    @End Reasoning
+
+    Let output be __load(module, 0)
+    Let const_pool_size be __load(module, 24)
+    Let func_count be __load(module, 40)
+    Let bytecode_size be __load(module, 56)
+    Let entry_point be __load(module, 64)
+    Let flags be __load(module, 72)
+
+    Note: Compute section offsets
+    Let const_pool_off be AOTT_HEADER_SIZE
+    Let func_table_size be func_count * 24
+    Let func_table_off be const_pool_off + const_pool_size + 4
+    Let bytecode_off be func_table_off + func_table_size + 4
+
+    Note: Magic number: "AOTT"
+    MachineCode.emit_byte(output, AOTT_MAGIC_0)
+    MachineCode.emit_byte(output, AOTT_MAGIC_1)
+    MachineCode.emit_byte(output, AOTT_MAGIC_2)
+    MachineCode.emit_byte(output, AOTT_MAGIC_3)
+
+    Note: Version (4 bytes, little-endian)
+    emit_u32_le(output, AOTT_VERSION)
+
+    Note: Constant pool offset
+    emit_u32_le(output, const_pool_off)
+
+    Note: Function table offset
+    emit_u32_le(output, func_table_off)
+
+    Note: Bytecode offset
+    emit_u32_le(output, bytecode_off)
+
+    Note: Entry point
+    If entry_point is less than 0:
+        emit_u32_le(output, 0)
+    Otherwise:
+        emit_u32_le(output, entry_point)
+    End If
+
+    Note: Flags
+    emit_u32_le(output, flags)
+
+    Note: Checksum placeholder (computed after all sections are emitted)
+    emit_u32_le(output, 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: BYTE EMISSION HELPERS
+Note: ============================================================================
+
+Process called "emit_u32_le" that takes output as Integer, value as Integer returns Integer:
+    @Reasoning
+    Emits a 32-bit unsigned integer in little-endian byte order.
+    @End Reasoning
+
+    Let byte0 be value - ((value / 256) * 256)
+    Let byte1 be (value / 256) - ((value / 65536) * 256)
+    Let byte2 be (value / 65536) - ((value / 16777216) * 256)
+    Let byte3 be value / 16777216
+
+    Note: Mask each byte to 0-255
+    If byte0 is less than 0:
+        Set byte0 to byte0 + 256
+    End If
+    If byte1 is less than 0:
+        Set byte1 to byte1 + 256
+    End If
+    If byte2 is less than 0:
+        Set byte2 to byte2 + 256
+    End If
+    If byte3 is less than 0:
+        Set byte3 to byte3 + 256
+    End If
+
+    MachineCode.emit_byte(output, byte0)
+    MachineCode.emit_byte(output, byte1)
+    MachineCode.emit_byte(output, byte2)
+    MachineCode.emit_byte(output, byte3)
+
+    Return 1
+End Process
+
+Process called "emit_u16_le" that takes output as Integer, value as Integer returns Integer:
+    Let byte0 be value - ((value / 256) * 256)
+    Let byte1 be value / 256
+
+    If byte0 is less than 0:
+        Set byte0 to byte0 + 256
+    End If
+    If byte1 is less than 0:
+        Set byte1 to byte1 + 256
+    End If
+
+    MachineCode.emit_byte(output, byte0)
+    MachineCode.emit_byte(output, byte1)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CONSTANT POOL
+Note: ============================================================================
+
+Process called "add_integer_constant" that takes module as Integer, value as Integer returns Integer:
+    @Reasoning
+    Adds an integer constant to the constant pool. Returns the pool index.
+    Entry format: tag(1) + value(8) = 9 bytes.
+    @End Reasoning
+
+    Let const_pool be __load(module, 8)
+    Let count be __load(module, 16)
+    Let size be __load(module, 24)
+
+    Note: Write tag
+    __store8(const_pool, size, CONST_TAG_INTEGER)
+    Set size to size + 1
+
+    Note: Write 8-byte integer value (little-endian)
+    __store(const_pool, size, value)
+    Set size to size + 8
+
+    __store(module, 16, count + 1)
+    __store(module, 24, size)
+
+    Return count
+End Process
+
+Process called "add_float_constant" that takes module as Integer, value as Integer returns Integer:
+    @Reasoning
+    Adds a float constant to the constant pool. The float value is passed
+    as its bit representation in an integer. Returns the pool index.
+    @End Reasoning
+
+    Let const_pool be __load(module, 8)
+    Let count be __load(module, 16)
+    Let size be __load(module, 24)
+
+    __store8(const_pool, size, CONST_TAG_FLOAT)
+    Set size to size + 1
+
+    __store(const_pool, size, value)
+    Set size to size + 8
+
+    __store(module, 16, count + 1)
+    __store(module, 24, size)
+
+    Return count
+End Process
+
+Process called "add_string_constant" that takes module as Integer, str_ptr as Integer, str_len as Integer returns Integer:
+    @Reasoning
+    Adds a string constant to the constant pool. Returns the pool index.
+    Entry format: tag(1) + length(4) + bytes(str_len).
+    @End Reasoning
+
+    Let const_pool be __load(module, 8)
+    Let count be __load(module, 16)
+    Let size be __load(module, 24)
+
+    Note: Write tag
+    __store8(const_pool, size, CONST_TAG_STRING)
+    Set size to size + 1
+
+    Note: Write length as 4 bytes (little-endian)
+    __store8(const_pool, size, str_len - ((str_len / 256) * 256))
+    __store8(const_pool, size + 1, (str_len / 256) - ((str_len / 65536) * 256))
+    __store8(const_pool, size + 2, (str_len / 65536) - ((str_len / 16777216) * 256))
+    __store8(const_pool, size + 3, str_len / 16777216)
+    Set size to size + 4
+
+    Note: Copy string bytes
+    Let i be 0
+    While i is less than str_len:
+        Let ch be __load8(str_ptr, i)
+        __store8(const_pool, size, ch)
+        Set size to size + 1
+        Set i to i + 1
+    End While
+
+    __store(module, 16, count + 1)
+    __store(module, 24, size)
+
+    Return count
+End Process
+
+Process called "emit_constant_pool" that takes module as Integer returns Integer:
+    @Reasoning
+    Emits the constant pool section to the output buffer. Writes the
+    count header followed by all constant pool entries.
+    @End Reasoning
+
+    Let output be __load(module, 0)
+    Let const_pool be __load(module, 8)
+    Let count be __load(module, 16)
+    Let size be __load(module, 24)
+
+    Note: Write entry count
+    emit_u32_le(output, count)
+
+    Note: Copy constant pool bytes
+    Let i be 0
+    While i is less than size:
+        Let byte_val be __load8(const_pool, i)
+        MachineCode.emit_byte(output, byte_val)
+        Set i to i + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: FUNCTION TABLE
+Note: ============================================================================
+
+Process called "add_function_entry" that takes module as Integer, name_idx as Integer, bytecode_off as Integer, bytecode_len as Integer, local_count as Integer, arg_count as Integer, flags as Integer returns Integer:
+    @Reasoning
+    Adds a function entry to the function table. Each entry is 24 bytes:
+      name_idx(4) + bytecode_off(4) + bytecode_len(4) +
+      local_count(4) + arg_count(4) + flags(4)
+    Returns the function index.
+    @End Reasoning
+
+    Let func_table be __load(module, 32)
+    Let func_count be __load(module, 40)
+    Let offset be func_count * 24
+
+    Note: Write entry fields (each 4 bytes)
+    __store(func_table, offset, name_idx)
+    __store(func_table, offset + 4, bytecode_off)
+    __store(func_table, offset + 8, bytecode_len)
+    __store(func_table, offset + 12, local_count)
+    __store(func_table, offset + 16, arg_count)
+    __store(func_table, offset + 20, flags)
+
+    __store(module, 40, func_count + 1)
+    Return func_count
+End Process
+
+Process called "emit_function_table" that takes module as Integer returns Integer:
+    @Reasoning
+    Emits the function table section to the output buffer. Writes the
+    function count followed by all function table entries.
+    @End Reasoning
+
+    Let output be __load(module, 0)
+    Let func_table be __load(module, 32)
+    Let func_count be __load(module, 40)
+
+    Note: Write function count
+    emit_u32_le(output, func_count)
+
+    Note: Write each entry (24 bytes each)
+    Let fi be 0
+    While fi is less than func_count:
+        Let offset be fi * 24
+        emit_u32_le(output, __load(func_table, offset))       Note: name_idx
+        emit_u32_le(output, __load(func_table, offset + 4))   Note: bytecode_off
+        emit_u32_le(output, __load(func_table, offset + 8))   Note: bytecode_len
+        emit_u32_le(output, __load(func_table, offset + 12))  Note: local_count
+        emit_u32_le(output, __load(func_table, offset + 16))  Note: arg_count
+        emit_u32_le(output, __load(func_table, offset + 20))  Note: flags
+        Set fi to fi + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: BYTECODE INSTRUCTION ENCODING
+Note: ============================================================================
+
+Process called "encode_bytecode_instruction" that takes module as Integer, opcode as Integer returns Integer:
+    @Reasoning
+    Encodes a single-byte bytecode instruction (no operands) into the
+    bytecode buffer. Returns the offset of this instruction.
+    @End Reasoning
+
+    Let bytecode_buf be __load(module, 48)
+    Let bytecode_size be __load(module, 56)
+
+    __store8(bytecode_buf, bytecode_size, opcode)
+    __store(module, 56, bytecode_size + 1)
+
+    Return bytecode_size
+End Process
+
+Process called "encode_bytecode_with_u32" that takes module as Integer, opcode as Integer, operand as Integer returns Integer:
+    @Reasoning
+    Encodes a bytecode instruction with a 32-bit unsigned operand (5 bytes total).
+    Used for CALL (func index), BR (offset), CONST_I32 (value), etc.
+    @End Reasoning
+
+    Let bytecode_buf be __load(module, 48)
+    Let bytecode_size be __load(module, 56)
+
+    Note: Opcode byte
+    __store8(bytecode_buf, bytecode_size, opcode)
+
+    Note: 4-byte operand (little-endian)
+    Let byte0 be operand - ((operand / 256) * 256)
+    Let byte1 be (operand / 256) - ((operand / 65536) * 256)
+    Let byte2 be (operand / 65536) - ((operand / 16777216) * 256)
+    Let byte3 be operand / 16777216
+
+    If byte0 is less than 0:
+        Set byte0 to byte0 + 256
+    End If
+    If byte1 is less than 0:
+        Set byte1 to byte1 + 256
+    End If
+    If byte2 is less than 0:
+        Set byte2 to byte2 + 256
+    End If
+    If byte3 is less than 0:
+        Set byte3 to byte3 + 256
+    End If
+
+    __store8(bytecode_buf, bytecode_size + 1, byte0)
+    __store8(bytecode_buf, bytecode_size + 2, byte1)
+    __store8(bytecode_buf, bytecode_size + 3, byte2)
+    __store8(bytecode_buf, bytecode_size + 4, byte3)
+
+    __store(module, 56, bytecode_size + 5)
+    Return bytecode_size
+End Process
+
+Process called "encode_bytecode_with_u16" that takes module as Integer, opcode as Integer, operand as Integer returns Integer:
+    @Reasoning
+    Encodes a bytecode instruction with a 16-bit unsigned operand (3 bytes total).
+    Used for LOAD_LOCAL and STORE_LOCAL (local variable index).
+    @End Reasoning
+
+    Let bytecode_buf be __load(module, 48)
+    Let bytecode_size be __load(module, 56)
+
+    __store8(bytecode_buf, bytecode_size, opcode)
+
+    Let byte0 be operand - ((operand / 256) * 256)
+    Let byte1 be operand / 256
+
+    If byte0 is less than 0:
+        Set byte0 to byte0 + 256
+    End If
+    If byte1 is less than 0:
+        Set byte1 to byte1 + 256
+    End If
+
+    __store8(bytecode_buf, bytecode_size + 1, byte0)
+    __store8(bytecode_buf, bytecode_size + 2, byte1)
+
+    __store(module, 56, bytecode_size + 3)
+    Return bytecode_size
+End Process
+
+Note: ============================================================================
+Note: BYTECODE SECTION EMISSION
+Note: ============================================================================
+
+Process called "emit_bytecode_instructions" that takes module as Integer returns Integer:
+    @Reasoning
+    Emits the bytecode section to the output buffer. Simply copies the
+    accumulated bytecode bytes from the internal buffer to the output.
+    @End Reasoning
+
+    Let output be __load(module, 0)
+    Let bytecode_buf be __load(module, 48)
+    Let bytecode_size be __load(module, 56)
+
+    Let i be 0
+    While i is less than bytecode_size:
+        Let byte_val be __load8(bytecode_buf, i)
+        MachineCode.emit_byte(output, byte_val)
+        Set i to i + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LIR TO AOTT OPCODE MAPPING
+Note: ============================================================================
+
+Process called "lir_opcode_to_aott" that takes lir_opcode as Integer returns Integer:
+    @Reasoning
+    Maps a LIR opcode to the corresponding AOTT bytecode opcode.
+    Returns the AOTT opcode, or -1 if the LIR opcode has no direct mapping.
+    @End Reasoning
+
+    If lir_opcode equals 30001:    Note: LIR_OP_ADD
+        Return AOTT_OP_ADD
+    End If
+    If lir_opcode equals 30002:    Note: LIR_OP_SUB
+        Return AOTT_OP_SUB
+    End If
+    If lir_opcode equals 30003:    Note: LIR_OP_MUL
+        Return AOTT_OP_MUL
+    End If
+    If lir_opcode equals 30004:    Note: LIR_OP_DIV
+        Return AOTT_OP_DIV
+    End If
+    If lir_opcode equals 30005:    Note: LIR_OP_MOD
+        Return AOTT_OP_MOD
+    End If
+    If lir_opcode equals 30006:    Note: LIR_OP_AND
+        Return AOTT_OP_AND
+    End If
+    If lir_opcode equals 30007:    Note: LIR_OP_OR
+        Return AOTT_OP_OR
+    End If
+    If lir_opcode equals 30008:    Note: LIR_OP_XOR
+        Return AOTT_OP_XOR
+    End If
+    If lir_opcode equals 30009:    Note: LIR_OP_SHL
+        Return AOTT_OP_SHL
+    End If
+    If lir_opcode equals 30010:    Note: LIR_OP_SHR
+        Return AOTT_OP_SHR
+    End If
+    If lir_opcode equals 30011:    Note: LIR_OP_SAR
+        Return AOTT_OP_SAR
+    End If
+    If lir_opcode equals 30020:    Note: LIR_OP_LOAD
+        Return AOTT_OP_LOAD_MEM
+    End If
+    If lir_opcode equals 30021:    Note: LIR_OP_STORE
+        Return AOTT_OP_STORE_MEM
+    End If
+    If lir_opcode equals 30030:    Note: LIR_OP_MOV
+        Return AOTT_OP_MOV
+    End If
+    If lir_opcode equals 30031:    Note: LIR_OP_LOAD_IMM
+        Return AOTT_OP_CONST_I32
+    End If
+    If lir_opcode equals 30040:    Note: LIR_OP_CMP_EQ
+        Return AOTT_OP_EQ
+    End If
+    If lir_opcode equals 30041:    Note: LIR_OP_CMP_NE
+        Return AOTT_OP_NE
+    End If
+    If lir_opcode equals 30042:    Note: LIR_OP_CMP_LT
+        Return AOTT_OP_LT
+    End If
+    If lir_opcode equals 30043:    Note: LIR_OP_CMP_LE
+        Return AOTT_OP_LE
+    End If
+    If lir_opcode equals 30044:    Note: LIR_OP_CMP_GT
+        Return AOTT_OP_GT
+    End If
+    If lir_opcode equals 30045:    Note: LIR_OP_CMP_GE
+        Return AOTT_OP_GE
+    End If
+    If lir_opcode equals 30050:    Note: LIR_OP_JUMP
+        Return AOTT_OP_BR
+    End If
+    If lir_opcode equals 30060:    Note: LIR_OP_CALL
+        Return AOTT_OP_CALL
+    End If
+    If lir_opcode equals 30070:    Note: LIR_OP_RET
+        Return AOTT_OP_RET
+    End If
+    If lir_opcode equals 30080:    Note: LIR_OP_SYSCALL
+        Return AOTT_OP_SYSCALL
+    End If
+    If lir_opcode equals 30090:    Note: LIR_OP_NOP
+        Return AOTT_OP_NOP
+    End If
+
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: COMPLETE MODULE ENCODING
+Note: ============================================================================
+
+Process called "encode_complete_module" that takes module as Integer returns Integer:
+    @Reasoning
+    Encodes the complete AOTT bytecode module to the output buffer in order:
+    1. Module header (32 bytes)
+    2. Constant pool section
+    3. Function table section
+    4. Bytecode section
+
+    This must be called after all constants, functions, and bytecode
+    instructions have been added to the module.
+    @End Reasoning
+
+    emit_bytecode_header(module)
+    emit_constant_pool(module)
+    emit_function_table(module)
+    emit_bytecode_instructions(module)
+
+    Return 1
+End Process
+
+Process called "set_entry_point" that takes module as Integer, func_idx as Integer returns Integer:
+    __store(module, 64, func_idx)
+    Return 1
+End Process
+
+Process called "set_module_flags" that takes module as Integer, flags as Integer returns Integer:
+    __store(module, 72, flags)
+    Return 1
+End Process
+
+Process called "get_bytecode_size" that takes module as Integer returns Integer:
+    Return __load(module, 56)
+End Process
+
+Process called "get_constant_count" that takes module as Integer returns Integer:
+    Return __load(module, 16)
+End Process
+
+Process called "get_function_count" that takes module as Integer returns Integer:
+    Return __load(module, 40)
+End Process

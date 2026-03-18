@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,8 @@ limitations under the License.
 :End Note
 
 Note:
+CACHE MANAGER - Compilation Cache for Incremental Builds
+
 This file handles compilation cache management and cache optimization for the compiler.
 
 This file performs the following tasks:
@@ -29,10 +31,703 @@ This file is essential because of the following reasons:
 - Cache utilities support incremental builds, dependency tracking, and build optimization
 
 This file consists of the following functions/features/operation types:
-- Cache storage and cache retrieval operations
-- Cache invalidation and cache consistency management
-- Cache optimization and cache performance utilities
-- Cache validation and cache monitoring operations
+- CompilationCache type with hash-indexed entries
+- create_cache for initializing the cache
+- compute_source_hash for computing content-based file hashes
+- lookup_cached for retrieving cached compilation artifacts
+- store_cached for recording new cache entries
+- invalidate_entry and invalidate_all for cache invalidation
+- is_cache_valid for checking staleness of cached entries
+
+Dependencies:
+- Imports memory_utils.runa for memory allocation
+- Imports string_utils.runa for string operations
+- Imports hash_utils.runa for hash computation
+- Imports file_utils.runa for file metadata and I/O
+- Imports arena_utils.runa for arena-based allocation
+- Imports collections.runa for hash table data structures
 :End Note
 
-Note: TODO - Implement cache manager functionality
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/hash_utils.runa" as HashUtils
+Import "compiler/internal/file_utils.runa" as FileUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+Import "compiler/internal/collections.runa" as Collections
+
+Note: ============================================================================
+Note: Cache Constants
+Note: ============================================================================
+
+Constant CACHE_DEFAULT_CAPACITY as Integer is 256
+Constant CACHE_MAX_ENTRIES as Integer is 8192
+Constant CACHE_HASH_SEED as Integer is 2654435761  Note: FNV-1a offset basis (32-bit-ish seed)
+Constant CACHE_VERSION as Integer is 1
+
+Note: CacheEntry memory layout (64 bytes):
+Note: offset  0: source_path (8 bytes) - Pointer to source file path string
+Note: offset  8: source_hash (8 bytes) - Hash of source file contents
+Note: offset 16: artifact_path (8 bytes) - Pointer to compiled artifact file path
+Note: offset 24: timestamp (8 bytes) - Time when cache entry was created (Unix timestamp)
+Note: offset 32: source_mtime (8 bytes) - Modification time of source file at cache time
+Note: offset 40: artifact_size (8 bytes) - Size of the compiled artifact in bytes
+Note: offset 48: is_valid (8 bytes) - Boolean: 1 if entry is valid, 0 if invalidated
+Note: offset 56: dependency_hash (8 bytes) - Combined hash of all dependencies
+
+Constant CACHE_ENTRY_SIZE as Integer is 64
+
+Note: CompilationCache memory layout (80 bytes):
+Note: offset  0: entries (8 bytes) - Pointer to HashTable (source_hash -> CacheEntry pointer)
+Note: offset  8: entry_count (8 bytes) - Number of active cache entries
+Note: offset 16: hit_count (8 bytes) - Number of cache hits
+Note: offset 24: miss_count (8 bytes) - Number of cache misses
+Note: offset 32: arena (8 bytes) - Pointer to arena for cache allocations
+Note: offset 40: cache_directory (8 bytes) - Pointer to directory path for on-disk cache
+Note: offset 48: max_entries (8 bytes) - Maximum number of entries before eviction
+Note: offset 56: version (8 bytes) - Cache format version
+Note: offset 64: total_saved_ms (8 bytes) - Estimated total time saved by cache hits
+Note: offset 72: is_persistent (8 bytes) - Boolean: 1 if cache should be persisted to disk
+
+Constant COMPILATION_CACHE_SIZE as Integer is 80
+
+Note: ============================================================================
+Note: Cache Creation and Destruction
+Note: ============================================================================
+
+Process called "create_cache" takes arena as Integer returns Integer:
+    Note: Create a new CompilationCache
+    Note: Returns pointer to the cache, or 0 on failure
+
+    If arena is equal to 0:
+        Alert "[CACHE ERROR] Cannot create cache: arena is null"
+        Return 0
+    End If
+
+    Let cache be arena_allocate(arena, COMPILATION_CACHE_SIZE, 8)
+    If cache is equal to 0:
+        Alert "[CACHE ERROR] Failed to allocate compilation cache"
+        Return 0
+    End If
+
+    memory_zero(cache, COMPILATION_CACHE_SIZE)
+
+    Note: Create the hash table for entries
+    Let entries be hashtable_create(CACHE_DEFAULT_CAPACITY, arena)
+    If entries is equal to 0:
+        Alert "[CACHE ERROR] Failed to create cache entries hash table"
+        Return 0
+    End If
+    memory_set_pointer(cache, 0, entries)
+
+    Note: Initialize counters
+    memory_set_integer(cache, 8, 0)   Note: entry_count
+    memory_set_integer(cache, 16, 0)  Note: hit_count
+    memory_set_integer(cache, 24, 0)  Note: miss_count
+
+    Note: Store arena
+    memory_set_pointer(cache, 32, arena)
+
+    Note: No cache directory by default
+    memory_set_pointer(cache, 40, 0)
+
+    Note: Set max entries
+    memory_set_integer(cache, 48, CACHE_MAX_ENTRIES)
+
+    Note: Set version
+    memory_set_integer(cache, 56, CACHE_VERSION)
+
+    Note: Initialize statistics
+    memory_set_integer(cache, 64, 0)  Note: total_saved_ms
+    memory_set_integer(cache, 72, 0)  Note: is_persistent = false
+
+    Return cache
+End Process
+
+Process called "create_cache_with_directory" takes arena as Integer, cache_dir as Integer returns Integer:
+    Note: Create a cache with a persistent on-disk directory
+    Let cache be create_cache(arena)
+    If cache is equal to 0:
+        Return 0
+    End If
+
+    If cache_dir is not equal to 0:
+        Let dir_copy be string_duplicate(cache_dir)
+        If dir_copy is not equal to 0:
+            memory_set_pointer(cache, 40, dir_copy)
+            memory_set_integer(cache, 72, 1)  Note: is_persistent = true
+
+            Note: Ensure the cache directory exists
+            Let dir_exists be file_directory_exists(cache_dir)
+            If dir_exists is equal to 0:
+                Let create_result be file_directory_create(cache_dir)
+                If create_result is equal to 0:
+                    Alert "[CACHE WARNING] Failed to create cache directory"
+                End If
+            End If
+        End If
+    End If
+
+    Return cache
+End Process
+
+Process called "destroy_cache" takes cache as Integer returns Nothing:
+    Note: Clean up owned resources in the cache
+    If cache is equal to 0:
+        Return
+    End If
+
+    Note: Free the cache directory string if heap-allocated
+    Let cache_dir be memory_get_pointer(cache, 40)
+    If cache_dir is not equal to 0:
+        deallocate(cache_dir)
+        memory_set_pointer(cache, 40, 0)
+    End If
+
+    Note: The hash table and entries are arena-allocated, so they are freed when arena is destroyed
+End Process
+
+Note: ============================================================================
+Note: Hash Computation
+Note: ============================================================================
+
+Process called "compute_source_hash" takes source_path as Integer returns Integer:
+    Note: Compute a hash of the source file contents using FNV-1a algorithm
+    Note: Returns the hash value, or 0 on failure (0 is treated as an error sentinel)
+
+    If source_path is equal to 0:
+        Return 0
+    End If
+
+    Note: Read file contents
+    Let content be runtime_read_file(source_path)
+    If content is equal to 0:
+        Return 0
+    End If
+
+    Note: Compute FNV-1a hash over file content bytes
+    Let hash be 2166136261  Note: FNV-1a offset basis (32-bit)
+    Let content_len be string_length(content)
+    Let i be 0
+    While i is less than content_len:
+        Let byte_val be memory_get_byte(content, i)
+        Note: XOR the hash with the byte, then multiply by FNV prime
+        Let xored be hash bitwise_xor byte_val
+        Note: FNV prime = 16777619
+        Set hash to xored multiplied by 16777619
+        Note: Keep hash within reasonable range using mask (simulate 32-bit wrapping)
+        Set hash to hash bitwise_and 4294967295
+        Set i to i plus 1
+    End While
+
+    deallocate(content)
+
+    Note: Ensure we never return 0 (reserved as error sentinel)
+    If hash is equal to 0:
+        Set hash to 1
+    End If
+
+    Return hash
+End Process
+
+Process called "compute_content_hash" takes content as Integer, content_length as Integer returns Integer:
+    Note: Compute a hash over raw content bytes (not from a file)
+    Note: Uses FNV-1a algorithm
+
+    If content is equal to 0:
+        Return 0
+    End If
+    If content_length is equal to 0:
+        Return 1
+    End If
+
+    Let hash be 2166136261
+    Let i be 0
+    While i is less than content_length:
+        Let byte_val be memory_get_byte(content, i)
+        Let xored be hash bitwise_xor byte_val
+        Set hash to xored multiplied by 16777619
+        Set hash to hash bitwise_and 4294967295
+        Set i to i plus 1
+    End While
+
+    If hash is equal to 0:
+        Set hash to 1
+    End If
+
+    Return hash
+End Process
+
+Note: ============================================================================
+Note: Cache Lookup and Storage
+Note: ============================================================================
+
+Process called "lookup_cached" takes cache as Integer, source_path as Integer returns Integer:
+    Note: Look up a cached compilation artifact for the given source file
+    Note: Returns pointer to the CacheEntry if found and valid, 0 if not cached or invalid
+
+    If cache is equal to 0:
+        Return 0
+    End If
+    If source_path is equal to 0:
+        Return 0
+    End If
+
+    Note: Compute hash of the source file path (used as key)
+    Let path_hash be compute_content_hash(source_path, string_length(source_path))
+
+    Note: Look up in the hash table
+    Let entries be memory_get_pointer(cache, 0)
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let entry be hashtable_get(entries, path_hash)
+    If entry is equal to 0:
+        Note: Cache miss
+        Let miss_count be memory_get_integer(cache, 24)
+        memory_set_integer(cache, 24, miss_count plus 1)
+        Return 0
+    End If
+
+    Note: Verify the entry is still valid
+    Let is_valid be memory_get_integer(entry, 48)
+    If is_valid is not equal to 1:
+        Note: Entry has been invalidated
+        Let miss_count be memory_get_integer(cache, 24)
+        memory_set_integer(cache, 24, miss_count plus 1)
+        Return 0
+    End If
+
+    Note: Verify the source file hash still matches (content hasn't changed)
+    Let cached_source_hash be memory_get_integer(entry, 8)
+    Let current_source_hash be compute_source_hash(source_path)
+    If current_source_hash is equal to 0:
+        Note: Could not read file, treat as miss
+        Let miss_count be memory_get_integer(cache, 24)
+        memory_set_integer(cache, 24, miss_count plus 1)
+        Return 0
+    End If
+
+    If cached_source_hash is not equal to current_source_hash:
+        Note: Source has changed, invalidate this entry
+        memory_set_integer(entry, 48, 0)  Note: Mark as invalid
+        Let miss_count be memory_get_integer(cache, 24)
+        memory_set_integer(cache, 24, miss_count plus 1)
+        Return 0
+    End If
+
+    Note: Verify the artifact file still exists
+    Let artifact_path be memory_get_pointer(entry, 16)
+    If artifact_path is not equal to 0:
+        Let artifact_exists be file_exists(artifact_path)
+        If artifact_exists is equal to 0:
+            Note: Artifact file was deleted, invalidate
+            memory_set_integer(entry, 48, 0)
+            Let miss_count be memory_get_integer(cache, 24)
+            memory_set_integer(cache, 24, miss_count plus 1)
+            Return 0
+        End If
+    End If
+
+    Note: Cache hit
+    Let hit_count be memory_get_integer(cache, 16)
+    memory_set_integer(cache, 16, hit_count plus 1)
+
+    Return entry
+End Process
+
+Process called "store_cached" takes cache as Integer, source_path as Integer, artifact_path as Integer returns Integer:
+    Note: Store a new cache entry mapping source file to compiled artifact
+    Note: Returns 1 on success, 0 on failure
+
+    If cache is equal to 0:
+        Return 0
+    End If
+    If source_path is equal to 0:
+        Return 0
+    End If
+    If artifact_path is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if we're at maximum capacity
+    Let entry_count be memory_get_integer(cache, 8)
+    Let max_entries be memory_get_integer(cache, 48)
+    If entry_count is greater than or equal to max_entries:
+        Note: Cache is full, evict oldest entries
+        Let evict_result be cache_evict_oldest(cache)
+        If evict_result is equal to 0:
+            Alert "[CACHE WARNING] Failed to evict entries, cache is full"
+            Return 0
+        End If
+    End If
+
+    Note: Compute source hash
+    Let source_hash be compute_source_hash(source_path)
+    If source_hash is equal to 0:
+        Return 0
+    End If
+
+    Note: Get source file modification time
+    Let source_mtime be file_get_modification_time(source_path)
+
+    Note: Get artifact file size
+    Let artifact_size be file_get_size(artifact_path)
+
+    Note: Allocate a new CacheEntry
+    Let arena be memory_get_pointer(cache, 32)
+    Let entry be arena_allocate(arena, CACHE_ENTRY_SIZE, 8)
+    If entry is equal to 0:
+        Alert "[CACHE ERROR] Failed to allocate cache entry"
+        Return 0
+    End If
+
+    memory_zero(entry, CACHE_ENTRY_SIZE)
+
+    Note: Store source path (duplicate to own the string)
+    Let src_copy be string_duplicate(source_path)
+    memory_set_pointer(entry, 0, src_copy)
+
+    Note: Store source hash
+    memory_set_integer(entry, 8, source_hash)
+
+    Note: Store artifact path (duplicate to own the string)
+    Let art_copy be string_duplicate(artifact_path)
+    memory_set_pointer(entry, 16, art_copy)
+
+    Note: Store current time as creation timestamp
+    Let now_spec be time_now_realtime(arena)
+    Let timestamp be 0
+    If now_spec is not equal to 0:
+        Set timestamp to memory_get_integer(now_spec, 0)  Note: seconds field
+    End If
+    memory_set_integer(entry, 24, timestamp)
+
+    Note: Store source modification time
+    memory_set_integer(entry, 32, source_mtime)
+
+    Note: Store artifact size
+    memory_set_integer(entry, 40, artifact_size)
+
+    Note: Mark as valid
+    memory_set_integer(entry, 48, 1)
+
+    Note: Dependency hash (0 = no dependency tracking yet)
+    memory_set_integer(entry, 56, 0)
+
+    Note: Insert into hash table using path hash as key
+    Let path_hash be compute_content_hash(source_path, string_length(source_path))
+    Let entries be memory_get_pointer(cache, 0)
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let put_result be hashtable_put(entries, path_hash, entry)
+    If put_result is equal to 0:
+        Return 0
+    End If
+
+    Note: Increment entry count
+    memory_set_integer(cache, 8, entry_count plus 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Cache Invalidation
+Note: ============================================================================
+
+Process called "invalidate_entry" takes cache as Integer, source_path as Integer returns Integer:
+    Note: Invalidate a specific cache entry by source path
+    Note: Returns 1 if entry was found and invalidated, 0 if not found
+
+    If cache is equal to 0:
+        Return 0
+    End If
+    If source_path is equal to 0:
+        Return 0
+    End If
+
+    Let path_hash be compute_content_hash(source_path, string_length(source_path))
+    Let entries be memory_get_pointer(cache, 0)
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let entry be hashtable_get(entries, path_hash)
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    Note: Mark entry as invalid
+    memory_set_integer(entry, 48, 0)
+
+    Note: Decrement active entry count
+    Let entry_count be memory_get_integer(cache, 8)
+    If entry_count is greater than 0:
+        memory_set_integer(cache, 8, entry_count minus 1)
+    End If
+
+    Return 1
+End Process
+
+Process called "invalidate_all" takes cache as Integer returns Integer:
+    Note: Invalidate all cache entries
+    Note: Returns 1 on success, 0 on failure
+
+    If cache is equal to 0:
+        Return 0
+    End If
+
+    Let entries be memory_get_pointer(cache, 0)
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Note: Clear the hash table
+    hashtable_clear(entries)
+
+    Note: Reset counters
+    memory_set_integer(cache, 8, 0)   Note: entry_count = 0
+    memory_set_integer(cache, 16, 0)  Note: hit_count = 0
+    memory_set_integer(cache, 24, 0)  Note: miss_count = 0
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Cache Validation
+Note: ============================================================================
+
+Process called "is_cache_valid" takes cache as Integer, source_path as Integer returns Integer:
+    Note: Check whether the cache entry for the given source file is still valid
+    Note: Compares the current source file hash against the stored hash
+    Note: Returns 1 if cache is valid (source unchanged), 0 if invalid or not found
+
+    If cache is equal to 0:
+        Return 0
+    End If
+    If source_path is equal to 0:
+        Return 0
+    End If
+
+    Note: Look up the entry
+    Let path_hash be compute_content_hash(source_path, string_length(source_path))
+    Let entries be memory_get_pointer(cache, 0)
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Let entry be hashtable_get(entries, path_hash)
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    Note: Check validity flag
+    Let is_valid be memory_get_integer(entry, 48)
+    If is_valid is not equal to 1:
+        Return 0
+    End If
+
+    Note: Quick check: compare modification times first (cheaper than rehashing)
+    Let cached_mtime be memory_get_integer(entry, 32)
+    Let current_mtime be file_get_modification_time(source_path)
+    If cached_mtime is not equal to current_mtime:
+        Note: File has been modified since cache entry was created
+        Note: Confirm with a full content hash check
+        Let cached_hash be memory_get_integer(entry, 8)
+        Let current_hash be compute_source_hash(source_path)
+        If current_hash is equal to 0:
+            Return 0
+        End If
+        If cached_hash is not equal to current_hash:
+            Note: Content actually changed, cache is invalid
+            memory_set_integer(entry, 48, 0)
+            Return 0
+        End If
+        Note: mtime changed but content is the same (e.g., touch command)
+        Note: Update the stored mtime
+        memory_set_integer(entry, 32, current_mtime)
+    End If
+
+    Note: Verify artifact still exists on disk
+    Let artifact_path be memory_get_pointer(entry, 16)
+    If artifact_path is not equal to 0:
+        Let artifact_exists be file_exists(artifact_path)
+        If artifact_exists is equal to 0:
+            memory_set_integer(entry, 48, 0)
+            Return 0
+        End If
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Cache Eviction
+Note: ============================================================================
+
+Process called "cache_evict_oldest" takes cache as Integer returns Integer:
+    Note: Evict the oldest cache entries to make room for new ones
+    Note: Removes approximately 25% of entries (the oldest quarter)
+    Note: Returns 1 on success, 0 on failure
+
+    If cache is equal to 0:
+        Return 0
+    End If
+
+    Note: For the current hash table implementation, we clear all invalidated entries
+    Note: This is the simplest eviction strategy that reclaims space
+    Let entries be memory_get_pointer(cache, 0)
+    If entries is equal to 0:
+        Return 0
+    End If
+
+    Note: Get all keys and check their entries for validity
+    Let arena be memory_get_pointer(cache, 32)
+    Let keys be hashtable_get_keys(entries, arena)
+    If keys is equal to 0:
+        Return 0
+    End If
+
+    Let key_count be arraylist_size(keys)
+    Let evicted be 0
+    Let target_evictions be key_count divided by 4  Note: Evict 25%
+    If target_evictions is less than 1:
+        Set target_evictions to 1
+    End If
+
+    Note: First pass: remove all already-invalidated entries
+    Let i be 0
+    While i is less than key_count:
+        If evicted is greater than or equal to target_evictions:
+            Set i to key_count  Note: Break
+        Otherwise:
+            Let key be arraylist_get(keys, i)
+            Let entry be hashtable_get(entries, key)
+            If entry is not equal to 0:
+                Let is_valid be memory_get_integer(entry, 48)
+                If is_valid is equal to 0:
+                    hashtable_remove(entries, key)
+                    Set evicted to evicted plus 1
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: If we still need more evictions, remove entries with oldest timestamps
+    If evicted is less than target_evictions:
+        Let j be 0
+        While j is less than key_count:
+            If evicted is greater than or equal to target_evictions:
+                Set j to key_count  Note: Break
+            Otherwise:
+                Let key be arraylist_get(keys, j)
+                Let entry be hashtable_get(entries, key)
+                If entry is not equal to 0:
+                    hashtable_remove(entries, key)
+                    Set evicted to evicted plus 1
+                End If
+            End If
+            Set j to j plus 1
+        End While
+    End If
+
+    Note: Update entry count
+    Let entry_count be memory_get_integer(cache, 8)
+    Set entry_count to entry_count minus evicted
+    If entry_count is less than 0:
+        Set entry_count to 0
+    End If
+    memory_set_integer(cache, 8, entry_count)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Cache Statistics
+Note: ============================================================================
+
+Process called "cache_get_hit_count" takes cache as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(cache, 16)
+End Process
+
+Process called "cache_get_miss_count" takes cache as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(cache, 24)
+End Process
+
+Process called "cache_get_entry_count" takes cache as Integer returns Integer:
+    If cache is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(cache, 8)
+End Process
+
+Process called "cache_get_hit_rate" takes cache as Integer returns Integer:
+    Note: Returns the cache hit rate as a percentage (0-100)
+    If cache is equal to 0:
+        Return 0
+    End If
+
+    Let hits be memory_get_integer(cache, 16)
+    Let misses be memory_get_integer(cache, 24)
+    Let total be hits plus misses
+
+    If total is equal to 0:
+        Return 0
+    End If
+
+    Let rate be hits multiplied by 100
+    Set rate to rate divided by total
+    Return rate
+End Process
+
+Process called "cache_print_statistics" takes cache as Integer returns Nothing:
+    Note: Print cache statistics
+    If cache is equal to 0:
+        Alert "[CACHE ERROR] Cannot print statistics: cache is null"
+        Return
+    End If
+
+    Display "--- Cache Statistics ---"
+
+    Let entry_count be memory_get_integer(cache, 8)
+    Let hit_count be memory_get_integer(cache, 16)
+    Let miss_count be memory_get_integer(cache, 24)
+    Let hit_rate be cache_get_hit_rate(cache)
+
+    Let entries_str be integer_to_string(entry_count)
+    Let msg1 be string_concat("  Entries: ", entries_str)
+    deallocate(entries_str)
+    Display msg1
+    deallocate(msg1)
+
+    Let hits_str be integer_to_string(hit_count)
+    Let msg2 be string_concat("  Hits:    ", hits_str)
+    deallocate(hits_str)
+    Display msg2
+    deallocate(msg2)
+
+    Let misses_str be integer_to_string(miss_count)
+    Let msg3 be string_concat("  Misses:  ", misses_str)
+    deallocate(misses_str)
+    Display msg3
+    deallocate(msg3)
+
+    Let rate_str be integer_to_string(hit_rate)
+    Let msg4 be string_concat("  Hit rate: ", rate_str)
+    deallocate(rate_str)
+    Let msg5 be string_concat(msg4, "%")
+    deallocate(msg4)
+    Display msg5
+    deallocate(msg5)
+
+    Display "------------------------"
+End Process

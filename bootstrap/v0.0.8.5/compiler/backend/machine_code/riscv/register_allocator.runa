@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,609 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles RISC-V register allocation and register management.
+RISC-V Register Allocator - Architecture-Specific Constraint Resolution
 
-This file performs the following tasks:
-- Process RISC-V register allocation and register management
-- Handle RISC-V register constraints and register usage optimization
-- Manage RISC-V register spilling and register optimization
-- Process RISC-V register-based operations and register optimization
+Resolves RISC-V register allocation constraints after middle-end graph coloring.
+RISC-V has 32 general-purpose registers (x0-x31) where x0 is hardwired to zero.
 
-This file is essential because of the following reasons:
-- RISC-V register management is crucial for efficient RISC-V code generation
-- Proper register handling ensures optimal RISC-V CPU resource utilization
-- RISC-V support enables Runa compilation for RISC-V platforms
+RISC-V is a clean three-address architecture with minimal constraints:
+- x0 (zero) is always zero and writes are discarded
+- x1 (ra) = return address
+- x2 (sp) = stack pointer
+- x3 (gp) = global pointer
+- x4 (tp) = thread pointer
+- x5-x7 (t0-t2) = temporaries (caller-saved)
+- x8 (s0/fp) = saved/frame pointer (callee-saved)
+- x9 (s1) = saved register (callee-saved)
+- x10-x11 (a0-a1) = function args + return values
+- x12-x17 (a2-a7) = function arguments
+- x18-x27 (s2-s11) = saved registers (callee-saved)
+- x28-x31 (t3-t6) = temporaries (caller-saved)
 
-This file consists of the following functions/features/operation types:
-- RISC-V register allocation and register management
-- RISC-V register constraints and register usage optimization
-- RISC-V register spilling and register optimization
-- RISC-V register-based operations and register optimization
+The clean three-address ISA means no two-address constraints, no implicit
+register usage (unlike x86 IDIV), and no shift-count register requirements.
+
+Dependencies:
+- Imports LIR types for function, block, and instruction structures
+- Imports LIRNodes for operand creation and instruction construction
+- Imports memory/layout.runa for OWNED HEAP allocation (Tier 3)
+- Imports list.runa for collection manipulation
 :End Note
 
-Note: TODO - Implement RISC-V register allocator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: RISC-V Register Constants (x0-x31)
+Note: ============================================================================
+
+Note: Zero register (hardwired to 0)
+Constant REG_ZERO as Integer is 0    Note: x0  - always zero
+
+Note: Special registers
+Constant REG_RA as Integer is 1      Note: x1  - return address
+Constant REG_SP as Integer is 2      Note: x2  - stack pointer
+Constant REG_GP as Integer is 3      Note: x3  - global pointer
+Constant REG_TP as Integer is 4      Note: x4  - thread pointer
+
+Note: Temporary registers (caller-saved)
+Constant REG_T0 as Integer is 5      Note: x5
+Constant REG_T1 as Integer is 6      Note: x6
+Constant REG_T2 as Integer is 7      Note: x7
+
+Note: Saved registers (callee-saved)
+Constant REG_S0 as Integer is 8      Note: x8  - also frame pointer (fp)
+Constant REG_FP as Integer is 8      Note: x8  - alias for s0
+Constant REG_S1 as Integer is 9      Note: x9
+
+Note: Argument/return registers
+Constant REG_A0 as Integer is 10     Note: x10 - arg 0 / return value 0
+Constant REG_A1 as Integer is 11     Note: x11 - arg 1 / return value 1
+Constant REG_A2 as Integer is 12     Note: x12 - arg 2
+Constant REG_A3 as Integer is 13     Note: x13 - arg 3
+Constant REG_A4 as Integer is 14     Note: x14 - arg 4
+Constant REG_A5 as Integer is 15     Note: x15 - arg 5
+Constant REG_A6 as Integer is 16     Note: x16 - arg 6
+Constant REG_A7 as Integer is 17     Note: x17 - arg 7
+
+Note: Saved registers (callee-saved) continued
+Constant REG_S2 as Integer is 18     Note: x18
+Constant REG_S3 as Integer is 19     Note: x19
+Constant REG_S4 as Integer is 20     Note: x20
+Constant REG_S5 as Integer is 21     Note: x21
+Constant REG_S6 as Integer is 22     Note: x22
+Constant REG_S7 as Integer is 23     Note: x23
+Constant REG_S8 as Integer is 24     Note: x24
+Constant REG_S9 as Integer is 25     Note: x25
+Constant REG_S10 as Integer is 26    Note: x26
+Constant REG_S11 as Integer is 27    Note: x27
+
+Note: Temporary registers (caller-saved) continued
+Constant REG_T3 as Integer is 28     Note: x28
+Constant REG_T4 as Integer is 29     Note: x29
+Constant REG_T5 as Integer is 30     Note: x30
+Constant REG_T6 as Integer is 31     Note: x31
+
+Note: Total GPRs
+Constant RISCV_GPR_COUNT as Integer is 32
+Constant RISCV_ALLOCATABLE_COUNT as Integer is 27
+Note: Allocatable: x5-x31 minus x8(fp if used) = 26 or 27 registers
+
+Note: ============================================================================
+Note: LIR Opcode Constants (mirrored from LIR)
+Note: ============================================================================
+
+Constant OP_MOV as Integer is 30001
+Constant OP_ADD as Integer is 30100
+Constant OP_SUB as Integer is 30101
+Constant OP_IMUL as Integer is 30102
+Constant OP_IDIV as Integer is 30103
+Constant OP_MUL as Integer is 30104
+Constant OP_DIV as Integer is 30105
+Constant OP_AND as Integer is 30200
+Constant OP_OR as Integer is 30201
+Constant OP_XOR as Integer is 30202
+Constant OP_SHL as Integer is 30300
+Constant OP_SHR as Integer is 30301
+Constant OP_SAR as Integer is 30302
+Constant OP_CALL as Integer is 30520
+
+Note: ============================================================================
+Note: Constraint Type Constants
+Note: ============================================================================
+
+@Reasoning
+RISC-V has the cleanest ISA design of the three architectures, with very
+few register constraints:
+
+1. No two-address form - all instructions are three-address (rd, rs1, rs2)
+2. No implicit register usage - DIVU/DIVW uses explicit operands (unlike x86 IDIV)
+3. No shift-count register - shift amount can be any register or immediate
+4. Calling convention: a0-a7 for arguments, a0-a1 for return values
+5. ra (x1) for return address (must be saved by callee if it makes calls)
+
+The only constraints are:
+- CONSTRAINT_CALL_ARGS: arguments must be in a0-a7 before calls
+- CONSTRAINT_CALL_RETURN: return value is in a0 after calls
+- CONSTRAINT_FIXED_REG: for specific calling convention needs
+@End Reasoning
+
+Constant CONSTRAINT_FIXED_REG as Integer is 1
+Constant CONSTRAINT_CLOBBER as Integer is 2
+Constant CONSTRAINT_CALL_ARGS as Integer is 3
+Constant CONSTRAINT_CALL_RETURN as Integer is 4
+
+Note: ============================================================================
+Note: RISCVAllocConstraint Type Definition
+Note: ============================================================================
+
+Type called "RISCVAllocConstraint":
+    instruction_index as Integer
+    constraint_type as Integer
+    required_register as Integer
+    operand_index as Integer
+    block_index as Integer
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per RISCVAllocConstraint
+
+Note: ============================================================================
+Note: Register Information Queries
+Note: ============================================================================
+
+Process called "is_allocatable_register" that takes reg_id as Integer returns Integer:
+    Note: Returns 1 if the register is available for general allocation
+    Note: x0 (zero), x1 (ra), x2 (sp), x3 (gp), x4 (tp) are reserved
+    If reg_id <= 4:
+        Return 0
+    End If
+    If reg_id > 31:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "is_callee_saved" that takes reg_id as Integer returns Integer:
+    Note: RISC-V calling convention: s0-s11 (x8-x9, x18-x27) are callee-saved
+    If reg_id is 8:
+        Return 1
+    End If
+    If reg_id is 9:
+        Return 1
+    End If
+    If reg_id >= 18:
+        If reg_id <= 27:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "is_caller_saved" that takes reg_id as Integer returns Integer:
+    Note: Caller-saved: t0-t6 (x5-x7, x28-x31), a0-a7 (x10-x17), ra (x1)
+    If reg_id is 1:
+        Return 1
+    End If
+    If reg_id >= 5:
+        If reg_id <= 7:
+            Return 1
+        End If
+    End If
+    If reg_id >= 10:
+        If reg_id <= 17:
+            Return 1
+        End If
+    End If
+    If reg_id >= 28:
+        If reg_id <= 31:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "is_argument_register" that takes reg_id as Integer returns Integer:
+    Note: a0-a7 (x10-x17) are used for up to 8 integer arguments
+    If reg_id >= 10:
+        If reg_id <= 17:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "get_allocatable_registers" returns Integer:
+    Note: Returns a List of allocatable register IDs for RISC-V
+    Note: Order: temporaries first, then argument regs, then saved regs
+    Let regs be List.list_create(32)
+    If regs is 0:
+        Return 0
+    End If
+
+    Note: Temporary registers (no save/restore cost, caller-saved)
+    List.list_append(regs, REG_T0)
+    List.list_append(regs, REG_T1)
+    List.list_append(regs, REG_T2)
+    List.list_append(regs, REG_T3)
+    List.list_append(regs, REG_T4)
+    List.list_append(regs, REG_T5)
+    List.list_append(regs, REG_T6)
+
+    Note: Argument registers (caller-saved)
+    List.list_append(regs, REG_A0)
+    List.list_append(regs, REG_A1)
+    List.list_append(regs, REG_A2)
+    List.list_append(regs, REG_A3)
+    List.list_append(regs, REG_A4)
+    List.list_append(regs, REG_A5)
+    List.list_append(regs, REG_A6)
+    List.list_append(regs, REG_A7)
+
+    Note: Saved registers (callee-saved, require save/restore)
+    List.list_append(regs, REG_S1)
+    List.list_append(regs, REG_S2)
+    List.list_append(regs, REG_S3)
+    List.list_append(regs, REG_S4)
+    List.list_append(regs, REG_S5)
+    List.list_append(regs, REG_S6)
+    List.list_append(regs, REG_S7)
+    List.list_append(regs, REG_S8)
+    List.list_append(regs, REG_S9)
+    List.list_append(regs, REG_S10)
+    List.list_append(regs, REG_S11)
+
+    Note: s0/fp last (often used as frame pointer)
+    List.list_append(regs, REG_S0)
+
+    Return regs
+End Process
+
+Note: ============================================================================
+Note: Virtual-to-Physical Register Mapping
+Note: ============================================================================
+
+Process called "map_virtual_to_physical" that takes virtual_reg as Integer returns Integer:
+    Note: Maps LIR virtual register IDs to RISC-V physical registers
+    Note: Starts with temporaries, then argument regs, then saved regs
+    Note: Returns -1 if spill is required
+    If virtual_reg < 0:
+        Return 0 - 1
+    End If
+
+    Note: First 7 virtual regs -> temporaries t0-t6
+    If virtual_reg <= 6:
+        If virtual_reg <= 2:
+            Return REG_T0 + virtual_reg
+        End If
+        Return REG_T3 + (virtual_reg - 3)
+    End If
+
+    Note: Next 8 virtual regs -> argument registers a0-a7
+    If virtual_reg <= 14:
+        Return REG_A0 + (virtual_reg - 7)
+    End If
+
+    Note: Next 12 virtual regs -> saved registers s0-s11
+    If virtual_reg <= 26:
+        Let s_index be virtual_reg - 15
+        If s_index is 0:
+            Return REG_S0
+        End If
+        If s_index is 1:
+            Return REG_S1
+        End If
+        Return REG_S2 + (s_index - 2)
+    End If
+
+    Note: Virtual register exceeds physical register count; needs spill
+    Return 0 - 1
+End Process
+
+Note: ============================================================================
+Note: Constraint Collection
+Note: ============================================================================
+
+@Reasoning
+RISC-V has remarkably few constraints due to its clean three-address design:
+
+1. All arithmetic/logic/shift instructions: rd, rs1, rs2 - no constraints
+2. DIV/DIVU/REM/REMU: rd, rs1, rs2 - no implicit registers (unlike x86)
+3. MUL/MULH/MULHU: rd, rs1, rs2 - no constraints
+4. Shifts: rd, rs1, rs2 or rd, rs1, shamt - no CL requirement
+
+The only constraints come from the calling convention:
+- Before CALL (jalr/jal): arguments must be placed in a0-a7
+- After CALL: return value is in a0
+
+This collector only emits constraints for CALL instructions.
+@End Reasoning
+
+Process called "collect_riscv_constraints" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let constraints be List.list_create(16)
+    If constraints is 0:
+        Return 0
+    End If
+
+    Let blocks be __load(lir_function, 32)
+    Let block_count be __load(lir_function, 40)
+
+    If blocks is 0:
+        Return constraints
+    End If
+    If block_count is 0:
+        Return constraints
+    End If
+
+    Let b be 0
+    While b < block_count:
+        Let block be List.list_get(blocks, b)
+        If block is not 0:
+            Let instructions be __load(block, 16)
+            Let inst_count be __load(block, 24)
+
+            If instructions is not 0:
+                Let i be 0
+                While i < inst_count:
+                    Let instruction be List.list_get(instructions, i)
+                    If instruction is not 0:
+                        Let opcode be __load(instruction, 0)
+
+                        Note: CALL: arguments must be in a0-a7, return in a0
+                        If opcode is OP_CALL:
+                            Let c be create_constraint(i, CONSTRAINT_CALL_ARGS, REG_A0, 1, b)
+                            List.list_append(constraints, c)
+                        End If
+                    End If
+
+                    Set i to i + 1
+                End While
+            End If
+        End If
+
+        Set b to b + 1
+    End While
+
+    Return constraints
+End Process
+
+Note: ============================================================================
+Note: Internal Helpers
+Note: ============================================================================
+
+Process called "create_constraint" that takes inst_idx as Integer, ctype as Integer, req_reg as Integer, op_idx as Integer, blk_idx as Integer returns Integer:
+    Let c be Layout.allocate(40)
+    If c is 0:
+        Return 0
+    End If
+    __store(c, 0, inst_idx)
+    __store(c, 8, ctype)
+    __store(c, 16, req_reg)
+    __store(c, 24, op_idx)
+    __store(c, 32, blk_idx)
+    Return c
+End Process
+
+Note: ============================================================================
+Note: Register Copy Insertion
+Note: ============================================================================
+
+Process called "insert_register_copy" that takes block as Integer, before_index as Integer, dest_reg as Integer, src_reg as Integer, size as Integer returns Integer:
+    If block is 0:
+        Return 0
+    End If
+    If dest_reg is src_reg:
+        Return 1
+    End If
+
+    Let mov_instruction be LIRNodes.create_lir_instruction(OP_MOV)
+    If mov_instruction is 0:
+        Return 0
+    End If
+
+    Let dest_operand be LIRNodes.create_register_operand(dest_reg, size)
+    If dest_operand is 0:
+        Return 0
+    End If
+
+    Let src_operand be LIRNodes.create_register_operand(src_reg, size)
+    If src_operand is 0:
+        Return 0
+    End If
+
+    __store(mov_instruction, 8, dest_operand)
+    __store(mov_instruction, 16, src_operand)
+    __store(mov_instruction, 48, block)
+
+    Let instructions be __load(block, 16)
+    If instructions is 0:
+        Return 0
+    End If
+
+    List.list_insert_at(instructions, before_index, mov_instruction)
+
+    Let inst_count be __load(block, 24)
+    __store(block, 24, inst_count + 1)
+
+    Let new_count be inst_count + 1
+    Let idx be before_index
+    While idx < new_count:
+        Let inst be List.list_get(instructions, idx)
+        If inst is not 0:
+            __store(inst, 64, idx)
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Complete Constraint Resolution Pass
+Note: ============================================================================
+
+@Reasoning
+RISC-V constraint resolution is minimal compared to x86.
+The main work is ensuring calling convention compliance:
+1. Move arguments to a0-a7 before call instructions
+2. Move return value from a0 to destination after call instructions
+3. No two-address fixups needed (three-address ISA)
+4. No implicit register fixups needed (clean register usage)
+@End Reasoning
+
+Process called "resolve_riscv_constraints" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let constraints be collect_riscv_constraints(lir_function)
+    If constraints is 0:
+        Return 0
+    End If
+
+    Let constraint_count be List.list_length(constraints)
+    If constraint_count is 0:
+        Return 1
+    End If
+
+    Note: Process constraints in reverse order
+    Let ci be constraint_count - 1
+    While ci >= 0:
+        Let constraint be List.list_get(constraints, ci)
+        If constraint is not 0:
+            Let inst_idx be __load(constraint, 0)
+            Let ctype be __load(constraint, 8)
+            Let blk_idx be __load(constraint, 32)
+
+            Let blocks be __load(lir_function, 32)
+            Let block be List.list_get(blocks, blk_idx)
+            If block is not 0:
+                Let instructions be __load(block, 16)
+                Let instruction be List.list_get(instructions, inst_idx)
+                If instruction is not 0:
+                    If ctype is CONSTRAINT_FIXED_REG:
+                        Let req_reg be __load(constraint, 16)
+                        Let op_idx be __load(constraint, 24)
+                        handle_fixed_reg_constraint(instruction, block, inst_idx, req_reg, op_idx)
+                    End If
+                    If ctype is CONSTRAINT_CALL_ARGS:
+                        handle_call_args_constraint(lir_function, instruction, block, inst_idx)
+                    End If
+                End If
+            End If
+        End If
+        Set ci to ci - 1
+    End While
+
+    Note: Coalesce redundant moves
+    coalesce_moves(lir_function)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Fixed Register Constraint Handler
+Note: ============================================================================
+
+Process called "handle_fixed_reg_constraint" that takes instruction as Integer, block as Integer, inst_index as Integer, required_reg as Integer, operand_index as Integer returns Integer:
+    Let operand_offset be 16 + (operand_index * 8)
+    If operand_index is 0:
+        Set operand_offset to 8
+    End If
+
+    Let operand_ptr be __load(instruction, operand_offset)
+    If operand_ptr is 0:
+        Return 0
+    End If
+
+    Let op_type be __load(operand_ptr, 0)
+    If op_type is not 1:
+        Return 0
+    End If
+
+    Let current_reg be __load(operand_ptr, 8)
+    If current_reg is required_reg:
+        Return 0
+    End If
+
+    Let success be insert_register_copy(block, inst_index, required_reg, current_reg, 8)
+    If success is 1:
+        __store(operand_ptr, 8, required_reg)
+    End If
+    Return success
+End Process
+
+Process called "handle_call_args_constraint" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer returns Integer:
+    Note: Ensures call arguments are in a0-a7 registers
+    Note: Higher-level instruction selection handles argument placement
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Move Coalescing
+Note: ============================================================================
+
+Process called "coalesce_moves" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let blocks be __load(lir_function, 32)
+    Let block_count be __load(lir_function, 40)
+    If blocks is 0:
+        Return 0
+    End If
+
+    Let removed_count be 0
+    Let b be 0
+    While b < block_count:
+        Let block be List.list_get(blocks, b)
+        If block is not 0:
+            Let instructions be __load(block, 16)
+            Let inst_count be __load(block, 24)
+            If instructions is not 0:
+                Let i be inst_count - 1
+                While i >= 0:
+                    Let inst be List.list_get(instructions, i)
+                    If inst is not 0:
+                        Let opcode be __load(inst, 0)
+                        If opcode is OP_MOV:
+                            Let result_ptr be __load(inst, 8)
+                            Let operand1_ptr be __load(inst, 16)
+                            If result_ptr is not 0:
+                                If operand1_ptr is not 0:
+                                    Let r_type be __load(result_ptr, 0)
+                                    Let o_type be __load(operand1_ptr, 0)
+                                    If r_type is 1:
+                                        If o_type is 1:
+                                            Let r_reg be __load(result_ptr, 8)
+                                            Let o_reg be __load(operand1_ptr, 8)
+                                            If r_reg is o_reg:
+                                                List.list_remove_at(instructions, i)
+                                                Let new_count be __load(block, 24)
+                                                __store(block, 24, new_count - 1)
+                                                Set removed_count to removed_count + 1
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set i to i - 1
+                End While
+            End If
+        End If
+        Set b to b + 1
+    End While
+
+    Return removed_count
+End Process

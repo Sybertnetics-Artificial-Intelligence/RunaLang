@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1091 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles executable loading and runtime executable management.
+Dynamic Linker / Loader - PLT/GOT Generation and Dynamic Symbol Resolution
 
-This file performs the following tasks:
-- Process executable loading and runtime executable management
-- Handle executable validation and executable verification
-- Manage executable initialization and executable startup
-- Process executable execution and executable runtime management
+This file implements the dynamic linking infrastructure needed to generate
+position-independent executables and shared libraries that use lazy binding.
 
-This file is essential because of the following reasons:
-- Executable loading enables runtime executable management and execution
-- Proper executable loading ensures correct executable execution
-- Executable loading support enables Runa compilation for executable runtime management
+Core Components:
 
-This file consists of the following functions/features/operation types:
-- Executable loading and runtime executable management
-- Executable validation and executable verification
-- Executable initialization and executable startup
-- Executable execution and executable runtime management
+1. PLT (Procedure Linkage Table):
+   A table of small code stubs, one per dynamically-linked function. On first
+   call, the stub redirects through the GOT to the dynamic linker's resolver.
+   After resolution, the GOT entry is overwritten with the actual function
+   address, so subsequent calls go directly to the target.
+
+   PLT[0] (resolver stub, 16 bytes on x86-64):
+     push  [GOT+8]         ; push link_map pointer
+     jmp   [GOT+16]        ; jump to _dl_runtime_resolve
+     nop; nop; nop; nop    ; padding to 16-byte alignment
+
+   PLT[n] (per-symbol stub, 16 bytes on x86-64):
+     jmp   [GOT+offset_n]  ; indirect jump through GOT
+     push  reloc_index     ; push relocation index for resolver
+     jmp   PLT[0]          ; jump to resolver stub
+
+2. GOT (Global Offset Table):
+   A table of 8-byte address slots. The first 3 entries are reserved:
+     GOT[0]: address of .dynamic section
+     GOT[1]: address of link_map (filled by dynamic linker)
+     GOT[2]: address of _dl_runtime_resolve (filled by dynamic linker)
+   Subsequent entries correspond to PLT stubs. Initially each GOT[n+3]
+   contains the address of PLT[n]+6 (the push instruction), implementing
+   lazy binding. The resolver overwrites this with the real function address.
+
+3. .dynamic Section:
+   Contains an array of Elf64_Dyn entries that the dynamic linker reads at
+   load time. Each entry has a tag (d_tag) and a value (d_un). Tags include:
+     DT_NEEDED:  index into .dynstr for a shared library dependency name
+     DT_SYMTAB:  address of .dynsym section
+     DT_STRTAB:  address of .dynstr section
+     DT_PLTGOT:  address of .got.plt section
+     DT_JMPREL:  address of .rela.plt section
+     DT_PLTRELSZ: size of .rela.plt section
+     DT_PLTREL:  relocation type (DT_RELA)
+     DT_NULL:    terminator entry
+
+PLTEntry Structure (24 bytes):
+  offset 0:  symbol_name (pointer to symbol name string)
+  offset 8:  got_offset (offset of this symbol's GOT entry from GOT base)
+  offset 16: plt_offset (offset of this symbol's PLT stub from PLT base)
+
+GOTEntry Structure (32 bytes):
+  offset 0:  symbol_name (pointer to symbol name string)
+  offset 8:  got_offset (offset from GOT base)
+  offset 16: resolved_address (0 until resolved, then the actual address)
+  offset 24: is_resolved (0 = unresolved, 1 = resolved)
+
+DynamicLinkerContext Structure (72 bytes):
+  offset 0:  plt_entries (List of PLTEntry pointers)
+  offset 8:  got_entries (List of GOTEntry pointers)
+  offset 16: plt_base (base virtual address of .plt section)
+  offset 24: got_base (base virtual address of .got.plt section)
+  offset 32: shared_libraries (List of library name string pointers)
+  offset 40: dynamic_symbols (Dictionary: name string -> GOTEntry pointer)
+  offset 48: plt_entry_count (number of PLT entries)
+  offset 56: got_reserved_count (number of reserved GOT entries, always 3)
+  offset 64: dynstr_offset_counter (current offset into .dynstr section)
 :End Note
 
-Note: TODO - Implement loader functionality
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/backend/machine_code/common/executable_format.runa" as ExeFormat
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+
+Note: ============================================================================
+Note: Constants
+Note: ============================================================================
+
+Constant PLT_ENTRY_STRUCT_SIZE as Integer is 24
+Constant GOT_ENTRY_STRUCT_SIZE as Integer is 32
+Constant DYNAMIC_LINKER_CONTEXT_SIZE as Integer is 72
+
+Note: GOT layout constants
+Constant GOT_ENTRY_SIZE as Integer is 8          Note: 8 bytes per GOT slot (64-bit address)
+Constant GOT_RESERVED_ENTRIES as Integer is 3    Note: GOT[0], GOT[1], GOT[2] are reserved
+
+Note: PLT layout constants (x86-64)
+Constant PLT_STUB_SIZE as Integer is 16          Note: Each PLT stub is 16 bytes
+Constant PLT0_SIZE as Integer is 16              Note: PLT[0] resolver stub is 16 bytes
+
+Note: ELF dynamic section tag constants
+Constant DT_NULL as Integer is 0                 Note: Marks end of .dynamic section
+Constant DT_NEEDED as Integer is 1               Note: Name of a needed shared library
+Constant DT_PLTRELSZ as Integer is 2             Note: Size in bytes of PLT relocation entries
+Constant DT_PLTGOT as Integer is 3               Note: Address of .got.plt section
+Constant DT_HASH as Integer is 4                 Note: Address of symbol hash table
+Constant DT_STRTAB as Integer is 5               Note: Address of .dynstr section
+Constant DT_SYMTAB as Integer is 6               Note: Address of .dynsym section
+Constant DT_STRSZ as Integer is 10               Note: Size of .dynstr section
+Constant DT_SYMENT as Integer is 11              Note: Size of one symbol entry (24 bytes)
+Constant DT_PLTREL as Integer is 20              Note: Type of relocation in PLT (DT_RELA=7)
+Constant DT_JMPREL as Integer is 23              Note: Address of .rela.plt section
+Constant DT_RELA as Integer is 7                 Note: Relocation type constant for RELA
+
+Note: Dynamic section entry size: each entry is a tag (8 bytes) + value (8 bytes) = 16 bytes
+Constant DYNAMIC_ENTRY_SIZE as Integer is 16
+
+Note: x86-64 PLT instruction encoding constants
+Note: These are the raw bytes for PLT stub instructions
+Constant PLT_JMP_INDIRECT_OPCODE as Integer is 255   Note: 0xFF for jmp *[rip+disp32]
+Constant PLT_JMP_INDIRECT_MODRM as Integer is 37     Note: 0x25 for [rip+disp32] with /4
+Constant PLT_PUSH_OPCODE as Integer is 104            Note: 0x68 for push imm32
+Constant PLT_JMP_REL32_OPCODE as Integer is 233       Note: 0xE9 for jmp rel32
+
+Note: Error codes
+Constant LOADER_OK as Integer is 1
+Constant LOADER_ERROR as Integer is 0
+Constant LOADER_ERROR_ALLOC as Integer is -1
+Constant LOADER_ERROR_NOT_FOUND as Integer is -2
+
+Note: ============================================================================
+Note: PLTEntry Type
+Note: ============================================================================
+
+Type called "PLTEntry":
+    symbol_name as Integer           Note: Pointer to symbol name string
+    got_offset as Integer            Note: Offset of this symbol's GOT entry from GOT base
+    plt_offset as Integer            Note: Offset of this symbol's PLT stub from PLT base
+End Type
+
+Note: Size: 3 fields * 8 bytes = 24 bytes per PLTEntry
+
+Note: ============================================================================
+Note: GOTEntry Type
+Note: ============================================================================
+
+Type called "GOTEntry":
+    symbol_name as Integer           Note: Pointer to symbol name string
+    got_offset as Integer            Note: Offset from GOT base
+    resolved_address as Integer      Note: 0 until resolved, then the actual address
+    is_resolved as Integer           Note: 0 = unresolved, 1 = resolved
+End Type
+
+Note: Size: 4 fields * 8 bytes = 32 bytes per GOTEntry
+
+Note: ============================================================================
+Note: DynamicLinkerContext Type
+Note: ============================================================================
+
+Type called "DynamicLinkerContext":
+    plt_entries as Integer           Note: List of PLTEntry pointers
+    got_entries as Integer           Note: List of GOTEntry pointers
+    plt_base as Integer              Note: Base virtual address of .plt section
+    got_base as Integer              Note: Base virtual address of .got.plt section
+    shared_libraries as Integer      Note: List of library name string pointers
+    dynamic_symbols as Integer       Note: Dictionary: name string -> GOTEntry pointer
+    plt_entry_count as Integer       Note: Number of PLT entries (excluding PLT[0])
+    got_reserved_count as Integer    Note: Number of reserved GOT entries (always 3)
+    dynstr_offset_counter as Integer Note: Current offset into .dynstr for library names
+End Type
+
+Note: Size: 9 fields * 8 bytes = 72 bytes per DynamicLinkerContext
+
+Note: ============================================================================
+Note: DynamicLinkerContext Creation
+Note: ============================================================================
+
+@Reasoning
+create_dynamic_linker allocates and initializes a DynamicLinkerContext with empty
+lists, an empty symbol dictionary, and default base addresses set to 0. The caller
+should set plt_base and got_base before generating PLT/GOT sections. The
+got_reserved_count is always 3 per the ELF dynamic linking ABI.
+@End Reasoning
+
+Process called "create_dynamic_linker" returns Integer:
+    Let ctx be Layout.allocate(DYNAMIC_LINKER_CONTEXT_SIZE)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Note: Create the PLT entries list
+    Let plt_list be List.list_create(32)
+    If plt_list is 0:
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 0, plt_list)
+
+    Note: Create the GOT entries list
+    Let got_list be List.list_create(32)
+    If got_list is 0:
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 8, got_list)
+
+    Note: PLT and GOT base addresses default to 0 (caller sets before generation)
+    __store(ctx, 16, 0)
+    __store(ctx, 24, 0)
+
+    Note: Create shared libraries list
+    Let libs_list be List.list_create(8)
+    If libs_list is 0:
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 32, libs_list)
+
+    Note: Create dynamic symbols dictionary (name -> GOTEntry pointer)
+    Let sym_dict be Dictionary.create()
+    If sym_dict is 0:
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 40, sym_dict)
+
+    Note: Initialize counters
+    __store(ctx, 48, 0)
+    __store(ctx, 56, GOT_RESERVED_ENTRIES)
+    __store(ctx, 64, 0)
+
+    Return ctx
+End Process
+
+Note: ============================================================================
+Note: Shared Library Registration
+Note: ============================================================================
+
+@Reasoning
+dynamic_add_shared_library registers a shared library dependency by name (e.g.,
+"libc.so.6"). This name will be emitted as a DT_NEEDED entry in the .dynamic
+section. The dynamic linker uses DT_NEEDED entries at load time to locate and
+map all required shared libraries before the program starts executing.
+@End Reasoning
+
+Process called "dynamic_add_shared_library" that takes ctx as Integer, lib_name as Integer returns Integer:
+    If ctx is 0:
+        Return LOADER_ERROR
+    End If
+    If lib_name is 0:
+        Return LOADER_ERROR
+    End If
+
+    Let libs_list be __load(ctx, 32)
+    If libs_list is 0:
+        Return LOADER_ERROR
+    End If
+
+    Note: Check for duplicate library entries
+    Let lib_count be List.list_length(libs_list)
+    Let li be 0
+    While li < lib_count:
+        Let existing be List.list_get(libs_list, li)
+        If existing is not 0:
+            Let cmp be StringUtils.string_compare(existing, lib_name)
+            If cmp is 0:
+                Note: Library already registered, not an error, just skip
+                Return LOADER_OK
+            End If
+        End If
+        Set li to li + 1
+    End While
+
+    List.list_push(libs_list, lib_name)
+    Return LOADER_OK
+End Process
+
+Note: ============================================================================
+Note: Dynamic Symbol Registration
+Note: ============================================================================
+
+@Reasoning
+dynamic_add_symbol registers a symbol that needs dynamic linking. It creates
+both a PLTEntry and a GOTEntry for the symbol. The GOT entry is assigned the
+next available offset after the 3 reserved entries, and the PLT entry is
+assigned the next offset after PLT[0].
+
+PLT offsets: PLT[0] occupies bytes [0..15], PLT[1] occupies [16..31], etc.
+GOT offsets: GOT[0..2] are reserved (24 bytes), GOT[3] is the first symbol slot.
+
+The GOTEntry is also stored in the dynamic_symbols dictionary for fast lookup
+by symbol name.
+@End Reasoning
+
+Process called "dynamic_add_symbol" that takes ctx as Integer, symbol_name as Integer returns Integer:
+    If ctx is 0:
+        Return LOADER_ERROR
+    End If
+    If symbol_name is 0:
+        Return LOADER_ERROR
+    End If
+
+    Note: Check if this symbol is already registered
+    Let sym_dict be __load(ctx, 40)
+    If sym_dict is 0:
+        Return LOADER_ERROR
+    End If
+
+    Let already_exists be Dictionary.contains(sym_dict, symbol_name)
+    If already_exists is 1:
+        Note: Symbol already has a PLT/GOT entry, not an error
+        Return LOADER_OK
+    End If
+
+    Note: Get current entry count for offset computation
+    Let entry_count be __load(ctx, 48)
+
+    Note: Compute GOT offset for this symbol
+    Note: GOT[0..2] are reserved, so the first symbol goes at offset 3 * 8 = 24
+    Let got_offset be (GOT_RESERVED_ENTRIES + entry_count) * GOT_ENTRY_SIZE
+
+    Note: Compute PLT offset for this symbol
+    Note: PLT[0] is the resolver stub (16 bytes), so the first symbol stub starts at 16
+    Let plt_offset be PLT0_SIZE + (entry_count * PLT_STUB_SIZE)
+
+    Note: Create GOTEntry
+    Let got_entry be Layout.allocate(GOT_ENTRY_STRUCT_SIZE)
+    If got_entry is 0:
+        Return LOADER_ERROR_ALLOC
+    End If
+    __store(got_entry, 0, symbol_name)
+    __store(got_entry, 8, got_offset)
+    __store(got_entry, 16, 0)
+    __store(got_entry, 24, 0)
+
+    Note: Create PLTEntry
+    Let plt_entry be Layout.allocate(PLT_ENTRY_STRUCT_SIZE)
+    If plt_entry is 0:
+        MemoryUtils.deallocate(got_entry)
+        Return LOADER_ERROR_ALLOC
+    End If
+    __store(plt_entry, 0, symbol_name)
+    __store(plt_entry, 8, got_offset)
+    __store(plt_entry, 16, plt_offset)
+
+    Note: Add to lists
+    Let plt_list be __load(ctx, 0)
+    Let got_list be __load(ctx, 8)
+    List.list_push(plt_list, plt_entry)
+    List.list_push(got_list, got_entry)
+
+    Note: Add to dictionary for fast lookup
+    Dictionary.set(sym_dict, symbol_name, got_entry)
+
+    Note: Increment entry count
+    __store(ctx, 48, entry_count + 1)
+
+    Return LOADER_OK
+End Process
+
+Note: ============================================================================
+Note: GOT Section Generation
+Note: ============================================================================
+
+@Reasoning
+dynamic_generate_got generates the .got.plt section as a byte buffer. The layout
+is:
+  GOT[0]: 0 (will be filled with .dynamic address by the loader)
+  GOT[1]: 0 (will be filled with link_map pointer by the loader)
+  GOT[2]: 0 (will be filled with _dl_runtime_resolve address by the loader)
+  GOT[3]: plt_base + PLT[1] + 6 (address of push instruction in PLT[1])
+  GOT[4]: plt_base + PLT[2] + 6 (address of push instruction in PLT[2])
+  ...
+
+Each GOT[n+3] is initialized to point to PLT[n]+6, which is the push instruction
+in the PLT stub. This implements lazy binding: the first call goes through the
+GOT, lands at the push, which pushes the relocation index and jumps to PLT[0]
+(the resolver). After resolution, GOT[n+3] is overwritten with the real address.
+
+The +6 offset comes from the PLT stub layout: bytes [0..5] are the jmp *[GOT]
+instruction (6 bytes: FF 25 xx xx xx xx), and byte [6] is the push instruction.
+
+Parameters:
+  ctx: DynamicLinkerContext pointer
+  output: pointer to a buffer pointer. This function allocates the buffer and
+          stores the pointer and size. output+0 = buffer pointer, output+8 = size.
+@End Reasoning
+
+Process called "dynamic_generate_got" that takes ctx as Integer, output as Integer returns Integer:
+    If ctx is 0:
+        Return LOADER_ERROR
+    End If
+    If output is 0:
+        Return LOADER_ERROR
+    End If
+
+    Let entry_count be __load(ctx, 48)
+    Let plt_base be __load(ctx, 16)
+    Let total_entries be GOT_RESERVED_ENTRIES + entry_count
+    Let total_size be total_entries * GOT_ENTRY_SIZE
+
+    Note: Allocate output buffer for GOT section
+    Let buf be MemoryUtils.allocate(total_size)
+    If buf is 0:
+        Return LOADER_ERROR_ALLOC
+    End If
+
+    Note: Zero-initialize the entire buffer (reserved entries start as 0)
+    Let zi be 0
+    While zi < total_size:
+        __store8(buf, zi, 0)
+        Set zi to zi + 1
+    End While
+
+    Note: GOT[0], GOT[1], GOT[2] remain 0 (filled by dynamic linker at load time)
+
+    Note: Fill GOT[3..N] with lazy binding addresses: PLT[n] + 6
+    Note: PLT[n] offset = PLT0_SIZE + n * PLT_STUB_SIZE
+    Note: The push instruction within PLT[n] is at offset +6 from start of PLT[n]
+    Let got_list be __load(ctx, 8)
+    Let gi be 0
+
+    While gi < entry_count:
+        Let got_entry be List.list_get(got_list, gi)
+        If got_entry is not 0:
+            Note: Compute lazy-binding address: plt_base + PLT[n].offset + 6
+            Let plt_offset be PLT0_SIZE + (gi * PLT_STUB_SIZE)
+            Let lazy_addr be plt_base + plt_offset + 6
+
+            Note: Compute GOT slot offset
+            Let slot_offset be (GOT_RESERVED_ENTRIES + gi) * GOT_ENTRY_SIZE
+
+            Note: Write 8-byte little-endian address
+            __store8(buf, slot_offset, lazy_addr & 255)
+            __store8(buf, slot_offset + 1, (lazy_addr >> 8) & 255)
+            __store8(buf, slot_offset + 2, (lazy_addr >> 16) & 255)
+            __store8(buf, slot_offset + 3, (lazy_addr >> 24) & 255)
+            __store8(buf, slot_offset + 4, (lazy_addr >> 32) & 255)
+            __store8(buf, slot_offset + 5, (lazy_addr >> 40) & 255)
+            __store8(buf, slot_offset + 6, (lazy_addr >> 48) & 255)
+            __store8(buf, slot_offset + 7, (lazy_addr >> 56) & 255)
+        End If
+
+        Set gi to gi + 1
+    End While
+
+    Note: Store output buffer pointer and size
+    __store(output, 0, buf)
+    __store(output, 8, total_size)
+
+    Return LOADER_OK
+End Process
+
+Note: ============================================================================
+Note: PLT Section Generation
+Note: ============================================================================
+
+@Reasoning
+dynamic_generate_plt generates the .plt section as a byte buffer containing
+x86-64 machine code for PLT stubs.
+
+PLT[0] - Resolver stub (16 bytes):
+  Bytes 0-1:  FF 35 xx xx xx xx   push [rip + GOT[1] displacement]
+  Bytes 6-11: FF 25 xx xx xx xx   jmp  [rip + GOT[2] displacement]
+  Bytes 12-15: 0F 1F 40 00        nop (4-byte NOP for alignment)
+
+  The displacements are computed as:
+    GOT[1] disp = got_base + 8 - (plt_base + 6)
+    GOT[2] disp = got_base + 16 - (plt_base + 12)
+
+PLT[n] - Per-symbol stub (16 bytes each):
+  Bytes 0-5:   FF 25 xx xx xx xx  jmp [rip + GOT[n+3] displacement]
+  Bytes 6-10:  68 xx xx xx xx     push relocation_index (n)
+  Bytes 11-15: E9 xx xx xx xx     jmp PLT[0] relative displacement
+
+  GOT[n+3] disp = got_base + (n+3)*8 - (plt_base + PLT[n].offset + 6)
+  PLT[0] disp = -(PLT[n].offset + 16)  [relative to end of jmp instruction]
+
+Parameters:
+  ctx: DynamicLinkerContext pointer
+  output: pointer where buffer pointer (offset 0) and size (offset 8) are stored
+@End Reasoning
+
+Process called "dynamic_generate_plt" that takes ctx as Integer, output as Integer returns Integer:
+    If ctx is 0:
+        Return LOADER_ERROR
+    End If
+    If output is 0:
+        Return LOADER_ERROR
+    End If
+
+    Let entry_count be __load(ctx, 48)
+    Let plt_base be __load(ctx, 16)
+    Let got_base be __load(ctx, 24)
+
+    Note: Total PLT size: PLT[0] (16 bytes) + entry_count * 16 bytes
+    Let total_size be PLT0_SIZE + (entry_count * PLT_STUB_SIZE)
+
+    Let buf be MemoryUtils.allocate(total_size)
+    If buf is 0:
+        Return LOADER_ERROR_ALLOC
+    End If
+
+    Note: ---- Generate PLT[0]: Resolver Stub ----
+    Note: push [rip + disp32] where disp32 reaches GOT[1]
+    Note: Instruction is at plt_base+0, RIP after instruction = plt_base+6
+    Note: Target = got_base + 8 (GOT[1])
+    Note: disp32 = (got_base + 8) - (plt_base + 6)
+    Let push_disp be (got_base + 8) - (plt_base + 6)
+
+    Note: FF 35 disp32 = push [rip+disp32]
+    __store8(buf, 0, 255)
+    __store8(buf, 1, 53)
+    __store8(buf, 2, push_disp & 255)
+    __store8(buf, 3, (push_disp >> 8) & 255)
+    __store8(buf, 4, (push_disp >> 16) & 255)
+    __store8(buf, 5, (push_disp >> 24) & 255)
+
+    Note: jmp [rip + disp32] where disp32 reaches GOT[2]
+    Note: Instruction is at plt_base+6, RIP after instruction = plt_base+12
+    Note: Target = got_base + 16 (GOT[2])
+    Note: disp32 = (got_base + 16) - (plt_base + 12)
+    Let jmp_disp be (got_base + 16) - (plt_base + 12)
+
+    Note: FF 25 disp32 = jmp [rip+disp32]
+    __store8(buf, 6, 255)
+    __store8(buf, 7, 37)
+    __store8(buf, 8, jmp_disp & 255)
+    __store8(buf, 9, (jmp_disp >> 8) & 255)
+    __store8(buf, 10, (jmp_disp >> 16) & 255)
+    __store8(buf, 11, (jmp_disp >> 24) & 255)
+
+    Note: 4-byte NOP for padding: 0F 1F 40 00 (nopl 0x0(%rax))
+    __store8(buf, 12, 15)
+    __store8(buf, 13, 31)
+    __store8(buf, 14, 64)
+    __store8(buf, 15, 0)
+
+    Note: ---- Generate PLT[1..N]: Per-Symbol Stubs ----
+    Let plt_list be __load(ctx, 0)
+    Let pi be 0
+
+    While pi < entry_count:
+        Let plt_entry be List.list_get(plt_list, pi)
+        If plt_entry is not 0:
+            Let stub_plt_offset be __load(plt_entry, 16)
+            Let stub_got_offset be __load(plt_entry, 8)
+
+            Note: Base byte offset in buffer for this stub
+            Let base be stub_plt_offset
+
+            Note: ---- jmp *[rip + GOT[n+3] displacement] ----
+            Note: Instruction at plt_base + stub_plt_offset
+            Note: RIP after this instruction = plt_base + stub_plt_offset + 6
+            Note: Target GOT slot = got_base + stub_got_offset
+            Note: disp32 = (got_base + stub_got_offset) - (plt_base + stub_plt_offset + 6)
+            Let got_disp be (got_base + stub_got_offset) - (plt_base + stub_plt_offset + 6)
+
+            Note: FF 25 disp32
+            __store8(buf, base, 255)
+            __store8(buf, base + 1, 37)
+            __store8(buf, base + 2, got_disp & 255)
+            __store8(buf, base + 3, (got_disp >> 8) & 255)
+            __store8(buf, base + 4, (got_disp >> 16) & 255)
+            __store8(buf, base + 5, (got_disp >> 24) & 255)
+
+            Note: ---- push reloc_index ----
+            Note: The relocation index is the 0-based index of this PLT entry
+            Note: 68 imm32
+            __store8(buf, base + 6, PLT_PUSH_OPCODE)
+            __store8(buf, base + 7, pi & 255)
+            __store8(buf, base + 8, (pi >> 8) & 255)
+            __store8(buf, base + 9, (pi >> 16) & 255)
+            __store8(buf, base + 10, (pi >> 24) & 255)
+
+            Note: ---- jmp PLT[0] ----
+            Note: E9 rel32 where rel32 = PLT[0] - (current_instruction_address + 5)
+            Note: Current instruction is at plt_base + stub_plt_offset + 11
+            Note: RIP after instruction = plt_base + stub_plt_offset + 16
+            Note: Target = plt_base (PLT[0])
+            Note: rel32 = plt_base - (plt_base + stub_plt_offset + 16)
+            Note:       = -(stub_plt_offset + 16)
+            Let plt0_disp be 0 - (stub_plt_offset + 16)
+
+            Note: E9 rel32
+            __store8(buf, base + 11, PLT_JMP_REL32_OPCODE)
+            __store8(buf, base + 12, plt0_disp & 255)
+            __store8(buf, base + 13, (plt0_disp >> 8) & 255)
+            __store8(buf, base + 14, (plt0_disp >> 16) & 255)
+            __store8(buf, base + 15, (plt0_disp >> 24) & 255)
+        End If
+
+        Set pi to pi + 1
+    End While
+
+    Note: Store output buffer pointer and size
+    __store(output, 0, buf)
+    __store(output, 8, total_size)
+
+    Return LOADER_OK
+End Process
+
+Note: ============================================================================
+Note: PLT/GOT Offset Lookup
+Note: ============================================================================
+
+Process called "dynamic_get_plt_offset" that takes ctx as Integer, symbol_name as Integer returns Integer:
+    Note: Returns the PLT offset for the given symbol, or -1 if not found
+    If ctx is 0:
+        Return -1
+    End If
+    If symbol_name is 0:
+        Return -1
+    End If
+
+    Note: Look up the GOTEntry in the dictionary to verify the symbol exists
+    Let sym_dict be __load(ctx, 40)
+    If sym_dict is 0:
+        Return -1
+    End If
+
+    Let exists be Dictionary.contains(sym_dict, symbol_name)
+    If exists is 0:
+        Return -1
+    End If
+
+    Note: Search the PLT list for the matching symbol to get its plt_offset
+    Let plt_list be __load(ctx, 0)
+    If plt_list is 0:
+        Return -1
+    End If
+
+    Let plt_count be List.list_length(plt_list)
+    Let pi be 0
+    While pi < plt_count:
+        Let plt_entry be List.list_get(plt_list, pi)
+        If plt_entry is not 0:
+            Let entry_name be __load(plt_entry, 0)
+            If entry_name is not 0:
+                Let cmp be StringUtils.string_compare(entry_name, symbol_name)
+                If cmp is 0:
+                    Return __load(plt_entry, 16)
+                End If
+            End If
+        End If
+        Set pi to pi + 1
+    End While
+
+    Return -1
+End Process
+
+Process called "dynamic_get_got_offset" that takes ctx as Integer, symbol_name as Integer returns Integer:
+    Note: Returns the GOT offset for the given symbol, or -1 if not found
+    If ctx is 0:
+        Return -1
+    End If
+    If symbol_name is 0:
+        Return -1
+    End If
+
+    Let sym_dict be __load(ctx, 40)
+    If sym_dict is 0:
+        Return -1
+    End If
+
+    Let exists be Dictionary.contains(sym_dict, symbol_name)
+    If exists is 0:
+        Return -1
+    End If
+
+    Note: The dictionary maps symbol name -> GOTEntry pointer
+    Let got_entry be Dictionary.get(sym_dict, symbol_name)
+    If got_entry is 0:
+        Return -1
+    End If
+
+    Note: GOTEntry offset 8 = got_offset
+    Return __load(got_entry, 8)
+End Process
+
+Note: ============================================================================
+Note: .dynamic Section Generation
+Note: ============================================================================
+
+@Reasoning
+dynamic_generate_dynamic_section generates the .dynamic section as a byte buffer.
+The .dynamic section is an array of Elf64_Dyn entries (each 16 bytes: 8-byte tag
++ 8-byte value). The entries we generate are:
+
+1. One DT_NEEDED entry per shared library dependency. The value is an offset
+   into the .dynstr string table where the library name begins.
+2. DT_SYMTAB: address of the .dynsym section (value provided as 0 here;
+   the static linker or executable format writer fills in the actual address).
+3. DT_STRTAB: address of the .dynstr section (same - placeholder 0).
+4. DT_STRSZ: size of the .dynstr section.
+5. DT_SYMENT: size of one .dynsym entry (24 bytes on ELF64).
+6. DT_PLTGOT: address of the .got.plt section = got_base.
+7. DT_JMPREL: address of the .rela.plt section (placeholder 0).
+8. DT_PLTRELSZ: size of .rela.plt = entry_count * 24 (each RELA entry is 24 bytes).
+9. DT_PLTREL: type of PLT relocations = DT_RELA (7).
+10. DT_NULL: terminator.
+
+The dynstr section is built as a side effect: we concatenate all library names
+with null terminators and track their offsets. The dynstr buffer starts with a
+null byte (index 0 is always the empty string per ELF convention).
+
+Parameters:
+  ctx: DynamicLinkerContext pointer
+  output: pointer where buffer pointer (offset 0), size (offset 8),
+          dynstr buffer pointer (offset 16), and dynstr size (offset 24) are stored.
+@End Reasoning
+
+Process called "dynamic_generate_dynamic_section" that takes ctx as Integer, output as Integer returns Integer:
+    If ctx is 0:
+        Return LOADER_ERROR
+    End If
+    If output is 0:
+        Return LOADER_ERROR
+    End If
+
+    Let entry_count be __load(ctx, 48)
+    Let got_base be __load(ctx, 24)
+    Let libs_list be __load(ctx, 32)
+
+    If libs_list is 0:
+        Return LOADER_ERROR
+    End If
+
+    Let lib_count be List.list_length(libs_list)
+
+    Note: ---- Build .dynstr section first ----
+    Note: .dynstr starts with a null byte (empty string at index 0)
+    Note: Then each library name is concatenated with a null terminator
+    Note: We first compute the total size, then fill the buffer
+
+    Let dynstr_size be 1
+    Let li be 0
+    While li < lib_count:
+        Let lib_name be List.list_get(libs_list, li)
+        If lib_name is not 0:
+            Note: Compute string length by scanning for null terminator
+            Let slen be 0
+            Let scanning be 1
+            While scanning is 1:
+                Let ch be __load8(lib_name, slen)
+                If ch is 0:
+                    Set scanning to 0
+                Otherwise:
+                    Set slen to slen + 1
+                End If
+            End While
+            Note: Add string length + 1 for null terminator
+            Set dynstr_size to dynstr_size + slen + 1
+        End If
+        Set li to li + 1
+    End While
+
+    Note: Allocate dynstr buffer
+    Let dynstr_buf be MemoryUtils.allocate(dynstr_size)
+    If dynstr_buf is 0:
+        Return LOADER_ERROR_ALLOC
+    End If
+
+    Note: Fill dynstr buffer
+    __store8(dynstr_buf, 0, 0)
+    Let dynstr_pos be 1
+
+    Note: We need to track each library's offset for DT_NEEDED entries
+    Note: Allocate a temporary array to store offsets
+    Let lib_offsets be MemoryUtils.allocate(lib_count * 8)
+    If lib_offsets is 0:
+        MemoryUtils.deallocate(dynstr_buf)
+        Return LOADER_ERROR_ALLOC
+    End If
+
+    Set li to 0
+    While li < lib_count:
+        Let lib_name be List.list_get(libs_list, li)
+
+        Note: Store this library's dynstr offset
+        __store(lib_offsets, li * 8, dynstr_pos)
+
+        If lib_name is not 0:
+            Note: Copy string bytes
+            Let si be 0
+            Let copying be 1
+            While copying is 1:
+                Let ch be __load8(lib_name, si)
+                __store8(dynstr_buf, dynstr_pos, ch)
+                Set dynstr_pos to dynstr_pos + 1
+                If ch is 0:
+                    Set copying to 0
+                Otherwise:
+                    Set si to si + 1
+                End If
+            End While
+        Otherwise:
+            Note: Null library name - write a null byte
+            __store8(dynstr_buf, dynstr_pos, 0)
+            Set dynstr_pos to dynstr_pos + 1
+        End If
+
+        Set li to li + 1
+    End While
+
+    Note: ---- Count .dynamic entries ----
+    Note: DT_NEEDED: lib_count entries
+    Note: DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_SYMENT: 4 entries
+    Note: DT_PLTGOT, DT_JMPREL, DT_PLTRELSZ, DT_PLTREL: 4 entries
+    Note: DT_NULL: 1 entry
+    Let dynamic_entry_count be lib_count + 4 + 4 + 1
+
+    Let dynamic_size be dynamic_entry_count * DYNAMIC_ENTRY_SIZE
+
+    Note: Allocate .dynamic buffer
+    Let dyn_buf be MemoryUtils.allocate(dynamic_size)
+    If dyn_buf is 0:
+        MemoryUtils.deallocate(lib_offsets)
+        MemoryUtils.deallocate(dynstr_buf)
+        Return LOADER_ERROR_ALLOC
+    End If
+
+    Note: ---- Fill .dynamic entries ----
+    Let dyn_pos be 0
+
+    Note: DT_NEEDED entries for each shared library
+    Set li to 0
+    While li < lib_count:
+        Let str_offset be __load(lib_offsets, li * 8)
+
+        Note: Write tag (DT_NEEDED = 1)
+        __store8(dyn_buf, dyn_pos, DT_NEEDED & 255)
+        __store8(dyn_buf, dyn_pos + 1, (DT_NEEDED >> 8) & 255)
+        __store8(dyn_buf, dyn_pos + 2, (DT_NEEDED >> 16) & 255)
+        __store8(dyn_buf, dyn_pos + 3, (DT_NEEDED >> 24) & 255)
+        __store8(dyn_buf, dyn_pos + 4, 0)
+        __store8(dyn_buf, dyn_pos + 5, 0)
+        __store8(dyn_buf, dyn_pos + 6, 0)
+        __store8(dyn_buf, dyn_pos + 7, 0)
+
+        Note: Write value (string table offset)
+        __store8(dyn_buf, dyn_pos + 8, str_offset & 255)
+        __store8(dyn_buf, dyn_pos + 9, (str_offset >> 8) & 255)
+        __store8(dyn_buf, dyn_pos + 10, (str_offset >> 16) & 255)
+        __store8(dyn_buf, dyn_pos + 11, (str_offset >> 24) & 255)
+        __store8(dyn_buf, dyn_pos + 12, (str_offset >> 32) & 255)
+        __store8(dyn_buf, dyn_pos + 13, (str_offset >> 40) & 255)
+        __store8(dyn_buf, dyn_pos + 14, (str_offset >> 48) & 255)
+        __store8(dyn_buf, dyn_pos + 15, (str_offset >> 56) & 255)
+
+        Set dyn_pos to dyn_pos + DYNAMIC_ENTRY_SIZE
+        Set li to li + 1
+    End While
+
+    Note: DT_SYMTAB (address of .dynsym - placeholder 0, filled by format writer)
+    Let result be dynamic_write_entry(dyn_buf, dyn_pos, DT_SYMTAB, 0)
+    Set dyn_pos to dyn_pos + DYNAMIC_ENTRY_SIZE
+
+    Note: DT_STRTAB (address of .dynstr - placeholder 0, filled by format writer)
+    Set result to dynamic_write_entry(dyn_buf, dyn_pos, DT_STRTAB, 0)
+    Set dyn_pos to dyn_pos + DYNAMIC_ENTRY_SIZE
+
+    Note: DT_STRSZ (size of .dynstr section)
+    Set result to dynamic_write_entry(dyn_buf, dyn_pos, DT_STRSZ, dynstr_size)
+    Set dyn_pos to dyn_pos + DYNAMIC_ENTRY_SIZE
+
+    Note: DT_SYMENT (size of one .dynsym entry: 24 bytes for ELF64)
+    Set result to dynamic_write_entry(dyn_buf, dyn_pos, DT_SYMENT, 24)
+    Set dyn_pos to dyn_pos + DYNAMIC_ENTRY_SIZE
+
+    Note: DT_PLTGOT (address of .got.plt section)
+    Set result to dynamic_write_entry(dyn_buf, dyn_pos, DT_PLTGOT, got_base)
+    Set dyn_pos to dyn_pos + DYNAMIC_ENTRY_SIZE
+
+    Note: DT_JMPREL (address of .rela.plt - placeholder 0, filled by format writer)
+    Set result to dynamic_write_entry(dyn_buf, dyn_pos, DT_JMPREL, 0)
+    Set dyn_pos to dyn_pos + DYNAMIC_ENTRY_SIZE
+
+    Note: DT_PLTRELSZ (total size of .rela.plt: each RELA entry is 24 bytes)
+    Let rela_plt_size be entry_count * 24
+    Set result to dynamic_write_entry(dyn_buf, dyn_pos, DT_PLTRELSZ, rela_plt_size)
+    Set dyn_pos to dyn_pos + DYNAMIC_ENTRY_SIZE
+
+    Note: DT_PLTREL (type of PLT relocations: DT_RELA = 7)
+    Set result to dynamic_write_entry(dyn_buf, dyn_pos, DT_PLTREL, DT_RELA)
+    Set dyn_pos to dyn_pos + DYNAMIC_ENTRY_SIZE
+
+    Note: DT_NULL (terminator)
+    Set result to dynamic_write_entry(dyn_buf, dyn_pos, DT_NULL, 0)
+
+    Note: Free temporary library offset array
+    MemoryUtils.deallocate(lib_offsets)
+
+    Note: Store output: dynamic buffer (offset 0), dynamic size (offset 8),
+    Note: dynstr buffer (offset 16), dynstr size (offset 24)
+    __store(output, 0, dyn_buf)
+    __store(output, 8, dynamic_size)
+    __store(output, 16, dynstr_buf)
+    __store(output, 24, dynstr_size)
+
+    Return LOADER_OK
+End Process
+
+Note: ============================================================================
+Note: Dynamic Entry Write Helper
+Note: ============================================================================
+
+@Reasoning
+dynamic_write_entry writes a single Elf64_Dyn entry (tag + value, 16 bytes total)
+to the buffer at the specified offset. Both tag and value are written as 8-byte
+little-endian integers.
+@End Reasoning
+
+Process called "dynamic_write_entry" that takes buf as Integer, offset as Integer, tag as Integer, value as Integer returns Integer:
+    Note: Write 8-byte tag in little-endian
+    __store8(buf, offset, tag & 255)
+    __store8(buf, offset + 1, (tag >> 8) & 255)
+    __store8(buf, offset + 2, (tag >> 16) & 255)
+    __store8(buf, offset + 3, (tag >> 24) & 255)
+    __store8(buf, offset + 4, (tag >> 32) & 255)
+    __store8(buf, offset + 5, (tag >> 40) & 255)
+    __store8(buf, offset + 6, (tag >> 48) & 255)
+    __store8(buf, offset + 7, (tag >> 56) & 255)
+
+    Note: Write 8-byte value in little-endian
+    __store8(buf, offset + 8, value & 255)
+    __store8(buf, offset + 9, (value >> 8) & 255)
+    __store8(buf, offset + 10, (value >> 16) & 255)
+    __store8(buf, offset + 11, (value >> 24) & 255)
+    __store8(buf, offset + 12, (value >> 32) & 255)
+    __store8(buf, offset + 13, (value >> 40) & 255)
+    __store8(buf, offset + 14, (value >> 48) & 255)
+    __store8(buf, offset + 15, (value >> 56) & 255)
+
+    Return LOADER_OK
+End Process
+
+Note: ============================================================================
+Note: Accessor and Diagnostic Functions
+Note: ============================================================================
+
+Process called "dynamic_get_plt_entry_count" that takes ctx as Integer returns Integer:
+    Note: Returns the number of PLT entries (excluding PLT[0] resolver stub)
+    If ctx is 0:
+        Return 0
+    End If
+    Return __load(ctx, 48)
+End Process
+
+Process called "dynamic_get_got_entry_count" that takes ctx as Integer returns Integer:
+    Note: Returns the total number of GOT entries (including 3 reserved)
+    If ctx is 0:
+        Return 0
+    End If
+    Let sym_count be __load(ctx, 48)
+    Return GOT_RESERVED_ENTRIES + sym_count
+End Process
+
+Process called "dynamic_get_plt_total_size" that takes ctx as Integer returns Integer:
+    Note: Returns the total size of the .plt section in bytes
+    If ctx is 0:
+        Return 0
+    End If
+    Let entry_count be __load(ctx, 48)
+    Return PLT0_SIZE + (entry_count * PLT_STUB_SIZE)
+End Process
+
+Process called "dynamic_get_got_total_size" that takes ctx as Integer returns Integer:
+    Note: Returns the total size of the .got.plt section in bytes
+    If ctx is 0:
+        Return 0
+    End If
+    Let entry_count be __load(ctx, 48)
+    Return (GOT_RESERVED_ENTRIES + entry_count) * GOT_ENTRY_SIZE
+End Process
+
+Process called "dynamic_get_shared_library_count" that takes ctx as Integer returns Integer:
+    Note: Returns the number of registered shared library dependencies
+    If ctx is 0:
+        Return 0
+    End If
+    Let libs_list be __load(ctx, 32)
+    If libs_list is 0:
+        Return 0
+    End If
+    Return List.list_length(libs_list)
+End Process
+
+Process called "dynamic_set_plt_base" that takes ctx as Integer, base as Integer returns Integer:
+    Note: Sets the virtual base address of the .plt section
+    If ctx is 0:
+        Return LOADER_ERROR
+    End If
+    __store(ctx, 16, base)
+    Return LOADER_OK
+End Process
+
+Process called "dynamic_set_got_base" that takes ctx as Integer, base as Integer returns Integer:
+    Note: Sets the virtual base address of the .got.plt section
+    If ctx is 0:
+        Return LOADER_ERROR
+    End If
+    __store(ctx, 24, base)
+    Return LOADER_OK
+End Process
+
+Process called "dynamic_resolve_symbol" that takes ctx as Integer, symbol_name as Integer, address as Integer returns Integer:
+    Note: Manually resolves a dynamic symbol by setting its GOT entry address
+    Note: This simulates what the dynamic linker does at runtime: overwriting the
+    Note: GOT entry with the real function address so subsequent calls bypass PLT
+    If ctx is 0:
+        Return LOADER_ERROR
+    End If
+    If symbol_name is 0:
+        Return LOADER_ERROR
+    End If
+
+    Let sym_dict be __load(ctx, 40)
+    If sym_dict is 0:
+        Return LOADER_ERROR
+    End If
+
+    Let exists be Dictionary.contains(sym_dict, symbol_name)
+    If exists is 0:
+        Return LOADER_ERROR_NOT_FOUND
+    End If
+
+    Let got_entry be Dictionary.get(sym_dict, symbol_name)
+    If got_entry is 0:
+        Return LOADER_ERROR_NOT_FOUND
+    End If
+
+    Note: Update the GOTEntry with the resolved address
+    __store(got_entry, 16, address)
+    __store(got_entry, 24, 1)
+
+    Return LOADER_OK
+End Process
+
+Process called "dynamic_is_symbol_resolved" that takes ctx as Integer, symbol_name as Integer returns Integer:
+    Note: Returns 1 if the symbol has been resolved, 0 if not, -1 on error
+    If ctx is 0:
+        Return -1
+    End If
+    If symbol_name is 0:
+        Return -1
+    End If
+
+    Let sym_dict be __load(ctx, 40)
+    If sym_dict is 0:
+        Return -1
+    End If
+
+    Let exists be Dictionary.contains(sym_dict, symbol_name)
+    If exists is 0:
+        Return -1
+    End If
+
+    Let got_entry be Dictionary.get(sym_dict, symbol_name)
+    If got_entry is 0:
+        Return -1
+    End If
+
+    Return __load(got_entry, 24)
+End Process
+
+Process called "dynamic_get_resolved_address" that takes ctx as Integer, symbol_name as Integer returns Integer:
+    Note: Returns the resolved address for a symbol, or 0 if not resolved
+    If ctx is 0:
+        Return 0
+    End If
+    If symbol_name is 0:
+        Return 0
+    End If
+
+    Let sym_dict be __load(ctx, 40)
+    If sym_dict is 0:
+        Return 0
+    End If
+
+    Let exists be Dictionary.contains(sym_dict, symbol_name)
+    If exists is 0:
+        Return 0
+    End If
+
+    Let got_entry be Dictionary.get(sym_dict, symbol_name)
+    If got_entry is 0:
+        Return 0
+    End If
+
+    Let is_resolved be __load(got_entry, 24)
+    If is_resolved is 0:
+        Return 0
+    End If
+
+    Return __load(got_entry, 16)
+End Process

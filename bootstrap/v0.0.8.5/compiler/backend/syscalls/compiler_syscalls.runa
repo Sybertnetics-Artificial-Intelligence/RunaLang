@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,522 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles compiler-specific system calls and compiler system interface for the compiler backend.
+Compiler Syscalls - Syscalls Required by the Compiler's Generated Code
 
-This file performs the following tasks:
-- Process compiler system call generation and compiler system call optimization
-- Handle compiler system interface and compiler system call management
-- Manage compiler system call validation and compiler system call verification
-- Process compiler system call performance and compiler system call utilities
+Defines the set of system calls that the Runa compiler must be able to emit in
+generated code. These are the fundamental OS interactions that any compiled Runa
+program needs: file I/O, memory management, and process control.
 
-This file is essential because of the following reasons:
-- Compiler system calls are fundamental to compiler operation and system integration
-- Proper compiler system call handling ensures correct compiler system interface and platform integration
-- Compiler system call utilities support compiler operation, system integration, and platform-specific functionality
+This module provides:
+1. Abstract syscall name constants that are platform-independent
+2. A function to register all required syscalls for a given platform
+3. Assembly code emission helpers for each abstract syscall
+4. Validation that a target platform supports all required syscalls
 
-This file consists of the following functions/features/operation types:
-- Compiler system call generation and compiler system call optimization
-- Compiler system interface and compiler system call management
-- Compiler system call validation and compiler system call verification
-- Compiler system call performance and compiler system call utilities
+The compiler uses abstract syscall names (e.g., COMPILER_SYSCALL_WRITE) and this
+module resolves them to platform-specific numbers and register assignments at
+code generation time.
+
+Dependencies:
+- Imports platform_interface for syscall definitions and conventions
+- Imports syscall_registry for registration and lookup
+- Imports machine_code_interface for assembly output
 :End Note
 
-Note: TODO - Implement compiler syscalls functionality
+Import "compiler/backend/syscalls/platforms/platform_interface.runa" as PlatformInterface
+Import "compiler/backend/syscalls/syscall_registry.runa" as SyscallRegistry
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: Abstract Compiler Syscall Names
+Note: ============================================================================
+
+@Reasoning
+These constants define the abstract syscall operations that the compiler's generated
+code must be able to perform. Each corresponds to a fundamental OS operation:
+
+- READ/WRITE: File descriptor I/O (stdin/stdout/stderr, files)
+- OPEN/CLOSE: File descriptor lifecycle
+- MMAP/MUNMAP: Memory mapping for heap allocation
+- BRK: Program break adjustment (alternative heap management)
+- EXIT: Process termination
+- LSEEK: File position seeking
+- FSTAT: File metadata query
+- IOCTL: Device control (terminal modes, etc.)
+
+These names are used as keys into the SyscallRegistry to look up platform-specific
+syscall numbers and calling conventions.
+@End Reasoning
+
+Constant COMPILER_SYSCALL_READ as Integer is "read"
+Constant COMPILER_SYSCALL_WRITE as Integer is "write"
+Constant COMPILER_SYSCALL_OPEN as Integer is "open"
+Constant COMPILER_SYSCALL_CLOSE as Integer is "close"
+Constant COMPILER_SYSCALL_MMAP as Integer is "mmap"
+Constant COMPILER_SYSCALL_MUNMAP as Integer is "munmap"
+Constant COMPILER_SYSCALL_BRK as Integer is "brk"
+Constant COMPILER_SYSCALL_EXIT as Integer is "exit"
+Constant COMPILER_SYSCALL_LSEEK as Integer is "lseek"
+Constant COMPILER_SYSCALL_FSTAT as Integer is "fstat"
+Constant COMPILER_SYSCALL_IOCTL as Integer is "ioctl"
+Constant COMPILER_SYSCALL_EXIT_GROUP as Integer is "exit_group"
+
+Note: Total number of required compiler syscalls
+Constant COMPILER_SYSCALL_COUNT as Integer is 12
+
+Note: ============================================================================
+Note: Required Syscall List
+Note: ============================================================================
+
+Process called "get_required_syscall_names" returns Integer:
+    Note: Returns a List of all syscall name strings that the compiler requires
+    Note: Used for validation that a target platform supports all necessary operations
+    Let names be List.list_create(16)
+
+    List.list_append(names, COMPILER_SYSCALL_READ)
+    List.list_append(names, COMPILER_SYSCALL_WRITE)
+    List.list_append(names, COMPILER_SYSCALL_OPEN)
+    List.list_append(names, COMPILER_SYSCALL_CLOSE)
+    List.list_append(names, COMPILER_SYSCALL_MMAP)
+    List.list_append(names, COMPILER_SYSCALL_MUNMAP)
+    List.list_append(names, COMPILER_SYSCALL_BRK)
+    List.list_append(names, COMPILER_SYSCALL_EXIT)
+    List.list_append(names, COMPILER_SYSCALL_LSEEK)
+    List.list_append(names, COMPILER_SYSCALL_FSTAT)
+    List.list_append(names, COMPILER_SYSCALL_IOCTL)
+    List.list_append(names, COMPILER_SYSCALL_EXIT_GROUP)
+
+    Return names
+End Process
+
+Note: ============================================================================
+Note: Platform Validation
+Note: ============================================================================
+
+Process called "validate_platform_support" that takes registry as Integer, platform_id as Integer returns Integer:
+    Note: Validates that the given platform has all required compiler syscalls registered
+    Note: Returns 1 if all required syscalls are present, 0 if any are missing
+    Let required be get_required_syscall_names()
+    Return SyscallRegistry.validate_platform_syscalls(registry, platform_id, required)
+End Process
+
+Process called "get_missing_syscalls" that takes registry as Integer, platform_id as Integer returns Integer:
+    Note: Returns a List of syscall name strings that are required but not registered
+    Note: Returns empty list if all are present
+    Let missing be List.list_create(16)
+    Let required be get_required_syscall_names()
+    Let count be List.list_length(required)
+
+    Let i be 0
+    While i < count:
+        Let name be List.list_get(required, i)
+        Let def be SyscallRegistry.lookup_syscall_by_name(registry, platform_id, name)
+        If def is 0:
+            List.list_append(missing, name)
+        End If
+        Set i to i + 1
+    End While
+
+    Return missing
+End Process
+
+Note: ============================================================================
+Note: Syscall Assembly Emission
+Note: ============================================================================
+
+@Reasoning
+These processes emit the assembly code sequence for invoking a specific syscall
+on the current target platform. The pattern is:
+1. Load the syscall number into the number register
+2. Load arguments into the argument registers (per platform convention)
+3. Emit the syscall instruction
+4. The return value is in the return register
+
+For x86_64 Linux, this looks like:
+    movq $1, %rax           # syscall number for write
+    movq $1, %rdi           # fd = stdout
+    leaq .LC0(%rip), %rsi   # buf = string address
+    movq $13, %rdx          # count = 13
+    syscall                 # invoke kernel
+
+Each emit function takes the assembly output buffer and the platform convention,
+and emits the appropriate instruction sequence for the target platform.
+@End Reasoning
+
+Process called "emit_syscall_sequence" that takes output as Integer, registry as Integer, platform_id as Integer, syscall_name as Integer, arg_values as Integer, arg_count as Integer returns Integer:
+    Note: Emits a complete syscall invocation sequence
+    Note: arg_values is a List of string pointers (assembly operand strings)
+    Note: Returns 1 on success, 0 on failure
+    If output is 0:
+        Return 0
+    End If
+    If registry is 0:
+        Return 0
+    End If
+
+    Note: Look up the syscall definition
+    Let def be SyscallRegistry.lookup_syscall_by_name(registry, platform_id, syscall_name)
+    If def is 0:
+        Return 0
+    End If
+
+    Note: Look up the convention
+    Let conv be SyscallRegistry.get_convention(registry, platform_id)
+    If conv is 0:
+        Return 0
+    End If
+
+    Note: Get the platform info for syscall instruction
+    Let platform_info be SyscallRegistry.get_platform_info(registry, platform_id)
+
+    Note: Get syscall number and apply offset
+    Let syscall_number be PlatformInterface.syscall_def_get_number(def)
+    Let offset be PlatformInterface.convention_get_syscall_offset(conv)
+    Let effective_number be syscall_number + offset
+
+    Note: Get the arch from platform info to determine instruction format
+    Let arch be __load(platform_info, 8)
+
+    Note: Emit architecture-specific syscall sequence
+    If arch is MachineCode.TARGET_ARCH_X86_64:
+        Return emit_x86_64_syscall(output, conv, effective_number, arg_values, arg_count)
+    End If
+
+    If arch is MachineCode.TARGET_ARCH_AARCH64:
+        Return emit_aarch64_syscall(output, conv, effective_number, arg_values, arg_count)
+    End If
+
+    If arch is MachineCode.TARGET_ARCH_ARM32:
+        Return emit_arm32_syscall(output, conv, effective_number, arg_values, arg_count)
+    End If
+
+    If arch is MachineCode.TARGET_ARCH_RISCV64:
+        Return emit_riscv_syscall(output, conv, effective_number, arg_values, arg_count)
+    End If
+
+    If arch is MachineCode.TARGET_ARCH_RISCV32:
+        Return emit_riscv_syscall(output, conv, effective_number, arg_values, arg_count)
+    End If
+
+    If arch is MachineCode.TARGET_ARCH_MIPS32:
+        Return emit_mips_syscall(output, conv, effective_number, arg_values, arg_count)
+    End If
+
+    If arch is MachineCode.TARGET_ARCH_MIPS64:
+        Return emit_mips_syscall(output, conv, effective_number, arg_values, arg_count)
+    End If
+
+    If arch is MachineCode.TARGET_ARCH_POWERPC:
+        Return emit_powerpc_syscall(output, conv, effective_number, arg_values, arg_count)
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Architecture-Specific Syscall Emission
+Note: ============================================================================
+
+Process called "emit_x86_64_syscall" that takes output as Integer, conv as Integer, syscall_num as Integer, args as Integer, arg_count as Integer returns Integer:
+    Note: Emits x86_64 syscall sequence
+    Note: Pattern: load args into registers, load number into RAX, syscall
+    Let section be MachineCode.SECTION_TEXT
+
+    Note: Load arguments into registers (in reverse order to avoid clobbering)
+    Note: x86_64 syscall args: RDI, RSI, RDX, R10, R8, R9
+    Let x86_arg_names be List.list_create(6)
+    List.list_append(x86_arg_names, "%rdi")
+    List.list_append(x86_arg_names, "%rsi")
+    List.list_append(x86_arg_names, "%rdx")
+    List.list_append(x86_arg_names, "%r10")
+    List.list_append(x86_arg_names, "%r8")
+    List.list_append(x86_arg_names, "%r9")
+
+    Let i be 0
+    While i < arg_count:
+        If i < 6:
+            Let arg_val be List.list_get(args, i)
+            Let reg_name be List.list_get(x86_arg_names, i)
+
+            Note: Emit: movq $arg_val, %reg_name (or movq arg_val, %reg_name)
+            MachineCode.asm_emit_to_section(output, section, "\tmovq\t")
+            MachineCode.asm_emit_to_section(output, section, arg_val)
+            MachineCode.asm_emit_to_section(output, section, ", ")
+            MachineCode.asm_emit_line(output, section, reg_name)
+        End If
+        Set i to i + 1
+    End While
+
+    Note: Load syscall number into RAX
+    MachineCode.asm_emit_to_section(output, section, "\tmovq\t$")
+    Let num_str be StringCore.integer_to_string(syscall_num)
+    MachineCode.asm_emit_to_section(output, section, num_str)
+    MachineCode.asm_emit_line(output, section, ", %rax")
+
+    Note: Emit syscall instruction
+    MachineCode.asm_emit_line(output, section, "\tsyscall")
+
+    Return 1
+End Process
+
+Process called "emit_aarch64_syscall" that takes output as Integer, conv as Integer, syscall_num as Integer, args as Integer, arg_count as Integer returns Integer:
+    Note: Emits AArch64 syscall sequence
+    Note: Pattern: load args into X0-X5, load number into X8, svc #0
+    Let section be MachineCode.SECTION_TEXT
+
+    Note: AArch64 syscall args: X0-X5
+    Let arm_arg_names be List.list_create(6)
+    List.list_append(arm_arg_names, "x0")
+    List.list_append(arm_arg_names, "x1")
+    List.list_append(arm_arg_names, "x2")
+    List.list_append(arm_arg_names, "x3")
+    List.list_append(arm_arg_names, "x4")
+    List.list_append(arm_arg_names, "x5")
+
+    Let i be 0
+    While i < arg_count:
+        If i < 6:
+            Let arg_val be List.list_get(args, i)
+            Let reg_name be List.list_get(arm_arg_names, i)
+
+            MachineCode.asm_emit_to_section(output, section, "\tmov\t")
+            MachineCode.asm_emit_to_section(output, section, reg_name)
+            MachineCode.asm_emit_to_section(output, section, ", ")
+            MachineCode.asm_emit_line(output, section, arg_val)
+        End If
+        Set i to i + 1
+    End While
+
+    Note: Load syscall number into X8
+    Let num_reg be PlatformInterface.convention_get_number_register(conv)
+    MachineCode.asm_emit_to_section(output, section, "\tmov\tx8, #")
+    Let num_str be StringCore.integer_to_string(syscall_num)
+    MachineCode.asm_emit_line(output, section, num_str)
+
+    Note: Emit supervisor call
+    MachineCode.asm_emit_line(output, section, "\tsvc\t#0")
+
+    Return 1
+End Process
+
+Process called "emit_arm32_syscall" that takes output as Integer, conv as Integer, syscall_num as Integer, args as Integer, arg_count as Integer returns Integer:
+    Note: Emits ARM32 syscall sequence
+    Note: Pattern: load args into R0-R5, load number into R7, swi 0
+    Let section be MachineCode.SECTION_TEXT
+
+    Let arm_arg_names be List.list_create(6)
+    List.list_append(arm_arg_names, "r0")
+    List.list_append(arm_arg_names, "r1")
+    List.list_append(arm_arg_names, "r2")
+    List.list_append(arm_arg_names, "r3")
+    List.list_append(arm_arg_names, "r4")
+    List.list_append(arm_arg_names, "r5")
+
+    Let i be 0
+    While i < arg_count:
+        If i < 6:
+            Let arg_val be List.list_get(args, i)
+            Let reg_name be List.list_get(arm_arg_names, i)
+
+            MachineCode.asm_emit_to_section(output, section, "\tmov\t")
+            MachineCode.asm_emit_to_section(output, section, reg_name)
+            MachineCode.asm_emit_to_section(output, section, ", ")
+            MachineCode.asm_emit_line(output, section, arg_val)
+        End If
+        Set i to i + 1
+    End While
+
+    Note: Load syscall number into R7
+    MachineCode.asm_emit_to_section(output, section, "\tmov\tr7, #")
+    Let num_str be StringCore.integer_to_string(syscall_num)
+    MachineCode.asm_emit_line(output, section, num_str)
+
+    MachineCode.asm_emit_line(output, section, "\tswi\t#0")
+
+    Return 1
+End Process
+
+Process called "emit_riscv_syscall" that takes output as Integer, conv as Integer, syscall_num as Integer, args as Integer, arg_count as Integer returns Integer:
+    Note: Emits RISC-V syscall sequence
+    Note: Pattern: load args into a0-a5, load number into a7, ecall
+    Let section be MachineCode.SECTION_TEXT
+
+    Let rv_arg_names be List.list_create(6)
+    List.list_append(rv_arg_names, "a0")
+    List.list_append(rv_arg_names, "a1")
+    List.list_append(rv_arg_names, "a2")
+    List.list_append(rv_arg_names, "a3")
+    List.list_append(rv_arg_names, "a4")
+    List.list_append(rv_arg_names, "a5")
+
+    Let i be 0
+    While i < arg_count:
+        If i < 6:
+            Let arg_val be List.list_get(args, i)
+            Let reg_name be List.list_get(rv_arg_names, i)
+
+            MachineCode.asm_emit_to_section(output, section, "\tli\t")
+            MachineCode.asm_emit_to_section(output, section, reg_name)
+            MachineCode.asm_emit_to_section(output, section, ", ")
+            MachineCode.asm_emit_line(output, section, arg_val)
+        End If
+        Set i to i + 1
+    End While
+
+    Note: Load syscall number into a7
+    MachineCode.asm_emit_to_section(output, section, "\tli\ta7, ")
+    Let num_str be StringCore.integer_to_string(syscall_num)
+    MachineCode.asm_emit_line(output, section, num_str)
+
+    MachineCode.asm_emit_line(output, section, "\tecall")
+
+    Return 1
+End Process
+
+Process called "emit_mips_syscall" that takes output as Integer, conv as Integer, syscall_num as Integer, args as Integer, arg_count as Integer returns Integer:
+    Note: Emits MIPS syscall sequence
+    Note: Pattern: load args into $a0-$a3, load number into $v0, syscall
+    Let section be MachineCode.SECTION_TEXT
+
+    Let mips_arg_names be List.list_create(4)
+    List.list_append(mips_arg_names, "$a0")
+    List.list_append(mips_arg_names, "$a1")
+    List.list_append(mips_arg_names, "$a2")
+    List.list_append(mips_arg_names, "$a3")
+
+    Let i be 0
+    While i < arg_count:
+        If i < 4:
+            Let arg_val be List.list_get(args, i)
+            Let reg_name be List.list_get(mips_arg_names, i)
+
+            MachineCode.asm_emit_to_section(output, section, "\tli\t")
+            MachineCode.asm_emit_to_section(output, section, reg_name)
+            MachineCode.asm_emit_to_section(output, section, ", ")
+            MachineCode.asm_emit_line(output, section, arg_val)
+        End If
+        Set i to i + 1
+    End While
+
+    Note: Load syscall number into $v0
+    MachineCode.asm_emit_to_section(output, section, "\tli\t$v0, ")
+    Let num_str be StringCore.integer_to_string(syscall_num)
+    MachineCode.asm_emit_line(output, section, num_str)
+
+    MachineCode.asm_emit_line(output, section, "\tsyscall")
+
+    Return 1
+End Process
+
+Process called "emit_powerpc_syscall" that takes output as Integer, conv as Integer, syscall_num as Integer, args as Integer, arg_count as Integer returns Integer:
+    Note: Emits PowerPC syscall sequence
+    Note: Pattern: load args into r3-r8, load number into r0, sc
+    Let section be MachineCode.SECTION_TEXT
+
+    Let ppc_arg_names be List.list_create(6)
+    List.list_append(ppc_arg_names, "3")
+    List.list_append(ppc_arg_names, "4")
+    List.list_append(ppc_arg_names, "5")
+    List.list_append(ppc_arg_names, "6")
+    List.list_append(ppc_arg_names, "7")
+    List.list_append(ppc_arg_names, "8")
+
+    Let i be 0
+    While i < arg_count:
+        If i < 6:
+            Let arg_val be List.list_get(args, i)
+            Let reg_num be List.list_get(ppc_arg_names, i)
+
+            MachineCode.asm_emit_to_section(output, section, "\tli\tr")
+            MachineCode.asm_emit_to_section(output, section, reg_num)
+            MachineCode.asm_emit_to_section(output, section, ", ")
+            MachineCode.asm_emit_line(output, section, arg_val)
+        End If
+        Set i to i + 1
+    End While
+
+    Note: Load syscall number into r0
+    MachineCode.asm_emit_to_section(output, section, "\tli\tr0, ")
+    Let num_str be StringCore.integer_to_string(syscall_num)
+    MachineCode.asm_emit_line(output, section, num_str)
+
+    MachineCode.asm_emit_line(output, section, "\tsc")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Convenience Syscall Emitters
+Note: ============================================================================
+
+Process called "emit_write_syscall" that takes output as Integer, registry as Integer, platform_id as Integer, fd_operand as Integer, buf_operand as Integer, count_operand as Integer returns Integer:
+    Note: Emits a write() syscall: write(fd, buf, count)
+    Let args be List.list_create(3)
+    List.list_append(args, fd_operand)
+    List.list_append(args, buf_operand)
+    List.list_append(args, count_operand)
+    Return emit_syscall_sequence(output, registry, platform_id, COMPILER_SYSCALL_WRITE, args, 3)
+End Process
+
+Process called "emit_read_syscall" that takes output as Integer, registry as Integer, platform_id as Integer, fd_operand as Integer, buf_operand as Integer, count_operand as Integer returns Integer:
+    Note: Emits a read() syscall: read(fd, buf, count)
+    Let args be List.list_create(3)
+    List.list_append(args, fd_operand)
+    List.list_append(args, buf_operand)
+    List.list_append(args, count_operand)
+    Return emit_syscall_sequence(output, registry, platform_id, COMPILER_SYSCALL_READ, args, 3)
+End Process
+
+Process called "emit_open_syscall" that takes output as Integer, registry as Integer, platform_id as Integer, path_operand as Integer, flags_operand as Integer, mode_operand as Integer returns Integer:
+    Note: Emits an open() syscall: open(path, flags, mode)
+    Let args be List.list_create(3)
+    List.list_append(args, path_operand)
+    List.list_append(args, flags_operand)
+    List.list_append(args, mode_operand)
+    Return emit_syscall_sequence(output, registry, platform_id, COMPILER_SYSCALL_OPEN, args, 3)
+End Process
+
+Process called "emit_close_syscall" that takes output as Integer, registry as Integer, platform_id as Integer, fd_operand as Integer returns Integer:
+    Note: Emits a close() syscall: close(fd)
+    Let args be List.list_create(1)
+    List.list_append(args, fd_operand)
+    Return emit_syscall_sequence(output, registry, platform_id, COMPILER_SYSCALL_CLOSE, args, 1)
+End Process
+
+Process called "emit_exit_syscall" that takes output as Integer, registry as Integer, platform_id as Integer, code_operand as Integer returns Integer:
+    Note: Emits an exit() syscall: exit(code)
+    Let args be List.list_create(1)
+    List.list_append(args, code_operand)
+    Return emit_syscall_sequence(output, registry, platform_id, COMPILER_SYSCALL_EXIT, args, 1)
+End Process
+
+Process called "emit_mmap_syscall" that takes output as Integer, registry as Integer, platform_id as Integer, addr_op as Integer, len_op as Integer, prot_op as Integer, flags_op as Integer, fd_op as Integer, offset_op as Integer returns Integer:
+    Note: Emits an mmap() syscall: mmap(addr, length, prot, flags, fd, offset)
+    Let args be List.list_create(6)
+    List.list_append(args, addr_op)
+    List.list_append(args, len_op)
+    List.list_append(args, prot_op)
+    List.list_append(args, flags_op)
+    List.list_append(args, fd_op)
+    List.list_append(args, offset_op)
+    Return emit_syscall_sequence(output, registry, platform_id, COMPILER_SYSCALL_MMAP, args, 6)
+End Process
+
+Process called "emit_munmap_syscall" that takes output as Integer, registry as Integer, platform_id as Integer, addr_op as Integer, len_op as Integer returns Integer:
+    Note: Emits a munmap() syscall: munmap(addr, length)
+    Let args be List.list_create(2)
+    List.list_append(args, addr_op)
+    List.list_append(args, len_op)
+    Return emit_syscall_sequence(output, registry, platform_id, COMPILER_SYSCALL_MUNMAP, args, 2)
+End Process
+
+Process called "emit_brk_syscall" that takes output as Integer, registry as Integer, platform_id as Integer, addr_op as Integer returns Integer:
+    Note: Emits a brk() syscall: brk(addr)
+    Let args be List.list_create(1)
+    List.list_append(args, addr_op)
+    Return emit_syscall_sequence(output, registry, platform_id, COMPILER_SYSCALL_BRK, args, 1)
+End Process

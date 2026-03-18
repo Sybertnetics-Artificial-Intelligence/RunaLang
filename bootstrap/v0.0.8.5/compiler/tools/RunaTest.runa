@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,598 @@ limitations under the License.
 :End Note
 
 Note:
+RUNA TEST TOOL - CLI Test Runner Entry Point
+
 This file handles Runa test execution and testing framework.
 
 This file performs the following tasks:
-- Process Runa test execution and testing framework
-- Handle test discovery and test execution
-- Manage test reporting and test validation
-- Process test optimization and test consistency
+- Discover test files matching naming conventions (test_*.runa, *_test.runa)
+- Compile and execute each test file, capturing pass/fail/skip status
+- Collect results into a TestResults summary structure
+- Report test summary with counts, timings, and failure details
 
 This file is essential because of the following reasons:
-- Runa test execution ensures code quality and correctness
-- Proper test handling ensures correct test execution and reporting
-- RunaTest support enables Runa compilation for tested code
+- Runa test tool ensures code quality and correctness through automated testing
+- Proper test discovery and execution ensures comprehensive test coverage
+- RunaTest bridges user-facing CLI with compiler test infrastructure
 
 This file consists of the following functions/features/operation types:
-- Runa test execution and testing framework
-- Test discovery and test execution
-- Test reporting and test validation
-- Test optimization and test consistency
+- TestResults type for aggregated test outcome tracking
+- discover_test_files to scan directories for test file patterns
+- execute_test_file to compile and run a single test, returning pass/fail/skip
+- collect_results to aggregate individual test outcomes into TestResults
+- report_test_summary to display formatted test results to the user
+- run_tests as the top-level entry point orchestrating the test pipeline
+
+Dependencies:
+- Imports compiler/internal/string_utils.runa for string operations
+- Imports compiler/internal/file_utils.runa for file/directory scanning
+- Imports compiler/internal/memory_utils.runa for memory allocation
+- Imports compiler/internal/time_utils.runa for test timing
+- Imports compiler/internal/arena_utils.runa for arena-scoped allocation
+- Imports compiler/driver/build_system.runa for compilation of test files
 :End Note
 
-Note: TODO - Implement RunaTest functionality
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/file_utils.runa" as FileUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/time_utils.runa" as TimeUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+Import "compiler/driver/build_system.runa" as BuildSystem
+
+Note: ============================================================================
+Note: Test Tool Constants
+Note: ============================================================================
+
+Constant TEST_TOOL_VERSION as Integer is 1
+Constant TEST_TOOL_SUCCESS as Integer is 0
+Constant TEST_TOOL_FAILURE as Integer is 1
+Constant TEST_TOOL_INVALID_ARGS as Integer is 2
+
+Constant TEST_STATUS_PASSED as Integer is 0
+Constant TEST_STATUS_FAILED as Integer is 1
+Constant TEST_STATUS_SKIPPED as Integer is 2
+Constant TEST_STATUS_ERROR as Integer is 3
+
+Constant TEST_MAX_FILES as Integer is 4096
+Constant TEST_FILE_PREFIX_LEN as Integer is 5     Note: Length of "test_"
+Constant TEST_FILE_SUFFIX_LEN as Integer is 10    Note: Length of "_test.runa"
+
+Note: TestResults memory layout (72 bytes):
+Note: offset  0: passed (8 bytes) - Number of tests that passed
+Note: offset  8: failed (8 bytes) - Number of tests that failed
+Note: offset 16: skipped (8 bytes) - Number of tests that were skipped
+Note: offset 24: total (8 bytes) - Total number of tests discovered
+Note: offset 32: error_count (8 bytes) - Number of tests that had compilation errors
+Note: offset 40: failed_names (8 bytes) - Pointer to ArrayList of failed test name strings
+Note: offset 48: elapsed_ms (8 bytes) - Total elapsed time in milliseconds
+Note: offset 56: is_verbose (8 bytes) - Boolean: 1 if verbose output requested
+Note: offset 64: arena (8 bytes) - Pointer to arena for test results allocation
+
+Constant TEST_RESULTS_SIZE as Integer is 72
+
+Note: TestFileEntry memory layout (24 bytes):
+Note: offset  0: file_path (8 bytes) - Pointer to full file path string
+Note: offset  8: test_name (8 bytes) - Pointer to extracted test name string
+Note: offset 16: status (8 bytes) - Test status (TEST_STATUS_*)
+
+Constant TEST_FILE_ENTRY_SIZE as Integer is 24
+
+Note: ============================================================================
+Note: TestResults Creation
+Note: ============================================================================
+
+Process called "create_test_results" takes arena as Integer returns Integer:
+    Note: Allocate and initialize a TestResults structure
+    If arena is equal to 0:
+        Alert "[RUNATEST ERROR] Cannot create test results: arena is null"
+        Return 0
+    End If
+
+    Let results be arena_allocate(arena, TEST_RESULTS_SIZE, 8)
+    If results is equal to 0:
+        Alert "[RUNATEST ERROR] Failed to allocate test results"
+        Return 0
+    End If
+
+    memory_zero(results, TEST_RESULTS_SIZE)
+
+    Note: Initialize counters to zero
+    memory_set_integer(results, 0, 0)    Note: passed
+    memory_set_integer(results, 8, 0)    Note: failed
+    memory_set_integer(results, 16, 0)   Note: skipped
+    memory_set_integer(results, 24, 0)   Note: total
+    memory_set_integer(results, 32, 0)   Note: error_count
+
+    Note: Create list for failed test names
+    Let failed_names be arraylist_create(32, 8, arena)
+    If failed_names is equal to 0:
+        Alert "[RUNATEST ERROR] Failed to create failed names list"
+        Return 0
+    End If
+    memory_set_pointer(results, 40, failed_names)
+
+    memory_set_integer(results, 48, 0)   Note: elapsed_ms
+    memory_set_integer(results, 56, 0)   Note: is_verbose
+    memory_set_pointer(results, 64, arena)
+
+    Return results
+End Process
+
+Note: ============================================================================
+Note: Test File Discovery
+Note: ============================================================================
+
+Process called "discover_test_files" takes directory_path as Integer, arena as Integer returns Integer:
+    Note: Scan a directory for test files matching Runa test naming conventions
+    Note: Patterns: test_*.runa and *_test.runa
+    Note: Returns pointer to ArrayList of TestFileEntry pointers, or 0 on failure
+
+    If directory_path is equal to 0:
+        Alert "[RUNATEST ERROR] Cannot discover tests: directory path is null"
+        Return 0
+    End If
+
+    If arena is equal to 0:
+        Alert "[RUNATEST ERROR] Cannot discover tests: arena is null"
+        Return 0
+    End If
+
+    Note: List all files in the directory
+    Let all_files be directory_list_files(directory_path, arena)
+    If all_files is equal to 0:
+        Let err_msg be string_concat("[RUNATEST ERROR] Cannot list directory: ", directory_path)
+        Alert err_msg
+        deallocate(err_msg)
+        Return 0
+    End If
+
+    Note: Create result list for matching test files
+    Let test_files be arraylist_create(64, 8, arena)
+    If test_files is equal to 0:
+        Alert "[RUNATEST ERROR] Failed to create test files list"
+        Return 0
+    End If
+
+    Note: Iterate through all files and filter for test patterns
+    Let file_count be arraylist_length(all_files)
+    Let file_idx be 0
+    While file_idx is less than file_count:
+        Let entry_ptr be arraylist_get(all_files, file_idx)
+        If entry_ptr is not equal to 0:
+            Let file_name be memory_get_pointer(entry_ptr, 0)
+            If file_name is not equal to 0:
+                Let is_test_file be 0
+
+                Note: Check if filename starts with "test_"
+                Let has_test_prefix be string_starts_with(file_name, "test_")
+                If has_test_prefix is equal to 1:
+                    Note: Check if filename ends with ".runa"
+                    Let has_runa_suffix be string_ends_with(file_name, ".runa")
+                    If has_runa_suffix is equal to 1:
+                        Set is_test_file to 1
+                    End If
+                End If
+
+                Note: Check if filename ends with "_test.runa"
+                If is_test_file is equal to 0:
+                    Let has_test_suffix be string_ends_with(file_name, "_test.runa")
+                    If has_test_suffix is equal to 1:
+                        Set is_test_file to 1
+                    End If
+                End If
+
+                Note: If this is a test file, create an entry and add it
+                If is_test_file is equal to 1:
+                    Let entry be arena_allocate(arena, TEST_FILE_ENTRY_SIZE, 8)
+                    If entry is not equal to 0:
+                        memory_zero(entry, TEST_FILE_ENTRY_SIZE)
+
+                        Note: Build full path: directory_path + "/" + file_name
+                        Let path_with_sep be string_concat(directory_path, "/")
+                        Let full_path be string_concat(path_with_sep, file_name)
+                        deallocate(path_with_sep)
+                        Let full_path_copy be string_duplicate(full_path, arena)
+                        deallocate(full_path)
+
+                        memory_set_pointer(entry, 0, full_path_copy)
+
+                        Note: Extract test name (filename without .runa extension)
+                        Let name_len be string_length(file_name)
+                        Let test_name_len be name_len minus 5   Note: Remove ".runa"
+                        Let test_name be string_substring(file_name, 0, test_name_len, arena)
+                        memory_set_pointer(entry, 8, test_name)
+
+                        Note: Status not yet determined
+                        memory_set_integer(entry, 16, TEST_STATUS_SKIPPED)
+
+                        arraylist_append(test_files, entry)
+                    End If
+                End If
+            End If
+        End If
+        Set file_idx to file_idx plus 1
+    End While
+
+    Return test_files
+End Process
+
+Note: ============================================================================
+Note: Single Test File Execution
+Note: ============================================================================
+
+Process called "execute_test_file" takes test_entry as Integer, arena as Integer returns Integer:
+    Note: Compile and execute a single test file
+    Note: Returns TEST_STATUS_PASSED, TEST_STATUS_FAILED, TEST_STATUS_SKIPPED, or TEST_STATUS_ERROR
+
+    If test_entry is equal to 0:
+        Return TEST_STATUS_ERROR
+    End If
+
+    If arena is equal to 0:
+        Return TEST_STATUS_ERROR
+    End If
+
+    Let file_path be memory_get_pointer(test_entry, 0)
+    Let test_name be memory_get_pointer(test_entry, 8)
+
+    If file_path is equal to 0:
+        Return TEST_STATUS_ERROR
+    End If
+
+    Note: Verify the test file exists
+    Let exists be file_exists_check(file_path)
+    If exists is not equal to 1:
+        Let err_msg be string_concat("[RUNATEST] Test file not found: ", file_path)
+        Alert err_msg
+        deallocate(err_msg)
+        memory_set_integer(test_entry, 16, TEST_STATUS_ERROR)
+        Return TEST_STATUS_ERROR
+    End If
+
+    Note: Create a build context to compile the test file
+    Let build_ctx be create_build_context(arena)
+    If build_ctx is equal to 0:
+        memory_set_integer(test_entry, 16, TEST_STATUS_ERROR)
+        Return TEST_STATUS_ERROR
+    End If
+
+    Note: Add the test file as source
+    add_source_file(build_ctx, file_path)
+
+    Note: Set optimization to none for test builds (preserve debug semantics)
+    memory_set_integer(build_ctx, 16, 0)
+
+    Note: Enable debug info for test builds
+    memory_set_integer(build_ctx, 104, 1)
+
+    Note: Compile the test file
+    Let compile_result be build_all(build_ctx)
+    If compile_result is not equal to 0:
+        Note: Compilation failed
+        If test_name is not equal to 0:
+            Let err_msg be string_concat("[RUNATEST] Compilation failed: ", test_name)
+            Alert err_msg
+            deallocate(err_msg)
+        End If
+        memory_set_integer(test_entry, 16, TEST_STATUS_ERROR)
+        Return TEST_STATUS_ERROR
+    End If
+
+    Note: Execute the compiled test binary
+    Note: The build system produces an executable; we run it and check the exit code
+    Let exe_path be memory_get_pointer(build_ctx, 144)
+    If exe_path is equal to 0:
+        Note: No executable was produced
+        memory_set_integer(test_entry, 16, TEST_STATUS_ERROR)
+        Return TEST_STATUS_ERROR
+    End If
+
+    Let exit_code be execute_process(exe_path)
+
+    Note: Interpret exit code: 0 = passed, nonzero = failed
+    If exit_code is equal to 0:
+        memory_set_integer(test_entry, 16, TEST_STATUS_PASSED)
+        Return TEST_STATUS_PASSED
+    End If
+
+    memory_set_integer(test_entry, 16, TEST_STATUS_FAILED)
+    Return TEST_STATUS_FAILED
+End Process
+
+Note: ============================================================================
+Note: Result Collection
+Note: ============================================================================
+
+Process called "collect_results" takes test_files as Integer, results as Integer returns Integer:
+    Note: Aggregate individual test outcomes into the TestResults structure
+    Note: Returns 0 on success, 1 on failure
+
+    If test_files is equal to 0:
+        Alert "[RUNATEST ERROR] Cannot collect results: test files list is null"
+        Return 1
+    End If
+
+    If results is equal to 0:
+        Alert "[RUNATEST ERROR] Cannot collect results: results structure is null"
+        Return 1
+    End If
+
+    Let total be arraylist_length(test_files)
+    memory_set_integer(results, 24, total)
+
+    Let passed be 0
+    Let failed be 0
+    Let skipped be 0
+    Let errors be 0
+
+    Let failed_names be memory_get_pointer(results, 40)
+
+    Let idx be 0
+    While idx is less than total:
+        Let entry_ptr be arraylist_get(test_files, idx)
+        If entry_ptr is not equal to 0:
+            Let entry be memory_get_pointer(entry_ptr, 0)
+            If entry is not equal to 0:
+                Let status be memory_get_integer(entry, 16)
+
+                If status is equal to TEST_STATUS_PASSED:
+                    Set passed to passed plus 1
+                Otherwise:
+                    If status is equal to TEST_STATUS_FAILED:
+                        Set failed to failed plus 1
+                        Note: Record the failed test name
+                        If failed_names is not equal to 0:
+                            Let test_name be memory_get_pointer(entry, 8)
+                            If test_name is not equal to 0:
+                                arraylist_append(failed_names, test_name)
+                            End If
+                        End If
+                    Otherwise:
+                        If status is equal to TEST_STATUS_SKIPPED:
+                            Set skipped to skipped plus 1
+                        Otherwise:
+                            Set errors to errors plus 1
+                            Note: Errors are also considered failures for reporting
+                            If failed_names is not equal to 0:
+                                Let test_name be memory_get_pointer(entry, 8)
+                                If test_name is not equal to 0:
+                                    arraylist_append(failed_names, test_name)
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    memory_set_integer(results, 0, passed)
+    memory_set_integer(results, 8, failed)
+    memory_set_integer(results, 16, skipped)
+    memory_set_integer(results, 32, errors)
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Test Summary Reporting
+Note: ============================================================================
+
+Process called "report_test_summary" takes results as Integer returns Integer:
+    Note: Display formatted test results to the user
+    Note: Returns 0 on success
+
+    If results is equal to 0:
+        Alert "[RUNATEST ERROR] Cannot report summary: results is null"
+        Return 1
+    End If
+
+    Let passed be memory_get_integer(results, 0)
+    Let failed be memory_get_integer(results, 8)
+    Let skipped be memory_get_integer(results, 16)
+    Let total be memory_get_integer(results, 24)
+    Let errors be memory_get_integer(results, 32)
+    Let elapsed_ms be memory_get_integer(results, 48)
+    Let is_verbose be memory_get_integer(results, 56)
+
+    Display "=================================================="
+    Display "[RUNATEST] Test Summary"
+    Display "=================================================="
+
+    Display "[RUNATEST]   Total:   "
+    Display total
+
+    Display "[RUNATEST]   Passed:  "
+    Display passed
+
+    Display "[RUNATEST]   Failed:  "
+    Display failed
+
+    Display "[RUNATEST]   Skipped: "
+    Display skipped
+
+    If errors is greater than 0:
+        Display "[RUNATEST]   Errors:  "
+        Display errors
+    End If
+
+    Display "[RUNATEST]   Elapsed: "
+    Display elapsed_ms
+    Display " ms"
+
+    Note: Display failed test names
+    Let total_failures be failed plus errors
+    If total_failures is greater than 0:
+        Display ""
+        Alert "[RUNATEST] Failed tests:"
+        Let failed_names be memory_get_pointer(results, 40)
+        If failed_names is not equal to 0:
+            Let fail_count be arraylist_length(failed_names)
+            Let fail_idx be 0
+            While fail_idx is less than fail_count:
+                Let name_ptr be arraylist_get(failed_names, fail_idx)
+                If name_ptr is not equal to 0:
+                    Let name be memory_get_pointer(name_ptr, 0)
+                    If name is not equal to 0:
+                        Let fail_msg be string_concat("  FAIL: ", name)
+                        Alert fail_msg
+                        deallocate(fail_msg)
+                    End If
+                End If
+                Set fail_idx to fail_idx plus 1
+            End While
+        End If
+    End If
+
+    Display "=================================================="
+
+    Note: Final pass/fail verdict
+    If total_failures is equal to 0:
+        Display "[RUNATEST] ALL TESTS PASSED"
+    Otherwise:
+        Alert "[RUNATEST] SOME TESTS FAILED"
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Top-Level Entry Point
+Note: ============================================================================
+
+Process called "run_tests" takes argc as Integer, argv as Integer returns Integer:
+    Note: Main entry point for the RunaTest tool
+    Note: Discovers test files, executes them, collects results, reports summary
+    Note: Returns exit code (0 = all passed, 1 = some failed)
+
+    Note: Create arena for test-scoped allocations
+    Let arena be arena_create(131072)
+    If arena is equal to 0:
+        Alert "[RUNATEST ERROR] Failed to create arena"
+        Return TEST_TOOL_FAILURE
+    End If
+
+    Note: Parse test directory from arguments (default: "tests/")
+    Let test_dir be 0
+    Let is_verbose be 0
+    Let ptr_size be 8
+
+    If argc is greater than 1:
+        Let i be 1
+        While i is less than argc:
+            Let arg_offset be i multiplied by ptr_size
+            Let arg_ptr be argv plus arg_offset
+            Let arg be memory_get_pointer(arg_ptr, 0)
+            If arg is not equal to 0:
+                Let is_verbose_flag be string_equals(arg, "--verbose")
+                If is_verbose_flag is equal to 1:
+                    Set is_verbose to 1
+                Otherwise:
+                    Note: Treat non-flag arguments as test directory
+                    Set test_dir to arg
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Default test directory
+    If test_dir is equal to 0:
+        Set test_dir to "tests/"
+    End If
+
+    Note: Record start time
+    Let start_time be time_now_monotonic(arena)
+
+    Note: Discover test files
+    Let test_files be discover_test_files(test_dir, arena)
+    If test_files is equal to 0:
+        Alert "[RUNATEST] No test files found"
+        arena_destroy(arena)
+        Return TEST_TOOL_SUCCESS
+    End If
+
+    Let file_count be arraylist_length(test_files)
+    If file_count is equal to 0:
+        Display "[RUNATEST] No test files found in: "
+        Display test_dir
+        arena_destroy(arena)
+        Return TEST_TOOL_SUCCESS
+    End If
+
+    Display "[RUNATEST] Discovered "
+    Display file_count
+    Display " test file(s)"
+
+    Note: Execute each test file
+    Let exec_idx be 0
+    While exec_idx is less than file_count:
+        Let entry_ptr be arraylist_get(test_files, exec_idx)
+        If entry_ptr is not equal to 0:
+            Let entry be memory_get_pointer(entry_ptr, 0)
+            If entry is not equal to 0:
+                Let test_name be memory_get_pointer(entry, 8)
+                If is_verbose is equal to 1:
+                    If test_name is not equal to 0:
+                        Let run_msg be string_concat("[RUNATEST] Running: ", test_name)
+                        Display run_msg
+                        deallocate(run_msg)
+                    End If
+                End If
+
+                Let status be execute_test_file(entry, arena)
+
+                If is_verbose is equal to 1:
+                    If status is equal to TEST_STATUS_PASSED:
+                        Display "[RUNATEST]   PASSED"
+                    Otherwise:
+                        If status is equal to TEST_STATUS_FAILED:
+                            Alert "[RUNATEST]   FAILED"
+                        Otherwise:
+                            If status is equal to TEST_STATUS_SKIPPED:
+                                Display "[RUNATEST]   SKIPPED"
+                            Otherwise:
+                                Alert "[RUNATEST]   ERROR"
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set exec_idx to exec_idx plus 1
+    End While
+
+    Note: Collect results
+    Let results be create_test_results(arena)
+    If results is equal to 0:
+        arena_destroy(arena)
+        Return TEST_TOOL_FAILURE
+    End If
+
+    memory_set_integer(results, 56, is_verbose)
+    Let collect_status be collect_results(test_files, results)
+
+    Note: Record end time and compute elapsed
+    Let end_time be time_now_monotonic(arena)
+    Let elapsed_ms be time_diff_ms(start_time, end_time)
+    memory_set_integer(results, 48, elapsed_ms)
+
+    Note: Report summary
+    Let report_status be report_test_summary(results)
+
+    Note: Determine exit code
+    Let failed be memory_get_integer(results, 8)
+    Let errors be memory_get_integer(results, 32)
+    Let total_failures be failed plus errors
+
+    Note: Cleanup
+    arena_destroy(arena)
+
+    If total_failures is greater than 0:
+        Return TEST_TOOL_FAILURE
+    End If
+
+    Return TEST_TOOL_SUCCESS
+End Process

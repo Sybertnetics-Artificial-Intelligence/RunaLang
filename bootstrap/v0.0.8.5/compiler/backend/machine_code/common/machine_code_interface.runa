@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,937 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles machine code interface and architecture abstraction.
+Machine Code Interface - Architecture Abstraction Layer
 
-This file performs the following tasks:
-- Process machine code interface and architecture abstraction
-- Handle machine code generation and machine code output
-- Manage machine code optimization and machine code optimization
-- Process machine code validation and machine code verification
+Defines the abstract backend interface that all architecture-specific code generators
+implement. Provides common types for assembly output buffering, binary output buffering,
+and backend configuration. All architecture backends (x86_64, aarch64, arm32, riscv,
+mips, powerpc, wasm) implement the BackendInterface contract through function pointers.
 
-This file is essential because of the following reasons:
-- Machine code interface enables architecture-agnostic machine code generation
-- Proper machine code interface ensures correct machine code generation across architectures
-- Machine code interface support enables Runa compilation for multiple architectures
-
-This file consists of the following functions/features/operation types:
-- Machine code interface and architecture abstraction
-- Machine code generation and machine code output
-- Machine code optimization and machine code optimization
-- Machine code validation and machine code verification
+Dependencies:
+- Imports LIR types for instruction/operand/function/module definitions
+- Imports string utilities for assembly text output buffering
+- Imports memory utilities for binary output buffering
 :End Note
 
-Note: TODO - Implement machine code interface functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+
+Note: ============================================================================
+Note: Target Architecture Constants
+Note: ============================================================================
+
+Constant TARGET_ARCH_X86_64 as Integer is 1
+Constant TARGET_ARCH_AARCH64 as Integer is 2
+Constant TARGET_ARCH_ARM32 as Integer is 3
+Constant TARGET_ARCH_X86 as Integer is 4
+Constant TARGET_ARCH_RISCV64 as Integer is 5
+Constant TARGET_ARCH_RISCV32 as Integer is 6
+Constant TARGET_ARCH_MIPS64 as Integer is 7
+Constant TARGET_ARCH_MIPS32 as Integer is 8
+Constant TARGET_ARCH_POWERPC as Integer is 9
+Constant TARGET_ARCH_WASM32 as Integer is 10
+Constant TARGET_ARCH_WASM64 as Integer is 11
+
+Note: Target Operating System Constants
+Constant TARGET_OS_LINUX as Integer is 1
+Constant TARGET_OS_DARWIN as Integer is 2
+Constant TARGET_OS_WINDOWS as Integer is 3
+Constant TARGET_OS_FREEBSD as Integer is 4
+Constant TARGET_OS_OPENBSD as Integer is 5
+Constant TARGET_OS_NETBSD as Integer is 6
+Constant TARGET_OS_WASI as Integer is 7
+Constant TARGET_OS_BARE_METAL as Integer is 8
+
+Note: Output Format Constants
+Constant OUTPUT_FORMAT_ASM as Integer is 1          Note: Text assembly (.s files)
+Constant OUTPUT_FORMAT_OBJECT as Integer is 2       Note: Object files (.o files)
+Constant OUTPUT_FORMAT_EXECUTABLE as Integer is 3   Note: Linked executables
+Constant OUTPUT_FORMAT_SHARED_LIB as Integer is 4   Note: Shared libraries (.so/.dylib/.dll)
+Constant OUTPUT_FORMAT_STATIC_LIB as Integer is 5   Note: Static libraries (.a)
+
+Note: Assembly Syntax Constants
+Constant ASM_SYNTAX_ATT as Integer is 1             Note: AT&T syntax (GNU as)
+Constant ASM_SYNTAX_INTEL as Integer is 2           Note: Intel syntax (NASM)
+Constant ASM_SYNTAX_ARM as Integer is 3             Note: ARM syntax
+Constant ASM_SYNTAX_WAT as Integer is 4             Note: WebAssembly Text format
+
+Note: Optimization Level Constants
+Constant OPT_LEVEL_NONE as Integer is 0             Note: No optimization (-O0)
+Constant OPT_LEVEL_BASIC as Integer is 1            Note: Basic optimization (-O1)
+Constant OPT_LEVEL_STANDARD as Integer is 2         Note: Standard optimization (-O2)
+Constant OPT_LEVEL_AGGRESSIVE as Integer is 3       Note: Aggressive optimization (-O3)
+Constant OPT_LEVEL_SIZE as Integer is 4             Note: Size optimization (-Os)
+
+Note: Section Type Constants
+Constant SECTION_TEXT as Integer is 1               Note: .text (executable code)
+Constant SECTION_DATA as Integer is 2               Note: .data (initialized data)
+Constant SECTION_RODATA as Integer is 3             Note: .rodata (read-only data)
+Constant SECTION_BSS as Integer is 4                Note: .bss (uninitialized data)
+Constant SECTION_NOTE as Integer is 5               Note: .note (metadata)
+
+Note: ============================================================================
+Note: Assembly Output Buffer
+Note: ============================================================================
+
+@Reasoning
+AssemblyOutput provides a section-aware string buffer for generating assembly text.
+It maintains separate buffers for different sections (.text, .data, .rodata, .bss)
+and tracks string literals, global variables, and external symbols for proper
+assembly file structure.
+
+Each section is a separate string buffer so that the final assembly file can be
+emitted with sections in the correct order regardless of the order in which code
+generation encounters them. String literals are deduplicated and assigned unique
+labels.
+@End Reasoning
+
+Type called "AssemblyOutput":
+    text_section as Integer           Note: String buffer pointer for .text section
+    data_section as Integer           Note: String buffer pointer for .data section
+    rodata_section as Integer         Note: String buffer pointer for .rodata section
+    bss_section as Integer            Note: String buffer pointer for .bss section
+    string_literals as Integer        Note: Dictionary mapping string content -> label name
+    string_literal_count as Integer   Note: Counter for generating unique string labels
+    global_symbols as Integer         Note: List of global symbol name pointers
+    external_symbols as Integer       Note: List of external symbol name pointers
+    label_counter as Integer          Note: Counter for generating unique code labels
+    current_section as Integer        Note: Currently active section (SECTION_TEXT, etc.)
+    total_lines as Integer            Note: Total lines emitted across all sections
+    arena as Integer                  Note: Arena pointer for temporary allocations
+End Type
+
+Note: Size: 12 fields * 8 bytes = 96 bytes per AssemblyOutput
+
+Note: ============================================================================
+Note: Binary Output Buffer
+Note: ============================================================================
+
+@Reasoning
+BinaryOutput provides a byte buffer for encoding binary machine code directly.
+This is used for the direct binary encoding path (bypassing the system assembler)
+for producing object files and executables. It tracks relocations, symbols, and
+section boundaries for proper ELF/PE/Mach-O generation.
+@End Reasoning
+
+Type called "BinaryOutput":
+    code_buffer as Integer            Note: Pointer to byte buffer for machine code
+    code_size as Integer              Note: Current size of code buffer in bytes
+    code_capacity as Integer          Note: Allocated capacity of code buffer
+    data_buffer as Integer            Note: Pointer to byte buffer for data section
+    data_size as Integer              Note: Current size of data buffer
+    data_capacity as Integer          Note: Allocated capacity of data buffer
+    rodata_buffer as Integer          Note: Pointer to byte buffer for read-only data
+    rodata_size as Integer            Note: Current size of rodata buffer
+    rodata_capacity as Integer        Note: Allocated capacity of rodata buffer
+    relocations as Integer            Note: List of RelocationEntry pointers
+    relocation_count as Integer       Note: Number of relocations
+    symbols as Integer                Note: List of SymbolEntry pointers
+    symbol_count as Integer           Note: Number of symbols
+    arena as Integer                  Note: Arena pointer for allocations
+End Type
+
+Note: Size: 14 fields * 8 bytes = 112 bytes per BinaryOutput
+
+Note: ============================================================================
+Note: Backend Configuration
+Note: ============================================================================
+
+@Reasoning
+BackendConfig captures all the settings needed to configure code generation for a
+specific target. This includes the target architecture, OS, optimization level,
+output format, and various flags like PIC (position-independent code), debug info
+generation, and assembly syntax preference.
+
+This type is passed to the backend at initialization and guides all code generation
+decisions throughout the compilation process.
+@End Reasoning
+
+Type called "BackendConfig":
+    target_arch as Integer            Note: Target architecture (TARGET_ARCH_*)
+    target_os as Integer              Note: Target OS (TARGET_OS_*)
+    optimization_level as Integer     Note: Optimization level (OPT_LEVEL_*)
+    output_format as Integer          Note: Output format (OUTPUT_FORMAT_*)
+    asm_syntax as Integer             Note: Assembly syntax (ASM_SYNTAX_*)
+    enable_pic as Integer             Note: 1 to enable position-independent code
+    enable_debug_info as Integer      Note: 1 to emit debug information (DWARF/CodeView)
+    enable_frame_pointer as Integer   Note: 1 to always use frame pointer
+    pointer_size as Integer           Note: Pointer size in bytes (4 or 8)
+    stack_alignment as Integer        Note: Required stack alignment (8 or 16)
+    red_zone_size as Integer          Note: Red zone size (128 on System V x86_64, 0 on Win64)
+    target_features as Integer        Note: Bitfield of enabled target features (SSE, AVX, etc.)
+End Type
+
+Note: Size: 12 fields * 8 bytes = 96 bytes per BackendConfig
+
+Note: ============================================================================
+Note: Relocation and Symbol Entries
+Note: ============================================================================
+
+@Reasoning
+Relocations represent addresses that need to be patched after linking. Each relocation
+records the location in the code/data buffer that needs patching, the symbol it refers
+to, the relocation type (absolute, PC-relative, GOT, PLT), and any addend.
+
+SymbolEntry tracks named entities (functions, globals, labels) with their addresses,
+sizes, visibility, and binding (local vs global vs weak).
+@End Reasoning
+
+Constant RELOC_TYPE_ABSOLUTE as Integer is 1        Note: Absolute address relocation
+Constant RELOC_TYPE_PC_RELATIVE as Integer is 2     Note: PC-relative relocation
+Constant RELOC_TYPE_GOT as Integer is 3             Note: GOT (Global Offset Table) entry
+Constant RELOC_TYPE_PLT as Integer is 4             Note: PLT (Procedure Linkage Table) entry
+Constant RELOC_TYPE_GOTPCREL as Integer is 5        Note: GOT entry, PC-relative
+
+Constant SYMBOL_BIND_LOCAL as Integer is 0          Note: Local symbol
+Constant SYMBOL_BIND_GLOBAL as Integer is 1         Note: Global symbol
+Constant SYMBOL_BIND_WEAK as Integer is 2           Note: Weak symbol
+
+Constant SYMBOL_TYPE_NOTYPE as Integer is 0         Note: No type
+Constant SYMBOL_TYPE_FUNC as Integer is 1           Note: Function symbol
+Constant SYMBOL_TYPE_OBJECT as Integer is 2         Note: Data object symbol
+Constant SYMBOL_TYPE_SECTION as Integer is 3        Note: Section symbol
+
+Type called "RelocationEntry":
+    offset as Integer                 Note: Offset within section where relocation applies
+    symbol_index as Integer           Note: Index into symbol table
+    relocation_type as Integer        Note: Type of relocation (RELOC_TYPE_*)
+    addend as Integer                 Note: Constant addend for relocation computation
+    section as Integer                Note: Section containing the relocation site
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per RelocationEntry
+
+Type called "SymbolEntry":
+    name as Integer                   Note: Pointer to symbol name string
+    value as Integer                  Note: Symbol value (address/offset within section)
+    size as Integer                   Note: Symbol size in bytes (for objects/functions)
+    section as Integer                Note: Section index where symbol is defined
+    binding as Integer                Note: Symbol binding (SYMBOL_BIND_*)
+    symbol_type as Integer            Note: Symbol type (SYMBOL_TYPE_*)
+    is_defined as Integer             Note: 1 if defined here, 0 if external reference
+    visibility as Integer             Note: 0=default, 1=hidden, 2=protected
+End Type
+
+Note: Size: 8 fields * 8 bytes = 64 bytes per SymbolEntry
+
+Note: ============================================================================
+Note: Backend Interface (Function Pointer Table)
+Note: ============================================================================
+
+@Reasoning
+BackendInterface is a type containing function pointers that each architecture backend
+implements. This provides polymorphic dispatch to the correct code generator without
+needing language-level virtual dispatch.
+
+The main entry point is generate_assembly which takes a complete LIR module and produces
+an AssemblyOutput. Additional function pointers handle specific aspects like prologue/
+epilogue emission, operand formatting, and binary encoding.
+
+Each architecture creates an instance of this type and fills in the function pointers
+with its own implementation functions.
+@End Reasoning
+
+Type called "BackendInterface":
+    generate_assembly as Integer      Note: fn(lir_module, config) -> AssemblyOutput*
+    generate_binary as Integer        Note: fn(lir_module, config) -> BinaryOutput*
+    emit_prologue as Integer          Note: fn(lir_function, output, config) -> void
+    emit_epilogue as Integer          Note: fn(lir_function, output, config) -> void
+    emit_instruction as Integer       Note: fn(lir_instruction, output, config) -> void
+    format_operand as Integer         Note: fn(lir_operand, config) -> string*
+    format_register as Integer        Note: fn(register_id, size, config) -> string*
+    get_register_name as Integer      Note: fn(register_id, size) -> string*
+    get_arch_name as Integer          Note: fn() -> string*
+    supports_feature as Integer       Note: fn(feature_id) -> bool
+End Type
+
+Note: Size: 10 fields * 8 bytes = 80 bytes per BackendInterface
+
+Note: ============================================================================
+Note: Assembly Output Operations
+Note: ============================================================================
+
+Process called "create_assembly_output" that takes arena as Integer returns Integer:
+    Note: Creates a new AssemblyOutput with all section buffers initialized
+    Let output be Layout.allocate(96)
+    If output is 0:
+        Return 0
+    End If
+
+    Note: Create string buffers for each section (initial capacity 4096 bytes)
+    Let text_buf be StringUtils.string_create(arena, 4096)
+    Let data_buf be StringUtils.string_create(arena, 4096)
+    Let rodata_buf be StringUtils.string_create(arena, 4096)
+    Let bss_buf be StringUtils.string_create(arena, 1024)
+
+    Note: Store section buffers
+    __store(output, 0, text_buf)
+    __store(output, 8, data_buf)
+    __store(output, 16, rodata_buf)
+    __store(output, 24, bss_buf)
+
+    Note: Create string literal dedup dictionary
+    Let string_dict be Dictionary.dictionary_create(64)
+    __store(output, 32, string_dict)
+    __store(output, 40, 0)
+
+    Note: Create symbol lists
+    Let globals be List.list_create(32)
+    Let externals be List.list_create(32)
+    __store(output, 48, globals)
+    __store(output, 56, externals)
+
+    Note: Initialize counters
+    __store(output, 64, 0)
+    __store(output, 72, SECTION_TEXT)
+    __store(output, 80, 0)
+    __store(output, 88, arena)
+
+    Return output
+End Process
+
+Process called "asm_emit_to_section" that takes output as Integer, section as Integer, text as Integer returns Integer:
+    Note: Emits text to the specified section of the assembly output
+    Note: text is a pointer to a null-terminated string
+    Note: Returns 1 on success, 0 on failure
+    If output is 0:
+        Return 0
+    End If
+
+    Note: Select the correct section buffer based on section constant
+    Let buffer be 0
+    If section is SECTION_TEXT:
+        Set buffer to __load(output, 0)
+    End If
+    If section is SECTION_DATA:
+        Set buffer to __load(output, 8)
+    End If
+    If section is SECTION_RODATA:
+        Set buffer to __load(output, 16)
+    End If
+    If section is SECTION_BSS:
+        Set buffer to __load(output, 24)
+    End If
+
+    If buffer is 0:
+        Return 0
+    End If
+
+    Note: Append the text to the section buffer
+    Let result be StringUtils.string_append(buffer, text)
+
+    Note: Increment line counter
+    Let lines be __load(output, 80)
+    __store(output, 80, lines + 1)
+
+    Return 1
+End Process
+
+Process called "asm_emit_line" that takes output as Integer, section as Integer, text as Integer returns Integer:
+    Note: Emits text followed by a newline to the specified section
+    Let result be asm_emit_to_section(output, section, text)
+    If result is 0:
+        Return 0
+    End If
+
+    Note: Append newline
+    Let buffer be 0
+    If section is SECTION_TEXT:
+        Set buffer to __load(output, 0)
+    End If
+    If section is SECTION_DATA:
+        Set buffer to __load(output, 8)
+    End If
+    If section is SECTION_RODATA:
+        Set buffer to __load(output, 16)
+    End If
+    If section is SECTION_BSS:
+        Set buffer to __load(output, 24)
+    End If
+
+    If buffer is not 0:
+        StringUtils.string_append(buffer, "\n")
+    End If
+
+    Return 1
+End Process
+
+Process called "asm_get_unique_label" that takes output as Integer returns Integer:
+    Note: Returns a unique label ID and increments the counter
+    If output is 0:
+        Return 0
+    End If
+    Let counter be __load(output, 64)
+    __store(output, 64, counter + 1)
+    Return counter
+End Process
+
+Process called "asm_register_string_literal" that takes output as Integer, content as Integer returns Integer:
+    Note: Registers a string literal and returns its unique label name pointer
+    Note: Deduplicates: if the same string was already registered, returns existing label
+    If output is 0:
+        Return 0
+    End If
+
+    Let string_dict be __load(output, 32)
+    If string_dict is 0:
+        Return 0
+    End If
+
+    Note: Check if string is already registered
+    Let existing be Dictionary.dictionary_get(string_dict, content)
+    If existing is not 0:
+        Return existing
+    End If
+
+    Note: Generate new string label (.LC0, .LC1, etc.)
+    Let str_count be __load(output, 40)
+    Let arena be __load(output, 88)
+    Let label_buf be StringUtils.string_create(arena, 16)
+    StringUtils.string_append(label_buf, ".LC")
+
+    Note: Convert counter to string and append
+    Let counter_str be StringCore.integer_to_string(str_count)
+    StringUtils.string_append(label_buf, counter_str)
+
+    Note: Get the label string pointer
+    Let label_ptr be __load(label_buf, 0)
+
+    Note: Store in dictionary for deduplication
+    Dictionary.dictionary_set(string_dict, content, label_ptr)
+
+    Note: Increment counter
+    __store(output, 40, str_count + 1)
+
+    Return label_ptr
+End Process
+
+Process called "asm_add_global_symbol" that takes output as Integer, symbol_name as Integer returns Integer:
+    Note: Registers a global symbol (.globl directive in assembly)
+    If output is 0:
+        Return 0
+    End If
+    Let globals be __load(output, 48)
+    If globals is 0:
+        Return 0
+    End If
+    List.list_append(globals, symbol_name)
+    Return 1
+End Process
+
+Process called "asm_add_external_symbol" that takes output as Integer, symbol_name as Integer returns Integer:
+    Note: Registers an external symbol (.extern directive in assembly)
+    If output is 0:
+        Return 0
+    End If
+    Let externals be __load(output, 56)
+    If externals is 0:
+        Return 0
+    End If
+    List.list_append(externals, symbol_name)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Binary Output Operations
+Note: ============================================================================
+
+Process called "create_binary_output" that takes arena as Integer returns Integer:
+    Note: Creates a new BinaryOutput with code and data buffers initialized
+    Let output be Layout.allocate(112)
+    If output is 0:
+        Return 0
+    End If
+
+    Note: Allocate code buffer (initial 8KB)
+    Let code_buf be MemoryUtils.allocate(8192)
+    __store(output, 0, code_buf)
+    __store(output, 8, 0)
+    __store(output, 16, 8192)
+
+    Note: Allocate data buffer (initial 4KB)
+    Let data_buf be MemoryUtils.allocate(4096)
+    __store(output, 24, data_buf)
+    __store(output, 32, 0)
+    __store(output, 40, 4096)
+
+    Note: Allocate rodata buffer (initial 4KB)
+    Let rodata_buf be MemoryUtils.allocate(4096)
+    __store(output, 48, rodata_buf)
+    __store(output, 56, 0)
+    __store(output, 64, 4096)
+
+    Note: Create relocation and symbol lists
+    Let relocs be List.list_create(64)
+    __store(output, 72, relocs)
+    __store(output, 80, 0)
+
+    Let syms be List.list_create(64)
+    __store(output, 88, syms)
+    __store(output, 96, 0)
+
+    __store(output, 104, arena)
+
+    Return output
+End Process
+
+Process called "binary_emit_byte" that takes output as Integer, byte_val as Integer returns Integer:
+    Note: Emits a single byte to the code buffer, growing if necessary
+    If output is 0:
+        Return 0
+    End If
+
+    Let code_buf be __load(output, 0)
+    Let code_size be __load(output, 8)
+    Let code_cap be __load(output, 16)
+
+    Note: Grow buffer if needed (double capacity)
+    If code_size >= code_cap:
+        Let new_cap be code_cap * 2
+        Let new_buf be MemoryUtils.allocate(new_cap)
+        If new_buf is 0:
+            Return 0
+        End If
+        Note: Copy existing data
+        Let i be 0
+        While i < code_size:
+            Let b be __load8(code_buf, i)
+            __store8(new_buf, i, b)
+            Set i to i + 1
+        End While
+        MemoryUtils.deallocate(code_buf)
+        __store(output, 0, new_buf)
+        __store(output, 16, new_cap)
+        Set code_buf to new_buf
+    End If
+
+    Note: Write byte and increment size
+    __store8(code_buf, code_size, byte_val)
+    __store(output, 8, code_size + 1)
+
+    Return 1
+End Process
+
+Process called "binary_emit_word" that takes output as Integer, word_val as Integer returns Integer:
+    Note: Emits a 16-bit little-endian value to the code buffer
+    Let low be word_val & 255
+    Let high be (word_val >> 8) & 255
+    binary_emit_byte(output, low)
+    binary_emit_byte(output, high)
+    Return 1
+End Process
+
+Process called "binary_emit_dword" that takes output as Integer, dword_val as Integer returns Integer:
+    Note: Emits a 32-bit little-endian value to the code buffer
+    binary_emit_byte(output, dword_val & 255)
+    binary_emit_byte(output, (dword_val >> 8) & 255)
+    binary_emit_byte(output, (dword_val >> 16) & 255)
+    binary_emit_byte(output, (dword_val >> 24) & 255)
+    Return 1
+End Process
+
+Process called "binary_emit_qword" that takes output as Integer, qword_val as Integer returns Integer:
+    Note: Emits a 64-bit little-endian value to the code buffer
+    binary_emit_dword(output, qword_val & 4294967295)
+    binary_emit_dword(output, (qword_val >> 32) & 4294967295)
+    Return 1
+End Process
+
+Process called "binary_add_relocation" that takes output as Integer, offset as Integer, symbol_idx as Integer, reloc_type as Integer, addend as Integer returns Integer:
+    Note: Adds a relocation entry to the binary output
+    If output is 0:
+        Return 0
+    End If
+
+    Let entry be Layout.allocate(40)
+    If entry is 0:
+        Return 0
+    End If
+
+    __store(entry, 0, offset)
+    __store(entry, 8, symbol_idx)
+    __store(entry, 16, reloc_type)
+    __store(entry, 24, addend)
+    __store(entry, 32, SECTION_TEXT)
+
+    Let relocs be __load(output, 72)
+    List.list_append(relocs, entry)
+
+    Let count be __load(output, 80)
+    __store(output, 80, count + 1)
+
+    Return 1
+End Process
+
+Process called "binary_add_symbol" that takes output as Integer, name as Integer, value as Integer, size as Integer, section as Integer, binding as Integer, sym_type as Integer returns Integer:
+    Note: Adds a symbol entry to the binary output
+    If output is 0:
+        Return 0
+    End If
+
+    Let entry be Layout.allocate(64)
+    If entry is 0:
+        Return 0
+    End If
+
+    __store(entry, 0, name)
+    __store(entry, 8, value)
+    __store(entry, 16, size)
+    __store(entry, 24, section)
+    __store(entry, 32, binding)
+    __store(entry, 40, sym_type)
+    __store(entry, 48, 1)
+    __store(entry, 56, 0)
+
+    Let syms be __load(output, 88)
+    List.list_append(syms, entry)
+
+    Let count be __load(output, 96)
+    __store(output, 96, count + 1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Backend Configuration Operations
+Note: ============================================================================
+
+Process called "create_backend_config" that takes arch as Integer, os as Integer, opt_level as Integer returns Integer:
+    Note: Creates a BackendConfig with sensible defaults for the given target
+    Let config be Layout.allocate(96)
+    If config is 0:
+        Return 0
+    End If
+
+    __store(config, 0, arch)
+    __store(config, 8, os)
+    __store(config, 16, opt_level)
+    __store(config, 24, OUTPUT_FORMAT_ASM)
+
+    Note: Set assembly syntax based on architecture
+    If arch is TARGET_ARCH_X86_64:
+        __store(config, 32, ASM_SYNTAX_ATT)
+    End If
+    If arch is TARGET_ARCH_X86:
+        __store(config, 32, ASM_SYNTAX_ATT)
+    End If
+    If arch is TARGET_ARCH_AARCH64:
+        __store(config, 32, ASM_SYNTAX_ARM)
+    End If
+    If arch is TARGET_ARCH_ARM32:
+        __store(config, 32, ASM_SYNTAX_ARM)
+    End If
+    If arch is TARGET_ARCH_WASM32:
+        __store(config, 32, ASM_SYNTAX_WAT)
+    End If
+    If arch is TARGET_ARCH_WASM64:
+        __store(config, 32, ASM_SYNTAX_WAT)
+    End If
+    If arch is TARGET_ARCH_RISCV64:
+        __store(config, 32, ASM_SYNTAX_ATT)
+    End If
+    If arch is TARGET_ARCH_RISCV32:
+        __store(config, 32, ASM_SYNTAX_ATT)
+    End If
+    If arch is TARGET_ARCH_MIPS64:
+        __store(config, 32, ASM_SYNTAX_ATT)
+    End If
+    If arch is TARGET_ARCH_MIPS32:
+        __store(config, 32, ASM_SYNTAX_ATT)
+    End If
+    If arch is TARGET_ARCH_POWERPC:
+        __store(config, 32, ASM_SYNTAX_ATT)
+    End If
+
+    Note: Default: no PIC
+    __store(config, 40, 0)
+    Note: Default: no debug info
+    __store(config, 48, 0)
+    Note: Default: use frame pointer
+    __store(config, 56, 1)
+
+    Note: Set pointer size based on architecture
+    If arch is TARGET_ARCH_X86_64:
+        __store(config, 64, 8)
+    End If
+    If arch is TARGET_ARCH_AARCH64:
+        __store(config, 64, 8)
+    End If
+    If arch is TARGET_ARCH_RISCV64:
+        __store(config, 64, 8)
+    End If
+    If arch is TARGET_ARCH_MIPS64:
+        __store(config, 64, 8)
+    End If
+    If arch is TARGET_ARCH_WASM64:
+        __store(config, 64, 8)
+    End If
+    If arch is TARGET_ARCH_X86:
+        __store(config, 64, 4)
+    End If
+    If arch is TARGET_ARCH_ARM32:
+        __store(config, 64, 4)
+    End If
+    If arch is TARGET_ARCH_RISCV32:
+        __store(config, 64, 4)
+    End If
+    If arch is TARGET_ARCH_MIPS32:
+        __store(config, 64, 4)
+    End If
+    If arch is TARGET_ARCH_WASM32:
+        __store(config, 64, 4)
+    End If
+    If arch is TARGET_ARCH_POWERPC:
+        __store(config, 64, 4)
+    End If
+
+    Note: Set stack alignment based on architecture
+    If arch is TARGET_ARCH_X86_64:
+        __store(config, 72, 16)
+    End If
+    If arch is TARGET_ARCH_AARCH64:
+        __store(config, 72, 16)
+    End If
+    If arch is TARGET_ARCH_X86:
+        __store(config, 72, 16)
+    End If
+    If arch is TARGET_ARCH_ARM32:
+        __store(config, 72, 8)
+    End If
+    If arch is TARGET_ARCH_RISCV64:
+        __store(config, 72, 16)
+    End If
+    If arch is TARGET_ARCH_RISCV32:
+        __store(config, 72, 16)
+    End If
+    If arch is TARGET_ARCH_MIPS64:
+        __store(config, 72, 16)
+    End If
+    If arch is TARGET_ARCH_MIPS32:
+        __store(config, 72, 8)
+    End If
+    If arch is TARGET_ARCH_POWERPC:
+        __store(config, 72, 16)
+    End If
+    If arch is TARGET_ARCH_WASM32:
+        __store(config, 72, 0)
+    End If
+    If arch is TARGET_ARCH_WASM64:
+        __store(config, 72, 0)
+    End If
+
+    Note: Set red zone size: 128 for System V x86_64, 0 for Win64 and other archs
+    If arch is TARGET_ARCH_X86_64:
+        If os is TARGET_OS_WINDOWS:
+            __store(config, 80, 0)
+        Otherwise:
+            __store(config, 80, 128)
+        End If
+    Otherwise:
+        __store(config, 80, 0)
+    End If
+
+    Note: No target features enabled by default
+    __store(config, 88, 0)
+
+    Return config
+End Process
+
+Process called "config_enable_pic" that takes config as Integer returns Integer:
+    Note: Enables position-independent code generation
+    If config is 0:
+        Return 0
+    End If
+    __store(config, 40, 1)
+    Return 1
+End Process
+
+Process called "config_enable_debug" that takes config as Integer returns Integer:
+    Note: Enables debug information generation
+    If config is 0:
+        Return 0
+    End If
+    __store(config, 48, 1)
+    Return 1
+End Process
+
+Process called "config_set_output_format" that takes config as Integer, format as Integer returns Integer:
+    Note: Sets the output format (ASM, OBJECT, EXECUTABLE, etc.)
+    If config is 0:
+        Return 0
+    End If
+    __store(config, 24, format)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Backend Interface Creation
+Note: ============================================================================
+
+Process called "create_backend_interface" returns Integer:
+    Note: Creates an empty BackendInterface with null function pointers
+    Note: Architecture-specific modules fill in the function pointers
+    Let iface be Layout.allocate(80)
+    If iface is 0:
+        Return 0
+    End If
+
+    Note: Initialize all function pointers to 0 (null)
+    Let i be 0
+    While i < 80:
+        __store(iface, i, 0)
+        Set i to i + 8
+    End While
+
+    Return iface
+End Process
+
+Note: ============================================================================
+Note: Assembly Finalization
+Note: ============================================================================
+
+Process called "asm_finalize" that takes output as Integer, config as Integer returns Integer:
+    Note: Finalizes the assembly output by combining all sections into a single
+    Note: assembly file string. Returns a pointer to the complete assembly text.
+    Note: Emits sections in order: directives, .rodata, .data, .bss, .text
+    If output is 0:
+        Return 0
+    End If
+
+    Let arena be __load(output, 88)
+    Let final_buf be StringUtils.string_create(arena, 16384)
+
+    Note: Emit file-level directives
+    Let arch be __load(config, 0)
+    If arch is TARGET_ARCH_X86_64:
+        StringUtils.string_append(final_buf, "\t.file\t\"output.s\"\n")
+    End If
+
+    Note: Emit .extern declarations for external symbols
+    Let externals be __load(output, 56)
+    If externals is not 0:
+        Let ext_count be List.list_length(externals)
+        Let ei be 0
+        While ei < ext_count:
+            Let ext_name be List.list_get(externals, ei)
+            If ext_name is not 0:
+                StringUtils.string_append(final_buf, "\t.extern\t")
+                StringUtils.string_append(final_buf, ext_name)
+                StringUtils.string_append(final_buf, "\n")
+            End If
+            Set ei to ei + 1
+        End While
+    End If
+
+    Note: Emit .globl declarations for global symbols
+    Let globals be __load(output, 48)
+    If globals is not 0:
+        Let gl_count be List.list_length(globals)
+        Let gi be 0
+        While gi < gl_count:
+            Let gl_name be List.list_get(globals, gi)
+            If gl_name is not 0:
+                StringUtils.string_append(final_buf, "\t.globl\t")
+                StringUtils.string_append(final_buf, gl_name)
+                StringUtils.string_append(final_buf, "\n")
+            End If
+            Set gi to gi + 1
+        End While
+    End If
+
+    Note: Emit .rodata section (string literals and read-only data)
+    Let rodata_buf be __load(output, 16)
+    If rodata_buf is not 0:
+        Let rodata_len be __load(rodata_buf, 8)
+        If rodata_len > 0:
+            StringUtils.string_append(final_buf, "\n\t.section\t.rodata\n")
+            Let rodata_text be __load(rodata_buf, 0)
+            StringUtils.string_append(final_buf, rodata_text)
+        End If
+    End If
+
+    Note: Emit .data section (initialized global variables)
+    Let data_buf be __load(output, 8)
+    If data_buf is not 0:
+        Let data_len be __load(data_buf, 8)
+        If data_len > 0:
+            StringUtils.string_append(final_buf, "\n\t.data\n")
+            Let data_text be __load(data_buf, 0)
+            StringUtils.string_append(final_buf, data_text)
+        End If
+    End If
+
+    Note: Emit .bss section (uninitialized global variables)
+    Let bss_buf be __load(output, 24)
+    If bss_buf is not 0:
+        Let bss_len be __load(bss_buf, 8)
+        If bss_len > 0:
+            StringUtils.string_append(final_buf, "\n\t.bss\n")
+            Let bss_text be __load(bss_buf, 0)
+            StringUtils.string_append(final_buf, bss_text)
+        End If
+    End If
+
+    Note: Emit .text section (executable code)
+    Let text_buf be __load(output, 0)
+    If text_buf is not 0:
+        StringUtils.string_append(final_buf, "\n\t.text\n")
+        Let text_content be __load(text_buf, 0)
+        StringUtils.string_append(final_buf, text_content)
+    End If
+
+    Note: Emit section note for non-executable stack (Linux security)
+    Let os be __load(config, 8)
+    If os is TARGET_OS_LINUX:
+        StringUtils.string_append(final_buf, "\n\t.section\t.note.GNU-stack,\"\",@progbits\n")
+    End If
+
+    Return __load(final_buf, 0)
+End Process
+
+Process called "asm_emit_string_literals" that takes output as Integer returns Integer:
+    Note: Emits all registered string literals to the .rodata section
+    If output is 0:
+        Return 0
+    End If
+
+    Let string_dict be __load(output, 32)
+    If string_dict is 0:
+        Return 0
+    End If
+
+    Let str_count be __load(output, 40)
+    If str_count is 0:
+        Return 1
+    End If
+
+    Note: Iterate through string dictionary and emit each literal
+    Let keys be Dictionary.dictionary_keys(string_dict)
+    If keys is 0:
+        Return 0
+    End If
+
+    Let key_count be List.list_length(keys)
+    Let ki be 0
+    While ki < key_count:
+        Let content be List.list_get(keys, ki)
+        Let label be Dictionary.dictionary_get(string_dict, content)
+
+        Note: Emit label and string data in .rodata
+        asm_emit_to_section(output, SECTION_RODATA, label)
+        asm_emit_to_section(output, SECTION_RODATA, ":\n")
+        asm_emit_to_section(output, SECTION_RODATA, "\t.string\t\"")
+        asm_emit_to_section(output, SECTION_RODATA, content)
+        asm_emit_line(output, SECTION_RODATA, "\"")
+
+        Set ki to ki + 1
+    End While
+
+    Return 1
+End Process

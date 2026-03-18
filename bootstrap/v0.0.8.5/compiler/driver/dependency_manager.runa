@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,8 @@ limitations under the License.
 :End Note
 
 Note:
+DEPENDENCY MANAGER - Module Dependency Graph and Topological Ordering
+
 This file handles dependency management and dependency resolution for the compiler.
 
 This file performs the following tasks:
@@ -29,10 +31,703 @@ This file is essential because of the following reasons:
 - Dependency utilities support import resolution, module compilation, and build optimization
 
 This file consists of the following functions/features/operation types:
-- Dependency resolution and dependency tracking operations
-- Dependency validation and dependency consistency management
-- Dependency optimization and dependency performance utilities
-- Dependency monitoring and dependency analysis operations
+- DependencyGraph with hash-indexed DependencyNode entries
+- DependencyNode with name, dependency list, and DFS visit markers
+- create_dependency_graph for initializing the graph
+- add_module for registering modules
+- add_dependency for recording module-to-module dependencies
+- topological_sort using DFS-based algorithm
+- detect_cycles for circular dependency detection
+- get_build_order for retrieving compilation order
+
+Dependencies:
+- Imports memory_utils.runa for memory allocation
+- Imports string_utils.runa for string operations
+- Imports arena_utils.runa for arena-based allocation
+- Imports collections.runa for ArrayList and HashTable
 :End Note
 
-Note: TODO - Implement dependency manager functionality
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+Import "compiler/internal/collections.runa" as Collections
+
+Note: ============================================================================
+Note: Dependency Manager Constants
+Note: ============================================================================
+
+Constant DEP_MAX_MODULES as Integer is 4096
+Constant DEP_MAX_DEPS_PER_MODULE as Integer is 256
+
+Note: DFS visit states
+Constant DEP_UNVISITED as Integer is 0
+Constant DEP_VISITING as Integer is 1   Note: Currently on the DFS stack (cycle detection)
+Constant DEP_VISITED as Integer is 2    Note: Fully processed
+
+Note: DependencyNode memory layout (56 bytes):
+Note: offset  0: name (8 bytes) - Pointer to module name string
+Note: offset  8: dependencies (8 bytes) - Pointer to ArrayList of dependency name strings
+Note: offset 16: dependents (8 bytes) - Pointer to ArrayList of dependent module name strings
+Note: offset 24: visit_state (8 bytes) - DFS visit state (DEP_UNVISITED/VISITING/VISITED)
+Note: offset 32: is_resolved (8 bytes) - Boolean: 1 if all deps resolved, 0 if not
+Note: offset 40: depth (8 bytes) - Topological depth (distance from leaf nodes)
+Note: offset 48: source_path (8 bytes) - Pointer to source file path (if known)
+
+Constant DEP_NODE_SIZE as Integer is 56
+
+Note: DependencyGraph memory layout (56 bytes):
+Note: offset  0: nodes (8 bytes) - Pointer to HashTable (module_name_hash -> DependencyNode pointer)
+Note: offset  8: node_count (8 bytes) - Number of modules in the graph
+Note: offset 16: arena (8 bytes) - Pointer to arena for graph allocations
+Note: offset 24: has_cycles (8 bytes) - Boolean: 1 if cycles detected
+Note: offset 32: sorted_order (8 bytes) - Pointer to ArrayList of sorted module names (cached)
+Note: offset 40: is_sorted (8 bytes) - Boolean: 1 if sorted_order is valid
+Note: offset 48: module_names (8 bytes) - Pointer to ArrayList of all module name strings (for iteration)
+
+Constant DEP_GRAPH_SIZE as Integer is 56
+
+Note: ============================================================================
+Note: Dependency Graph Creation and Destruction
+Note: ============================================================================
+
+Process called "create_dependency_graph" takes arena as Integer returns Integer:
+    Note: Create a new empty DependencyGraph
+    Note: Returns pointer to graph, or 0 on failure
+
+    If arena is equal to 0:
+        Alert "[DEP ERROR] Cannot create dependency graph: arena is null"
+        Return 0
+    End If
+
+    Let graph be arena_allocate(arena, DEP_GRAPH_SIZE, 8)
+    If graph is equal to 0:
+        Alert "[DEP ERROR] Failed to allocate dependency graph"
+        Return 0
+    End If
+
+    memory_zero(graph, DEP_GRAPH_SIZE)
+
+    Note: Create the nodes hash table
+    Let nodes be hashtable_create(128, arena)
+    If nodes is equal to 0:
+        Alert "[DEP ERROR] Failed to create nodes hash table"
+        Return 0
+    End If
+    memory_set_pointer(graph, 0, nodes)
+
+    Note: Initialize node count
+    memory_set_integer(graph, 8, 0)
+
+    Note: Store arena
+    memory_set_pointer(graph, 16, arena)
+
+    Note: No cycles detected yet
+    memory_set_integer(graph, 24, 0)
+
+    Note: No sorted order yet
+    memory_set_pointer(graph, 32, 0)
+    memory_set_integer(graph, 40, 0)
+
+    Note: Create module names list for iteration
+    Let module_names be arraylist_create(64, 8, arena)
+    If module_names is equal to 0:
+        Alert "[DEP ERROR] Failed to create module names list"
+        Return 0
+    End If
+    memory_set_pointer(graph, 48, module_names)
+
+    Return graph
+End Process
+
+Process called "destroy_dependency_graph" takes graph as Integer returns Nothing:
+    Note: DependencyGraph is fully arena-allocated, so cleanup is handled by arena_destroy.
+    Note: This function exists for explicit resource management semantics.
+    If graph is equal to 0:
+        Return
+    End If
+    Note: Invalidate the sorted cache
+    memory_set_integer(graph, 40, 0)
+End Process
+
+Note: ============================================================================
+Note: Module Management
+Note: ============================================================================
+
+Process called "add_module" takes graph as Integer, module_name as Integer returns Integer:
+    Note: Add a module to the dependency graph
+    Note: Returns 1 on success, 0 on failure
+
+    If graph is equal to 0:
+        Alert "[DEP ERROR] Cannot add module: graph is null"
+        Return 0
+    End If
+    If module_name is equal to 0:
+        Alert "[DEP ERROR] Cannot add module: name is null"
+        Return 0
+    End If
+
+    Note: Check if module already exists
+    Let nodes be memory_get_pointer(graph, 0)
+    If nodes is equal to 0:
+        Return 0
+    End If
+
+    Let name_hash be dep_compute_name_hash(module_name)
+    Let existing be hashtable_get(nodes, name_hash)
+    If existing is not equal to 0:
+        Note: Module already registered - no error, just return success
+        Return 1
+    End If
+
+    Note: Check maximum module count
+    Let node_count be memory_get_integer(graph, 8)
+    If node_count is greater than or equal to DEP_MAX_MODULES:
+        Alert "[DEP ERROR] Maximum module count exceeded"
+        Return 0
+    End If
+
+    Note: Allocate a new DependencyNode
+    Let arena be memory_get_pointer(graph, 16)
+    Let node be arena_allocate(arena, DEP_NODE_SIZE, 8)
+    If node is equal to 0:
+        Alert "[DEP ERROR] Failed to allocate dependency node"
+        Return 0
+    End If
+
+    memory_zero(node, DEP_NODE_SIZE)
+
+    Note: Store module name (duplicate to own it)
+    Let name_copy be string_duplicate(module_name)
+    memory_set_pointer(node, 0, name_copy)
+
+    Note: Create dependencies list
+    Let deps be arraylist_create(16, 8, arena)
+    If deps is equal to 0:
+        Alert "[DEP ERROR] Failed to create dependencies list"
+        Return 0
+    End If
+    memory_set_pointer(node, 8, deps)
+
+    Note: Create dependents list (reverse deps)
+    Let dependents be arraylist_create(16, 8, arena)
+    If dependents is equal to 0:
+        Alert "[DEP ERROR] Failed to create dependents list"
+        Return 0
+    End If
+    memory_set_pointer(node, 16, dependents)
+
+    Note: Initialize visit state
+    memory_set_integer(node, 24, DEP_UNVISITED)
+
+    Note: Not resolved yet
+    memory_set_integer(node, 32, 0)
+
+    Note: Depth = 0
+    memory_set_integer(node, 40, 0)
+
+    Note: No source path yet
+    memory_set_pointer(node, 48, 0)
+
+    Note: Insert into hash table
+    Let put_result be hashtable_put(nodes, name_hash, node)
+    If put_result is equal to 0:
+        Return 0
+    End If
+
+    Note: Add to module names list
+    Let module_names be memory_get_pointer(graph, 48)
+    If module_names is not equal to 0:
+        Let name_for_list be string_duplicate(module_name)
+        arraylist_add(module_names, name_for_list)
+    End If
+
+    Note: Increment node count
+    memory_set_integer(graph, 8, node_count plus 1)
+
+    Note: Invalidate cached sort
+    memory_set_integer(graph, 40, 0)
+
+    Return 1
+End Process
+
+Process called "add_dependency" takes graph as Integer, module_name as Integer, depends_on as Integer returns Integer:
+    Note: Record that module_name depends on depends_on
+    Note: Both modules are auto-registered if not already present
+    Note: Returns 1 on success, 0 on failure
+
+    If graph is equal to 0:
+        Return 0
+    End If
+    If module_name is equal to 0:
+        Return 0
+    End If
+    If depends_on is equal to 0:
+        Return 0
+    End If
+
+    Note: Ensure both modules exist in the graph
+    Let add_result1 be add_module(graph, module_name)
+    If add_result1 is equal to 0:
+        Return 0
+    End If
+
+    Let add_result2 be add_module(graph, depends_on)
+    If add_result2 is equal to 0:
+        Return 0
+    End If
+
+    Note: Get the dependent module's node
+    Let nodes be memory_get_pointer(graph, 0)
+    Let src_hash be dep_compute_name_hash(module_name)
+    Let src_node be hashtable_get(nodes, src_hash)
+    If src_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if this dependency is already recorded
+    Let deps be memory_get_pointer(src_node, 8)
+    If deps is equal to 0:
+        Return 0
+    End If
+
+    Let deps_count be arraylist_size(deps)
+    Let already_added be 0
+    Let i be 0
+    While i is less than deps_count:
+        Let existing_dep be arraylist_get(deps, i)
+        If existing_dep is not equal to 0:
+            Let match be string_equals(existing_dep, depends_on)
+            If match is equal to 1:
+                Set already_added to 1
+                Set i to deps_count  Note: Break
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If already_added is equal to 1:
+        Return 1  Note: Already recorded, success
+    End If
+
+    Note: Add the dependency
+    Let dep_copy be string_duplicate(depends_on)
+    Let add_dep_result be arraylist_add(deps, dep_copy)
+    If add_dep_result is equal to 0:
+        deallocate(dep_copy)
+        Return 0
+    End If
+
+    Note: Also add the reverse dependency (depends_on is depended on by module_name)
+    Let dep_hash be dep_compute_name_hash(depends_on)
+    Let dep_node be hashtable_get(nodes, dep_hash)
+    If dep_node is not equal to 0:
+        Let dependents be memory_get_pointer(dep_node, 16)
+        If dependents is not equal to 0:
+            Let rev_copy be string_duplicate(module_name)
+            arraylist_add(dependents, rev_copy)
+        End If
+    End If
+
+    Note: Invalidate cached sort
+    memory_set_integer(graph, 40, 0)
+
+    Return 1
+End Process
+
+Process called "set_module_source_path" takes graph as Integer, module_name as Integer, source_path as Integer returns Integer:
+    Note: Associate a source file path with a module
+    If graph is equal to 0:
+        Return 0
+    End If
+    If module_name is equal to 0:
+        Return 0
+    End If
+
+    Let nodes be memory_get_pointer(graph, 0)
+    Let name_hash be dep_compute_name_hash(module_name)
+    Let node be hashtable_get(nodes, name_hash)
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Note: Free old source path if any
+    Let old_path be memory_get_pointer(node, 48)
+    If old_path is not equal to 0:
+        deallocate(old_path)
+    End If
+
+    If source_path is not equal to 0:
+        Let path_copy be string_duplicate(source_path)
+        memory_set_pointer(node, 48, path_copy)
+    Otherwise:
+        memory_set_pointer(node, 48, 0)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Topological Sort (DFS-based)
+Note: ============================================================================
+
+Process called "topological_sort" takes graph as Integer returns Integer:
+    Note: Perform a DFS-based topological sort of the dependency graph
+    Note: Returns pointer to ArrayList of module name strings in build order, or 0 on failure
+    Note: Build order means dependencies come before dependents
+
+    If graph is equal to 0:
+        Alert "[DEP ERROR] Cannot sort: graph is null"
+        Return 0
+    End If
+
+    Note: Check if we have a cached result
+    Let is_sorted be memory_get_integer(graph, 40)
+    If is_sorted is equal to 1:
+        Return memory_get_pointer(graph, 32)
+    End If
+
+    Let arena be memory_get_pointer(graph, 16)
+    Let nodes be memory_get_pointer(graph, 0)
+    If nodes is equal to 0:
+        Return 0
+    End If
+
+    Note: Reset all visit states to UNVISITED
+    Let module_names be memory_get_pointer(graph, 48)
+    If module_names is equal to 0:
+        Return 0
+    End If
+
+    Let module_count be arraylist_size(module_names)
+    Let i be 0
+    While i is less than module_count:
+        Let name be arraylist_get(module_names, i)
+        If name is not equal to 0:
+            Let name_hash be dep_compute_name_hash(name)
+            Let node be hashtable_get(nodes, name_hash)
+            If node is not equal to 0:
+                memory_set_integer(node, 24, DEP_UNVISITED)
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Create result list
+    Let result be arraylist_create(module_count plus 1, 8, arena)
+    If result is equal to 0:
+        Alert "[DEP ERROR] Failed to create topological sort result list"
+        Return 0
+    End If
+
+    Note: Reset cycle detection flag
+    memory_set_integer(graph, 24, 0)
+
+    Note: Visit each unvisited module
+    Set i to 0
+    While i is less than module_count:
+        Let name be arraylist_get(module_names, i)
+        If name is not equal to 0:
+            Let name_hash be dep_compute_name_hash(name)
+            Let node be hashtable_get(nodes, name_hash)
+            If node is not equal to 0:
+                Let visit_state be memory_get_integer(node, 24)
+                If visit_state is equal to DEP_UNVISITED:
+                    Let visit_result be dep_dfs_visit(graph, nodes, node, result)
+                    If visit_result is equal to 0:
+                        Note: Cycle detected
+                        memory_set_integer(graph, 24, 1)
+                        Alert "[DEP ERROR] Circular dependency detected during topological sort"
+                        Return 0
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Cache the result
+    memory_set_pointer(graph, 32, result)
+    memory_set_integer(graph, 40, 1)
+
+    Return result
+End Process
+
+Process called "dep_dfs_visit" takes graph as Integer, nodes as Integer, node as Integer, result as Integer returns Integer:
+    Note: DFS visit for topological sort
+    Note: Returns 1 on success, 0 if cycle detected
+
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Let visit_state be memory_get_integer(node, 24)
+
+    Note: If currently visiting this node, we have a cycle
+    If visit_state is equal to DEP_VISITING:
+        Return 0
+    End If
+
+    Note: If already fully visited, skip
+    If visit_state is equal to DEP_VISITED:
+        Return 1
+    End If
+
+    Note: Mark as currently visiting (on the DFS stack)
+    memory_set_integer(node, 24, DEP_VISITING)
+
+    Note: Visit all dependencies first
+    Let deps be memory_get_pointer(node, 8)
+    If deps is not equal to 0:
+        Let dep_count be arraylist_size(deps)
+        Let i be 0
+        While i is less than dep_count:
+            Let dep_name be arraylist_get(deps, i)
+            If dep_name is not equal to 0:
+                Let dep_hash be dep_compute_name_hash(dep_name)
+                Let dep_node be hashtable_get(nodes, dep_hash)
+                If dep_node is not equal to 0:
+                    Let visit_result be dep_dfs_visit(graph, nodes, dep_node, result)
+                    If visit_result is equal to 0:
+                        Return 0  Note: Propagate cycle detection
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Mark as fully visited
+    memory_set_integer(node, 24, DEP_VISITED)
+
+    Note: Add this module to the result (post-order = dependencies before dependents)
+    Let module_name be memory_get_pointer(node, 0)
+    If module_name is not equal to 0:
+        Let name_copy be string_duplicate(module_name)
+        arraylist_add(result, name_copy)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Cycle Detection
+Note: ============================================================================
+
+Process called "detect_cycles" takes graph as Integer returns Integer:
+    Note: Check whether the dependency graph contains any cycles
+    Note: Returns 1 if cycles are detected, 0 if the graph is acyclic
+
+    If graph is equal to 0:
+        Return 0
+    End If
+
+    Note: Attempt a topological sort; if it fails, there is a cycle
+    Let sort_result be topological_sort(graph)
+    If sort_result is equal to 0:
+        Note: Check if cycle was the reason for failure
+        Let has_cycles be memory_get_integer(graph, 24)
+        Return has_cycles
+    End If
+
+    Return 0  Note: No cycles
+End Process
+
+Note: ============================================================================
+Note: Build Order
+Note: ============================================================================
+
+Process called "get_build_order" takes graph as Integer returns Integer:
+    Note: Get the compilation order for all modules (topologically sorted)
+    Note: Returns pointer to ArrayList of module name strings, or 0 on failure
+    Note: Dependencies come before the modules that depend on them
+
+    If graph is equal to 0:
+        Return 0
+    End If
+
+    Return topological_sort(graph)
+End Process
+
+Note: ============================================================================
+Note: Query Functions
+Note: ============================================================================
+
+Process called "get_module_dependencies" takes graph as Integer, module_name as Integer returns Integer:
+    Note: Get the list of direct dependencies for a module
+    Note: Returns pointer to ArrayList, or 0 if module not found
+
+    If graph is equal to 0:
+        Return 0
+    End If
+    If module_name is equal to 0:
+        Return 0
+    End If
+
+    Let nodes be memory_get_pointer(graph, 0)
+    If nodes is equal to 0:
+        Return 0
+    End If
+
+    Let name_hash be dep_compute_name_hash(module_name)
+    Let node be hashtable_get(nodes, name_hash)
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Return memory_get_pointer(node, 8)
+End Process
+
+Process called "get_module_dependents" takes graph as Integer, module_name as Integer returns Integer:
+    Note: Get the list of modules that depend on the given module
+    Note: Returns pointer to ArrayList, or 0 if module not found
+
+    If graph is equal to 0:
+        Return 0
+    End If
+    If module_name is equal to 0:
+        Return 0
+    End If
+
+    Let nodes be memory_get_pointer(graph, 0)
+    If nodes is equal to 0:
+        Return 0
+    End If
+
+    Let name_hash be dep_compute_name_hash(module_name)
+    Let node be hashtable_get(nodes, name_hash)
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Return memory_get_pointer(node, 16)
+End Process
+
+Process called "has_module" takes graph as Integer, module_name as Integer returns Integer:
+    Note: Check if a module exists in the dependency graph
+    Note: Returns 1 if present, 0 if not
+
+    If graph is equal to 0:
+        Return 0
+    End If
+    If module_name is equal to 0:
+        Return 0
+    End If
+
+    Let nodes be memory_get_pointer(graph, 0)
+    If nodes is equal to 0:
+        Return 0
+    End If
+
+    Let name_hash be dep_compute_name_hash(module_name)
+    Let node be hashtable_get(nodes, name_hash)
+    If node is not equal to 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "get_module_count" takes graph as Integer returns Integer:
+    If graph is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(graph, 8)
+End Process
+
+Note: ============================================================================
+Note: Dependency Graph Printing
+Note: ============================================================================
+
+Process called "dep_print_graph" takes graph as Integer returns Nothing:
+    Note: Print the dependency graph for debugging
+    If graph is equal to 0:
+        Alert "[DEP ERROR] Cannot print graph: graph is null"
+        Return
+    End If
+
+    Display "--- Dependency Graph ---"
+
+    Let module_names be memory_get_pointer(graph, 48)
+    If module_names is equal to 0:
+        Display "  (empty)"
+        Return
+    End If
+
+    Let nodes be memory_get_pointer(graph, 0)
+    Let module_count be arraylist_size(module_names)
+
+    Let i be 0
+    While i is less than module_count:
+        Let name be arraylist_get(module_names, i)
+        If name is not equal to 0:
+            Let name_hash be dep_compute_name_hash(name)
+            Let node be hashtable_get(nodes, name_hash)
+            If node is not equal to 0:
+                Let deps be memory_get_pointer(node, 8)
+                Let dep_count be 0
+                If deps is not equal to 0:
+                    Set dep_count to arraylist_size(deps)
+                End If
+
+                Let msg be string_concat("  ", name)
+                Let dep_str be integer_to_string(dep_count)
+                Let msg2 be string_concat(msg, " -> ")
+                deallocate(msg)
+                Let msg3 be string_concat(msg2, dep_str)
+                deallocate(dep_str)
+                deallocate(msg2)
+                Let msg4 be string_concat(msg3, " dependencies")
+                deallocate(msg3)
+                Display msg4
+                deallocate(msg4)
+
+                Note: Print each dependency
+                If deps is not equal to 0:
+                    Let j be 0
+                    While j is less than dep_count:
+                        Let dep_name be arraylist_get(deps, j)
+                        If dep_name is not equal to 0:
+                            Let dep_msg be string_concat("    -> ", dep_name)
+                            Display dep_msg
+                            deallocate(dep_msg)
+                        End If
+                        Set j to j plus 1
+                    End While
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Display "------------------------"
+End Process
+
+Note: ============================================================================
+Note: Internal Helper Functions
+Note: ============================================================================
+
+Process called "dep_compute_name_hash" takes name as Integer returns Integer:
+    Note: Compute a hash of a module name string for use as a hash table key
+    Note: Uses FNV-1a algorithm
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let hash be 2166136261
+    Let len be string_length(name)
+    Let i be 0
+    While i is less than len:
+        Let byte_val be memory_get_byte(name, i)
+        Let xored be hash bitwise_xor byte_val
+        Set hash to xored multiplied by 16777619
+        Set hash to hash bitwise_and 4294967295
+        Set i to i plus 1
+    End While
+
+    If hash is equal to 0:
+        Set hash to 1
+    End If
+
+    Return hash
+End Process

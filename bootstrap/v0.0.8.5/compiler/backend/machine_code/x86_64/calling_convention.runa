@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1056 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles x86_64 calling convention and function call interface.
+x86_64 Calling Convention Implementation
+
+Implements both the System V AMD64 ABI (used on Linux, macOS, BSD, and other Unix systems)
+and the Win64 ABI (used on Windows) calling conventions for x86_64 code generation.
 
 This file performs the following tasks:
-- Process x86_64 calling convention rules and parameter passing
-- Handle x86_64-specific register usage and register allocation
-- Manage x86_64 stack frame management and stack operations
-- Process x86_64 function call optimization and call interface
+- Defines calling convention data structures for argument passing and register usage
+- Creates System V AMD64 ABI and Win64 ABI convention instances with correct register maps
+- Classifies function arguments as INTEGER or SSE class per ABI rules
+- Maps argument indices to physical registers or stack positions
+- Computes stack space requirements for spilled arguments
+- Provides callee-saved and caller-saved register lists per convention
+- Computes stack frame adjustments ensuring 16-byte alignment
 
 This file is essential because of the following reasons:
-- x86_64 calling convention ensures correct function calls on x86_64 systems
-- Proper calling convention handling enables system integration and library compatibility
-- x86_64 support enables Runa compilation for x86_64 platforms
+- Correct calling convention handling is required for interoperability with C libraries and OS APIs
+- System V and Win64 ABIs differ significantly in register usage, stack layout, and shadow space
+- Proper frame alignment prevents segfaults on SSE instructions that require 16-byte alignment
+- The register classification drives register allocation decisions across the backend
 
-This file consists of the following functions/features/operation types:
-- x86_64 calling convention processing and parameter passing
-- x86_64 register usage and register allocation
-- x86_64 stack frame management and stack operations
-- x86_64 function call optimization and call interface
+Dependencies:
+- Imports LIR types for physical register constants
+- Imports LIR node types for type inspection
+- Imports machine code interface for target architecture constants
+- Imports layout for heap allocation of convention structures
+- Imports list for register list management
 :End Note
 
-Note: TODO - Implement x86_64 calling convention functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: Argument Classification Constants
+Note: ============================================================================
+
+@Reasoning
+The System V AMD64 ABI classifies each 8-byte unit of an argument into one of several
+classes. INTEGER class arguments are passed in general-purpose registers, SSE class
+arguments are passed in XMM registers, MEMORY class arguments are passed on the stack,
+and NO_CLASS is used for padding or empty slots.
+
+For Runa's current type system, all non-float types (Integer, Boolean, String pointers,
+struct pointers, etc.) classify as INTEGER, and Float/Float64 classify as SSE. The
+MEMORY class is used when register slots are exhausted.
+@End Reasoning
+
+Constant ARG_CLASS_INTEGER as Integer is 0     Note: Passed in GPR (Integer, Boolean, String, pointer, struct pointer)
+Constant ARG_CLASS_SSE as Integer is 1         Note: Passed in XMM register (Float, Float64)
+Constant ARG_CLASS_MEMORY as Integer is 2      Note: Passed on the stack (register slots exhausted or large struct)
+Constant ARG_CLASS_NO_CLASS as Integer is 3    Note: Ignored or padding (zero-size types, void)
+
+Note: Calling Convention Identifiers
+Constant CALLING_CONV_SYSTEMV as Integer is 0  Note: System V AMD64 ABI (Linux, macOS, FreeBSD, OpenBSD, NetBSD)
+Constant CALLING_CONV_WIN64 as Integer is 1    Note: Microsoft x64 calling convention (Windows)
+
+Note: ============================================================================
+Note: CallingConventionInfo Type Definition
+Note: ============================================================================
+
+@Reasoning
+CallingConventionInfo encapsulates all data needed to generate correct function prologues,
+epilogues, call sequences, and register allocation constraints for a specific calling
+convention.
+
+The int_arg_registers and float_arg_registers fields point to Lists of physical register
+IDs in argument-passing order. The callee_saved_registers and caller_saved_registers
+fields point to Lists used by the register allocator to determine which registers must
+be preserved across calls.
+
+Structure layout (12 fields, 96 bytes):
+  offset  0: convention_id          - CALLING_CONV_SYSTEMV or CALLING_CONV_WIN64
+  offset  8: int_arg_registers      - List pointer: GPRs used for integer arguments in order
+  offset 16: float_arg_registers    - List pointer: XMM regs used for float arguments in order
+  offset 24: int_arg_count          - Number of GPRs available for integer arguments
+  offset 32: float_arg_count        - Number of XMM regs available for float arguments
+  offset 40: return_register        - GPR for integer return value (RAX)
+  offset 48: float_return_register  - XMM for float return value (XMM0)
+  offset 56: callee_saved_registers - List pointer: registers the callee must preserve
+  offset 64: caller_saved_registers - List pointer: registers the caller must save before calls
+  offset 72: stack_alignment        - Required stack alignment in bytes (16 for both ABIs)
+  offset 80: red_zone_size          - Red zone below RSP (128 for System V, 0 for Win64)
+  offset 88: shadow_space_size      - Shadow/home space in bytes (0 for System V, 32 for Win64)
+@End Reasoning
+
+Type called "CallingConventionInfo":
+    convention_id as Integer           Note: CALLING_CONV_SYSTEMV or CALLING_CONV_WIN64
+    int_arg_registers as Integer       Note: List of GPR register IDs for integer args
+    float_arg_registers as Integer     Note: List of XMM register IDs for float args
+    int_arg_count as Integer           Note: Number of integer argument registers
+    float_arg_count as Integer         Note: Number of float argument registers
+    return_register as Integer         Note: Integer return register ID (RAX = 0)
+    float_return_register as Integer   Note: Float return register ID (XMM0 = 16)
+    callee_saved_registers as Integer  Note: List of callee-saved register IDs
+    caller_saved_registers as Integer  Note: List of caller-saved register IDs
+    stack_alignment as Integer         Note: Stack alignment requirement in bytes
+    red_zone_size as Integer           Note: Red zone size in bytes below RSP
+    shadow_space_size as Integer       Note: Shadow/home space size in bytes
+End Type
+
+Note: Size: 12 fields * 8 bytes = 96 bytes per CallingConventionInfo
+
+Note: ============================================================================
+Note: System V AMD64 ABI Convention
+Note: ============================================================================
+
+@Reasoning
+The System V AMD64 ABI is used on all Unix-like systems (Linux, macOS, FreeBSD, etc.).
+It is the primary calling convention for Runa since Linux is the primary target.
+
+Key characteristics:
+- 6 integer argument registers: RDI, RSI, RDX, RCX, R8, R9
+- 8 float argument registers: XMM0 through XMM7
+- Integer and float argument counts are tracked independently (each gets its own index)
+- Return values in RAX (integer) or XMM0 (float)
+- 128-byte red zone below RSP that leaf functions can use without adjusting RSP
+- No shadow space requirement
+- 16-byte stack alignment at the point of CALL instruction
+- Callee-saved (nonvolatile): RBX, RBP, R12, R13, R14, R15
+- Caller-saved (volatile): RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, XMM0-XMM15
+@End Reasoning
+
+Process called "create_systemv_convention" returns Integer:
+    Note: Allocate CallingConventionInfo structure (96 bytes)
+    Let info be Layout.allocate(96)
+    If info is 0:
+        Return 0
+    End If
+
+    Note: Set convention identifier
+    __store(info, 0, CALLING_CONV_SYSTEMV)
+
+    Note: Build integer argument register list: RDI(5), RSI(4), RDX(3), RCX(2), R8(8), R9(9)
+    Let int_regs be List.list_create(8)
+    If int_regs is 0:
+        Return 0
+    End If
+    List.list_append(int_regs, 5)    Note: RDI - 1st integer arg
+    List.list_append(int_regs, 4)    Note: RSI - 2nd integer arg
+    List.list_append(int_regs, 3)    Note: RDX - 3rd integer arg
+    List.list_append(int_regs, 2)    Note: RCX - 4th integer arg
+    List.list_append(int_regs, 8)    Note: R8  - 5th integer arg
+    List.list_append(int_regs, 9)    Note: R9  - 6th integer arg
+    __store(info, 8, int_regs)
+
+    Note: Build float argument register list: XMM0(16) through XMM7(23)
+    Let float_regs be List.list_create(8)
+    If float_regs is 0:
+        Return 0
+    End If
+    List.list_append(float_regs, 16)  Note: XMM0 - 1st float arg
+    List.list_append(float_regs, 17)  Note: XMM1 - 2nd float arg
+    List.list_append(float_regs, 18)  Note: XMM2 - 3rd float arg
+    List.list_append(float_regs, 19)  Note: XMM3 - 4th float arg
+    List.list_append(float_regs, 20)  Note: XMM4 - 5th float arg
+    List.list_append(float_regs, 21)  Note: XMM5 - 6th float arg
+    List.list_append(float_regs, 22)  Note: XMM6 - 7th float arg
+    List.list_append(float_regs, 23)  Note: XMM7 - 8th float arg
+    __store(info, 16, float_regs)
+
+    Note: Set argument register counts
+    __store(info, 24, 6)   Note: 6 integer argument registers
+    __store(info, 32, 8)   Note: 8 float argument registers
+
+    Note: Set return registers
+    __store(info, 40, 0)   Note: RAX(0) for integer returns
+    __store(info, 48, 16)  Note: XMM0(16) for float returns
+
+    Note: Build callee-saved register list: RBX(1), RBP(6), R12(12), R13(13), R14(14), R15(15)
+    Let callee_saved be List.list_create(8)
+    If callee_saved is 0:
+        Return 0
+    End If
+    List.list_append(callee_saved, 1)   Note: RBX
+    List.list_append(callee_saved, 6)   Note: RBP
+    List.list_append(callee_saved, 12)  Note: R12
+    List.list_append(callee_saved, 13)  Note: R13
+    List.list_append(callee_saved, 14)  Note: R14
+    List.list_append(callee_saved, 15)  Note: R15
+    __store(info, 56, callee_saved)
+
+    Note: Build caller-saved register list: RAX(0), RCX(2), RDX(3), RSI(4), RDI(5),
+    Note: R8(8), R9(9), R10(10), R11(11)
+    Note: XMM0-XMM15 are also caller-saved but tracked separately for register allocation
+    Let caller_saved be List.list_create(16)
+    If caller_saved is 0:
+        Return 0
+    End If
+    List.list_append(caller_saved, 0)   Note: RAX
+    List.list_append(caller_saved, 2)   Note: RCX
+    List.list_append(caller_saved, 3)   Note: RDX
+    List.list_append(caller_saved, 4)   Note: RSI
+    List.list_append(caller_saved, 5)   Note: RDI
+    List.list_append(caller_saved, 8)   Note: R8
+    List.list_append(caller_saved, 9)   Note: R9
+    List.list_append(caller_saved, 10)  Note: R10
+    List.list_append(caller_saved, 11)  Note: R11
+    __store(info, 64, caller_saved)
+
+    Note: Set stack parameters
+    __store(info, 72, 16)   Note: 16-byte stack alignment
+    __store(info, 80, 128)  Note: 128-byte red zone
+    __store(info, 88, 0)    Note: No shadow space in System V
+
+    Return info
+End Process
+
+Note: ============================================================================
+Note: Win64 ABI Convention
+Note: ============================================================================
+
+@Reasoning
+The Win64 ABI (Microsoft x64 calling convention) is used on Windows systems. It differs
+significantly from System V:
+
+Key characteristics:
+- 4 integer argument registers: RCX, RDX, R8, R9
+- 4 float argument registers: XMM0, XMM1, XMM2, XMM3
+- Integer and float arguments share positional slots (arg 1 uses either RCX or XMM0,
+  never both; arg 2 uses either RDX or XMM1, etc.)
+- Return values in RAX (integer) or XMM0 (float)
+- No red zone
+- 32-byte shadow space (home space) that the caller must allocate for the callee to
+  spill the 4 register arguments, even if the callee has fewer than 4 parameters
+- 16-byte stack alignment at the point of CALL instruction
+- Callee-saved (nonvolatile): RBX, RBP, RDI, RSI, R12, R13, R14, R15, XMM6-XMM15
+  Note: RDI and RSI are callee-saved in Win64 but caller-saved in System V
+- Caller-saved (volatile): RAX, RCX, RDX, R8, R9, R10, R11, XMM0-XMM5
+@End Reasoning
+
+Process called "create_win64_convention" returns Integer:
+    Note: Allocate CallingConventionInfo structure (96 bytes)
+    Let info be Layout.allocate(96)
+    If info is 0:
+        Return 0
+    End If
+
+    Note: Set convention identifier
+    __store(info, 0, CALLING_CONV_WIN64)
+
+    Note: Build integer argument register list: RCX(2), RDX(3), R8(8), R9(9)
+    Let int_regs be List.list_create(4)
+    If int_regs is 0:
+        Return 0
+    End If
+    List.list_append(int_regs, 2)    Note: RCX - 1st integer arg
+    List.list_append(int_regs, 3)    Note: RDX - 2nd integer arg
+    List.list_append(int_regs, 8)    Note: R8  - 3rd integer arg
+    List.list_append(int_regs, 9)    Note: R9  - 4th integer arg
+    __store(info, 8, int_regs)
+
+    Note: Build float argument register list: XMM0(16), XMM1(17), XMM2(18), XMM3(19)
+    Let float_regs be List.list_create(4)
+    If float_regs is 0:
+        Return 0
+    End If
+    List.list_append(float_regs, 16)  Note: XMM0 - 1st float arg
+    List.list_append(float_regs, 17)  Note: XMM1 - 2nd float arg
+    List.list_append(float_regs, 18)  Note: XMM2 - 3rd float arg
+    List.list_append(float_regs, 19)  Note: XMM3 - 4th float arg
+    __store(info, 16, float_regs)
+
+    Note: Set argument register counts
+    __store(info, 24, 4)   Note: 4 integer argument registers
+    __store(info, 32, 4)   Note: 4 float argument registers
+
+    Note: Set return registers
+    __store(info, 40, 0)   Note: RAX(0) for integer returns
+    __store(info, 48, 16)  Note: XMM0(16) for float returns
+
+    Note: Build callee-saved register list: RBX(1), RBP(6), RDI(5), RSI(4),
+    Note: R12(12), R13(13), R14(14), R15(15)
+    Note: XMM6-XMM15 are also callee-saved on Win64 (added to list for register allocator)
+    Let callee_saved be List.list_create(20)
+    If callee_saved is 0:
+        Return 0
+    End If
+    List.list_append(callee_saved, 1)   Note: RBX
+    List.list_append(callee_saved, 6)   Note: RBP
+    List.list_append(callee_saved, 5)   Note: RDI (callee-saved on Win64, unlike System V)
+    List.list_append(callee_saved, 4)   Note: RSI (callee-saved on Win64, unlike System V)
+    List.list_append(callee_saved, 12)  Note: R12
+    List.list_append(callee_saved, 13)  Note: R13
+    List.list_append(callee_saved, 14)  Note: R14
+    List.list_append(callee_saved, 15)  Note: R15
+    List.list_append(callee_saved, 22)  Note: XMM6
+    List.list_append(callee_saved, 23)  Note: XMM7
+    List.list_append(callee_saved, 24)  Note: XMM8
+    List.list_append(callee_saved, 25)  Note: XMM9
+    List.list_append(callee_saved, 26)  Note: XMM10
+    List.list_append(callee_saved, 27)  Note: XMM11
+    List.list_append(callee_saved, 28)  Note: XMM12
+    List.list_append(callee_saved, 29)  Note: XMM13
+    List.list_append(callee_saved, 30)  Note: XMM14
+    List.list_append(callee_saved, 31)  Note: XMM15
+    __store(info, 56, callee_saved)
+
+    Note: Build caller-saved register list: RAX(0), RCX(2), RDX(3), R8(8), R9(9),
+    Note: R10(10), R11(11), XMM0(16)-XMM5(21)
+    Let caller_saved be List.list_create(16)
+    If caller_saved is 0:
+        Return 0
+    End If
+    List.list_append(caller_saved, 0)   Note: RAX
+    List.list_append(caller_saved, 2)   Note: RCX
+    List.list_append(caller_saved, 3)   Note: RDX
+    List.list_append(caller_saved, 8)   Note: R8
+    List.list_append(caller_saved, 9)   Note: R9
+    List.list_append(caller_saved, 10)  Note: R10
+    List.list_append(caller_saved, 11)  Note: R11
+    List.list_append(caller_saved, 16)  Note: XMM0
+    List.list_append(caller_saved, 17)  Note: XMM1
+    List.list_append(caller_saved, 18)  Note: XMM2
+    List.list_append(caller_saved, 19)  Note: XMM3
+    List.list_append(caller_saved, 20)  Note: XMM4
+    List.list_append(caller_saved, 21)  Note: XMM5
+    __store(info, 64, caller_saved)
+
+    Note: Set stack parameters
+    __store(info, 72, 16)   Note: 16-byte stack alignment
+    __store(info, 80, 0)    Note: No red zone on Win64
+    __store(info, 88, 32)   Note: 32-byte shadow space (home area)
+
+    Return info
+End Process
+
+Note: ============================================================================
+Note: Argument Classification
+Note: ============================================================================
+
+@Reasoning
+Classifies a function argument based on its HIR type information to determine whether
+it should be passed in a general-purpose register (INTEGER class) or an XMM register
+(SSE class).
+
+The classification follows the type_kind encoding used throughout the compiler:
+  type_kind 1 = Integer  -> ARG_CLASS_INTEGER
+  type_kind 2 = Float    -> ARG_CLASS_SSE
+  type_kind 3 = String   -> ARG_CLASS_INTEGER (String is a pointer, passed in GPR)
+  type_kind 4 = Boolean  -> ARG_CLASS_INTEGER
+  type_kind 0 = Void     -> ARG_CLASS_NO_CLASS
+
+All pointer types, struct pointers, array pointers, and reference types are passed as
+INTEGER class because they are 8-byte pointer values on x86-64.
+
+The convention parameter is accepted for future extensibility (Win64 has different
+struct-passing rules for aggregates > 8 bytes) but currently both ABIs use the same
+classification logic for Runa's types since all non-scalar aggregates are heap-allocated
+and passed by pointer.
+@End Reasoning
+
+Process called "classify_argument" that takes arg_type as Integer, convention as Integer returns Integer:
+    Note: If arg_type is null (0), treat as void/no-class
+    If arg_type is 0:
+        Return ARG_CLASS_NO_CLASS
+    End If
+
+    Note: Read the type_kind from the type info structure
+    Note: type_kind is stored at offset 0 of the type info (8 bytes)
+    Let type_kind be __load(arg_type, 0)
+
+    Note: Type kind 0: Void - no argument class
+    If type_kind is 0:
+        Return ARG_CLASS_NO_CLASS
+    End If
+
+    Note: Type kind 2: Float/Float64 - passed in XMM registers
+    If type_kind is 2:
+        Return ARG_CLASS_SSE
+    End If
+
+    Note: Type kind 1: Integer - passed in GPR
+    If type_kind is 1:
+        Return ARG_CLASS_INTEGER
+    End If
+
+    Note: Type kind 3: String - passed as pointer in GPR
+    If type_kind is 3:
+        Return ARG_CLASS_INTEGER
+    End If
+
+    Note: Type kind 4: Boolean - passed in GPR (zero-extended to 64 bits)
+    If type_kind is 4:
+        Return ARG_CLASS_INTEGER
+    End If
+
+    Note: All other types (struct pointers, array pointers, reference types,
+    Note: optional types, union types, function pointers, etc.) are 8-byte
+    Note: pointer values on x86-64 and are passed in general-purpose registers
+    Return ARG_CLASS_INTEGER
+End Process
+
+Note: ============================================================================
+Note: Argument Register Mapping
+Note: ============================================================================
+
+@Reasoning
+Maps a function argument (identified by its position within its class) to the physical
+register that should hold it, according to the specified calling convention.
+
+For System V AMD64 ABI:
+  INTEGER class: arg 0->RDI(5), 1->RSI(4), 2->RDX(3), 3->RCX(2), 4->R8(8), 5->R9(9)
+  SSE class:     arg 0->XMM0(16), 1->XMM1(17), ..., 7->XMM7(23)
+
+For Win64 ABI:
+  INTEGER class: arg 0->RCX(2), 1->RDX(3), 2->R8(8), 3->R9(9)
+  SSE class:     arg 0->XMM0(16), 1->XMM1(17), 2->XMM2(18), 3->XMM3(19)
+
+Note on Win64 positional slots: In Win64, integer and float arguments share positional
+slots. This means if argument 0 is an integer (in RCX), argument 1 is a float (in XMM1,
+NOT XMM0). The arg_index passed here must already account for this positional sharing.
+The caller is responsible for tracking the combined positional index for Win64.
+
+Returns the physical register ID, or -1 if the argument must be passed on the stack
+because all register slots for that class are exhausted.
+@End Reasoning
+
+Process called "get_arg_register" that takes convention as Integer, arg_index as Integer, arg_class as Integer returns Integer:
+    Note: Validate arg_index is non-negative
+    If arg_index < 0:
+        Return -1
+    End If
+
+    Note: NO_CLASS arguments do not occupy a register
+    If arg_class is ARG_CLASS_NO_CLASS:
+        Return -1
+    End If
+
+    Note: MEMORY class arguments are explicitly on the stack
+    If arg_class is ARG_CLASS_MEMORY:
+        Return -1
+    End If
+
+    Note: System V AMD64 ABI
+    If convention is CALLING_CONV_SYSTEMV:
+        If arg_class is ARG_CLASS_INTEGER:
+            Note: 6 integer argument registers in System V
+            If arg_index is 0:
+                Return 5   Note: RDI
+            End If
+            If arg_index is 1:
+                Return 4   Note: RSI
+            End If
+            If arg_index is 2:
+                Return 3   Note: RDX
+            End If
+            If arg_index is 3:
+                Return 2   Note: RCX
+            End If
+            If arg_index is 4:
+                Return 8   Note: R8
+            End If
+            If arg_index is 5:
+                Return 9   Note: R9
+            End If
+            Note: arg_index >= 6: passed on stack
+            Return -1
+        End If
+
+        If arg_class is ARG_CLASS_SSE:
+            Note: 8 float argument registers in System V: XMM0 through XMM7
+            If arg_index < 8:
+                Return 16 + arg_index  Note: XMM0(16) + offset
+            End If
+            Note: arg_index >= 8: passed on stack
+            Return -1
+        End If
+
+        Note: Unrecognized class falls to stack
+        Return -1
+    End If
+
+    Note: Win64 ABI
+    If convention is CALLING_CONV_WIN64:
+        If arg_class is ARG_CLASS_INTEGER:
+            Note: 4 integer argument registers in Win64
+            If arg_index is 0:
+                Return 2   Note: RCX
+            End If
+            If arg_index is 1:
+                Return 3   Note: RDX
+            End If
+            If arg_index is 2:
+                Return 8   Note: R8
+            End If
+            If arg_index is 3:
+                Return 9   Note: R9
+            End If
+            Note: arg_index >= 4: passed on stack
+            Return -1
+        End If
+
+        If arg_class is ARG_CLASS_SSE:
+            Note: 4 float argument registers in Win64: XMM0 through XMM3
+            If arg_index is 0:
+                Return 16  Note: XMM0
+            End If
+            If arg_index is 1:
+                Return 17  Note: XMM1
+            End If
+            If arg_index is 2:
+                Return 18  Note: XMM2
+            End If
+            If arg_index is 3:
+                Return 19  Note: XMM3
+            End If
+            Note: arg_index >= 4: passed on stack
+            Return -1
+        End If
+
+        Note: Unrecognized class falls to stack
+        Return -1
+    End If
+
+    Note: Unknown convention: all arguments on stack
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: Stack Argument Space Computation
+Note: ============================================================================
+
+@Reasoning
+Computes the total stack space (in bytes) required for function arguments that do not
+fit into registers. Each stack argument occupies 8 bytes (one quadword slot) on x86-64,
+regardless of its actual size (values smaller than 8 bytes are zero-extended or
+sign-extended to fill the slot).
+
+For System V AMD64 ABI:
+  - Integer arguments beyond the 6th go on the stack
+  - Float arguments beyond the 8th go on the stack
+  - Integer and float argument positions are tracked independently
+
+For Win64 ABI:
+  - Arguments share positional slots (arg position is shared between int and float)
+  - Arguments beyond the 4th position go on the stack
+  - Additionally, 32 bytes of shadow space is always reserved (handled separately in
+    frame computation, not counted here)
+
+The arg_types parameter is a pointer to an array of type info pointers, and arg_count
+is the total number of arguments.
+@End Reasoning
+
+Process called "compute_stack_args_size" that takes convention as Integer, arg_types as Integer, arg_count as Integer returns Integer:
+    Note: If no arguments, no stack space needed
+    If arg_count is 0:
+        Return 0
+    End If
+    If arg_types is 0:
+        Return 0
+    End If
+
+    Let stack_bytes be 0
+
+    If convention is CALLING_CONV_SYSTEMV:
+        Note: System V: integer and float argument indices are independent
+        Let int_index be 0
+        Let float_index be 0
+
+        Let i be 0
+        While i < arg_count:
+            Note: Read the type info pointer for this argument
+            Let type_ptr be __load(arg_types, i * 8)
+            Let arg_class be classify_argument(type_ptr, convention)
+
+            If arg_class is ARG_CLASS_INTEGER:
+                If int_index >= 6:
+                    Note: This integer argument spills to the stack
+                    Set stack_bytes to stack_bytes + 8
+                End If
+                Set int_index to int_index + 1
+            End If
+
+            If arg_class is ARG_CLASS_SSE:
+                If float_index >= 8:
+                    Note: This float argument spills to the stack
+                    Set stack_bytes to stack_bytes + 8
+                End If
+                Set float_index to float_index + 1
+            End If
+
+            If arg_class is ARG_CLASS_MEMORY:
+                Note: Explicitly stack-passed arguments always take 8 bytes
+                Set stack_bytes to stack_bytes + 8
+            End If
+
+            Set i to i + 1
+        End While
+    End If
+
+    If convention is CALLING_CONV_WIN64:
+        Note: Win64: arguments share positional slots (1st arg is position 0, etc.)
+        Note: The first 4 positional slots go in registers, rest on stack
+        If arg_count > 4:
+            Let spill_count be arg_count - 4
+            Set stack_bytes to spill_count * 8
+        End If
+    End If
+
+    Note: Ensure stack argument area is 16-byte aligned
+    Note: Each argument is 8 bytes, so we align the total to 16
+    Let remainder be stack_bytes % 16
+    If remainder is not 0:
+        Set stack_bytes to stack_bytes + (16 - remainder)
+    End If
+
+    Return stack_bytes
+End Process
+
+Note: ============================================================================
+Note: Callee-Saved Register List
+Note: ============================================================================
+
+@Reasoning
+Returns a pointer to the List of callee-saved register IDs for the specified calling
+convention. Callee-saved (nonvolatile) registers must be saved in the function prologue
+and restored in the epilogue if the function uses them.
+
+The returned list is freshly created each time to allow the caller to modify it without
+affecting the canonical convention data. This is important because register allocation
+may need to filter or reorder the list.
+
+System V callee-saved GPRs: RBX(1), RBP(6), R12(12), R13(13), R14(14), R15(15)
+Win64 callee-saved GPRs:    RBX(1), RBP(6), RDI(5), RSI(4), R12(12), R13(13), R14(14), R15(15)
+Win64 callee-saved XMMs:    XMM6(22)-XMM15(31)
+@End Reasoning
+
+Process called "get_callee_saved_list" that takes convention as Integer returns Integer:
+    Let result be List.list_create(20)
+    If result is 0:
+        Return 0
+    End If
+
+    If convention is CALLING_CONV_SYSTEMV:
+        List.list_append(result, 1)   Note: RBX
+        List.list_append(result, 6)   Note: RBP
+        List.list_append(result, 12)  Note: R12
+        List.list_append(result, 13)  Note: R13
+        List.list_append(result, 14)  Note: R14
+        List.list_append(result, 15)  Note: R15
+        Return result
+    End If
+
+    If convention is CALLING_CONV_WIN64:
+        Note: GPRs
+        List.list_append(result, 1)   Note: RBX
+        List.list_append(result, 6)   Note: RBP
+        List.list_append(result, 5)   Note: RDI
+        List.list_append(result, 4)   Note: RSI
+        List.list_append(result, 12)  Note: R12
+        List.list_append(result, 13)  Note: R13
+        List.list_append(result, 14)  Note: R14
+        List.list_append(result, 15)  Note: R15
+        Note: XMM registers that are callee-saved on Win64
+        List.list_append(result, 22)  Note: XMM6
+        List.list_append(result, 23)  Note: XMM7
+        List.list_append(result, 24)  Note: XMM8
+        List.list_append(result, 25)  Note: XMM9
+        List.list_append(result, 26)  Note: XMM10
+        List.list_append(result, 27)  Note: XMM11
+        List.list_append(result, 28)  Note: XMM12
+        List.list_append(result, 29)  Note: XMM13
+        List.list_append(result, 30)  Note: XMM14
+        List.list_append(result, 31)  Note: XMM15
+        Return result
+    End If
+
+    Note: Unknown convention: return empty list
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Caller-Saved Register List
+Note: ============================================================================
+
+@Reasoning
+Returns a pointer to the List of caller-saved register IDs for the specified calling
+convention. Caller-saved (volatile) registers may be clobbered by any function call,
+so the caller must save them before a call if their values are still needed afterward.
+
+The returned list is freshly created each time to allow modification without affecting
+canonical data.
+
+System V caller-saved GPRs: RAX(0), RCX(2), RDX(3), RSI(4), RDI(5), R8(8), R9(9), R10(10), R11(11)
+Win64 caller-saved GPRs:    RAX(0), RCX(2), RDX(3), R8(8), R9(9), R10(10), R11(11)
+Win64 caller-saved XMMs:    XMM0(16)-XMM5(21)
+@End Reasoning
+
+Process called "get_caller_saved_list" that takes convention as Integer returns Integer:
+    Let result be List.list_create(16)
+    If result is 0:
+        Return 0
+    End If
+
+    If convention is CALLING_CONV_SYSTEMV:
+        List.list_append(result, 0)   Note: RAX
+        List.list_append(result, 2)   Note: RCX
+        List.list_append(result, 3)   Note: RDX
+        List.list_append(result, 4)   Note: RSI
+        List.list_append(result, 5)   Note: RDI
+        List.list_append(result, 8)   Note: R8
+        List.list_append(result, 9)   Note: R9
+        List.list_append(result, 10)  Note: R10
+        List.list_append(result, 11)  Note: R11
+        Return result
+    End If
+
+    If convention is CALLING_CONV_WIN64:
+        Note: GPRs
+        List.list_append(result, 0)   Note: RAX
+        List.list_append(result, 2)   Note: RCX
+        List.list_append(result, 3)   Note: RDX
+        List.list_append(result, 8)   Note: R8
+        List.list_append(result, 9)   Note: R9
+        List.list_append(result, 10)  Note: R10
+        List.list_append(result, 11)  Note: R11
+        Note: XMM registers that are caller-saved on Win64
+        List.list_append(result, 16)  Note: XMM0
+        List.list_append(result, 17)  Note: XMM1
+        List.list_append(result, 18)  Note: XMM2
+        List.list_append(result, 19)  Note: XMM3
+        List.list_append(result, 20)  Note: XMM4
+        List.list_append(result, 21)  Note: XMM5
+        Return result
+    End If
+
+    Note: Unknown convention: return empty list
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Stack Frame Adjustment Computation
+Note: ============================================================================
+
+@Reasoning
+Computes the total frame size ensuring the stack remains 16-byte aligned at the point
+where the callee's code begins executing (after prologue push instructions).
+
+The x86-64 ABI requires that the stack pointer (RSP) is 16-byte aligned immediately
+before the CALL instruction. The CALL instruction pushes the 8-byte return address,
+so upon function entry RSP is 8 bytes misaligned from 16.
+
+The typical prologue is:
+  push rbp         -> RSP -= 8 (now 16-byte aligned if no callee-saved pushes follow)
+  mov rbp, rsp
+  push callee-saved registers (each 8 bytes)
+  sub rsp, local_size
+
+The total adjustment below RBP must maintain 16-byte alignment. The formula accounts for:
+1. The return address (8 bytes, already on stack from CALL)
+2. The pushed RBP (8 bytes)
+3. The callee-saved register pushes (callee_saved_count * 8 bytes)
+4. The local variable space (local_size bytes)
+5. Win64 shadow space (if applicable)
+
+After accounting for (1) return address + (2) pushed RBP + (3) callee-saved pushes,
+the remaining space to allocate (local_size + any padding) must result in RSP being
+16-byte aligned.
+@End Reasoning
+
+Process called "compute_frame_adjustment" that takes convention as Integer, local_size as Integer, callee_saved_count as Integer returns Integer:
+    Note: The CALL instruction pushed 8 bytes (return address)
+    Note: push rbp adds another 8 bytes
+    Note: Each callee-saved register push adds 8 bytes
+    Note: Total bytes pushed before RSP adjustment: 8 (ret addr) + 8 (rbp) + callee_saved_count * 8
+    Let pushed_bytes be 16 + (callee_saved_count * 8)
+
+    Note: Start with the requested local variable space
+    Let frame_size be local_size
+
+    Note: For Win64, add shadow space to the frame
+    If convention is CALLING_CONV_WIN64:
+        Set frame_size to frame_size + 32
+    End If
+
+    Note: The total below the initial RSP (at function entry, before our prologue) is:
+    Note:   pushed_bytes + frame_size
+    Note: This total must be a multiple of 16 for alignment.
+    Note:
+    Note: At function entry, RSP was 16-byte aligned minus 8 (due to CALL pushing ret addr).
+    Note: After push rbp: RSP is 16-byte aligned if callee_saved_count is even, or 8-misaligned if odd.
+    Note:
+    Note: We need: (pushed_bytes + frame_size) % 16 == 0
+    Note: Since pushed_bytes = 16 + callee_saved_count * 8:
+    Note:   If callee_saved_count is even: pushed_bytes % 16 == 0, so frame_size must be % 16 == 0
+    Note:   If callee_saved_count is odd:  pushed_bytes % 16 == 8, so frame_size must be % 16 == 8
+
+    Let total be pushed_bytes + frame_size
+    Let remainder be total % 16
+
+    If remainder is not 0:
+        Note: Add padding to achieve 16-byte alignment
+        Set frame_size to frame_size + (16 - remainder)
+    End If
+
+    Return frame_size
+End Process
+
+Note: ============================================================================
+Note: Callee-Saved Register Query
+Note: ============================================================================
+
+@Reasoning
+Determines whether a given physical register is callee-saved in the specified calling
+convention. Returns 1 if the register must be preserved by the callee (saved in
+prologue, restored in epilogue), or 0 if it is caller-saved (volatile).
+
+This is used by the register allocator to decide whether a register needs
+save/restore code in the function prologue/epilogue, and by the call sequence
+generator to determine which registers survive across call sites.
+
+RSP(7) is technically preserved by the callee but is not listed as callee-saved
+because it is managed by prologue/epilogue frame setup code, not by explicit
+save/restore pairs. It is handled separately.
+@End Reasoning
+
+Process called "is_callee_saved" that takes convention as Integer, reg_id as Integer returns Integer:
+    Note: RSP(7) is always preserved but handled separately by frame management
+    If reg_id is 7:
+        Return 0
+    End If
+
+    If convention is CALLING_CONV_SYSTEMV:
+        Note: System V callee-saved GPRs: RBX(1), RBP(6), R12(12), R13(13), R14(14), R15(15)
+        If reg_id is 1:
+            Return 1  Note: RBX
+        End If
+        If reg_id is 6:
+            Return 1  Note: RBP
+        End If
+        If reg_id is 12:
+            Return 1  Note: R12
+        End If
+        If reg_id is 13:
+            Return 1  Note: R13
+        End If
+        If reg_id is 14:
+            Return 1  Note: R14
+        End If
+        If reg_id is 15:
+            Return 1  Note: R15
+        End If
+        Note: All other registers (including all XMM regs) are caller-saved in System V
+        Return 0
+    End If
+
+    If convention is CALLING_CONV_WIN64:
+        Note: Win64 callee-saved GPRs: RBX(1), RBP(6), RDI(5), RSI(4), R12-R15
+        If reg_id is 1:
+            Return 1  Note: RBX
+        End If
+        If reg_id is 4:
+            Return 1  Note: RSI (callee-saved on Win64)
+        End If
+        If reg_id is 5:
+            Return 1  Note: RDI (callee-saved on Win64)
+        End If
+        If reg_id is 6:
+            Return 1  Note: RBP
+        End If
+        If reg_id is 12:
+            Return 1  Note: R12
+        End If
+        If reg_id is 13:
+            Return 1  Note: R13
+        End If
+        If reg_id is 14:
+            Return 1  Note: R14
+        End If
+        If reg_id is 15:
+            Return 1  Note: R15
+        End If
+        Note: Win64 callee-saved XMMs: XMM6(22) through XMM15(31)
+        If reg_id >= 22:
+            If reg_id <= 31:
+                Return 1
+            End If
+        End If
+        Return 0
+    End If
+
+    Note: Unknown convention: assume nothing is callee-saved (safest default)
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Convention Selection Helper
+Note: ============================================================================
+
+@Reasoning
+Selects the appropriate calling convention based on the target operating system.
+Linux, macOS, FreeBSD, OpenBSD, and NetBSD use System V AMD64 ABI.
+Windows uses Win64 ABI.
+Bare metal and WASI default to System V since it is the more common convention
+for standalone executables and WASI follows Unix conventions.
+
+This function returns a freshly allocated CallingConventionInfo structure configured
+for the selected convention. The caller owns the returned pointer.
+@End Reasoning
+
+Process called "create_convention_for_target" that takes target_os as Integer returns Integer:
+    If target_os is MachineCode.TARGET_OS_WINDOWS:
+        Return create_win64_convention()
+    End If
+
+    Note: All other operating systems use System V AMD64 ABI
+    Return create_systemv_convention()
+End Process
+
+Note: ============================================================================
+Note: Return Register Selection
+Note: ============================================================================
+
+@Reasoning
+Returns the physical register ID for the function return value based on the type
+classification and calling convention. Both System V and Win64 use RAX for integer
+returns and XMM0 for float returns, but this function abstracts the convention for
+consistency and future extensibility (e.g., 128-bit returns in RDX:RAX).
+@End Reasoning
+
+Process called "get_return_register" that takes convention as Integer, return_type as Integer returns Integer:
+    Let arg_class be classify_argument(return_type, convention)
+
+    If arg_class is ARG_CLASS_SSE:
+        Return 16  Note: XMM0 for float returns
+    End If
+
+    Note: INTEGER, MEMORY, NO_CLASS all return via RAX (or void returns RAX conventionally)
+    Return 0  Note: RAX for integer/pointer returns
+End Process
+
+Note: ============================================================================
+Note: Win64 Shadow Space Query
+Note: ============================================================================
+
+@Reasoning
+Returns the shadow space (home space) size in bytes for the given convention.
+Win64 requires 32 bytes of shadow space to be allocated by the caller on the stack,
+even for functions with fewer than 4 parameters. This space allows the callee to spill
+the register arguments to known stack locations.
+
+System V has no shadow space requirement.
+
+This value must be added to the stack allocation before any CALL instruction on Win64.
+@End Reasoning
+
+Process called "get_shadow_space" that takes convention as Integer returns Integer:
+    If convention is CALLING_CONV_WIN64:
+        Return 32
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Red Zone Query
+Note: ============================================================================
+
+@Reasoning
+Returns the red zone size in bytes for the given convention.
+System V AMD64 ABI provides a 128-byte red zone below RSP that leaf functions may use
+for temporary storage without adjusting RSP. This optimization avoids the cost of
+sub/add RSP in small leaf functions.
+
+Win64 has no red zone.
+
+Leaf functions (functions that make no calls) can use the red zone to avoid stack frame
+setup entirely. Non-leaf functions must not use the red zone because called functions
+would overwrite it.
+@End Reasoning
+
+Process called "get_red_zone_size" that takes convention as Integer returns Integer:
+    If convention is CALLING_CONV_SYSTEMV:
+        Return 128
+    End If
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Maximum Register Argument Count
+Note: ============================================================================
+
+@Reasoning
+Returns the maximum number of arguments that can be passed in registers for a given
+argument class and convention. This is used by the register allocator and call
+sequence generator to determine when arguments spill to the stack.
+@End Reasoning
+
+Process called "get_max_reg_args" that takes convention as Integer, arg_class as Integer returns Integer:
+    If convention is CALLING_CONV_SYSTEMV:
+        If arg_class is ARG_CLASS_INTEGER:
+            Return 6   Note: RDI, RSI, RDX, RCX, R8, R9
+        End If
+        If arg_class is ARG_CLASS_SSE:
+            Return 8   Note: XMM0 through XMM7
+        End If
+        Return 0
+    End If
+
+    If convention is CALLING_CONV_WIN64:
+        If arg_class is ARG_CLASS_INTEGER:
+            Return 4   Note: RCX, RDX, R8, R9
+        End If
+        If arg_class is ARG_CLASS_SSE:
+            Return 4   Note: XMM0 through XMM3
+        End If
+        Return 0
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Stack Argument Offset Computation
+Note: ============================================================================
+
+@Reasoning
+Computes the stack offset (relative to RSP at the point of the CALL instruction) for
+an argument that must be passed on the stack.
+
+For System V AMD64 ABI:
+  Stack arguments are at [RSP + 0], [RSP + 8], [RSP + 16], etc. (from the caller's
+  perspective before the CALL). After the CALL pushes the return address, these become
+  [RSP + 8], [RSP + 16], [RSP + 24] from the callee's perspective.
+
+For Win64 ABI:
+  The first 4 argument positions always have shadow space at [RSP + 0] through
+  [RSP + 24] (from the caller's perspective). Stack arguments for positions >= 4
+  start at [RSP + 32]. After the CALL, callee sees them at [RSP + 40], etc.
+
+The stack_arg_index parameter is the zero-based index among stack-passed arguments
+(not the overall argument index). For example, if 3 args are in registers and the
+4th is on the stack, stack_arg_index for the 4th argument is 0.
+@End Reasoning
+
+Process called "get_stack_arg_offset" that takes convention as Integer, stack_arg_index as Integer returns Integer:
+    If stack_arg_index < 0:
+        Return 0
+    End If
+
+    If convention is CALLING_CONV_SYSTEMV:
+        Note: Stack args start immediately at RSP (caller's view)
+        Return stack_arg_index * 8
+    End If
+
+    If convention is CALLING_CONV_WIN64:
+        Note: First 32 bytes are shadow space, stack args follow
+        Return 32 + (stack_arg_index * 8)
+    End If
+
+    Return stack_arg_index * 8
+End Process

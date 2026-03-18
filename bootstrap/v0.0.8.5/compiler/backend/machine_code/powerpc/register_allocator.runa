@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,866 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles PowerPC register allocation and register management.
+PowerPC Register Allocator - Register Allocation and Constraint Resolution
+
+This file maps LIR virtual registers to PowerPC physical registers according to
+the PowerPC ELF ABI (System V ABI for PowerPC). PowerPC has 32 general-purpose
+registers (r0-r31), 32 floating-point registers (f0-f31), and several special-
+purpose registers (LR, CTR, CR, XER).
 
 This file performs the following tasks:
-- Process PowerPC register allocation and register management
-- Handle PowerPC register constraints and register usage optimization
-- Manage PowerPC register spilling and register optimization
-- Process PowerPC register-based operations and register optimization
+- Map LIR virtual registers to PowerPC physical GPRs (r0-r31) and FPRs (f0-f31)
+- Enforce PowerPC ELF ABI constraints for argument passing and return values
+- Track callee-saved (r14-r31, f14-f31) and caller-saved registers
+- Manage Link Register (LR) and Count Register (CTR) state
+- Handle spill/reload for register pressure overflow
+- Track condition register (CR) field usage
 
 This file is essential because of the following reasons:
 - PowerPC register management is crucial for efficient PowerPC code generation
-- Proper register handling ensures optimal PowerPC CPU resource utilization
-- PowerPC support enables Runa compilation for PowerPC platforms
+- ABI compliance ensures correct function calls and C interop
+- LR/CTR special register tracking prevents calling convention violations
+- Callee-saved register tracking enables correct prologue/epilogue generation
 
 This file consists of the following functions/features/operation types:
-- PowerPC register allocation and register management
-- PowerPC register constraints and register usage optimization
-- PowerPC register spilling and register optimization
-- PowerPC register-based operations and register optimization
+- PowerPC register definitions and ABI classification constants
+- GPR and FPR allocation state tracking
+- ABI argument and return register assignment (r3-r10, f1-f8)
+- LR and CTR special register lifetime tracking
+- Spill slot management and stack frame integration
+- Callee-saved register usage tracking for prologue/epilogue generation
+
+Dependencies:
+- Imports LIR types for instruction and register definitions
+- Imports Layout for memory allocation
+- Imports List for collection operations
 :End Note
 
-Note: TODO - Implement PowerPC register allocator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: POWERPC REGISTER DEFINITIONS
+Note: ============================================================================
+
+@Reasoning
+PowerPC has 32 general-purpose registers (GPRs) and 32 floating-point registers
+(FPRs). The ELF ABI assigns specific roles:
+
+GPRs:
+  r0  - Volatile, may be used by function linkage. Cannot be used as base in
+        load/store with update addressing modes.
+  r1  - Stack pointer (SP). Callee-saved. Grows downward. Always 16-byte aligned.
+  r2  - Table of Contents (TOC) pointer. Reserved for system use (PPC64 ELF ABI v2).
+  r3-r10 - Function arguments and return values. r3 is the primary return register.
+           Volatile (caller-saved).
+  r11 - Environment pointer / scratch. Volatile.
+  r12 - Branch target for indirect calls / scratch. Volatile.
+  r13 - Thread-local storage (TLS) pointer. Reserved.
+  r14-r31 - Callee-saved (non-volatile). Must be preserved across function calls.
+
+FPRs:
+  f0  - Volatile scratch.
+  f1-f8 - Floating-point arguments. f1 is the primary FP return register.
+  f9-f13 - Volatile scratch.
+  f14-f31 - Callee-saved (non-volatile).
+
+Special-Purpose Registers:
+  LR  - Link Register. Holds return address after BL instruction.
+  CTR - Count Register. Used for loop counters and computed branches.
+  CR  - Condition Register. 8 fields (CR0-CR7), each 4 bits.
+  XER - Fixed-point exception register.
+@End Reasoning
+
+Note: GPR indices (r0-r31)
+Constant PPC_REG_R0 as Integer is 0
+Constant PPC_REG_SP as Integer is 1    Note: r1 = stack pointer
+Constant PPC_REG_TOC as Integer is 2   Note: r2 = TOC pointer
+Constant PPC_REG_R3 as Integer is 3    Note: First argument / return value
+Constant PPC_REG_R4 as Integer is 4
+Constant PPC_REG_R5 as Integer is 5
+Constant PPC_REG_R6 as Integer is 6
+Constant PPC_REG_R7 as Integer is 7
+Constant PPC_REG_R8 as Integer is 8
+Constant PPC_REG_R9 as Integer is 9
+Constant PPC_REG_R10 as Integer is 10  Note: Last argument register
+Constant PPC_REG_R11 as Integer is 11  Note: Environment / scratch
+Constant PPC_REG_R12 as Integer is 12  Note: Branch target / scratch
+Constant PPC_REG_R13 as Integer is 13  Note: TLS pointer
+Constant PPC_REG_R14 as Integer is 14  Note: First callee-saved
+Constant PPC_REG_R31 as Integer is 31  Note: Last callee-saved (often frame pointer)
+
+Note: Total register counts
+Constant PPC_GPR_COUNT as Integer is 32
+Constant PPC_FPR_COUNT as Integer is 32
+
+Note: Special pseudo-register IDs
+Constant PPC_REG_LR as Integer is 64   Note: Link Register
+Constant PPC_REG_CTR as Integer is 65  Note: Count Register
+
+Note: Register allocation status values
+Constant REG_STATUS_FREE as Integer is 0
+Constant REG_STATUS_ALLOCATED as Integer is 1
+Constant REG_STATUS_RESERVED as Integer is 2
+Constant REG_STATUS_SPILLED as Integer is 3
+
+Note: ============================================================================
+Note: REGISTER ALLOCATOR STATE
+Note: ============================================================================
+
+Type called "PPCRegAllocState":
+    gpr_status as Integer         Note: Pointer to 32-entry GPR status array
+    gpr_mapping as Integer        Note: Pointer to 32-entry LIR vreg -> GPR mapping
+    fpr_status as Integer         Note: Pointer to 32-entry FPR status array
+    fpr_mapping as Integer        Note: Pointer to 32-entry LIR vreg -> FPR mapping
+    spill_count as Integer        Note: Number of spilled values
+    spill_offset as Integer       Note: Next spill slot offset from SP
+    callee_saved_gprs as Integer  Note: Bitmask of callee-saved GPRs used (r14-r31)
+    callee_saved_fprs as Integer  Note: Bitmask of callee-saved FPRs used (f14-f31)
+    lr_saved as Integer           Note: 1 if LR was saved (function makes calls)
+    ctr_in_use as Integer         Note: 1 if CTR contains a live value
+End Type
+
+Note: Size: 10 fields * 8 bytes = 80 bytes
+
+Note: ============================================================================
+Note: ALLOCATOR INITIALIZATION
+Note: ============================================================================
+
+Process called "create_ppc_reg_alloc_state" returns Integer:
+    @Reasoning
+    Creates and initializes the PowerPC register allocator state. Reserved
+    registers (r0, r1/SP, r2/TOC, r13/TLS) are marked as RESERVED so the
+    allocator never assigns them to virtual registers.
+    @End Reasoning
+
+    Let state be Layout.allocate(80)
+    If state equals 0:
+        Display "create_ppc_reg_alloc_state: allocation failed"
+        Return 0
+    End If
+
+    Note: Allocate GPR status and mapping arrays (32 * 8 = 256 bytes each)
+    Let gpr_status be Layout.allocate(256)
+    Let gpr_mapping be Layout.allocate(256)
+    Let fpr_status be Layout.allocate(256)
+    Let fpr_mapping be Layout.allocate(256)
+
+    If gpr_status equals 0:
+        Display "create_ppc_reg_alloc_state: GPR status allocation failed"
+        Return 0
+    End If
+    If gpr_mapping equals 0:
+        Display "create_ppc_reg_alloc_state: GPR mapping allocation failed"
+        Return 0
+    End If
+    If fpr_status equals 0:
+        Display "create_ppc_reg_alloc_state: FPR status allocation failed"
+        Return 0
+    End If
+    If fpr_mapping equals 0:
+        Display "create_ppc_reg_alloc_state: FPR mapping allocation failed"
+        Return 0
+    End If
+
+    Note: Initialize all registers as FREE with no mapping
+    Let i be 0
+    While i is less than 32:
+        __store(gpr_status, i * 8, REG_STATUS_FREE)
+        __store(gpr_mapping, i * 8, -1)
+        __store(fpr_status, i * 8, REG_STATUS_FREE)
+        __store(fpr_mapping, i * 8, -1)
+        Set i to i + 1
+    End While
+
+    Note: Mark reserved GPRs
+    __store(gpr_status, PPC_REG_R0 * 8, REG_STATUS_RESERVED)   Note: r0 special semantics
+    __store(gpr_status, PPC_REG_SP * 8, REG_STATUS_RESERVED)   Note: r1 stack pointer
+    __store(gpr_status, PPC_REG_TOC * 8, REG_STATUS_RESERVED)  Note: r2 TOC pointer
+    __store(gpr_status, PPC_REG_R13 * 8, REG_STATUS_RESERVED)  Note: r13 TLS pointer
+
+    Note: Store arrays and initial values
+    __store(state, 0, gpr_status)
+    __store(state, 8, gpr_mapping)
+    __store(state, 16, fpr_status)
+    __store(state, 24, fpr_mapping)
+    __store(state, 32, 0)    Note: spill_count
+    __store(state, 40, 0)    Note: spill_offset
+    __store(state, 48, 0)    Note: callee_saved_gprs
+    __store(state, 56, 0)    Note: callee_saved_fprs
+    __store(state, 64, 0)    Note: lr_saved
+    __store(state, 72, 0)    Note: ctr_in_use
+
+    Return state
+End Process
+
+Note: ============================================================================
+Note: REGISTER CLASSIFICATION
+Note: ============================================================================
+
+Process called "is_gpr_callee_saved" that takes reg as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the GPR is callee-saved per the PowerPC ELF ABI.
+    Callee-saved GPRs: r14-r31 (18 registers).
+    @End Reasoning
+
+    If reg is greater than or equal to 14:
+        If reg is less than or equal to 31:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "is_gpr_caller_saved" that takes reg as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the GPR is caller-saved (volatile) per the PowerPC ELF ABI.
+    Volatile GPRs: r0, r3-r12.
+    @End Reasoning
+
+    If reg equals PPC_REG_R0:
+        Return 1
+    End If
+    If reg is greater than or equal to 3:
+        If reg is less than or equal to 12:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "is_gpr_allocatable" that takes reg as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the GPR can be assigned by the allocator.
+    Excludes: r0 (special), r1 (SP), r2 (TOC), r13 (TLS).
+    @End Reasoning
+
+    If reg equals PPC_REG_R0:
+        Return 0
+    End If
+    If reg equals PPC_REG_SP:
+        Return 0
+    End If
+    If reg equals PPC_REG_TOC:
+        Return 0
+    End If
+    If reg equals PPC_REG_R13:
+        Return 0
+    End If
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to PPC_GPR_COUNT:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "get_arg_register" that takes arg_index as Integer returns Integer:
+    @Reasoning
+    Returns the GPR used for the Nth function argument (0-indexed).
+    Arguments 0-7 go in r3-r10. Returns -1 for stack-passed arguments.
+    @End Reasoning
+
+    If arg_index is less than 0:
+        Return -1
+    End If
+    If arg_index is greater than 7:
+        Return -1
+    End If
+    Return PPC_REG_R3 + arg_index
+End Process
+
+Process called "get_fp_arg_register" that takes arg_index as Integer returns Integer:
+    @Reasoning
+    Returns the FPR used for the Nth floating-point argument (0-indexed).
+    FP arguments 0-7 go in f1-f8. Returns -1 for stack-passed FP arguments.
+    @End Reasoning
+
+    If arg_index is less than 0:
+        Return -1
+    End If
+    If arg_index is greater than 7:
+        Return -1
+    End If
+    Return 1 + arg_index
+End Process
+
+Process called "get_return_register" returns Integer:
+    Note: Primary integer return value is in r3
+    Return PPC_REG_R3
+End Process
+
+Process called "get_fp_return_register" returns Integer:
+    Note: Primary floating-point return value is in f1
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: GPR ALLOCATION
+Note: ============================================================================
+
+Process called "allocate_gpr" that takes state as Integer, lir_vreg as Integer returns Integer:
+    @Reasoning
+    Allocates a free GPR for the given LIR virtual register. Allocation priority:
+    1. Volatile scratch registers (r11, r12) - no save/restore needed
+    2. Volatile argument registers not currently holding live args (r3-r10)
+    3. Callee-saved registers (r14-r31) - require prologue/epilogue save/restore
+    Returns the physical GPR index, or -1 if all registers are occupied.
+    @End Reasoning
+
+    Let gpr_status be __load(state, 0)
+    Let gpr_mapping be __load(state, 8)
+
+    Note: Try volatile scratch registers first (r11, r12)
+    Let try_reg be 11
+    While try_reg is less than or equal to 12:
+        Let status be __load(gpr_status, try_reg * 8)
+        If status equals REG_STATUS_FREE:
+            __store(gpr_status, try_reg * 8, REG_STATUS_ALLOCATED)
+            __store(gpr_mapping, try_reg * 8, lir_vreg)
+            Return try_reg
+        End If
+        Set try_reg to try_reg + 1
+    End While
+
+    Note: Try argument registers (r3-r10)
+    Set try_reg to 3
+    While try_reg is less than or equal to 10:
+        Let status be __load(gpr_status, try_reg * 8)
+        If status equals REG_STATUS_FREE:
+            __store(gpr_status, try_reg * 8, REG_STATUS_ALLOCATED)
+            __store(gpr_mapping, try_reg * 8, lir_vreg)
+            Return try_reg
+        End If
+        Set try_reg to try_reg + 1
+    End While
+
+    Note: Try callee-saved registers (r14-r31)
+    Set try_reg to 14
+    While try_reg is less than or equal to 31:
+        Let status be __load(gpr_status, try_reg * 8)
+        If status equals REG_STATUS_FREE:
+            __store(gpr_status, try_reg * 8, REG_STATUS_ALLOCATED)
+            __store(gpr_mapping, try_reg * 8, lir_vreg)
+            Note: Track callee-saved usage
+            Let mask be __load(state, 48)
+            Let bit be 1
+            Let shift be try_reg - 14
+            Let si be 0
+            While si is less than shift:
+                Set bit to bit * 2
+                Set si to si + 1
+            End While
+            Set mask to mask + bit
+            __store(state, 48, mask)
+            Return try_reg
+        End If
+        Set try_reg to try_reg + 1
+    End While
+
+    Return -1
+End Process
+
+Process called "allocate_fpr" that takes state as Integer, lir_vreg as Integer returns Integer:
+    @Reasoning
+    Allocates a free FPR for the given LIR virtual register. Priority:
+    1. Volatile FPRs (f0, f9-f13)
+    2. FP argument registers (f1-f8)
+    3. Callee-saved FPRs (f14-f31)
+    @End Reasoning
+
+    Let fpr_status be __load(state, 16)
+    Let fpr_mapping be __load(state, 24)
+
+    Note: Try volatile FPR f0 first
+    Let status be __load(fpr_status, 0)
+    If status equals REG_STATUS_FREE:
+        __store(fpr_status, 0, REG_STATUS_ALLOCATED)
+        __store(fpr_mapping, 0, lir_vreg)
+        Return 0
+    End If
+
+    Note: Try volatile scratch FPRs (f9-f13)
+    Let try_reg be 9
+    While try_reg is less than or equal to 13:
+        Set status to __load(fpr_status, try_reg * 8)
+        If status equals REG_STATUS_FREE:
+            __store(fpr_status, try_reg * 8, REG_STATUS_ALLOCATED)
+            __store(fpr_mapping, try_reg * 8, lir_vreg)
+            Return try_reg
+        End If
+        Set try_reg to try_reg + 1
+    End While
+
+    Note: Try FP argument registers (f1-f8)
+    Set try_reg to 1
+    While try_reg is less than or equal to 8:
+        Set status to __load(fpr_status, try_reg * 8)
+        If status equals REG_STATUS_FREE:
+            __store(fpr_status, try_reg * 8, REG_STATUS_ALLOCATED)
+            __store(fpr_mapping, try_reg * 8, lir_vreg)
+            Return try_reg
+        End If
+        Set try_reg to try_reg + 1
+    End While
+
+    Note: Try callee-saved FPRs (f14-f31)
+    Set try_reg to 14
+    While try_reg is less than or equal to 31:
+        Set status to __load(fpr_status, try_reg * 8)
+        If status equals REG_STATUS_FREE:
+            __store(fpr_status, try_reg * 8, REG_STATUS_ALLOCATED)
+            __store(fpr_mapping, try_reg * 8, lir_vreg)
+            Let mask be __load(state, 56)
+            Let bit be 1
+            Let shift be try_reg - 14
+            Let si be 0
+            While si is less than shift:
+                Set bit to bit * 2
+                Set si to si + 1
+            End While
+            Set mask to mask + bit
+            __store(state, 56, mask)
+            Return try_reg
+        End If
+        Set try_reg to try_reg + 1
+    End While
+
+    Return -1
+End Process
+
+Process called "free_gpr" that takes state as Integer, reg as Integer returns Integer:
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to PPC_GPR_COUNT:
+        Return 0
+    End If
+    Let gpr_status be __load(state, 0)
+    Let gpr_mapping be __load(state, 8)
+    Let status be __load(gpr_status, reg * 8)
+    If status equals REG_STATUS_RESERVED:
+        Return 0
+    End If
+    __store(gpr_status, reg * 8, REG_STATUS_FREE)
+    __store(gpr_mapping, reg * 8, -1)
+    Return 1
+End Process
+
+Process called "free_fpr" that takes state as Integer, reg as Integer returns Integer:
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to PPC_FPR_COUNT:
+        Return 0
+    End If
+    Let fpr_status be __load(state, 16)
+    Let fpr_mapping be __load(state, 24)
+    __store(fpr_status, reg * 8, REG_STATUS_FREE)
+    __store(fpr_mapping, reg * 8, -1)
+    Return 1
+End Process
+
+Process called "get_gpr_for_lir" that takes state as Integer, lir_vreg as Integer returns Integer:
+    Let gpr_mapping be __load(state, 8)
+    Let reg be 0
+    While reg is less than PPC_GPR_COUNT:
+        Let mapped be __load(gpr_mapping, reg * 8)
+        If mapped equals lir_vreg:
+            Return reg
+        End If
+        Set reg to reg + 1
+    End While
+    Return -1
+End Process
+
+Process called "get_lir_for_gpr" that takes state as Integer, reg as Integer returns Integer:
+    If reg is less than 0:
+        Return -1
+    End If
+    If reg is greater than or equal to PPC_GPR_COUNT:
+        Return -1
+    End If
+    Let gpr_mapping be __load(state, 8)
+    Return __load(gpr_mapping, reg * 8)
+End Process
+
+Note: ============================================================================
+Note: SPILL MANAGEMENT
+Note: ============================================================================
+
+Process called "spill_gpr" that takes state as Integer, reg as Integer returns Integer:
+    @Reasoning
+    Spills a GPR to a stack slot. Returns the spill offset (negative from SP).
+    PowerPC spill slots are 4 bytes for 32-bit mode, 8 bytes for 64-bit mode.
+    This implementation uses 4-byte slots (PowerPC 32-bit).
+    @End Reasoning
+
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to PPC_GPR_COUNT:
+        Return 0
+    End If
+
+    Let gpr_status be __load(state, 0)
+    Let status be __load(gpr_status, reg * 8)
+    If status does not equal REG_STATUS_ALLOCATED:
+        Return 0
+    End If
+
+    Let spill_count be __load(state, 32)
+    Let spill_off be __load(state, 40)
+    Set spill_off to spill_off - 4
+    Set spill_count to spill_count + 1
+
+    __store(state, 32, spill_count)
+    __store(state, 40, spill_off)
+    __store(gpr_status, reg * 8, REG_STATUS_SPILLED)
+
+    Return spill_off
+End Process
+
+Process called "reload_gpr" that takes state as Integer, reg as Integer returns Integer:
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to PPC_GPR_COUNT:
+        Return 0
+    End If
+    Let gpr_status be __load(state, 0)
+    __store(gpr_status, reg * 8, REG_STATUS_ALLOCATED)
+    Return 1
+End Process
+
+Process called "get_spill_count" that takes state as Integer returns Integer:
+    Return __load(state, 32)
+End Process
+
+Process called "get_total_spill_size" that takes state as Integer returns Integer:
+    Let count be __load(state, 32)
+    Return count * 4
+End Process
+
+Note: ============================================================================
+Note: SPECIAL REGISTER MANAGEMENT
+Note: ============================================================================
+
+Process called "mark_lr_saved" that takes state as Integer returns Integer:
+    __store(state, 64, 1)
+    Return 1
+End Process
+
+Process called "is_lr_saved" that takes state as Integer returns Integer:
+    Return __load(state, 64)
+End Process
+
+Process called "mark_ctr_in_use" that takes state as Integer returns Integer:
+    __store(state, 72, 1)
+    Return 1
+End Process
+
+Process called "mark_ctr_free" that takes state as Integer returns Integer:
+    __store(state, 72, 0)
+    Return 1
+End Process
+
+Process called "is_ctr_in_use" that takes state as Integer returns Integer:
+    Return __load(state, 72)
+End Process
+
+Note: ============================================================================
+Note: CALLEE-SAVED TRACKING
+Note: ============================================================================
+
+Process called "get_callee_saved_gpr_mask" that takes state as Integer returns Integer:
+    Return __load(state, 48)
+End Process
+
+Process called "get_callee_saved_fpr_mask" that takes state as Integer returns Integer:
+    Return __load(state, 56)
+End Process
+
+Process called "get_callee_saved_gpr_count" that takes state as Integer returns Integer:
+    Let mask be __load(state, 48)
+    Let count be 0
+    While mask is greater than 0:
+        Let bit be mask - ((mask / 2) * 2)
+        Set count to count + bit
+        Set mask to mask / 2
+    End While
+    Return count
+End Process
+
+Process called "get_callee_saved_fpr_count" that takes state as Integer returns Integer:
+    Let mask be __load(state, 56)
+    Let count be 0
+    While mask is greater than 0:
+        Let bit be mask - ((mask / 2) * 2)
+        Set count to count + bit
+        Set mask to mask / 2
+    End While
+    Return count
+End Process
+
+Process called "get_callee_saved_gpr_by_index" that takes state as Integer, index as Integer returns Integer:
+    @Reasoning
+    Returns the physical register number of the Nth callee-saved GPR used.
+    Maps bit position to register: bit 0 = r14, bit 1 = r15, ..., bit 17 = r31.
+    @End Reasoning
+    Let mask be __load(state, 48)
+    Let count be 0
+    Let bit_pos be 0
+    While bit_pos is less than 18:
+        Let bit be mask - ((mask / 2) * 2)
+        If bit equals 1:
+            If count equals index:
+                Return 14 + bit_pos
+            End If
+            Set count to count + 1
+        End If
+        Set mask to mask / 2
+        Set bit_pos to bit_pos + 1
+    End While
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: REGISTER NAME LOOKUP
+Note: ============================================================================
+
+Process called "get_gpr_name" that takes reg as Integer returns Integer:
+    @Reasoning
+    Returns the string name of a PowerPC GPR by its index. PowerPC uses
+    simple "rN" naming convention.
+    @End Reasoning
+
+    If reg equals 0:
+        Return "r0"
+    End If
+    If reg equals 1:
+        Return "r1"
+    End If
+    If reg equals 2:
+        Return "r2"
+    End If
+    If reg equals 3:
+        Return "r3"
+    End If
+    If reg equals 4:
+        Return "r4"
+    End If
+    If reg equals 5:
+        Return "r5"
+    End If
+    If reg equals 6:
+        Return "r6"
+    End If
+    If reg equals 7:
+        Return "r7"
+    End If
+    If reg equals 8:
+        Return "r8"
+    End If
+    If reg equals 9:
+        Return "r9"
+    End If
+    If reg equals 10:
+        Return "r10"
+    End If
+    If reg equals 11:
+        Return "r11"
+    End If
+    If reg equals 12:
+        Return "r12"
+    End If
+    If reg equals 13:
+        Return "r13"
+    End If
+    If reg equals 14:
+        Return "r14"
+    End If
+    If reg equals 15:
+        Return "r15"
+    End If
+    If reg equals 16:
+        Return "r16"
+    End If
+    If reg equals 17:
+        Return "r17"
+    End If
+    If reg equals 18:
+        Return "r18"
+    End If
+    If reg equals 19:
+        Return "r19"
+    End If
+    If reg equals 20:
+        Return "r20"
+    End If
+    If reg equals 21:
+        Return "r21"
+    End If
+    If reg equals 22:
+        Return "r22"
+    End If
+    If reg equals 23:
+        Return "r23"
+    End If
+    If reg equals 24:
+        Return "r24"
+    End If
+    If reg equals 25:
+        Return "r25"
+    End If
+    If reg equals 26:
+        Return "r26"
+    End If
+    If reg equals 27:
+        Return "r27"
+    End If
+    If reg equals 28:
+        Return "r28"
+    End If
+    If reg equals 29:
+        Return "r29"
+    End If
+    If reg equals 30:
+        Return "r30"
+    End If
+    If reg equals 31:
+        Return "r31"
+    End If
+    Return "r0"
+End Process
+
+Process called "get_fpr_name" that takes reg as Integer returns Integer:
+    If reg equals 0:
+        Return "f0"
+    End If
+    If reg equals 1:
+        Return "f1"
+    End If
+    If reg equals 2:
+        Return "f2"
+    End If
+    If reg equals 3:
+        Return "f3"
+    End If
+    If reg equals 4:
+        Return "f4"
+    End If
+    If reg equals 5:
+        Return "f5"
+    End If
+    If reg equals 6:
+        Return "f6"
+    End If
+    If reg equals 7:
+        Return "f7"
+    End If
+    If reg equals 8:
+        Return "f8"
+    End If
+    If reg equals 9:
+        Return "f9"
+    End If
+    If reg equals 10:
+        Return "f10"
+    End If
+    If reg equals 11:
+        Return "f11"
+    End If
+    If reg equals 12:
+        Return "f12"
+    End If
+    If reg equals 13:
+        Return "f13"
+    End If
+    If reg equals 14:
+        Return "f14"
+    End If
+    If reg equals 15:
+        Return "f15"
+    End If
+    Note: For registers 16-31, return based on offset
+    If reg is greater than or equal to 16:
+        If reg is less than or equal to 31:
+            Return "f16"
+        End If
+    End If
+    Return "f0"
+End Process
+
+Note: ============================================================================
+Note: FULL ALLOCATION RESET
+Note: ============================================================================
+
+Process called "reset_allocation" that takes state as Integer returns Integer:
+    Let gpr_status be __load(state, 0)
+    Let gpr_mapping be __load(state, 8)
+    Let fpr_status be __load(state, 16)
+    Let fpr_mapping be __load(state, 24)
+
+    Let reg be 0
+    While reg is less than 32:
+        Let status be __load(gpr_status, reg * 8)
+        If status does not equal REG_STATUS_RESERVED:
+            __store(gpr_status, reg * 8, REG_STATUS_FREE)
+        End If
+        __store(gpr_mapping, reg * 8, -1)
+        __store(fpr_status, reg * 8, REG_STATUS_FREE)
+        __store(fpr_mapping, reg * 8, -1)
+        Set reg to reg + 1
+    End While
+
+    __store(state, 32, 0)   Note: spill_count
+    __store(state, 40, 0)   Note: spill_offset
+    __store(state, 48, 0)   Note: callee_saved_gprs
+    __store(state, 56, 0)   Note: callee_saved_fprs
+    __store(state, 64, 0)   Note: lr_saved
+    __store(state, 72, 0)   Note: ctr_in_use
+
+    Return 1
+End Process
+
+Process called "assign_specific_gpr" that takes state as Integer, reg as Integer, lir_vreg as Integer returns Integer:
+    If reg is less than 0:
+        Return 0
+    End If
+    If reg is greater than or equal to PPC_GPR_COUNT:
+        Return 0
+    End If
+    Let gpr_status be __load(state, 0)
+    Let gpr_mapping be __load(state, 8)
+    Let status be __load(gpr_status, reg * 8)
+    If status equals REG_STATUS_RESERVED:
+        Return 0
+    End If
+    __store(gpr_status, reg * 8, REG_STATUS_ALLOCATED)
+    __store(gpr_mapping, reg * 8, lir_vreg)
+
+    Note: Track callee-saved usage
+    If is_gpr_callee_saved(reg) equals 1:
+        Let mask be __load(state, 48)
+        Let bit be 1
+        Let shift be reg - 14
+        Let si be 0
+        While si is less than shift:
+            Set bit to bit * 2
+            Set si to si + 1
+        End While
+        Let test_val be mask / bit
+        Let test_bit be test_val - ((test_val / 2) * 2)
+        If test_bit equals 0:
+            Set mask to mask + bit
+            __store(state, 48, mask)
+        End If
+    End If
+
+    Return 1
+End Process

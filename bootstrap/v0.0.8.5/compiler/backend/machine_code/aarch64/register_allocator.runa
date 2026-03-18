@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,709 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles AArch64 register allocation and register management.
+AArch64 Register Allocation Constraint Resolution
+
+Handles AArch64-specific register allocation constraints that the middle-end
+graph-coloring allocator does not address. Unlike x86_64, AArch64 is a
+three-operand RISC architecture, so there are far fewer constraints to resolve.
 
 This file performs the following tasks:
-- Process AArch64 register allocation and register management
-- Handle AArch64 register constraints and register usage optimization
-- Manage AArch64 register spilling and register optimization
-- Process AArch64 register-based operations and register optimization
+- Finalizes register allocation for AArch64 by resolving architecture-specific constraints
+- Collects constraints for instructions that require specific register placements
+- Coalesces redundant MOV instructions introduced by constraint resolution
+- Handles SP usage restrictions (SP cannot be used as a general operand in most instructions)
+- Handles fixed-register requirements for certain instructions (e.g., division, syscalls)
 
 This file is essential because of the following reasons:
-- AArch64 register management is crucial for efficient AArch64 code generation
-- Proper register handling ensures optimal AArch64 CPU resource utilization
-- AArch64 support enables Runa compilation for AArch64 platforms
+- AArch64 has a clean three-operand ISA, but certain instructions still impose constraints
+- SDIV/UDIV do NOT use implicit register pairs (unlike x86 IDIV), but syscalls use X8
+  for the syscall number and X0-X5 for arguments
+- SP cannot be used as Rd in most data processing instructions (use X29 for frame access)
+- The STP/LDP pair instructions require registers to be consecutive or specific pairs
+- X16/X17 (IP0/IP1) may be clobbered by linker veneers, restricting their use across calls
+- MADD/MSUB/SMADDL are 3-source instructions requiring special operand handling
 
-This file consists of the following functions/features/operation types:
-- AArch64 register allocation and register management
-- AArch64 register constraints and register usage optimization
-- AArch64 register spilling and register optimization
-- AArch64 register-based operations and register optimization
+AArch64 Constraint Differences from x86_64:
+- NO two-address form: AArch64 uses 3-operand instructions (dest, src1, src2)
+- NO implicit register pairs for division: SDIV/UDIV are dest=src1/src2, no clobber
+- NO CL register for shifts: shift count is the third operand, any register
+- SP restrictions: SP can only be used as base in load/store, not in ALU operations
+- X16/X17 linker scratch: may be clobbered by PLT stubs, should not hold live values across calls
+
+Dependencies:
+- Imports LIR types for instruction/operand/function/module definitions
+- Imports CallingConv for AArch64 calling convention register usage
+- Imports layout.runa for OWNED HEAP allocation (Tier 3)
+- Imports list.runa and dictionary.runa for collection manipulation
 :End Note
 
-Note: TODO - Implement AArch64 register allocator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/middle/gungnir/lir/register_alloc.runa" as RegisterAlloc
+Import "compiler/backend/machine_code/aarch64/calling_convention.runa" as CallingConv
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+
+Note: ============================================================================
+Note: AArch64 Register Constants (mirrored from CallingConv for local convenience)
+Note: ============================================================================
+
+Constant REG_X0 as Integer is 0
+Constant REG_X1 as Integer is 1
+Constant REG_X2 as Integer is 2
+Constant REG_X3 as Integer is 3
+Constant REG_X4 as Integer is 4
+Constant REG_X5 as Integer is 5
+Constant REG_X6 as Integer is 6
+Constant REG_X7 as Integer is 7
+Constant REG_X8 as Integer is 8    Note: Indirect result / syscall number
+Constant REG_X9 as Integer is 9
+Constant REG_X10 as Integer is 10
+Constant REG_X11 as Integer is 11
+Constant REG_X12 as Integer is 12
+Constant REG_X13 as Integer is 13
+Constant REG_X14 as Integer is 14
+Constant REG_X15 as Integer is 15
+Constant REG_X16 as Integer is 16  Note: IP0 (linker scratch)
+Constant REG_X17 as Integer is 17  Note: IP1 (linker scratch)
+Constant REG_X18 as Integer is 18  Note: Platform register
+Constant REG_X29 as Integer is 29  Note: Frame pointer (FP)
+Constant REG_X30 as Integer is 30  Note: Link register (LR)
+Constant REG_SP as Integer is 31   Note: Stack pointer
+
+Note: ============================================================================
+Note: LIR Opcode Constants (mirrored from LIR for local convenience)
+Note: ============================================================================
+
+Constant OP_MOV as Integer is 30001
+Constant OP_ADD as Integer is 30100
+Constant OP_SUB as Integer is 30101
+Constant OP_IMUL as Integer is 30102
+Constant OP_IDIV as Integer is 30103
+Constant OP_MUL as Integer is 30104
+Constant OP_DIV as Integer is 30105
+Constant OP_AND as Integer is 30200
+Constant OP_OR as Integer is 30201
+Constant OP_XOR as Integer is 30202
+Constant OP_SHL as Integer is 30300
+Constant OP_SHR as Integer is 30301
+Constant OP_SAR as Integer is 30302
+Constant OP_CALL as Integer is 30520
+Constant OP_SYSCALL as Integer is 30523
+
+Note: ============================================================================
+Note: Constraint Type Constants
+Note: ============================================================================
+
+@Reasoning
+AArch64 has far fewer constraint types than x86_64 because it is a 3-operand RISC
+architecture. The constraints that remain are:
+
+CONSTRAINT_FIXED_REG: An operand must reside in a specific physical register. This
+  covers syscall number (X8), return values (X0), and calling convention requirements.
+  Unlike x86_64, there is no implicit register pair for division.
+
+CONSTRAINT_CLOBBER: An instruction implicitly writes to registers not named in its
+  operand list. On AArch64, the main cases are:
+  - BL (function call) clobbers X0-X18, V0-V7, V16-V31 (caller-saved)
+  - SVC (supervisor call) clobbers return registers
+  - X16/X17 may be clobbered by linker veneers after any BL
+
+CONSTRAINT_SP_RESTRICTED: SP cannot be used as Rd in most data-processing instructions.
+  If the allocator assigned SP to a data-processing result, we must insert a MOV
+  through a temporary register. In practice, the allocator should never assign SP since
+  it is excluded from the allocatable register set, but this constraint serves as a
+  safety net.
+
+No CONSTRAINT_TWO_ADDRESS: AArch64 does not have two-address form instructions.
+No CONSTRAINT_SHIFT_CL: Shifts take the count as a normal register operand.
+No CONSTRAINT_DIV_RAX_RDX: SDIV/UDIV are normal 3-operand instructions.
+@End Reasoning
+
+Constant CONSTRAINT_FIXED_REG as Integer is 2
+Constant CONSTRAINT_CLOBBER as Integer is 3
+Constant CONSTRAINT_SP_RESTRICTED as Integer is 6
+
+Note: ============================================================================
+Note: AArch64AllocConstraint Type Definition
+Note: ============================================================================
+
+@Reasoning
+Each constraint record describes a single AArch64-specific register constraint that
+must be resolved after middle-end graph-coloring allocation.
+
+Fields:
+- instruction_index: position of the constrained instruction within its block
+- constraint_type: one of the CONSTRAINT_* constants
+- required_register: the physical register that an operand must reside in
+  (e.g., X8 for syscall number, X0 for return value)
+- operand_index: which operand is constrained (0=result, 1=operand1, 2=operand2)
+- block_index: index of the basic block containing the instruction
+
+Structure layout: 5 fields * 8 bytes = 40 bytes
+@End Reasoning
+
+Type called "AArch64AllocConstraint":
+    instruction_index as Integer
+    constraint_type as Integer
+    required_register as Integer
+    operand_index as Integer
+    block_index as Integer
+End Type
+
+Note: Size: 5 fields * 8 bytes = 40 bytes per AArch64AllocConstraint
+
+Note: ============================================================================
+Note: Constraint Collection
+Note: ============================================================================
+
+@Reasoning
+Scans every instruction in every basic block of the given LIR function and emits
+constraint descriptors for instructions that require AArch64-specific register fixups.
+
+AArch64 constraint categories:
+
+Syscall instructions (SVC):
+  Emit CONSTRAINT_FIXED_REG. The syscall number must be in X8, and arguments must be
+  in X0-X5. The constraint for X8 is emitted here; argument placement is handled by
+  the calling convention lowering pass.
+
+Function calls (BL/BLR):
+  Emit CONSTRAINT_CLOBBER for all caller-saved registers. This informs the allocator
+  that these registers are unavailable across the call boundary.
+
+SP usage in data processing:
+  Emit CONSTRAINT_SP_RESTRICTED if any operand in a data-processing instruction
+  references SP(31). This should not happen with a correct allocator but provides
+  a safety net.
+
+Note: Division (SDIV/UDIV) generates NO constraints on AArch64 because these are
+clean 3-operand instructions with no implicit register usage.
+
+Note: Shifts (LSL/LSR/ASR) generate NO constraints because the shift count is a
+normal register operand, not restricted to a specific register.
+
+Returns a List of pointers to AArch64AllocConstraint structures.
+@End Reasoning
+
+Process called "collect_constraints" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Display "collect_constraints: null function"
+        Return 0
+    End If
+
+    Let constraints be List.list_create(16)
+    If constraints is 0:
+        Display "collect_constraints: failed to create constraints list"
+        Return 0
+    End If
+
+    Note: Retrieve basic blocks from the LIR function
+    Let blocks be __load(lir_function, 32)
+    Let block_count be __load(lir_function, 40)
+
+    If blocks is 0:
+        Return constraints
+    End If
+    If block_count is 0:
+        Return constraints
+    End If
+
+    Let b be 0
+    While b < block_count:
+        Let block be List.list_get(blocks, b)
+        If block is not 0:
+            Let instructions be __load(block, 16)
+            Let inst_count be __load(block, 24)
+
+            If instructions is not 0:
+                Let i be 0
+                While i < inst_count:
+                    Let instruction be List.list_get(instructions, i)
+                    If instruction is not 0:
+                        Let opcode be __load(instruction, 0)
+
+                        Note: ---- Syscall constraints ----
+                        Note: SVC requires syscall number in X8
+                        If opcode is OP_SYSCALL:
+                            Let constraint be Layout.allocate(40)
+                            __store(constraint, 0, i)
+                            __store(constraint, 8, CONSTRAINT_FIXED_REG)
+                            __store(constraint, 16, REG_X8)
+                            __store(constraint, 24, 1)
+                            __store(constraint, 32, b)
+                            List.list_append(constraints, constraint)
+                        End If
+
+                        Note: ---- Function call clobber constraints ----
+                        Note: BL/BLR clobbers all caller-saved registers
+                        If opcode is OP_CALL:
+                            Let clobber_constraint be Layout.allocate(40)
+                            __store(clobber_constraint, 0, i)
+                            __store(clobber_constraint, 8, CONSTRAINT_CLOBBER)
+                            __store(clobber_constraint, 16, -1)
+                            __store(clobber_constraint, 24, -1)
+                            __store(clobber_constraint, 32, b)
+                            List.list_append(constraints, clobber_constraint)
+                        End If
+
+                        Note: ---- SP restriction check ----
+                        Note: Check if any data-processing instruction uses SP as result
+                        If opcode >= OP_ADD:
+                            If opcode <= OP_SAR:
+                                Let result_ptr be __load(instruction, 8)
+                                If result_ptr is not 0:
+                                    Let result_type be __load(result_ptr, 0)
+                                    If result_type is 1:
+                                        Let result_reg be __load(result_ptr, 8)
+                                        If result_reg is REG_SP:
+                                            Let sp_constraint be Layout.allocate(40)
+                                            __store(sp_constraint, 0, i)
+                                            __store(sp_constraint, 8, CONSTRAINT_SP_RESTRICTED)
+                                            __store(sp_constraint, 16, REG_SP)
+                                            __store(sp_constraint, 24, 0)
+                                            __store(sp_constraint, 32, b)
+                                            List.list_append(constraints, sp_constraint)
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Set i to i + 1
+                End While
+            End If
+        End If
+
+        Set b to b + 1
+    End While
+
+    Return constraints
+End Process
+
+Note: ============================================================================
+Note: Register Copy Insertion
+Note: ============================================================================
+
+@Reasoning
+Creates a new LIR MOV instruction and inserts it into the given basic block's
+instruction list at the specified position (before the instruction at before_index).
+
+On AArch64, MOV is implemented as:
+  - For GPR to GPR: ORR Xd, XZR, Xn (bitwise OR with zero register)
+  - The LIR MOV opcode is architecture-neutral; the asm_generator handles the
+    translation to the appropriate AArch64 instruction.
+
+This is the fundamental fixup operation for constraint resolution. All constraint
+resolution works by inserting MOV instructions to shuttle values into required registers.
+
+Returns 1 on success, 0 on failure.
+@End Reasoning
+
+Process called "insert_register_copy" that takes block as Integer, before_index as Integer, dest_reg as Integer, src_reg as Integer, size as Integer returns Integer:
+    If block is 0:
+        Display "insert_register_copy: null block"
+        Return 0
+    End If
+
+    Note: No copy needed if source and destination are the same register
+    If dest_reg is src_reg:
+        Return 1
+    End If
+
+    Note: Create the MOV instruction
+    Let mov_instruction be LIRNodes.create_lir_instruction(OP_MOV)
+    If mov_instruction is 0:
+        Display "insert_register_copy: failed to create MOV instruction"
+        Return 0
+    End If
+
+    Note: Create register operands for destination and source
+    Let dest_operand be LIRNodes.create_register_operand(dest_reg, size)
+    If dest_operand is 0:
+        Display "insert_register_copy: failed to create dest operand"
+        Return 0
+    End If
+
+    Let src_operand be LIRNodes.create_register_operand(src_reg, size)
+    If src_operand is 0:
+        Display "insert_register_copy: failed to create src operand"
+        Return 0
+    End If
+
+    Note: Wire up the MOV instruction: result = dest, operand1 = src
+    Note: LIRInstruction layout: [0] opcode, [8] result, [16] operand1, [24] operand2
+    __store(mov_instruction, 8, dest_operand)
+    __store(mov_instruction, 16, src_operand)
+    __store(mov_instruction, 48, block)
+
+    Note: Insert into the block's instruction list at before_index
+    Let instructions be __load(block, 16)
+    If instructions is 0:
+        Display "insert_register_copy: null instruction list"
+        Return 0
+    End If
+
+    List.list_insert(instructions, before_index, mov_instruction)
+
+    Note: Update instruction count in the block
+    Let inst_count be __load(block, 24)
+    __store(block, 24, inst_count + 1)
+
+    Note: Update instruction indices for all instructions from before_index onward
+    Let new_count be inst_count + 1
+    Let idx be before_index
+    While idx < new_count:
+        Let inst be List.list_get(instructions, idx)
+        If inst is not 0:
+            __store(inst, 64, idx)
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Fixed Register Resolution
+Note: ============================================================================
+
+@Reasoning
+Resolves a CONSTRAINT_FIXED_REG constraint by inserting a MOV to shuttle a value
+into the required physical register before the constrained instruction.
+
+On AArch64, the primary use case is syscall number placement in X8 before SVC.
+If the syscall number is already in X8, no MOV is needed. Otherwise, a MOV is
+inserted before the SVC instruction.
+
+Parameters:
+- lir_function: pointer to the LIRFunction
+- instruction: pointer to the constrained LIRInstruction
+- block: pointer to the containing LIRBasicBlock
+- inst_index: index of the instruction within the block
+- required_reg: the physical register the operand must be in
+- operand_idx: which operand is constrained
+
+Returns the number of instructions inserted (0 or 1).
+@End Reasoning
+
+Process called "handle_fixed_reg_constraint" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer, required_reg as Integer, operand_idx as Integer returns Integer:
+    If instruction is 0:
+        Return 0
+    End If
+    If block is 0:
+        Return 0
+    End If
+
+    Note: Read the constrained operand pointer
+    Note: Operand layout: [8] = result/operand0, [16] = operand1, [24] = operand2
+    Let operand_offset be 8 + (operand_idx * 8)
+    Let operand_ptr be __load(instruction, operand_offset)
+
+    If operand_ptr is 0:
+        Return 0
+    End If
+
+    Note: Check if operand is a register
+    Let op_type be __load(operand_ptr, 0)
+    If op_type is not 1:
+        Note: Not a register operand, nothing to fix
+        Return 0
+    End If
+
+    Note: Get current physical register and operand size
+    Let current_reg be __load(operand_ptr, 8)
+    Let operand_size be __load(operand_ptr, 56)
+    If operand_size is 0:
+        Set operand_size to 8
+    End If
+
+    Note: If already in the required register, no fixup needed
+    If current_reg is required_reg:
+        Return 0
+    End If
+
+    Note: Insert MOV current_reg -> required_reg before this instruction
+    Let success be insert_register_copy(block, inst_index, required_reg, current_reg, operand_size)
+    If success is 0:
+        Display "handle_fixed_reg_constraint: failed to insert MOV"
+        Return 0
+    End If
+
+    Note: Rewrite the operand to reference the required register
+    __store(operand_ptr, 8, required_reg)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: SP Restriction Resolution
+Note: ============================================================================
+
+@Reasoning
+Resolves a CONSTRAINT_SP_RESTRICTED constraint. If the allocator incorrectly assigned
+SP (register 31) as the result of a data-processing instruction, this function rewrites
+the instruction to use a temporary register (X9, a caller-saved scratch) and inserts a
+MOV from the temporary to SP afterward.
+
+In practice, this should never happen because SP is excluded from the allocatable
+register set. This function exists as a safety net.
+
+Returns the number of instructions inserted (0 or 1).
+@End Reasoning
+
+Process called "handle_sp_restriction" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer returns Integer:
+    If instruction is 0:
+        Return 0
+    End If
+    If block is 0:
+        Return 0
+    End If
+
+    Note: Read the result operand
+    Let result_ptr be __load(instruction, 8)
+    If result_ptr is 0:
+        Return 0
+    End If
+
+    Let result_type be __load(result_ptr, 0)
+    If result_type is not 1:
+        Return 0
+    End If
+
+    Let result_reg be __load(result_ptr, 8)
+    If result_reg is not REG_SP:
+        Note: Not targeting SP, no fix needed
+        Return 0
+    End If
+
+    Note: Rewrite the result to use X9 (caller-saved scratch) instead of SP
+    Let temp_reg be REG_X9
+    Let operand_size be __load(result_ptr, 56)
+    If operand_size is 0:
+        Set operand_size to 8
+    End If
+
+    __store(result_ptr, 8, temp_reg)
+
+    Note: Insert MOV X9 -> SP after this instruction (at inst_index + 1)
+    Let after_index be inst_index + 1
+    Let success be insert_register_copy(block, after_index, REG_SP, temp_reg, operand_size)
+    If success is 0:
+        Display "handle_sp_restriction: failed to insert MOV to SP"
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Move Coalescing
+Note: ============================================================================
+
+@Reasoning
+Eliminates redundant MOV instructions that were introduced during constraint resolution
+or that exist in the original LIR output where the source and destination registers are
+the same physical register.
+
+A MOV is redundant when:
+1. Both operands are register operands (type 1)
+2. The source and destination physical register IDs are identical
+3. The operand sizes match (or both are default/64-bit)
+
+This pass scans all basic blocks and removes any MOV Xn, Xn instructions by deleting
+them from the instruction list and updating the instruction count.
+
+On AArch64, MOV elimination is particularly beneficial because the ISA does not have
+implicit register constraints that force copies, so most MOVs introduced by the
+allocator can be eliminated through coalescing.
+
+Returns the total number of MOVs eliminated.
+@End Reasoning
+
+Process called "coalesce_moves" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Return 0
+    End If
+
+    Let total_eliminated be 0
+
+    Let blocks be __load(lir_function, 32)
+    Let block_count be __load(lir_function, 40)
+
+    If blocks is 0:
+        Return 0
+    End If
+    If block_count is 0:
+        Return 0
+    End If
+
+    Let b be 0
+    While b < block_count:
+        Let block be List.list_get(blocks, b)
+        If block is not 0:
+            Let instructions be __load(block, 16)
+            Let inst_count be __load(block, 24)
+
+            If instructions is not 0:
+                Note: Scan backwards to avoid index invalidation when removing
+                Let i be inst_count - 1
+                While i >= 0:
+                    Let instruction be List.list_get(instructions, i)
+                    If instruction is not 0:
+                        Let opcode be __load(instruction, 0)
+
+                        If opcode is OP_MOV:
+                            Note: Check if this is a redundant MOV (same src and dest)
+                            Let result_ptr be __load(instruction, 8)
+                            Let operand1_ptr be __load(instruction, 16)
+
+                            If result_ptr is not 0:
+                                If operand1_ptr is not 0:
+                                    Let result_type be __load(result_ptr, 0)
+                                    Let op1_type be __load(operand1_ptr, 0)
+
+                                    Note: Both must be register operands
+                                    If result_type is 1:
+                                        If op1_type is 1:
+                                            Let dest_reg be __load(result_ptr, 8)
+                                            Let src_reg be __load(operand1_ptr, 8)
+
+                                            If dest_reg is src_reg:
+                                                Note: Redundant MOV - remove it
+                                                List.list_remove(instructions, i)
+                                                Set inst_count to inst_count - 1
+                                                __store(block, 24, inst_count)
+                                                Set total_eliminated to total_eliminated + 1
+
+                                                Note: Update indices for remaining instructions
+                                                Let idx be i
+                                                While idx < inst_count:
+                                                    Let inst be List.list_get(instructions, idx)
+                                                    If inst is not 0:
+                                                        __store(inst, 64, idx)
+                                                    End If
+                                                    Set idx to idx + 1
+                                                End While
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Set i to i - 1
+                End While
+            End If
+        End If
+
+        Set b to b + 1
+    End While
+
+    Return total_eliminated
+End Process
+
+Note: ============================================================================
+Note: Main Entry Point: Finalize AArch64 Allocation
+Note: ============================================================================
+
+@Reasoning
+Main entry point for AArch64-specific register allocation finalization.
+
+This function performs the complete post-allocation fixup pipeline:
+1. Collect all AArch64-specific constraints from the LIR function
+2. Resolve each constraint by inserting necessary MOV instructions
+3. Coalesce redundant MOVs to minimize instruction count
+
+Unlike x86_64 which requires extensive two-address form resolution, division fixups,
+and shift-count CL constraints, AArch64 finalization is lightweight because the ISA
+is a clean 3-operand architecture. The primary constraints are:
+- Syscall number placement in X8
+- Function call clobber tracking
+- SP usage validation
+
+The function processes constraints in order. When a constraint resolution inserts
+instructions before the constrained instruction, subsequent constraint indices in
+the same block are shifted forward by the number of inserted instructions to maintain
+correct instruction references.
+
+Returns 1 on success, 0 on failure.
+@End Reasoning
+
+Process called "finalize_aarch64_allocation" that takes lir_function as Integer returns Integer:
+    If lir_function is 0:
+        Display "finalize_aarch64_allocation: null function"
+        Return 0
+    End If
+
+    Note: Step 1: Collect all architecture-specific constraints
+    Let constraints be collect_constraints(lir_function)
+    If constraints is 0:
+        Note: Failed to collect constraints; still attempt coalescing
+        Let eliminated be coalesce_moves(lir_function)
+        Return 1
+    End If
+
+    Let constraint_count be List.list_length(constraints)
+
+    Note: Step 2: Resolve each constraint
+    Note: Track insertion offsets per block to maintain correct instruction indices
+    Note: We use a dictionary mapping block_index -> accumulated_offset
+    Let block_offsets be Dictionary.dictionary_create(16)
+
+    Let c be 0
+    While c < constraint_count:
+        Let constraint be List.list_get(constraints, c)
+        If constraint is not 0:
+            Let inst_index be __load(constraint, 0)
+            Let constraint_type be __load(constraint, 8)
+            Let required_reg be __load(constraint, 16)
+            Let operand_idx be __load(constraint, 24)
+            Let block_idx be __load(constraint, 32)
+
+            Note: Apply accumulated offset for this block
+            Let offset be Dictionary.dictionary_get_default(block_offsets, block_idx, 0)
+            Let adjusted_index be inst_index + offset
+
+            Note: Get the block and instruction
+            Let blocks be __load(lir_function, 32)
+            Let block be List.list_get(blocks, block_idx)
+
+            If block is not 0:
+                Let instructions be __load(block, 16)
+                Let instruction be List.list_get(instructions, adjusted_index)
+
+                If instruction is not 0:
+                    Let inserted be 0
+
+                    If constraint_type is CONSTRAINT_FIXED_REG:
+                        Set inserted to handle_fixed_reg_constraint(lir_function, instruction, block, adjusted_index, required_reg, operand_idx)
+                    End If
+
+                    If constraint_type is CONSTRAINT_SP_RESTRICTED:
+                        Set inserted to handle_sp_restriction(lir_function, instruction, block, adjusted_index)
+                    End If
+
+                    Note: CONSTRAINT_CLOBBER does not insert instructions; it is informational
+                    Note: for the register allocator's liveness analysis
+
+                    Note: Update the accumulated offset for this block
+                    If inserted > 0:
+                        Let new_offset be offset + inserted
+                        Dictionary.dictionary_set(block_offsets, block_idx, new_offset)
+                    End If
+                End If
+            End If
+        End If
+
+        Set c to c + 1
+    End While
+
+    Note: Step 3: Coalesce redundant MOV instructions
+    Let eliminated be coalesce_moves(lir_function)
+
+    Return 1
+End Process

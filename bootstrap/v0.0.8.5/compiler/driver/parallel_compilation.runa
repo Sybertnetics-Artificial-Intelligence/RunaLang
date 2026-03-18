@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,8 @@ limitations under the License.
 :End Note
 
 Note:
+PARALLEL COMPILATION - Thread Pool for Concurrent Module Compilation
+
 This file handles parallel compilation and concurrent compilation process management.
 
 This file performs the following tasks:
@@ -29,10 +31,639 @@ This file is essential because of the following reasons:
 - Parallel utilities support concurrent compilation, thread management, and build optimization
 
 This file consists of the following functions/features/operation types:
-- Parallel compilation orchestration and concurrent process management
-- Parallel optimization and parallel performance utilities
-- Parallel synchronization and parallel consistency management
-- Parallel monitoring and parallel analysis operations
+- CompilationUnit type for individual compilation work items
+- CompilationPool type with thread pool and work queue
+- create_compilation_pool for initializing the thread pool
+- submit_compilation_unit for adding work items
+- wait_for_all for blocking until all work completes
+- get_results for retrieving compilation results
+- destroy_pool for cleaning up resources
+
+Dependencies:
+- Imports memory_utils.runa for memory allocation
+- Imports string_utils.runa for string operations
+- Imports arena_utils.runa for arena-based allocation
+- Imports collections.runa for ArrayList and Queue
+- Imports thread_utils.runa for thread creation, mutexes, and channels
+- Imports time_utils.runa for timing
 :End Note
 
-Note: TODO - Implement parallel compilation functionality
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+Import "compiler/internal/collections.runa" as Collections
+Import "compiler/internal/thread_utils.runa" as ThreadUtils
+Import "compiler/internal/time_utils.runa" as TimeUtils
+
+Note: ============================================================================
+Note: Parallel Compilation Constants
+Note: ============================================================================
+
+Constant PARALLEL_MAX_THREADS as Integer is 64
+Constant PARALLEL_DEFAULT_THREADS as Integer is 4
+Constant PARALLEL_QUEUE_CAPACITY as Integer is 4096
+
+Note: CompilationUnit states
+Constant UNIT_PENDING as Integer is 0
+Constant UNIT_COMPILING as Integer is 1
+Constant UNIT_SUCCESS as Integer is 2
+Constant UNIT_FAILED as Integer is 3
+
+Note: CompilationUnit memory layout (64 bytes):
+Note: offset  0: source_path (8 bytes) - Pointer to source file path string
+Note: offset  8: output_path (8 bytes) - Pointer to output file path string
+Note: offset 16: state (8 bytes) - Unit state (UNIT_PENDING/COMPILING/SUCCESS/FAILED)
+Note: offset 24: error_message (8 bytes) - Pointer to error message string (if failed)
+Note: offset 32: compilation_time_ms (8 bytes) - Time spent compiling this unit in milliseconds
+Note: offset 40: thread_id (8 bytes) - ID of the thread that compiled this unit
+Note: offset 48: unit_index (8 bytes) - Index of this unit in the work queue
+Note: offset 56: dependency_count (8 bytes) - Number of unresolved dependencies
+
+Constant COMPILATION_UNIT_SIZE as Integer is 64
+
+Note: CompilationPool memory layout (112 bytes):
+Note: offset   0: thread_count (8 bytes) - Number of worker threads
+Note: offset   8: threads (8 bytes) - Pointer to ArrayList of thread handles
+Note: offset  16: work_queue (8 bytes) - Pointer to ArrayList of CompilationUnit pointers (pending)
+Note: offset  24: results (8 bytes) - Pointer to ArrayList of CompilationUnit pointers (completed)
+Note: offset  32: active_count (8 bytes) - Number of currently active compilations
+Note: offset  40: completed_count (8 bytes) - Number of completed compilations
+Note: offset  48: failed_count (8 bytes) - Number of failed compilations
+Note: offset  56: arena (8 bytes) - Pointer to arena for pool allocations
+Note: offset  64: mutex (8 bytes) - Pointer to mutex for thread-safe queue access
+Note: offset  72: work_channel (8 bytes) - Pointer to channel for distributing work
+Note: offset  80: result_channel (8 bytes) - Pointer to channel for collecting results
+Note: offset  88: is_running (8 bytes) - Boolean: 1 if pool is accepting work
+Note: offset  96: is_shutdown (8 bytes) - Boolean: 1 if pool is shutting down
+Note: offset 104: total_compilation_time_ms (8 bytes) - Total wall-clock compilation time
+
+Constant COMPILATION_POOL_SIZE as Integer is 112
+
+Note: ============================================================================
+Note: Compilation Unit Creation
+Note: ============================================================================
+
+Process called "create_compilation_unit" takes arena as Integer, source_path as Integer, output_path as Integer returns Integer:
+    Note: Create a new CompilationUnit representing a single file to compile
+    Note: Returns pointer to unit, or 0 on failure
+
+    If arena is equal to 0:
+        Return 0
+    End If
+    If source_path is equal to 0:
+        Return 0
+    End If
+
+    Let unit be arena_allocate(arena, COMPILATION_UNIT_SIZE, 8)
+    If unit is equal to 0:
+        Return 0
+    End If
+
+    memory_zero(unit, COMPILATION_UNIT_SIZE)
+
+    Note: Store source path (duplicate to own)
+    Let src_copy be string_duplicate(source_path)
+    memory_set_pointer(unit, 0, src_copy)
+
+    Note: Store output path if provided
+    If output_path is not equal to 0:
+        Let out_copy be string_duplicate(output_path)
+        memory_set_pointer(unit, 8, out_copy)
+    Otherwise:
+        memory_set_pointer(unit, 8, 0)
+    End If
+
+    Note: Initial state is pending
+    memory_set_integer(unit, 16, UNIT_PENDING)
+
+    Note: No error yet
+    memory_set_pointer(unit, 24, 0)
+
+    Note: Timing = 0
+    memory_set_integer(unit, 32, 0)
+
+    Note: Thread ID = 0 (not assigned yet)
+    memory_set_integer(unit, 40, 0)
+
+    Note: Unit index = 0 (set when submitted)
+    memory_set_integer(unit, 48, 0)
+
+    Note: Dependency count = 0
+    memory_set_integer(unit, 56, 0)
+
+    Return unit
+End Process
+
+Note: ============================================================================
+Note: Compilation Pool Creation and Destruction
+Note: ============================================================================
+
+Process called "create_compilation_pool" takes arena as Integer, thread_count as Integer returns Integer:
+    Note: Create a new CompilationPool with the specified number of worker threads
+    Note: Returns pointer to pool, or 0 on failure
+
+    If arena is equal to 0:
+        Alert "[PARALLEL ERROR] Cannot create pool: arena is null"
+        Return 0
+    End If
+
+    Note: Clamp thread count to valid range
+    Let actual_threads be thread_count
+    If actual_threads is less than 1:
+        Set actual_threads to 1
+    End If
+    If actual_threads is greater than PARALLEL_MAX_THREADS:
+        Set actual_threads to PARALLEL_MAX_THREADS
+    End If
+
+    Let pool be arena_allocate(arena, COMPILATION_POOL_SIZE, 8)
+    If pool is equal to 0:
+        Alert "[PARALLEL ERROR] Failed to allocate compilation pool"
+        Return 0
+    End If
+
+    memory_zero(pool, COMPILATION_POOL_SIZE)
+
+    Note: Store thread count
+    memory_set_integer(pool, 0, actual_threads)
+
+    Note: Create thread handles list
+    Let threads be arraylist_create(actual_threads, 8, arena)
+    If threads is equal to 0:
+        Alert "[PARALLEL ERROR] Failed to create threads list"
+        Return 0
+    End If
+    memory_set_pointer(pool, 8, threads)
+
+    Note: Create work queue
+    Let work_queue be arraylist_create(PARALLEL_QUEUE_CAPACITY, 8, arena)
+    If work_queue is equal to 0:
+        Alert "[PARALLEL ERROR] Failed to create work queue"
+        Return 0
+    End If
+    memory_set_pointer(pool, 16, work_queue)
+
+    Note: Create results list
+    Let results be arraylist_create(PARALLEL_QUEUE_CAPACITY, 8, arena)
+    If results is equal to 0:
+        Alert "[PARALLEL ERROR] Failed to create results list"
+        Return 0
+    End If
+    memory_set_pointer(pool, 24, results)
+
+    Note: Initialize counters
+    memory_set_integer(pool, 32, 0)  Note: active_count
+    memory_set_integer(pool, 40, 0)  Note: completed_count
+    memory_set_integer(pool, 48, 0)  Note: failed_count
+
+    Note: Store arena
+    memory_set_pointer(pool, 56, arena)
+
+    Note: Create mutex for thread-safe access
+    Let mutex be mutex_create()
+    If mutex is equal to 0:
+        Alert "[PARALLEL ERROR] Failed to create mutex"
+        Return 0
+    End If
+    memory_set_pointer(pool, 64, mutex)
+
+    Note: Create work channel for distributing compilation units to workers
+    Let work_channel be channel_create(PARALLEL_QUEUE_CAPACITY)
+    If work_channel is equal to 0:
+        Alert "[PARALLEL WARNING] Failed to create work channel, falling back to queue-based dispatch"
+    End If
+    memory_set_pointer(pool, 72, work_channel)
+
+    Note: Create result channel for collecting completed work
+    Let result_channel be channel_create(PARALLEL_QUEUE_CAPACITY)
+    If result_channel is equal to 0:
+        Alert "[PARALLEL WARNING] Failed to create result channel"
+    End If
+    memory_set_pointer(pool, 80, result_channel)
+
+    Note: Pool is running
+    memory_set_integer(pool, 88, 1)
+
+    Note: Not in shutdown
+    memory_set_integer(pool, 96, 0)
+
+    Note: Total compilation time = 0
+    memory_set_integer(pool, 104, 0)
+
+    Note: Start worker threads
+    Let i be 0
+    While i is less than actual_threads:
+        Let thread be thread_create(parallel_worker_function, pool)
+        If thread is not equal to 0:
+            arraylist_add(threads, thread)
+        Otherwise:
+            Alert "[PARALLEL WARNING] Failed to create worker thread"
+        End If
+        Set i to i plus 1
+    End While
+
+    Return pool
+End Process
+
+Process called "destroy_pool" takes pool as Integer returns Nothing:
+    Note: Shut down the compilation pool and clean up resources
+    If pool is equal to 0:
+        Return
+    End If
+
+    Note: Signal shutdown
+    memory_set_integer(pool, 96, 1)  Note: is_shutdown = true
+    memory_set_integer(pool, 88, 0)  Note: is_running = false
+
+    Note: Send sentinel values through work channel to wake up waiting workers
+    Let work_channel be memory_get_pointer(pool, 72)
+    Let thread_count be memory_get_integer(pool, 0)
+    If work_channel is not equal to 0:
+        Let i be 0
+        While i is less than thread_count:
+            channel_send(work_channel, 0)  Note: Sentinel value to signal shutdown
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Join all worker threads
+    Let threads be memory_get_pointer(pool, 8)
+    If threads is not equal to 0:
+        Let actual_count be arraylist_size(threads)
+        Let j be 0
+        While j is less than actual_count:
+            Let thread be arraylist_get(threads, j)
+            If thread is not equal to 0:
+                thread_join(thread)
+            End If
+            Set j to j plus 1
+        End While
+    End If
+
+    Note: Destroy mutex
+    Let mutex be memory_get_pointer(pool, 64)
+    If mutex is not equal to 0:
+        mutex_destroy(mutex)
+    End If
+End Process
+
+Note: ============================================================================
+Note: Work Submission
+Note: ============================================================================
+
+Process called "submit_compilation_unit" takes pool as Integer, unit as Integer returns Integer:
+    Note: Submit a compilation unit to the pool for parallel compilation
+    Note: Returns 1 on success, 0 on failure
+
+    If pool is equal to 0:
+        Return 0
+    End If
+    If unit is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if pool is still accepting work
+    Let is_running be memory_get_integer(pool, 88)
+    If is_running is not equal to 1:
+        Alert "[PARALLEL ERROR] Pool is not running, cannot submit work"
+        Return 0
+    End If
+
+    Note: Lock mutex for thread-safe queue modification
+    Let mutex be memory_get_pointer(pool, 64)
+    If mutex is not equal to 0:
+        mutex_lock(mutex)
+    End If
+
+    Note: Add to work queue
+    Let work_queue be memory_get_pointer(pool, 16)
+    If work_queue is equal to 0:
+        If mutex is not equal to 0:
+            mutex_unlock(mutex)
+        End If
+        Return 0
+    End If
+
+    Note: Set the unit index
+    Let queue_size be arraylist_size(work_queue)
+    memory_set_integer(unit, 48, queue_size)
+
+    Let add_result be arraylist_add(work_queue, unit)
+
+    If mutex is not equal to 0:
+        mutex_unlock(mutex)
+    End If
+
+    If add_result is equal to 0:
+        Return 0
+    End If
+
+    Note: Send unit through work channel to notify a waiting worker
+    Let work_channel be memory_get_pointer(pool, 72)
+    If work_channel is not equal to 0:
+        channel_send(work_channel, unit)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Wait and Results
+Note: ============================================================================
+
+Process called "wait_for_all" takes pool as Integer returns Integer:
+    Note: Block until all submitted compilation units have completed
+    Note: Returns 1 if all succeeded, 0 if any failed
+
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Note: Busy-wait with short sleeps until all work is completed
+    Note: Check active_count == 0 and work queue is empty
+    Let all_done be 0
+    While all_done is equal to 0:
+        Let mutex be memory_get_pointer(pool, 64)
+        If mutex is not equal to 0:
+            mutex_lock(mutex)
+        End If
+
+        Let active_count be memory_get_integer(pool, 32)
+        Let work_queue be memory_get_pointer(pool, 16)
+        Let queue_size be 0
+        If work_queue is not equal to 0:
+            Set queue_size to arraylist_size(work_queue)
+        End If
+
+        Let completed be memory_get_integer(pool, 40)
+        Let results be memory_get_pointer(pool, 24)
+        Let result_count be 0
+        If results is not equal to 0:
+            Set result_count to arraylist_size(results)
+        End If
+
+        Note: All done when no active work and results count >= queue size
+        If active_count is equal to 0:
+            If result_count is greater than or equal to queue_size:
+                Set all_done to 1
+            End If
+        End If
+
+        If mutex is not equal to 0:
+            mutex_unlock(mutex)
+        End If
+
+        Note: Short sleep to avoid busy-waiting
+        If all_done is equal to 0:
+            time_sleep_milliseconds(10)
+        End If
+    End While
+
+    Note: Check if any failed
+    Let failed_count be memory_get_integer(pool, 48)
+    If failed_count is greater than 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "get_results" takes pool as Integer returns Integer:
+    Note: Get the results list (ArrayList of CompilationUnit pointers)
+    Note: Each unit has its state set to UNIT_SUCCESS or UNIT_FAILED
+
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Return memory_get_pointer(pool, 24)
+End Process
+
+Note: ============================================================================
+Note: Worker Thread Function
+Note: ============================================================================
+
+Process called "parallel_worker_function" takes pool_ptr as Integer returns Integer:
+    Note: Worker thread main function
+    Note: Pulls compilation units from the work channel and compiles them
+
+    If pool_ptr is equal to 0:
+        Return 1
+    End If
+
+    Let work_channel be memory_get_pointer(pool_ptr, 72)
+
+    Note: Worker loop: keep pulling units until shutdown
+    Let keep_running be 1
+    While keep_running is equal to 1:
+        Note: Check for shutdown
+        Let is_shutdown be memory_get_integer(pool_ptr, 96)
+        If is_shutdown is equal to 1:
+            Set keep_running to 0
+        Otherwise:
+            Note: Receive a unit from the work channel (blocking)
+            Let unit be 0
+            If work_channel is not equal to 0:
+                Set unit to channel_receive(work_channel)
+            End If
+
+            Note: Check for sentinel (shutdown signal)
+            If unit is equal to 0:
+                Set keep_running to 0
+            Otherwise:
+                Note: Compile this unit
+                parallel_compile_unit(pool_ptr, unit)
+            End If
+        End If
+    End While
+
+    Return 0
+End Process
+
+Process called "parallel_compile_unit" takes pool as Integer, unit as Integer returns Nothing:
+    Note: Compile a single compilation unit within a worker thread
+
+    If unit is equal to 0:
+        Return
+    End If
+
+    Note: Mark as active
+    Let mutex be memory_get_pointer(pool, 64)
+    If mutex is not equal to 0:
+        mutex_lock(mutex)
+    End If
+
+    memory_set_integer(unit, 16, UNIT_COMPILING)
+    Let active_count be memory_get_integer(pool, 32)
+    memory_set_integer(pool, 32, active_count plus 1)
+
+    If mutex is not equal to 0:
+        mutex_unlock(mutex)
+    End If
+
+    Note: Get source and output paths
+    Let source_path be memory_get_pointer(unit, 0)
+    Let output_path be memory_get_pointer(unit, 8)
+
+    Note: Measure compilation time
+    Let arena be memory_get_pointer(pool, 56)
+    Let start_time be time_now_monotonic(arena)
+
+    Note: Perform the compilation
+    Let compile_success be 0
+    If source_path is not equal to 0:
+        Note: Read source
+        Let source_content be runtime_read_file(source_path)
+        If source_content is not equal to 0:
+            Note: Create lexer and parser
+            Let lexer be lexer_create(source_content)
+            If lexer is not equal to 0:
+                Let parser be parser_create(lexer)
+                If parser is not equal to 0:
+                    Let program be parser_parse_program(parser)
+                    If program is not equal to 0:
+                        If output_path is not equal to 0:
+                            Let result be compile_program(program, output_path)
+                            If result is equal to 0:
+                                Set compile_success to 1
+                            End If
+                        End If
+                        program_destroy(program)
+                    End If
+                    parser_destroy(parser)
+                End If
+                lexer_destroy(lexer)
+            End If
+            deallocate(source_content)
+        End If
+    End If
+
+    Note: Measure end time
+    Let end_time be time_now_monotonic(arena)
+    Let duration be time_diff(end_time, start_time, arena)
+    Let duration_ms be time_to_milliseconds(duration)
+    memory_set_integer(unit, 32, duration_ms)
+
+    Note: Update unit state and pool counters
+    If mutex is not equal to 0:
+        mutex_lock(mutex)
+    End If
+
+    If compile_success is equal to 1:
+        memory_set_integer(unit, 16, UNIT_SUCCESS)
+        Let completed be memory_get_integer(pool, 40)
+        memory_set_integer(pool, 40, completed plus 1)
+    Otherwise:
+        memory_set_integer(unit, 16, UNIT_FAILED)
+        Let failed be memory_get_integer(pool, 48)
+        memory_set_integer(pool, 48, failed plus 1)
+
+        Note: Record error message
+        Let err_msg be string_concat("[PARALLEL ERROR] Compilation failed: ", source_path)
+        memory_set_pointer(unit, 24, err_msg)
+    End If
+
+    Note: Decrement active count
+    Set active_count to memory_get_integer(pool, 32)
+    memory_set_integer(pool, 32, active_count minus 1)
+
+    Note: Add to results
+    Let results be memory_get_pointer(pool, 24)
+    If results is not equal to 0:
+        arraylist_add(results, unit)
+    End If
+
+    Note: Update total compilation time
+    Let total_time be memory_get_integer(pool, 104)
+    memory_set_integer(pool, 104, total_time plus duration_ms)
+
+    If mutex is not equal to 0:
+        mutex_unlock(mutex)
+    End If
+
+    Note: Send result notification through result channel
+    Let result_channel be memory_get_pointer(pool, 80)
+    If result_channel is not equal to 0:
+        channel_send(result_channel, unit)
+    End If
+End Process
+
+Note: ============================================================================
+Note: Pool Statistics
+Note: ============================================================================
+
+Process called "pool_get_thread_count" takes pool as Integer returns Integer:
+    If pool is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(pool, 0)
+End Process
+
+Process called "pool_get_active_count" takes pool as Integer returns Integer:
+    If pool is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(pool, 32)
+End Process
+
+Process called "pool_get_completed_count" takes pool as Integer returns Integer:
+    If pool is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(pool, 40)
+End Process
+
+Process called "pool_get_failed_count" takes pool as Integer returns Integer:
+    If pool is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(pool, 48)
+End Process
+
+Process called "pool_get_total_time_ms" takes pool as Integer returns Integer:
+    If pool is equal to 0:
+        Return 0
+    End If
+    Return memory_get_integer(pool, 104)
+End Process
+
+Process called "pool_print_statistics" takes pool as Integer returns Nothing:
+    If pool is equal to 0:
+        Alert "[PARALLEL ERROR] Cannot print stats: pool is null"
+        Return
+    End If
+
+    Display "--- Parallel Compilation Stats ---"
+
+    Let threads be memory_get_integer(pool, 0)
+    Let threads_str be integer_to_string(threads)
+    Let msg1 be string_concat("  Worker threads:  ", threads_str)
+    deallocate(threads_str)
+    Display msg1
+    deallocate(msg1)
+
+    Let completed be memory_get_integer(pool, 40)
+    Let completed_str be integer_to_string(completed)
+    Let msg2 be string_concat("  Completed:       ", completed_str)
+    deallocate(completed_str)
+    Display msg2
+    deallocate(msg2)
+
+    Let failed be memory_get_integer(pool, 48)
+    Let failed_str be integer_to_string(failed)
+    Let msg3 be string_concat("  Failed:          ", failed_str)
+    deallocate(failed_str)
+    Display msg3
+    deallocate(msg3)
+
+    Let total_time be memory_get_integer(pool, 104)
+    Let time_str be integer_to_string(total_time)
+    Let msg4 be string_concat("  Total time:      ", time_str)
+    deallocate(time_str)
+    Let msg5 be string_concat(msg4, " ms")
+    deallocate(msg4)
+    Display msg5
+    deallocate(msg5)
+
+    Display "----------------------------------"
+End Process

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1357 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles x86 assembly code generation and assembly output.
+x86 (IA-32) Assembly Generator - LIR to AT&T Syntax x86 Assembly
 
-This file performs the following tasks:
-- Process x86 assembly code generation and assembly output formatting
-- Handle x86 assembly optimization and assembly code optimization
-- Manage x86 assembly validation and assembly code verification
-- Process x86 assembly debugging and assembly code debugging
+Translates LIR instructions with physical register assignments into AT&T syntax
+x86 32-bit assembly text. Uses cdecl calling convention where ALL arguments are
+passed on the stack (no register arguments) and return values go in EAX.
 
-This file is essential because of the following reasons:
-- x86 assembly generation enables native x86 code output
-- Proper assembly handling ensures correct and efficient x86 code generation
-- x86 support enables Runa compilation for x86 platforms
+AT&T syntax conventions (32-bit):
+- Source before destination: movl %eax, %ebx (move eax INTO ebx)
+- Register names prefixed with %: %eax, %ebp, %esp
+- Immediates prefixed with $: $42, $0x1000
+- Memory: displacement(%base, %index, scale)
+- Size suffixes: b(byte), w(word), l(long/32-bit)
+- Default operand size is 32-bit (l suffix)
 
-This file consists of the following functions/features/operation types:
-- x86 assembly code generation and assembly output formatting
-- x86 assembly optimization and assembly code optimization
-- x86 assembly validation and assembly code verification
-- x86 assembly debugging and assembly code debugging
+cdecl calling convention (IA-32 Linux):
+- Arguments pushed right-to-left on stack
+- Return value in EAX (or EDX:EAX for 64-bit)
+- Caller cleans up stack after call
+- EBX, ESI, EDI, EBP are callee-saved
+- EAX, ECX, EDX are caller-saved (scratch)
+
+Dependencies:
+- Imports LIR types for instructions, operands, functions, blocks
+- Imports machine_code_interface for AssemblyOutput buffer management
+- Imports string utilities for output buffer building
 :End Note
 
-Note: TODO - Implement x86 assembly generator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: x86 32-bit Assembly Generation Context
+Note: ============================================================================
+
+Type called "X86AsmContext":
+    output as Integer                 Note: Pointer to AssemblyOutput
+    config as Integer                 Note: Pointer to BackendConfig
+    current_function as Integer       Note: Pointer to current LIRFunction being emitted
+    arena as Integer                  Note: Arena for temporary allocations
+    error_count as Integer            Note: Number of errors encountered
+    string_buffer as Integer          Note: Temporary string buffer for building instruction text
+End Type
+
+Note: Size: 6 fields * 8 bytes = 48 bytes per X86AsmContext
+
+Note: ============================================================================
+Note: x86 32-bit GPR Name Tables (AT&T syntax)
+Note: ============================================================================
+
+Process called "get_gpr_name_32" that takes reg_id as Integer returns Integer:
+    Note: Returns the 32-bit AT&T register name for GPR (0-7)
+    If reg_id is 0:
+        Return "%eax"
+    End If
+    If reg_id is 1:
+        Return "%ebx"
+    End If
+    If reg_id is 2:
+        Return "%ecx"
+    End If
+    If reg_id is 3:
+        Return "%edx"
+    End If
+    If reg_id is 4:
+        Return "%esi"
+    End If
+    If reg_id is 5:
+        Return "%edi"
+    End If
+    If reg_id is 6:
+        Return "%ebp"
+    End If
+    If reg_id is 7:
+        Return "%esp"
+    End If
+    Return "%eax"
+End Process
+
+Process called "get_gpr_name_16" that takes reg_id as Integer returns Integer:
+    Note: Returns the 16-bit AT&T register name for GPR (0-7)
+    If reg_id is 0:
+        Return "%ax"
+    End If
+    If reg_id is 1:
+        Return "%bx"
+    End If
+    If reg_id is 2:
+        Return "%cx"
+    End If
+    If reg_id is 3:
+        Return "%dx"
+    End If
+    If reg_id is 4:
+        Return "%si"
+    End If
+    If reg_id is 5:
+        Return "%di"
+    End If
+    If reg_id is 6:
+        Return "%bp"
+    End If
+    If reg_id is 7:
+        Return "%sp"
+    End If
+    Return "%ax"
+End Process
+
+Process called "get_gpr_name_8" that takes reg_id as Integer returns Integer:
+    Note: Returns the 8-bit AT&T register name for GPR (0-7)
+    Note: Only AL, BL, CL, DL are directly addressable 8-bit registers on IA-32
+    If reg_id is 0:
+        Return "%al"
+    End If
+    If reg_id is 1:
+        Return "%bl"
+    End If
+    If reg_id is 2:
+        Return "%cl"
+    End If
+    If reg_id is 3:
+        Return "%dl"
+    End If
+    If reg_id is 4:
+        Return "%ah"
+    End If
+    If reg_id is 5:
+        Return "%bh"
+    End If
+    If reg_id is 6:
+        Return "%ch"
+    End If
+    If reg_id is 7:
+        Return "%dh"
+    End If
+    Return "%al"
+End Process
+
+Note: ============================================================================
+Note: Register Name Selection by Size
+Note: ============================================================================
+
+Process called "get_register_name" that takes reg_id as Integer, size as Integer returns Integer:
+    Note: Returns the AT&T register name for the given register ID and operand size
+    Note: x86 32-bit only has registers 0-7
+    If reg_id > 7:
+        Return "%eax"
+    End If
+    If reg_id < 0:
+        Return "%eax"
+    End If
+
+    If size is 4:
+        Return get_gpr_name_32(reg_id)
+    End If
+    If size is 2:
+        Return get_gpr_name_16(reg_id)
+    End If
+    If size is 1:
+        Return get_gpr_name_8(reg_id)
+    End If
+
+    Note: Default to 32-bit
+    Return get_gpr_name_32(reg_id)
+End Process
+
+Process called "get_size_suffix" that takes size as Integer returns Integer:
+    Note: Returns the AT&T size suffix for the given operand size
+    If size is 4:
+        Return "l"
+    End If
+    If size is 2:
+        Return "w"
+    End If
+    If size is 1:
+        Return "b"
+    End If
+    Return "l"
+End Process
+
+Note: ============================================================================
+Note: Operand Formatting
+Note: ============================================================================
+
+Process called "format_operand" that takes operand as Integer, size as Integer returns Integer:
+    Note: Formats an LIROperand into AT&T syntax string for x86 32-bit
+    If operand is 0:
+        Return ""
+    End If
+
+    Let op_type be __load(operand, 0)
+
+    Note: Register operand: %eax, %ecx, etc.
+    If op_type is 1:
+        Let reg_id be __load(operand, 8)
+        Let op_size be __load(operand, 56)
+        If op_size is 0:
+            Set op_size to size
+        End If
+        If op_size is 0:
+            Set op_size to 4
+        End If
+        Return get_register_name(reg_id, op_size)
+    End If
+
+    Note: Immediate operand: $42
+    If op_type is 2:
+        Let imm_val be __load(operand, 16)
+        Let num_str be StringCore.integer_to_string(imm_val)
+        Let result be Layout.allocate(32)
+        __store8(result, 0, 36)    Note: '$' character
+        Let ni be 0
+        Let ch be __load8(num_str, ni)
+        While ch is not 0:
+            __store8(result, ni + 1, ch)
+            Set ni to ni + 1
+            Set ch to __load8(num_str, ni)
+        End While
+        __store8(result, ni + 1, 0)
+        Return result
+    End If
+
+    Note: Memory operand: displacement(%base, %index, scale)
+    If op_type is 3:
+        Let base_reg be __load(operand, 24)
+        Let index_reg be __load(operand, 32)
+        Let scale be __load(operand, 40)
+        Let displacement be __load(operand, 48)
+
+        Let mem_buf be Layout.allocate(128)
+        Let pos be 0
+
+        Note: Emit displacement if non-zero
+        If displacement is not 0:
+            Let disp_str be StringCore.integer_to_string(displacement)
+            Let di be 0
+            Let dc be __load8(disp_str, di)
+            While dc is not 0:
+                __store8(mem_buf, pos, dc)
+                Set pos to pos + 1
+                Set di to di + 1
+                Set dc to __load8(disp_str, di)
+            End While
+        End If
+
+        Note: Open parenthesis
+        __store8(mem_buf, pos, 40)
+        Set pos to pos + 1
+
+        Note: Base register
+        If base_reg is not 0:
+            Let base_name be get_gpr_name_32(base_reg)
+            Let bi be 0
+            Let bc be __load8(base_name, bi)
+            While bc is not 0:
+                __store8(mem_buf, pos, bc)
+                Set pos to pos + 1
+                Set bi to bi + 1
+                Set bc to __load8(base_name, bi)
+            End While
+        Otherwise:
+            Note: No base register - use EBP-relative as default
+            Let ebp_name be "%ebp"
+            Let bi be 0
+            Let bc be __load8(ebp_name, bi)
+            While bc is not 0:
+                __store8(mem_buf, pos, bc)
+                Set pos to pos + 1
+                Set bi to bi + 1
+                Set bc to __load8(ebp_name, bi)
+            End While
+        End If
+
+        Note: Index register and scale
+        If index_reg is not 0:
+            __store8(mem_buf, pos, 44)    Note: ','
+            Set pos to pos + 1
+
+            Let idx_name be get_gpr_name_32(index_reg)
+            Let ii be 0
+            Let ic be __load8(idx_name, ii)
+            While ic is not 0:
+                __store8(mem_buf, pos, ic)
+                Set pos to pos + 1
+                Set ii to ii + 1
+                Set ic to __load8(idx_name, ii)
+            End While
+
+            If scale > 1:
+                __store8(mem_buf, pos, 44)    Note: ','
+                Set pos to pos + 1
+                Let scale_str be StringCore.integer_to_string(scale)
+                Let si be 0
+                Let sc be __load8(scale_str, si)
+                While sc is not 0:
+                    __store8(mem_buf, pos, sc)
+                    Set pos to pos + 1
+                    Set si to si + 1
+                    Set sc to __load8(scale_str, si)
+                End While
+            End If
+        End If
+
+        Note: Close parenthesis
+        __store8(mem_buf, pos, 41)
+        Set pos to pos + 1
+        __store8(mem_buf, pos, 0)
+
+        Return mem_buf
+    End If
+
+    Return ""
+End Process
+
+Note: ============================================================================
+Note: Context Creation and Main Entry Point
+Note: ============================================================================
+
+Process called "create_asm_context" that takes config as Integer, arena as Integer returns Integer:
+    Note: Creates an X86AsmContext ready for assembly generation
+    Let ctx be Layout.allocate(48)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let output be MachineCode.create_assembly_output(arena)
+    __store(ctx, 0, output)
+    __store(ctx, 8, config)
+    __store(ctx, 16, 0)
+    __store(ctx, 24, arena)
+    __store(ctx, 32, 0)
+
+    Let str_buf be StringUtils.string_create(arena, 256)
+    __store(ctx, 40, str_buf)
+
+    Return ctx
+End Process
+
+Process called "generate_x86_assembly" that takes lir_module as Integer, config as Integer returns Integer:
+    Note: MAIN ENTRY POINT
+    Note: Generates complete x86 32-bit assembly for an entire LIR module
+    Note: Returns pointer to AssemblyOutput
+    If lir_module is 0:
+        Return 0
+    End If
+
+    Let arena be Layout.allocate(8)
+    Let ctx be create_asm_context(config, arena)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let output be __load(ctx, 0)
+    Let func_count be List.list_length(lir_module)
+
+    Note: Emit each function
+    Let fi be 0
+    While fi < func_count:
+        Let lir_func be List.list_get(lir_module, fi)
+        If lir_func is not 0:
+            emit_function(ctx, lir_func)
+        End If
+        Set fi to fi + 1
+    End While
+
+    Note: Emit string literals to .rodata
+    MachineCode.asm_emit_string_literals(output)
+
+    Return output
+End Process
+
+Note: ============================================================================
+Note: Function Emission
+Note: ============================================================================
+
+Process called "emit_function" that takes ctx as Integer, lir_func as Integer returns Integer:
+    Note: Emits a complete function: directive, prologue, blocks, epilogue
+    If ctx is 0:
+        Return 0
+    End If
+    If lir_func is 0:
+        Return 0
+    End If
+
+    __store(ctx, 16, lir_func)
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Let func_name be __load(lir_func, 0)
+    Let is_external be __load(lir_func, 112)
+
+    Note: Skip external functions
+    If is_external is 1:
+        MachineCode.asm_add_external_symbol(output, func_name)
+        Return 1
+    End If
+
+    Note: Emit function directives
+    MachineCode.asm_add_global_symbol(output, func_name)
+    MachineCode.asm_emit_to_section(output, section, "\t.type\t")
+    MachineCode.asm_emit_to_section(output, section, func_name)
+    MachineCode.asm_emit_line(output, section, ", @function")
+
+    Note: Emit function label
+    MachineCode.asm_emit_to_section(output, section, func_name)
+    MachineCode.asm_emit_line(output, section, ":")
+
+    Note: Emit prologue
+    emit_prologue(ctx, lir_func)
+
+    Note: Emit all basic blocks
+    Let blocks be __load(lir_func, 32)
+    Let block_count be __load(lir_func, 40)
+    Let bi be 0
+    While bi < block_count:
+        Let block be List.list_get(blocks, bi)
+        If block is not 0:
+            emit_basic_block(ctx, block)
+        End If
+        Set bi to bi + 1
+    End While
+
+    Note: Emit function size directive
+    MachineCode.asm_emit_to_section(output, section, "\t.size\t")
+    MachineCode.asm_emit_to_section(output, section, func_name)
+    MachineCode.asm_emit_to_section(output, section, ", .-")
+    MachineCode.asm_emit_line(output, section, func_name)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Function Prologue and Epilogue (cdecl)
+Note: ============================================================================
+
+@Reasoning
+cdecl prologue for IA-32:
+  pushl %ebp            Note: Save caller's frame pointer
+  movl  %esp, %ebp      Note: Set up new frame pointer
+  subl  $N, %esp         Note: Allocate stack frame
+  pushl %ebx             Note: Save callee-saved registers (as needed)
+  pushl %esi
+  pushl %edi
+
+cdecl epilogue:
+  popl  %edi             Note: Restore callee-saved (reverse order)
+  popl  %esi
+  popl  %ebx
+  leave                  Note: movl %ebp, %esp; popl %ebp
+  ret
+@End Reasoning
+
+Process called "emit_prologue" that takes ctx as Integer, lir_func as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let stack_frame be __load(lir_func, 72)
+
+    Let uses_fp be 1
+    If stack_frame is not 0:
+        Set uses_fp to __load(stack_frame, 40)
+    End If
+
+    If uses_fp is 1:
+        MachineCode.asm_emit_line(output, section, "\tpushl\t%ebp")
+        MachineCode.asm_emit_line(output, section, "\tmovl\t%esp, %ebp")
+    End If
+
+    If stack_frame is not 0:
+        Let frame_size be __load(stack_frame, 0)
+        If frame_size > 0:
+            MachineCode.asm_emit_to_section(output, section, "\tsubl\t$")
+            Let size_str be StringCore.integer_to_string(frame_size)
+            MachineCode.asm_emit_to_section(output, section, size_str)
+            MachineCode.asm_emit_line(output, section, ", %esp")
+        End If
+
+        Note: Save callee-saved registers
+        Let callee_saved be __load(stack_frame, 48)
+        Let callee_count be __load(stack_frame, 56)
+        If callee_saved is not 0:
+            Let ci be 0
+            While ci < callee_count:
+                Let reg_id be List.list_get(callee_saved, ci)
+                Let reg_name be get_gpr_name_32(reg_id)
+                MachineCode.asm_emit_to_section(output, section, "\tpushl\t")
+                MachineCode.asm_emit_line(output, section, reg_name)
+                Set ci to ci + 1
+            End While
+        End If
+    End If
+
+    Return 1
+End Process
+
+Process called "emit_epilogue" that takes ctx as Integer, lir_func as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let stack_frame be __load(lir_func, 72)
+
+    Note: Restore callee-saved registers in reverse order
+    If stack_frame is not 0:
+        Let callee_saved be __load(stack_frame, 48)
+        Let callee_count be __load(stack_frame, 56)
+        If callee_saved is not 0:
+            Let ci be callee_count - 1
+            While ci >= 0:
+                Let reg_id be List.list_get(callee_saved, ci)
+                Let reg_name be get_gpr_name_32(reg_id)
+                MachineCode.asm_emit_to_section(output, section, "\tpopl\t")
+                MachineCode.asm_emit_line(output, section, reg_name)
+                Set ci to ci - 1
+            End While
+        End If
+    End If
+
+    Let uses_fp be 1
+    If stack_frame is not 0:
+        Set uses_fp to __load(stack_frame, 40)
+    End If
+
+    If uses_fp is 1:
+        MachineCode.asm_emit_line(output, section, "\tleave")
+    Otherwise:
+        If stack_frame is not 0:
+            Let frame_size be __load(stack_frame, 0)
+            If frame_size > 0:
+                MachineCode.asm_emit_to_section(output, section, "\taddl\t$")
+                Let size_str be StringCore.integer_to_string(frame_size)
+                MachineCode.asm_emit_to_section(output, section, size_str)
+                MachineCode.asm_emit_line(output, section, ", %esp")
+            End If
+        End If
+    End If
+
+    MachineCode.asm_emit_line(output, section, "\tret")
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Basic Block Emission
+Note: ============================================================================
+
+Process called "emit_basic_block" that takes ctx as Integer, block as Integer returns Integer:
+    If block is 0:
+        Return 0
+    End If
+
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+
+    Let label be __load(block, 8)
+    If label is not 0:
+        MachineCode.asm_emit_to_section(output, section, label)
+        MachineCode.asm_emit_line(output, section, ":")
+    Otherwise:
+        Let block_id be __load(block, 0)
+        MachineCode.asm_emit_to_section(output, section, ".LBB")
+        Let id_str be StringCore.integer_to_string(block_id)
+        MachineCode.asm_emit_to_section(output, section, id_str)
+        MachineCode.asm_emit_line(output, section, ":")
+    End If
+
+    Let instructions be __load(block, 16)
+    Let instr_count be __load(block, 24)
+    Let ii be 0
+    While ii < instr_count:
+        Let instr be List.list_get(instructions, ii)
+        If instr is not 0:
+            emit_instruction(ctx, instr)
+        End If
+        Set ii to ii + 1
+    End While
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Instruction Emission - Main Dispatch
+Note: ============================================================================
+
+Process called "emit_instruction" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Dispatches a single LIR instruction to the appropriate emitter
+    If instr is 0:
+        Return 0
+    End If
+
+    Let opcode be __load(instr, 0)
+
+    Note: Data Movement (30000-30008)
+    If opcode is 30000:
+        Let output be __load(ctx, 0)
+        MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, "\tnop")
+        Return 1
+    End If
+    If opcode is 30001:
+        Return emit_mov(ctx, instr)
+    End If
+    If opcode is 30002:
+        Return emit_lea(ctx, instr)
+    End If
+    If opcode is 30003:
+        Return emit_push(ctx, instr)
+    End If
+    If opcode is 30004:
+        Return emit_pop(ctx, instr)
+    End If
+    If opcode is 30005:
+        Return emit_xchg(ctx, instr)
+    End If
+    If opcode is 30006:
+        Return emit_movsx(ctx, instr)
+    End If
+    If opcode is 30007:
+        Return emit_movzx(ctx, instr)
+    End If
+
+    Note: Arithmetic (30100-30110)
+    If opcode is 30100:
+        Return emit_binary_op(ctx, instr, "add")
+    End If
+    If opcode is 30101:
+        Return emit_binary_op(ctx, instr, "sub")
+    End If
+    If opcode is 30102:
+        Return emit_imul(ctx, instr)
+    End If
+    If opcode is 30103:
+        Return emit_idiv(ctx, instr)
+    End If
+    If opcode is 30104:
+        Return emit_binary_op(ctx, instr, "mul")
+    End If
+    If opcode is 30105:
+        Return emit_div(ctx, instr)
+    End If
+    If opcode is 30106:
+        Return emit_unary_op(ctx, instr, "neg")
+    End If
+    If opcode is 30107:
+        Return emit_unary_op(ctx, instr, "inc")
+    End If
+    If opcode is 30108:
+        Return emit_unary_op(ctx, instr, "dec")
+    End If
+    If opcode is 30109:
+        Return emit_binary_op(ctx, instr, "adc")
+    End If
+    If opcode is 30110:
+        Return emit_binary_op(ctx, instr, "sbb")
+    End If
+
+    Note: Bitwise (30200-30204)
+    If opcode is 30200:
+        Return emit_binary_op(ctx, instr, "and")
+    End If
+    If opcode is 30201:
+        Return emit_binary_op(ctx, instr, "or")
+    End If
+    If opcode is 30202:
+        Return emit_binary_op(ctx, instr, "xor")
+    End If
+    If opcode is 30203:
+        Return emit_unary_op(ctx, instr, "not")
+    End If
+    If opcode is 30204:
+        Return emit_binary_op(ctx, instr, "test")
+    End If
+
+    Note: Shifts (30300-30306)
+    If opcode is 30300:
+        Return emit_shift(ctx, instr, "shl")
+    End If
+    If opcode is 30301:
+        Return emit_shift(ctx, instr, "shr")
+    End If
+    If opcode is 30302:
+        Return emit_shift(ctx, instr, "sar")
+    End If
+    If opcode is 30303:
+        Return emit_shift(ctx, instr, "rol")
+    End If
+    If opcode is 30304:
+        Return emit_shift(ctx, instr, "ror")
+    End If
+    If opcode is 30305:
+        Return emit_shift(ctx, instr, "rcl")
+    End If
+    If opcode is 30306:
+        Return emit_shift(ctx, instr, "rcr")
+    End If
+
+    Note: Comparisons (30400)
+    If opcode is 30400:
+        Return emit_cmp(ctx, instr)
+    End If
+
+    Note: Control Flow (30500-30523)
+    If opcode is 30500:
+        Return emit_jmp(ctx, instr)
+    End If
+    If opcode is 30501:
+        Return emit_conditional_jmp(ctx, instr, "jz")
+    End If
+    If opcode is 30502:
+        Return emit_conditional_jmp(ctx, instr, "jnz")
+    End If
+    If opcode is 30503:
+        Return emit_conditional_jmp(ctx, instr, "je")
+    End If
+    If opcode is 30504:
+        Return emit_conditional_jmp(ctx, instr, "jne")
+    End If
+    If opcode is 30505:
+        Return emit_conditional_jmp(ctx, instr, "jl")
+    End If
+    If opcode is 30506:
+        Return emit_conditional_jmp(ctx, instr, "jle")
+    End If
+    If opcode is 30507:
+        Return emit_conditional_jmp(ctx, instr, "jg")
+    End If
+    If opcode is 30508:
+        Return emit_conditional_jmp(ctx, instr, "jge")
+    End If
+    If opcode is 30509:
+        Return emit_conditional_jmp(ctx, instr, "jb")
+    End If
+    If opcode is 30510:
+        Return emit_conditional_jmp(ctx, instr, "jbe")
+    End If
+    If opcode is 30511:
+        Return emit_conditional_jmp(ctx, instr, "ja")
+    End If
+    If opcode is 30512:
+        Return emit_conditional_jmp(ctx, instr, "jae")
+    End If
+    If opcode is 30520:
+        Return emit_call(ctx, instr)
+    End If
+    If opcode is 30521:
+        Return emit_call_indirect(ctx, instr)
+    End If
+    If opcode is 30522:
+        Return emit_ret(ctx, instr)
+    End If
+    If opcode is 30523:
+        Note: INT 0x80 for Linux syscalls on IA-32
+        Let output be __load(ctx, 0)
+        MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, "\tint\t$0x80")
+        Return 1
+    End If
+
+    Note: Memory Operations (30600-30609)
+    If opcode is 30600:
+        Return emit_load_store(ctx, instr, "l", 1)
+    End If
+    If opcode is 30601:
+        Return emit_load_store(ctx, instr, "l", 0)
+    End If
+    If opcode is 30602:
+        Return emit_load_store(ctx, instr, "b", 1)
+    End If
+    If opcode is 30603:
+        Return emit_load_store(ctx, instr, "w", 1)
+    End If
+    If opcode is 30604:
+        Return emit_load_store(ctx, instr, "l", 1)
+    End If
+    If opcode is 30606:
+        Return emit_load_store(ctx, instr, "b", 0)
+    End If
+    If opcode is 30607:
+        Return emit_load_store(ctx, instr, "w", 0)
+    End If
+    If opcode is 30608:
+        Return emit_load_store(ctx, instr, "l", 0)
+    End If
+
+    Note: Type Conversion (30700-30702)
+    If opcode is 30700:
+        Return emit_sext(ctx, instr)
+    End If
+    If opcode is 30701:
+        Return emit_zext(ctx, instr)
+    End If
+    If opcode is 30702:
+        Return emit_trunc(ctx, instr)
+    End If
+
+    Note: Special (30900-30903)
+    If opcode is 30900:
+        Return emit_label(ctx, instr)
+    End If
+    If opcode is 30902:
+        Return emit_comment(ctx, instr)
+    End If
+    If opcode is 30903:
+        Return emit_inline_asm(ctx, instr)
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Data Movement Instruction Emitters
+Note: ============================================================================
+
+Process called "emit_mov" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+
+    Let dest_size be 4
+    If result is not 0:
+        Let rs be __load(result, 56)
+        If rs > 0:
+            Set dest_size to rs
+        End If
+    End If
+
+    Let suffix be get_size_suffix(dest_size)
+    Let dest_str be format_operand(result, dest_size)
+    Let src_str be format_operand(operand1, dest_size)
+
+    MachineCode.asm_emit_to_section(output, section, "\tmov")
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, src_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, dest_str)
+    Return 1
+End Process
+
+Process called "emit_lea" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+
+    Let dest_str be format_operand(result, 4)
+    Let src_str be format_operand(operand1, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\tleal\t")
+    MachineCode.asm_emit_to_section(output, section, src_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, dest_str)
+    Return 1
+End Process
+
+Process called "emit_push" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let operand1 be __load(instr, 16)
+    Let op_str be format_operand(operand1, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\tpushl\t")
+    MachineCode.asm_emit_line(output, section, op_str)
+    Return 1
+End Process
+
+Process called "emit_pop" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let op_str be format_operand(result, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\tpopl\t")
+    MachineCode.asm_emit_line(output, section, op_str)
+    Return 1
+End Process
+
+Process called "emit_xchg" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+
+    Let op1_str be format_operand(result, 4)
+    Let op2_str be format_operand(operand1, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\txchgl\t")
+    MachineCode.asm_emit_to_section(output, section, op2_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, op1_str)
+    Return 1
+End Process
+
+Process called "emit_movsx" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+
+    Let src_size be 1
+    If operand1 is not 0:
+        Let ss be __load(operand1, 56)
+        If ss > 0:
+            Set src_size to ss
+        End If
+    End If
+
+    Let src_suffix be get_size_suffix(src_size)
+    Let dest_suffix be "l"
+    Let src_str be format_operand(operand1, src_size)
+    Let dest_str be format_operand(result, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\tmovs")
+    MachineCode.asm_emit_to_section(output, section, src_suffix)
+    MachineCode.asm_emit_to_section(output, section, dest_suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, src_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, dest_str)
+    Return 1
+End Process
+
+Process called "emit_movzx" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+
+    Let src_size be 1
+    If operand1 is not 0:
+        Let ss be __load(operand1, 56)
+        If ss > 0:
+            Set src_size to ss
+        End If
+    End If
+
+    Let src_suffix be get_size_suffix(src_size)
+    Let dest_suffix be "l"
+    Let src_str be format_operand(operand1, src_size)
+    Let dest_str be format_operand(result, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\tmovz")
+    MachineCode.asm_emit_to_section(output, section, src_suffix)
+    MachineCode.asm_emit_to_section(output, section, dest_suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, src_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, dest_str)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Arithmetic and Logic Emitters
+Note: ============================================================================
+
+Process called "emit_binary_op" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Emits a two-operand ALU instruction: mnemonic src, dest
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+    Let operand2 be __load(instr, 24)
+
+    Note: Use operand2 as source, result as destination (two-address form)
+    Let src_op be operand2
+    If src_op is 0:
+        Set src_op to operand1
+    End If
+
+    Let dest_size be 4
+    If result is not 0:
+        Let rs be __load(result, 56)
+        If rs > 0:
+            Set dest_size to rs
+        End If
+    End If
+
+    Let suffix be get_size_suffix(dest_size)
+    Let src_str be format_operand(src_op, dest_size)
+    Let dest_str be format_operand(result, dest_size)
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, src_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, dest_str)
+    Return 1
+End Process
+
+Process called "emit_unary_op" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Emits a unary instruction: mnemonic operand
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+
+    Let target_op be result
+    If target_op is 0:
+        Set target_op to operand1
+    End If
+
+    Let dest_size be 4
+    If target_op is not 0:
+        Let rs be __load(target_op, 56)
+        If rs > 0:
+            Set dest_size to rs
+        End If
+    End If
+
+    Let suffix be get_size_suffix(dest_size)
+    Let op_str be format_operand(target_op, dest_size)
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_line(output, section, op_str)
+    Return 1
+End Process
+
+Process called "emit_imul" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: IMUL: two-operand form imull src, dest
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand2 be __load(instr, 24)
+
+    Let src_op be operand2
+    If src_op is 0:
+        Set src_op to __load(instr, 16)
+    End If
+
+    Let src_str be format_operand(src_op, 4)
+    Let dest_str be format_operand(result, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\timull\t")
+    MachineCode.asm_emit_to_section(output, section, src_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, dest_str)
+    Return 1
+End Process
+
+Process called "emit_idiv" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: IDIV: one-operand form idivl divisor (operates on EDX:EAX)
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let operand2 be __load(instr, 24)
+    If operand2 is 0:
+        Set operand2 to __load(instr, 16)
+    End If
+
+    Let div_str be format_operand(operand2, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\tidivl\t")
+    MachineCode.asm_emit_line(output, section, div_str)
+    Return 1
+End Process
+
+Process called "emit_div" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: DIV: one-operand form divl divisor (operates on EDX:EAX)
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let operand2 be __load(instr, 24)
+    If operand2 is 0:
+        Set operand2 to __load(instr, 16)
+    End If
+
+    Let div_str be format_operand(operand2, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\tdivl\t")
+    MachineCode.asm_emit_line(output, section, div_str)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Shift Instruction Emitter
+Note: ============================================================================
+
+Process called "emit_shift" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Note: Shift/rotate: shll count, dest
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand2 be __load(instr, 24)
+
+    Let dest_str be format_operand(result, 4)
+
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, mnemonic)
+    MachineCode.asm_emit_to_section(output, section, "l\t")
+
+    If operand2 is not 0:
+        Let op2_type be __load(operand2, 0)
+        If op2_type is 2:
+            Note: Immediate shift count
+            Let count_str be format_operand(operand2, 1)
+            MachineCode.asm_emit_to_section(output, section, count_str)
+        Otherwise:
+            Note: CL register shift count
+            MachineCode.asm_emit_to_section(output, section, "%cl")
+        End If
+    Otherwise:
+        MachineCode.asm_emit_to_section(output, section, "$1")
+    End If
+
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, dest_str)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Compare Instruction Emitter
+Note: ============================================================================
+
+Process called "emit_cmp" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let operand1 be __load(instr, 16)
+    Let operand2 be __load(instr, 24)
+
+    Let size be 4
+    If operand1 is not 0:
+        Let os be __load(operand1, 56)
+        If os > 0:
+            Set size to os
+        End If
+    End If
+
+    Let suffix be get_size_suffix(size)
+    Let op1_str be format_operand(operand1, size)
+    Let op2_str be format_operand(operand2, size)
+
+    MachineCode.asm_emit_to_section(output, section, "\tcmp")
+    MachineCode.asm_emit_to_section(output, section, suffix)
+    MachineCode.asm_emit_to_section(output, section, "\t")
+    MachineCode.asm_emit_to_section(output, section, op2_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, op1_str)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Control Flow Emitters
+Note: ============================================================================
+
+Process called "emit_jmp" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let operand1 be __load(instr, 16)
+
+    If operand1 is not 0:
+        Let op_type be __load(operand1, 0)
+        If op_type is 2:
+            Note: Immediate target (label ID)
+            Let label_id be __load(operand1, 16)
+            MachineCode.asm_emit_to_section(output, section, "\tjmp\t.LBB")
+            Let id_str be StringCore.integer_to_string(label_id)
+            MachineCode.asm_emit_line(output, section, id_str)
+            Return 1
+        End If
+        If op_type is 1:
+            Note: Indirect jump through register
+            Let reg_str be format_operand(operand1, 4)
+            MachineCode.asm_emit_to_section(output, section, "\tjmp\t*")
+            MachineCode.asm_emit_line(output, section, reg_str)
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "emit_conditional_jmp" that takes ctx as Integer, instr as Integer, mnemonic as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let operand1 be __load(instr, 16)
+
+    If operand1 is not 0:
+        Let op_type be __load(operand1, 0)
+        If op_type is 2:
+            Let label_id be __load(operand1, 16)
+            MachineCode.asm_emit_to_section(output, section, "\t")
+            MachineCode.asm_emit_to_section(output, section, mnemonic)
+            MachineCode.asm_emit_to_section(output, section, "\t.LBB")
+            Let id_str be StringCore.integer_to_string(label_id)
+            MachineCode.asm_emit_line(output, section, id_str)
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "emit_call" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Direct function call: call func_name
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let operand1 be __load(instr, 16)
+
+    If operand1 is not 0:
+        Let op_type be __load(operand1, 0)
+        If op_type is 2:
+            Note: Immediate contains function name pointer
+            Let func_name be __load(operand1, 16)
+            MachineCode.asm_emit_to_section(output, section, "\tcall\t")
+            MachineCode.asm_emit_line(output, section, func_name)
+            Return 1
+        End If
+    End If
+
+    Note: Fallback: get callee name from LIRCall structure
+    Let lir_func be __load(ctx, 16)
+    MachineCode.asm_emit_line(output, section, "\tcall\t*%eax")
+    Return 1
+End Process
+
+Process called "emit_call_indirect" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Indirect function call: call *%reg
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let operand1 be __load(instr, 16)
+
+    If operand1 is not 0:
+        Let reg_str be format_operand(operand1, 4)
+        MachineCode.asm_emit_to_section(output, section, "\tcall\t*")
+        MachineCode.asm_emit_line(output, section, reg_str)
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "emit_ret" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Emit epilogue and return
+    Let lir_func be __load(ctx, 16)
+    emit_epilogue(ctx, lir_func)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Memory Operation Emitters
+Note: ============================================================================
+
+Process called "emit_load_store" that takes ctx as Integer, instr as Integer, suffix as Integer, is_load as Integer returns Integer:
+    Note: Emits mov instruction for load (mem->reg) or store (reg->mem)
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let result be __load(instr, 8)
+    Let operand1 be __load(instr, 16)
+
+    Let size be 4
+    If result is not 0:
+        Let rs be __load(result, 56)
+        If rs > 0:
+            Set size to rs
+        End If
+    End If
+
+    If is_load is 1:
+        Note: Load: mov mem, reg
+        Let mem_str be format_operand(operand1, size)
+        Let reg_str be format_operand(result, size)
+        MachineCode.asm_emit_to_section(output, section, "\tmov")
+        MachineCode.asm_emit_to_section(output, section, suffix)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, mem_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, reg_str)
+    Otherwise:
+        Note: Store: mov reg, mem
+        Let reg_str be format_operand(operand1, size)
+        Let mem_str be format_operand(result, size)
+        MachineCode.asm_emit_to_section(output, section, "\tmov")
+        MachineCode.asm_emit_to_section(output, section, suffix)
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_to_section(output, section, reg_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, mem_str)
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Type Conversion Emitters
+Note: ============================================================================
+
+Process called "emit_sext" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Sign extension via MOVSX
+    Return emit_movsx(ctx, instr)
+End Process
+
+Process called "emit_zext" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Zero extension via MOVZX
+    Return emit_movzx(ctx, instr)
+End Process
+
+Process called "emit_trunc" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Truncation is a simple MOV with smaller register names
+    Return emit_mov(ctx, instr)
+End Process
+
+Note: ============================================================================
+Note: Special Instruction Emitters
+Note: ============================================================================
+
+Process called "emit_label" that takes ctx as Integer, instr as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let operand1 be __load(instr, 16)
+
+    If operand1 is not 0:
+        Let op_type be __load(operand1, 0)
+        If op_type is 2:
+            Let label_id be __load(operand1, 16)
+            MachineCode.asm_emit_to_section(output, section, ".LBB")
+            Let id_str be StringCore.integer_to_string(label_id)
+            MachineCode.asm_emit_to_section(output, section, id_str)
+            MachineCode.asm_emit_line(output, section, ":")
+            Return 1
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "emit_comment" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Emit an assembly comment from metadata
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let metadata be __load(instr, 56)
+
+    If metadata is not 0:
+        MachineCode.asm_emit_to_section(output, section, "\t# ")
+        MachineCode.asm_emit_line(output, section, metadata)
+    End If
+
+    Return 1
+End Process
+
+Process called "emit_inline_asm" that takes ctx as Integer, instr as Integer returns Integer:
+    Note: Emit inline assembly directly
+    Let output be __load(ctx, 0)
+    Let section be MachineCode.SECTION_TEXT
+    Let metadata be __load(instr, 56)
+
+    If metadata is not 0:
+        MachineCode.asm_emit_to_section(output, section, "\t")
+        MachineCode.asm_emit_line(output, section, metadata)
+    End If
+
+    Return 1
+End Process

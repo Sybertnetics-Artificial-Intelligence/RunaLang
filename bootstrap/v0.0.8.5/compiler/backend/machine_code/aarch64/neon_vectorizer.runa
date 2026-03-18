@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,719 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles AArch64 NEON vectorization and SIMD optimization.
+AArch64 NEON Vectorizer - SIMD Operations Using V Registers
+
+Generates AArch64 NEON (Advanced SIMD) instructions for vectorized operations using
+the 128-bit V0-V31 register file. NEON provides parallel computation on multiple
+data elements packed into a single register.
 
 This file performs the following tasks:
-- Process AArch64 NEON vectorization and SIMD instruction generation
-- Handle AArch64 NEON optimization and vector operation optimization
-- Manage AArch64 NEON register allocation and vector register management
-- Process AArch64 NEON instruction selection and vector instruction selection
+- Emits NEON arithmetic operations: add, sub, mul (element-wise)
+- Emits NEON logical operations: and, orr, eor (bitwise on vectors)
+- Emits NEON memory operations: ld1, st1 (vector load/store)
+- Emits NEON broadcast operations: dup (replicate scalar to all lanes)
+- Maps LIR vector opcodes to NEON instruction sequences
+- Handles data arrangement specifiers (4S, 2D, 8H, 16B, etc.)
 
-This file is essential because of the following reasons:
-- AArch64 NEON vectorization enables high-performance SIMD operations
-- Proper NEON handling ensures optimal AArch64 vector code generation
-- AArch64 NEON support enables Runa compilation for high-performance AArch64 platforms
+NEON data arrangements:
+  128-bit (Q-form, full vector):
+    16B = 16 x  8-bit bytes
+    8H  =  8 x 16-bit halfwords
+    4S  =  4 x 32-bit single-precision or integers
+    2D  =  2 x 64-bit double-precision or integers
 
-This file consists of the following functions/features/operation types:
-- AArch64 NEON vectorization and SIMD instruction generation
-- AArch64 NEON optimization and vector operation optimization
-- AArch64 NEON register allocation and vector register management
-- AArch64 NEON instruction selection and vector instruction selection
+  64-bit (D-form, lower half only):
+    8B  =  8 x  8-bit bytes
+    4H  =  4 x 16-bit halfwords
+    2S  =  2 x 32-bit
+    1D  =  1 x 64-bit
+
+NEON instruction syntax:
+  add  v0.4s, v1.4s, v2.4s    Note: 4x32-bit integer add
+  fadd v0.4s, v1.4s, v2.4s    Note: 4x32-bit float add
+  fadd v0.2d, v1.2d, v2.2d    Note: 2x64-bit float add
+  and  v0.16b, v1.16b, v2.16b Note: 128-bit bitwise AND
+  ld1  {v0.4s}, [x0]          Note: Load 128 bits into v0 as 4x32-bit
+  st1  {v0.4s}, [x0]          Note: Store 128 bits from v0
+  dup  v0.4s, w0               Note: Broadcast 32-bit GPR to all 4 lanes
+
+Dependencies:
+- Imports machine_code_interface.runa for output buffer types and section constants
+- Imports calling_convention.runa for FPR register ID constants
+- Imports layout.runa for memory allocation
+- Imports list.runa for collection operations
+- Imports string_core.runa for integer-to-string conversion
 :End Note
 
-Note: TODO - Implement AArch64 NEON vectorizer functionality
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/backend/machine_code/aarch64/calling_convention.runa" as CallingConv
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+
+Note: ============================================================================
+Note: Data Arrangement Constants
+Note: ============================================================================
+
+@Reasoning
+NEON data arrangement specifiers control how many elements and what element size
+a vector operation processes. These constants identify the arrangement for suffix
+generation. The arrangement determines:
+- The number of lanes (elements) in the vector
+- The width of each lane
+- Whether the operation uses the full 128-bit register or lower 64-bit half
+
+The integer values are arbitrary identifiers used in the get_arrangement_suffix
+lookup function.
+@End Reasoning
+
+Constant ARRANGEMENT_16B as Integer is 0    Note: 16 x  8-bit bytes (128-bit)
+Constant ARRANGEMENT_8H as Integer is 1     Note:  8 x 16-bit halfwords (128-bit)
+Constant ARRANGEMENT_4S as Integer is 2     Note:  4 x 32-bit words (128-bit)
+Constant ARRANGEMENT_2D as Integer is 3     Note:  2 x 64-bit doublewords (128-bit)
+Constant ARRANGEMENT_8B as Integer is 4     Note:  8 x  8-bit bytes (64-bit lower half)
+Constant ARRANGEMENT_4H as Integer is 5     Note:  4 x 16-bit halfwords (64-bit lower half)
+Constant ARRANGEMENT_2S as Integer is 6     Note:  2 x 32-bit words (64-bit lower half)
+Constant ARRANGEMENT_1D as Integer is 7     Note:  1 x 64-bit doubleword (64-bit lower half)
+
+Note: LIR vector operation opcode range (30800-30899)
+Constant LIR_VADD as Integer is 30800
+Constant LIR_VSUB as Integer is 30801
+Constant LIR_VMUL as Integer is 30802
+Constant LIR_VAND as Integer is 30803
+Constant LIR_VOR as Integer is 30804
+Constant LIR_VXOR as Integer is 30805
+Constant LIR_VLOAD as Integer is 30810
+Constant LIR_VSTORE as Integer is 30811
+Constant LIR_VBROADCAST as Integer is 30812
+Constant LIR_VFADD as Integer is 30820
+Constant LIR_VFSUB as Integer is 30821
+Constant LIR_VFMUL as Integer is 30822
+Constant LIR_VFDIV as Integer is 30823
+
+Note: ============================================================================
+Note: Arrangement Suffix Lookup
+Note: ============================================================================
+
+@Reasoning
+Returns the string suffix for the given data arrangement constant. This suffix is
+appended to the register name in NEON instructions, e.g., v0.4s, v1.2d, v2.16b.
+
+Each arrangement suffix encodes both the element count and element size, which the
+assembler uses to determine the correct instruction encoding.
+@End Reasoning
+
+Process called "get_arrangement_suffix" that takes arrangement as Integer returns Integer:
+    If arrangement is ARRANGEMENT_16B:
+        Return ".16b"
+    End If
+    If arrangement is ARRANGEMENT_8H:
+        Return ".8h"
+    End If
+    If arrangement is ARRANGEMENT_4S:
+        Return ".4s"
+    End If
+    If arrangement is ARRANGEMENT_2D:
+        Return ".2d"
+    End If
+    If arrangement is ARRANGEMENT_8B:
+        Return ".8b"
+    End If
+    If arrangement is ARRANGEMENT_4H:
+        Return ".4h"
+    End If
+    If arrangement is ARRANGEMENT_2S:
+        Return ".2s"
+    End If
+    If arrangement is ARRANGEMENT_1D:
+        Return ".1d"
+    End If
+    Note: Default to 4S (32-bit words, most common for integer SIMD)
+    Return ".4s"
+End Process
+
+Note: ============================================================================
+Note: NEON Register Name Helper
+Note: ============================================================================
+
+@Reasoning
+Returns the V register name with arrangement suffix for a given FPR register ID.
+For example, register ID 32 (V0) with arrangement 4S returns "v0.4s".
+
+The register name is built by combining the base V register name with the
+arrangement suffix string.
+@End Reasoning
+
+Process called "get_neon_reg_name" that takes reg_id as Integer, arrangement as Integer returns Integer:
+    Let fpr_index be reg_id - 32
+    If fpr_index < 0:
+        Set fpr_index to 0
+    End If
+    If fpr_index > 31:
+        Set fpr_index to 0
+    End If
+
+    Let suffix be get_arrangement_suffix(arrangement)
+
+    Note: Build "v<N><suffix>" string
+    Let buf be Layout.allocate(16)
+    Let pos be 0
+
+    Note: Write 'v' prefix
+    __store8(buf, pos, 118)  Note: 'v'
+    Set pos to pos + 1
+
+    Note: Write register number
+    Let num_str be StringCore.integer_to_string(fpr_index)
+    Let ni be 0
+    Let nc be __load8(num_str, ni)
+    While nc is not 0:
+        __store8(buf, pos, nc)
+        Set pos to pos + 1
+        Set ni to ni + 1
+        Set nc to __load8(num_str, ni)
+    End While
+
+    Note: Write arrangement suffix
+    Let si be 0
+    Let sc be __load8(suffix, si)
+    While sc is not 0:
+        __store8(buf, pos, sc)
+        Set pos to pos + 1
+        Set si to si + 1
+        Set sc to __load8(suffix, si)
+    End While
+
+    __store8(buf, pos, 0)
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: NEON Arithmetic Operations
+Note: ============================================================================
+
+@Reasoning
+Emits a NEON integer ADD instruction: add Vd.<T>, Vn.<T>, Vm.<T>
+where <T> is the data arrangement (4S, 2D, 8H, 16B, etc.).
+
+For integer element sizes, the add instruction performs element-wise addition
+across all lanes simultaneously. For example, add v0.4s, v1.4s, v2.4s adds
+four 32-bit integers in parallel.
+
+Parameters:
+- output: pointer to AssemblyOutput buffer
+- vd, vn, vm: FPR register IDs (32-63 mapping to V0-V31)
+- arrangement: data arrangement constant (ARRANGEMENT_4S, ARRANGEMENT_2D, etc.)
+@End Reasoning
+
+Process called "emit_neon_add" that takes output as Integer, vd as Integer, vn as Integer, vm as Integer, arrangement as Integer returns Integer:
+    Let section be MachineCode.SECTION_TEXT
+    Let dest_str be get_neon_reg_name(vd, arrangement)
+    Let src1_str be get_neon_reg_name(vn, arrangement)
+    Let src2_str be get_neon_reg_name(vm, arrangement)
+
+    MachineCode.asm_emit_to_section(output, section, "\tadd\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_to_section(output, section, src1_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src2_str)
+
+    Return 1
+End Process
+
+@Reasoning
+Emits a NEON integer SUB instruction: sub Vd.<T>, Vn.<T>, Vm.<T>
+Element-wise subtraction across all lanes.
+@End Reasoning
+
+Process called "emit_neon_sub" that takes output as Integer, vd as Integer, vn as Integer, vm as Integer, arrangement as Integer returns Integer:
+    Let section be MachineCode.SECTION_TEXT
+    Let dest_str be get_neon_reg_name(vd, arrangement)
+    Let src1_str be get_neon_reg_name(vn, arrangement)
+    Let src2_str be get_neon_reg_name(vm, arrangement)
+
+    MachineCode.asm_emit_to_section(output, section, "\tsub\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_to_section(output, section, src1_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src2_str)
+
+    Return 1
+End Process
+
+@Reasoning
+Emits a NEON integer MUL instruction: mul Vd.<T>, Vn.<T>, Vm.<T>
+Element-wise multiplication (lower result) across all lanes.
+
+Note: NEON integer MUL is only available for 8B/16B, 4H/8H, 2S/4S arrangements.
+There is no 2D (64-bit element) integer multiply in NEON. For 2D integer multiply,
+a sequence of UMULL/SMULL instructions would be needed, but this is rare in practice.
+The caller is responsible for not requesting 2D integer multiply.
+@End Reasoning
+
+Process called "emit_neon_mul" that takes output as Integer, vd as Integer, vn as Integer, vm as Integer, arrangement as Integer returns Integer:
+    Let section be MachineCode.SECTION_TEXT
+
+    Note: For floating-point arrangements, use fmul instead of mul
+    If arrangement is ARRANGEMENT_4S:
+        Note: Could be integer or float - caller determines via separate functions
+        Note: This function handles integer MUL
+        Let dest_str be get_neon_reg_name(vd, arrangement)
+        Let src1_str be get_neon_reg_name(vn, arrangement)
+        Let src2_str be get_neon_reg_name(vm, arrangement)
+
+        MachineCode.asm_emit_to_section(output, section, "\tmul\t")
+        MachineCode.asm_emit_to_section(output, section, dest_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_to_section(output, section, src1_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, src2_str)
+        Return 1
+    End If
+
+    Note: All other valid arrangements (16B, 8H, 8B, 4H, 2S)
+    Let dest_str be get_neon_reg_name(vd, arrangement)
+    Let src1_str be get_neon_reg_name(vn, arrangement)
+    Let src2_str be get_neon_reg_name(vm, arrangement)
+
+    MachineCode.asm_emit_to_section(output, section, "\tmul\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_to_section(output, section, src1_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src2_str)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: NEON Logical Operations
+Note: ============================================================================
+
+@Reasoning
+NEON bitwise operations operate on the full 128-bit register as a single bit vector.
+The arrangement suffix for bitwise operations is always .16b (or .8b for 64-bit form)
+because the operation is performed on all 128 bits regardless of element interpretation.
+However, the assembler accepts any arrangement; .16b is canonical.
+@End Reasoning
+
+Process called "emit_neon_and" that takes output as Integer, vd as Integer, vn as Integer, vm as Integer, arrangement as Integer returns Integer:
+    Let section be MachineCode.SECTION_TEXT
+    Note: Bitwise AND always uses .16b arrangement for the full 128-bit register
+    Let dest_str be get_neon_reg_name(vd, ARRANGEMENT_16B)
+    Let src1_str be get_neon_reg_name(vn, ARRANGEMENT_16B)
+    Let src2_str be get_neon_reg_name(vm, ARRANGEMENT_16B)
+
+    MachineCode.asm_emit_to_section(output, section, "\tand\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_to_section(output, section, src1_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src2_str)
+
+    Return 1
+End Process
+
+Process called "emit_neon_or" that takes output as Integer, vd as Integer, vn as Integer, vm as Integer, arrangement as Integer returns Integer:
+    Let section be MachineCode.SECTION_TEXT
+    Let dest_str be get_neon_reg_name(vd, ARRANGEMENT_16B)
+    Let src1_str be get_neon_reg_name(vn, ARRANGEMENT_16B)
+    Let src2_str be get_neon_reg_name(vm, ARRANGEMENT_16B)
+
+    MachineCode.asm_emit_to_section(output, section, "\torr\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_to_section(output, section, src1_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src2_str)
+
+    Return 1
+End Process
+
+Process called "emit_neon_xor" that takes output as Integer, vd as Integer, vn as Integer, vm as Integer, arrangement as Integer returns Integer:
+    Let section be MachineCode.SECTION_TEXT
+    Let dest_str be get_neon_reg_name(vd, ARRANGEMENT_16B)
+    Let src1_str be get_neon_reg_name(vn, ARRANGEMENT_16B)
+    Let src2_str be get_neon_reg_name(vm, ARRANGEMENT_16B)
+
+    MachineCode.asm_emit_to_section(output, section, "\teor\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_to_section(output, section, src1_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src2_str)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: NEON Memory Operations
+Note: ============================================================================
+
+@Reasoning
+NEON load/store uses LD1/ST1 for single-structure access (the most common form).
+These instructions load/store a full vector register from/to a contiguous memory
+address.
+
+Syntax: ld1 {Vt.<T>}, [Xn]         (no offset, base register only)
+        ld1 {Vt.<T>}, [Xn], #bytes  (post-index by element count * element size)
+        st1 {Vt.<T>}, [Xn]
+
+The register list is enclosed in curly braces. For single-register transfers,
+only one register is listed: {v0.4s}.
+
+Parameters:
+- output: pointer to AssemblyOutput
+- vt: FPR register ID (32-63) for the vector register
+- xn: GPR register ID (0-30) for the base address
+- arrangement: data arrangement for element interpretation
+@End Reasoning
+
+Process called "emit_neon_load" that takes output as Integer, vt as Integer, xn as Integer, arrangement as Integer returns Integer:
+    Let section be MachineCode.SECTION_TEXT
+    Let vec_str be get_neon_reg_name(vt, arrangement)
+
+    Note: Get the base register name (always 64-bit GPR for addresses)
+    Let base_buf be Layout.allocate(8)
+    Let base_name be ""
+    If xn is 31:
+        Set base_name to "sp"
+    Otherwise:
+        Set base_name to "x"
+        Let idx_str be StringCore.integer_to_string(xn)
+        Let bb be Layout.allocate(8)
+        __store8(bb, 0, 120)  Note: 'x'
+        Let ii be 0
+        Let ic be __load8(idx_str, ii)
+        While ic is not 0:
+            __store8(bb, ii + 1, ic)
+            Set ii to ii + 1
+            Set ic to __load8(idx_str, ii)
+        End While
+        __store8(bb, ii + 1, 0)
+        Set base_name to bb
+    End If
+
+    Note: Emit: ld1 {Vt.<T>}, [Xn]
+    MachineCode.asm_emit_to_section(output, section, "\tld1\t{")
+    MachineCode.asm_emit_to_section(output, section, vec_str)
+    MachineCode.asm_emit_to_section(output, section, "}, [")
+    MachineCode.asm_emit_to_section(output, section, base_name)
+    MachineCode.asm_emit_line(output, section, "]")
+
+    Return 1
+End Process
+
+Process called "emit_neon_store" that takes output as Integer, vt as Integer, xn as Integer, arrangement as Integer returns Integer:
+    Let section be MachineCode.SECTION_TEXT
+    Let vec_str be get_neon_reg_name(vt, arrangement)
+
+    Let base_name be ""
+    If xn is 31:
+        Set base_name to "sp"
+    Otherwise:
+        Let bb be Layout.allocate(8)
+        __store8(bb, 0, 120)  Note: 'x'
+        Let idx_str be StringCore.integer_to_string(xn)
+        Let ii be 0
+        Let ic be __load8(idx_str, ii)
+        While ic is not 0:
+            __store8(bb, ii + 1, ic)
+            Set ii to ii + 1
+            Set ic to __load8(idx_str, ii)
+        End While
+        __store8(bb, ii + 1, 0)
+        Set base_name to bb
+    End If
+
+    Note: Emit: st1 {Vt.<T>}, [Xn]
+    MachineCode.asm_emit_to_section(output, section, "\tst1\t{")
+    MachineCode.asm_emit_to_section(output, section, vec_str)
+    MachineCode.asm_emit_to_section(output, section, "}, [")
+    MachineCode.asm_emit_to_section(output, section, base_name)
+    MachineCode.asm_emit_line(output, section, "]")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: NEON Broadcast Operation
+Note: ============================================================================
+
+@Reasoning
+DUP (duplicate) broadcasts a scalar value from a GPR to all lanes of a NEON register.
+
+Syntax:
+  dup Vd.4s, Wn    Note: Broadcast 32-bit GPR to 4 x 32-bit lanes
+  dup Vd.2d, Xn    Note: Broadcast 64-bit GPR to 2 x 64-bit lanes
+  dup Vd.8h, Wn    Note: Broadcast lower 16 bits to 8 x 16-bit lanes
+  dup Vd.16b, Wn   Note: Broadcast lower 8 bits to 16 x 8-bit lanes
+
+The source register size must match the element size:
+- 32-bit elements (4S, 2S): use Wn (32-bit GPR name)
+- 64-bit elements (2D, 1D): use Xn (64-bit GPR name)
+- 16-bit elements (8H, 4H): use Wn (lower 16 bits used)
+- 8-bit elements (16B, 8B): use Wn (lower 8 bits used)
+
+Parameters:
+- output: pointer to AssemblyOutput
+- vd: FPR register ID (32-63) for destination vector
+- gpr_src: GPR register ID (0-30) for scalar source value
+- arrangement: data arrangement (determines element size and lane count)
+@End Reasoning
+
+Process called "emit_neon_broadcast" that takes output as Integer, vd as Integer, gpr_src as Integer, arrangement as Integer returns Integer:
+    Let section be MachineCode.SECTION_TEXT
+    Let dest_str be get_neon_reg_name(vd, arrangement)
+
+    Note: Determine GPR name based on element size
+    Note: 2D arrangement uses 64-bit Xn, all others use 32-bit Wn
+    Let src_name be ""
+    If arrangement is ARRANGEMENT_2D:
+        Note: 64-bit elements: use Xn
+        Let buf be Layout.allocate(8)
+        __store8(buf, 0, 120)  Note: 'x'
+        Let num_str be StringCore.integer_to_string(gpr_src)
+        Let ni be 0
+        Let nc be __load8(num_str, ni)
+        While nc is not 0:
+            __store8(buf, ni + 1, nc)
+            Set ni to ni + 1
+            Set nc to __load8(num_str, ni)
+        End While
+        __store8(buf, ni + 1, 0)
+        Set src_name to buf
+    If arrangement is ARRANGEMENT_1D:
+        Let buf be Layout.allocate(8)
+        __store8(buf, 0, 120)  Note: 'x'
+        Let num_str be StringCore.integer_to_string(gpr_src)
+        Let ni be 0
+        Let nc be __load8(num_str, ni)
+        While nc is not 0:
+            __store8(buf, ni + 1, nc)
+            Set ni to ni + 1
+            Set nc to __load8(num_str, ni)
+        End While
+        __store8(buf, ni + 1, 0)
+        Set src_name to buf
+    Otherwise:
+        Note: 32-bit, 16-bit, or 8-bit elements: use Wn
+        Let buf be Layout.allocate(8)
+        __store8(buf, 0, 119)  Note: 'w'
+        Let num_str be StringCore.integer_to_string(gpr_src)
+        Let ni be 0
+        Let nc be __load8(num_str, ni)
+        While nc is not 0:
+            __store8(buf, ni + 1, nc)
+            Set ni to ni + 1
+            Set nc to __load8(num_str, ni)
+        End While
+        __store8(buf, ni + 1, 0)
+        Set src_name to buf
+    End If
+
+    Note: Emit: dup Vd.<T>, Xn/Wn
+    MachineCode.asm_emit_to_section(output, section, "\tdup\t")
+    MachineCode.asm_emit_to_section(output, section, dest_str)
+    MachineCode.asm_emit_to_section(output, section, ", ")
+    MachineCode.asm_emit_line(output, section, src_name)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LIR Vector Opcode Dispatch
+Note: ============================================================================
+
+@Reasoning
+Maps LIR vector opcodes (30800-30899) to the appropriate NEON instruction emission.
+This function extracts register IDs and arrangement information from the LIR instruction
+and calls the corresponding emit function.
+
+LIR vector instruction layout:
+  [0]  opcode (30800-30899)
+  [8]  result operand (destination Vd register)
+  [16] operand1 (source Vn register)
+  [24] operand2 (source Vm register or address Xn for load/store)
+  [32] operand3 (arrangement specifier or GPR source for broadcast)
+
+The arrangement is stored in the instruction's metadata field at offset 32 as an
+integer matching the ARRANGEMENT_* constants.
+
+Returns 1 on success, 0 on unknown opcode or error.
+@End Reasoning
+
+Process called "map_lir_vector_op" that takes output as Integer, instruction as Integer returns Integer:
+    If instruction is 0:
+        Return 0
+    End If
+    If output is 0:
+        Return 0
+    End If
+
+    Let opcode be __load(instruction, 0)
+
+    Note: Extract register IDs
+    Let result_ptr be __load(instruction, 8)
+    Let op1_ptr be __load(instruction, 16)
+    Let op2_ptr be __load(instruction, 24)
+
+    Let vd be 32  Note: Default to V0
+    Let vn be 32
+    Let vm be 32
+
+    If result_ptr is not 0:
+        Let res_type be __load(result_ptr, 0)
+        If res_type is 1:
+            Set vd to __load(result_ptr, 8)
+        End If
+    End If
+
+    If op1_ptr is not 0:
+        Let op1_type be __load(op1_ptr, 0)
+        If op1_type is 1:
+            Set vn to __load(op1_ptr, 8)
+        End If
+    End If
+
+    If op2_ptr is not 0:
+        Let op2_type be __load(op2_ptr, 0)
+        If op2_type is 1:
+            Set vm to __load(op2_ptr, 8)
+        End If
+    End If
+
+    Note: Read arrangement from instruction metadata at offset 32
+    Let arrangement be __load(instruction, 32)
+    Note: Validate arrangement range
+    If arrangement < 0:
+        Set arrangement to ARRANGEMENT_4S
+    End If
+    If arrangement > 7:
+        Set arrangement to ARRANGEMENT_4S
+    End If
+
+    Note: Dispatch based on opcode
+    If opcode is LIR_VADD:
+        Return emit_neon_add(output, vd, vn, vm, arrangement)
+    End If
+
+    If opcode is LIR_VSUB:
+        Return emit_neon_sub(output, vd, vn, vm, arrangement)
+    End If
+
+    If opcode is LIR_VMUL:
+        Return emit_neon_mul(output, vd, vn, vm, arrangement)
+    End If
+
+    If opcode is LIR_VAND:
+        Return emit_neon_and(output, vd, vn, vm, arrangement)
+    End If
+
+    If opcode is LIR_VOR:
+        Return emit_neon_or(output, vd, vn, vm, arrangement)
+    End If
+
+    If opcode is LIR_VXOR:
+        Return emit_neon_xor(output, vd, vn, vm, arrangement)
+    End If
+
+    If opcode is LIR_VLOAD:
+        Note: For vector load, op1 is the base address register (GPR)
+        Let base_reg be 0
+        If op1_ptr is not 0:
+            Let op1_type be __load(op1_ptr, 0)
+            If op1_type is 1:
+                Set base_reg to __load(op1_ptr, 8)
+            End If
+        End If
+        Return emit_neon_load(output, vd, base_reg, arrangement)
+    End If
+
+    If opcode is LIR_VSTORE:
+        Note: For vector store, result is the source vector, op1 is the base address
+        Let base_reg be 0
+        If op1_ptr is not 0:
+            Let op1_type be __load(op1_ptr, 0)
+            If op1_type is 1:
+                Set base_reg to __load(op1_ptr, 8)
+            End If
+        End If
+        Return emit_neon_store(output, vd, base_reg, arrangement)
+    End If
+
+    If opcode is LIR_VBROADCAST:
+        Note: For broadcast, op1 is the GPR source register
+        Let gpr_src be 0
+        If op1_ptr is not 0:
+            Let op1_type be __load(op1_ptr, 0)
+            If op1_type is 1:
+                Set gpr_src to __load(op1_ptr, 8)
+            End If
+        End If
+        Return emit_neon_broadcast(output, vd, gpr_src, arrangement)
+    End If
+
+    Note: Floating-point NEON operations
+    If opcode is LIR_VFADD:
+        Note: fadd Vd.<T>, Vn.<T>, Vm.<T>
+        Let section be MachineCode.SECTION_TEXT
+        Let dest_str be get_neon_reg_name(vd, arrangement)
+        Let src1_str be get_neon_reg_name(vn, arrangement)
+        Let src2_str be get_neon_reg_name(vm, arrangement)
+        MachineCode.asm_emit_to_section(output, section, "\tfadd\t")
+        MachineCode.asm_emit_to_section(output, section, dest_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_to_section(output, section, src1_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, src2_str)
+        Return 1
+    End If
+
+    If opcode is LIR_VFSUB:
+        Let section be MachineCode.SECTION_TEXT
+        Let dest_str be get_neon_reg_name(vd, arrangement)
+        Let src1_str be get_neon_reg_name(vn, arrangement)
+        Let src2_str be get_neon_reg_name(vm, arrangement)
+        MachineCode.asm_emit_to_section(output, section, "\tfsub\t")
+        MachineCode.asm_emit_to_section(output, section, dest_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_to_section(output, section, src1_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, src2_str)
+        Return 1
+    End If
+
+    If opcode is LIR_VFMUL:
+        Let section be MachineCode.SECTION_TEXT
+        Let dest_str be get_neon_reg_name(vd, arrangement)
+        Let src1_str be get_neon_reg_name(vn, arrangement)
+        Let src2_str be get_neon_reg_name(vm, arrangement)
+        MachineCode.asm_emit_to_section(output, section, "\tfmul\t")
+        MachineCode.asm_emit_to_section(output, section, dest_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_to_section(output, section, src1_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, src2_str)
+        Return 1
+    End If
+
+    If opcode is LIR_VFDIV:
+        Let section be MachineCode.SECTION_TEXT
+        Let dest_str be get_neon_reg_name(vd, arrangement)
+        Let src1_str be get_neon_reg_name(vn, arrangement)
+        Let src2_str be get_neon_reg_name(vm, arrangement)
+        MachineCode.asm_emit_to_section(output, section, "\tfdiv\t")
+        MachineCode.asm_emit_to_section(output, section, dest_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_to_section(output, section, src1_str)
+        MachineCode.asm_emit_to_section(output, section, ", ")
+        MachineCode.asm_emit_line(output, section, src2_str)
+        Return 1
+    End If
+
+    Note: Unknown vector opcode
+    Return 0
+End Process

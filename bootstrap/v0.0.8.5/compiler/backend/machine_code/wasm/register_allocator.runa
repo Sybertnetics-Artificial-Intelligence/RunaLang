@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,464 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles WebAssembly register allocation and register management.
+WebAssembly Register Allocator - Virtual Register to Wasm Local Mapping
+
+WebAssembly has no physical registers; it uses a stack-based execution model
+with indexed local variables. This file maps LIR virtual registers to Wasm
+local variable indices and tracks the Wasm type (i32, i64, f32, f64) for each.
 
 This file performs the following tasks:
-- Process WebAssembly register allocation and register management
-- Handle WebAssembly register constraints and register usage optimization
-- Manage WebAssembly register spilling and register optimization
-- Process WebAssembly register-based operations and register optimization
+- Map LIR virtual registers to Wasm local variable indices
+- Track the Wasm value type for each local variable
+- Manage function parameter locals (parameters are locals 0..N-1)
+- Count total locals needed per function for the code section
+- Support register-to-local resolution during instruction translation
 
 This file is essential because of the following reasons:
-- WebAssembly register management is crucial for efficient WebAssembly code generation
-- Proper register handling ensures optimal WebAssembly CPU resource utilization
-- WebAssembly support enables Runa compilation for WebAssembly platforms
+- Wasm has no registers; all values live in the operand stack or local variables
+- LIR uses virtual registers which must be mapped to Wasm locals
+- Correct type tracking is required for Wasm validation (type-safe bytecode)
+- Parameter/local separation affects the locals declaration in the code section
 
 This file consists of the following functions/features/operation types:
-- WebAssembly register allocation and register management
-- WebAssembly register constraints and register usage optimization
-- WebAssembly register spilling and register optimization
-- WebAssembly register-based operations and register optimization
+- Wasm local variable allocation and type tracking
+- LIR virtual register to Wasm local index mapping
+- Function parameter registration
+- Local count and type queries for code section emission
+- Type conversion from LIR types to Wasm value types
+
+Dependencies:
+- Imports LIR types for virtual register definitions
+- Imports Layout for memory allocation
+- Imports List for collection operations
 :End Note
 
-Note: TODO - Implement WebAssembly register allocator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: WASM VALUE TYPE CONSTANTS
+Note: ============================================================================
+
+@Reasoning
+WebAssembly has four basic value types, each identified by a single byte
+in the binary format. These types are used in function signatures, local
+declarations, and block result types.
+
+  0x7F = i32 (32-bit integer)
+  0x7E = i64 (64-bit integer)
+  0x7D = f32 (32-bit IEEE 754 float)
+  0x7C = f64 (64-bit IEEE 754 float)
+
+Additionally, funcref (0x70) and externref (0x6F) exist for reference types
+but are not used in basic register allocation.
+@End Reasoning
+
+Constant WASM_TYPE_I32 as Integer is 127    Note: 0x7F
+Constant WASM_TYPE_I64 as Integer is 126    Note: 0x7E
+Constant WASM_TYPE_F32 as Integer is 125    Note: 0x7D
+Constant WASM_TYPE_F64 as Integer is 124    Note: 0x7C
+Constant WASM_TYPE_FUNCREF as Integer is 112  Note: 0x70
+Constant WASM_TYPE_EXTERNREF as Integer is 111 Note: 0x6F
+Constant WASM_TYPE_VOID as Integer is 64    Note: 0x40 (empty block type)
+
+Note: Maximum locals per function (Wasm spec allows up to 2^32-1 but we cap)
+Constant MAX_WASM_LOCALS as Integer is 4096
+
+Note: ============================================================================
+Note: WASM LOCAL ALLOCATION STATE
+Note: ============================================================================
+
+@Reasoning
+The WasmLocalAllocState tracks the mapping from LIR virtual registers to Wasm
+local variable indices and their types. Wasm locals are numbered sequentially:
+  locals 0..param_count-1 are the function parameters
+  locals param_count..total_count-1 are the non-parameter locals
+
+Memory layout per entry: 16 bytes
+  Offset 0: LIR virtual register ID (8 bytes)
+  Offset 8: Wasm value type (8 bytes)
+@End Reasoning
+
+Type called "WasmLocalAllocState":
+    local_entries as Integer      Note: Pointer to array of local entries (16 bytes each)
+    local_types as Integer        Note: Pointer to array of Wasm types for each local index
+    lir_to_local as Integer       Note: Pointer to LIR vreg -> local index mapping
+    local_count as Integer        Note: Total number of locals (params + non-params)
+    param_count as Integer        Note: Number of function parameters
+    capacity as Integer           Note: Maximum number of entries allocated
+End Type
+
+Note: Size: 6 fields * 8 bytes = 48 bytes
+
+Note: ============================================================================
+Note: ALLOCATOR INITIALIZATION
+Note: ============================================================================
+
+Process called "create_wasm_local_alloc_state" that takes capacity as Integer returns Integer:
+    @Reasoning
+    Creates the Wasm local allocation state with the given maximum capacity.
+    Allocates three arrays:
+    - local_types: maps local index -> Wasm type
+    - lir_to_local: maps LIR vreg -> local index (-1 if unmapped)
+    Both arrays are indexed by their respective ID spaces.
+    @End Reasoning
+
+    Let state be Layout.allocate(48)
+    If state equals 0:
+        Display "create_wasm_local_alloc_state: allocation failed"
+        Return 0
+    End If
+
+    Let types_array be Layout.allocate(capacity * 8)
+    Let mapping_array be Layout.allocate(capacity * 8)
+
+    If types_array equals 0:
+        Display "create_wasm_local_alloc_state: types array allocation failed"
+        Return 0
+    End If
+    If mapping_array equals 0:
+        Display "create_wasm_local_alloc_state: mapping array allocation failed"
+        Return 0
+    End If
+
+    Note: Initialize all mappings to -1 (unmapped)
+    Let i be 0
+    While i is less than capacity:
+        __store(types_array, i * 8, WASM_TYPE_I32)
+        __store(mapping_array, i * 8, -1)
+        Set i to i + 1
+    End While
+
+    __store(state, 0, 0)              Note: local_entries (unused, reserved)
+    __store(state, 8, types_array)
+    __store(state, 16, mapping_array)
+    __store(state, 24, 0)             Note: local_count = 0
+    __store(state, 32, 0)             Note: param_count = 0
+    __store(state, 40, capacity)
+
+    Return state
+End Process
+
+Process called "create_default_wasm_local_state" returns Integer:
+    Return create_wasm_local_alloc_state(MAX_WASM_LOCALS)
+End Process
+
+Note: ============================================================================
+Note: PARAMETER REGISTRATION
+Note: ============================================================================
+
+Process called "register_parameter" that takes state as Integer, lir_vreg as Integer, wasm_type as Integer returns Integer:
+    @Reasoning
+    Registers a function parameter as a Wasm local. Parameters are assigned
+    sequential local indices starting from 0. Each parameter has a known
+    Wasm type from the function signature.
+    Returns the assigned local index, or -1 on failure.
+    @End Reasoning
+
+    Let local_count be __load(state, 24)
+    Let param_count be __load(state, 32)
+    Let capacity be __load(state, 40)
+
+    If local_count is greater than or equal to capacity:
+        Display "register_parameter: capacity exceeded"
+        Return -1
+    End If
+
+    Let types_array be __load(state, 8)
+    Let mapping_array be __load(state, 16)
+
+    Let local_idx be local_count
+
+    __store(types_array, local_idx * 8, wasm_type)
+
+    Note: Map LIR vreg to this local index
+    If lir_vreg is greater than or equal to 0:
+        If lir_vreg is less than capacity:
+            __store(mapping_array, lir_vreg * 8, local_idx)
+        End If
+    End If
+
+    __store(state, 24, local_count + 1)
+    __store(state, 32, param_count + 1)
+
+    Return local_idx
+End Process
+
+Note: ============================================================================
+Note: LOCAL ALLOCATION
+Note: ============================================================================
+
+Process called "map_registers_to_locals" that takes state as Integer, lir_vreg as Integer, wasm_type as Integer returns Integer:
+    @Reasoning
+    Maps a LIR virtual register to a new Wasm local variable. Assigns the
+    next available local index and records the Wasm type. Non-parameter
+    locals start after all parameters.
+    Returns the assigned local index, or -1 on failure.
+    @End Reasoning
+
+    Let local_count be __load(state, 24)
+    Let capacity be __load(state, 40)
+
+    If local_count is greater than or equal to capacity:
+        Display "map_registers_to_locals: capacity exceeded"
+        Return -1
+    End If
+
+    Note: Check if this vreg is already mapped
+    Let mapping_array be __load(state, 16)
+    If lir_vreg is greater than or equal to 0:
+        If lir_vreg is less than capacity:
+            Let existing be __load(mapping_array, lir_vreg * 8)
+            If existing is greater than or equal to 0:
+                Return existing
+            End If
+        End If
+    End If
+
+    Let types_array be __load(state, 8)
+    Let local_idx be local_count
+
+    __store(types_array, local_idx * 8, wasm_type)
+
+    If lir_vreg is greater than or equal to 0:
+        If lir_vreg is less than capacity:
+            __store(mapping_array, lir_vreg * 8, local_idx)
+        End If
+    End If
+
+    __store(state, 24, local_count + 1)
+
+    Return local_idx
+End Process
+
+Process called "get_local_index" that takes state as Integer, lir_vreg as Integer returns Integer:
+    @Reasoning
+    Returns the Wasm local index mapped to the given LIR virtual register.
+    Returns -1 if the virtual register has not been mapped.
+    @End Reasoning
+
+    Let capacity be __load(state, 40)
+    If lir_vreg is less than 0:
+        Return -1
+    End If
+    If lir_vreg is greater than or equal to capacity:
+        Return -1
+    End If
+
+    Let mapping_array be __load(state, 16)
+    Return __load(mapping_array, lir_vreg * 8)
+End Process
+
+Process called "get_local_type" that takes state as Integer, local_idx as Integer returns Integer:
+    @Reasoning
+    Returns the Wasm value type for the given local variable index.
+    Returns WASM_TYPE_I32 as default if the index is out of range.
+    @End Reasoning
+
+    Let local_count be __load(state, 24)
+    If local_idx is less than 0:
+        Return WASM_TYPE_I32
+    End If
+    If local_idx is greater than or equal to local_count:
+        Return WASM_TYPE_I32
+    End If
+
+    Let types_array be __load(state, 8)
+    Return __load(types_array, local_idx * 8)
+End Process
+
+Note: ============================================================================
+Note: QUERY FUNCTIONS
+Note: ============================================================================
+
+Process called "get_local_count" that takes state as Integer returns Integer:
+    Note: Returns total number of locals (params + non-params)
+    Return __load(state, 24)
+End Process
+
+Process called "get_param_count" that takes state as Integer returns Integer:
+    Note: Returns number of function parameters
+    Return __load(state, 32)
+End Process
+
+Process called "get_non_param_local_count" that takes state as Integer returns Integer:
+    @Reasoning
+    Returns the number of non-parameter locals. This is the count that goes
+    into the code section's locals declaration (parameters are declared in
+    the function type, not in the locals vector).
+    @End Reasoning
+
+    Let total be __load(state, 24)
+    Let params be __load(state, 32)
+    Return total - params
+End Process
+
+Process called "get_local_type_groups" that takes state as Integer returns Integer:
+    @Reasoning
+    Computes the number of type groups needed for the locals declaration in
+    the Wasm code section. Consecutive locals of the same type are grouped
+    together as (count, type) pairs. Returns the number of groups.
+
+    For example, if non-param locals are [i32, i32, i64, i32], the groups are:
+      (2, i32), (1, i64), (1, i32) = 3 groups
+    @End Reasoning
+
+    Let param_count be __load(state, 32)
+    Let total_count be __load(state, 24)
+    Let types_array be __load(state, 8)
+
+    If total_count is less than or equal to param_count:
+        Return 0
+    End If
+
+    Let group_count be 1
+    Let prev_type be __load(types_array, param_count * 8)
+    Let i be param_count + 1
+    While i is less than total_count:
+        Let cur_type be __load(types_array, i * 8)
+        If cur_type does not equal prev_type:
+            Set group_count to group_count + 1
+            Set prev_type to cur_type
+        End If
+        Set i to i + 1
+    End While
+
+    Return group_count
+End Process
+
+Process called "get_type_group_at" that takes state as Integer, group_idx as Integer, out_count as Integer, out_type as Integer returns Integer:
+    @Reasoning
+    Retrieves the count and type for a specific local type group (0-indexed).
+    Writes the count to *out_count and the type to *out_type.
+    Returns 1 on success, 0 if group_idx is out of range.
+    @End Reasoning
+
+    Let param_count be __load(state, 32)
+    Let total_count be __load(state, 24)
+    Let types_array be __load(state, 8)
+
+    If total_count is less than or equal to param_count:
+        Return 0
+    End If
+
+    Let current_group be 0
+    Let run_start be param_count
+    Let run_type be __load(types_array, param_count * 8)
+    Let i be param_count + 1
+
+    While i is less than or equal to total_count:
+        Let at_end be 0
+        If i equals total_count:
+            Set at_end to 1
+        End If
+
+        Let type_changed be 0
+        If at_end equals 0:
+            Let cur_type be __load(types_array, i * 8)
+            If cur_type does not equal run_type:
+                Set type_changed to 1
+            End If
+        End If
+
+        If at_end equals 1:
+            Set type_changed to 1
+        End If
+
+        If type_changed equals 1:
+            If current_group equals group_idx:
+                Let run_count be i - run_start
+                __store(out_count, 0, run_count)
+                __store(out_type, 0, run_type)
+                Return 1
+            End If
+            Set current_group to current_group + 1
+            Set run_start to i
+            If at_end equals 0:
+                Set run_type to __load(types_array, i * 8)
+            End If
+        End If
+
+        Set i to i + 1
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: TYPE CONVERSION
+Note: ============================================================================
+
+Process called "lir_type_to_wasm_type" that takes lir_type as Integer returns Integer:
+    @Reasoning
+    Converts a LIR type identifier to the corresponding Wasm value type byte.
+    LIR uses its own type system which must be mapped to one of the four
+    Wasm primitive types.
+
+    Mapping:
+    - LIR integer types (8/16/32 bit) -> i32
+    - LIR integer 64-bit -> i64
+    - LIR float 32-bit -> f32
+    - LIR float 64-bit -> f64
+    - LIR pointer types -> i32 (in wasm32 linear memory model)
+    - Default -> i32
+    @End Reasoning
+
+    Note: LIR type constants (from lir.runa)
+    Note: LIR_TYPE_I8  = 1, LIR_TYPE_I16 = 2, LIR_TYPE_I32 = 3
+    Note: LIR_TYPE_I64 = 4, LIR_TYPE_F32 = 5, LIR_TYPE_F64 = 6
+    Note: LIR_TYPE_PTR = 7
+
+    If lir_type equals 1:
+        Return WASM_TYPE_I32
+    End If
+    If lir_type equals 2:
+        Return WASM_TYPE_I32
+    End If
+    If lir_type equals 3:
+        Return WASM_TYPE_I32
+    End If
+    If lir_type equals 4:
+        Return WASM_TYPE_I64
+    End If
+    If lir_type equals 5:
+        Return WASM_TYPE_F32
+    End If
+    If lir_type equals 6:
+        Return WASM_TYPE_F64
+    End If
+    If lir_type equals 7:
+        Return WASM_TYPE_I32
+    End If
+    Return WASM_TYPE_I32
+End Process
+
+Note: ============================================================================
+Note: RESET
+Note: ============================================================================
+
+Process called "reset_allocation" that takes state as Integer returns Integer:
+    @Reasoning
+    Resets the allocation state for a new function. Clears all local type
+    assignments and LIR-to-local mappings. Resets counts to zero.
+    @End Reasoning
+
+    Let capacity be __load(state, 40)
+    Let types_array be __load(state, 8)
+    Let mapping_array be __load(state, 16)
+
+    Let i be 0
+    While i is less than capacity:
+        __store(types_array, i * 8, WASM_TYPE_I32)
+        __store(mapping_array, i * 8, -1)
+        Set i to i + 1
+    End While
+
+    __store(state, 24, 0)   Note: local_count = 0
+    __store(state, 32, 0)   Note: param_count = 0
+
+    Return 1
+End Process

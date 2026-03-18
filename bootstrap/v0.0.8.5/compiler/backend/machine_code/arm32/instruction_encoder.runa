@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,727 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles ARM32 instruction encoding and instruction processing.
+ARM32 Instruction Encoder - Binary Machine Code Encoding
 
-This file performs the following tasks:
-- Process ARM32 instruction encoding and instruction generation
-- Handle ARM32 instruction optimization and instruction selection
-- Manage ARM32 instruction scheduling and instruction reordering
-- Process ARM32 instruction validation and instruction verification
+Encodes ARM32 instructions into 32-bit (ARM mode) or 16-bit (Thumb mode) binary
+machine code. ARM instructions have a fixed 32-bit width with a regular encoding
+structure. Every ARM instruction includes a 4-bit condition field.
 
-This file is essential because of the following reasons:
-- ARM32 instruction processing enables native ARM32 code generation
-- Proper instruction handling ensures correct and efficient ARM32 code
-- ARM32 support enables Runa compilation for ARM32 platforms
+ARM32 instruction format (32-bit ARM mode):
+  [cond(4)|type(2-3)|opcode_fields|operands]
 
-This file consists of the following functions/features/operation types:
-- ARM32 instruction encoding and instruction generation
-- ARM32 instruction optimization and instruction selection
-- ARM32 instruction scheduling and instruction reordering
-- ARM32 instruction validation and instruction verification
+Data Processing: [cond(4)|00|I|opcode(4)|S|Rn(4)|Rd(4)|operand2(12)]
+  I=0: operand2 is register with optional shift
+  I=1: operand2 is immediate (8-bit rotated by even amount)
+
+Load/Store:      [cond(4)|01|I|P|U|B|W|L|Rn(4)|Rd(4)|offset(12)]
+Branch:           [cond(4)|101|L|offset(24)]
+Software Int:     [cond(4)|1111|imm24]
+
+Dependencies:
+- Imports LIR types for instruction definitions
+- Imports LIRNodes for operand type checking
+- Imports machine_code_interface for BinaryOutput buffer management
+- Imports memory/layout.runa for allocation
 :End Note
 
-Note: TODO - Implement ARM32 instruction encoder functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: ARM32 Condition Code Constants
+Note: ============================================================================
+
+@Reasoning
+Every ARM instruction has a 4-bit condition field (bits 31-28).
+The condition determines whether the instruction executes based on the
+current flags in the CPSR (Current Program Status Register).
+@End Reasoning
+
+Constant COND_EQ as Integer is 0          Note: Equal (Z=1)
+Constant COND_NE as Integer is 1          Note: Not equal (Z=0)
+Constant COND_CS as Integer is 2          Note: Carry set / unsigned higher or same (C=1)
+Constant COND_CC as Integer is 3          Note: Carry clear / unsigned lower (C=0)
+Constant COND_MI as Integer is 4          Note: Minus / negative (N=1)
+Constant COND_PL as Integer is 5          Note: Plus / positive or zero (N=0)
+Constant COND_VS as Integer is 6          Note: Overflow (V=1)
+Constant COND_VC as Integer is 7          Note: No overflow (V=0)
+Constant COND_HI as Integer is 8          Note: Unsigned higher (C=1 and Z=0)
+Constant COND_LS as Integer is 9          Note: Unsigned lower or same (C=0 or Z=1)
+Constant COND_GE as Integer is 10         Note: Signed greater or equal (N=V)
+Constant COND_LT as Integer is 11         Note: Signed less than (N!=V)
+Constant COND_GT as Integer is 12         Note: Signed greater than (Z=0 and N=V)
+Constant COND_LE as Integer is 13         Note: Signed less or equal (Z=1 or N!=V)
+Constant COND_AL as Integer is 14         Note: Always (unconditional)
+Constant COND_NV as Integer is 15         Note: Never (reserved, do not use)
+
+Note: ============================================================================
+Note: Data Processing Opcode Constants
+Note: ============================================================================
+
+Constant DP_AND as Integer is 0           Note: AND Rd, Rn, operand2
+Constant DP_EOR as Integer is 1           Note: EOR (XOR) Rd, Rn, operand2
+Constant DP_SUB as Integer is 2           Note: SUB Rd, Rn, operand2
+Constant DP_RSB as Integer is 3           Note: RSB (reverse subtract) Rd, Rn, operand2
+Constant DP_ADD as Integer is 4           Note: ADD Rd, Rn, operand2
+Constant DP_ADC as Integer is 5           Note: ADC (add with carry)
+Constant DP_SBC as Integer is 6           Note: SBC (subtract with carry)
+Constant DP_RSC as Integer is 7           Note: RSC (reverse subtract with carry)
+Constant DP_TST as Integer is 8           Note: TST (test - AND without result)
+Constant DP_TEQ as Integer is 9           Note: TEQ (test equivalence - XOR without result)
+Constant DP_CMP as Integer is 10          Note: CMP (compare - SUB without result)
+Constant DP_CMN as Integer is 11          Note: CMN (compare negated - ADD without result)
+Constant DP_ORR as Integer is 12          Note: ORR (OR) Rd, Rn, operand2
+Constant DP_MOV as Integer is 13          Note: MOV Rd, operand2
+Constant DP_BIC as Integer is 14          Note: BIC (bit clear) Rd, Rn, operand2
+Constant DP_MVN as Integer is 15          Note: MVN (move NOT) Rd, operand2
+
+Note: Shift types for operand2 register form
+Constant SHIFT_LSL as Integer is 0        Note: Logical shift left
+Constant SHIFT_LSR as Integer is 1        Note: Logical shift right
+Constant SHIFT_ASR as Integer is 2        Note: Arithmetic shift right
+Constant SHIFT_ROR as Integer is 3        Note: Rotate right
+
+Note: ============================================================================
+Note: Encoder Context
+Note: ============================================================================
+
+Type called "ARM32EncoderContext":
+    output as Integer              Note: Pointer to BinaryOutput
+    current_condition as Integer   Note: Current condition code (default: AL)
+End Type
+
+Note: Size: 2 fields * 8 bytes = 16 bytes
+
+Process called "create_encoder_context" that takes output as Integer returns Integer:
+    Let ctx be Layout.allocate(16)
+    If ctx is 0:
+        Return 0
+    End If
+    __store(ctx, 0, output)
+    __store(ctx, 8, COND_AL)
+    Return ctx
+End Process
+
+Process called "set_condition" that takes ctx as Integer, condition as Integer returns Integer:
+    Note: Sets the condition code for subsequent instruction encoding
+    If ctx is 0:
+        Return 0
+    End If
+    __store(ctx, 8, condition & 15)
+    Return 1
+End Process
+
+Process called "emit_word" that takes ctx as Integer, word as Integer returns Integer:
+    Note: Emits a 32-bit word to the binary output in little-endian order
+    If ctx is 0:
+        Return 0
+    End If
+    Let output be __load(ctx, 0)
+    MachineCode.binary_emit_byte(output, word & 255)
+    MachineCode.binary_emit_byte(output, (word / 256) & 255)
+    MachineCode.binary_emit_byte(output, (word / 65536) & 255)
+    MachineCode.binary_emit_byte(output, (word / 16777216) & 255)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Immediate Encoding
+Note: ============================================================================
+
+@Reasoning
+ARM data processing immediates are encoded as an 8-bit value rotated right
+by an even number (0-30) of positions within a 32-bit word. The encoding is:
+  imm12 = [rotate(4)|imm8(8)]
+  value = imm8 ROR (rotate * 2)
+
+Not all 32-bit values can be represented. This function attempts to find
+a valid rotation for the given immediate value. Returns -1 if the value
+cannot be encoded as an ARM immediate.
+@End Reasoning
+
+Process called "encode_arm_immediate" that takes value as Integer returns Integer:
+    Note: Tries to encode a 32-bit value as an ARM rotated immediate
+    Note: Returns the 12-bit imm12 field, or -1 if not representable
+
+    Note: Handle zero directly
+    If value is 0:
+        Return 0
+    End If
+
+    Note: Try each rotation (0 through 15, meaning ROR by 0,2,4,...,30)
+    Let rot be 0
+    While rot < 16:
+        Note: Rotate value left by rot*2 positions to check if it fits in 8 bits
+        Let shift_amount be rot * 2
+        Let rotated be value
+        Note: Rotate left by shift_amount (equivalent to checking ROR)
+        If shift_amount > 0:
+            Let left_part be (value * 1) & 4294967295
+            Note: Manual rotation: (val << shift) | (val >> (32-shift))
+            Let lshift be 1
+            Let ri be 0
+            While ri < shift_amount:
+                Set lshift to lshift * 2
+                Set ri to ri + 1
+            End While
+            Let rshift_amount be 32 - shift_amount
+            Let rshift be 1
+            Let rj be 0
+            While rj < rshift_amount:
+                Set rshift to rshift * 2
+                Set rj to rj + 1
+            End While
+            Set rotated to ((value * lshift) & 4294967295) + ((value / rshift) & 4294967295)
+            Set rotated to rotated & 4294967295
+        End If
+
+        Note: Check if the rotated value fits in 8 bits
+        If rotated >= 0:
+            If rotated <= 255:
+                Note: Encode as [rot(4)|imm8(8)]
+                Let encoded be (rot * 256) + (rotated & 255)
+                Return encoded & 4095
+            End If
+        End If
+
+        Set rot to rot + 1
+    End While
+
+    Note: Cannot encode as ARM immediate
+    Return 0 - 1
+End Process
+
+Note: ============================================================================
+Note: Data Processing Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+ARM data processing instruction format (32-bit):
+Bits 31-28: condition code
+Bits 27-26: 00 (data processing class)
+Bit  25:    I (1=immediate operand2, 0=register operand2)
+Bits 24-21: opcode (AND, EOR, SUB, etc.)
+Bit  20:    S (1=update condition flags, 0=don't update)
+Bits 19-16: Rn (first source register)
+Bits 15-12: Rd (destination register)
+Bits 11-0:  operand2 (immediate or register with shift)
+
+For register operand2:
+Bits 11-7: shift amount (5-bit immediate) or shift register
+Bits 6-5:  shift type (LSL, LSR, ASR, ROR)
+Bit  4:    0=immediate shift, 1=register shift
+Bits 3-0:  Rm (second source register)
+@End Reasoning
+
+Process called "encode_data_processing" that takes ctx as Integer, opcode as Integer, s_flag as Integer, rd as Integer, rn as Integer, operand2 as Integer, is_immediate as Integer returns Integer:
+    Note: Encodes a data processing instruction
+    Note: opcode: DP_AND through DP_MVN
+    Note: s_flag: 1 to set flags, 0 to not set flags
+    Note: rd: destination register (0-15)
+    Note: rn: first source register (0-15)
+    Note: operand2: 12-bit operand2 field
+    Note: is_immediate: 1 if operand2 is immediate encoding, 0 if register
+
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let cond be __load(ctx, 8)
+    Let instruction be 0
+
+    Note: Condition field (bits 31-28)
+    Set instruction to (cond & 15) * 268435456
+
+    Note: Data processing class (bits 27-26 = 00) - already zero
+
+    Note: I bit (bit 25)
+    If is_immediate is 1:
+        Set instruction to instruction + 33554432
+    End If
+
+    Note: Opcode (bits 24-21)
+    Set instruction to instruction + ((opcode & 15) * 2097152)
+
+    Note: S flag (bit 20)
+    If s_flag is 1:
+        Set instruction to instruction + 1048576
+    End If
+
+    Note: Rn (bits 19-16)
+    Set instruction to instruction + ((rn & 15) * 65536)
+
+    Note: Rd (bits 15-12)
+    Set instruction to instruction + ((rd & 15) * 4096)
+
+    Note: Operand2 (bits 11-0)
+    Set instruction to instruction + (operand2 & 4095)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Process called "encode_dp_reg_reg" that takes ctx as Integer, opcode as Integer, s_flag as Integer, rd as Integer, rn as Integer, rm as Integer returns Integer:
+    Note: Encodes data processing with register operand2 (no shift)
+    Let operand2 be rm & 15
+    Return encode_data_processing(ctx, opcode, s_flag, rd, rn, operand2, 0)
+End Process
+
+Process called "encode_dp_reg_shifted" that takes ctx as Integer, opcode as Integer, s_flag as Integer, rd as Integer, rn as Integer, rm as Integer, shift_type as Integer, shift_amount as Integer returns Integer:
+    Note: Encodes data processing with shifted register operand2
+    Note: operand2 format: [shift_amount(5)|shift_type(2)|0|Rm(4)]
+    Let operand2 be ((shift_amount & 31) * 128) + ((shift_type & 3) * 32) + (rm & 15)
+    Return encode_data_processing(ctx, opcode, s_flag, rd, rn, operand2, 0)
+End Process
+
+Process called "encode_dp_reg_imm" that takes ctx as Integer, opcode as Integer, s_flag as Integer, rd as Integer, rn as Integer, imm_value as Integer returns Integer:
+    Note: Encodes data processing with immediate operand2
+    Let imm12 be encode_arm_immediate(imm_value)
+    If imm12 is (0 - 1):
+        Note: Cannot encode directly; must load into register first
+        Return 0
+    End If
+    Return encode_data_processing(ctx, opcode, s_flag, rd, rn, imm12, 1)
+End Process
+
+Note: ============================================================================
+Note: Load/Store Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+ARM load/store instruction format (32-bit):
+Bits 31-28: condition code
+Bits 27-26: 01 (load/store class)
+Bit  25:    I (0=immediate offset, 1=register offset)
+Bit  24:    P (1=pre-indexed, 0=post-indexed)
+Bit  23:    U (1=add offset, 0=subtract offset)
+Bit  22:    B (1=byte transfer, 0=word transfer)
+Bit  21:    W (1=write-back, 0=no write-back)
+Bit  20:    L (1=load, 0=store)
+Bits 19-16: Rn (base register)
+Bits 15-12: Rd (source/destination register)
+Bits 11-0:  offset (12-bit immediate or register with shift)
+@End Reasoning
+
+Process called "encode_load_store" that takes ctx as Integer, is_load as Integer, is_byte as Integer, rd as Integer, rn as Integer, offset as Integer, pre_index as Integer, add_offset as Integer, writeback as Integer returns Integer:
+    Note: Encodes a load or store instruction with immediate offset
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let cond be __load(ctx, 8)
+    Let instruction be 0
+
+    Note: Condition field (bits 31-28)
+    Set instruction to (cond & 15) * 268435456
+
+    Note: Load/store class (bits 27-26 = 01)
+    Set instruction to instruction + 67108864
+
+    Note: I bit = 0 for immediate offset (bit 25)
+
+    Note: P bit (bit 24)
+    If pre_index is 1:
+        Set instruction to instruction + 16777216
+    End If
+
+    Note: U bit (bit 23)
+    If add_offset is 1:
+        Set instruction to instruction + 8388608
+    End If
+
+    Note: B bit (bit 22)
+    If is_byte is 1:
+        Set instruction to instruction + 4194304
+    End If
+
+    Note: W bit (bit 21)
+    If writeback is 1:
+        Set instruction to instruction + 2097152
+    End If
+
+    Note: L bit (bit 20)
+    If is_load is 1:
+        Set instruction to instruction + 1048576
+    End If
+
+    Note: Rn (bits 19-16)
+    Set instruction to instruction + ((rn & 15) * 65536)
+
+    Note: Rd (bits 15-12)
+    Set instruction to instruction + ((rd & 15) * 4096)
+
+    Note: Offset (bits 11-0)
+    Let abs_offset be offset
+    If abs_offset < 0:
+        Set abs_offset to 0 - abs_offset
+    End If
+    Set instruction to instruction + (abs_offset & 4095)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Process called "encode_ldr" that takes ctx as Integer, rd as Integer, rn as Integer, offset as Integer returns Integer:
+    Note: LDR Rd, [Rn, #offset] - pre-indexed, add/sub based on sign
+    Let add be 1
+    Let abs_off be offset
+    If offset < 0:
+        Set add to 0
+        Set abs_off to 0 - offset
+    End If
+    Return encode_load_store(ctx, 1, 0, rd, rn, abs_off, 1, add, 0)
+End Process
+
+Process called "encode_str" that takes ctx as Integer, rd as Integer, rn as Integer, offset as Integer returns Integer:
+    Note: STR Rd, [Rn, #offset]
+    Let add be 1
+    Let abs_off be offset
+    If offset < 0:
+        Set add to 0
+        Set abs_off to 0 - offset
+    End If
+    Return encode_load_store(ctx, 0, 0, rd, rn, abs_off, 1, add, 0)
+End Process
+
+Process called "encode_ldrb" that takes ctx as Integer, rd as Integer, rn as Integer, offset as Integer returns Integer:
+    Note: LDRB Rd, [Rn, #offset] - byte load
+    Let add be 1
+    Let abs_off be offset
+    If offset < 0:
+        Set add to 0
+        Set abs_off to 0 - offset
+    End If
+    Return encode_load_store(ctx, 1, 1, rd, rn, abs_off, 1, add, 0)
+End Process
+
+Process called "encode_strb" that takes ctx as Integer, rd as Integer, rn as Integer, offset as Integer returns Integer:
+    Note: STRB Rd, [Rn, #offset] - byte store
+    Let add be 1
+    Let abs_off be offset
+    If offset < 0:
+        Set add to 0
+        Set abs_off to 0 - offset
+    End If
+    Return encode_load_store(ctx, 0, 1, rd, rn, abs_off, 1, add, 0)
+End Process
+
+Note: ============================================================================
+Note: Branch Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+ARM branch instruction format:
+Bits 31-28: condition code
+Bits 27-25: 101
+Bit  24:    L (1=branch with link (BL), 0=branch (B))
+Bits 23-0:  signed 24-bit offset (in words, PC-relative)
+
+The offset is in words (4-byte units), so the actual byte displacement
+is offset * 4. The PC is 8 bytes ahead due to pipeline.
+Effective target = PC + 8 + (offset * 4)
+@End Reasoning
+
+Process called "encode_branch" that takes ctx as Integer, offset as Integer, link as Integer returns Integer:
+    Note: Encodes B (link=0) or BL (link=1) instruction
+    Note: offset is in words (will be sign-extended 24-bit)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let cond be __load(ctx, 8)
+    Let instruction be 0
+
+    Note: Condition field (bits 31-28)
+    Set instruction to (cond & 15) * 268435456
+
+    Note: Branch class (bits 27-25 = 101)
+    Set instruction to instruction + 167772160
+
+    Note: L bit (bit 24)
+    If link is 1:
+        Set instruction to instruction + 16777216
+    End If
+
+    Note: Offset (bits 23-0, signed)
+    Set instruction to instruction + (offset & 16777215)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Process called "encode_b" that takes ctx as Integer, offset as Integer returns Integer:
+    Note: B (branch) instruction
+    Return encode_branch(ctx, offset, 0)
+End Process
+
+Process called "encode_bl" that takes ctx as Integer, offset as Integer returns Integer:
+    Note: BL (branch with link) instruction - function call
+    Return encode_branch(ctx, offset, 1)
+End Process
+
+Process called "encode_bx" that takes ctx as Integer, rm as Integer returns Integer:
+    Note: BX Rm - branch and exchange (return from function when Rm=LR)
+    Note: Encoding: cond(4) 0001 0010 1111 1111 1111 0001 Rm(4)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let cond be __load(ctx, 8)
+    Let instruction be 0
+
+    Set instruction to (cond & 15) * 268435456
+    Note: 0001 0010 1111 1111 1111 0001 = 0x012FFF10 + Rm
+    Set instruction to instruction + 19922704 + (rm & 15)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Software Interrupt Encoding
+Note: ============================================================================
+
+Process called "encode_swi" that takes ctx as Integer, imm24 as Integer returns Integer:
+    Note: SWI (SVC) imm24 - software interrupt for system calls
+    Note: Encoding: cond(4) 1111 imm24(24)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let cond be __load(ctx, 8)
+    Let instruction be 0
+
+    Set instruction to (cond & 15) * 268435456
+    Note: SWI class: bits 27-24 = 1111
+    Set instruction to instruction + 251658240
+    Note: Immediate (bits 23-0)
+    Set instruction to instruction + (imm24 & 16777215)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Multiply Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+ARM multiply instructions have a unique encoding:
+MUL:  cond(4) 0000 000S Rd(4) 0000 Rs(4) 1001 Rm(4)
+MLA:  cond(4) 0000 001S Rd(4) Rn(4) Rs(4) 1001 Rm(4)
+Result: Rd = Rm * Rs (MUL) or Rd = Rm * Rs + Rn (MLA)
+@End Reasoning
+
+Process called "encode_mul" that takes ctx as Integer, rd as Integer, rm as Integer, rs as Integer, s_flag as Integer returns Integer:
+    Note: MUL Rd, Rm, Rs
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let cond be __load(ctx, 8)
+    Let instruction be 0
+
+    Set instruction to (cond & 15) * 268435456
+    Note: bits 27-22 = 000000 (already zero)
+    Note: S flag (bit 20)
+    If s_flag is 1:
+        Set instruction to instruction + 1048576
+    End If
+    Note: Rd (bits 19-16)
+    Set instruction to instruction + ((rd & 15) * 65536)
+    Note: Rs (bits 11-8)
+    Set instruction to instruction + ((rs & 15) * 256)
+    Note: bits 7-4 = 1001
+    Set instruction to instruction + 144
+    Note: Rm (bits 3-0)
+    Set instruction to instruction + (rm & 15)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Process called "encode_mla" that takes ctx as Integer, rd as Integer, rm as Integer, rs as Integer, rn as Integer, s_flag as Integer returns Integer:
+    Note: MLA Rd, Rm, Rs, Rn (multiply-accumulate: Rd = Rm * Rs + Rn)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let cond be __load(ctx, 8)
+    Let instruction be 0
+
+    Set instruction to (cond & 15) * 268435456
+    Note: bit 21 = 1 (accumulate flag)
+    Set instruction to instruction + 2097152
+    If s_flag is 1:
+        Set instruction to instruction + 1048576
+    End If
+    Set instruction to instruction + ((rd & 15) * 65536)
+    Set instruction to instruction + ((rn & 15) * 4096)
+    Set instruction to instruction + ((rs & 15) * 256)
+    Set instruction to instruction + 144
+    Set instruction to instruction + (rm & 15)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Push/Pop (STM/LDM) Instruction Encoding
+Note: ============================================================================
+
+@Reasoning
+Block data transfer (LDM/STM) instructions transfer multiple registers.
+Format: cond(4) 100 P U S W L Rn(4) register_list(16)
+
+register_list is a 16-bit bitmask where bit N=1 means include register RN.
+PUSH = STMDB SP!, {regs} = STM with P=1, U=0, W=1, L=0, Rn=SP
+POP  = LDMIA SP!, {regs} = LDM with P=0, U=1, W=1, L=1, Rn=SP
+@End Reasoning
+
+Process called "encode_push" that takes ctx as Integer, register_mask as Integer returns Integer:
+    Note: PUSH {regs} = STMDB SP!, {regs}
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let cond be __load(ctx, 8)
+    Let instruction be 0
+
+    Set instruction to (cond & 15) * 268435456
+    Note: 100 P=1 U=0 S=0 W=1 L=0 = 10010010 in bits 27-20
+    Set instruction to instruction + 150994944
+    Note: Rn = SP (13) in bits 19-16
+    Set instruction to instruction + (13 * 65536)
+    Note: Register list (bits 15-0)
+    Set instruction to instruction + (register_mask & 65535)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Process called "encode_pop" that takes ctx as Integer, register_mask as Integer returns Integer:
+    Note: POP {regs} = LDMIA SP!, {regs}
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let cond be __load(ctx, 8)
+    Let instruction be 0
+
+    Set instruction to (cond & 15) * 268435456
+    Note: 100 P=0 U=1 S=0 W=1 L=1 = 10001011 in bits 27-20
+    Set instruction to instruction + 143654912
+    Note: Rn = SP (13) in bits 19-16
+    Set instruction to instruction + (13 * 65536)
+    Note: Register list (bits 15-0)
+    Set instruction to instruction + (register_mask & 65535)
+
+    emit_word(ctx, instruction)
+    Return 1
+End Process
+
+Process called "build_register_mask" that takes reg_list as Integer returns Integer:
+    Note: Builds a register bitmask from a List of register IDs
+    If reg_list is 0:
+        Return 0
+    End If
+
+    Let mask be 0
+    Let count be List.list_length(reg_list)
+    Let i be 0
+    While i < count:
+        Let reg_id be List.list_get(reg_list, i)
+        If reg_id >= 0:
+            If reg_id <= 15:
+                Note: Set bit for register
+                Let bit_val be 1
+                Let j be 0
+                While j < reg_id:
+                    Set bit_val to bit_val * 2
+                    Set j to j + 1
+                End While
+                Set mask to mask + bit_val
+            End If
+        End If
+        Set i to i + 1
+    End While
+
+    Return mask
+End Process
+
+Note: ============================================================================
+Note: MOV Instruction Convenience Wrappers
+Note: ============================================================================
+
+Process called "encode_mov_reg" that takes ctx as Integer, rd as Integer, rm as Integer returns Integer:
+    Note: MOV Rd, Rm
+    Return encode_data_processing(ctx, DP_MOV, 0, rd, 0, rm & 15, 0)
+End Process
+
+Process called "encode_mov_imm" that takes ctx as Integer, rd as Integer, imm_value as Integer returns Integer:
+    Note: MOV Rd, #imm
+    Let imm12 be encode_arm_immediate(imm_value)
+    If imm12 is (0 - 1):
+        Return 0
+    End If
+    Return encode_data_processing(ctx, DP_MOV, 0, rd, 0, imm12, 1)
+End Process
+
+Process called "encode_mvn_reg" that takes ctx as Integer, rd as Integer, rm as Integer returns Integer:
+    Note: MVN Rd, Rm (bitwise NOT)
+    Return encode_data_processing(ctx, DP_MVN, 0, rd, 0, rm & 15, 0)
+End Process
+
+Note: ============================================================================
+Note: NOP Encoding
+Note: ============================================================================
+
+Process called "encode_nop" that takes ctx as Integer returns Integer:
+    Note: NOP = MOV R0, R0 (on older ARM; ARMv6K+ has dedicated NOP encoding)
+    Return encode_mov_reg(ctx, 0, 0)
+End Process
+
+Note: ============================================================================
+Note: Condition Code Mapping from LIR
+Note: ============================================================================
+
+Process called "lir_condition_to_arm" that takes lir_cond as Integer returns Integer:
+    Note: Maps LIR condition codes (0-9) to ARM condition codes
+    If lir_cond is 0:
+        Return COND_EQ
+    End If
+    If lir_cond is 1:
+        Return COND_NE
+    End If
+    If lir_cond is 2:
+        Return COND_LT
+    End If
+    If lir_cond is 3:
+        Return COND_LE
+    End If
+    If lir_cond is 4:
+        Return COND_GT
+    End If
+    If lir_cond is 5:
+        Return COND_GE
+    End If
+    If lir_cond is 6:
+        Return COND_CC
+    End If
+    If lir_cond is 7:
+        Return COND_LS
+    End If
+    If lir_cond is 8:
+        Return COND_HI
+    End If
+    If lir_cond is 9:
+        Return COND_CS
+    End If
+    Return COND_AL
+End Process

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,487 @@ limitations under the License.
 :End Note
 
 Note:
+RUNA BUILD TOOL - CLI Build System Entry Point
+
 This file handles Runa build system and project compilation.
 
 This file performs the following tasks:
-- Process Runa build system and project compilation
-- Handle build configuration and build optimization
-- Manage build dependencies and build caching
-- Process build validation and build verification
+- Parse CLI arguments for build configuration (source files, output path, optimization, target)
+- Invoke the compiler driver build_system to compile one or more source files
+- Report build results including file counts, error counts, and elapsed time
+- Support incremental, verbose, and debug-info build modes
 
 This file is essential because of the following reasons:
-- Runa build system ensures efficient project compilation and building
-- Proper build handling ensures correct project compilation
-- RunaBuild support enables Runa compilation for complete project building
+- Runa build tool is the primary CLI entry point for compiling Runa projects
+- Proper build argument parsing ensures correct compiler invocation
+- RunaBuild bridges user-facing CLI with compiler/driver/build_system internals
 
 This file consists of the following functions/features/operation types:
-- Runa build system and project compilation
-- Build configuration and build optimization
-- Build dependencies and build caching
-- Build validation and build verification
+- BuildArgs type for CLI argument representation
+- parse_build_args to extract structured arguments from raw CLI args
+- execute_build to invoke the build system with parsed arguments
+- report_build_result to display compilation outcomes to the user
+- run_build as the top-level entry point orchestrating the build pipeline
+
+Dependencies:
+- Imports compiler/internal/string_utils.runa for string operations
+- Imports compiler/internal/file_utils.runa for file existence checks
+- Imports compiler/internal/memory_utils.runa for memory allocation
+- Imports compiler/internal/time_utils.runa for build timing
+- Imports compiler/internal/arena_utils.runa for arena-scoped allocation
+- Imports compiler/driver/build_system.runa for build context and compilation
 :End Note
 
-Note: TODO - Implement RunaBuild functionality
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/file_utils.runa" as FileUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/time_utils.runa" as TimeUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+Import "compiler/driver/build_system.runa" as BuildSystem
+
+Note: ============================================================================
+Note: Build Tool Constants
+Note: ============================================================================
+
+Constant BUILD_TOOL_VERSION as Integer is 1
+Constant BUILD_TOOL_SUCCESS as Integer is 0
+Constant BUILD_TOOL_FAILURE as Integer is 1
+Constant BUILD_TOOL_INVALID_ARGS as Integer is 2
+
+Constant BUILD_OPT_LEVEL_NONE as Integer is 0
+Constant BUILD_OPT_LEVEL_SIZE as Integer is 1
+Constant BUILD_OPT_LEVEL_SPEED as Integer is 2
+Constant BUILD_OPT_LEVEL_AGGRESSIVE as Integer is 3
+
+Constant BUILD_ARGS_MAX_FILES as Integer is 1024
+
+Note: BuildArgs memory layout (80 bytes):
+Note: offset  0: source_files (8 bytes) - Pointer to ArrayList of source file path strings
+Note: offset  8: source_count (8 bytes) - Number of source files
+Note: offset 16: output_path (8 bytes) - Pointer to output path string (or 0 for default)
+Note: offset 24: opt_level (8 bytes) - Optimization level (BUILD_OPT_LEVEL_*)
+Note: offset 32: target (8 bytes) - Pointer to target triple string (or 0 for host)
+Note: offset 40: is_verbose (8 bytes) - Boolean: 1 if verbose output requested
+Note: offset 48: is_incremental (8 bytes) - Boolean: 1 if incremental build requested
+Note: offset 56: emit_debug_info (8 bytes) - Boolean: 1 if debug info requested
+Note: offset 64: warning_level (8 bytes) - Warning level (0=none, 1=some, 2=all)
+Note: offset 72: arena (8 bytes) - Pointer to arena for build args allocation
+
+Constant BUILD_ARGS_SIZE as Integer is 80
+
+Note: ============================================================================
+Note: BuildArgs Creation
+Note: ============================================================================
+
+Process called "create_build_args" takes arena as Integer returns Integer:
+    Note: Allocate BuildArgs structure from arena
+    If arena is equal to 0:
+        Alert "[RUNABUILD ERROR] Cannot create build args: arena is null"
+        Return 0
+    End If
+
+    Let args be arena_allocate(arena, BUILD_ARGS_SIZE, 8)
+    If args is equal to 0:
+        Alert "[RUNABUILD ERROR] Failed to allocate build args"
+        Return 0
+    End If
+
+    Note: Zero out entire structure
+    memory_zero(args, BUILD_ARGS_SIZE)
+
+    Note: Create source files list (ArrayList of pointers, element_size = 8)
+    Let source_files be arraylist_create(64, 8, arena)
+    If source_files is equal to 0:
+        Alert "[RUNABUILD ERROR] Failed to create source files list"
+        Return 0
+    End If
+    memory_set_pointer(args, 0, source_files)
+
+    Note: Initialize source count to 0
+    memory_set_integer(args, 8, 0)
+
+    Note: No output path yet (will use default)
+    memory_set_integer(args, 16, 0)
+
+    Note: Default optimization: none
+    memory_set_integer(args, 24, BUILD_OPT_LEVEL_NONE)
+
+    Note: No target triple (auto-detect host)
+    memory_set_integer(args, 32, 0)
+
+    Note: Not verbose by default
+    memory_set_integer(args, 40, 0)
+
+    Note: Not incremental by default
+    memory_set_integer(args, 48, 0)
+
+    Note: No debug info by default
+    memory_set_integer(args, 56, 0)
+
+    Note: Default warning level: all warnings
+    memory_set_integer(args, 64, 2)
+
+    Note: Store arena
+    memory_set_pointer(args, 72, arena)
+
+    Return args
+End Process
+
+Note: ============================================================================
+Note: CLI Argument Parsing
+Note: ============================================================================
+
+Process called "parse_build_args" takes argc as Integer, argv as Integer, arena as Integer returns Integer:
+    Note: Parse raw CLI arguments into a BuildArgs structure
+    Note: argv is a pointer to an array of string pointers
+    Note: Returns pointer to BuildArgs or 0 on failure
+
+    If argc is less than 2:
+        Alert "[RUNABUILD] Usage: runa build <source_file> [options]"
+        Alert "[RUNABUILD] Options:"
+        Alert "[RUNABUILD]   -o <path>       Output file/directory path"
+        Alert "[RUNABUILD]   -O0             No optimization"
+        Alert "[RUNABUILD]   -O1             Optimize for size"
+        Alert "[RUNABUILD]   -O2             Optimize for speed"
+        Alert "[RUNABUILD]   -O3             Aggressive optimization"
+        Alert "[RUNABUILD]   --target <triple> Target triple (e.g., x86_64-linux-gnu)"
+        Alert "[RUNABUILD]   --verbose       Enable verbose output"
+        Alert "[RUNABUILD]   --incremental   Enable incremental compilation"
+        Alert "[RUNABUILD]   --debug         Emit debug information"
+        Alert "[RUNABUILD]   -W0             No warnings"
+        Alert "[RUNABUILD]   -W1             Some warnings"
+        Alert "[RUNABUILD]   -W2             All warnings (default)"
+        Return 0
+    End If
+
+    Let args be create_build_args(arena)
+    If args is equal to 0:
+        Return 0
+    End If
+
+    Let source_files be memory_get_pointer(args, 0)
+    Let ptr_size be 8
+    Let i be 1
+    While i is less than argc:
+        Let arg_offset be i multiplied by ptr_size
+        Let arg_ptr be argv plus arg_offset
+        Let arg be memory_get_pointer(arg_ptr, 0)
+
+        If arg is equal to 0:
+            Set i to i plus 1
+            Note: Skip null arguments
+        Otherwise:
+            Note: Check for output path flag
+            Let is_output_flag be string_equals(arg, "-o")
+            If is_output_flag is equal to 1:
+                Set i to i plus 1
+                If i is less than argc:
+                    Let next_offset be i multiplied by ptr_size
+                    Let next_ptr be argv plus next_offset
+                    Let output_path be memory_get_pointer(next_ptr, 0)
+                    If output_path is not equal to 0:
+                        Let output_copy be string_duplicate(output_path, arena)
+                        memory_set_pointer(args, 16, output_copy)
+                    End If
+                Otherwise:
+                    Alert "[RUNABUILD ERROR] -o requires a path argument"
+                    Return 0
+                End If
+            Otherwise:
+                Note: Check for optimization flags
+                Let is_o0 be string_equals(arg, "-O0")
+                If is_o0 is equal to 1:
+                    memory_set_integer(args, 24, BUILD_OPT_LEVEL_NONE)
+                Otherwise:
+                    Let is_o1 be string_equals(arg, "-O1")
+                    If is_o1 is equal to 1:
+                        memory_set_integer(args, 24, BUILD_OPT_LEVEL_SIZE)
+                    Otherwise:
+                        Let is_o2 be string_equals(arg, "-O2")
+                        If is_o2 is equal to 1:
+                            memory_set_integer(args, 24, BUILD_OPT_LEVEL_SPEED)
+                        Otherwise:
+                            Let is_o3 be string_equals(arg, "-O3")
+                            If is_o3 is equal to 1:
+                                memory_set_integer(args, 24, BUILD_OPT_LEVEL_AGGRESSIVE)
+                            Otherwise:
+                                Note: Check for target flag
+                                Let is_target be string_equals(arg, "--target")
+                                If is_target is equal to 1:
+                                    Set i to i plus 1
+                                    If i is less than argc:
+                                        Let t_offset be i multiplied by ptr_size
+                                        Let t_ptr be argv plus t_offset
+                                        Let target_str be memory_get_pointer(t_ptr, 0)
+                                        If target_str is not equal to 0:
+                                            Let target_copy be string_duplicate(target_str, arena)
+                                            memory_set_pointer(args, 32, target_copy)
+                                        End If
+                                    Otherwise:
+                                        Alert "[RUNABUILD ERROR] --target requires a triple argument"
+                                        Return 0
+                                    End If
+                                Otherwise:
+                                    Note: Check for boolean flags
+                                    Let is_verbose be string_equals(arg, "--verbose")
+                                    If is_verbose is equal to 1:
+                                        memory_set_integer(args, 40, 1)
+                                    Otherwise:
+                                        Let is_incremental be string_equals(arg, "--incremental")
+                                        If is_incremental is equal to 1:
+                                            memory_set_integer(args, 48, 1)
+                                        Otherwise:
+                                            Let is_debug be string_equals(arg, "--debug")
+                                            If is_debug is equal to 1:
+                                                memory_set_integer(args, 56, 1)
+                                            Otherwise:
+                                                Let is_w0 be string_equals(arg, "-W0")
+                                                If is_w0 is equal to 1:
+                                                    memory_set_integer(args, 64, 0)
+                                                Otherwise:
+                                                    Let is_w1 be string_equals(arg, "-W1")
+                                                    If is_w1 is equal to 1:
+                                                        memory_set_integer(args, 64, 1)
+                                                    Otherwise:
+                                                        Let is_w2 be string_equals(arg, "-W2")
+                                                        If is_w2 is equal to 1:
+                                                            memory_set_integer(args, 64, 2)
+                                                        Otherwise:
+                                                            Note: Not a flag, treat as source file
+                                                            Let file_exists be file_exists_check(arg)
+                                                            If file_exists is equal to 1:
+                                                                Let file_copy be string_duplicate(arg, arena)
+                                                                arraylist_append(source_files, file_copy)
+                                                                Let current_count be memory_get_integer(args, 8)
+                                                                Set current_count to current_count plus 1
+                                                                memory_set_integer(args, 8, current_count)
+                                                            Otherwise:
+                                                                Let err_msg be string_concat("[RUNABUILD ERROR] Source file not found: ", arg)
+                                                                Alert err_msg
+                                                                deallocate(err_msg)
+                                                                Return 0
+                                                            End If
+                                                        End If
+                                                    End If
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Validate that at least one source file was provided
+    Let file_count be memory_get_integer(args, 8)
+    If file_count is equal to 0:
+        Alert "[RUNABUILD ERROR] No source files specified"
+        Return 0
+    End If
+
+    Return args
+End Process
+
+Note: ============================================================================
+Note: Build Execution
+Note: ============================================================================
+
+Process called "execute_build" takes args as Integer returns Integer:
+    Note: Execute build using parsed BuildArgs
+    Note: Invokes the compiler driver build_system
+    Note: Returns BUILD_TOOL_SUCCESS or BUILD_TOOL_FAILURE
+
+    If args is equal to 0:
+        Alert "[RUNABUILD ERROR] Cannot execute build: args is null"
+        Return BUILD_TOOL_FAILURE
+    End If
+
+    Let arena be memory_get_pointer(args, 72)
+    If arena is equal to 0:
+        Alert "[RUNABUILD ERROR] Cannot execute build: arena is null"
+        Return BUILD_TOOL_FAILURE
+    End If
+
+    Note: Record build start time
+    Let start_time be time_now_monotonic(arena)
+
+    Note: Create build context from driver build_system
+    Let build_ctx be create_build_context(arena)
+    If build_ctx is equal to 0:
+        Alert "[RUNABUILD ERROR] Failed to create build context"
+        Return BUILD_TOOL_FAILURE
+    End If
+
+    Note: Configure build context from BuildArgs
+    Let opt_level be memory_get_integer(args, 24)
+    memory_set_integer(build_ctx, 16, opt_level)
+
+    Let output_path be memory_get_pointer(args, 16)
+    If output_path is not equal to 0:
+        memory_set_pointer(build_ctx, 8, output_path)
+    End If
+
+    Let target be memory_get_pointer(args, 32)
+    If target is not equal to 0:
+        memory_set_pointer(build_ctx, 24, target)
+    End If
+
+    Let is_verbose be memory_get_integer(args, 40)
+    memory_set_integer(build_ctx, 64, is_verbose)
+
+    Let is_incremental be memory_get_integer(args, 48)
+    memory_set_integer(build_ctx, 72, is_incremental)
+
+    Let emit_debug be memory_get_integer(args, 56)
+    memory_set_integer(build_ctx, 104, emit_debug)
+
+    Let warning_level be memory_get_integer(args, 64)
+    memory_set_integer(build_ctx, 112, warning_level)
+
+    Note: Add all source files to the build context
+    Let source_files be memory_get_pointer(args, 0)
+    Let source_count be memory_get_integer(args, 8)
+    Let ptr_size be 8
+
+    If is_verbose is equal to 1:
+        Display "[RUNABUILD] Starting build with "
+        Display source_count
+        Display " source file(s)"
+    End If
+
+    Let file_idx be 0
+    While file_idx is less than source_count:
+        Let file_ptr be arraylist_get(source_files, file_idx)
+        If file_ptr is not equal to 0:
+            Let file_path be memory_get_pointer(file_ptr, 0)
+            If file_path is not equal to 0:
+                add_source_file(build_ctx, file_path)
+                If is_verbose is equal to 1:
+                    Let verbose_msg be string_concat("[RUNABUILD]   Adding: ", file_path)
+                    Display verbose_msg
+                    deallocate(verbose_msg)
+                End If
+            End If
+        End If
+        Set file_idx to file_idx plus 1
+    End While
+
+    Note: Execute the build through the build system driver
+    Let build_result be build_all(build_ctx)
+
+    Note: Record build end time
+    Let end_time be time_now_monotonic(arena)
+
+    Note: Report the result
+    Let report_status be report_build_result(build_ctx, start_time, end_time, is_verbose)
+
+    Note: Return appropriate exit code
+    If build_result is equal to 0:
+        Return BUILD_TOOL_SUCCESS
+    End If
+
+    Return BUILD_TOOL_FAILURE
+End Process
+
+Note: ============================================================================
+Note: Build Result Reporting
+Note: ============================================================================
+
+Process called "report_build_result" takes build_ctx as Integer, start_time as Integer, end_time as Integer, is_verbose as Integer returns Integer:
+    Note: Display build outcome to the user
+    Note: Returns 0 on success
+
+    If build_ctx is equal to 0:
+        Alert "[RUNABUILD ERROR] Cannot report result: build context is null"
+        Return 1
+    End If
+
+    Let compiled_count be memory_get_integer(build_ctx, 32)
+    Let error_count be memory_get_integer(build_ctx, 40)
+
+    Note: Calculate elapsed time in milliseconds
+    Let elapsed_ms be 0
+    If start_time is not equal to 0:
+        If end_time is not equal to 0:
+            Set elapsed_ms to time_diff_ms(start_time, end_time)
+        End If
+    End If
+
+    Note: Display summary separator
+    Display "=================================================="
+
+    If error_count is equal to 0:
+        Display "[RUNABUILD] Build succeeded"
+        Display "[RUNABUILD]   Files compiled: "
+        Display compiled_count
+    Otherwise:
+        Alert "[RUNABUILD] Build failed"
+        Alert "[RUNABUILD]   Files compiled: "
+        Display compiled_count
+        Alert "[RUNABUILD]   Errors: "
+        Display error_count
+
+        Note: Display individual error messages if verbose
+        If is_verbose is equal to 1:
+            Let error_messages be memory_get_pointer(build_ctx, 48)
+            If error_messages is not equal to 0:
+                Let err_idx be 0
+                While err_idx is less than error_count:
+                    Let err_ptr be arraylist_get(error_messages, err_idx)
+                    If err_ptr is not equal to 0:
+                        Let err_msg be memory_get_pointer(err_ptr, 0)
+                        If err_msg is not equal to 0:
+                            Alert err_msg
+                        End If
+                    End If
+                    Set err_idx to err_idx plus 1
+                End While
+            End If
+        End If
+    End If
+
+    Display "[RUNABUILD]   Elapsed: "
+    Display elapsed_ms
+    Display " ms"
+    Display "=================================================="
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Top-Level Entry Point
+Note: ============================================================================
+
+Process called "run_build" takes argc as Integer, argv as Integer returns Integer:
+    Note: Main entry point for the RunaBuild tool
+    Note: Parses CLI arguments, executes the build, reports results
+    Note: Returns exit code (0 = success, nonzero = failure)
+
+    Note: Create arena for build-scoped allocations
+    Let arena be arena_create(65536)
+    If arena is equal to 0:
+        Alert "[RUNABUILD ERROR] Failed to create arena"
+        Return BUILD_TOOL_FAILURE
+    End If
+
+    Note: Parse CLI arguments
+    Let args be parse_build_args(argc, argv, arena)
+    If args is equal to 0:
+        arena_destroy(arena)
+        Return BUILD_TOOL_INVALID_ARGS
+    End If
+
+    Note: Execute the build
+    Let result be execute_build(args)
+
+    Note: Cleanup arena (frees all build-scoped allocations in O(1))
+    arena_destroy(arena)
+
+    Return result
+End Process

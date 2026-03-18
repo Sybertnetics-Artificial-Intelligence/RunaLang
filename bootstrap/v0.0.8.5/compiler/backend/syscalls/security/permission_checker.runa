@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,715 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles permission checking and security validation for system calls in the compiler.
+Syscall Permission Checker - Capability-Based Permission Model
+
+This file implements a capability-based permission model that controls which
+system calls a compiled Runa module is allowed to invoke. Permissions are
+checked at compile time (not runtime), ensuring that generated code only
+contains syscalls that the module's declared capabilities authorize.
+
+The permission model uses four levels:
+  NONE      - No access to any syscalls in this category
+  READ_ONLY - Only read/query syscalls (e.g., read, stat, getpid)
+  READ_WRITE - Read and write syscalls (e.g., read, write, open, close)
+  FULL      - All syscalls including dangerous ones (e.g., execve, mmap)
+
+Permissions are organized by category:
+  FILESYSTEM - File and directory operations
+  NETWORK    - Socket and network operations
+  PROCESS    - Process creation and management
+  MEMORY     - Memory mapping and protection
+  SYSTEM     - System information and configuration
+  IPC        - Inter-process communication
 
 This file performs the following tasks:
-- Process permission validation and security checking for system calls
-- Handle security policy enforcement and access control management
-- Manage security audit and security monitoring operations
-- Process security optimization and security performance utilities
+- Create and manage permission sets for modules
+- Grant and revoke permissions by category and level
+- Check whether a specific syscall is allowed given current permissions
+- Validate that a module's syscall usage matches its declared capabilities
+- Report permission violations with descriptive error messages
 
 This file is essential because of the following reasons:
-- Permission checking is fundamental to secure system call execution and access control
-- Proper security handling ensures safe system call execution and security policy enforcement
-- Security utilities support access control, security auditing, and secure system integration
+- Capability-based security prevents untrusted modules from invoking dangerous syscalls
+- Compile-time permission checking catches violations before deployment
+- Fine-grained categories allow minimal-privilege module compilation
+- Clear violation reporting helps developers understand security constraints
 
 This file consists of the following functions/features/operation types:
-- Permission validation and security checking for system calls
-- Security policy enforcement and access control management
-- Security audit and security monitoring operations
-- Security optimization and security performance utilities
+- Permission level and category constants
+- Permission set creation, granting, and revocation
+- Per-syscall permission checking
+- Module-level permission validation
+- Violation tracking and reporting
+
+Dependencies:
+- Imports Layout for memory allocation
 :End Note
 
-Note: TODO - Implement permission checker functionality
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: PERMISSION LEVEL CONSTANTS
+Note: ============================================================================
+
+Constant PERM_NONE as Integer is 0
+Constant PERM_READ_ONLY as Integer is 1
+Constant PERM_READ_WRITE as Integer is 2
+Constant PERM_FULL as Integer is 3
+
+Note: ============================================================================
+Note: PERMISSION CATEGORY CONSTANTS
+Note: ============================================================================
+
+Constant CAT_FILESYSTEM as Integer is 0
+Constant CAT_NETWORK as Integer is 1
+Constant CAT_PROCESS as Integer is 2
+Constant CAT_MEMORY as Integer is 3
+Constant CAT_SYSTEM as Integer is 4
+Constant CAT_IPC as Integer is 5
+Constant CAT_COUNT as Integer is 6
+
+Note: ============================================================================
+Note: SYSCALL CLASSIFICATION CONSTANTS
+Note: ============================================================================
+
+@Reasoning
+Each syscall is classified into a category and a minimum required permission
+level. This allows the permission checker to determine whether a given syscall
+is allowed based on the module's granted permissions.
+
+Classification examples (Linux x86-64 syscall numbers):
+  read (0)       -> FILESYSTEM, READ_ONLY
+  write (1)      -> FILESYSTEM, READ_WRITE
+  open (2)       -> FILESYSTEM, READ_WRITE
+  close (3)      -> FILESYSTEM, READ_ONLY
+  stat (4)       -> FILESYSTEM, READ_ONLY
+  mmap (9)       -> MEMORY, READ_WRITE
+  mprotect (10)  -> MEMORY, FULL
+  brk (12)       -> MEMORY, READ_WRITE
+  socket (41)    -> NETWORK, READ_WRITE
+  connect (42)   -> NETWORK, READ_WRITE
+  fork (57)      -> PROCESS, FULL
+  execve (59)    -> PROCESS, FULL
+  exit (60)      -> PROCESS, READ_ONLY
+  kill (62)      -> PROCESS, FULL
+  getpid (39)    -> SYSTEM, READ_ONLY
+@End Reasoning
+
+Note: Maximum number of tracked syscalls
+Constant MAX_SYSCALLS as Integer is 512
+
+Note: ============================================================================
+Note: PERMISSION SET TYPE
+Note: ============================================================================
+
+Type called "PermissionSet":
+    categories as Integer         Note: Pointer to array of 6 permission levels (8 bytes each)
+    violation_count as Integer    Note: Number of permission violations detected
+    violation_log as Integer      Note: Pointer to list of violation entries
+    violation_capacity as Integer Note: Maximum violation entries
+End Type
+
+Note: Size: 4 fields * 8 bytes = 32 bytes
+
+Note: Violation entry layout (24 bytes each):
+Note:   Offset 0: syscall_number (8 bytes)
+Note:   Offset 8: required_category (8 bytes)
+Note:   Offset 16: required_level (8 bytes)
+
+Note: ============================================================================
+Note: PERMISSION SET MANAGEMENT
+Note: ============================================================================
+
+Process called "create_permission_set" returns Integer:
+    @Reasoning
+    Creates a new permission set with all categories set to NONE (most
+    restrictive). The caller must explicitly grant permissions for each
+    category the module needs.
+    @End Reasoning
+
+    Let pset be Layout.allocate(32)
+    If pset equals 0:
+        Display "create_permission_set: allocation failed"
+        Return 0
+    End If
+
+    Note: Allocate category array (6 categories * 8 bytes = 48 bytes)
+    Let cats be Layout.allocate(48)
+    If cats equals 0:
+        Display "create_permission_set: categories allocation failed"
+        Return 0
+    End If
+
+    Note: Allocate violation log (max 256 entries * 24 bytes = 6144 bytes)
+    Let violations be Layout.allocate(6144)
+    If violations equals 0:
+        Display "create_permission_set: violations allocation failed"
+        Return 0
+    End If
+
+    Note: Initialize all categories to NONE
+    Let i be 0
+    While i is less than CAT_COUNT:
+        __store(cats, i * 8, PERM_NONE)
+        Set i to i + 1
+    End While
+
+    __store(pset, 0, cats)
+    __store(pset, 8, 0)        Note: violation_count = 0
+    __store(pset, 16, violations)
+    __store(pset, 24, 256)     Note: violation_capacity = 256
+
+    Return pset
+End Process
+
+Process called "grant_permission" that takes pset as Integer, category as Integer, level as Integer returns Integer:
+    @Reasoning
+    Grants a permission level for the specified category. If the category
+    already has a higher permission level, it is not downgraded (grant is
+    additive). Returns 1 on success, 0 on invalid category.
+    @End Reasoning
+
+    If category is less than 0:
+        Return 0
+    End If
+    If category is greater than or equal to CAT_COUNT:
+        Return 0
+    End If
+    If level is less than PERM_NONE:
+        Return 0
+    End If
+    If level is greater than PERM_FULL:
+        Return 0
+    End If
+
+    Let cats be __load(pset, 0)
+    Let current be __load(cats, category * 8)
+
+    Note: Only upgrade, never downgrade
+    If level is greater than current:
+        __store(cats, category * 8, level)
+    End If
+
+    Return 1
+End Process
+
+Process called "revoke_permission" that takes pset as Integer, category as Integer returns Integer:
+    @Reasoning
+    Revokes all permissions for the specified category, setting it to NONE.
+    Returns 1 on success, 0 on invalid category.
+    @End Reasoning
+
+    If category is less than 0:
+        Return 0
+    End If
+    If category is greater than or equal to CAT_COUNT:
+        Return 0
+    End If
+
+    Let cats be __load(pset, 0)
+    __store(cats, category * 8, PERM_NONE)
+    Return 1
+End Process
+
+Process called "set_permission" that takes pset as Integer, category as Integer, level as Integer returns Integer:
+    @Reasoning
+    Sets the exact permission level for a category (can upgrade or downgrade).
+    Unlike grant_permission, this replaces the current level.
+    @End Reasoning
+
+    If category is less than 0:
+        Return 0
+    End If
+    If category is greater than or equal to CAT_COUNT:
+        Return 0
+    End If
+
+    Let cats be __load(pset, 0)
+    __store(cats, category * 8, level)
+    Return 1
+End Process
+
+Process called "get_permission" that takes pset as Integer, category as Integer returns Integer:
+    @Reasoning
+    Returns the current permission level for the given category.
+    Returns PERM_NONE for invalid categories.
+    @End Reasoning
+
+    If category is less than 0:
+        Return PERM_NONE
+    End If
+    If category is greater than or equal to CAT_COUNT:
+        Return PERM_NONE
+    End If
+
+    Let cats be __load(pset, 0)
+    Return __load(cats, category * 8)
+End Process
+
+Note: ============================================================================
+Note: SYSCALL CLASSIFICATION
+Note: ============================================================================
+
+Process called "get_syscall_category" that takes syscall_num as Integer returns Integer:
+    @Reasoning
+    Returns the permission category for a given Linux x86-64 syscall number.
+    This covers the most common syscalls. Unknown syscalls default to SYSTEM
+    category requiring FULL permission (fail-safe).
+    @End Reasoning
+
+    Note: Filesystem syscalls
+    If syscall_num equals 0:    Note: read
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 1:    Note: write
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 2:    Note: open
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 3:    Note: close
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 4:    Note: stat
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 5:    Note: fstat
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 6:    Note: lstat
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 8:    Note: lseek
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 17:   Note: pread64
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 18:   Note: pwrite64
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 19:   Note: readv
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 20:   Note: writev
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 21:   Note: access
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 76:   Note: truncate
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 77:   Note: ftruncate
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 78:   Note: getdents
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 79:   Note: getcwd
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 80:   Note: chdir
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 82:   Note: rename
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 83:   Note: mkdir
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 84:   Note: rmdir
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 85:   Note: creat
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 86:   Note: link
+        Return CAT_FILESYSTEM
+    End If
+    If syscall_num equals 87:   Note: unlink
+        Return CAT_FILESYSTEM
+    End If
+
+    Note: Memory management syscalls
+    If syscall_num equals 9:    Note: mmap
+        Return CAT_MEMORY
+    End If
+    If syscall_num equals 10:   Note: mprotect
+        Return CAT_MEMORY
+    End If
+    If syscall_num equals 11:   Note: munmap
+        Return CAT_MEMORY
+    End If
+    If syscall_num equals 12:   Note: brk
+        Return CAT_MEMORY
+    End If
+    If syscall_num equals 25:   Note: mremap
+        Return CAT_MEMORY
+    End If
+    If syscall_num equals 28:   Note: madvise
+        Return CAT_MEMORY
+    End If
+
+    Note: Network syscalls
+    If syscall_num equals 41:   Note: socket
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 42:   Note: connect
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 43:   Note: accept
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 44:   Note: sendto
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 45:   Note: recvfrom
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 46:   Note: sendmsg
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 47:   Note: recvmsg
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 49:   Note: bind
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 50:   Note: listen
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 51:   Note: getsockname
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 52:   Note: getpeername
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 53:   Note: socketpair
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 54:   Note: setsockopt
+        Return CAT_NETWORK
+    End If
+    If syscall_num equals 55:   Note: getsockopt
+        Return CAT_NETWORK
+    End If
+
+    Note: Process management syscalls
+    If syscall_num equals 56:   Note: clone
+        Return CAT_PROCESS
+    End If
+    If syscall_num equals 57:   Note: fork
+        Return CAT_PROCESS
+    End If
+    If syscall_num equals 58:   Note: vfork
+        Return CAT_PROCESS
+    End If
+    If syscall_num equals 59:   Note: execve
+        Return CAT_PROCESS
+    End If
+    If syscall_num equals 60:   Note: exit
+        Return CAT_PROCESS
+    End If
+    If syscall_num equals 61:   Note: wait4
+        Return CAT_PROCESS
+    End If
+    If syscall_num equals 62:   Note: kill
+        Return CAT_PROCESS
+    End If
+    If syscall_num equals 231:  Note: exit_group
+        Return CAT_PROCESS
+    End If
+
+    Note: System info syscalls
+    If syscall_num equals 39:   Note: getpid
+        Return CAT_SYSTEM
+    End If
+    If syscall_num equals 96:   Note: gettimeofday
+        Return CAT_SYSTEM
+    End If
+    If syscall_num equals 102:  Note: getuid
+        Return CAT_SYSTEM
+    End If
+    If syscall_num equals 104:  Note: getgid
+        Return CAT_SYSTEM
+    End If
+    If syscall_num equals 63:   Note: uname
+        Return CAT_SYSTEM
+    End If
+
+    Note: IPC syscalls
+    If syscall_num equals 22:   Note: pipe
+        Return CAT_IPC
+    End If
+    If syscall_num equals 32:   Note: dup
+        Return CAT_IPC
+    End If
+    If syscall_num equals 33:   Note: dup2
+        Return CAT_IPC
+    End If
+
+    Note: Default: unknown syscalls require SYSTEM FULL
+    Return CAT_SYSTEM
+End Process
+
+Process called "get_syscall_required_level" that takes syscall_num as Integer returns Integer:
+    @Reasoning
+    Returns the minimum permission level required for a given syscall.
+    Read-only operations (stat, read, getpid) require READ_ONLY.
+    Write operations (write, open, close) require READ_WRITE.
+    Dangerous operations (fork, execve, kill, mprotect) require FULL.
+    @End Reasoning
+
+    Note: Read-only filesystem operations
+    If syscall_num equals 0:    Note: read
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 3:    Note: close
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 4:    Note: stat
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 5:    Note: fstat
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 6:    Note: lstat
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 8:    Note: lseek
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 21:   Note: access
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 78:   Note: getdents
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 79:   Note: getcwd
+        Return PERM_READ_ONLY
+    End If
+
+    Note: Read-write filesystem operations
+    If syscall_num equals 1:    Note: write
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 2:    Note: open
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 82:   Note: rename
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 83:   Note: mkdir
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 84:   Note: rmdir
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 85:   Note: creat
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 87:   Note: unlink
+        Return PERM_READ_WRITE
+    End If
+
+    Note: Memory operations
+    If syscall_num equals 9:    Note: mmap
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 11:   Note: munmap
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 12:   Note: brk
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 10:   Note: mprotect
+        Return PERM_FULL
+    End If
+
+    Note: Network operations
+    If syscall_num equals 41:   Note: socket
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 42:   Note: connect
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 43:   Note: accept
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 44:   Note: sendto
+        Return PERM_READ_WRITE
+    End If
+    If syscall_num equals 45:   Note: recvfrom
+        Return PERM_READ_WRITE
+    End If
+
+    Note: Dangerous process operations
+    If syscall_num equals 57:   Note: fork
+        Return PERM_FULL
+    End If
+    If syscall_num equals 59:   Note: execve
+        Return PERM_FULL
+    End If
+    If syscall_num equals 62:   Note: kill
+        Return PERM_FULL
+    End If
+    If syscall_num equals 56:   Note: clone
+        Return PERM_FULL
+    End If
+
+    Note: Safe process/system operations
+    If syscall_num equals 60:   Note: exit
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 231:  Note: exit_group
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 39:   Note: getpid
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 96:   Note: gettimeofday
+        Return PERM_READ_ONLY
+    End If
+    If syscall_num equals 102:  Note: getuid
+        Return PERM_READ_ONLY
+    End If
+
+    Note: Default: unknown syscalls require FULL
+    Return PERM_FULL
+End Process
+
+Note: ============================================================================
+Note: PERMISSION CHECKING
+Note: ============================================================================
+
+Process called "check_permission" that takes pset as Integer, syscall_num as Integer returns Integer:
+    @Reasoning
+    Checks whether the given syscall is allowed by the current permission set.
+    Returns 1 if allowed, 0 if denied.
+
+    The check works by:
+    1. Determining the syscall's category
+    2. Determining the required permission level
+    3. Comparing the required level against the granted level for that category
+    4. If the granted level >= required level, the syscall is allowed
+    @End Reasoning
+
+    Let category be get_syscall_category(syscall_num)
+    Let required_level be get_syscall_required_level(syscall_num)
+    Let granted_level be get_permission(pset, category)
+
+    If granted_level is greater than or equal to required_level:
+        Return 1
+    End If
+
+    Note: Permission denied - log the violation
+    Let violation_count be __load(pset, 8)
+    Let violation_cap be __load(pset, 24)
+
+    If violation_count is less than violation_cap:
+        Let violations be __load(pset, 16)
+        Let entry_offset be violation_count * 24
+        __store(violations, entry_offset, syscall_num)
+        __store(violations, entry_offset + 8, category)
+        __store(violations, entry_offset + 16, required_level)
+        __store(pset, 8, violation_count + 1)
+    End If
+
+    Return 0
+End Process
+
+Process called "validate_module_permissions" that takes pset as Integer, syscall_list as Integer, syscall_count as Integer returns Integer:
+    @Reasoning
+    Validates that all syscalls in the given list are allowed by the
+    permission set. Returns 1 if all syscalls are permitted, 0 if any
+    are denied. Violations are logged in the permission set's violation log.
+    @End Reasoning
+
+    Let all_allowed be 1
+    Let i be 0
+    While i is less than syscall_count:
+        Let syscall_num be __load(syscall_list, i * 8)
+        Let allowed be check_permission(pset, syscall_num)
+        If allowed equals 0:
+            Set all_allowed to 0
+        End If
+        Set i to i + 1
+    End While
+
+    Return all_allowed
+End Process
+
+Process called "get_violation_count" that takes pset as Integer returns Integer:
+    Return __load(pset, 8)
+End Process
+
+Process called "get_violation" that takes pset as Integer, index as Integer, out_syscall as Integer, out_category as Integer, out_level as Integer returns Integer:
+    @Reasoning
+    Retrieves a violation entry by index. Writes the syscall number,
+    category, and required level to the provided output pointers.
+    Returns 1 on success, 0 if index is out of range.
+    @End Reasoning
+
+    Let violation_count be __load(pset, 8)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to violation_count:
+        Return 0
+    End If
+
+    Let violations be __load(pset, 16)
+    Let entry_offset be index * 24
+
+    __store(out_syscall, 0, __load(violations, entry_offset))
+    __store(out_category, 0, __load(violations, entry_offset + 8))
+    __store(out_level, 0, __load(violations, entry_offset + 16))
+
+    Return 1
+End Process
+
+Process called "clear_violations" that takes pset as Integer returns Integer:
+    __store(pset, 8, 0)
+    Return 1
+End Process
+
+Process called "get_category_name" that takes category as Integer returns Integer:
+    If category equals CAT_FILESYSTEM:
+        Return "FILESYSTEM"
+    End If
+    If category equals CAT_NETWORK:
+        Return "NETWORK"
+    End If
+    If category equals CAT_PROCESS:
+        Return "PROCESS"
+    End If
+    If category equals CAT_MEMORY:
+        Return "MEMORY"
+    End If
+    If category equals CAT_SYSTEM:
+        Return "SYSTEM"
+    End If
+    If category equals CAT_IPC:
+        Return "IPC"
+    End If
+    Return "UNKNOWN"
+End Process
+
+Process called "get_level_name" that takes level as Integer returns Integer:
+    If level equals PERM_NONE:
+        Return "NONE"
+    End If
+    If level equals PERM_READ_ONLY:
+        Return "READ_ONLY"
+    End If
+    If level equals PERM_READ_WRITE:
+        Return "READ_WRITE"
+    End If
+    If level equals PERM_FULL:
+        Return "FULL"
+    End If
+    Return "UNKNOWN"
+End Process

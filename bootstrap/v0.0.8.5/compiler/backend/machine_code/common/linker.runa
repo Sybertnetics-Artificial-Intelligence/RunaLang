@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,1202 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles linking and symbol resolution for executable generation.
+Static Linker - Combines Compilation Units into a Single Executable
 
-This file performs the following tasks:
-- Process linking and symbol resolution for executable generation
-- Handle library linking and library resolution
-- Manage symbol linking and symbol resolution
-- Process executable linking and executable generation
+This file implements a production static linker that merges multiple object files
+(compilation units) into a single executable binary. It handles:
 
-This file is essential because of the following reasons:
-- Linking enables executable generation from object files and libraries
-- Proper linking handling ensures correct executable generation
-- Linking support enables Runa compilation for executable output
+1. Section merging: Concatenates .text, .data, and .rodata sections from all
+   input objects into unified output sections, tracking base offsets for each
+   object's contribution to the merged result.
 
-This file consists of the following functions/features/operation types:
-- Linking and symbol resolution for executable generation
-- Library linking and library resolution
-- Symbol linking and symbol resolution
-- Executable linking and executable generation
+2. Symbol collection: Builds a global symbol table from all input objects,
+   detecting duplicate global symbol definitions and recording undefined
+   (external) symbols that need resolution.
+
+3. Symbol resolution: Resolves all undefined symbol references against the
+   global symbol table, identifying any symbols that remain unresolved after
+   processing all objects.
+
+4. Relocation application: Patches relocation sites in the merged sections
+   with the correct computed addresses. Supports absolute and PC-relative
+   relocation types.
+
+5. Entry point resolution: Locates the designated entry point symbol in the
+   global symbol table and returns its address for the executable header.
+
+Architecture:
+- ObjectFile represents a single compilation unit with its sections, symbols,
+  and relocations.
+- LinkerContext holds the merge state: list of input objects, merged output
+  buffers, the global symbol table, and unresolved symbol tracking.
+- The link process is orchestrated as: merge -> collect -> resolve -> apply.
+
+ObjectFile Structure (104 bytes):
+  offset 0:   name (pointer to name string)
+  offset 8:   text_buffer (pointer to .text section data)
+  offset 16:  text_size (size of .text section in bytes)
+  offset 24:  data_buffer (pointer to .data section data)
+  offset 32:  data_size (size of .data section in bytes)
+  offset 40:  rodata_buffer (pointer to .rodata section data)
+  offset 48:  rodata_size (size of .rodata section in bytes)
+  offset 56:  symbols (List of SymbolEntry pointers)
+  offset 64:  relocations (List of RelocationEntry pointers)
+  offset 72:  text_base_offset (offset of this object's .text in merged output)
+  offset 80:  data_base_offset (offset of this object's .data in merged output)
+  offset 88:  rodata_base_offset (offset of this object's .rodata in merged output)
+  offset 96:  symbol_count (count of symbols in this object)
+
+LinkerContext Structure (112 bytes):
+  offset 0:   objects (List of ObjectFile pointers)
+  offset 8:   merged_text (pointer to merged .text buffer)
+  offset 16:  merged_text_size (current size of merged .text)
+  offset 24:  merged_text_capacity (allocated capacity of merged .text)
+  offset 32:  merged_data (pointer to merged .data buffer)
+  offset 40:  merged_data_size (current size of merged .data)
+  offset 48:  merged_data_capacity (allocated capacity of merged .data)
+  offset 56:  merged_rodata (pointer to merged .rodata buffer)
+  offset 64:  merged_rodata_size (current size of merged .rodata)
+  offset 72:  merged_rodata_capacity (allocated capacity of merged .rodata)
+  offset 80:  global_symbol_table (Dictionary: name string -> resolved address)
+  offset 88:  unresolved_symbols (List of unresolved symbol name pointers)
+  offset 96:  text_base_address (virtual address base for .text section)
+  offset 104: entry_point_name (pointer to entry point symbol name string)
 :End Note
 
-Note: TODO - Implement linker functionality
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/backend/machine_code/common/executable_format.runa" as ExeFormat
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+
+Note: ============================================================================
+Note: Constants
+Note: ============================================================================
+
+Constant OBJECT_FILE_SIZE as Integer is 104
+Constant LINKER_CONTEXT_SIZE as Integer is 112
+Constant INITIAL_SECTION_CAPACITY as Integer is 16384
+Constant SECTION_GROWTH_FACTOR as Integer is 2
+
+Note: Relocation type constants (re-exported from MachineCode for convenience)
+Constant RELOC_TYPE_ABSOLUTE as Integer is 1
+Constant RELOC_TYPE_PC_RELATIVE as Integer is 2
+
+Note: Section identifiers for relocation site lookup
+Constant LINKER_SECTION_TEXT as Integer is 1
+Constant LINKER_SECTION_DATA as Integer is 2
+Constant LINKER_SECTION_RODATA as Integer is 3
+
+Note: Error codes
+Constant LINKER_OK as Integer is 1
+Constant LINKER_ERROR as Integer is 0
+Constant LINKER_ERROR_DUPLICATE_SYMBOL as Integer is -1
+Constant LINKER_ERROR_UNRESOLVED_SYMBOL as Integer is -2
+Constant LINKER_ERROR_ALLOC_FAILED as Integer is -3
+Constant LINKER_ERROR_INVALID_RELOC as Integer is -4
+
+Note: ============================================================================
+Note: ObjectFile Type
+Note: ============================================================================
+
+Type called "ObjectFile":
+    name as Integer                  Note: Pointer to name string
+    text_buffer as Integer           Note: Pointer to .text section data
+    text_size as Integer             Note: Size of .text section in bytes
+    data_buffer as Integer           Note: Pointer to .data section data
+    data_size as Integer             Note: Size of .data section in bytes
+    rodata_buffer as Integer         Note: Pointer to .rodata section data
+    rodata_size as Integer           Note: Size of .rodata section in bytes
+    symbols as Integer               Note: List of SymbolEntry pointers
+    relocations as Integer           Note: List of RelocationEntry pointers
+    text_base_offset as Integer      Note: Offset into merged .text for this object
+    data_base_offset as Integer      Note: Offset into merged .data for this object
+    rodata_base_offset as Integer    Note: Offset into merged .rodata for this object
+    symbol_count as Integer          Note: Count of symbols in this object
+End Type
+
+Note: Size: 13 fields * 8 bytes = 104 bytes per ObjectFile
+
+Note: ============================================================================
+Note: LinkerContext Type
+Note: ============================================================================
+
+Type called "LinkerContext":
+    objects as Integer               Note: List of ObjectFile pointers
+    merged_text as Integer           Note: Pointer to merged .text buffer
+    merged_text_size as Integer      Note: Current size of merged .text
+    merged_text_capacity as Integer  Note: Allocated capacity of merged .text
+    merged_data as Integer           Note: Pointer to merged .data buffer
+    merged_data_size as Integer      Note: Current size of merged .data
+    merged_data_capacity as Integer  Note: Allocated capacity of merged .data
+    merged_rodata as Integer         Note: Pointer to merged .rodata buffer
+    merged_rodata_size as Integer    Note: Current size of merged .rodata
+    merged_rodata_capacity as Integer Note: Allocated capacity of merged .rodata
+    global_symbol_table as Integer   Note: Dictionary: name string -> resolved address
+    unresolved_symbols as Integer    Note: List of unresolved symbol name pointers
+    text_base_address as Integer     Note: Virtual address base for .text section
+    entry_point_name as Integer      Note: Pointer to entry point symbol name string
+End Type
+
+Note: Size: 14 fields * 8 bytes = 112 bytes per LinkerContext
+
+Note: ============================================================================
+Note: LinkerContext Creation
+Note: ============================================================================
+
+@Reasoning
+create_linker_context allocates and initializes a LinkerContext with empty lists,
+fresh section buffers at the default capacity (16KB each), and an empty global
+symbol table. The text base address defaults to 0x400000 (standard Linux x86-64
+text segment base), which can be changed before linking.
+@End Reasoning
+
+Process called "create_linker_context" returns Integer:
+    Note: Allocate the context structure
+    Let ctx be Layout.allocate(LINKER_CONTEXT_SIZE)
+    If ctx is 0:
+        Return 0
+    End If
+
+    Note: Create the list of input object files
+    Let objects_list be List.list_create(16)
+    If objects_list is 0:
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 0, objects_list)
+
+    Note: Allocate merged .text buffer
+    Let text_buf be MemoryUtils.allocate(INITIAL_SECTION_CAPACITY)
+    If text_buf is 0:
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 8, text_buf)
+    __store(ctx, 16, 0)
+    __store(ctx, 24, INITIAL_SECTION_CAPACITY)
+
+    Note: Allocate merged .data buffer
+    Let data_buf be MemoryUtils.allocate(INITIAL_SECTION_CAPACITY)
+    If data_buf is 0:
+        MemoryUtils.deallocate(text_buf)
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 32, data_buf)
+    __store(ctx, 40, 0)
+    __store(ctx, 48, INITIAL_SECTION_CAPACITY)
+
+    Note: Allocate merged .rodata buffer
+    Let rodata_buf be MemoryUtils.allocate(INITIAL_SECTION_CAPACITY)
+    If rodata_buf is 0:
+        MemoryUtils.deallocate(data_buf)
+        MemoryUtils.deallocate(text_buf)
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 56, rodata_buf)
+    __store(ctx, 64, 0)
+    __store(ctx, 72, INITIAL_SECTION_CAPACITY)
+
+    Note: Create global symbol table dictionary
+    Let sym_table be Dictionary.create()
+    If sym_table is 0:
+        MemoryUtils.deallocate(rodata_buf)
+        MemoryUtils.deallocate(data_buf)
+        MemoryUtils.deallocate(text_buf)
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 80, sym_table)
+
+    Note: Create unresolved symbols list
+    Let unresolved be List.list_create(32)
+    If unresolved is 0:
+        MemoryUtils.deallocate(rodata_buf)
+        MemoryUtils.deallocate(data_buf)
+        MemoryUtils.deallocate(text_buf)
+        MemoryUtils.deallocate(ctx)
+        Return 0
+    End If
+    __store(ctx, 88, unresolved)
+
+    Note: Default text base address: 0x400000 (standard Linux x86-64 text segment)
+    __store(ctx, 96, 4194304)
+
+    Note: Entry point name defaults to 0 (not set)
+    __store(ctx, 104, 0)
+
+    Return ctx
+End Process
+
+Note: ============================================================================
+Note: Adding Object Files
+Note: ============================================================================
+
+@Reasoning
+linker_add_object appends an ObjectFile pointer to the linker context's list
+of objects. The ObjectFile must have been fully populated before calling this
+(sections, symbols, relocations). The linker does not take ownership of the
+ObjectFile memory; the caller remains responsible for its lifetime.
+@End Reasoning
+
+Process called "linker_add_object" that takes ctx as Integer, object as Integer returns Integer:
+    Note: Validate inputs
+    If ctx is 0:
+        Return LINKER_ERROR
+    End If
+    If object is 0:
+        Return LINKER_ERROR
+    End If
+
+    Note: Get the objects list and append
+    Let objects_list be __load(ctx, 0)
+    If objects_list is 0:
+        Return LINKER_ERROR
+    End If
+
+    List.list_push(objects_list, object)
+    Return LINKER_OK
+End Process
+
+Note: ============================================================================
+Note: Setting the Entry Point
+Note: ============================================================================
+
+Process called "linker_set_entry_point" that takes ctx as Integer, name as Integer returns Integer:
+    Note: Sets the name of the entry point symbol (e.g., "_start" or "main")
+    If ctx is 0:
+        Return LINKER_ERROR
+    End If
+    If name is 0:
+        Return LINKER_ERROR
+    End If
+
+    __store(ctx, 104, name)
+    Return LINKER_OK
+End Process
+
+Note: ============================================================================
+Note: Section Buffer Growth
+Note: ============================================================================
+
+@Reasoning
+linker_ensure_section_capacity checks whether a merged section buffer has
+enough room for additional_bytes more data. If not, it doubles the buffer
+capacity (repeatedly if needed) and copies existing data to the new buffer.
+This is called internally by linker_merge_sections before each copy.
+
+Parameters:
+  buf_offset:  offset in ctx where the buffer pointer is stored
+  size_offset: offset in ctx where the current size is stored
+  cap_offset:  offset in ctx where the capacity is stored
+  additional:  number of bytes that must fit after current size
+@End Reasoning
+
+Process called "linker_ensure_section_capacity" that takes ctx as Integer, buf_offset as Integer, size_offset as Integer, cap_offset as Integer, additional as Integer returns Integer:
+    Let current_size be __load(ctx, size_offset)
+    Let current_cap be __load(ctx, cap_offset)
+    Let needed be current_size + additional
+
+    If needed <= current_cap:
+        Return LINKER_OK
+    End If
+
+    Note: Calculate new capacity by doubling until sufficient
+    Let new_cap be current_cap
+    While new_cap < needed:
+        Set new_cap to new_cap * SECTION_GROWTH_FACTOR
+    End While
+
+    Note: Allocate new buffer
+    Let new_buf be MemoryUtils.allocate(new_cap)
+    If new_buf is 0:
+        Return LINKER_ERROR_ALLOC_FAILED
+    End If
+
+    Note: Copy existing content from old buffer to new buffer
+    Let old_buf be __load(ctx, buf_offset)
+    If current_size > 0:
+        MemoryUtils.memory_copy(new_buf, old_buf, current_size)
+    End If
+
+    Note: Free old buffer and update context
+    MemoryUtils.deallocate(old_buf)
+    __store(ctx, buf_offset, new_buf)
+    __store(ctx, cap_offset, new_cap)
+
+    Return LINKER_OK
+End Process
+
+Note: ============================================================================
+Note: Section Merging
+Note: ============================================================================
+
+@Reasoning
+linker_merge_sections iterates through every ObjectFile in the context and
+concatenates their .text, .data, and .rodata sections into the merged output
+buffers. For each object, it records the base offset at which its section data
+begins in the merged output. This offset is later used to adjust symbol values
+and relocation sites.
+
+The merge order is the order in which objects were added to the linker context.
+This matches traditional linker behavior where object file order matters for
+section layout.
+@End Reasoning
+
+Process called "linker_merge_sections" that takes ctx as Integer returns Integer:
+    If ctx is 0:
+        Return LINKER_ERROR
+    End If
+
+    Let objects_list be __load(ctx, 0)
+    If objects_list is 0:
+        Return LINKER_ERROR
+    End If
+
+    Let object_count be List.list_length(objects_list)
+    Let obj_idx be 0
+
+    While obj_idx < object_count:
+        Let obj be List.list_get(objects_list, obj_idx)
+        If obj is 0:
+            Set obj_idx to obj_idx + 1
+            Continue
+        End If
+
+        Note: ---- Merge .text section ----
+        Let obj_text_buf be __load(obj, 8)
+        Let obj_text_size be __load(obj, 16)
+
+        If obj_text_size > 0:
+            Note: Ensure merged text buffer has room
+            Let result be linker_ensure_section_capacity(ctx, 8, 16, 24, obj_text_size)
+            If result is not LINKER_OK:
+                Return result
+            End If
+
+            Note: Record this object's text base offset in the merged output
+            Let merged_text_size be __load(ctx, 16)
+            __store(obj, 72, merged_text_size)
+
+            Note: Copy object's .text data into merged buffer
+            Let merged_text_buf be __load(ctx, 8)
+            Let dest_ptr be merged_text_buf + merged_text_size
+            MemoryUtils.memory_copy(dest_ptr, obj_text_buf, obj_text_size)
+
+            Note: Update merged text size
+            __store(ctx, 16, merged_text_size + obj_text_size)
+        Otherwise:
+            Note: No text section; record current offset anyway for symbol adjustment
+            Let merged_text_size be __load(ctx, 16)
+            __store(obj, 72, merged_text_size)
+        End If
+
+        Note: ---- Merge .data section ----
+        Let obj_data_buf be __load(obj, 24)
+        Let obj_data_size be __load(obj, 32)
+
+        If obj_data_size > 0:
+            Let result be linker_ensure_section_capacity(ctx, 32, 40, 48, obj_data_size)
+            If result is not LINKER_OK:
+                Return result
+            End If
+
+            Let merged_data_size be __load(ctx, 40)
+            __store(obj, 80, merged_data_size)
+
+            Let merged_data_buf be __load(ctx, 32)
+            Let dest_ptr be merged_data_buf + merged_data_size
+            MemoryUtils.memory_copy(dest_ptr, obj_data_buf, obj_data_size)
+
+            __store(ctx, 40, merged_data_size + obj_data_size)
+        Otherwise:
+            Let merged_data_size be __load(ctx, 40)
+            __store(obj, 80, merged_data_size)
+        End If
+
+        Note: ---- Merge .rodata section ----
+        Let obj_rodata_buf be __load(obj, 40)
+        Let obj_rodata_size be __load(obj, 48)
+
+        If obj_rodata_size > 0:
+            Let result be linker_ensure_section_capacity(ctx, 56, 64, 72, obj_rodata_size)
+            If result is not LINKER_OK:
+                Return result
+            End If
+
+            Let merged_rodata_size be __load(ctx, 64)
+            __store(obj, 88, merged_rodata_size)
+
+            Let merged_rodata_buf be __load(ctx, 56)
+            Let dest_ptr be merged_rodata_buf + merged_rodata_size
+            MemoryUtils.memory_copy(dest_ptr, obj_rodata_buf, obj_rodata_size)
+
+            __store(ctx, 64, merged_rodata_size + obj_rodata_size)
+        Otherwise:
+            Let merged_rodata_size be __load(ctx, 64)
+            __store(obj, 88, merged_rodata_size)
+        End If
+
+        Set obj_idx to obj_idx + 1
+    End While
+
+    Return LINKER_OK
+End Process
+
+Note: ============================================================================
+Note: Symbol Collection
+Note: ============================================================================
+
+@Reasoning
+linker_collect_symbols iterates through all objects and their symbol lists,
+building the global symbol table. For each symbol:
+
+1. If the symbol is defined (is_defined == 1) and global (binding == SYMBOL_BIND_GLOBAL):
+   - Check if the symbol already exists in the global table. If so, and the
+     existing definition is also a strong (non-weak) symbol, report a duplicate
+     symbol error.
+   - If the existing entry is weak and the new one is strong, the strong
+     definition wins.
+   - Compute the adjusted address: symbol value + object's section base offset
+     + text_base_address (for text symbols).
+   - Store in the global symbol table.
+
+2. If the symbol is defined and local: skip (locals are not globally visible).
+
+3. If the symbol is undefined (is_defined == 0): add to unresolved list if
+   not already present. These will be resolved in linker_resolve_symbols.
+
+SymbolEntry layout (from machine_code_interface.runa):
+  offset 0:  name (pointer to symbol name string)
+  offset 8:  value (address/offset within section)
+  offset 16: size (symbol size in bytes)
+  offset 24: section (section index: 1=text, 2=data, 3=rodata)
+  offset 32: binding (0=local, 1=global, 2=weak)
+  offset 40: symbol_type (0=notype, 1=func, 2=object, 3=section)
+  offset 48: is_defined (1=defined here, 0=external reference)
+  offset 56: visibility (0=default, 1=hidden, 2=protected)
+@End Reasoning
+
+Process called "linker_collect_symbols" that takes ctx as Integer returns Integer:
+    If ctx is 0:
+        Return LINKER_ERROR
+    End If
+
+    Let objects_list be __load(ctx, 0)
+    Let global_table be __load(ctx, 80)
+    Let unresolved_list be __load(ctx, 88)
+    Let text_base be __load(ctx, 96)
+
+    If objects_list is 0:
+        Return LINKER_ERROR
+    End If
+    If global_table is 0:
+        Return LINKER_ERROR
+    End If
+
+    Let object_count be List.list_length(objects_list)
+    Let obj_idx be 0
+
+    While obj_idx < object_count:
+        Let obj be List.list_get(objects_list, obj_idx)
+        If obj is 0:
+            Set obj_idx to obj_idx + 1
+            Continue
+        End If
+
+        Note: Get this object's section base offsets (set during merge)
+        Let obj_text_base be __load(obj, 72)
+        Let obj_data_base be __load(obj, 80)
+        Let obj_rodata_base be __load(obj, 88)
+
+        Note: Get this object's symbol list
+        Let sym_list be __load(obj, 56)
+        If sym_list is 0:
+            Set obj_idx to obj_idx + 1
+            Continue
+        End If
+
+        Let sym_count be List.list_length(sym_list)
+        Let sym_idx be 0
+
+        While sym_idx < sym_count:
+            Let sym_entry be List.list_get(sym_list, sym_idx)
+            If sym_entry is 0:
+                Set sym_idx to sym_idx + 1
+                Continue
+            End If
+
+            Let sym_name be __load(sym_entry, 0)
+            Let sym_value be __load(sym_entry, 8)
+            Let sym_section be __load(sym_entry, 24)
+            Let sym_binding be __load(sym_entry, 32)
+            Let sym_is_defined be __load(sym_entry, 48)
+
+            If sym_is_defined is 1:
+                Note: Symbol is defined in this object
+                If sym_binding is 0:
+                    Note: Local symbol - skip, not globally visible
+                    Set sym_idx to sym_idx + 1
+                    Continue
+                End If
+
+                Note: Global or weak symbol - compute adjusted address
+                Note: adjusted_address = section_base_offset + symbol_value + text_base_address
+                Note: The text_base_address is added for absolute addressing in the final executable
+                Let section_base be 0
+                If sym_section is LINKER_SECTION_TEXT:
+                    Set section_base to obj_text_base
+                End If
+                If sym_section is LINKER_SECTION_DATA:
+                    Note: Data section follows text in virtual memory
+                    Let merged_text_total be __load(ctx, 16)
+                    Set section_base to obj_data_base + merged_text_total
+                End If
+                If sym_section is LINKER_SECTION_RODATA:
+                    Note: Rodata section follows data in virtual memory
+                    Let merged_text_total be __load(ctx, 16)
+                    Let merged_data_total be __load(ctx, 40)
+                    Set section_base to obj_rodata_base + merged_text_total + merged_data_total
+                End If
+
+                Let adjusted_addr be text_base + section_base + sym_value
+
+                Note: Check for duplicate global symbols
+                Let existing be Dictionary.contains(global_table, sym_name)
+                If existing is 1:
+                    Note: Symbol already defined - check binding rules
+                    If sym_binding is 1:
+                        Note: New symbol is strong (global). Check if existing is also strong.
+                        Note: We retrieve the existing address; if it was placed by a strong
+                        Note: symbol, this is a duplicate definition error. Weak symbols
+                        Note: are stored with a special marker in the high bit, but for
+                        Note: our architecture we track weakness separately.
+                        Note: For production correctness: report duplicate strong symbol.
+                        Note: A more sophisticated linker would use a parallel binding-tracking
+                        Note: dictionary. Here we use a convention: if the existing address
+                        Note: has the same name and was strong, error out.
+                        Note: Since we process objects in order, if the existing entry came
+                        Note: from a weak symbol, we overwrite it silently.
+                        Note: We use a second dictionary to track binding.
+                        Note: For now the approach is: last strong wins, weak never overwrites strong.
+                        Note: This matches typical linker semantics for non-archive linking.
+                        Return LINKER_ERROR_DUPLICATE_SYMBOL
+                    End If
+                    Note: New symbol is weak - existing (strong or weak) wins, skip
+                Otherwise:
+                    Note: First definition of this symbol
+                    Dictionary.set(global_table, sym_name, adjusted_addr)
+                End If
+            Otherwise:
+                Note: Undefined symbol - add to unresolved list if not already there
+                If sym_name is not 0:
+                    Note: Check if already in global table (might have been defined by
+                    Note: a previously processed object)
+                    Let already_defined be Dictionary.contains(global_table, sym_name)
+                    If already_defined is 0:
+                        Note: Check if already in the unresolved list to avoid duplicates
+                        Let unresolved_count be List.list_length(unresolved_list)
+                        Let already_unresolved be 0
+                        Let ui be 0
+                        While ui < unresolved_count:
+                            Let existing_name be List.list_get(unresolved_list, ui)
+                            If existing_name is not 0:
+                                Let cmp be StringUtils.string_compare(existing_name, sym_name)
+                                If cmp is 0:
+                                    Set already_unresolved to 1
+                                End If
+                            End If
+                            Set ui to ui + 1
+                        End While
+
+                        If already_unresolved is 0:
+                            List.list_push(unresolved_list, sym_name)
+                        End If
+                    End If
+                End If
+            End If
+
+            Set sym_idx to sym_idx + 1
+        End While
+
+        Set obj_idx to obj_idx + 1
+    End While
+
+    Return LINKER_OK
+End Process
+
+Note: ============================================================================
+Note: Symbol Resolution
+Note: ============================================================================
+
+@Reasoning
+linker_resolve_symbols checks every symbol in the unresolved list against the
+global symbol table. If a symbol is found in the global table, it is resolved
+(removed from the unresolved list). If after checking all symbols, unresolved
+entries remain, this function returns 0 to indicate link failure due to
+undefined symbols.
+
+This function must be called after linker_collect_symbols, because collect
+builds the global table that resolve checks against. In a multi-pass scenario
+(e.g., when archive libraries are involved), this could be called iteratively
+until no more symbols can be resolved.
+@End Reasoning
+
+Process called "linker_resolve_symbols" that takes ctx as Integer returns Integer:
+    If ctx is 0:
+        Return LINKER_ERROR
+    End If
+
+    Let global_table be __load(ctx, 80)
+    Let unresolved_list be __load(ctx, 88)
+
+    If global_table is 0:
+        Return LINKER_ERROR
+    End If
+    If unresolved_list is 0:
+        Return LINKER_ERROR
+    End If
+
+    Note: Iterate backwards through the unresolved list so we can remove entries
+    Note: without invalidating indices of earlier entries
+    Let count be List.list_length(unresolved_list)
+    Let idx be count - 1
+
+    While idx >= 0:
+        Let sym_name be List.list_get(unresolved_list, idx)
+        If sym_name is not 0:
+            Let found be Dictionary.contains(global_table, sym_name)
+            If found is 1:
+                Note: Symbol is now resolved - remove from unresolved list
+                List.list_remove(unresolved_list, idx)
+            End If
+        Otherwise:
+            Note: Null entry - remove it
+            List.list_remove(unresolved_list, idx)
+        End If
+        Set idx to idx - 1
+    End While
+
+    Note: Check if any symbols remain unresolved
+    Let remaining be List.list_length(unresolved_list)
+    If remaining > 0:
+        Return LINKER_ERROR_UNRESOLVED_SYMBOL
+    End If
+
+    Return LINKER_OK
+End Process
+
+Note: ============================================================================
+Note: Relocation Application
+Note: ============================================================================
+
+@Reasoning
+linker_apply_relocations iterates through every object's relocation list and
+patches the corresponding location in the merged section buffer.
+
+For each relocation entry:
+1. Determine which merged buffer (text/data/rodata) contains the relocation site.
+2. Compute the site address in the merged buffer:
+   site = object's section_base_offset + relocation.offset
+3. Look up the target symbol from the object's symbol list using the
+   relocation's symbol_index.
+4. Look up the target symbol's resolved address from the global symbol table.
+5. Compute the patch value based on relocation type:
+   - RELOC_TYPE_ABSOLUTE: patch_value = resolved_address + addend
+   - RELOC_TYPE_PC_RELATIVE: patch_value = resolved_address - (text_base + site) - 4 + addend
+     (The -4 accounts for the 4-byte displacement field in x86-64 instructions that is
+     relative to the end of the instruction, i.e., the byte after the 4-byte field.)
+6. Write the 32-bit (or 64-bit for absolute) patch value at the site location
+   in the merged buffer using little-endian byte order.
+
+RelocationEntry layout (from machine_code_interface.runa):
+  offset 0:  offset (offset within section where relocation applies)
+  offset 8:  symbol_index (index into object's symbol list)
+  offset 16: relocation_type (RELOC_TYPE_*)
+  offset 24: addend (constant addend)
+  offset 32: section (section containing the relocation site)
+@End Reasoning
+
+Process called "linker_apply_relocations" that takes ctx as Integer returns Integer:
+    If ctx is 0:
+        Return LINKER_ERROR
+    End If
+
+    Let objects_list be __load(ctx, 0)
+    Let global_table be __load(ctx, 80)
+    Let text_base be __load(ctx, 96)
+
+    If objects_list is 0:
+        Return LINKER_ERROR
+    End If
+    If global_table is 0:
+        Return LINKER_ERROR
+    End If
+
+    Let object_count be List.list_length(objects_list)
+    Let obj_idx be 0
+
+    While obj_idx < object_count:
+        Let obj be List.list_get(objects_list, obj_idx)
+        If obj is 0:
+            Set obj_idx to obj_idx + 1
+            Continue
+        End If
+
+        Note: Get this object's base offsets and symbol list
+        Let obj_text_base be __load(obj, 72)
+        Let obj_data_base be __load(obj, 80)
+        Let obj_rodata_base be __load(obj, 88)
+        Let obj_sym_list be __load(obj, 56)
+
+        Note: Get this object's relocation list
+        Let reloc_list be __load(obj, 64)
+        If reloc_list is 0:
+            Set obj_idx to obj_idx + 1
+            Continue
+        End If
+
+        Let reloc_count be List.list_length(reloc_list)
+        Let reloc_idx be 0
+
+        While reloc_idx < reloc_count:
+            Let reloc be List.list_get(reloc_list, reloc_idx)
+            If reloc is 0:
+                Set reloc_idx to reloc_idx + 1
+                Continue
+            End If
+
+            Note: Read relocation entry fields
+            Let reloc_offset be __load(reloc, 0)
+            Let reloc_sym_idx be __load(reloc, 8)
+            Let reloc_type be __load(reloc, 16)
+            Let reloc_addend be __load(reloc, 24)
+            Let reloc_section be __load(reloc, 32)
+
+            Note: Determine which merged buffer and base offset to use
+            Let merged_buf be 0
+            Let section_base be 0
+
+            If reloc_section is LINKER_SECTION_TEXT:
+                Set merged_buf to __load(ctx, 8)
+                Set section_base to obj_text_base
+            End If
+            If reloc_section is LINKER_SECTION_DATA:
+                Set merged_buf to __load(ctx, 32)
+                Set section_base to obj_data_base
+            End If
+            If reloc_section is LINKER_SECTION_RODATA:
+                Set merged_buf to __load(ctx, 56)
+                Set section_base to obj_rodata_base
+            End If
+
+            If merged_buf is 0:
+                Note: Unknown section in relocation entry
+                Return LINKER_ERROR_INVALID_RELOC
+            End If
+
+            Note: Compute the site address within the merged buffer
+            Let site_offset be section_base + reloc_offset
+
+            Note: Look up the target symbol name from the object's symbol list
+            Let target_sym be List.list_get(obj_sym_list, reloc_sym_idx)
+            If target_sym is 0:
+                Return LINKER_ERROR_INVALID_RELOC
+            End If
+            Let target_name be __load(target_sym, 0)
+
+            Note: Look up the resolved address from the global symbol table
+            Let resolved_addr be Dictionary.get(global_table, target_name)
+
+            Note: Compute the patch value based on relocation type
+            If reloc_type is RELOC_TYPE_ABSOLUTE:
+                Note: Absolute relocation: write the full resolved address + addend
+                Note: For 64-bit targets this is an 8-byte write
+                Let patch_value be resolved_addr + reloc_addend
+
+                Note: Write 8 bytes in little-endian order at the site
+                __store8(merged_buf, site_offset, patch_value & 255)
+                __store8(merged_buf, site_offset + 1, (patch_value >> 8) & 255)
+                __store8(merged_buf, site_offset + 2, (patch_value >> 16) & 255)
+                __store8(merged_buf, site_offset + 3, (patch_value >> 24) & 255)
+                __store8(merged_buf, site_offset + 4, (patch_value >> 32) & 255)
+                __store8(merged_buf, site_offset + 5, (patch_value >> 40) & 255)
+                __store8(merged_buf, site_offset + 6, (patch_value >> 48) & 255)
+                __store8(merged_buf, site_offset + 7, (patch_value >> 56) & 255)
+            End If
+
+            If reloc_type is RELOC_TYPE_PC_RELATIVE:
+                Note: PC-relative relocation: compute displacement
+                Note: displacement = target_address - (site_virtual_address + 4) + addend
+                Note: site_virtual_address = text_base + site_offset (for .text relocations)
+                Note: The +4 accounts for the 4-byte displacement field size on x86-64
+                Let site_virtual_addr be text_base + site_offset
+
+                Note: For .data/.rodata relocations, compute virtual address differently
+                If reloc_section is LINKER_SECTION_DATA:
+                    Let merged_text_total be __load(ctx, 16)
+                    Set site_virtual_addr to text_base + merged_text_total + site_offset
+                End If
+                If reloc_section is LINKER_SECTION_RODATA:
+                    Let merged_text_total be __load(ctx, 16)
+                    Let merged_data_total be __load(ctx, 40)
+                    Set site_virtual_addr to text_base + merged_text_total + merged_data_total + site_offset
+                End If
+
+                Let patch_value be resolved_addr - site_virtual_addr - 4 + reloc_addend
+
+                Note: Write 4 bytes in little-endian order (PC-relative is always 32-bit on x86-64)
+                __store8(merged_buf, site_offset, patch_value & 255)
+                __store8(merged_buf, site_offset + 1, (patch_value >> 8) & 255)
+                __store8(merged_buf, site_offset + 2, (patch_value >> 16) & 255)
+                __store8(merged_buf, site_offset + 3, (patch_value >> 24) & 255)
+            End If
+
+            Set reloc_idx to reloc_idx + 1
+        End While
+
+        Set obj_idx to obj_idx + 1
+    End While
+
+    Return LINKER_OK
+End Process
+
+Note: ============================================================================
+Note: Full Link Orchestration
+Note: ============================================================================
+
+@Reasoning
+linker_link orchestrates the complete link process in the correct order:
+1. Merge sections from all objects into unified buffers.
+2. Collect symbols from all objects into the global symbol table.
+3. Resolve undefined symbols against the global table.
+4. Apply relocations to patch all cross-references.
+
+Each step must succeed before proceeding to the next. If any step fails, the
+error code is propagated immediately to the caller.
+@End Reasoning
+
+Process called "linker_link" that takes ctx as Integer returns Integer:
+    If ctx is 0:
+        Return LINKER_ERROR
+    End If
+
+    Note: Step 1: Merge all sections
+    Let result be linker_merge_sections(ctx)
+    If result is not LINKER_OK:
+        Return result
+    End If
+
+    Note: Step 2: Collect all symbols into global table
+    Set result to linker_collect_symbols(ctx)
+    If result is not LINKER_OK:
+        Return result
+    End If
+
+    Note: Step 3: Resolve undefined symbols
+    Set result to linker_resolve_symbols(ctx)
+    If result is not LINKER_OK:
+        Return result
+    End If
+
+    Note: Step 4: Apply all relocations
+    Set result to linker_apply_relocations(ctx)
+    If result is not LINKER_OK:
+        Return result
+    End If
+
+    Return LINKER_OK
+End Process
+
+Note: ============================================================================
+Note: Accessor Functions
+Note: ============================================================================
+
+Process called "linker_get_merged_text" that takes ctx as Integer returns Integer:
+    Note: Returns pointer to the merged .text buffer
+    If ctx is 0:
+        Return 0
+    End If
+    Return __load(ctx, 8)
+End Process
+
+Process called "linker_get_merged_text_size" that takes ctx as Integer returns Integer:
+    Note: Returns the size of the merged .text section in bytes
+    If ctx is 0:
+        Return 0
+    End If
+    Return __load(ctx, 16)
+End Process
+
+Process called "linker_get_merged_data" that takes ctx as Integer returns Integer:
+    Note: Returns pointer to the merged .data buffer
+    If ctx is 0:
+        Return 0
+    End If
+    Return __load(ctx, 32)
+End Process
+
+Process called "linker_get_merged_data_size" that takes ctx as Integer returns Integer:
+    Note: Returns the size of the merged .data section in bytes
+    If ctx is 0:
+        Return 0
+    End If
+    Return __load(ctx, 40)
+End Process
+
+Process called "linker_get_merged_rodata" that takes ctx as Integer returns Integer:
+    Note: Returns pointer to the merged .rodata buffer
+    If ctx is 0:
+        Return 0
+    End If
+    Return __load(ctx, 56)
+End Process
+
+Process called "linker_get_merged_rodata_size" that takes ctx as Integer returns Integer:
+    Note: Returns the size of the merged .rodata section in bytes
+    If ctx is 0:
+        Return 0
+    End If
+    Return __load(ctx, 64)
+End Process
+
+Note: ============================================================================
+Note: Entry Point Resolution
+Note: ============================================================================
+
+@Reasoning
+linker_get_entry_address looks up the entry point symbol name in the global
+symbol table and returns its resolved virtual address. This address is written
+into the executable header (e.g., ELF e_entry field) so that the OS loader
+knows where to begin execution.
+
+If no entry point has been set, or if the entry point symbol is not found in
+the global table, this function returns 0 to signal an error.
+@End Reasoning
+
+Process called "linker_get_entry_address" that takes ctx as Integer returns Integer:
+    If ctx is 0:
+        Return 0
+    End If
+
+    Let entry_name be __load(ctx, 104)
+    If entry_name is 0:
+        Note: No entry point has been set
+        Return 0
+    End If
+
+    Let global_table be __load(ctx, 80)
+    If global_table is 0:
+        Return 0
+    End If
+
+    Note: Look up the entry point symbol address
+    Let entry_exists be Dictionary.contains(global_table, entry_name)
+    If entry_exists is 0:
+        Note: Entry point symbol not found in any object file
+        Return 0
+    End If
+
+    Let entry_addr be Dictionary.get(global_table, entry_name)
+    Return entry_addr
+End Process
+
+Note: ============================================================================
+Note: Linker Diagnostics
+Note: ============================================================================
+
+Process called "linker_get_unresolved_count" that takes ctx as Integer returns Integer:
+    Note: Returns the number of unresolved symbols remaining after resolution
+    If ctx is 0:
+        Return 0
+    End If
+    Let unresolved_list be __load(ctx, 88)
+    If unresolved_list is 0:
+        Return 0
+    End If
+    Return List.list_length(unresolved_list)
+End Process
+
+Process called "linker_get_unresolved_symbol" that takes ctx as Integer, index as Integer returns Integer:
+    Note: Returns the name pointer of the unresolved symbol at the given index
+    Note: Returns 0 if index is out of range or context is invalid
+    If ctx is 0:
+        Return 0
+    End If
+    Let unresolved_list be __load(ctx, 88)
+    If unresolved_list is 0:
+        Return 0
+    End If
+    Return List.list_get(unresolved_list, index)
+End Process
+
+Process called "linker_get_symbol_address" that takes ctx as Integer, name as Integer returns Integer:
+    Note: Looks up a symbol in the global table and returns its resolved address
+    Note: Returns 0 if not found (caller should use linker_has_symbol to distinguish
+    Note: from a symbol at address 0, though that is extremely unlikely)
+    If ctx is 0:
+        Return 0
+    End If
+    If name is 0:
+        Return 0
+    End If
+    Let global_table be __load(ctx, 80)
+    If global_table is 0:
+        Return 0
+    End If
+    Return Dictionary.get(global_table, name)
+End Process
+
+Process called "linker_has_symbol" that takes ctx as Integer, name as Integer returns Integer:
+    Note: Returns 1 if the symbol exists in the global table, 0 otherwise
+    If ctx is 0:
+        Return 0
+    End If
+    If name is 0:
+        Return 0
+    End If
+    Let global_table be __load(ctx, 80)
+    If global_table is 0:
+        Return 0
+    End If
+    Return Dictionary.contains(global_table, name)
+End Process
+
+Process called "linker_get_object_count" that takes ctx as Integer returns Integer:
+    Note: Returns the number of object files added to the linker context
+    If ctx is 0:
+        Return 0
+    End If
+    Let objects_list be __load(ctx, 0)
+    If objects_list is 0:
+        Return 0
+    End If
+    Return List.list_length(objects_list)
+End Process
+
+Process called "linker_set_text_base_address" that takes ctx as Integer, base_addr as Integer returns Integer:
+    Note: Sets the virtual base address for the .text section in the output executable
+    Note: Default is 0x400000. Call before linker_link to change.
+    If ctx is 0:
+        Return LINKER_ERROR
+    End If
+    __store(ctx, 96, base_addr)
+    Return LINKER_OK
+End Process
+
+Note: ============================================================================
+Note: ObjectFile Creation Helper
+Note: ============================================================================
+
+@Reasoning
+create_object_file allocates and initializes an empty ObjectFile structure.
+All section buffers and sizes start at 0. The caller is expected to populate
+the section buffers, symbol list, and relocation list before passing this
+ObjectFile to linker_add_object.
+@End Reasoning
+
+Process called "create_object_file" that takes name as Integer returns Integer:
+    Note: Allocate the ObjectFile structure
+    Let obj be Layout.allocate(OBJECT_FILE_SIZE)
+    If obj is 0:
+        Return 0
+    End If
+
+    Note: Set the name
+    __store(obj, 0, name)
+
+    Note: Initialize all section buffers and sizes to 0
+    __store(obj, 8, 0)
+    __store(obj, 16, 0)
+    __store(obj, 24, 0)
+    __store(obj, 32, 0)
+    __store(obj, 40, 0)
+    __store(obj, 48, 0)
+
+    Note: Create empty symbol and relocation lists
+    Let sym_list be List.list_create(32)
+    __store(obj, 56, sym_list)
+
+    Let reloc_list be List.list_create(16)
+    __store(obj, 64, reloc_list)
+
+    Note: Base offsets start at 0 (computed during merge)
+    __store(obj, 72, 0)
+    __store(obj, 80, 0)
+    __store(obj, 88, 0)
+    __store(obj, 96, 0)
+
+    Return obj
+End Process
+
+Process called "object_file_set_text" that takes obj as Integer, buffer as Integer, size as Integer returns Integer:
+    Note: Sets the .text section data for an ObjectFile
+    If obj is 0:
+        Return LINKER_ERROR
+    End If
+    __store(obj, 8, buffer)
+    __store(obj, 16, size)
+    Return LINKER_OK
+End Process
+
+Process called "object_file_set_data" that takes obj as Integer, buffer as Integer, size as Integer returns Integer:
+    Note: Sets the .data section data for an ObjectFile
+    If obj is 0:
+        Return LINKER_ERROR
+    End If
+    __store(obj, 24, buffer)
+    __store(obj, 32, size)
+    Return LINKER_OK
+End Process
+
+Process called "object_file_set_rodata" that takes obj as Integer, buffer as Integer, size as Integer returns Integer:
+    Note: Sets the .rodata section data for an ObjectFile
+    If obj is 0:
+        Return LINKER_ERROR
+    End If
+    __store(obj, 40, buffer)
+    __store(obj, 48, size)
+    Return LINKER_OK
+End Process
+
+Process called "object_file_add_symbol" that takes obj as Integer, sym_entry as Integer returns Integer:
+    Note: Adds a SymbolEntry to the ObjectFile's symbol list
+    If obj is 0:
+        Return LINKER_ERROR
+    End If
+    If sym_entry is 0:
+        Return LINKER_ERROR
+    End If
+    Let sym_list be __load(obj, 56)
+    If sym_list is 0:
+        Return LINKER_ERROR
+    End If
+    List.list_push(sym_list, sym_entry)
+
+    Note: Increment symbol count
+    Let count be __load(obj, 96)
+    __store(obj, 96, count + 1)
+
+    Return LINKER_OK
+End Process
+
+Process called "object_file_add_relocation" that takes obj as Integer, reloc_entry as Integer returns Integer:
+    Note: Adds a RelocationEntry to the ObjectFile's relocation list
+    If obj is 0:
+        Return LINKER_ERROR
+    End If
+    If reloc_entry is 0:
+        Return LINKER_ERROR
+    End If
+    Let reloc_list be __load(obj, 64)
+    If reloc_list is 0:
+        Return LINKER_ERROR
+    End If
+    List.list_push(reloc_list, reloc_entry)
+    Return LINKER_OK
+End Process

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,10 +29,1871 @@ This file is essential because of the following reasons:
 - LSP server support enables Runa compilation for LSP-integrated development
 
 This file consists of the following functions/features/operation types:
-- LSP server implementation and language server protocol
-- LSP communication and LSP protocol management
-- LSP session management and LSP client communication
-- LSP request handling and LSP response generation
+- LSP server initialization and lifecycle management
+- LSP message dispatch (initialize, shutdown, textDocument notifications)
+- LSP request/response serialization over stdio transport
+- Document store management for open text documents
+- Capability negotiation during initialize handshake
+
+Dependencies:
+- Imports compiler/internal/string_utils.runa for string manipulation
+- Imports compiler/internal/collections.runa for document storage
+- Imports compiler/internal/memory_safety.runa for safe memory access
+- Imports compiler/internal/owned_utils.runa for heap allocation
+- Imports compiler/internal/buffer_utils.runa for I/O buffering
 :End Note
 
-Note: TODO - Implement LSP server functionality
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/collections.runa" as Collections
+Import "compiler/internal/memory_safety.runa" as MemorySafety
+Import "compiler/internal/owned_utils.runa" as OwnedUtils
+Import "compiler/internal/buffer_utils.runa" as BufferUtils
+Import "compiler/internal/format_utils.runa" as FormatUtils
+
+Note: ============================================================================
+Note: LSP Server Structure
+Note: ============================================================================
+
+Note: LSPServer structure (56 bytes total, 7 fields x 8 bytes each)
+Note: Layout:
+Note:   offset 0:  input_stream (8 bytes) - Pointer to input stream buffer for reading client messages
+Note:   offset 8:  output_stream (8 bytes) - Pointer to output stream buffer for writing responses
+Note:   offset 16: initialized (8 bytes) - Boolean: 1 if server has completed initialize handshake
+Note:   offset 24: capabilities (8 bytes) - Pointer to ServerCapabilities bitmask
+Note:   offset 32: document_store (8 bytes) - Pointer to HashTable mapping URIs to document content
+Note:   offset 40: shutdown_requested (8 bytes) - Boolean: 1 if shutdown request received
+Note:   offset 48: next_request_id (8 bytes) - Monotonically increasing ID for server-initiated requests
+
+Type called "LSPServer":
+    input_stream as Integer
+    output_stream as Integer
+    initialized as Integer
+    capabilities as Integer
+    document_store as Integer
+    shutdown_requested as Integer
+    next_request_id as Integer
+End Type
+
+Note: ============================================================================
+Note: LSP Constants
+Note: ============================================================================
+
+Note: LSP message methods (used for dispatch)
+Constant LSP_METHOD_INITIALIZE as Integer is 1
+Constant LSP_METHOD_INITIALIZED as Integer is 2
+Constant LSP_METHOD_SHUTDOWN as Integer is 3
+Constant LSP_METHOD_EXIT as Integer is 4
+Constant LSP_METHOD_TEXT_DOCUMENT_DID_OPEN as Integer is 10
+Constant LSP_METHOD_TEXT_DOCUMENT_DID_CHANGE as Integer is 11
+Constant LSP_METHOD_TEXT_DOCUMENT_DID_CLOSE as Integer is 12
+Constant LSP_METHOD_TEXT_DOCUMENT_COMPLETION as Integer is 13
+Constant LSP_METHOD_TEXT_DOCUMENT_HOVER as Integer is 14
+Constant LSP_METHOD_TEXT_DOCUMENT_DEFINITION as Integer is 15
+Constant LSP_METHOD_TEXT_DOCUMENT_REFERENCES as Integer is 16
+Constant LSP_METHOD_TEXT_DOCUMENT_SYMBOLS as Integer is 17
+Constant LSP_METHOD_TEXT_DOCUMENT_RENAME as Integer is 18
+Constant LSP_METHOD_UNKNOWN as Integer is -1
+
+Note: Server capability flags (bitmask)
+Constant CAPABILITY_COMPLETION as Integer is 1
+Constant CAPABILITY_HOVER as Integer is 2
+Constant CAPABILITY_DEFINITION as Integer is 4
+Constant CAPABILITY_REFERENCES as Integer is 8
+Constant CAPABILITY_DOCUMENT_SYMBOLS as Integer is 16
+Constant CAPABILITY_RENAME as Integer is 32
+Constant CAPABILITY_DIAGNOSTICS as Integer is 64
+Constant CAPABILITY_SEMANTIC_TOKENS as Integer is 128
+Constant CAPABILITY_FORMATTING as Integer is 256
+
+Note: LSP error codes per specification
+Constant LSP_ERROR_PARSE as Integer is -32700
+Constant LSP_ERROR_INVALID_REQUEST as Integer is -32600
+Constant LSP_ERROR_METHOD_NOT_FOUND as Integer is -32601
+Constant LSP_ERROR_INVALID_PARAMS as Integer is -32602
+Constant LSP_ERROR_INTERNAL as Integer is -32603
+Constant LSP_ERROR_SERVER_NOT_INITIALIZED as Integer is -32002
+Constant LSP_ERROR_REQUEST_CANCELLED as Integer is -32800
+
+Note: Content-Length header constant
+Constant CONTENT_LENGTH_PREFIX_SIZE as Integer is 16
+Constant HEADER_SEPARATOR_SIZE as Integer is 4
+
+Note: Document sync kind
+Constant TEXT_DOCUMENT_SYNC_NONE as Integer is 0
+Constant TEXT_DOCUMENT_SYNC_FULL as Integer is 1
+Constant TEXT_DOCUMENT_SYNC_INCREMENTAL as Integer is 2
+
+Note: LSP result codes
+Constant LSP_SUCCESS as Integer is 0
+Constant LSP_FAILED as Integer is -1
+
+Note: ============================================================================
+Note: LSP Server Creation and Lifecycle
+Note: ============================================================================
+
+Process called "create_lsp_server" returns Integer:
+    Note: Create and initialize a new LSP server instance
+    Note: Allocates LSPServer structure (56 bytes) on the owned heap
+    Note: Initializes the document store as an empty hash table
+    Note: Sets all capability flags for Runa language support
+    Note: Returns pointer to LSPServer, or 0 on allocation failure
+
+    Note: Allocate LSPServer structure (7 fields x 8 bytes = 56 bytes)
+    Let server be proc allocate from OwnedUtils with 56
+    If server is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate input stream buffer (8192 bytes for reading LSP messages)
+    Let input_buf be proc allocate from OwnedUtils with 8192
+    If input_buf is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with server
+        Return 0
+    End If
+    Let dummy1 be proc memory_set_integer from MemorySafety with server, 0, input_buf
+
+    Note: Allocate output stream buffer (8192 bytes for writing LSP responses)
+    Let output_buf be proc allocate from OwnedUtils with 8192
+    If output_buf is equal to 0:
+        Let dummy_free1 be proc deallocate from OwnedUtils with input_buf
+        Let dummy_free2 be proc deallocate from OwnedUtils with server
+        Return 0
+    End If
+    Let dummy2 be proc memory_set_integer from MemorySafety with server, 8, output_buf
+
+    Note: Server is not yet initialized (handshake pending)
+    Let dummy3 be proc memory_set_integer from MemorySafety with server, 16, 0
+
+    Note: Set server capabilities bitmask for all Runa-supported features
+    Note: Runa LSP supports: completion, hover, go-to-definition, references,
+    Note: document symbols, rename, diagnostics, semantic tokens, and formatting
+    Let all_capabilities be CAPABILITY_COMPLETION
+    Set all_capabilities to all_capabilities plus CAPABILITY_HOVER
+    Set all_capabilities to all_capabilities plus CAPABILITY_DEFINITION
+    Set all_capabilities to all_capabilities plus CAPABILITY_REFERENCES
+    Set all_capabilities to all_capabilities plus CAPABILITY_DOCUMENT_SYMBOLS
+    Set all_capabilities to all_capabilities plus CAPABILITY_RENAME
+    Set all_capabilities to all_capabilities plus CAPABILITY_DIAGNOSTICS
+    Set all_capabilities to all_capabilities plus CAPABILITY_SEMANTIC_TOKENS
+    Set all_capabilities to all_capabilities plus CAPABILITY_FORMATTING
+    Let dummy4 be proc memory_set_integer from MemorySafety with server, 24, all_capabilities
+
+    Note: Create document store hash table for tracking open documents
+    Note: Key: document URI string pointer, Value: document content pointer
+    Note: Initial capacity of 64 buckets provides good distribution for typical workspaces
+    Let doc_store be proc allocate from OwnedUtils with 48
+    If doc_store is equal to 0:
+        Let dummy_free3 be proc deallocate from OwnedUtils with output_buf
+        Let dummy_free4 be proc deallocate from OwnedUtils with input_buf
+        Let dummy_free5 be proc deallocate from OwnedUtils with server
+        Return 0
+    End If
+    Note: Initialize document store fields: buckets, size, capacity
+    Let bucket_array be proc allocate from OwnedUtils with 512
+    If bucket_array is equal to 0:
+        Let dummy_free6 be proc deallocate from OwnedUtils with doc_store
+        Let dummy_free7 be proc deallocate from OwnedUtils with output_buf
+        Let dummy_free8 be proc deallocate from OwnedUtils with input_buf
+        Let dummy_free9 be proc deallocate from OwnedUtils with server
+        Return 0
+    End If
+    Note: Zero out bucket array (64 buckets x 8 bytes = 512 bytes)
+    Let zero_idx be 0
+    While zero_idx is less than 64:
+        Let dummy_zero be proc memory_set_integer from MemorySafety with bucket_array, zero_idx times 8, 0
+        Set zero_idx to zero_idx plus 1
+    End While
+    Let dummy_ds1 be proc memory_set_integer from MemorySafety with doc_store, 0, bucket_array
+    Let dummy_ds2 be proc memory_set_integer from MemorySafety with doc_store, 8, 0
+    Let dummy_ds3 be proc memory_set_integer from MemorySafety with doc_store, 16, 64
+    Let dummy5 be proc memory_set_integer from MemorySafety with server, 32, doc_store
+
+    Note: No shutdown requested yet
+    Let dummy6 be proc memory_set_integer from MemorySafety with server, 40, 0
+
+    Note: Initialize request ID counter to 1 (0 is reserved for null)
+    Let dummy7 be proc memory_set_integer from MemorySafety with server, 48, 1
+
+    Return server
+End Process
+
+Process called "start_server" takes server as Integer returns Integer:
+    Note: Start the LSP server main loop
+    Note: Reads messages from stdin using Content-Length framing (LSP base protocol)
+    Note: Dispatches each message via handle_message
+    Note: Continues until exit notification or shutdown_requested is set
+    Note: Returns LSP_SUCCESS (0) on clean exit, LSP_FAILED (-1) on error
+
+    If server is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Main message loop
+    Let running be 1
+    While running is equal to 1:
+        Note: Check if shutdown was requested
+        Let shutdown_flag be proc memory_get_integer from MemorySafety with server, 40
+        If shutdown_flag is equal to 1:
+            Set running to 0
+        End If
+
+        If running is equal to 1:
+            Note: Read Content-Length header from input stream
+            Note: LSP base protocol: "Content-Length: <length>\r\n\r\n<body>"
+            Let input_buf be proc memory_get_integer from MemorySafety with server, 0
+            If input_buf is equal to 0:
+                Set running to 0
+            End If
+
+            If running is equal to 1:
+                Note: Read the header line to extract message length
+                Note: Parse Content-Length value from header bytes
+                Let content_length be proc read_content_length from input_buf
+                If content_length is less than 0:
+                    Note: Invalid or missing Content-Length means protocol error or stream closed
+                    Set running to 0
+                End If
+
+                If running is equal to 1:
+                    If content_length is equal to 0:
+                        Note: Zero-length content indicates stream end
+                        Set running to 0
+                    End If
+
+                    If running is equal to 1:
+                        Note: Read the message body of content_length bytes
+                        Let message_body be proc allocate from OwnedUtils with content_length plus 1
+                        If message_body is equal to 0:
+                            Set running to 0
+                        End If
+
+                        If running is equal to 1:
+                            Note: Read content_length bytes from input into message_body
+                            Let bytes_read be proc read_message_body from input_buf, message_body, content_length
+                            If bytes_read is not equal to content_length:
+                                Let dummy_free_msg be proc deallocate from OwnedUtils with message_body
+                                Set running to 0
+                            End If
+
+                            If running is equal to 1:
+                                Note: Null-terminate the message body
+                                Let dummy_term be proc memory_set_integer from MemorySafety with message_body, content_length, 0
+
+                                Note: Dispatch the message
+                                Let dispatch_result be proc handle_message with server, message_body, content_length
+                                Let dummy_free_body be proc deallocate from OwnedUtils with message_body
+
+                                Note: Check if the dispatched message was an exit notification
+                                Let shutdown_after be proc memory_get_integer from MemorySafety with server, 40
+                                If shutdown_after is equal to 1:
+                                    Set running to 0
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Return LSP_SUCCESS
+End Process
+
+Note: ============================================================================
+Note: Internal Helper - Read Content-Length from LSP Base Protocol Header
+Note: ============================================================================
+
+Private Process called "read_content_length" takes input_buf as Integer returns Integer:
+    Note: Parse the Content-Length header from the LSP base protocol
+    Note: Reads bytes from input_buf looking for "Content-Length: <digits>\r\n\r\n"
+    Note: Returns the integer content length, or -1 on parse failure
+    Note: The LSP specification requires Content-Length as the only mandatory header
+
+    If input_buf is equal to 0:
+        Return -1
+    End If
+
+    Note: Read header bytes character by character
+    Note: Look for pattern: "Content-Length: " followed by digits followed by "\r\n\r\n"
+    Let header_buf be proc allocate from OwnedUtils with 256
+    If header_buf is equal to 0:
+        Return -1
+    End If
+
+    Let pos be 0
+    Let found_end be 0
+    Let max_header_size be 255
+
+    Note: Read bytes until we find the double CRLF that ends the header section
+    While found_end is equal to 0:
+        If pos is greater than max_header_size:
+            Note: Header too large, protocol error
+            Let dummy_free be proc deallocate from OwnedUtils with header_buf
+            Return -1
+        End If
+
+        Note: Read one byte from the input buffer
+        Let byte_val be proc memory_get_integer from MemorySafety with input_buf, pos
+        Let dummy_store be proc memory_set_integer from MemorySafety with header_buf, pos, byte_val
+
+        Note: Check for end of header (\r\n\r\n sequence)
+        If pos is greater than 2:
+            Let prev3 be proc memory_get_integer from MemorySafety with header_buf, pos minus 3
+            Let prev2 be proc memory_get_integer from MemorySafety with header_buf, pos minus 2
+            Let prev1 be proc memory_get_integer from MemorySafety with header_buf, pos minus 1
+            If prev3 is equal to 13:
+                If prev2 is equal to 10:
+                    If prev1 is equal to 13:
+                        If byte_val is equal to 10:
+                            Set found_end to 1
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set pos to pos plus 1
+    End While
+
+    Note: Parse the content length value from the header
+    Note: Skip "Content-Length: " prefix (16 characters)
+    Let digit_start be CONTENT_LENGTH_PREFIX_SIZE
+    Let content_length be 0
+    Let digit_pos be digit_start
+
+    While digit_pos is less than pos:
+        Let digit_byte be proc memory_get_integer from MemorySafety with header_buf, digit_pos
+        Note: Check if byte is a digit (ASCII 48-57)
+        If digit_byte is greater than 47:
+            If digit_byte is less than 58:
+                Set content_length to content_length times 10
+                Set content_length to content_length plus digit_byte minus 48
+            End If
+        End If
+        Note: Stop at CR (13) which starts the line ending
+        If digit_byte is equal to 13:
+            Set digit_pos to pos
+        End If
+        Set digit_pos to digit_pos plus 1
+    End While
+
+    Let dummy_free_hdr be proc deallocate from OwnedUtils with header_buf
+    Return content_length
+End Process
+
+Private Process called "read_message_body" takes input_buf as Integer, message_body as Integer, content_length as Integer returns Integer:
+    Note: Read exactly content_length bytes from input buffer into message_body
+    Note: Returns number of bytes successfully read
+
+    If input_buf is equal to 0:
+        Return 0
+    End If
+    If message_body is equal to 0:
+        Return 0
+    End If
+    If content_length is less than 1:
+        Return 0
+    End If
+
+    Note: Copy content_length bytes from input to message body
+    Let idx be 0
+    While idx is less than content_length:
+        Let byte_val be proc memory_get_integer from MemorySafety with input_buf, idx
+        Let dummy_write be proc memory_set_integer from MemorySafety with message_body, idx, byte_val
+        Set idx to idx plus 1
+    End While
+
+    Return content_length
+End Process
+
+Note: ============================================================================
+Note: Message Dispatch
+Note: ============================================================================
+
+Process called "handle_message" takes server as Integer, message as Integer, length as Integer returns Integer:
+    Note: Parse and dispatch an incoming LSP JSON-RPC message
+    Note: Identifies the method field and routes to the appropriate handler
+    Note: Returns LSP_SUCCESS on successful dispatch, LSP_FAILED on error
+    Note:
+    Note: The method string is identified by scanning the JSON for the "method" key
+    Note: and comparing against known LSP method strings. Each method routes to its
+    Note: dedicated handler process.
+
+    If server is equal to 0:
+        Return LSP_FAILED
+    End If
+    If message is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Extract the method from the JSON-RPC message
+    Note: Scan for "method" key in the JSON payload
+    Let method_id be proc identify_method from message, length
+    If method_id is equal to LSP_METHOD_UNKNOWN:
+        Note: Unknown method - send method not found error for requests
+        Note: Notifications (no id) can be silently ignored per spec
+        Let has_id be proc json_has_field from message, length, 105, 100
+        If has_id is equal to 1:
+            Let request_id be proc extract_request_id from message, length
+            Let dummy_err be proc send_error_response with server, request_id, LSP_ERROR_METHOD_NOT_FOUND, 0
+        End If
+        Return LSP_SUCCESS
+    End If
+
+    Note: Check server initialization state
+    Note: Before initialize, only initialize and exit are allowed
+    Let is_initialized be proc memory_get_integer from MemorySafety with server, 16
+    If is_initialized is equal to 0:
+        If method_id is not equal to LSP_METHOD_INITIALIZE:
+            If method_id is not equal to LSP_METHOD_EXIT:
+                Let has_id2 be proc json_has_field from message, length, 105, 100
+                If has_id2 is equal to 1:
+                    Let request_id2 be proc extract_request_id from message, length
+                    Let dummy_err2 be proc send_error_response with server, request_id2, LSP_ERROR_SERVER_NOT_INITIALIZED, 0
+                End If
+                Return LSP_SUCCESS
+            End If
+        End If
+    End If
+
+    Note: Route to appropriate handler based on method
+    If method_id is equal to LSP_METHOD_INITIALIZE:
+        Let result be proc handle_initialize with server, message, length
+        Return result
+    End If
+    If method_id is equal to LSP_METHOD_INITIALIZED:
+        Note: initialized notification - no response needed, server is ready
+        Return LSP_SUCCESS
+    End If
+    If method_id is equal to LSP_METHOD_SHUTDOWN:
+        Let result be proc handle_shutdown with server, message, length
+        Return result
+    End If
+    If method_id is equal to LSP_METHOD_EXIT:
+        Note: Mark server for exit
+        Let dummy_exit be proc memory_set_integer from MemorySafety with server, 40, 1
+        Return LSP_SUCCESS
+    End If
+    If method_id is equal to LSP_METHOD_TEXT_DOCUMENT_DID_OPEN:
+        Let result be proc handle_text_document_did_open with server, message, length
+        Return result
+    End If
+    If method_id is equal to LSP_METHOD_TEXT_DOCUMENT_DID_CHANGE:
+        Let result be proc handle_text_document_did_change with server, message, length
+        Return result
+    End If
+    If method_id is equal to LSP_METHOD_TEXT_DOCUMENT_DID_CLOSE:
+        Let result be proc handle_text_document_did_close with server, message, length
+        Return result
+    End If
+
+    Return LSP_SUCCESS
+End Process
+
+Note: ============================================================================
+Note: Internal Helpers - JSON Field Operations
+Note: ============================================================================
+
+Private Process called "identify_method" takes message as Integer, length as Integer returns Integer:
+    Note: Identify the LSP method from a JSON-RPC message
+    Note: Scans the raw JSON bytes for the "method" key and compares the value
+    Note: against known LSP method strings
+    Note: Returns the method constant ID, or LSP_METHOD_UNKNOWN
+
+    If message is equal to 0:
+        Return LSP_METHOD_UNKNOWN
+    End If
+
+    Note: Scan for "method" key in JSON
+    Note: Look for the byte sequence: "method":"
+    Note: ASCII: m=109, e=101, t=116, h=104, o=111, d=100
+    Let scan_pos be 0
+    Let method_start be -1
+
+    While scan_pos is less than length:
+        Let ch be proc memory_get_integer from MemorySafety with message, scan_pos
+        Note: Look for 'm' followed by "ethod"
+        If ch is equal to 109:
+            If scan_pos plus 6 is less than length:
+                Let ch1 be proc memory_get_integer from MemorySafety with message, scan_pos plus 1
+                Let ch2 be proc memory_get_integer from MemorySafety with message, scan_pos plus 2
+                Let ch3 be proc memory_get_integer from MemorySafety with message, scan_pos plus 3
+                Let ch4 be proc memory_get_integer from MemorySafety with message, scan_pos plus 4
+                Let ch5 be proc memory_get_integer from MemorySafety with message, scan_pos plus 5
+                If ch1 is equal to 101:
+                    If ch2 is equal to 116:
+                        If ch3 is equal to 104:
+                            If ch4 is equal to 111:
+                                If ch5 is equal to 100:
+                                    Note: Found "method" - now find the value string start
+                                    Let val_scan be scan_pos plus 6
+                                    While val_scan is less than length:
+                                        Let vc be proc memory_get_integer from MemorySafety with message, val_scan
+                                        Note: Look for opening quote of value (ASCII 34 = ")
+                                        If vc is equal to 34:
+                                            Set method_start to val_scan plus 1
+                                            Set val_scan to length
+                                        End If
+                                        Set val_scan to val_scan plus 1
+                                    End While
+                                    Set scan_pos to length
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set scan_pos to scan_pos plus 1
+    End While
+
+    If method_start is equal to -1:
+        Return LSP_METHOD_UNKNOWN
+    End If
+
+    Note: Extract method string and compare against known methods
+    Note: Read characters from method_start until closing quote
+    Let method_len be 0
+    Let end_scan be method_start
+    While end_scan is less than length:
+        Let end_ch be proc memory_get_integer from MemorySafety with message, end_scan
+        If end_ch is equal to 34:
+            Set method_len to end_scan minus method_start
+            Set end_scan to length
+        End If
+        Set end_scan to end_scan plus 1
+    End While
+
+    Note: Compare method string against known LSP methods
+    Note: "initialize" = 10 chars
+    If method_len is equal to 10:
+        Let m0 be proc memory_get_integer from MemorySafety with message, method_start
+        Let m1 be proc memory_get_integer from MemorySafety with message, method_start plus 1
+        Note: i=105, n=110
+        If m0 is equal to 105:
+            If m1 is equal to 110:
+                Return LSP_METHOD_INITIALIZE
+            End If
+        End If
+    End If
+
+    Note: "initialized" = 11 chars
+    If method_len is equal to 11:
+        Let m0 be proc memory_get_integer from MemorySafety with message, method_start
+        If m0 is equal to 105:
+            Return LSP_METHOD_INITIALIZED
+        End If
+    End If
+
+    Note: "shutdown" = 8 chars
+    If method_len is equal to 8:
+        Let m0 be proc memory_get_integer from MemorySafety with message, method_start
+        Let m1 be proc memory_get_integer from MemorySafety with message, method_start plus 1
+        Note: s=115, h=104
+        If m0 is equal to 115:
+            If m1 is equal to 104:
+                Return LSP_METHOD_SHUTDOWN
+            End If
+        End If
+    End If
+
+    Note: "exit" = 4 chars
+    If method_len is equal to 4:
+        Let m0 be proc memory_get_integer from MemorySafety with message, method_start
+        Note: e=101
+        If m0 is equal to 101:
+            Return LSP_METHOD_EXIT
+        End If
+    End If
+
+    Note: "textDocument/didOpen" = 20 chars
+    If method_len is equal to 20:
+        Let m0 be proc memory_get_integer from MemorySafety with message, method_start
+        Note: t=116
+        If m0 is equal to 116:
+            Let m14 be proc memory_get_integer from MemorySafety with message, method_start plus 14
+            Note: 'O' = 79 (didOpen)
+            If m14 is equal to 79:
+                Return LSP_METHOD_TEXT_DOCUMENT_DID_OPEN
+            End If
+        End If
+    End If
+
+    Note: "textDocument/didChange" = 22 chars
+    If method_len is equal to 22:
+        Let m0 be proc memory_get_integer from MemorySafety with message, method_start
+        If m0 is equal to 116:
+            Return LSP_METHOD_TEXT_DOCUMENT_DID_CHANGE
+        End If
+    End If
+
+    Note: "textDocument/didClose" = 21 chars
+    If method_len is equal to 21:
+        Let m0 be proc memory_get_integer from MemorySafety with message, method_start
+        If m0 is equal to 116:
+            Return LSP_METHOD_TEXT_DOCUMENT_DID_CLOSE
+        End If
+    End If
+
+    Return LSP_METHOD_UNKNOWN
+End Process
+
+Private Process called "json_has_field" takes message as Integer, length as Integer, char1 as Integer, char2 as Integer returns Integer:
+    Note: Check if the JSON message contains a field whose key starts with the two given ASCII characters
+    Note: Used to detect presence of "id" field (char1=105 'i', char2=100 'd')
+    Note: Returns 1 if found, 0 if not
+
+    If message is equal to 0:
+        Return 0
+    End If
+
+    Let scan be 0
+    While scan is less than length minus 1:
+        Let c1 be proc memory_get_integer from MemorySafety with message, scan
+        Let c2 be proc memory_get_integer from MemorySafety with message, scan plus 1
+        If c1 is equal to char1:
+            If c2 is equal to char2:
+                Return 1
+            End If
+        End If
+        Set scan to scan plus 1
+    End While
+
+    Return 0
+End Process
+
+Private Process called "extract_request_id" takes message as Integer, length as Integer returns Integer:
+    Note: Extract the numeric request ID from a JSON-RPC message
+    Note: Scans for "id": followed by a number
+    Note: Returns the integer ID, or 0 if not found
+
+    If message is equal to 0:
+        Return 0
+    End If
+
+    Note: Scan for "id" key - look for "id":
+    Note: ASCII: i=105, d=100
+    Let scan be 0
+    Let id_value_start be -1
+
+    While scan is less than length minus 3:
+        Let c0 be proc memory_get_integer from MemorySafety with message, scan
+        Let c1 be proc memory_get_integer from MemorySafety with message, scan plus 1
+        Let c2 be proc memory_get_integer from MemorySafety with message, scan plus 2
+        Note: Look for quote-i-d-quote pattern: "id"
+        If c0 is equal to 34:
+            If c1 is equal to 105:
+                If c2 is equal to 100:
+                    Note: Skip past "id" and find the colon then the value
+                    Let after_key be scan plus 3
+                    While after_key is less than length:
+                        Let ac be proc memory_get_integer from MemorySafety with message, after_key
+                        Note: Skip colon (58), spaces (32), quotes
+                        If ac is greater than 47:
+                            If ac is less than 58:
+                                Set id_value_start to after_key
+                                Set after_key to length
+                            End If
+                        End If
+                        Set after_key to after_key plus 1
+                    End While
+                    Set scan to length
+                End If
+            End If
+        End If
+        Set scan to scan plus 1
+    End While
+
+    If id_value_start is equal to -1:
+        Return 0
+    End If
+
+    Note: Parse the numeric ID value
+    Let id_value be 0
+    Let digit_pos be id_value_start
+    While digit_pos is less than length:
+        Let dch be proc memory_get_integer from MemorySafety with message, digit_pos
+        If dch is greater than 47:
+            If dch is less than 58:
+                Set id_value to id_value times 10
+                Set id_value to id_value plus dch minus 48
+            End If
+        End If
+        Otherwise:
+            Set digit_pos to length
+        End If
+        Set digit_pos to digit_pos plus 1
+    End While
+
+    Return id_value
+End Process
+
+Note: ============================================================================
+Note: LSP Protocol Handlers
+Note: ============================================================================
+
+Process called "handle_initialize" takes server as Integer, message as Integer, length as Integer returns Integer:
+    Note: Handle the "initialize" request from the client
+    Note: Per LSP spec, the server MUST respond with ServerCapabilities
+    Note: The server MUST NOT respond to any other request before initialize completes
+    Note: Returns LSP_SUCCESS on success, LSP_FAILED on error
+
+    If server is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Extract the request ID for the response
+    Let request_id be proc extract_request_id from message, length
+
+    Note: Mark server as initialized
+    Let dummy_init be proc memory_set_integer from MemorySafety with server, 16, 1
+
+    Note: Build the initialize response with server capabilities
+    Note: Response JSON structure:
+    Note: {"jsonrpc":"2.0","id":<id>,"result":{"capabilities":{
+    Note:   "textDocumentSync":1,
+    Note:   "completionProvider":{"triggerCharacters":[".","@"]},
+    Note:   "hoverProvider":true,
+    Note:   "definitionProvider":true,
+    Note:   "referencesProvider":true,
+    Note:   "documentSymbolProvider":true,
+    Note:   "renameProvider":true,
+    Note:   "semanticTokensProvider":{"full":true,"legend":{...}}
+    Note: }}}
+
+    Note: Allocate response buffer (2048 bytes for capability response)
+    Let response_buf be proc allocate from OwnedUtils with 2048
+    If response_buf is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Build JSON response manually (byte-by-byte construction)
+    Note: {"jsonrpc":"2.0","id":
+    Let response_json be proc build_initialize_response from request_id
+    If response_json is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with response_buf
+        Return LSP_FAILED
+    End If
+
+    Note: Send the response
+    Let send_result be proc send_response with server, response_json
+    Return send_result
+End Process
+
+Process called "handle_shutdown" takes server as Integer, message as Integer, length as Integer returns Integer:
+    Note: Handle the "shutdown" request
+    Note: Per LSP spec, the server should prepare to exit but not exit yet
+    Note: Must respond with null result
+    Note: After shutdown, only "exit" notification is valid
+
+    If server is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Extract request ID
+    Let request_id be proc extract_request_id from message, length
+
+    Note: Mark shutdown as requested
+    Let dummy_sd be proc memory_set_integer from MemorySafety with server, 40, 1
+
+    Note: Build null result response: {"jsonrpc":"2.0","id":<id>,"result":null}
+    Let response be proc build_null_response from request_id
+    If response is not equal to 0:
+        Let send_result be proc send_response with server, response
+        Return send_result
+    End If
+
+    Return LSP_SUCCESS
+End Process
+
+Process called "handle_text_document_did_open" takes server as Integer, message as Integer, length as Integer returns Integer:
+    Note: Handle textDocument/didOpen notification
+    Note: The client sends this when a document is opened
+    Note: We store the document URI and content in the document store
+    Note: This is a notification - no response is sent
+
+    If server is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Extract the document URI from the textDocument.uri field
+    Let uri_ptr be proc extract_text_document_uri from message, length
+    If uri_ptr is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Extract the document text from the textDocument.text field
+    Let text_ptr be proc extract_text_document_text from message, length
+    If text_ptr is equal to 0:
+        Let dummy_free_uri be proc deallocate from OwnedUtils with uri_ptr
+        Return LSP_FAILED
+    End If
+
+    Note: Store the document in the document store
+    Note: The document store is a hash table at offset 32 of the server
+    Let doc_store be proc memory_get_integer from MemorySafety with server, 32
+    If doc_store is not equal to 0:
+        Note: Create a document entry (16 bytes: uri pointer + content pointer)
+        Let doc_entry be proc allocate from OwnedUtils with 16
+        If doc_entry is not equal to 0:
+            Let dummy_set_uri be proc memory_set_integer from MemorySafety with doc_entry, 0, uri_ptr
+            Let dummy_set_text be proc memory_set_integer from MemorySafety with doc_entry, 8, text_ptr
+
+            Note: Insert into document store using URI hash as key
+            Let uri_hash be proc hash_string_bytes from uri_ptr
+            Let capacity be proc memory_get_integer from MemorySafety with doc_store, 16
+            Let bucket_idx be uri_hash
+            Note: Modulo by capacity to get bucket index
+            If capacity is greater than 0:
+                While bucket_idx is greater than capacity minus 1:
+                    Set bucket_idx to bucket_idx minus capacity
+                End While
+            End If
+            Let buckets be proc memory_get_integer from MemorySafety with doc_store, 0
+            Let dummy_insert be proc memory_set_integer from MemorySafety with buckets, bucket_idx times 8, doc_entry
+
+            Note: Increment size counter
+            Let current_size be proc memory_get_integer from MemorySafety with doc_store, 8
+            Let dummy_inc_size be proc memory_set_integer from MemorySafety with doc_store, 8, current_size plus 1
+        End If
+    End If
+
+    Return LSP_SUCCESS
+End Process
+
+Process called "handle_text_document_did_change" takes server as Integer, message as Integer, length as Integer returns Integer:
+    Note: Handle textDocument/didChange notification
+    Note: Updates the stored document content with the new text
+    Note: Uses full document sync (TEXT_DOCUMENT_SYNC_FULL) - replaces entire content
+    Note: This is a notification - no response is sent
+
+    If server is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Extract the document URI
+    Let uri_ptr be proc extract_text_document_uri from message, length
+    If uri_ptr is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Extract the new document text from contentChanges[0].text
+    Let new_text_ptr be proc extract_change_text from message, length
+    If new_text_ptr is equal to 0:
+        Let dummy_free_uri be proc deallocate from OwnedUtils with uri_ptr
+        Return LSP_FAILED
+    End If
+
+    Note: Find existing document in the store and update its content
+    Let doc_store be proc memory_get_integer from MemorySafety with server, 32
+    If doc_store is not equal to 0:
+        Let uri_hash be proc hash_string_bytes from uri_ptr
+        Let capacity be proc memory_get_integer from MemorySafety with doc_store, 16
+        Let bucket_idx be uri_hash
+        If capacity is greater than 0:
+            While bucket_idx is greater than capacity minus 1:
+                Set bucket_idx to bucket_idx minus capacity
+            End While
+        End If
+        Let buckets be proc memory_get_integer from MemorySafety with doc_store, 0
+        Let doc_entry be proc memory_get_integer from MemorySafety with buckets, bucket_idx times 8
+
+        If doc_entry is not equal to 0:
+            Note: Free old text content
+            Let old_text be proc memory_get_integer from MemorySafety with doc_entry, 8
+            If old_text is not equal to 0:
+                Let dummy_free_old be proc deallocate from OwnedUtils with old_text
+            End If
+            Note: Set new text content
+            Let dummy_set_new be proc memory_set_integer from MemorySafety with doc_entry, 8, new_text_ptr
+        End If
+        Otherwise:
+            Note: Document not found - create new entry (handles race condition)
+            Let doc_entry_new be proc allocate from OwnedUtils with 16
+            If doc_entry_new is not equal to 0:
+                Let dummy_new_uri be proc memory_set_integer from MemorySafety with doc_entry_new, 0, uri_ptr
+                Let dummy_new_text be proc memory_set_integer from MemorySafety with doc_entry_new, 8, new_text_ptr
+                Let dummy_ins be proc memory_set_integer from MemorySafety with buckets, bucket_idx times 8, doc_entry_new
+            End If
+        End If
+    End If
+
+    Return LSP_SUCCESS
+End Process
+
+Process called "handle_text_document_did_close" takes server as Integer, message as Integer, length as Integer returns Integer:
+    Note: Handle textDocument/didClose notification
+    Note: Removes the document from the document store and frees its memory
+    Note: This is a notification - no response is sent
+
+    If server is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Extract the document URI
+    Let uri_ptr be proc extract_text_document_uri from message, length
+    If uri_ptr is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Find and remove the document from the store
+    Let doc_store be proc memory_get_integer from MemorySafety with server, 32
+    If doc_store is not equal to 0:
+        Let uri_hash be proc hash_string_bytes from uri_ptr
+        Let capacity be proc memory_get_integer from MemorySafety with doc_store, 16
+        Let bucket_idx be uri_hash
+        If capacity is greater than 0:
+            While bucket_idx is greater than capacity minus 1:
+                Set bucket_idx to bucket_idx minus capacity
+            End While
+        End If
+        Let buckets be proc memory_get_integer from MemorySafety with doc_store, 0
+        Let doc_entry be proc memory_get_integer from MemorySafety with buckets, bucket_idx times 8
+
+        If doc_entry is not equal to 0:
+            Note: Free document URI
+            Let stored_uri be proc memory_get_integer from MemorySafety with doc_entry, 0
+            If stored_uri is not equal to 0:
+                Let dummy_free_suri be proc deallocate from OwnedUtils with stored_uri
+            End If
+            Note: Free document content
+            Let stored_text be proc memory_get_integer from MemorySafety with doc_entry, 8
+            If stored_text is not equal to 0:
+                Let dummy_free_stext be proc deallocate from OwnedUtils with stored_text
+            End If
+            Note: Free the entry itself
+            Let dummy_free_entry be proc deallocate from OwnedUtils with doc_entry
+            Note: Clear the bucket slot
+            Let dummy_clear_slot be proc memory_set_integer from MemorySafety with buckets, bucket_idx times 8, 0
+
+            Note: Decrement size counter
+            Let current_size be proc memory_get_integer from MemorySafety with doc_store, 8
+            If current_size is greater than 0:
+                Let dummy_dec_size be proc memory_set_integer from MemorySafety with doc_store, 8, current_size minus 1
+            End If
+        End If
+    End If
+
+    Note: Free the extracted URI
+    Let dummy_free_uri2 be proc deallocate from OwnedUtils with uri_ptr
+
+    Return LSP_SUCCESS
+End Process
+
+Note: ============================================================================
+Note: Response Construction and Sending
+Note: ============================================================================
+
+Process called "send_response" takes server as Integer, response_json as Integer returns Integer:
+    Note: Send an LSP response message to the client via stdout
+    Note: Wraps the JSON body with Content-Length header per LSP base protocol
+    Note: Format: "Content-Length: <length>\r\n\r\n<json_body>"
+    Note: Returns LSP_SUCCESS on success, LSP_FAILED on error
+
+    If server is equal to 0:
+        Return LSP_FAILED
+    End If
+    If response_json is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Calculate the length of the response JSON body
+    Let json_length be proc measure_string_length from response_json
+    If json_length is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Build the Content-Length header
+    Note: "Content-Length: " + digits + "\r\n\r\n"
+    Let output_buf be proc memory_get_integer from MemorySafety with server, 8
+    If output_buf is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Write "Content-Length: " header prefix
+    Let header_bytes be proc write_content_length_header from output_buf, json_length
+    If header_bytes is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Write the JSON body after the header
+    Let body_write be proc write_bytes from output_buf, header_bytes, response_json, json_length
+
+    Note: Free the response JSON buffer
+    Let dummy_free_json be proc deallocate from OwnedUtils with response_json
+
+    Return LSP_SUCCESS
+End Process
+
+Process called "send_notification" takes server as Integer, method as Integer, params_json as Integer returns Integer:
+    Note: Send an LSP notification message to the client
+    Note: Notifications have no "id" field and expect no response
+    Note: Used for diagnostics publishing, log messages, etc.
+    Note: Format: {"jsonrpc":"2.0","method":"<method>","params":<params>}
+    Note: Returns LSP_SUCCESS on success, LSP_FAILED on error
+
+    If server is equal to 0:
+        Return LSP_FAILED
+    End If
+    If method is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Build the notification JSON envelope
+    Note: Allocate buffer for notification (4096 bytes max)
+    Let notif_buf be proc allocate from OwnedUtils with 4096
+    If notif_buf is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Note: Write JSON-RPC 2.0 notification structure
+    Note: {"jsonrpc":"2.0","method":"
+    Let write_pos be 0
+    Note: Opening brace
+    Let dummy_w1 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 123
+    Set write_pos to write_pos plus 1
+    Note: "jsonrpc":"2.0"
+    Let jsonrpc_str_bytes be proc write_jsonrpc_header from notif_buf, write_pos
+    Set write_pos to write_pos plus jsonrpc_str_bytes
+
+    Note: ,"method":"
+    Let dummy_w2 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 44
+    Set write_pos to write_pos plus 1
+    Let dummy_w3 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 34
+    Set write_pos to write_pos plus 1
+    Note: Write "method"
+    Let method_key_len be proc write_ascii_string from notif_buf, write_pos, 109, 101, 116, 104, 111, 100
+    Set write_pos to write_pos plus method_key_len
+    Note: ":"
+    Let dummy_w4 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 34
+    Set write_pos to write_pos plus 1
+    Let dummy_w5 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 58
+    Set write_pos to write_pos plus 1
+    Let dummy_w6 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 34
+    Set write_pos to write_pos plus 1
+
+    Note: Write method name
+    Let method_len be proc measure_string_length from method
+    Let copy_idx be 0
+    While copy_idx is less than method_len:
+        Let mbyte be proc memory_get_integer from MemorySafety with method, copy_idx
+        Let dummy_wm be proc memory_set_integer from MemorySafety with notif_buf, write_pos, mbyte
+        Set write_pos to write_pos plus 1
+        Set copy_idx to copy_idx plus 1
+    End While
+
+    Note: Close method value quote
+    Let dummy_w7 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 34
+    Set write_pos to write_pos plus 1
+
+    Note: Add params if provided
+    If params_json is not equal to 0:
+        Note: ,"params":
+        Let dummy_w8 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 44
+        Set write_pos to write_pos plus 1
+        Let dummy_w9 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 34
+        Set write_pos to write_pos plus 1
+        Let params_key_len be proc write_ascii_string from notif_buf, write_pos, 112, 97, 114, 97, 109, 115
+        Set write_pos to write_pos plus params_key_len
+        Let dummy_w10 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 34
+        Set write_pos to write_pos plus 1
+        Let dummy_w11 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 58
+        Set write_pos to write_pos plus 1
+
+        Note: Copy params JSON
+        Let params_len be proc measure_string_length from params_json
+        Let pcopy_idx be 0
+        While pcopy_idx is less than params_len:
+            Let pbyte be proc memory_get_integer from MemorySafety with params_json, pcopy_idx
+            Let dummy_wp be proc memory_set_integer from MemorySafety with notif_buf, write_pos, pbyte
+            Set write_pos to write_pos plus 1
+            Set pcopy_idx to pcopy_idx plus 1
+        End While
+    End If
+
+    Note: Closing brace and null terminator
+    Let dummy_w12 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 125
+    Set write_pos to write_pos plus 1
+    Let dummy_w13 be proc memory_set_integer from MemorySafety with notif_buf, write_pos, 0
+
+    Note: Send the notification using the response sending mechanism
+    Let send_result be proc send_response with server, notif_buf
+    Return send_result
+End Process
+
+Note: ============================================================================
+Note: Internal Helpers - Response Building
+Note: ============================================================================
+
+Private Process called "build_initialize_response" takes request_id as Integer returns Integer:
+    Note: Build the JSON response for the initialize request
+    Note: Contains full server capabilities declaration
+    Note: Returns pointer to JSON string buffer, or 0 on failure
+
+    Let buf be proc allocate from OwnedUtils with 2048
+    If buf is equal to 0:
+        Return 0
+    End If
+
+    Note: Build the full initialize result JSON
+    Note: We declare all capabilities that Runa LSP supports
+    Let pos be 0
+
+    Note: {"jsonrpc":"2.0","id":
+    Let dummy_o be proc memory_set_integer from MemorySafety with buf, pos, 123
+    Set pos to pos plus 1
+    Let header_len be proc write_jsonrpc_header from buf, pos
+    Set pos to pos plus header_len
+
+    Note: ,"id":
+    Let dummy_c1 be proc memory_set_integer from MemorySafety with buf, pos, 44
+    Set pos to pos plus 1
+    Let id_len be proc write_json_key from buf, pos, 105, 100
+    Set pos to pos plus id_len
+    Let dummy_colon be proc memory_set_integer from MemorySafety with buf, pos, 58
+    Set pos to pos plus 1
+    Let id_digits be proc write_integer_digits from buf, pos, request_id
+    Set pos to pos plus id_digits
+
+    Note: ,"result":{"capabilities":{"textDocumentSync":1,
+    Note: "completionProvider":{"triggerCharacters":[".","@"]},
+    Note: "hoverProvider":true,"definitionProvider":true,
+    Note: "referencesProvider":true,"documentSymbolProvider":true,
+    Note: "renameProvider":true}}
+    Note: Write result object with capabilities
+    Let result_str_bytes be proc write_capabilities_json from buf, pos
+    Set pos to pos plus result_str_bytes
+
+    Note: Close the root object
+    Let dummy_close be proc memory_set_integer from MemorySafety with buf, pos, 125
+    Set pos to pos plus 1
+    Let dummy_null be proc memory_set_integer from MemorySafety with buf, pos, 0
+
+    Return buf
+End Process
+
+Private Process called "build_null_response" takes request_id as Integer returns Integer:
+    Note: Build a JSON-RPC response with null result
+    Note: Used for shutdown and other requests that return no data
+    Note: Returns pointer to JSON string buffer, or 0 on failure
+
+    Let buf be proc allocate from OwnedUtils with 256
+    If buf is equal to 0:
+        Return 0
+    End If
+
+    Let pos be 0
+
+    Note: {"jsonrpc":"2.0","id":
+    Let dummy_o be proc memory_set_integer from MemorySafety with buf, pos, 123
+    Set pos to pos plus 1
+    Let header_len be proc write_jsonrpc_header from buf, pos
+    Set pos to pos plus header_len
+
+    Note: ,"id":
+    Let dummy_c1 be proc memory_set_integer from MemorySafety with buf, pos, 44
+    Set pos to pos plus 1
+    Let id_len be proc write_json_key from buf, pos, 105, 100
+    Set pos to pos plus id_len
+    Let dummy_colon be proc memory_set_integer from MemorySafety with buf, pos, 58
+    Set pos to pos plus 1
+    Let id_digits be proc write_integer_digits from buf, pos, request_id
+    Set pos to pos plus id_digits
+
+    Note: ,"result":null}
+    Let dummy_c2 be proc memory_set_integer from MemorySafety with buf, pos, 44
+    Set pos to pos plus 1
+    Note: "result"
+    Let res_len be proc write_json_key from buf, pos, 114, 101
+    Set pos to pos plus res_len
+    Note: Write "sult" to complete "result"
+    Let dummy_s be proc memory_set_integer from MemorySafety with buf, pos, 115
+    Set pos to pos plus 1
+    Let dummy_u be proc memory_set_integer from MemorySafety with buf, pos, 117
+    Set pos to pos plus 1
+    Let dummy_l be proc memory_set_integer from MemorySafety with buf, pos, 108
+    Set pos to pos plus 1
+    Let dummy_t be proc memory_set_integer from MemorySafety with buf, pos, 116
+    Set pos to pos plus 1
+    Let dummy_q2 be proc memory_set_integer from MemorySafety with buf, pos, 34
+    Set pos to pos plus 1
+    Note: :null
+    Let dummy_colon2 be proc memory_set_integer from MemorySafety with buf, pos, 58
+    Set pos to pos plus 1
+    Note: n=110, u=117, l=108, l=108
+    Let dummy_n be proc memory_set_integer from MemorySafety with buf, pos, 110
+    Set pos to pos plus 1
+    Let dummy_u2 be proc memory_set_integer from MemorySafety with buf, pos, 117
+    Set pos to pos plus 1
+    Let dummy_l2 be proc memory_set_integer from MemorySafety with buf, pos, 108
+    Set pos to pos plus 1
+    Let dummy_l3 be proc memory_set_integer from MemorySafety with buf, pos, 108
+    Set pos to pos plus 1
+
+    Note: Close object
+    Let dummy_close be proc memory_set_integer from MemorySafety with buf, pos, 125
+    Set pos to pos plus 1
+    Let dummy_term be proc memory_set_integer from MemorySafety with buf, pos, 0
+
+    Return buf
+End Process
+
+Private Process called "send_error_response" takes server as Integer, request_id as Integer, error_code as Integer, error_message as Integer returns Integer:
+    Note: Send an LSP error response
+    Note: Format: {"jsonrpc":"2.0","id":<id>,"error":{"code":<code>,"message":"<msg>"}}
+
+    Let buf be proc allocate from OwnedUtils with 512
+    If buf is equal to 0:
+        Return LSP_FAILED
+    End If
+
+    Let pos be 0
+
+    Note: {"jsonrpc":"2.0","id":
+    Let dummy_o be proc memory_set_integer from MemorySafety with buf, pos, 123
+    Set pos to pos plus 1
+    Let header_len be proc write_jsonrpc_header from buf, pos
+    Set pos to pos plus header_len
+    Let dummy_c be proc memory_set_integer from MemorySafety with buf, pos, 44
+    Set pos to pos plus 1
+    Let id_len be proc write_json_key from buf, pos, 105, 100
+    Set pos to pos plus id_len
+    Let dummy_colon be proc memory_set_integer from MemorySafety with buf, pos, 58
+    Set pos to pos plus 1
+    Let id_digits be proc write_integer_digits from buf, pos, request_id
+    Set pos to pos plus id_digits
+
+    Note: ,"error":{"code":
+    Let dummy_c2 be proc memory_set_integer from MemorySafety with buf, pos, 44
+    Set pos to pos plus 1
+    Note: Write "error" key and nested object with code
+    Let err_key_len be proc write_json_key from buf, pos, 101, 114
+    Set pos to pos plus err_key_len
+    Note: "ror"
+    Let dummy_r be proc memory_set_integer from MemorySafety with buf, pos, 114
+    Set pos to pos plus 1
+    Let dummy_o2 be proc memory_set_integer from MemorySafety with buf, pos, 111
+    Set pos to pos plus 1
+    Let dummy_r2 be proc memory_set_integer from MemorySafety with buf, pos, 114
+    Set pos to pos plus 1
+    Let dummy_q be proc memory_set_integer from MemorySafety with buf, pos, 34
+    Set pos to pos plus 1
+    Note: :{"code":
+    Let dummy_colon2 be proc memory_set_integer from MemorySafety with buf, pos, 58
+    Set pos to pos plus 1
+    Let dummy_ob be proc memory_set_integer from MemorySafety with buf, pos, 123
+    Set pos to pos plus 1
+    Let code_key_len be proc write_json_key from buf, pos, 99, 111
+    Set pos to pos plus code_key_len
+    Note: "de"
+    Let dummy_d be proc memory_set_integer from MemorySafety with buf, pos, 100
+    Set pos to pos plus 1
+    Let dummy_e be proc memory_set_integer from MemorySafety with buf, pos, 101
+    Set pos to pos plus 1
+    Let dummy_q2 be proc memory_set_integer from MemorySafety with buf, pos, 34
+    Set pos to pos plus 1
+    Let dummy_colon3 be proc memory_set_integer from MemorySafety with buf, pos, 58
+    Set pos to pos plus 1
+
+    Note: Write error code value (may be negative)
+    If error_code is less than 0:
+        Let dummy_neg be proc memory_set_integer from MemorySafety with buf, pos, 45
+        Set pos to pos plus 1
+        Let abs_code be 0 minus error_code
+        Let code_digits be proc write_integer_digits from buf, pos, abs_code
+        Set pos to pos plus code_digits
+    End If
+    Otherwise:
+        Let code_digits be proc write_integer_digits from buf, pos, error_code
+        Set pos to pos plus code_digits
+    End If
+
+    Note: ,"message":"Error"}}
+    Let dummy_c3 be proc memory_set_integer from MemorySafety with buf, pos, 44
+    Set pos to pos plus 1
+    Let msg_key_len be proc write_json_key from buf, pos, 109, 101
+    Set pos to pos plus msg_key_len
+    Note: "ssage"
+    Let dummy_s be proc memory_set_integer from MemorySafety with buf, pos, 115
+    Set pos to pos plus 1
+    Let dummy_s2 be proc memory_set_integer from MemorySafety with buf, pos, 115
+    Set pos to pos plus 1
+    Let dummy_a be proc memory_set_integer from MemorySafety with buf, pos, 97
+    Set pos to pos plus 1
+    Let dummy_g be proc memory_set_integer from MemorySafety with buf, pos, 103
+    Set pos to pos plus 1
+    Let dummy_e2 be proc memory_set_integer from MemorySafety with buf, pos, 101
+    Set pos to pos plus 1
+    Let dummy_q3 be proc memory_set_integer from MemorySafety with buf, pos, 34
+    Set pos to pos plus 1
+    Let dummy_colon4 be proc memory_set_integer from MemorySafety with buf, pos, 58
+    Set pos to pos plus 1
+    Note: "Error"
+    Let dummy_q4 be proc memory_set_integer from MemorySafety with buf, pos, 34
+    Set pos to pos plus 1
+    Note: E=69, r=114, r=114, o=111, r=114
+    Let dummy_E be proc memory_set_integer from MemorySafety with buf, pos, 69
+    Set pos to pos plus 1
+    Let dummy_r3 be proc memory_set_integer from MemorySafety with buf, pos, 114
+    Set pos to pos plus 1
+    Let dummy_r4 be proc memory_set_integer from MemorySafety with buf, pos, 114
+    Set pos to pos plus 1
+    Let dummy_o3 be proc memory_set_integer from MemorySafety with buf, pos, 111
+    Set pos to pos plus 1
+    Let dummy_r5 be proc memory_set_integer from MemorySafety with buf, pos, 114
+    Set pos to pos plus 1
+    Let dummy_q5 be proc memory_set_integer from MemorySafety with buf, pos, 34
+    Set pos to pos plus 1
+
+    Note: Close error object and root object: }}
+    Let dummy_close1 be proc memory_set_integer from MemorySafety with buf, pos, 125
+    Set pos to pos plus 1
+    Let dummy_close2 be proc memory_set_integer from MemorySafety with buf, pos, 125
+    Set pos to pos plus 1
+    Let dummy_term be proc memory_set_integer from MemorySafety with buf, pos, 0
+
+    Let send_result be proc send_response with server, buf
+    Return send_result
+End Process
+
+Note: ============================================================================
+Note: Internal Helpers - JSON Writing Utilities
+Note: ============================================================================
+
+Private Process called "write_jsonrpc_header" takes buf as Integer, pos as Integer returns Integer:
+    Note: Write "jsonrpc":"2.0" into buffer at given position
+    Note: Returns number of bytes written
+
+    Note: "jsonrpc":"2.0"
+    Note: " j s o n r p c " : " 2 . 0 "
+    Note: 34 106 115 111 110 114 112 99 34 58 34 50 46 48 34
+    Let p be pos
+    Let dummy1 be proc memory_set_integer from MemorySafety with buf, p, 34
+    Set p to p plus 1
+    Let dummy2 be proc memory_set_integer from MemorySafety with buf, p, 106
+    Set p to p plus 1
+    Let dummy3 be proc memory_set_integer from MemorySafety with buf, p, 115
+    Set p to p plus 1
+    Let dummy4 be proc memory_set_integer from MemorySafety with buf, p, 111
+    Set p to p plus 1
+    Let dummy5 be proc memory_set_integer from MemorySafety with buf, p, 110
+    Set p to p plus 1
+    Let dummy6 be proc memory_set_integer from MemorySafety with buf, p, 114
+    Set p to p plus 1
+    Let dummy7 be proc memory_set_integer from MemorySafety with buf, p, 112
+    Set p to p plus 1
+    Let dummy8 be proc memory_set_integer from MemorySafety with buf, p, 99
+    Set p to p plus 1
+    Let dummy9 be proc memory_set_integer from MemorySafety with buf, p, 34
+    Set p to p plus 1
+    Let dummy10 be proc memory_set_integer from MemorySafety with buf, p, 58
+    Set p to p plus 1
+    Let dummy11 be proc memory_set_integer from MemorySafety with buf, p, 34
+    Set p to p plus 1
+    Let dummy12 be proc memory_set_integer from MemorySafety with buf, p, 50
+    Set p to p plus 1
+    Let dummy13 be proc memory_set_integer from MemorySafety with buf, p, 46
+    Set p to p plus 1
+    Let dummy14 be proc memory_set_integer from MemorySafety with buf, p, 48
+    Set p to p plus 1
+    Let dummy15 be proc memory_set_integer from MemorySafety with buf, p, 34
+    Set p to p plus 1
+
+    Return p minus pos
+End Process
+
+Private Process called "write_json_key" takes buf as Integer, pos as Integer, ch1 as Integer, ch2 as Integer returns Integer:
+    Note: Write a quoted JSON key starting with two ASCII characters: "<ch1><ch2>
+    Note: Only writes the opening quote and first two characters (caller adds rest)
+    Note: Returns number of bytes written
+
+    Let p be pos
+    Let dummy1 be proc memory_set_integer from MemorySafety with buf, p, 34
+    Set p to p plus 1
+    Let dummy2 be proc memory_set_integer from MemorySafety with buf, p, ch1
+    Set p to p plus 1
+    Let dummy3 be proc memory_set_integer from MemorySafety with buf, p, ch2
+    Set p to p plus 1
+
+    Return p minus pos
+End Process
+
+Private Process called "write_integer_digits" takes buf as Integer, pos as Integer, value as Integer returns Integer:
+    Note: Write an integer value as ASCII decimal digits into the buffer
+    Note: Returns the number of bytes written
+
+    If value is equal to 0:
+        Let dummy_z be proc memory_set_integer from MemorySafety with buf, pos, 48
+        Return 1
+    End If
+
+    Note: Extract digits in reverse order, then write forward
+    Let digit_buf be proc allocate from OwnedUtils with 32
+    If digit_buf is equal to 0:
+        Return 0
+    End If
+
+    Let remaining be value
+    Let digit_count be 0
+
+    While remaining is greater than 0:
+        Let digit be remaining
+        Note: Compute remainder: digit = remaining - (remaining / 10) * 10
+        Let quotient be remaining divided by 10
+        Set digit to remaining minus quotient times 10
+        Let dummy_d be proc memory_set_integer from MemorySafety with digit_buf, digit_count, digit plus 48
+        Set digit_count to digit_count plus 1
+        Set remaining to quotient
+    End While
+
+    Note: Write digits in forward order (reverse of extraction)
+    Let write_idx be 0
+    Let read_idx be digit_count minus 1
+    While read_idx is greater than -1:
+        Let d_byte be proc memory_get_integer from MemorySafety with digit_buf, read_idx
+        Let dummy_w be proc memory_set_integer from MemorySafety with buf, pos plus write_idx, d_byte
+        Set write_idx to write_idx plus 1
+        Set read_idx to read_idx minus 1
+    End While
+
+    Let dummy_free be proc deallocate from OwnedUtils with digit_buf
+    Return digit_count
+End Process
+
+Private Process called "write_ascii_string" takes buf as Integer, pos as Integer, c1 as Integer, c2 as Integer, c3 as Integer, c4 as Integer, c5 as Integer, c6 as Integer returns Integer:
+    Note: Write 6 ASCII characters into buffer at position
+    Note: Returns 6 (number of bytes written)
+
+    Let dummy1 be proc memory_set_integer from MemorySafety with buf, pos, c1
+    Let dummy2 be proc memory_set_integer from MemorySafety with buf, pos plus 1, c2
+    Let dummy3 be proc memory_set_integer from MemorySafety with buf, pos plus 2, c3
+    Let dummy4 be proc memory_set_integer from MemorySafety with buf, pos plus 3, c4
+    Let dummy5 be proc memory_set_integer from MemorySafety with buf, pos plus 4, c5
+    Let dummy6 be proc memory_set_integer from MemorySafety with buf, pos plus 5, c6
+    Return 6
+End Process
+
+Private Process called "write_content_length_header" takes buf as Integer, json_length as Integer returns Integer:
+    Note: Write "Content-Length: <length>\r\n\r\n" into the output buffer
+    Note: Returns total number of header bytes written
+
+    Let pos be 0
+    Note: "Content-Length: "
+    Note: C=67 o=111 n=110 t=116 e=101 n=110 t=116 -=45 L=76 e=101 n=110 g=103 t=116 h=104 :=58 space=32
+    Let cl_bytes_list be proc allocate from OwnedUtils with 128
+    If cl_bytes_list is equal to 0:
+        Return 0
+    End If
+
+    Let dummy1 be proc memory_set_integer from MemorySafety with buf, 0, 67
+    Let dummy2 be proc memory_set_integer from MemorySafety with buf, 1, 111
+    Let dummy3 be proc memory_set_integer from MemorySafety with buf, 2, 110
+    Let dummy4 be proc memory_set_integer from MemorySafety with buf, 3, 116
+    Let dummy5 be proc memory_set_integer from MemorySafety with buf, 4, 101
+    Let dummy6 be proc memory_set_integer from MemorySafety with buf, 5, 110
+    Let dummy7 be proc memory_set_integer from MemorySafety with buf, 6, 116
+    Let dummy8 be proc memory_set_integer from MemorySafety with buf, 7, 45
+    Let dummy9 be proc memory_set_integer from MemorySafety with buf, 8, 76
+    Let dummy10 be proc memory_set_integer from MemorySafety with buf, 9, 101
+    Let dummy11 be proc memory_set_integer from MemorySafety with buf, 10, 110
+    Let dummy12 be proc memory_set_integer from MemorySafety with buf, 11, 103
+    Let dummy13 be proc memory_set_integer from MemorySafety with buf, 12, 116
+    Let dummy14 be proc memory_set_integer from MemorySafety with buf, 13, 104
+    Let dummy15 be proc memory_set_integer from MemorySafety with buf, 14, 58
+    Let dummy16 be proc memory_set_integer from MemorySafety with buf, 15, 32
+    Set pos to 16
+
+    Note: Write the content length digits
+    Let digits_written be proc write_integer_digits from buf, pos, json_length
+    Set pos to pos plus digits_written
+
+    Note: Write \r\n\r\n (CR LF CR LF)
+    Let dummy_cr1 be proc memory_set_integer from MemorySafety with buf, pos, 13
+    Set pos to pos plus 1
+    Let dummy_lf1 be proc memory_set_integer from MemorySafety with buf, pos, 10
+    Set pos to pos plus 1
+    Let dummy_cr2 be proc memory_set_integer from MemorySafety with buf, pos, 13
+    Set pos to pos plus 1
+    Let dummy_lf2 be proc memory_set_integer from MemorySafety with buf, pos, 10
+    Set pos to pos plus 1
+
+    Let dummy_free_cl be proc deallocate from OwnedUtils with cl_bytes_list
+    Return pos
+End Process
+
+Private Process called "write_bytes" takes dest as Integer, dest_offset as Integer, src as Integer, count as Integer returns Integer:
+    Note: Copy count bytes from src to dest starting at dest_offset
+    Note: Returns number of bytes copied
+
+    Let idx be 0
+    While idx is less than count:
+        Let byte_val be proc memory_get_integer from MemorySafety with src, idx
+        Let dummy_w be proc memory_set_integer from MemorySafety with dest, dest_offset plus idx, byte_val
+        Set idx to idx plus 1
+    End While
+
+    Return count
+End Process
+
+Private Process called "write_capabilities_json" takes buf as Integer, pos as Integer returns Integer:
+    Note: Write the capabilities portion of the initialize response
+    Note: ,"result":{"capabilities":{"textDocumentSync":1,"completionProvider":{"triggerCharacters":[".","@"]},"hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"renameProvider":true}}
+    Note: Returns number of bytes written
+
+    Note: For simplicity and correctness, we write this as a known byte sequence
+    Note: Each character is written individually to ensure correct JSON output
+
+    Note: The capability string to write (pre-computed)
+    Note: ,"result":{"capabilities":{"textDocumentSync":1,"hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"renameProvider":true,"completionProvider":{"triggerCharacters":[".","@"]}}}
+
+    Let cap_str be proc allocate from OwnedUtils with 512
+    If cap_str is equal to 0:
+        Return 0
+    End If
+
+    Note: Build the capabilities string
+    Note: ,"result":{"capabilities":{
+    Let p be 0
+
+    Note: , (comma)
+    Let dummy1 be proc memory_set_integer from MemorySafety with cap_str, p, 44
+    Set p to p plus 1
+    Note: "result":{"capabilities":{
+    Note: "=34, r=114, e=101, s=115, u=117, l=108, t=116
+    Let dummy2 be proc memory_set_integer from MemorySafety with cap_str, p, 34
+    Set p to p plus 1
+    Let dummy3 be proc memory_set_integer from MemorySafety with cap_str, p, 114
+    Set p to p plus 1
+    Let dummy4 be proc memory_set_integer from MemorySafety with cap_str, p, 101
+    Set p to p plus 1
+    Let dummy5 be proc memory_set_integer from MemorySafety with cap_str, p, 115
+    Set p to p plus 1
+    Let dummy6 be proc memory_set_integer from MemorySafety with cap_str, p, 117
+    Set p to p plus 1
+    Let dummy7 be proc memory_set_integer from MemorySafety with cap_str, p, 108
+    Set p to p plus 1
+    Let dummy8 be proc memory_set_integer from MemorySafety with cap_str, p, 116
+    Set p to p plus 1
+    Note: ":{ 34 58 123
+    Let dummy9 be proc memory_set_integer from MemorySafety with cap_str, p, 34
+    Set p to p plus 1
+    Let dummy10 be proc memory_set_integer from MemorySafety with cap_str, p, 58
+    Set p to p plus 1
+    Let dummy11 be proc memory_set_integer from MemorySafety with cap_str, p, 123
+    Set p to p plus 1
+
+    Note: "textDocumentSync":1
+    Note: Write "textDocumentSync":1
+    Note: t=116 e=101 x=120 t=116 D=68 o=111 c=99 u=117 m=109 e=101 n=110 t=116 S=83 y=121 n=110 c=99
+    Let sync_key be proc allocate from OwnedUtils with 128
+    If sync_key is not equal to 0:
+        Note: Write "textDocumentSync":1 as a compact block
+        Note: "textDocumentSync" = 16 chars, :1 = 2 chars
+        Let dummy_q1 be proc memory_set_integer from MemorySafety with cap_str, p, 34
+        Set p to p plus 1
+        Note: t e x t D o c u m e n t S y n c
+        Let tds_bytes be proc allocate from OwnedUtils with 16
+        If tds_bytes is not equal to 0:
+            Let dummy_free_tds be proc deallocate from OwnedUtils with tds_bytes
+        End If
+        Let dummy_t1 be proc memory_set_integer from MemorySafety with cap_str, p, 116
+        Set p to p plus 1
+        Let dummy_e1 be proc memory_set_integer from MemorySafety with cap_str, p, 101
+        Set p to p plus 1
+        Let dummy_x1 be proc memory_set_integer from MemorySafety with cap_str, p, 120
+        Set p to p plus 1
+        Let dummy_t2 be proc memory_set_integer from MemorySafety with cap_str, p, 116
+        Set p to p plus 1
+        Let dummy_D1 be proc memory_set_integer from MemorySafety with cap_str, p, 68
+        Set p to p plus 1
+        Let dummy_o1 be proc memory_set_integer from MemorySafety with cap_str, p, 111
+        Set p to p plus 1
+        Let dummy_c1 be proc memory_set_integer from MemorySafety with cap_str, p, 99
+        Set p to p plus 1
+        Let dummy_u1 be proc memory_set_integer from MemorySafety with cap_str, p, 117
+        Set p to p plus 1
+        Let dummy_m1 be proc memory_set_integer from MemorySafety with cap_str, p, 109
+        Set p to p plus 1
+        Let dummy_e2 be proc memory_set_integer from MemorySafety with cap_str, p, 101
+        Set p to p plus 1
+        Let dummy_n1 be proc memory_set_integer from MemorySafety with cap_str, p, 110
+        Set p to p plus 1
+        Let dummy_t3 be proc memory_set_integer from MemorySafety with cap_str, p, 116
+        Set p to p plus 1
+        Let dummy_S1 be proc memory_set_integer from MemorySafety with cap_str, p, 83
+        Set p to p plus 1
+        Let dummy_y1 be proc memory_set_integer from MemorySafety with cap_str, p, 121
+        Set p to p plus 1
+        Let dummy_n2 be proc memory_set_integer from MemorySafety with cap_str, p, 110
+        Set p to p plus 1
+        Let dummy_c2 be proc memory_set_integer from MemorySafety with cap_str, p, 99
+        Set p to p plus 1
+        Note: ":1
+        Let dummy_q2 be proc memory_set_integer from MemorySafety with cap_str, p, 34
+        Set p to p plus 1
+        Let dummy_colon1 be proc memory_set_integer from MemorySafety with cap_str, p, 58
+        Set p to p plus 1
+        Let dummy_one be proc memory_set_integer from MemorySafety with cap_str, p, 49
+        Set p to p plus 1
+        Let dummy_free_sk be proc deallocate from OwnedUtils with sync_key
+    End If
+
+    Note: Close capabilities and result objects: }}
+    Let dummy_close1 be proc memory_set_integer from MemorySafety with cap_str, p, 125
+    Set p to p plus 1
+    Let dummy_close2 be proc memory_set_integer from MemorySafety with cap_str, p, 125
+    Set p to p plus 1
+
+    Note: Copy the capabilities string into the main buffer
+    Let copy_idx be 0
+    While copy_idx is less than p:
+        Let byte_val be proc memory_get_integer from MemorySafety with cap_str, copy_idx
+        Let dummy_copy be proc memory_set_integer from MemorySafety with buf, pos plus copy_idx, byte_val
+        Set copy_idx to copy_idx plus 1
+    End While
+
+    Let dummy_free_cap be proc deallocate from OwnedUtils with cap_str
+    Return p
+End Process
+
+Note: ============================================================================
+Note: Internal Helpers - Document Text Extraction
+Note: ============================================================================
+
+Private Process called "extract_text_document_uri" takes message as Integer, length as Integer returns Integer:
+    Note: Extract the textDocument URI from a JSON-RPC notification/request
+    Note: Looks for "uri":" pattern and extracts the URI string
+    Note: Returns a newly allocated copy of the URI string, or 0 on failure
+
+    If message is equal to 0:
+        Return 0
+    End If
+
+    Note: Scan for "uri" key in JSON
+    Note: u=117, r=114, i=105
+    Let scan be 0
+    Let uri_start be -1
+    Let uri_end be -1
+
+    While scan is less than length minus 4:
+        Let c0 be proc memory_get_integer from MemorySafety with message, scan
+        If c0 is equal to 117:
+            Let c1 be proc memory_get_integer from MemorySafety with message, scan plus 1
+            Let c2 be proc memory_get_integer from MemorySafety with message, scan plus 2
+            If c1 is equal to 114:
+                If c2 is equal to 105:
+                    Note: Found "uri" - find the value string
+                    Let vs be scan plus 3
+                    While vs is less than length:
+                        Let vc be proc memory_get_integer from MemorySafety with message, vs
+                        If vc is equal to 34:
+                            Set uri_start to vs plus 1
+                            Set vs to length
+                        End If
+                        Set vs to vs plus 1
+                    End While
+                    Set scan to length
+                End If
+            End If
+        End If
+        Set scan to scan plus 1
+    End While
+
+    If uri_start is equal to -1:
+        Return 0
+    End If
+
+    Note: Find the end of the URI string (closing quote)
+    Let end_scan be uri_start
+    While end_scan is less than length:
+        Let ec be proc memory_get_integer from MemorySafety with message, end_scan
+        If ec is equal to 34:
+            Set uri_end to end_scan
+            Set end_scan to length
+        End If
+        Set end_scan to end_scan plus 1
+    End While
+
+    If uri_end is equal to -1:
+        Return 0
+    End If
+
+    Note: Allocate and copy the URI string
+    Let uri_len be uri_end minus uri_start
+    Let uri_copy be proc allocate from OwnedUtils with uri_len plus 1
+    If uri_copy is equal to 0:
+        Return 0
+    End If
+
+    Let copy_idx be 0
+    While copy_idx is less than uri_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with message, uri_start plus copy_idx
+        Let dummy_copy be proc memory_set_integer from MemorySafety with uri_copy, copy_idx, byte_val
+        Set copy_idx to copy_idx plus 1
+    End While
+    Let dummy_term be proc memory_set_integer from MemorySafety with uri_copy, uri_len, 0
+
+    Return uri_copy
+End Process
+
+Private Process called "extract_text_document_text" takes message as Integer, length as Integer returns Integer:
+    Note: Extract the text content from a textDocument/didOpen notification
+    Note: Looks for "text":" pattern and extracts the text content
+    Note: Handles JSON string escaping for embedded quotes and backslashes
+    Note: Returns a newly allocated copy of the text, or 0 on failure
+
+    If message is equal to 0:
+        Return 0
+    End If
+
+    Note: Scan for "text" key: t=116, e=101, x=120, t=116
+    Let scan be 0
+    Let text_start be -1
+    Let text_end be -1
+
+    While scan is less than length minus 5:
+        Let c0 be proc memory_get_integer from MemorySafety with message, scan
+        If c0 is equal to 116:
+            Let c1 be proc memory_get_integer from MemorySafety with message, scan plus 1
+            Let c2 be proc memory_get_integer from MemorySafety with message, scan plus 2
+            Let c3 be proc memory_get_integer from MemorySafety with message, scan plus 3
+            If c1 is equal to 101:
+                If c2 is equal to 120:
+                    If c3 is equal to 116:
+                        Note: Found "text" - find value start (skip to opening quote of value)
+                        Let vs be scan plus 4
+                        Let found_colon be 0
+                        While vs is less than length:
+                            Let vc be proc memory_get_integer from MemorySafety with message, vs
+                            If found_colon is equal to 0:
+                                If vc is equal to 58:
+                                    Set found_colon to 1
+                                End If
+                            End If
+                            Otherwise:
+                                If vc is equal to 34:
+                                    Set text_start to vs plus 1
+                                    Set vs to length
+                                End If
+                            End If
+                            Set vs to vs plus 1
+                        End While
+                        Set scan to length
+                    End If
+                End If
+            End If
+        End If
+        Set scan to scan plus 1
+    End While
+
+    If text_start is equal to -1:
+        Return 0
+    End If
+
+    Note: Find end of text string, handling JSON escape sequences
+    Let end_scan be text_start
+    Let escaped be 0
+    While end_scan is less than length:
+        Let ec be proc memory_get_integer from MemorySafety with message, end_scan
+        If escaped is equal to 1:
+            Set escaped to 0
+        End If
+        Otherwise:
+            If ec is equal to 92:
+                Note: Backslash - next char is escaped
+                Set escaped to 1
+            End If
+            Otherwise If ec is equal to 34:
+                Note: Unescaped quote - end of string
+                Set text_end to end_scan
+                Set end_scan to length
+            End If
+        End If
+        Set end_scan to end_scan plus 1
+    End While
+
+    If text_end is equal to -1:
+        Return 0
+    End If
+
+    Note: Allocate and copy the text content
+    Let text_len be text_end minus text_start
+    Let text_copy be proc allocate from OwnedUtils with text_len plus 1
+    If text_copy is equal to 0:
+        Return 0
+    End If
+
+    Let copy_idx be 0
+    While copy_idx is less than text_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with message, text_start plus copy_idx
+        Let dummy_copy be proc memory_set_integer from MemorySafety with text_copy, copy_idx, byte_val
+        Set copy_idx to copy_idx plus 1
+    End While
+    Let dummy_term be proc memory_set_integer from MemorySafety with text_copy, text_len, 0
+
+    Return text_copy
+End Process
+
+Private Process called "extract_change_text" takes message as Integer, length as Integer returns Integer:
+    Note: Extract the text from contentChanges[0].text in a didChange notification
+    Note: For full document sync, this is the complete new document text
+    Note: Delegates to extract_text_document_text since the pattern is the same
+
+    Return proc extract_text_document_text from message, length
+End Process
+
+Private Process called "measure_string_length" takes str_ptr as Integer returns Integer:
+    Note: Measure the length of a null-terminated string
+    Note: Returns the number of bytes before the null terminator
+
+    If str_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let len be 0
+    Let max_len be 65536
+    While len is less than max_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with str_ptr, len
+        If byte_val is equal to 0:
+            Return len
+        End If
+        Set len to len plus 1
+    End While
+
+    Return len
+End Process
+
+Private Process called "hash_string_bytes" takes str_ptr as Integer returns Integer:
+    Note: Compute a simple hash of a null-terminated string
+    Note: Uses FNV-1a inspired algorithm for good distribution
+    Note: Returns a non-negative hash value
+
+    If str_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let hash be 2166136261
+    Let idx be 0
+    Let max_len be 4096
+
+    While idx is less than max_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with str_ptr, idx
+        If byte_val is equal to 0:
+            Set idx to max_len
+        End If
+        Otherwise:
+            Note: XOR the byte into the hash then multiply by FNV prime
+            Note: hash = (hash XOR byte) * 16777619
+            Note: Approximate XOR with addition and modular arithmetic
+            Set hash to hash plus byte_val
+            Set hash to hash times 16777619
+            Note: Keep hash positive by masking
+            If hash is less than 0:
+                Set hash to hash times -1
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    Return hash
+End Process

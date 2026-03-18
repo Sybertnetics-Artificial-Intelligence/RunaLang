@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,757 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles PowerPC assembly code generation and assembly output.
+PowerPC Assembly Generator - LIR to PowerPC Assembly Text
+
+This file translates LIR instructions into PowerPC assembly text following
+the GNU assembler (gas) syntax. It generates ELF ABI-compliant code with
+proper function prologues/epilogues, link register management, and stack
+frame construction.
 
 This file performs the following tasks:
-- Process PowerPC assembly code generation and assembly output formatting
-- Handle PowerPC assembly optimization and assembly code optimization
-- Manage PowerPC assembly validation and assembly code verification
-- Process PowerPC assembly debugging and assembly code debugging
+- Generate PowerPC assembly for complete LIR modules
+- Emit function prologues (STWU stack adjustment, MFLR/STW LR save, save callee-saved)
+- Emit function epilogues (restore callee-saved, LWZ/MTLR LR restore, BLR return)
+- Translate all LIR instructions to PowerPC assembly equivalents
+- Handle ELF ABI argument passing (r3-r10 for integers, f1-f8 for floats)
+- Generate .data, .rodata, and .bss sections
+- Emit proper alignment and linkage directives
 
 This file is essential because of the following reasons:
-- PowerPC assembly generation enables native PowerPC code output
-- Proper assembly handling ensures correct and efficient PowerPC code generation
-- PowerPC support enables Runa compilation for PowerPC platforms
+- PowerPC assembly generation enables Runa compilation for PowerPC platforms
+- ELF ABI compliance ensures correct function calls and C interop
+- Link register management is critical for correct call/return semantics
+- Stack frame layout differs from x86/MIPS and must follow PowerPC conventions
 
 This file consists of the following functions/features/operation types:
-- PowerPC assembly code generation and assembly output formatting
-- PowerPC assembly optimization and assembly code optimization
-- PowerPC assembly validation and assembly code verification
-- PowerPC assembly debugging and assembly code debugging
+- Assembly generation context management
+- GPR/FPR name lookup
+- Function prologue/epilogue generation (PowerPC ELF ABI)
+- LIR to PowerPC instruction translation
+- Data section emission
+- Compare-and-branch instruction sequences
+
+Dependencies:
+- Imports LIR types for instructions, operands, functions, blocks
+- Imports machine_code_interface for AssemblyOutput buffer management
+- Imports register allocator for register naming and state
+- Imports Layout for memory allocation
 :End Note
 
-Note: TODO - Implement PowerPC assembly generator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/backend/machine_code/powerpc/register_allocator.runa" as PPCRegs
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: POWERPC ASSEMBLY GENERATION CONTEXT
+Note: ============================================================================
+
+Type called "PPCAsmContext":
+    output as Integer              Note: Pointer to AssemblyOutput buffer
+    config as Integer              Note: Pointer to BackendConfig
+    current_function as Integer    Note: Pointer to current LIRFunction
+    reg_state as Integer           Note: Pointer to PPCRegAllocState
+    frame_size as Integer          Note: Total stack frame size in bytes
+    has_calls as Integer           Note: 1 if current function calls others
+    error_count as Integer         Note: Error counter
+    label_counter as Integer       Note: Unique label counter
+End Type
+
+Note: Size: 8 fields * 8 bytes = 64 bytes
+
+Note: ============================================================================
+Note: CONTEXT CREATION
+Note: ============================================================================
+
+Process called "create_ppc_asm_context" that takes output as Integer, config as Integer returns Integer:
+    Let ctx be Layout.allocate(64)
+    If ctx equals 0:
+        Display "create_ppc_asm_context: allocation failed"
+        Return 0
+    End If
+
+    Let reg_state be PPCRegs.create_ppc_reg_alloc_state()
+    If reg_state equals 0:
+        Display "create_ppc_asm_context: register state allocation failed"
+        Return 0
+    End If
+
+    __store(ctx, 0, output)
+    __store(ctx, 8, config)
+    __store(ctx, 16, 0)
+    __store(ctx, 24, reg_state)
+    __store(ctx, 32, 0)
+    __store(ctx, 40, 0)
+    __store(ctx, 48, 0)
+    __store(ctx, 56, 0)
+
+    Return ctx
+End Process
+
+Process called "get_output" that takes ctx as Integer returns Integer:
+    Return __load(ctx, 0)
+End Process
+
+Process called "get_next_label" that takes ctx as Integer returns Integer:
+    Let counter be __load(ctx, 56)
+    __store(ctx, 56, counter + 1)
+    Return counter
+End Process
+
+Note: ============================================================================
+Note: ASSEMBLY OUTPUT HELPERS
+Note: ============================================================================
+
+Process called "emit_line" that takes ctx as Integer, text as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, text)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_indented" that takes ctx as Integer, text as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, text)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_label" that takes ctx as Integer, name as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, name)
+    MachineCode.emit_text(output, ":\n")
+    Return 1
+End Process
+
+Process called "emit_comment" that takes ctx as Integer, text as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t# ")
+    MachineCode.emit_text(output, text)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_directive" that takes ctx as Integer, directive as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, directive)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: FUNCTION PROLOGUE AND EPILOGUE
+Note: ============================================================================
+
+Process called "emit_function_prologue" that takes ctx as Integer, func_name as Integer, frame_size as Integer, has_calls as Integer returns Integer:
+    @Reasoning
+    Generates the PowerPC ELF ABI function prologue. The standard prologue:
+    1. STWU r1, -framesize(r1)  - allocate stack frame (atomic push)
+    2. MFLR r0                   - read LR into r0 (if non-leaf)
+    3. STW r0, framesize+4(r1)   - save LR on stack (in caller's frame)
+    4. Save callee-saved GPRs    - STW r14-r31 as needed
+
+    PowerPC ELF stack frame layout (growing downward):
+      [caller's frame]
+      LR save word (at old_SP + 4)
+      Back chain (at old_SP + 0)  -- r1 always points here
+      [callee's local storage]
+      [callee-saved register save area]
+      [parameter save area - 8 words = 32 bytes minimum]
+      [current r1 points here]
+
+    Frame size must be 16-byte aligned per ELF ABI.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+
+    Note: Emit function directives
+    emit_directive(ctx, ".text")
+    emit_directive(ctx, ".align 2")
+
+    MachineCode.emit_text(output, "\t.globl ")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, "\n")
+
+    MachineCode.emit_text(output, "\t.type ")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, ", @function\n")
+
+    emit_label(ctx, func_name)
+
+    Note: Ensure 16-byte alignment
+    Let aligned_frame be frame_size
+    Let remainder be aligned_frame - ((aligned_frame / 16) * 16)
+    If remainder does not equal 0:
+        Set aligned_frame to aligned_frame + (16 - remainder)
+    End If
+
+    __store(ctx, 32, aligned_frame)
+
+    Note: STWU r1, -framesize(r1) - allocate frame and set back chain
+    MachineCode.emit_text(output, "\tstwu r1, -")
+    MachineCode.emit_int(output, aligned_frame)
+    MachineCode.emit_text(output, "(r1)\n")
+
+    Note: Save LR if function makes calls
+    If has_calls equals 1:
+        emit_indented(ctx, "mflr r0")
+        MachineCode.emit_text(output, "\tstw r0, ")
+        MachineCode.emit_int(output, aligned_frame + 4)
+        MachineCode.emit_text(output, "(r1)\n")
+    End If
+
+    Note: Save callee-saved GPRs
+    Let reg_state be __load(ctx, 24)
+    Let saved_count be PPCRegs.get_callee_saved_gpr_count(reg_state)
+    Let save_idx be 0
+    While save_idx is less than saved_count:
+        Let save_reg be PPCRegs.get_callee_saved_gpr_by_index(reg_state, save_idx)
+        If save_reg is greater than or equal to 0:
+            Let reg_name be PPCRegs.get_gpr_name(save_reg)
+            Let save_offset be aligned_frame - 4 - ((save_idx + 1) * 4)
+            MachineCode.emit_text(output, "\tstw ")
+            MachineCode.emit_text(output, reg_name)
+            MachineCode.emit_text(output, ", ")
+            MachineCode.emit_int(output, save_offset)
+            MachineCode.emit_text(output, "(r1)\n")
+        End If
+        Set save_idx to save_idx + 1
+    End While
+
+    Return 1
+End Process
+
+Process called "emit_function_epilogue" that takes ctx as Integer, func_name as Integer, has_calls as Integer returns Integer:
+    @Reasoning
+    Generates the PowerPC ELF ABI function epilogue:
+    1. Restore callee-saved GPRs in reverse order
+    2. LWZ r0, framesize+4(r1) - load saved LR (if non-leaf)
+    3. MTLR r0                  - restore LR
+    4. ADDI r1, r1, framesize   - deallocate frame
+    5. BLR                       - return to caller
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let aligned_frame be __load(ctx, 32)
+    Let reg_state be __load(ctx, 24)
+
+    Note: Restore callee-saved GPRs in reverse order
+    Let saved_count be PPCRegs.get_callee_saved_gpr_count(reg_state)
+    Let restore_idx be saved_count - 1
+    While restore_idx is greater than or equal to 0:
+        Let restore_reg be PPCRegs.get_callee_saved_gpr_by_index(reg_state, restore_idx)
+        If restore_reg is greater than or equal to 0:
+            Let reg_name be PPCRegs.get_gpr_name(restore_reg)
+            Let restore_offset be aligned_frame - 4 - ((restore_idx + 1) * 4)
+            MachineCode.emit_text(output, "\tlwz ")
+            MachineCode.emit_text(output, reg_name)
+            MachineCode.emit_text(output, ", ")
+            MachineCode.emit_int(output, restore_offset)
+            MachineCode.emit_text(output, "(r1)\n")
+        End If
+        Set restore_idx to restore_idx - 1
+    End While
+
+    Note: Restore LR if saved
+    If has_calls equals 1:
+        MachineCode.emit_text(output, "\tlwz r0, ")
+        MachineCode.emit_int(output, aligned_frame + 4)
+        MachineCode.emit_text(output, "(r1)\n")
+        emit_indented(ctx, "mtlr r0")
+    End If
+
+    Note: Deallocate frame
+    MachineCode.emit_text(output, "\taddi r1, r1, ")
+    MachineCode.emit_int(output, aligned_frame)
+    MachineCode.emit_text(output, "\n")
+
+    Note: Return
+    emit_indented(ctx, "blr")
+
+    Note: Function size directive
+    MachineCode.emit_text(output, "\t.size ")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, ", .-")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, "\n\n")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: INSTRUCTION EMISSION HELPERS
+Note: ============================================================================
+
+Process called "emit_alu_rrr" that takes ctx as Integer, mnemonic as Integer, rt as Integer, ra as Integer, rb as Integer returns Integer:
+    @Reasoning
+    Emits a three-register ALU instruction: mnemonic rt, ra, rb
+    Example: "add r3, r4, r5"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(rt))
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(ra))
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(rb))
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_alu_rri" that takes ctx as Integer, mnemonic as Integer, rt as Integer, ra as Integer, immediate as Integer returns Integer:
+    @Reasoning
+    Emits a register-register-immediate ALU instruction: mnemonic rt, ra, imm
+    Example: "addi r3, r4, 42"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(rt))
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(ra))
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, immediate)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_load_store" that takes ctx as Integer, mnemonic as Integer, rt as Integer, offset as Integer, ra as Integer returns Integer:
+    @Reasoning
+    Emits a load or store instruction: mnemonic rt, offset(ra)
+    Example: "lwz r3, 16(r1)"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(rt))
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, offset)
+    MachineCode.emit_text(output, "(")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(ra))
+    MachineCode.emit_text(output, ")\n")
+    Return 1
+End Process
+
+Process called "emit_cmp_rr" that takes ctx as Integer, mnemonic as Integer, bf as Integer, ra as Integer, rb as Integer returns Integer:
+    @Reasoning
+    Emits a compare instruction: mnemonic bf, ra, rb
+    Example: "cmpw cr0, r3, r4"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " cr")
+    MachineCode.emit_int(output, bf)
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(ra))
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(rb))
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_branch_cond" that takes ctx as Integer, mnemonic as Integer, label as Integer returns Integer:
+    @Reasoning
+    Emits a conditional branch to a label: mnemonic label
+    Example: "beq .L_target"
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\t")
+    MachineCode.emit_text(output, mnemonic)
+    MachineCode.emit_text(output, " ")
+    MachineCode.emit_text(output, label)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_branch" that takes ctx as Integer, label as Integer returns Integer:
+    Note: Emits unconditional branch: b label
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\tb ")
+    MachineCode.emit_text(output, label)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_call" that takes ctx as Integer, func_name as Integer returns Integer:
+    Note: Emits function call: bl func_name
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\tbl ")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_li" that takes ctx as Integer, rt as Integer, value as Integer returns Integer:
+    @Reasoning
+    Emits a load immediate pseudo-instruction. The assembler handles
+    expansion to lis+ori for large values.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\tli ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(rt))
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_int(output, value)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_mr" that takes ctx as Integer, ra as Integer, rs as Integer returns Integer:
+    Note: Emits move register: mr ra, rs (pseudo for or ra, rs, rs)
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "\tmr ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(ra))
+    MachineCode.emit_text(output, ", ")
+    MachineCode.emit_text(output, PPCRegs.get_gpr_name(rs))
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "emit_syscall" that takes ctx as Integer returns Integer:
+    emit_indented(ctx, "sc")
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: DATA SECTION EMISSION
+Note: ============================================================================
+
+Process called "emit_data_section" that takes ctx as Integer returns Integer:
+    emit_directive(ctx, ".data")
+    emit_directive(ctx, ".align 2")
+    Return 1
+End Process
+
+Process called "emit_rodata_section" that takes ctx as Integer returns Integer:
+    emit_directive(ctx, ".section .rodata")
+    emit_directive(ctx, ".align 2")
+    Return 1
+End Process
+
+Process called "emit_string_literal" that takes ctx as Integer, label as Integer, value as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    emit_label(ctx, label)
+    MachineCode.emit_text(output, "\t.asciz \"")
+    MachineCode.emit_text(output, value)
+    MachineCode.emit_text(output, "\"\n")
+    Return 1
+End Process
+
+Process called "emit_word_data" that takes ctx as Integer, label as Integer, value as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    emit_label(ctx, label)
+    MachineCode.emit_text(output, "\t.long ")
+    MachineCode.emit_int(output, value)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LIR INSTRUCTION TRANSLATION
+Note: ============================================================================
+
+Process called "translate_lir_instruction" that takes ctx as Integer, instr as Integer returns Integer:
+    @Reasoning
+    Dispatches a single LIR instruction to the appropriate PowerPC assembly
+    emitter. PowerPC uses compare-then-branch (cmpw + beq/bne/blt/bgt)
+    instead of fused compare-and-branch like some other architectures.
+
+    PowerPC arithmetic note: SUBF has reversed operand order (rt = rb - ra),
+    so for LIR_OP_SUB (dest = src1 - src2) we emit SUBF dest, src2, src1.
+    @End Reasoning
+
+    Let opcode be LIRNodes.get_opcode(instr)
+
+    Note: LIR_OP_ADD (30001)
+    If opcode equals 30001:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "add", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_SUB (30002) - PowerPC SUBF has reversed operands
+    If opcode equals 30002:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Note: subf dest, src2, src1 computes src1 - src2
+        Return emit_alu_rrr(ctx, "subf", dest, src2, src1)
+    End If
+
+    Note: LIR_OP_MUL (30003)
+    If opcode equals 30003:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "mullw", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_DIV (30004)
+    If opcode equals 30004:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "divw", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_MOD (30005) - PowerPC has no MOD; compute as a - (a/b)*b
+    If opcode equals 30005:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Note: Use r0 as temporary: r0 = src1 / src2
+        emit_alu_rrr(ctx, "divw", 0, src1, src2)
+        Note: r0 = r0 * src2
+        emit_alu_rrr(ctx, "mullw", 0, 0, src2)
+        Note: dest = src1 - r0
+        Return emit_alu_rrr(ctx, "subf", dest, 0, src1)
+    End If
+
+    Note: LIR_OP_AND (30006)
+    If opcode equals 30006:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "and", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_OR (30007)
+    If opcode equals 30007:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "or", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_XOR (30008)
+    If opcode equals 30008:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "xor", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_SHL (30009)
+    If opcode equals 30009:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "slw", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_SHR (30010)
+    If opcode equals 30010:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "srw", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_SAR (30011)
+    If opcode equals 30011:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Return emit_alu_rrr(ctx, "sraw", dest, src1, src2)
+    End If
+
+    Note: LIR_OP_LOAD (30020)
+    If opcode equals 30020:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let base be LIRNodes.get_src1_reg(instr)
+        Let offset be LIRNodes.get_immediate(instr)
+        Return emit_load_store(ctx, "lwz", dest, offset, base)
+    End If
+
+    Note: LIR_OP_STORE (30021)
+    If opcode equals 30021:
+        Let src be LIRNodes.get_src1_reg(instr)
+        Let base be LIRNodes.get_src2_reg(instr)
+        Let offset be LIRNodes.get_immediate(instr)
+        Return emit_load_store(ctx, "stw", src, offset, base)
+    End If
+
+    Note: LIR_OP_MOV (30030)
+    If opcode equals 30030:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src be LIRNodes.get_src1_reg(instr)
+        Return emit_mr(ctx, dest, src)
+    End If
+
+    Note: LIR_OP_LOAD_IMM (30031)
+    If opcode equals 30031:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let imm be LIRNodes.get_immediate(instr)
+        Return emit_li(ctx, dest, imm)
+    End If
+
+    Note: LIR_OP_CMP_EQ (30040) - compare and branch if equal
+    If opcode equals 30040:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        emit_cmp_rr(ctx, "cmpw", 0, src1, src2)
+        Return emit_branch_cond(ctx, "beq", target)
+    End If
+
+    Note: LIR_OP_CMP_NE (30041)
+    If opcode equals 30041:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        emit_cmp_rr(ctx, "cmpw", 0, src1, src2)
+        Return emit_branch_cond(ctx, "bne", target)
+    End If
+
+    Note: LIR_OP_CMP_LT (30042)
+    If opcode equals 30042:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        emit_cmp_rr(ctx, "cmpw", 0, src1, src2)
+        Return emit_branch_cond(ctx, "blt", target)
+    End If
+
+    Note: LIR_OP_CMP_LE (30043)
+    If opcode equals 30043:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        emit_cmp_rr(ctx, "cmpw", 0, src1, src2)
+        Return emit_branch_cond(ctx, "ble", target)
+    End If
+
+    Note: LIR_OP_CMP_GT (30044)
+    If opcode equals 30044:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        emit_cmp_rr(ctx, "cmpw", 0, src1, src2)
+        Return emit_branch_cond(ctx, "bgt", target)
+    End If
+
+    Note: LIR_OP_CMP_GE (30045)
+    If opcode equals 30045:
+        Let src1 be LIRNodes.get_src1_reg(instr)
+        Let src2 be LIRNodes.get_src2_reg(instr)
+        Let target be LIRNodes.get_branch_target(instr)
+        emit_cmp_rr(ctx, "cmpw", 0, src1, src2)
+        Return emit_branch_cond(ctx, "bge", target)
+    End If
+
+    Note: LIR_OP_JUMP (30050)
+    If opcode equals 30050:
+        Let target be LIRNodes.get_branch_target(instr)
+        Return emit_branch(ctx, target)
+    End If
+
+    Note: LIR_OP_CALL (30060)
+    If opcode equals 30060:
+        Let target be LIRNodes.get_call_target(instr)
+        Return emit_call(ctx, target)
+    End If
+
+    Note: LIR_OP_RET (30070)
+    If opcode equals 30070:
+        Note: Return value should already be in r3
+        Note: Epilogue handles BLR
+        Return 1
+    End If
+
+    Note: LIR_OP_SYSCALL (30080)
+    If opcode equals 30080:
+        Return emit_syscall(ctx)
+    End If
+
+    Note: LIR_OP_NOP (30090)
+    If opcode equals 30090:
+        Return emit_indented(ctx, "nop")
+    End If
+
+    emit_comment(ctx, "unhandled LIR opcode")
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: MODULE-LEVEL GENERATION
+Note: ============================================================================
+
+Process called "generate_ppc_assembly" that takes ctx as Integer, lir_module as Integer returns Integer:
+    @Reasoning
+    Top-level entry point that generates PowerPC assembly for an entire LIR module.
+    Processes all functions, emitting prologues, instructions, and epilogues.
+    @End Reasoning
+
+    emit_comment(ctx, "Generated by Runa compiler - PowerPC ELF ABI")
+
+    emit_directive(ctx, ".text")
+
+    Let func_count be LIR.get_function_count(lir_module)
+    Let func_idx be 0
+    While func_idx is less than func_count:
+        Let func be LIR.get_function(lir_module, func_idx)
+        If func does not equal 0:
+            Let reg_state be __load(ctx, 24)
+            PPCRegs.reset_allocation(reg_state)
+
+            Let func_name be LIR.get_function_name(func)
+            Let frame_size_val be LIR.get_frame_size(func)
+            Let has_calls_val be LIR.get_has_calls(func)
+
+            __store(ctx, 16, func)
+            __store(ctx, 40, has_calls_val)
+
+            Note: Minimum frame size: 8 bytes back chain + LR save area
+            If frame_size_val is less than 64:
+                Set frame_size_val to 64
+            End If
+
+            emit_function_prologue(ctx, func_name, frame_size_val, has_calls_val)
+
+            Let block_count be LIR.get_block_count(func)
+            Let block_idx be 0
+            While block_idx is less than block_count:
+                Let block be LIR.get_block(func, block_idx)
+                If block does not equal 0:
+                    Let block_label be LIR.get_block_label(block)
+                    If block_idx is greater than 0:
+                        emit_label(ctx, block_label)
+                    End If
+
+                    Let instr_count be LIR.get_instruction_count(block)
+                    Let instr_idx be 0
+                    While instr_idx is less than instr_count:
+                        Let instr be LIR.get_instruction(block, instr_idx)
+                        If instr does not equal 0:
+                            translate_lir_instruction(ctx, instr)
+                        End If
+                        Set instr_idx to instr_idx + 1
+                    End While
+                End If
+                Set block_idx to block_idx + 1
+            End While
+
+            emit_function_epilogue(ctx, func_name, has_calls_val)
+        End If
+        Set func_idx to func_idx + 1
+    End While
+
+    Return 1
+End Process

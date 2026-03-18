@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,644 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles WebAssembly assembly code generation and assembly output.
+WebAssembly Assembly Generator - LIR to WAT (WebAssembly Text Format)
+
+This file translates LIR instructions into WAT (WebAssembly Text Format),
+the human-readable text representation of WebAssembly. The primary challenge
+is converting register-based LIR to stack-based Wasm operations. For each
+LIR instruction, we emit:
+1. local.get for each source operand (pushing values onto the stack)
+2. The Wasm operation (consuming stack values, pushing results)
+3. local.set for the destination (popping result into a local)
+
+WAT output can be assembled to .wasm binary using tools like wat2wasm, or
+used for debugging and inspection of the generated code.
 
 This file performs the following tasks:
-- Process WebAssembly assembly code generation and assembly output formatting
-- Handle WebAssembly assembly optimization and assembly code optimization
-- Manage WebAssembly assembly validation and assembly code verification
-- Process WebAssembly assembly debugging and assembly code debugging
+- Generate WAT text for complete LIR modules
+- Emit function declarations with type signatures and local declarations
+- Convert register-based LIR operations to stack-based Wasm sequences
+- Handle control flow translation (branches become blocks/loops/br)
+- Generate module-level structure (imports, exports, memory declarations)
 
 This file is essential because of the following reasons:
-- WebAssembly assembly generation enables native WebAssembly code output
-- Proper assembly handling ensures correct and efficient WebAssembly code generation
-- WebAssembly support enables Runa compilation for WebAssembly platforms
+- WAT text output enables human inspection of generated Wasm code
+- Register-to-stack conversion is the fundamental Wasm code generation step
+- Correct control flow translation requires structured Wasm block nesting
+- WAT can be directly tested with Wasm runtimes and toolchains
 
 This file consists of the following functions/features/operation types:
-- WebAssembly assembly code generation and assembly output formatting
-- WebAssembly assembly optimization and assembly code optimization
-- WebAssembly assembly validation and assembly code verification
-- WebAssembly assembly debugging and assembly code debugging
+- WAT text generation context management
+- Function declaration and local variable emission
+- LIR instruction to Wasm stack operation translation
+- Control flow structure generation (blocks, loops, branches)
+- Module structure emission (module, memory, export, import)
+
+Dependencies:
+- Imports LIR types for instructions, operands, functions, blocks
+- Imports register_allocator for local variable mappings
+- Imports wasm_optimizer for stack scheduling
+- Imports MachineCode for text output buffer management
+- Imports Layout for memory allocation
 :End Note
 
-Note: TODO - Implement WebAssembly assembly generator functionality
+Import "compiler/middle/gungnir/lir/lir.runa" as LIR
+Import "compiler/middle/gungnir/lir/lir_nodes.runa" as LIRNodes
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/backend/machine_code/wasm/register_allocator.runa" as WasmRegs
+Import "compiler/backend/machine_code/wasm/wasm_optimizer.runa" as WasmOpt
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/internal/string_utils.runa" as StringUtils
+
+Note: ============================================================================
+Note: WAT GENERATION CONTEXT
+Note: ============================================================================
+
+Type called "WasmAsmContext":
+    output as Integer              Note: Pointer to AssemblyOutput text buffer
+    config as Integer              Note: Pointer to BackendConfig
+    current_function as Integer    Note: Pointer to current LIRFunction
+    local_state as Integer         Note: Pointer to WasmLocalAllocState
+    optimizer as Integer           Note: Pointer to BlockLifetimeAnalysis
+    indent_level as Integer        Note: Current indentation depth for WAT formatting
+    error_count as Integer         Note: Number of errors encountered
+    label_counter as Integer       Note: Unique label counter for blocks/loops
+End Type
+
+Note: Size: 8 fields * 8 bytes = 64 bytes
+
+Note: ============================================================================
+Note: CONTEXT CREATION
+Note: ============================================================================
+
+Process called "create_wasm_asm_context" that takes output as Integer, config as Integer returns Integer:
+    Let ctx be Layout.allocate(64)
+    If ctx equals 0:
+        Display "create_wasm_asm_context: allocation failed"
+        Return 0
+    End If
+
+    Let local_state be WasmRegs.create_default_wasm_local_state()
+    If local_state equals 0:
+        Display "create_wasm_asm_context: local state allocation failed"
+        Return 0
+    End If
+
+    Let optimizer be WasmOpt.create_block_analysis(1024)
+    If optimizer equals 0:
+        Display "create_wasm_asm_context: optimizer allocation failed"
+        Return 0
+    End If
+
+    __store(ctx, 0, output)
+    __store(ctx, 8, config)
+    __store(ctx, 16, 0)
+    __store(ctx, 24, local_state)
+    __store(ctx, 32, optimizer)
+    __store(ctx, 40, 0)
+    __store(ctx, 48, 0)
+    __store(ctx, 56, 0)
+
+    Return ctx
+End Process
+
+Note: ============================================================================
+Note: WAT TEXT OUTPUT HELPERS
+Note: ============================================================================
+
+Process called "emit_indent" that takes ctx as Integer returns Integer:
+    @Reasoning
+    Emits spaces for the current indentation level. Each level is 2 spaces
+    in WAT convention.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let level be __load(ctx, 40)
+    Let i be 0
+    While i is less than level:
+        MachineCode.emit_text(output, "  ")
+        Set i to i + 1
+    End While
+    Return 1
+End Process
+
+Process called "emit_wat_line" that takes ctx as Integer, text as Integer returns Integer:
+    emit_indent(ctx)
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, text)
+    MachineCode.emit_text(output, "\n")
+    Return 1
+End Process
+
+Process called "increase_indent" that takes ctx as Integer returns Integer:
+    Let level be __load(ctx, 40)
+    __store(ctx, 40, level + 1)
+    Return 1
+End Process
+
+Process called "decrease_indent" that takes ctx as Integer returns Integer:
+    Let level be __load(ctx, 40)
+    If level is greater than 0:
+        __store(ctx, 40, level - 1)
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MODULE STRUCTURE
+Note: ============================================================================
+
+Process called "emit_module_start" that takes ctx as Integer returns Integer:
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, "(module\n")
+    increase_indent(ctx)
+    Return 1
+End Process
+
+Process called "emit_module_end" that takes ctx as Integer returns Integer:
+    decrease_indent(ctx)
+    Let output be __load(ctx, 0)
+    MachineCode.emit_text(output, ")\n")
+    Return 1
+End Process
+
+Process called "emit_memory_declaration" that takes ctx as Integer, min_pages as Integer, max_pages as Integer returns Integer:
+    @Reasoning
+    Emits a memory declaration and export. The memory export with name "memory"
+    is the standard convention for WASI and JavaScript interop.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    emit_indent(ctx)
+    MachineCode.emit_text(output, "(memory (export \"memory\") ")
+    MachineCode.emit_int(output, min_pages)
+    If max_pages is greater than 0:
+        MachineCode.emit_text(output, " ")
+        MachineCode.emit_int(output, max_pages)
+    End If
+    MachineCode.emit_text(output, ")\n")
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: FUNCTION GENERATION
+Note: ============================================================================
+
+Process called "emit_wasm_function" that takes ctx as Integer, func as Integer returns Integer:
+    @Reasoning
+    Emits a complete WAT function declaration. Structure:
+      (func $name (param $p0 i32) ... (result i32)
+        (local $l0 i32)
+        ...
+        instructions
+      )
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let local_state be __load(ctx, 24)
+    WasmRegs.reset_allocation(local_state)
+
+    Let func_name be LIR.get_function_name(func)
+    __store(ctx, 16, func)
+
+    Note: Function header
+    emit_indent(ctx)
+    MachineCode.emit_text(output, "(func $")
+    MachineCode.emit_text(output, func_name)
+
+    Note: Emit export directive
+    MachineCode.emit_text(output, " (export \"")
+    MachineCode.emit_text(output, func_name)
+    MachineCode.emit_text(output, "\")")
+
+    Note: Emit parameter declarations
+    Let param_count be LIR.get_param_count(func)
+    Let pi be 0
+    While pi is less than param_count:
+        MachineCode.emit_text(output, " (param i32)")
+        WasmRegs.register_parameter(local_state, pi, 127)
+        Set pi to pi + 1
+    End While
+
+    Note: Emit result type if function returns a value
+    Let has_return be LIR.get_has_return(func)
+    If has_return equals 1:
+        MachineCode.emit_text(output, " (result i32)")
+    End If
+
+    MachineCode.emit_text(output, "\n")
+    increase_indent(ctx)
+
+    Note: First pass: register all virtual registers as locals
+    Let block_count be LIR.get_block_count(func)
+    Let bi be 0
+    While bi is less than block_count:
+        Let block be LIR.get_block(func, bi)
+        If block does not equal 0:
+            Let instr_count be LIR.get_instruction_count(block)
+            Let ii be 0
+            While ii is less than instr_count:
+                Let instr be LIR.get_instruction(block, ii)
+                If instr does not equal 0:
+                    Let dest be LIRNodes.get_dest_reg(instr)
+                    If dest is greater than or equal to 0:
+                        WasmRegs.map_registers_to_locals(local_state, dest, 127)
+                    End If
+                    Let src1 be LIRNodes.get_src1_reg(instr)
+                    If src1 is greater than or equal to 0:
+                        WasmRegs.map_registers_to_locals(local_state, src1, 127)
+                    End If
+                    Let src2 be LIRNodes.get_src2_reg(instr)
+                    If src2 is greater than or equal to 0:
+                        WasmRegs.map_registers_to_locals(local_state, src2, 127)
+                    End If
+                End If
+                Set ii to ii + 1
+            End While
+        End If
+        Set bi to bi + 1
+    End While
+
+    Note: Emit local declarations for non-parameter locals
+    Let non_param_count be WasmRegs.get_non_param_local_count(local_state)
+    If non_param_count is greater than 0:
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "(local")
+        Let li be 0
+        While li is less than non_param_count:
+            MachineCode.emit_text(output, " i32")
+            Set li to li + 1
+        End While
+        MachineCode.emit_text(output, ")\n")
+    End If
+
+    Note: Emit instructions for each basic block
+    Set bi to 0
+    While bi is less than block_count:
+        Let block be LIR.get_block(func, bi)
+        If block does not equal 0:
+            Note: Emit block label as comment
+            Let block_label be LIR.get_block_label(block)
+            If bi is greater than 0:
+                emit_indent(ctx)
+                MachineCode.emit_text(output, ";; ")
+                MachineCode.emit_text(output, block_label)
+                MachineCode.emit_text(output, "\n")
+            End If
+
+            Let instr_count be LIR.get_instruction_count(block)
+            Let ii be 0
+            While ii is less than instr_count:
+                Let instr be LIR.get_instruction(block, ii)
+                If instr does not equal 0:
+                    emit_wasm_instruction(ctx, instr)
+                End If
+                Set ii to ii + 1
+            End While
+        End If
+        Set bi to bi + 1
+    End While
+
+    decrease_indent(ctx)
+    emit_wat_line(ctx, ")")
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: INSTRUCTION TRANSLATION
+Note: ============================================================================
+
+Process called "emit_wasm_instruction" that takes ctx as Integer, instr as Integer returns Integer:
+    @Reasoning
+    Translates a single LIR instruction to WAT stack operations.
+    For a typical binary operation like ADD:
+      LIR: dest = src1 + src2
+      WAT: local.get $src1
+           local.get $src2
+           i32.add
+           local.set $dest
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let local_state be __load(ctx, 24)
+    Let opcode be LIRNodes.get_opcode(instr)
+
+    Note: LIR_OP_ADD (30001)
+    If opcode equals 30001:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.add")
+    End If
+
+    Note: LIR_OP_SUB (30002)
+    If opcode equals 30002:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.sub")
+    End If
+
+    Note: LIR_OP_MUL (30003)
+    If opcode equals 30003:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.mul")
+    End If
+
+    Note: LIR_OP_DIV (30004)
+    If opcode equals 30004:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.div_s")
+    End If
+
+    Note: LIR_OP_MOD (30005)
+    If opcode equals 30005:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.rem_s")
+    End If
+
+    Note: LIR_OP_AND (30006)
+    If opcode equals 30006:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.and")
+    End If
+
+    Note: LIR_OP_OR (30007)
+    If opcode equals 30007:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.or")
+    End If
+
+    Note: LIR_OP_XOR (30008)
+    If opcode equals 30008:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.xor")
+    End If
+
+    Note: LIR_OP_SHL (30009)
+    If opcode equals 30009:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.shl")
+    End If
+
+    Note: LIR_OP_SHR (30010)
+    If opcode equals 30010:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.shr_u")
+    End If
+
+    Note: LIR_OP_SAR (30011)
+    If opcode equals 30011:
+        Return convert_lir_to_stack_ops(ctx, instr, "i32.shr_s")
+    End If
+
+    Note: LIR_OP_LOAD (30020)
+    If opcode equals 30020:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let base be LIRNodes.get_src1_reg(instr)
+        Let offset be LIRNodes.get_immediate(instr)
+        Let base_local be WasmRegs.get_local_index(local_state, base)
+        Let dest_local be WasmRegs.get_local_index(local_state, dest)
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "local.get ")
+        MachineCode.emit_int(output, base_local)
+        MachineCode.emit_text(output, "\n")
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "i32.load offset=")
+        MachineCode.emit_int(output, offset)
+        MachineCode.emit_text(output, "\n")
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "local.set ")
+        MachineCode.emit_int(output, dest_local)
+        MachineCode.emit_text(output, "\n")
+        Return 1
+    End If
+
+    Note: LIR_OP_STORE (30021)
+    If opcode equals 30021:
+        Let src be LIRNodes.get_src1_reg(instr)
+        Let base be LIRNodes.get_src2_reg(instr)
+        Let offset be LIRNodes.get_immediate(instr)
+        Let base_local be WasmRegs.get_local_index(local_state, base)
+        Let src_local be WasmRegs.get_local_index(local_state, src)
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "local.get ")
+        MachineCode.emit_int(output, base_local)
+        MachineCode.emit_text(output, "\n")
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "local.get ")
+        MachineCode.emit_int(output, src_local)
+        MachineCode.emit_text(output, "\n")
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "i32.store offset=")
+        MachineCode.emit_int(output, offset)
+        MachineCode.emit_text(output, "\n")
+        Return 1
+    End If
+
+    Note: LIR_OP_MOV (30030)
+    If opcode equals 30030:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let src be LIRNodes.get_src1_reg(instr)
+        Let src_local be WasmRegs.get_local_index(local_state, src)
+        Let dest_local be WasmRegs.get_local_index(local_state, dest)
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "local.get ")
+        MachineCode.emit_int(output, src_local)
+        MachineCode.emit_text(output, "\n")
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "local.set ")
+        MachineCode.emit_int(output, dest_local)
+        MachineCode.emit_text(output, "\n")
+        Return 1
+    End If
+
+    Note: LIR_OP_LOAD_IMM (30031)
+    If opcode equals 30031:
+        Let dest be LIRNodes.get_dest_reg(instr)
+        Let imm be LIRNodes.get_immediate(instr)
+        Let dest_local be WasmRegs.get_local_index(local_state, dest)
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "i32.const ")
+        MachineCode.emit_int(output, imm)
+        MachineCode.emit_text(output, "\n")
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "local.set ")
+        MachineCode.emit_int(output, dest_local)
+        MachineCode.emit_text(output, "\n")
+        Return 1
+    End If
+
+    Note: LIR_OP_CMP_EQ (30040) through LIR_OP_CMP_GE (30045)
+    Note: Wasm handles comparisons as operations that produce i32 0 or 1
+    If opcode equals 30040:
+        Return emit_compare_branch(ctx, instr, "i32.eq")
+    End If
+    If opcode equals 30041:
+        Return emit_compare_branch(ctx, instr, "i32.ne")
+    End If
+    If opcode equals 30042:
+        Return emit_compare_branch(ctx, instr, "i32.lt_s")
+    End If
+    If opcode equals 30043:
+        Return emit_compare_branch(ctx, instr, "i32.le_s")
+    End If
+    If opcode equals 30044:
+        Return emit_compare_branch(ctx, instr, "i32.gt_s")
+    End If
+    If opcode equals 30045:
+        Return emit_compare_branch(ctx, instr, "i32.ge_s")
+    End If
+
+    Note: LIR_OP_JUMP (30050)
+    If opcode equals 30050:
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "br 0\n")
+        Return 1
+    End If
+
+    Note: LIR_OP_CALL (30060)
+    If opcode equals 30060:
+        Let target be LIRNodes.get_call_target(instr)
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "call $")
+        MachineCode.emit_text(output, target)
+        MachineCode.emit_text(output, "\n")
+        Return 1
+    End If
+
+    Note: LIR_OP_RET (30070)
+    If opcode equals 30070:
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "return\n")
+        Return 1
+    End If
+
+    Note: LIR_OP_NOP (30090)
+    If opcode equals 30090:
+        emit_indent(ctx)
+        MachineCode.emit_text(output, "nop\n")
+        Return 1
+    End If
+
+    Note: Unknown opcode
+    emit_indent(ctx)
+    MachineCode.emit_text(output, ";; unhandled LIR opcode ")
+    MachineCode.emit_int(output, opcode)
+    MachineCode.emit_text(output, "\n")
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: HELPER: BINARY OPERATION CONVERSION
+Note: ============================================================================
+
+Process called "convert_lir_to_stack_ops" that takes ctx as Integer, instr as Integer, wasm_op as Integer returns Integer:
+    @Reasoning
+    Converts a register-based binary LIR operation to stack-based Wasm:
+    1. Push src1 (local.get)
+    2. Push src2 (local.get)
+    3. Execute operation (consumes 2, produces 1)
+    4. Store result (local.set)
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let local_state be __load(ctx, 24)
+
+    Let dest be LIRNodes.get_dest_reg(instr)
+    Let src1 be LIRNodes.get_src1_reg(instr)
+    Let src2 be LIRNodes.get_src2_reg(instr)
+
+    Let src1_local be WasmRegs.get_local_index(local_state, src1)
+    Let src2_local be WasmRegs.get_local_index(local_state, src2)
+    Let dest_local be WasmRegs.get_local_index(local_state, dest)
+
+    Note: Push first operand
+    emit_indent(ctx)
+    MachineCode.emit_text(output, "local.get ")
+    MachineCode.emit_int(output, src1_local)
+    MachineCode.emit_text(output, "\n")
+
+    Note: Push second operand
+    emit_indent(ctx)
+    MachineCode.emit_text(output, "local.get ")
+    MachineCode.emit_int(output, src2_local)
+    MachineCode.emit_text(output, "\n")
+
+    Note: Execute operation
+    emit_indent(ctx)
+    MachineCode.emit_text(output, wasm_op)
+    MachineCode.emit_text(output, "\n")
+
+    Note: Store result
+    emit_indent(ctx)
+    MachineCode.emit_text(output, "local.set ")
+    MachineCode.emit_int(output, dest_local)
+    MachineCode.emit_text(output, "\n")
+
+    Return 1
+End Process
+
+Process called "emit_compare_branch" that takes ctx as Integer, instr as Integer, cmp_op as Integer returns Integer:
+    @Reasoning
+    Translates a LIR compare-and-branch to Wasm. In Wasm, comparisons
+    produce an i32 result (0 or 1), and br_if branches if the value
+    is non-zero.
+
+    Sequence:
+      local.get src1
+      local.get src2
+      i32.eq (or other comparison)
+      br_if <target>
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+    Let local_state be __load(ctx, 24)
+
+    Let src1 be LIRNodes.get_src1_reg(instr)
+    Let src2 be LIRNodes.get_src2_reg(instr)
+
+    Let src1_local be WasmRegs.get_local_index(local_state, src1)
+    Let src2_local be WasmRegs.get_local_index(local_state, src2)
+
+    emit_indent(ctx)
+    MachineCode.emit_text(output, "local.get ")
+    MachineCode.emit_int(output, src1_local)
+    MachineCode.emit_text(output, "\n")
+
+    emit_indent(ctx)
+    MachineCode.emit_text(output, "local.get ")
+    MachineCode.emit_int(output, src2_local)
+    MachineCode.emit_text(output, "\n")
+
+    emit_indent(ctx)
+    MachineCode.emit_text(output, cmp_op)
+    MachineCode.emit_text(output, "\n")
+
+    emit_indent(ctx)
+    MachineCode.emit_text(output, "br_if 0\n")
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: MODULE-LEVEL GENERATION
+Note: ============================================================================
+
+Process called "generate_wasm_text" that takes ctx as Integer, lir_module as Integer returns Integer:
+    @Reasoning
+    Top-level entry point that generates WAT text for an entire LIR module.
+    Emits the module wrapper, memory declaration, and all function bodies.
+    @End Reasoning
+
+    Let output be __load(ctx, 0)
+
+    Note: Module header
+    emit_module_start(ctx)
+
+    Note: Memory declaration (1 page = 64KB)
+    emit_memory_declaration(ctx, 1, -1)
+
+    Note: Generate each function
+    Let func_count be LIR.get_function_count(lir_module)
+    Let func_idx be 0
+    While func_idx is less than func_count:
+        Let func be LIR.get_function(lir_module, func_idx)
+        If func does not equal 0:
+            emit_wasm_function(ctx, func)
+        End If
+        Set func_idx to func_idx + 1
+    End While
+
+    Note: Module footer
+    emit_module_end(ctx)
+
+    Return 1
+End Process

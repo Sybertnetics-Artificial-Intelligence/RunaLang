@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,854 @@ limitations under the License.
 :End Note
 
 Note:
+RUNA DEBUG TOOL - CLI Debugger Entry Point
+
 This file handles Runa debugging and runtime debugging support.
 
 This file performs the following tasks:
-- Process Runa debugging and runtime debugging support
-- Handle breakpoint management and debugging session control
-- Manage debug information and debugging metadata
-- Process debugging communication and debugging protocol
+- Launch a debug REPL for interactive debugging of Runa programs
+- Attach to a running Runa process via PID for live debugging
+- Manage breakpoints (set, list, remove) by file and line number
+- Support step, continue, and variable inspection commands
+- Provide a command-driven interactive debug session
 
 This file is essential because of the following reasons:
-- Runa debugging ensures comprehensive runtime debugging and development support
-- Proper debugging handling ensures correct debugging session management
-- RunaDebug support enables Runa compilation for debuggable code
+- Runa debug tool enables developers to interactively debug Runa programs
+- Proper breakpoint and step management ensures efficient debugging workflows
+- RunaDebug bridges user-facing CLI with compiler debug information subsystems
 
 This file consists of the following functions/features/operation types:
-- Runa debugging and runtime debugging support
-- Breakpoint management and debugging session control
-- Debug information and debugging metadata
-- Debugging communication and debugging protocol
+- DebugSession type for tracking active debug session state
+- Breakpoint type for individual breakpoint representation
+- attach_to_process to connect to a running process by PID
+- set_breakpoint_command to register a breakpoint at a file:line location
+- continue_command to resume execution until next breakpoint or exit
+- step_command to advance execution by one statement
+- print_variable_command to inspect a variable value at current scope
+- debug_repl for interactive command loop
+- run_debugger as the top-level entry point
+
+Dependencies:
+- Imports compiler/internal/string_utils.runa for string operations
+- Imports compiler/internal/memory_utils.runa for memory allocation
+- Imports compiler/internal/arena_utils.runa for arena-scoped allocation
+- Imports compiler/internal/file_utils.runa for source file reading
 :End Note
 
-Note: TODO - Implement RunaDebug functionality
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+Import "compiler/internal/file_utils.runa" as FileUtils
+
+Note: ============================================================================
+Note: Debug Tool Constants
+Note: ============================================================================
+
+Constant DEBUG_TOOL_VERSION as Integer is 1
+Constant DEBUG_TOOL_SUCCESS as Integer is 0
+Constant DEBUG_TOOL_FAILURE as Integer is 1
+Constant DEBUG_TOOL_INVALID_ARGS as Integer is 2
+
+Constant DEBUG_CMD_BREAK as Integer is 1
+Constant DEBUG_CMD_CONTINUE as Integer is 2
+Constant DEBUG_CMD_STEP as Integer is 3
+Constant DEBUG_CMD_PRINT as Integer is 4
+Constant DEBUG_CMD_LIST as Integer is 5
+Constant DEBUG_CMD_QUIT as Integer is 6
+Constant DEBUG_CMD_HELP as Integer is 7
+Constant DEBUG_CMD_BACKTRACE as Integer is 8
+Constant DEBUG_CMD_DELETE as Integer is 9
+Constant DEBUG_CMD_UNKNOWN as Integer is 0
+
+Constant DEBUG_MAX_BREAKPOINTS as Integer is 256
+Constant DEBUG_INPUT_BUFFER_SIZE as Integer is 1024
+
+Note: Breakpoint memory layout (32 bytes):
+Note: offset  0: file_path (8 bytes) - Pointer to source file path string
+Note: offset  8: line_number (8 bytes) - Line number for the breakpoint
+Note: offset 16: is_enabled (8 bytes) - Boolean: 1 if enabled, 0 if disabled
+Note: offset 24: hit_count (8 bytes) - Number of times this breakpoint has been hit
+
+Constant BREAKPOINT_SIZE as Integer is 32
+
+Note: DebugSession memory layout (80 bytes):
+Note: offset  0: target_pid (8 bytes) - PID of attached process (0 if not attached)
+Note: offset  8: target_executable (8 bytes) - Pointer to executable path string
+Note: offset 16: breakpoints (8 bytes) - Pointer to ArrayList of Breakpoint pointers
+Note: offset 24: breakpoint_count (8 bytes) - Number of active breakpoints
+Note: offset 32: is_running (8 bytes) - Boolean: 1 if target is running
+Note: offset 40: is_attached (8 bytes) - Boolean: 1 if attached to a process
+Note: offset 48: current_file (8 bytes) - Pointer to current source file path
+Note: offset 56: current_line (8 bytes) - Current line number in source
+Note: offset 64: is_verbose (8 bytes) - Boolean: 1 if verbose output requested
+Note: offset 72: arena (8 bytes) - Pointer to arena for debug session allocation
+
+Constant DEBUG_SESSION_SIZE as Integer is 80
+
+Note: ============================================================================
+Note: Debug Session Creation
+Note: ============================================================================
+
+Process called "create_debug_session" takes arena as Integer returns Integer:
+    Note: Allocate and initialize a DebugSession structure
+    If arena is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot create debug session: arena is null"
+        Return 0
+    End If
+
+    Let session be arena_allocate(arena, DEBUG_SESSION_SIZE, 8)
+    If session is equal to 0:
+        Alert "[RUNADEBUG ERROR] Failed to allocate debug session"
+        Return 0
+    End If
+
+    memory_zero(session, DEBUG_SESSION_SIZE)
+
+    Note: Create breakpoints list
+    Let breakpoints be arraylist_create(DEBUG_MAX_BREAKPOINTS, 8, arena)
+    If breakpoints is equal to 0:
+        Alert "[RUNADEBUG ERROR] Failed to create breakpoints list"
+        Return 0
+    End If
+    memory_set_pointer(session, 16, breakpoints)
+    memory_set_integer(session, 24, 0)
+    memory_set_integer(session, 32, 0)
+    memory_set_integer(session, 40, 0)
+    memory_set_integer(session, 64, 0)
+    memory_set_pointer(session, 72, arena)
+
+    Return session
+End Process
+
+Note: ============================================================================
+Note: Process Attachment
+Note: ============================================================================
+
+Process called "attach_to_process" takes session as Integer, pid as Integer returns Integer:
+    Note: Attach the debugger to a running process by PID
+    Note: Uses ptrace syscall (Linux) to attach
+    Note: Returns 0 on success, 1 on failure
+
+    If session is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot attach: session is null"
+        Return 1
+    End If
+
+    If pid is less than 1:
+        Alert "[RUNADEBUG ERROR] Cannot attach: invalid PID"
+        Return 1
+    End If
+
+    Note: Issue ptrace PTRACE_ATTACH (syscall 101 on x86_64, request 16)
+    Note: ptrace(PTRACE_ATTACH, pid, 0, 0)
+    Let ptrace_attach be 16
+    Let ptrace_result be syscall_ptrace(ptrace_attach, pid, 0, 0)
+
+    If ptrace_result is less than 0:
+        Alert "[RUNADEBUG ERROR] ptrace attach failed (permission denied or invalid PID)"
+        Return 1
+    End If
+
+    Note: Wait for the process to stop
+    Let wait_result be syscall_waitpid(pid, 0, 0)
+    If wait_result is less than 0:
+        Alert "[RUNADEBUG ERROR] waitpid failed after attach"
+        Return 1
+    End If
+
+    memory_set_integer(session, 0, pid)
+    memory_set_integer(session, 40, 1)
+    memory_set_integer(session, 32, 0)    Note: Process is stopped after attach
+
+    Display "[RUNADEBUG] Attached to process "
+    Display pid
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Breakpoint Management
+Note: ============================================================================
+
+Process called "set_breakpoint_command" takes session as Integer, file_path as Integer, line_number as Integer returns Integer:
+    Note: Set a breakpoint at the specified file and line number
+    Note: Returns breakpoint index on success, -1 on failure
+
+    If session is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot set breakpoint: session is null"
+        Return -1
+    End If
+
+    If file_path is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot set breakpoint: file path is null"
+        Return -1
+    End If
+
+    If line_number is less than 1:
+        Alert "[RUNADEBUG ERROR] Cannot set breakpoint: invalid line number"
+        Return -1
+    End If
+
+    Let arena be memory_get_pointer(session, 72)
+    If arena is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot set breakpoint: arena is null"
+        Return -1
+    End If
+
+    Note: Allocate a new Breakpoint structure
+    Let bp be arena_allocate(arena, BREAKPOINT_SIZE, 8)
+    If bp is equal to 0:
+        Alert "[RUNADEBUG ERROR] Failed to allocate breakpoint"
+        Return -1
+    End If
+
+    memory_zero(bp, BREAKPOINT_SIZE)
+
+    Note: Copy the file path into arena-managed memory
+    Let path_copy be string_duplicate(file_path, arena)
+    memory_set_pointer(bp, 0, path_copy)
+    memory_set_integer(bp, 8, line_number)
+    memory_set_integer(bp, 16, 1)    Note: Enabled by default
+    memory_set_integer(bp, 24, 0)    Note: Hit count starts at 0
+
+    Note: Add to breakpoints list
+    Let breakpoints be memory_get_pointer(session, 16)
+    arraylist_append(breakpoints, bp)
+
+    Let bp_count be memory_get_integer(session, 24)
+    Set bp_count to bp_count plus 1
+    memory_set_integer(session, 24, bp_count)
+
+    Note: Display confirmation
+    Display "[RUNADEBUG] Breakpoint "
+    Display bp_count
+    Display " set at "
+    Display file_path
+    Display ":"
+    Display line_number
+
+    Return bp_count
+End Process
+
+Note: ============================================================================
+Note: Execution Control Commands
+Note: ============================================================================
+
+Process called "continue_command" takes session as Integer returns Integer:
+    Note: Resume execution of the debugged process until next breakpoint or exit
+    Note: Returns 0 on success, 1 on failure
+
+    If session is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot continue: session is null"
+        Return 1
+    End If
+
+    Let is_attached be memory_get_integer(session, 40)
+    If is_attached is not equal to 1:
+        Alert "[RUNADEBUG ERROR] Not attached to any process"
+        Return 1
+    End If
+
+    Let pid be memory_get_integer(session, 0)
+
+    Note: Issue ptrace PTRACE_CONT (request 7)
+    Let ptrace_cont be 7
+    Let ptrace_result be syscall_ptrace(ptrace_cont, pid, 0, 0)
+
+    If ptrace_result is less than 0:
+        Alert "[RUNADEBUG ERROR] ptrace continue failed"
+        Return 1
+    End If
+
+    memory_set_integer(session, 32, 1)    Note: Process is now running
+
+    Note: Wait for the process to stop again (breakpoint hit or exit)
+    Let wait_status be 0
+    Let wait_result be syscall_waitpid(pid, wait_status, 0)
+
+    If wait_result is less than 0:
+        Alert "[RUNADEBUG ERROR] waitpid failed"
+        Return 1
+    End If
+
+    Note: Check if process exited
+    Let exited be waitpid_exited(wait_status)
+    If exited is equal to 1:
+        Display "[RUNADEBUG] Process exited"
+        memory_set_integer(session, 32, 0)
+        memory_set_integer(session, 40, 0)
+        Return 0
+    End If
+
+    memory_set_integer(session, 32, 0)    Note: Process stopped again
+    Display "[RUNADEBUG] Process stopped"
+
+    Return 0
+End Process
+
+Process called "step_command" takes session as Integer returns Integer:
+    Note: Single-step one instruction in the debugged process
+    Note: Returns 0 on success, 1 on failure
+
+    If session is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot step: session is null"
+        Return 1
+    End If
+
+    Let is_attached be memory_get_integer(session, 40)
+    If is_attached is not equal to 1:
+        Alert "[RUNADEBUG ERROR] Not attached to any process"
+        Return 1
+    End If
+
+    Let pid be memory_get_integer(session, 0)
+
+    Note: Issue ptrace PTRACE_SINGLESTEP (request 9)
+    Let ptrace_step be 9
+    Let ptrace_result be syscall_ptrace(ptrace_step, pid, 0, 0)
+
+    If ptrace_result is less than 0:
+        Alert "[RUNADEBUG ERROR] ptrace singlestep failed"
+        Return 1
+    End If
+
+    Note: Wait for the process to stop after the single step
+    Let wait_status be 0
+    Let wait_result be syscall_waitpid(pid, wait_status, 0)
+
+    If wait_result is less than 0:
+        Alert "[RUNADEBUG ERROR] waitpid failed after step"
+        Return 1
+    End If
+
+    Let exited be waitpid_exited(wait_status)
+    If exited is equal to 1:
+        Display "[RUNADEBUG] Process exited during step"
+        memory_set_integer(session, 32, 0)
+        memory_set_integer(session, 40, 0)
+        Return 0
+    End If
+
+    Display "[RUNADEBUG] Stepped one instruction"
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Variable Inspection
+Note: ============================================================================
+
+Process called "print_variable_command" takes session as Integer, var_name as Integer returns Integer:
+    Note: Inspect and print the value of a variable in the current scope
+    Note: Reads debug info (DWARF) to locate the variable in memory
+    Note: Returns 0 on success, 1 on failure
+
+    If session is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot print variable: session is null"
+        Return 1
+    End If
+
+    If var_name is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot print variable: name is null"
+        Return 1
+    End If
+
+    Let is_attached be memory_get_integer(session, 40)
+    If is_attached is not equal to 1:
+        Alert "[RUNADEBUG ERROR] Not attached to any process"
+        Return 1
+    End If
+
+    Let pid be memory_get_integer(session, 0)
+
+    Note: Read the instruction pointer to determine current execution location
+    Note: ptrace PTRACE_PEEKUSER (request 3) to read register
+    Note: x86_64 RIP is at offset 128 (16 * 8) in user_regs_struct
+    Let ptrace_peekuser be 3
+    Let rip_offset be 128
+    Let rip_value be syscall_ptrace(ptrace_peekuser, pid, rip_offset, 0)
+
+    Note: Look up the variable in debug information based on current RIP
+    Note: This requires parsing DWARF debug info from the executable
+    Let exe_path be memory_get_pointer(session, 8)
+    If exe_path is equal to 0:
+        Alert "[RUNADEBUG ERROR] No executable path set for debug info lookup"
+        Return 1
+    End If
+
+    Note: Search for the variable in the current scope's debug info
+    Note: The debug info maps variable names to stack/register locations
+    Note: For now, attempt to read from stack frame base pointer
+    Let ptrace_peekdata be 2
+    Let rbp_offset be 48    Note: RBP is at offset 48 in user_regs_struct (index 6)
+    Let rbp_value be syscall_ptrace(ptrace_peekuser, pid, rbp_offset, 0)
+
+    Note: Display the variable name and what we found at its presumed location
+    Display "[RUNADEBUG] Variable: "
+    Display var_name
+    Display " (lookup at RBP="
+    Display rbp_value
+    Display ", RIP="
+    Display rip_value
+    Display ")"
+
+    Note: Read 8 bytes from the stack at RBP-8 as a heuristic first local
+    Note: Proper implementation requires full DWARF parsing of variable locations
+    Let local_addr be rbp_value minus 8
+    Let local_value be syscall_ptrace(ptrace_peekdata, pid, local_addr, 0)
+
+    Display "[RUNADEBUG] Value at [RBP-8]: "
+    Display local_value
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Command Parsing
+Note: ============================================================================
+
+Process called "parse_debug_command" takes input as Integer, arena as Integer returns Integer:
+    Note: Parse a debug REPL command string into a command type constant
+    Note: Returns one of the DEBUG_CMD_* constants
+
+    If input is equal to 0:
+        Return DEBUG_CMD_UNKNOWN
+    End If
+
+    Note: Trim leading whitespace
+    Let trimmed be string_trim(input, arena)
+    If trimmed is equal to 0:
+        Return DEBUG_CMD_UNKNOWN
+    End If
+
+    Let input_len be string_length(trimmed)
+    If input_len is equal to 0:
+        Return DEBUG_CMD_UNKNOWN
+    End If
+
+    Note: Match against known commands
+    Let is_break be string_starts_with(trimmed, "break")
+    If is_break is equal to 1:
+        Return DEBUG_CMD_BREAK
+    End If
+
+    Let is_b be string_equals(trimmed, "b")
+    If is_b is equal to 1:
+        Return DEBUG_CMD_BREAK
+    End If
+
+    Let is_continue be string_equals(trimmed, "continue")
+    If is_continue is equal to 1:
+        Return DEBUG_CMD_CONTINUE
+    End If
+
+    Let is_c be string_equals(trimmed, "c")
+    If is_c is equal to 1:
+        Return DEBUG_CMD_CONTINUE
+    End If
+
+    Let is_step be string_equals(trimmed, "step")
+    If is_step is equal to 1:
+        Return DEBUG_CMD_STEP
+    End If
+
+    Let is_s be string_equals(trimmed, "s")
+    If is_s is equal to 1:
+        Return DEBUG_CMD_STEP
+    End If
+
+    Let is_print be string_starts_with(trimmed, "print")
+    If is_print is equal to 1:
+        Return DEBUG_CMD_PRINT
+    End If
+
+    Let is_p be string_starts_with(trimmed, "p ")
+    If is_p is equal to 1:
+        Return DEBUG_CMD_PRINT
+    End If
+
+    Let is_list be string_equals(trimmed, "list")
+    If is_list is equal to 1:
+        Return DEBUG_CMD_LIST
+    End If
+
+    Let is_l be string_equals(trimmed, "l")
+    If is_l is equal to 1:
+        Return DEBUG_CMD_LIST
+    End If
+
+    Let is_quit be string_equals(trimmed, "quit")
+    If is_quit is equal to 1:
+        Return DEBUG_CMD_QUIT
+    End If
+
+    Let is_q be string_equals(trimmed, "q")
+    If is_q is equal to 1:
+        Return DEBUG_CMD_QUIT
+    End If
+
+    Let is_help be string_equals(trimmed, "help")
+    If is_help is equal to 1:
+        Return DEBUG_CMD_HELP
+    End If
+
+    Let is_h be string_equals(trimmed, "h")
+    If is_h is equal to 1:
+        Return DEBUG_CMD_HELP
+    End If
+
+    Let is_bt be string_equals(trimmed, "backtrace")
+    If is_bt is equal to 1:
+        Return DEBUG_CMD_BACKTRACE
+    End If
+
+    Let is_bt_short be string_equals(trimmed, "bt")
+    If is_bt_short is equal to 1:
+        Return DEBUG_CMD_BACKTRACE
+    End If
+
+    Let is_delete be string_starts_with(trimmed, "delete")
+    If is_delete is equal to 1:
+        Return DEBUG_CMD_DELETE
+    End If
+
+    Return DEBUG_CMD_UNKNOWN
+End Process
+
+Note: ============================================================================
+Note: Debug REPL
+Note: ============================================================================
+
+Process called "debug_repl" takes session as Integer returns Integer:
+    Note: Interactive debug command loop
+    Note: Reads commands from stdin, dispatches to handlers
+    Note: Returns 0 when user quits
+
+    If session is equal to 0:
+        Alert "[RUNADEBUG ERROR] Cannot start REPL: session is null"
+        Return 1
+    End If
+
+    Let arena be memory_get_pointer(session, 72)
+
+    Display "[RUNADEBUG] Runa Debugger v1"
+    Display "[RUNADEBUG] Type 'help' for available commands"
+
+    Let running be 1
+    While running is equal to 1:
+        Note: Display prompt
+        Display "rdb> "
+
+        Note: Read a line of input from stdin
+        Let input be runtime_read_line()
+        If input is equal to 0:
+            Note: EOF reached
+            Set running to 0
+        Otherwise:
+            Let cmd_type be parse_debug_command(input, arena)
+
+            If cmd_type is equal to DEBUG_CMD_QUIT:
+                Display "[RUNADEBUG] Quitting debugger"
+                Set running to 0
+
+            Otherwise:
+                If cmd_type is equal to DEBUG_CMD_HELP:
+                    Display "[RUNADEBUG] Commands:"
+                    Display "  break <file>:<line>  - Set a breakpoint (alias: b)"
+                    Display "  continue             - Resume execution (alias: c)"
+                    Display "  step                 - Step one instruction (alias: s)"
+                    Display "  print <var>          - Print variable value (alias: p)"
+                    Display "  list                 - List breakpoints (alias: l)"
+                    Display "  backtrace            - Show call stack (alias: bt)"
+                    Display "  delete <n>           - Delete breakpoint by index"
+                    Display "  quit                 - Exit debugger (alias: q)"
+
+                Otherwise:
+                    If cmd_type is equal to DEBUG_CMD_BREAK:
+                        Note: Parse "break file:line" from input
+                        Note: Find the colon separator after "break "
+                        Let break_prefix_len be 6   Note: "break " is 6 characters
+                        Let arg_start be string_starts_with(input, "break ")
+                        If arg_start is equal to 1:
+                            Let bp_arg be string_substring_from(input, 6, arena)
+                            Let colon_pos be string_index_of(bp_arg, 58)  Note: 58 = ':'
+                            If colon_pos is greater than 0:
+                                Let bp_file be string_substring(bp_arg, 0, colon_pos, arena)
+                                Let bp_line_str be string_substring_from(bp_arg, colon_pos plus 1, arena)
+                                Let bp_line be string_to_integer(bp_line_str)
+                                If bp_line is greater than 0:
+                                    Let bp_result be set_breakpoint_command(session, bp_file, bp_line)
+                                Otherwise:
+                                    Alert "[RUNADEBUG ERROR] Invalid line number"
+                                End If
+                            Otherwise:
+                                Alert "[RUNADEBUG ERROR] Usage: break <file>:<line>"
+                            End If
+                        Otherwise:
+                            Note: Try short form "b file:line"
+                            Let b_arg be string_substring_from(input, 2, arena)
+                            Let colon_pos be string_index_of(b_arg, 58)
+                            If colon_pos is greater than 0:
+                                Let bp_file be string_substring(b_arg, 0, colon_pos, arena)
+                                Let bp_line_str be string_substring_from(b_arg, colon_pos plus 1, arena)
+                                Let bp_line be string_to_integer(bp_line_str)
+                                If bp_line is greater than 0:
+                                    Let bp_result be set_breakpoint_command(session, bp_file, bp_line)
+                                Otherwise:
+                                    Alert "[RUNADEBUG ERROR] Invalid line number"
+                                End If
+                            Otherwise:
+                                Alert "[RUNADEBUG ERROR] Usage: break <file>:<line>"
+                            End If
+                        End If
+
+                    Otherwise:
+                        If cmd_type is equal to DEBUG_CMD_CONTINUE:
+                            Let cont_result be continue_command(session)
+
+                        Otherwise:
+                            If cmd_type is equal to DEBUG_CMD_STEP:
+                                Let step_result be step_command(session)
+
+                            Otherwise:
+                                If cmd_type is equal to DEBUG_CMD_PRINT:
+                                    Note: Parse "print <var>" or "p <var>"
+                                    Let print_arg be 0
+                                    Let is_long_print be string_starts_with(input, "print ")
+                                    If is_long_print is equal to 1:
+                                        Set print_arg to string_substring_from(input, 6, arena)
+                                    Otherwise:
+                                        Let is_short_print be string_starts_with(input, "p ")
+                                        If is_short_print is equal to 1:
+                                            Set print_arg to string_substring_from(input, 2, arena)
+                                        End If
+                                    End If
+                                    If print_arg is not equal to 0:
+                                        Let trimmed_arg be string_trim(print_arg, arena)
+                                        Let print_result be print_variable_command(session, trimmed_arg)
+                                    Otherwise:
+                                        Alert "[RUNADEBUG ERROR] Usage: print <variable_name>"
+                                    End If
+
+                                Otherwise:
+                                    If cmd_type is equal to DEBUG_CMD_LIST:
+                                        Note: List all breakpoints
+                                        Let bp_count be memory_get_integer(session, 24)
+                                        If bp_count is equal to 0:
+                                            Display "[RUNADEBUG] No breakpoints set"
+                                        Otherwise:
+                                            Display "[RUNADEBUG] Breakpoints:"
+                                            Let breakpoints be memory_get_pointer(session, 16)
+                                            Let bp_idx be 0
+                                            While bp_idx is less than bp_count:
+                                                Let bp_ptr be arraylist_get(breakpoints, bp_idx)
+                                                If bp_ptr is not equal to 0:
+                                                    Let bp be memory_get_pointer(bp_ptr, 0)
+                                                    If bp is not equal to 0:
+                                                        Let bp_file be memory_get_pointer(bp, 0)
+                                                        Let bp_line be memory_get_integer(bp, 8)
+                                                        Let bp_enabled be memory_get_integer(bp, 16)
+                                                        Let bp_hits be memory_get_integer(bp, 24)
+                                                        Let idx_display be bp_idx plus 1
+                                                        Display "  "
+                                                        Display idx_display
+                                                        Display ": "
+                                                        Display bp_file
+                                                        Display ":"
+                                                        Display bp_line
+                                                        If bp_enabled is equal to 1:
+                                                            Display " (enabled, hits: "
+                                                        Otherwise:
+                                                            Display " (disabled, hits: "
+                                                        End If
+                                                        Display bp_hits
+                                                        Display ")"
+                                                    End If
+                                                End If
+                                                Set bp_idx to bp_idx plus 1
+                                            End While
+                                        End If
+
+                                    Otherwise:
+                                        If cmd_type is equal to DEBUG_CMD_BACKTRACE:
+                                            Note: Display call stack using frame pointer chain
+                                            Let is_attached be memory_get_integer(session, 40)
+                                            If is_attached is equal to 1:
+                                                Display "[RUNADEBUG] Backtrace:"
+                                                Let pid be memory_get_integer(session, 0)
+                                                Let ptrace_peekuser be 3
+                                                Let rip_offset be 128
+                                                Let rbp_offset be 48
+                                                Let rip be syscall_ptrace(ptrace_peekuser, pid, rip_offset, 0)
+                                                Let rbp be syscall_ptrace(ptrace_peekuser, pid, rbp_offset, 0)
+                                                Let frame_idx be 0
+                                                Let max_frames be 32
+                                                While frame_idx is less than max_frames:
+                                                    If rbp is equal to 0:
+                                                        Set frame_idx to max_frames
+                                                    Otherwise:
+                                                        Display "  #"
+                                                        Display frame_idx
+                                                        Display " RIP="
+                                                        Display rip
+                                                        Display " RBP="
+                                                        Display rbp
+                                                        Note: Walk up the frame: next RBP is at [RBP], return addr is at [RBP+8]
+                                                        Let ptrace_peekdata be 2
+                                                        Let next_rbp be syscall_ptrace(ptrace_peekdata, pid, rbp, 0)
+                                                        Let ret_addr be rbp plus 8
+                                                        Set rip to syscall_ptrace(ptrace_peekdata, pid, ret_addr, 0)
+                                                        Set rbp to next_rbp
+                                                        Set frame_idx to frame_idx plus 1
+                                                    End If
+                                                End While
+                                            Otherwise:
+                                                Alert "[RUNADEBUG ERROR] Not attached to any process"
+                                            End If
+
+                                        Otherwise:
+                                            If cmd_type is equal to DEBUG_CMD_DELETE:
+                                                Note: Parse "delete <n>" to remove a breakpoint by index
+                                                Let del_arg be string_substring_from(input, 7, arena)
+                                                Let del_trimmed be string_trim(del_arg, arena)
+                                                Let del_idx be string_to_integer(del_trimmed)
+                                                If del_idx is greater than 0:
+                                                    Let actual_idx be del_idx minus 1
+                                                    Let breakpoints be memory_get_pointer(session, 16)
+                                                    Let bp_ptr be arraylist_get(breakpoints, actual_idx)
+                                                    If bp_ptr is not equal to 0:
+                                                        Let bp be memory_get_pointer(bp_ptr, 0)
+                                                        If bp is not equal to 0:
+                                                            Note: Disable the breakpoint
+                                                            memory_set_integer(bp, 16, 0)
+                                                            Display "[RUNADEBUG] Breakpoint "
+                                                            Display del_idx
+                                                            Display " deleted"
+                                                        End If
+                                                    Otherwise:
+                                                        Alert "[RUNADEBUG ERROR] Breakpoint index out of range"
+                                                    End If
+                                                Otherwise:
+                                                    Alert "[RUNADEBUG ERROR] Usage: delete <breakpoint_number>"
+                                                End If
+
+                                            Otherwise:
+                                                Alert "[RUNADEBUG] Unknown command. Type 'help' for available commands."
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+
+            deallocate(input)
+        End If
+    End While
+
+    Note: Detach from process if still attached
+    Let is_attached be memory_get_integer(session, 40)
+    If is_attached is equal to 1:
+        Let pid be memory_get_integer(session, 0)
+        Note: ptrace PTRACE_DETACH (request 17)
+        Let ptrace_detach be 17
+        Let detach_result be syscall_ptrace(ptrace_detach, pid, 0, 0)
+        Display "[RUNADEBUG] Detached from process "
+        Display pid
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Top-Level Entry Point
+Note: ============================================================================
+
+Process called "run_debugger" takes argc as Integer, argv as Integer returns Integer:
+    Note: Main entry point for the RunaDebug tool
+    Note: Parses CLI arguments, creates debug session, launches debug REPL
+    Note: Returns exit code (0 = success, nonzero = failure)
+
+    Note: Create arena for debug-scoped allocations
+    Let arena be arena_create(65536)
+    If arena is equal to 0:
+        Alert "[RUNADEBUG ERROR] Failed to create arena"
+        Return DEBUG_TOOL_FAILURE
+    End If
+
+    Note: Parse arguments
+    If argc is less than 2:
+        Alert "[RUNADEBUG] Usage: runa debug <executable> [options]"
+        Alert "[RUNADEBUG] Options:"
+        Alert "[RUNADEBUG]   --pid <pid>   Attach to running process by PID"
+        Alert "[RUNADEBUG]   --verbose     Enable verbose output"
+        arena_destroy(arena)
+        Return DEBUG_TOOL_INVALID_ARGS
+    End If
+
+    Let session be create_debug_session(arena)
+    If session is equal to 0:
+        arena_destroy(arena)
+        Return DEBUG_TOOL_FAILURE
+    End If
+
+    Let target_exe be 0
+    Let target_pid be 0
+    Let ptr_size be 8
+    Let i be 1
+
+    While i is less than argc:
+        Let arg_offset be i multiplied by ptr_size
+        Let arg_ptr be argv plus arg_offset
+        Let arg be memory_get_pointer(arg_ptr, 0)
+
+        If arg is not equal to 0:
+            Let is_pid_flag be string_equals(arg, "--pid")
+            If is_pid_flag is equal to 1:
+                Set i to i plus 1
+                If i is less than argc:
+                    Let next_offset be i multiplied by ptr_size
+                    Let next_ptr be argv plus next_offset
+                    Let pid_str be memory_get_pointer(next_ptr, 0)
+                    If pid_str is not equal to 0:
+                        Set target_pid to string_to_integer(pid_str)
+                    End If
+                End If
+            Otherwise:
+                Let is_verbose be string_equals(arg, "--verbose")
+                If is_verbose is equal to 1:
+                    memory_set_integer(session, 64, 1)
+                Otherwise:
+                    Note: Treat as executable path
+                    Set target_exe to arg
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Set the executable path on the session
+    If target_exe is not equal to 0:
+        Let exe_copy be string_duplicate(target_exe, arena)
+        memory_set_pointer(session, 8, exe_copy)
+    End If
+
+    Note: Attach to process if PID was specified
+    If target_pid is greater than 0:
+        Let attach_result be attach_to_process(session, target_pid)
+        If attach_result is not equal to 0:
+            Alert "[RUNADEBUG ERROR] Failed to attach to process"
+            arena_destroy(arena)
+            Return DEBUG_TOOL_FAILURE
+        End If
+    End If
+
+    Note: Launch the debug REPL
+    Let repl_result be debug_repl(session)
+
+    Note: Cleanup
+    arena_destroy(arena)
+    Return DEBUG_TOOL_SUCCESS
+End Process
