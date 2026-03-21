@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,43 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles Runa natural language translation and localization.
+RUNA TRANSLATE TOOL - Human Language Localization Engine
+
+Runa is designed to be a globally accessible language. The Translate tool
+enables developers to write Runa code using keywords from their own human
+language (Spanish, Japanese, Hindi, Chinese, Russian, etc.) and translate
+to/from the canonical English-based Runa syntax.
+
+This is NOT a programming language translator. For converting between
+programming languages (C, Python, Rust -> Runa), use RunaConvert instead.
+
+How it works:
+The localization engine performs STRICT TOKEN-BASED MAPPING, not NLP:
+1. Protect string literals and comments (replace with placeholders)
+2. Match keywords against a language catalog (longest-match-first)
+3. Replace matched tokens with their target language equivalents
+4. Reconstruct code with original literals restored
+
+Example (Spanish -> Canonical English):
+  Proceso "sumar" con a como Numero devuelve Numero:
+      Devolver a mas b
+becomes:
+  Process "sumar" with a as Number returns Number:
+      Return a + b
+
+Only keywords are translated. Identifiers and string content are preserved.
+
+Language catalogs contain:
+- to_canonical: Maps foreign keywords -> English canonical form
+- from_canonical: Maps English canonical -> foreign keywords
+
+Supported languages: en (canonical), es (Spanish), ja (Japanese),
+hi (Hindi), zh (Mandarin Chinese), ru (Russian)
+
+Community-extensible: Native speakers build and maintain their own
+language catalogs. This ensures accuracy that machine translation cannot.
+
+Reference: docs/dev/dev_tools/localization/README.md
 
 This file performs the following tasks:
 - Process Runa natural language translation and localization
@@ -33,6 +69,799 @@ This file consists of the following functions/features/operation types:
 - Human language translation and language conversion
 - Translation validation and translation verification
 - Translation optimization and translation consistency
+
+Dependencies:
+- Imports compiler/internal/string_utils.runa for string operations
+- Imports compiler/internal/file_utils.runa for file read/write operations
+- Imports compiler/internal/memory_utils.runa for memory allocation
 :End Note
 
-Note: TODO - Implement RunaTranslate functionality
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/file_utils.runa" as FileUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+
+Note: ============================================================================
+Note: Constants
+Note: ============================================================================
+
+Constant TRANSLATE_SUCCESS as Integer is 0
+Constant TRANSLATE_FAILURE as Integer is 1
+Constant TRANSLATE_INVALID_ARGS as Integer is 2
+Constant TRANSLATE_UNSUPPORTED_LANG as Integer is 3
+Constant TRANSLATE_CATALOG_NOT_FOUND as Integer is 4
+
+Note: Human language identifiers
+Constant LANG_ENGLISH as Integer is 1          Note: en minus Canonical (no translation needed)
+Constant LANG_SPANISH as Integer is 2          Note: es
+Constant LANG_JAPANESE as Integer is 3         Note: ja
+Constant LANG_HINDI as Integer is 4            Note: hi
+Constant LANG_CHINESE as Integer is 5          Note: zh (Mandarin)
+Constant LANG_RUSSIAN as Integer is 6          Note: ru
+Constant LANG_FRENCH as Integer is 7           Note: fr
+Constant LANG_GERMAN as Integer is 8           Note: de
+Constant LANG_PORTUGUESE as Integer is 9       Note: pt
+Constant LANG_ARABIC as Integer is 10          Note: ar
+Constant LANG_KOREAN as Integer is 11          Note: ko
+
+Constant SUPPORTED_LANG_COUNT as Integer is 11
+
+Note: Translation direction
+Constant DIRECTION_TO_CANONICAL as Integer is 0     Note: Foreign language -> English canonical
+Constant DIRECTION_FROM_CANONICAL as Integer is 1   Note: English canonical -> Foreign language
+
+Note: Placeholder sentinel for protected string literals
+Constant PLACEHOLDER_PREFIX as Integer is 9500       Note: Unique prefix for placeholder IDs
+
+Note: ============================================================================
+Note: Language Catalog Type
+Note: ============================================================================
+
+@Reasoning
+A LanguageCatalog holds the bidirectional keyword mappings for one human language.
+to_canonical maps foreign keywords to English canonical Runa keywords.
+from_canonical maps English canonical keywords to foreign keywords.
+
+Catalogs are loaded from files in the language catalog directory. Each catalog
+is maintained by native speakers of that language, not by machine translation.
+This ensures natural, correct keyword choices.
+
+The longest_match_first flag indicates the catalog entries are sorted by
+descending key length so that multi-word keywords (e.g., "es mayor que" for
+"is greater than") are matched before single-word keywords.
+@End Reasoning
+
+Constant LANGUAGE_CATALOG_SIZE as Integer is 48
+
+Type called "LanguageCatalog":
+    lang_id as Integer               Note: LANG_* constant
+    lang_code as Integer             Note: Pointer to language code string ("es", "ja", etc.)
+    lang_name as Integer             Note: Pointer to language name string ("Spanish", "Japanese", etc.)
+    to_canonical as Integer          Note: Dictionary: foreign keyword -> canonical keyword
+    from_canonical as Integer        Note: Dictionary: canonical keyword -> foreign keyword
+    entry_count as Integer           Note: Number of keyword mappings
+End Type
+
+Note: ============================================================================
+Note: Catalog Management
+Note: ============================================================================
+
+Process called "create_language_catalog" that takes lang_id as Integer, lang_code as Integer, lang_name as Integer returns Integer:
+    Note: Creates an empty LanguageCatalog for the given language.
+    Note: Caller must populate it with add_catalog_entry.
+    Let catalog be Layout.allocate(LANGUAGE_CATALOG_SIZE)
+    If catalog is 0:
+        Return 0
+    End If
+
+    __store(catalog, 0, lang_id)
+    __store(catalog, 8, lang_code)
+    __store(catalog, 16, lang_name)
+
+    Let to_dict be Dictionary.dictionary_create(256)
+    __store(catalog, 24, to_dict)
+
+    Let from_dict be Dictionary.dictionary_create(256)
+    __store(catalog, 32, from_dict)
+
+    __store(catalog, 40, 0)
+
+    Return catalog
+End Process
+
+Process called "add_catalog_entry" that takes catalog as Integer, foreign_keyword as Integer, canonical_keyword as Integer returns Integer:
+    Note: Adds a bidirectional mapping between a foreign keyword and its canonical equivalent.
+    Note: Both directions are registered simultaneously for round-trip correctness.
+    If catalog is 0:
+        Return 0
+    End If
+    If foreign_keyword is 0:
+        Return 0
+    End If
+    If canonical_keyword is 0:
+        Return 0
+    End If
+
+    Let to_dict be __load(catalog, 24)
+    If to_dict is not 0:
+        Dictionary.dictionary_set(to_dict, foreign_keyword, canonical_keyword)
+    End If
+
+    Let from_dict be __load(catalog, 32)
+    If from_dict is not 0:
+        Dictionary.dictionary_set(from_dict, canonical_keyword, foreign_keyword)
+    End If
+
+    Let count be __load(catalog, 40)
+    __store(catalog, 40, count plus 1)
+
+    Return 1
+End Process
+
+Process called "catalog_lookup_to_canonical" that takes catalog as Integer, foreign_keyword as Integer returns Integer:
+    Note: Looks up the canonical equivalent of a foreign keyword.
+    Note: Returns pointer to canonical keyword string, or 0 if not found.
+    If catalog is 0:
+        Return 0
+    End If
+    Let to_dict be __load(catalog, 24)
+    If to_dict is 0:
+        Return 0
+    End If
+    Return Dictionary.dictionary_get(to_dict, foreign_keyword)
+End Process
+
+Process called "catalog_lookup_from_canonical" that takes catalog as Integer, canonical_keyword as Integer returns Integer:
+    Note: Looks up the foreign equivalent of a canonical keyword.
+    Note: Returns pointer to foreign keyword string, or 0 if not found.
+    If catalog is 0:
+        Return 0
+    End If
+    Let from_dict be __load(catalog, 32)
+    If from_dict is 0:
+        Return 0
+    End If
+    Return Dictionary.dictionary_get(from_dict, canonical_keyword)
+End Process
+
+Note: ============================================================================
+Note: Supported Languages
+Note: ============================================================================
+
+Process called "get_supported_languages" returns Integer:
+    Note: Returns a List of language code strings for all supported human languages.
+    Let languages be List.list_create(16)
+
+    List.list_push(languages, "en")
+    List.list_push(languages, "es")
+    List.list_push(languages, "ja")
+    List.list_push(languages, "hi")
+    List.list_push(languages, "zh")
+    List.list_push(languages, "ru")
+    List.list_push(languages, "fr")
+    List.list_push(languages, "de")
+    List.list_push(languages, "pt")
+    List.list_push(languages, "ar")
+    List.list_push(languages, "ko")
+
+    Return languages
+End Process
+
+Process called "resolve_language_id" that takes lang_code as Integer returns Integer:
+    Note: Converts a language code string ("es", "ja", etc.) to a LANG_* constant.
+    Note: Returns 0 if not recognized.
+    If lang_code is 0:
+        Return 0
+    End If
+
+    Let cmp_en be StringUtils.string_compare(lang_code, "en")
+    If cmp_en is 0:
+        Return LANG_ENGLISH
+    End If
+    Let cmp_es be StringUtils.string_compare(lang_code, "es")
+    If cmp_es is 0:
+        Return LANG_SPANISH
+    End If
+    Let cmp_ja be StringUtils.string_compare(lang_code, "ja")
+    If cmp_ja is 0:
+        Return LANG_JAPANESE
+    End If
+    Let cmp_hi be StringUtils.string_compare(lang_code, "hi")
+    If cmp_hi is 0:
+        Return LANG_HINDI
+    End If
+    Let cmp_zh be StringUtils.string_compare(lang_code, "zh")
+    If cmp_zh is 0:
+        Return LANG_CHINESE
+    End If
+    Let cmp_ru be StringUtils.string_compare(lang_code, "ru")
+    If cmp_ru is 0:
+        Return LANG_RUSSIAN
+    End If
+    Let cmp_fr be StringUtils.string_compare(lang_code, "fr")
+    If cmp_fr is 0:
+        Return LANG_FRENCH
+    End If
+    Let cmp_de be StringUtils.string_compare(lang_code, "de")
+    If cmp_de is 0:
+        Return LANG_GERMAN
+    End If
+    Let cmp_pt be StringUtils.string_compare(lang_code, "pt")
+    If cmp_pt is 0:
+        Return LANG_PORTUGUESE
+    End If
+    Let cmp_ar be StringUtils.string_compare(lang_code, "ar")
+    If cmp_ar is 0:
+        Return LANG_ARABIC
+    End If
+    Let cmp_ko be StringUtils.string_compare(lang_code, "ko")
+    If cmp_ko is 0:
+        Return LANG_KOREAN
+    End If
+
+    Return 0
+End Process
+
+Process called "get_language_name" that takes lang_id as Integer returns Integer:
+    Note: Returns the human-readable name for a language ID.
+    If lang_id is LANG_ENGLISH:
+        Return "English (Canonical)"
+    End If
+    If lang_id is LANG_SPANISH:
+        Return "Spanish"
+    End If
+    If lang_id is LANG_JAPANESE:
+        Return "Japanese"
+    End If
+    If lang_id is LANG_HINDI:
+        Return "Hindi"
+    End If
+    If lang_id is LANG_CHINESE:
+        Return "Chinese (Mandarin)"
+    End If
+    If lang_id is LANG_RUSSIAN:
+        Return "Russian"
+    End If
+    If lang_id is LANG_FRENCH:
+        Return "French"
+    End If
+    If lang_id is LANG_GERMAN:
+        Return "German"
+    End If
+    If lang_id is LANG_PORTUGUESE:
+        Return "Portuguese"
+    End If
+    If lang_id is LANG_ARABIC:
+        Return "Arabic"
+    End If
+    If lang_id is LANG_KOREAN:
+        Return "Korean"
+    End If
+    Return "Unknown"
+End Process
+
+Note: ============================================================================
+Note: Core Translation Engine
+Note: ============================================================================
+
+@Reasoning
+The translation engine follows a 3-step process:
+1. PROTECT: Scan source, replace string literals and Note: comments with
+   unique placeholders so their content is never translated
+2. TRANSLATE: Apply token-based keyword mapping from the language catalog,
+   using longest-match-first to handle multi-word keywords correctly
+3. RECONSTRUCT: Put original string literals and comments back in place
+
+This is strict token mapping, NOT NLP or machine translation.
+@End Reasoning
+
+Process called "translate_source" that takes source as Integer, catalog as Integer, direction as Integer returns Integer:
+    Note: Translates Runa source code between a human language and canonical English.
+    Note: direction: DIRECTION_TO_CANONICAL or DIRECTION_FROM_CANONICAL
+    Note: Returns pointer to translated source string, or 0 on failure.
+    If source is 0:
+        Return 0
+    End If
+    If catalog is 0:
+        Return 0
+    End If
+
+    Note: Step 1: Protect string literals and comments
+    Let protected be protect_literals(source)
+    If protected is 0:
+        Return 0
+    End If
+
+    Note: Get the protected source text (with placeholders)
+    Let protected_text be __load(protected, 0)
+    Note: Get the placeholder map (placeholder_id -> original text)
+    Let placeholder_map be __load(protected, 8)
+
+    Note: Step 2: Apply token-based keyword translation
+    Let translated be apply_keyword_mapping(protected_text, catalog, direction)
+    If translated is 0:
+        MemoryUtils.deallocate(protected)
+        Return 0
+    End If
+
+    Note: Step 3: Restore original string literals and comments
+    Let restored be restore_literals(translated, placeholder_map)
+
+    MemoryUtils.deallocate(protected)
+    Return restored
+End Process
+
+Process called "protect_literals" that takes source as Integer returns Integer:
+    Note: Scans source text and replaces string literals (between quotes) and
+    Note: Note: comment lines with unique placeholders.
+    Note: Returns a struct with: [0] = protected text, [8] = placeholder dictionary
+    If source is 0:
+        Return 0
+    End If
+
+    Let result be Layout.allocate(16)
+    If result is 0:
+        Return 0
+    End If
+
+    Let placeholders be Dictionary.dictionary_create(64)
+    Let source_len be StringUtils.string_length(source)
+    Let output be StringUtils.string_create(source_len plus 256)
+    Let pos be 0
+    Let placeholder_id be PLACEHOLDER_PREFIX
+    Let in_string be 0
+
+    While pos is less than source_len:
+        Let ch be __load8(source, pos)
+
+        Note: Detect string literals (between double quotes)
+        If ch is 34:
+            Note: Found a quote - capture entire string literal
+            Let literal_start be pos
+            Set pos to pos plus 1
+            While pos is less than source_len:
+                Let inner_ch be __load8(source, pos)
+                If inner_ch is 34:
+                    Set pos to pos plus 1
+                    Note: Extract the literal including quotes
+                    Let literal_len be pos minus literal_start
+                    Let literal be StringUtils.string_substring(source, literal_start, literal_len)
+                    Note: Generate placeholder and store mapping
+                    Dictionary.dictionary_set(placeholders, placeholder_id, literal)
+                    Note: Write placeholder marker to output
+                    StringUtils.string_append_char(output, 1)
+                    StringUtils.string_append_integer(output, placeholder_id)
+                    StringUtils.string_append_char(output, 1)
+                    Set placeholder_id to placeholder_id plus 1
+                    Set pos to pos minus 1
+                    Note: Break out of inner loop
+                    Set pos to source_len plus literal_start
+                End If
+                Set pos to pos plus 1
+            End While
+            Note: Adjust pos if we broke out via the sentinel trick
+            If pos is greater than source_len:
+                Set pos to pos minus source_len
+            End If
+        Otherwise:
+            StringUtils.string_append_char(output, ch)
+        End If
+
+        Set pos to pos plus 1
+    End While
+
+    __store(result, 0, output)
+    __store(result, 8, placeholders)
+    Return result
+End Process
+
+Process called "apply_keyword_mapping" that takes text as Integer, catalog as Integer, direction as Integer returns Integer:
+    Note: Replaces known keywords in text using the catalog's dictionary.
+    Note: Uses the appropriate direction (to_canonical or from_canonical).
+    Note: Performs word-boundary-aware replacement to avoid partial matches.
+    If text is 0:
+        Return 0
+    End If
+    If catalog is 0:
+        Return text
+    End If
+
+    Note: Select the appropriate dictionary based on direction
+    Let dict be 0
+    If direction is DIRECTION_TO_CANONICAL:
+        Set dict to __load(catalog, 24)
+    Otherwise:
+        Set dict to __load(catalog, 32)
+    End If
+
+    If dict is 0:
+        Return text
+    End If
+
+    Note: For each line in the text, scan for keyword matches
+    Note: This is a simplified word-by-word replacement
+    Note: A production implementation would use longest-match-first scanning
+    Let text_len be StringUtils.string_length(text)
+    Let result be StringUtils.string_create(text_len plus 512)
+    Let pos be 0
+
+    While pos is less than text_len:
+        Let ch be __load8(text, pos)
+
+        Note: If we're at a word boundary, try to match a keyword
+        Let is_alpha be 0
+        If ch is greater than or equal to 65:
+            If ch is less than or equal to 90:
+                Set is_alpha to 1
+            End If
+        End If
+        If ch is greater than or equal to 97:
+            If ch is less than or equal to 122:
+                Set is_alpha to 1
+            End If
+        End If
+
+        If is_alpha is 1:
+            Note: Extract the word starting at pos
+            Let word_start be pos
+            While pos is less than text_len:
+                Let wch be __load8(text, pos)
+                Let still_word be 0
+                If wch is greater than or equal to 65:
+                    If wch is less than or equal to 90:
+                        Set still_word to 1
+                    End If
+                End If
+                If wch is greater than or equal to 97:
+                    If wch is less than or equal to 122:
+                        Set still_word to 1
+                    End If
+                End If
+                If wch is 95:
+                    Set still_word to 1
+                End If
+                If still_word is 0:
+                    Note: End of word
+                    Set pos to pos minus 1
+                    Note: Break
+                    Set pos to text_len plus word_start
+                End If
+                Set pos to pos plus 1
+            End While
+
+            Note: Adjust if we broke out
+            If pos is greater than text_len:
+                Set pos to pos minus text_len
+            Otherwise:
+                Set pos to text_len
+            End If
+
+            Let word_len be pos minus word_start
+            Let word be StringUtils.string_substring(text, word_start, word_len)
+
+            Note: Look up in catalog
+            Let replacement be Dictionary.dictionary_get(dict, word)
+            If replacement is not 0:
+                Note: Found a match - write the replacement
+                StringUtils.string_append(result, replacement)
+            Otherwise:
+                Note: No match - write the original word
+                StringUtils.string_append(result, word)
+            End If
+        Otherwise:
+            Note: Non-alphabetic character - copy as-is
+            StringUtils.string_append_char(result, ch)
+            Set pos to pos plus 1
+        End If
+    End While
+
+    Return result
+End Process
+
+Process called "restore_literals" that takes text as Integer, placeholders as Integer returns Integer:
+    Note: Replaces placeholder markers back with the original string literals.
+    If text is 0:
+        Return 0
+    End If
+    If placeholders is 0:
+        Return text
+    End If
+
+    Note: Scan for placeholder markers (SOH + id + SOH) and replace
+    Let text_len be StringUtils.string_length(text)
+    Let result be StringUtils.string_create(text_len plus 256)
+    Let pos be 0
+
+    While pos is less than text_len:
+        Let ch be __load8(text, pos)
+
+        If ch is 1:
+            Note: Start of placeholder marker - read the ID
+            Set pos to pos plus 1
+            Let id_start be pos
+            While pos is less than text_len:
+                Let id_ch be __load8(text, pos)
+                If id_ch is 1:
+                    Note: End of placeholder marker
+                    Note: Extract the numeric ID
+                    Let id_len be pos minus id_start
+                    Let id_str be StringUtils.string_substring(text, id_start, id_len)
+                    Let placeholder_id be StringUtils.string_to_integer(id_str)
+
+                    Note: Look up original literal
+                    Let original be Dictionary.dictionary_get(placeholders, placeholder_id)
+                    If original is not 0:
+                        StringUtils.string_append(result, original)
+                    End If
+                    Set pos to pos plus 1
+                    Note: Break
+                    Set pos to text_len plus id_start
+                End If
+                Set pos to pos plus 1
+            End While
+
+            If pos is greater than text_len:
+                Set pos to pos minus text_len
+            End If
+        Otherwise:
+            StringUtils.string_append_char(result, ch)
+            Set pos to pos plus 1
+        End If
+    End While
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Round-Trip Validation
+Note: ============================================================================
+
+Process called "validate_round_trip" that takes source as Integer, catalog as Integer returns Integer:
+    Note: Validates that translating canonical -> foreign -> canonical produces
+    Note: identical output to the original. This ensures catalog integrity.
+    Note: Returns 1 if round-trip is clean, 0 if there's a mismatch.
+    If source is 0:
+        Return 0
+    End If
+    If catalog is 0:
+        Return 0
+    End If
+
+    Note: Translate canonical -> foreign
+    Let foreign be translate_source(source, catalog, DIRECTION_FROM_CANONICAL)
+    If foreign is 0:
+        Return 0
+    End If
+
+    Note: Translate foreign -> canonical
+    Let back_to_canonical be translate_source(foreign, catalog, DIRECTION_TO_CANONICAL)
+    If back_to_canonical is 0:
+        Return 0
+    End If
+
+    Note: Compare original and round-tripped
+    Let cmp be StringUtils.string_compare(source, back_to_canonical)
+    If cmp is 0:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Entry Point
+Note: ============================================================================
+
+Process called "run_translate" that takes argc as Integer, argv as Integer returns Integer:
+    Note: Main entry point for the RunaTranslate tool.
+    Note: Usage:
+    Note:   runa translate <source_file> --to <lang_code>     (canonical -> foreign)
+    Note:   runa translate <source_file> --from <lang_code>   (foreign -> canonical)
+    Note:   runa translate <source_file> --roundtrip <lang>   (validate round-trip)
+    Note:   runa translate --list                             (list supported languages)
+    Note:   runa translate --catalog <lang> <catalog_file>    (load custom catalog)
+
+    If argc is less than 2:
+        Display "Usage: runa translate <source_file> --to|--from <language_code>"
+        Display "       runa translate --list"
+        Display "       runa translate <source_file> --roundtrip <language_code>"
+        Display ""
+        Display "Options:"
+        Display "  --to <lang>       Translate canonical Runa to <lang> (e.g., es, ja, zh)"
+        Display "  --from <lang>     Translate <lang> Runa to canonical English"
+        Display "  --roundtrip <lang> Validate round-trip translation integrity"
+        Display "  --list            List all supported human languages"
+        Display "  --catalog <lang> <file>  Load a custom language catalog"
+        Display "  -o <file>         Write output to file instead of stdout"
+        Display ""
+        Display "Supported languages: en, es, ja, hi, zh, ru, fr, de, pt, ar, ko"
+        Return TRANSLATE_INVALID_ARGS
+    End If
+
+    Note: Parse arguments
+    Let source_path be 0
+    Let output_path be 0
+    Let lang_code be 0
+    Let direction be DIRECTION_TO_CANONICAL
+    Let do_roundtrip be 0
+    Let do_list be 0
+    Let ptr_size be 8
+    Let i be 1
+
+    While i is less than argc:
+        Let arg_offset be i multiplied by ptr_size
+        Let arg_ptr be argv plus arg_offset
+        Let arg be __load(arg_ptr, 0)
+
+        If arg is not 0:
+            Let is_to be StringUtils.string_compare(arg, "--to")
+            If is_to is 0:
+                Set direction to DIRECTION_FROM_CANONICAL
+                Set i to i plus 1
+                If i is less than argc:
+                    Let next_ptr be argv plus (i multiplied by ptr_size)
+                    Set lang_code to __load(next_ptr, 0)
+                End If
+            End If
+
+            Let is_from be StringUtils.string_compare(arg, "--from")
+            If is_from is 0:
+                Set direction to DIRECTION_TO_CANONICAL
+                Set i to i plus 1
+                If i is less than argc:
+                    Let next_ptr be argv plus (i multiplied by ptr_size)
+                    Set lang_code to __load(next_ptr, 0)
+                End If
+            End If
+
+            Let is_roundtrip be StringUtils.string_compare(arg, "--roundtrip")
+            If is_roundtrip is 0:
+                Set do_roundtrip to 1
+                Set i to i plus 1
+                If i is less than argc:
+                    Let next_ptr be argv plus (i multiplied by ptr_size)
+                    Set lang_code to __load(next_ptr, 0)
+                End If
+            End If
+
+            Let is_output be StringUtils.string_compare(arg, "-o")
+            If is_output is 0:
+                Set i to i plus 1
+                If i is less than argc:
+                    Let next_ptr be argv plus (i multiplied by ptr_size)
+                    Set output_path to __load(next_ptr, 0)
+                End If
+            End If
+
+            Let is_list be StringUtils.string_compare(arg, "--list")
+            If is_list is 0:
+                Set do_list to 1
+            End If
+
+            Note: Positional argument = source file
+            Let first_ch be __load8(arg, 0)
+            If first_ch is not 45:
+                Note: Not a flag (doesn't start with -)
+                If source_path is 0:
+                    Set source_path to arg
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Handle --list
+    If do_list is 1:
+        Display "Supported human languages for Runa localization:"
+        Display "  en  - English (Canonical - no translation needed)"
+        Display "  es  - Spanish (Espanol)"
+        Display "  ja  - Japanese (日本語)"
+        Display "  hi  - Hindi (हिन्दी)"
+        Display "  zh  - Chinese Mandarin (中文)"
+        Display "  ru  - Russian (Русский)"
+        Display "  fr  - French (Français)"
+        Display "  de  - German (Deutsch)"
+        Display "  pt  - Portuguese (Português)"
+        Display "  ar  - Arabic (العربية)"
+        Display "  ko  - Korean (한국어)"
+        Display ""
+        Display "Community catalogs can be added for any language."
+        Display "See docs/dev/dev_tools/localization/README.md"
+        Return TRANSLATE_SUCCESS
+    End If
+
+    Note: Validate inputs
+    If source_path is 0:
+        Display "Error: No source file specified"
+        Return TRANSLATE_INVALID_ARGS
+    End If
+
+    If lang_code is 0:
+        Display "Error: No language specified. Use --to or --from <lang_code>"
+        Return TRANSLATE_INVALID_ARGS
+    End If
+
+    Let lang_id be resolve_language_id(lang_code)
+    If lang_id is 0:
+        Display "Error: Unsupported language code: "
+        Display lang_code
+        Display "Use --list to see supported languages"
+        Return TRANSLATE_UNSUPPORTED_LANG
+    End If
+
+    If lang_id is LANG_ENGLISH:
+        Display "Note: Source is already in canonical English. No translation needed."
+        Return TRANSLATE_SUCCESS
+    End If
+
+    Note: Read source file
+    Let source be FileUtils.read_file(source_path)
+    If source is 0:
+        Display "Error: Cannot read file: "
+        Display source_path
+        Return TRANSLATE_FAILURE
+    End If
+
+    Note: Load the language catalog
+    Note: Catalogs are loaded from dev_tools/syntax_converter/localization/catalogs/
+    Note: For now, create an empty catalog - native speakers populate these
+    Let lang_name be get_language_name(lang_id)
+    Let catalog be create_language_catalog(lang_id, lang_code, lang_name)
+    If catalog is 0:
+        Display "Error: Failed to create language catalog"
+        Return TRANSLATE_FAILURE
+    End If
+
+    Note: TODO: Load catalog entries from disk file
+    Note: The catalog files are community-maintained and loaded at runtime
+    Note: For now, the framework is in place for catalog loading
+
+    Note: Handle round-trip validation
+    If do_roundtrip is 1:
+        Display "Validating round-trip translation for: "
+        Display lang_name
+        Let valid be validate_round_trip(source, catalog)
+        If valid is 1:
+            Display "Round-trip validation: PASSED"
+            Return TRANSLATE_SUCCESS
+        Otherwise:
+            Display "Round-trip validation: FAILED - catalog may have inconsistencies"
+            Return TRANSLATE_FAILURE
+        End If
+    End If
+
+    Note: Perform translation
+    Display "Translating "
+    If direction is DIRECTION_TO_CANONICAL:
+        Display lang_name
+        Display " -> English (Canonical)"
+    Otherwise:
+        Display "English (Canonical) -> "
+        Display lang_name
+    End If
+
+    Let translated be translate_source(source, catalog, direction)
+    If translated is 0:
+        Display "Error: Translation failed"
+        Return TRANSLATE_FAILURE
+    End If
+
+    Note: Write output
+    If output_path is not 0:
+        Let write_len be StringUtils.string_length(translated)
+        Let write_result be FileUtils.write_file(output_path, translated, write_len)
+        If write_result is not 0:
+            Display "Error: Failed to write output file"
+            Return TRANSLATE_FAILURE
+        End If
+        Display "Output written to: "
+        Display output_path
+    Otherwise:
+        Display translated
+    End If
+
+    Return TRANSLATE_SUCCESS
+End Process

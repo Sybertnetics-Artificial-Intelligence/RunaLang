@@ -303,16 +303,19 @@ Type Shape is:
     | Circle with radius as Float
     | Rectangle with width as Float and height as Float
     | Triangle with base as Float and height as Float
+End Type
 
 Note: Result type for error handling
 Type Result[T, E] is:
     | Success with value as T
     | Failure with error as E
+End Type
 
 Note: Option type (built-in as Optional[T])
 Type Option[T] is:
     | Some with value as T
     | None
+End Type
 
 Note: Complex state machine
 Type ConnectionState is:
@@ -320,6 +323,7 @@ Type ConnectionState is:
     | Connecting with progress as Float
     | Connected with session_id as String and start_time as Integer
     | Error with code as Integer and message as String
+End Type
 ```
 
 #### Variant Construction Syntax
@@ -398,6 +402,7 @@ Type ApiResponse is:
     | Ok with data as Any and status as Integer
     | ClientError with message as String and code as Integer
     | ServerError with error as String and retry_after as Optional[Integer]
+End Type
 ```
 
 ## Generic Types
@@ -984,6 +989,7 @@ Type Payment is:
     | CreditCard with number as String and expiry as String
     | PayPal with email as String
     | BankTransfer with account as String and routing as String
+End Type
 ```
 
 ## Type System Performance

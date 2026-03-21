@@ -1043,6 +1043,7 @@ Note: Generic pair type
 Type called "Pair" of A, B:
     first as A
     second as B
+End Type
 
 Note: Create a pair
 Let point be Pair of Integer, Integer with:

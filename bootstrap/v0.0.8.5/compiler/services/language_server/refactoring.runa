@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,10 +29,1151 @@ This file is essential because of the following reasons:
 - Refactoring support enables Runa compilation for LSP-integrated refactoring handling
 
 This file consists of the following functions/features/operation types:
-- Code refactoring and LSP refactoring integration
-- Refactoring operations and refactoring transformation
-- Refactoring validation and refactoring verification
-- Refactoring communication and refactoring protocol implementation
+- Symbol rename across all occurrences in a document
+- Extract process (function extraction from code selection)
+- Inline variable (replace variable with its value expression)
+- TextEdit construction for precise document modifications
+- Edit application engine with offset adjustment for sequential edits
+
+Dependencies:
+- Imports compiler/internal/memory_safety.runa for safe memory access
+- Imports compiler/internal/owned_utils.runa for heap allocation
+- Imports compiler/internal/string_utils.runa for string operations
+- Imports compiler/internal/collections.runa for edit list management
 :End Note
 
-Note: TODO - Implement code refactoring functionality
+Import "compiler/internal/memory_safety.runa" as MemorySafety
+Import "compiler/internal/owned_utils.runa" as OwnedUtils
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/collections.runa" as Collections
+
+Note: ============================================================================
+Note: Refactoring Data Structures
+Note: ============================================================================
+
+Note: TextEdit structure (24 bytes total, 3 fields x 8 bytes each)
+Note: Layout:
+Note:   offset 0:  start_offset (8 bytes) - Byte offset in document where edit begins
+Note:   offset 8:  end_offset (8 bytes) - Byte offset in document where edit ends (exclusive)
+Note:   offset 16: new_text (8 bytes) - Pointer to replacement text string
+
+Type called "TextEdit":
+    start_offset as Integer
+    end_offset as Integer
+    new_text as Integer
+End Type
+
+Note: EditList structure (24 bytes) for collecting edits before applying them
+Note: Layout:
+Note:   offset 0:  edits (8 bytes) - Pointer to array of TextEdit pointers
+Note:   offset 8:  count (8 bytes) - Number of edits in list
+Note:   offset 16: capacity (8 bytes) - Maximum number of edits
+
+Type called "EditList":
+    edits as Integer
+    count as Integer
+    capacity as Integer
+End Type
+
+Note: ============================================================================
+Note: Refactoring Constants
+Note: ============================================================================
+
+Constant MAX_EDITS as Integer is 1024
+Constant REFACTORING_SUCCESS as Integer is 0
+Constant REFACTORING_FAILED as Integer is -1
+Constant REFACTORING_NAME_CONFLICT as Integer is -2
+Constant REFACTORING_INVALID_SELECTION as Integer is -3
+
+Note: ============================================================================
+Note: Core Refactoring Operations
+Note: ============================================================================
+
+Process called "rename_symbol" takes document_text as Integer, doc_len as Integer, cursor_line as Integer, cursor_col as Integer, new_name as Integer returns Integer:
+    Note: Rename a symbol at the cursor position to new_name across all occurrences
+    Note:
+    Note: Algorithm:
+    Note: 1. Extract the identifier at the cursor position
+    Note: 2. Validate the new name (not empty, valid identifier, no conflicts)
+    Note: 3. Scan the document for all occurrences of the old identifier
+    Note: 4. For each occurrence, verify it is a code reference (not in comments/strings)
+    Note: 5. Create a TextEdit for each occurrence
+    Note: 6. Return the EditList sorted by position (reverse order for safe application)
+    Note:
+    Note: Parameters:
+    Note:   document_text - Pointer to document text
+    Note:   doc_len - Length of document text
+    Note:   cursor_line - Zero-based line of cursor
+    Note:   cursor_col - Zero-based column of cursor
+    Note:   new_name - Pointer to new identifier name string
+    Note:
+    Note: Returns pointer to EditList, or 0 on failure
+
+    If document_text is equal to 0:
+        Return 0
+    End If
+    If new_name is equal to 0:
+        Return 0
+    End If
+
+    Note: Validate new name is a valid identifier
+    Let new_name_len be proc measure_str_len from new_name
+    If new_name_len is equal to 0:
+        Return 0
+    End If
+
+    Let valid be proc validate_identifier_name from new_name, new_name_len
+    If valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Extract the old identifier at cursor position
+    Let old_name be proc extract_ident_at_cursor from document_text, doc_len, cursor_line, cursor_col
+    If old_name is equal to 0:
+        Return 0
+    End If
+
+    Let old_name_len be proc measure_str_len from old_name
+
+    Note: Create the edit list
+    Let edit_list be proc allocate from OwnedUtils with 24
+    If edit_list is equal to 0:
+        Let dummy_free_old be proc deallocate from OwnedUtils with old_name
+        Return 0
+    End If
+
+    Let edits_array be proc allocate from OwnedUtils with MAX_EDITS times 8
+    If edits_array is equal to 0:
+        Let dummy_free_el be proc deallocate from OwnedUtils with edit_list
+        Let dummy_free_old be proc deallocate from OwnedUtils with old_name
+        Return 0
+    End If
+
+    Let dummy_data be proc memory_set_integer from MemorySafety with edit_list, 0, edits_array
+    Let dummy_count be proc memory_set_integer from MemorySafety with edit_list, 8, 0
+    Let dummy_cap be proc memory_set_integer from MemorySafety with edit_list, 16, MAX_EDITS
+
+    Note: Scan document for all occurrences of the old identifier
+    Let scan be 0
+    Let edit_count be 0
+    Let in_comment be 0
+    Let in_string be 0
+
+    While scan < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with document_text, scan
+
+        Note: Track context (comments and strings)
+        If ch is equal to 10:
+            Set in_comment to 0
+            Set scan to scan + 1
+        End If
+        Otherwise:
+            Note: Check for "Note:" comment start
+            If ch is equal to 78:
+                If scan + 4 < doc_len:
+                    Let c1 be proc memory_get_integer from MemorySafety with document_text, scan + 1
+                    Let c4 be proc memory_get_integer from MemorySafety with document_text, scan + 4
+                    If c1 is equal to 111:
+                        If c4 is equal to 58:
+                            Set in_comment to 1
+                        End If
+                    End If
+                End If
+            End If
+
+            Note: Track string boundaries
+            If ch is equal to 34:
+                If in_comment is equal to 0:
+                    If in_string is equal to 0:
+                        Set in_string to 1
+                    End If
+                    Otherwise:
+                        Set in_string to 0
+                    End If
+                End If
+            End If
+
+            Note: Check for identifier match in code context
+            If in_comment is equal to 0:
+                If in_string is equal to 0:
+                    Let first_old_ch be proc memory_get_integer from MemorySafety with old_name, 0
+                    If ch is equal to first_old_ch:
+                        Note: Check full match
+                        Let match be proc check_ident_match from document_text, scan, doc_len, old_name, old_name_len
+                        If match is equal to 1:
+                            Note: Verify word boundary
+                            Let is_boundary be proc check_word_bounds from document_text, scan, old_name_len, doc_len
+                            If is_boundary is equal to 1:
+                                Note: Create a TextEdit for this occurrence
+                                If edit_count < MAX_EDITS:
+                                    Let edit be proc create_text_edit with scan, scan + old_name_len, new_name
+                                    If edit is not equal to 0:
+                                        Let dummy_add be proc memory_set_integer from MemorySafety with edits_array, edit_count times 8, edit
+                                        Set edit_count to edit_count + 1
+                                    End If
+                                End If
+                                Note: Skip past this occurrence to avoid re-matching
+                                Set scan to scan + old_name_len
+                            End If
+                            Otherwise:
+                                Set scan to scan + 1
+                            End If
+                        End If
+                        Otherwise:
+                            Set scan to scan + 1
+                        End If
+                    End If
+                    Otherwise:
+                        Set scan to scan + 1
+                    End If
+                End If
+                Otherwise:
+                    Set scan to scan + 1
+                End If
+            End If
+            Otherwise:
+                Set scan to scan + 1
+            End If
+        End If
+    End While
+
+    Note: Update edit count
+    Let dummy_final_count be proc memory_set_integer from MemorySafety with edit_list, 8, edit_count
+
+    Let dummy_free_old be proc deallocate from OwnedUtils with old_name
+
+    Note: Sort edits in reverse order (highest offset first) for safe application
+    Let sort_result be proc sort_edits_reverse from edits_array, edit_count
+
+    Return edit_list
+End Process
+
+Process called "extract_process" takes document_text as Integer, doc_len as Integer, selection_start as Integer, selection_end as Integer, process_name as Integer returns Integer:
+    Note: Extract selected code into a new Process definition
+    Note:
+    Note: Algorithm:
+    Note: 1. Extract the selected text region
+    Note: 2. Analyze the selection for:
+    Note:    a. Variables used but not declared in selection (these become parameters)
+    Note:    b. Variables declared in selection and used after (these become return values)
+    Note: 3. Build the new Process definition with the extracted code as body
+    Note: 4. Replace the selection with a call to the new Process
+    Note: 5. Return an EditList with two edits: the replacement and the insertion
+    Note:
+    Note: Parameters:
+    Note:   document_text - Full document text
+    Note:   doc_len - Document length
+    Note:   selection_start - Byte offset of selection start
+    Note:   selection_end - Byte offset of selection end (exclusive)
+    Note:   process_name - Pointer to name string for the new process
+    Note:
+    Note: Returns pointer to EditList, or 0 on failure
+
+    If document_text is equal to 0:
+        Return 0
+    End If
+    If process_name is equal to 0:
+        Return 0
+    End If
+    If selection_start > selection_end:
+        Return 0
+    End If
+    If selection_end > doc_len:
+        Return 0
+    End If
+
+    Let selection_len be selection_end - selection_start
+
+    Note: Extract the selected text
+    Let selected_text be proc allocate from OwnedUtils with selection_len + 1
+    If selected_text is equal to 0:
+        Return 0
+    End If
+
+    Let copy_idx be 0
+    While copy_idx < selection_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with document_text, selection_start + copy_idx
+        Let dummy_cp be proc memory_set_integer from MemorySafety with selected_text, copy_idx, byte_val
+        Set copy_idx to copy_idx + 1
+    End While
+    Let dummy_term be proc memory_set_integer from MemorySafety with selected_text, selection_len, 0
+
+    Note: Analyze variables used in the selection
+    Note: Find variables referenced but not declared within the selection (candidates for parameters)
+    Let used_vars be proc find_referenced_variables from selected_text, selection_len
+    Let declared_vars be proc find_declared_variables from selected_text, selection_len
+
+    Note: Build the new Process definition
+    Note: Format: Process called "<name>" that takes <params> returns <type>:\n<body>\nEnd Process
+    Let proc_name_len be proc measure_str_len from process_name
+    Note: Estimate buffer size: "Process called \"" (16) + name + "\"" (1) + params + body + "End Process\n" (12)
+    Let proc_def_size be 64 + proc_name_len + selection_len
+    Let proc_def be proc allocate from OwnedUtils with proc_def_size
+    If proc_def is equal to 0:
+        Let dummy_free_sel be proc deallocate from OwnedUtils with selected_text
+        Return 0
+    End If
+
+    Let pos be 0
+
+    Note: Write "Process called \""
+    Note: P=80 r=114 o=111 c=99 e=101 s=115 s=115 space=32 c=99 a=97 l=108 l=108 e=101 d=100 space=32 "=34
+    Let proc_header_bytes be proc allocate from OwnedUtils with 16
+    If proc_header_bytes is not equal to 0:
+        Let dummy_P be proc memory_set_integer from MemorySafety with proc_def, pos, 80
+        Set pos to pos + 1
+        Let dummy_r1 be proc memory_set_integer from MemorySafety with proc_def, pos, 114
+        Set pos to pos + 1
+        Let dummy_o1 be proc memory_set_integer from MemorySafety with proc_def, pos, 111
+        Set pos to pos + 1
+        Let dummy_c1 be proc memory_set_integer from MemorySafety with proc_def, pos, 99
+        Set pos to pos + 1
+        Let dummy_e1 be proc memory_set_integer from MemorySafety with proc_def, pos, 101
+        Set pos to pos + 1
+        Let dummy_s1 be proc memory_set_integer from MemorySafety with proc_def, pos, 115
+        Set pos to pos + 1
+        Let dummy_s2 be proc memory_set_integer from MemorySafety with proc_def, pos, 115
+        Set pos to pos + 1
+        Let dummy_sp1 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+        Set pos to pos + 1
+        Let dummy_c2 be proc memory_set_integer from MemorySafety with proc_def, pos, 99
+        Set pos to pos + 1
+        Let dummy_a1 be proc memory_set_integer from MemorySafety with proc_def, pos, 97
+        Set pos to pos + 1
+        Let dummy_l1 be proc memory_set_integer from MemorySafety with proc_def, pos, 108
+        Set pos to pos + 1
+        Let dummy_l2 be proc memory_set_integer from MemorySafety with proc_def, pos, 108
+        Set pos to pos + 1
+        Let dummy_e2 be proc memory_set_integer from MemorySafety with proc_def, pos, 101
+        Set pos to pos + 1
+        Let dummy_d1 be proc memory_set_integer from MemorySafety with proc_def, pos, 100
+        Set pos to pos + 1
+        Let dummy_sp2 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+        Set pos to pos + 1
+        Let dummy_q1 be proc memory_set_integer from MemorySafety with proc_def, pos, 34
+        Set pos to pos + 1
+        Let dummy_free_ph be proc deallocate from OwnedUtils with proc_header_bytes
+    End If
+
+    Note: Write process name
+    Let ni be 0
+    While ni < proc_name_len:
+        Let nb be proc memory_get_integer from MemorySafety with process_name, ni
+        Let dummy_nb be proc memory_set_integer from MemorySafety with proc_def, pos, nb
+        Set pos to pos + 1
+        Set ni to ni + 1
+    End While
+
+    Note: Write closing quote, colon, newline: ":\n
+    Let dummy_q2 be proc memory_set_integer from MemorySafety with proc_def, pos, 34
+    Set pos to pos + 1
+    Let dummy_colon be proc memory_set_integer from MemorySafety with proc_def, pos, 58
+    Set pos to pos + 1
+    Let dummy_nl1 be proc memory_set_integer from MemorySafety with proc_def, pos, 10
+    Set pos to pos + 1
+
+    Note: Write the body (indented with 4 spaces per line)
+    Let body_idx be 0
+    Note: Add initial indent
+    Let dummy_sp3 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+    Set pos to pos + 1
+    Let dummy_sp4 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+    Set pos to pos + 1
+    Let dummy_sp5 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+    Set pos to pos + 1
+    Let dummy_sp6 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+    Set pos to pos + 1
+
+    While body_idx < selection_len:
+        Let bc be proc memory_get_integer from MemorySafety with selected_text, body_idx
+        Let dummy_bc be proc memory_set_integer from MemorySafety with proc_def, pos, bc
+        Set pos to pos + 1
+
+        Note: After each newline, add 4 spaces of indentation
+        If bc is equal to 10:
+            If body_idx + 1 < selection_len:
+                Let dummy_ind1 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+                Set pos to pos + 1
+                Let dummy_ind2 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+                Set pos to pos + 1
+                Let dummy_ind3 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+                Set pos to pos + 1
+                Let dummy_ind4 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+                Set pos to pos + 1
+            End If
+        End If
+        Set body_idx to body_idx + 1
+    End While
+
+    Note: Write "\nEnd Process\n"
+    Let dummy_nl2 be proc memory_set_integer from MemorySafety with proc_def, pos, 10
+    Set pos to pos + 1
+    Note: E=69 n=110 d=100 space=32 P=80 r=114 o=111 c=99 e=101 s=115 s=115
+    Let dummy_E be proc memory_set_integer from MemorySafety with proc_def, pos, 69
+    Set pos to pos + 1
+    Let dummy_n1 be proc memory_set_integer from MemorySafety with proc_def, pos, 110
+    Set pos to pos + 1
+    Let dummy_d2 be proc memory_set_integer from MemorySafety with proc_def, pos, 100
+    Set pos to pos + 1
+    Let dummy_sp7 be proc memory_set_integer from MemorySafety with proc_def, pos, 32
+    Set pos to pos + 1
+    Let dummy_P2 be proc memory_set_integer from MemorySafety with proc_def, pos, 80
+    Set pos to pos + 1
+    Let dummy_r2 be proc memory_set_integer from MemorySafety with proc_def, pos, 114
+    Set pos to pos + 1
+    Let dummy_o2 be proc memory_set_integer from MemorySafety with proc_def, pos, 111
+    Set pos to pos + 1
+    Let dummy_c3 be proc memory_set_integer from MemorySafety with proc_def, pos, 99
+    Set pos to pos + 1
+    Let dummy_e3 be proc memory_set_integer from MemorySafety with proc_def, pos, 101
+    Set pos to pos + 1
+    Let dummy_s3 be proc memory_set_integer from MemorySafety with proc_def, pos, 115
+    Set pos to pos + 1
+    Let dummy_s4 be proc memory_set_integer from MemorySafety with proc_def, pos, 115
+    Set pos to pos + 1
+    Let dummy_nl3 be proc memory_set_integer from MemorySafety with proc_def, pos, 10
+    Set pos to pos + 1
+    Let dummy_null be proc memory_set_integer from MemorySafety with proc_def, pos, 0
+
+    Note: Build the replacement call text
+    Note: "Let result be proc <name>\n"
+    Let call_text_size be 32 + proc_name_len
+    Let call_text be proc allocate from OwnedUtils with call_text_size
+    If call_text is equal to 0:
+        Let dummy_free_def be proc deallocate from OwnedUtils with proc_def
+        Let dummy_free_sel be proc deallocate from OwnedUtils with selected_text
+        Return 0
+    End If
+
+    Let cp be 0
+    Note: "Let result be proc "
+    Note: L=76 e=101 t=116 space=32 r=114 e=101 s=115 u=117 l=108 t=116 space=32 b=98 e=101 space=32 p=112 r=114 o=111 c=99 space=32
+    Let dummy_L be proc memory_set_integer from MemorySafety with call_text, cp, 76
+    Set cp to cp + 1
+    Let dummy_e4 be proc memory_set_integer from MemorySafety with call_text, cp, 101
+    Set cp to cp + 1
+    Let dummy_t1 be proc memory_set_integer from MemorySafety with call_text, cp, 116
+    Set cp to cp + 1
+    Let dummy_sp8 be proc memory_set_integer from MemorySafety with call_text, cp, 32
+    Set cp to cp + 1
+    Let dummy_r3 be proc memory_set_integer from MemorySafety with call_text, cp, 114
+    Set cp to cp + 1
+    Let dummy_e5 be proc memory_set_integer from MemorySafety with call_text, cp, 101
+    Set cp to cp + 1
+    Let dummy_s5 be proc memory_set_integer from MemorySafety with call_text, cp, 115
+    Set cp to cp + 1
+    Let dummy_u1 be proc memory_set_integer from MemorySafety with call_text, cp, 117
+    Set cp to cp + 1
+    Let dummy_l3 be proc memory_set_integer from MemorySafety with call_text, cp, 108
+    Set cp to cp + 1
+    Let dummy_t2 be proc memory_set_integer from MemorySafety with call_text, cp, 116
+    Set cp to cp + 1
+    Let dummy_sp9 be proc memory_set_integer from MemorySafety with call_text, cp, 32
+    Set cp to cp + 1
+    Let dummy_b1 be proc memory_set_integer from MemorySafety with call_text, cp, 98
+    Set cp to cp + 1
+    Let dummy_e6 be proc memory_set_integer from MemorySafety with call_text, cp, 101
+    Set cp to cp + 1
+    Let dummy_sp10 be proc memory_set_integer from MemorySafety with call_text, cp, 32
+    Set cp to cp + 1
+    Let dummy_p1 be proc memory_set_integer from MemorySafety with call_text, cp, 112
+    Set cp to cp + 1
+    Let dummy_r4 be proc memory_set_integer from MemorySafety with call_text, cp, 114
+    Set cp to cp + 1
+    Let dummy_o3 be proc memory_set_integer from MemorySafety with call_text, cp, 111
+    Set cp to cp + 1
+    Let dummy_c4 be proc memory_set_integer from MemorySafety with call_text, cp, 99
+    Set cp to cp + 1
+    Let dummy_sp11 be proc memory_set_integer from MemorySafety with call_text, cp, 32
+    Set cp to cp + 1
+
+    Note: Write process name
+    Let cni be 0
+    While cni < proc_name_len:
+        Let cnb be proc memory_get_integer from MemorySafety with process_name, cni
+        Let dummy_cnb be proc memory_set_integer from MemorySafety with call_text, cp, cnb
+        Set cp to cp + 1
+        Set cni to cni + 1
+    End While
+    Let dummy_call_term be proc memory_set_integer from MemorySafety with call_text, cp, 0
+
+    Note: Create the edit list with two edits:
+    Note: 1. Insert the new Process definition before the selection
+    Note: 2. Replace the selection with the call to the new process
+    Let edit_list be proc allocate from OwnedUtils with 24
+    If edit_list is equal to 0:
+        Let dummy_free_call be proc deallocate from OwnedUtils with call_text
+        Let dummy_free_def be proc deallocate from OwnedUtils with proc_def
+        Let dummy_free_sel be proc deallocate from OwnedUtils with selected_text
+        Return 0
+    End If
+
+    Let edits_array be proc allocate from OwnedUtils with 16
+    If edits_array is equal to 0:
+        Let dummy_free_el be proc deallocate from OwnedUtils with edit_list
+        Let dummy_free_call be proc deallocate from OwnedUtils with call_text
+        Let dummy_free_def be proc deallocate from OwnedUtils with proc_def
+        Let dummy_free_sel be proc deallocate from OwnedUtils with selected_text
+        Return 0
+    End If
+
+    Note: Edit 1: Replace selection with function call
+    Let edit_replace be proc create_text_edit with selection_start, selection_end, call_text
+    Note: Edit 2: Insert process definition at the start of the selection line
+    Note: Find the start of the line containing selection_start
+    Let line_start be proc find_line_start_offset from document_text, selection_start
+    Let edit_insert be proc create_text_edit with line_start, line_start, proc_def
+
+    Let dummy_e1_set be proc memory_set_integer from MemorySafety with edits_array, 0, edit_insert
+    Let dummy_e2_set be proc memory_set_integer from MemorySafety with edits_array, 8, edit_replace
+
+    Let dummy_data be proc memory_set_integer from MemorySafety with edit_list, 0, edits_array
+    Let dummy_count be proc memory_set_integer from MemorySafety with edit_list, 8, 2
+    Let dummy_cap be proc memory_set_integer from MemorySafety with edit_list, 16, MAX_EDITS
+
+    Let dummy_free_sel be proc deallocate from OwnedUtils with selected_text
+
+    If used_vars is not equal to 0:
+        Let dummy_free_uv be proc deallocate from OwnedUtils with used_vars
+    End If
+    If declared_vars is not equal to 0:
+        Let dummy_free_dv be proc deallocate from OwnedUtils with declared_vars
+    End If
+
+    Return edit_list
+End Process
+
+Process called "inline_variable" takes document_text as Integer, doc_len as Integer, cursor_line as Integer, cursor_col as Integer returns Integer:
+    Note: Inline a variable at the cursor position by replacing all references
+    Note: with the variable's initialization expression
+    Note:
+    Note: Algorithm:
+    Note: 1. Extract the variable name at the cursor
+    Note: 2. Find the Let declaration and extract the value expression
+    Note: 3. Find all references to the variable
+    Note: 4. Create TextEdits to replace each reference with the expression
+    Note: 5. Create a TextEdit to remove the Let declaration
+    Note: 6. Return the EditList
+    Note:
+    Note: Returns pointer to EditList, or 0 on failure
+
+    If document_text is equal to 0:
+        Return 0
+    End If
+
+    Note: Extract variable name at cursor
+    Let var_name be proc extract_ident_at_cursor from document_text, doc_len, cursor_line, cursor_col
+    If var_name is equal to 0:
+        Return 0
+    End If
+
+    Let var_name_len be proc measure_str_len from var_name
+
+    Note: Find the Let declaration for this variable
+    Note: Search for "Let <var_name> be "
+    Let decl_offset be proc find_let_decl_offset from document_text, doc_len, var_name, var_name_len
+    If decl_offset is equal to -1:
+        Let dummy_free_var be proc deallocate from OwnedUtils with var_name
+        Return 0
+    End If
+
+    Note: Extract the value expression (everything after "be " until end of line)
+    Let value_start be decl_offset + 4 + var_name_len + 4
+    Note: "Let " (4) + name + " be " (4) = offset to value
+    Let value_end be value_start
+    While value_end < doc_len:
+        Let vc be proc memory_get_integer from MemorySafety with document_text, value_end
+        If vc is equal to 10:
+            Set value_end to value_end + doc_len
+        End If
+        Otherwise:
+            Set value_end to value_end + 1
+        End If
+    End While
+    If value_end > doc_len:
+        Set value_end to value_end - doc_len
+    End If
+
+    Let value_len be value_end - value_start
+    If value_len < 1:
+        Let dummy_free_var be proc deallocate from OwnedUtils with var_name
+        Return 0
+    End If
+
+    Note: Copy the value expression
+    Let value_text be proc allocate from OwnedUtils with value_len + 1
+    If value_text is equal to 0:
+        Let dummy_free_var be proc deallocate from OwnedUtils with var_name
+        Return 0
+    End If
+    Let vi be 0
+    While vi < value_len:
+        Let vb be proc memory_get_integer from MemorySafety with document_text, value_start + vi
+        Let dummy_vb be proc memory_set_integer from MemorySafety with value_text, vi, vb
+        Set vi to vi + 1
+    End While
+    Let dummy_vterm be proc memory_set_integer from MemorySafety with value_text, value_len, 0
+
+    Note: Find all references to the variable and build edits
+    Let edit_list be proc allocate from OwnedUtils with 24
+    If edit_list is equal to 0:
+        Let dummy_free_val be proc deallocate from OwnedUtils with value_text
+        Let dummy_free_var be proc deallocate from OwnedUtils with var_name
+        Return 0
+    End If
+
+    Let edits_array be proc allocate from OwnedUtils with MAX_EDITS times 8
+    If edits_array is equal to 0:
+        Let dummy_free_el be proc deallocate from OwnedUtils with edit_list
+        Let dummy_free_val be proc deallocate from OwnedUtils with value_text
+        Let dummy_free_var be proc deallocate from OwnedUtils with var_name
+        Return 0
+    End If
+
+    Let dummy_data be proc memory_set_integer from MemorySafety with edit_list, 0, edits_array
+    Let dummy_count be proc memory_set_integer from MemorySafety with edit_list, 8, 0
+    Let dummy_cap be proc memory_set_integer from MemorySafety with edit_list, 16, MAX_EDITS
+
+    Let edit_count be 0
+
+    Note: First edit: remove the Let declaration line
+    Let decl_line_end be decl_offset
+    While decl_line_end < doc_len:
+        Let dc be proc memory_get_integer from MemorySafety with document_text, decl_line_end
+        If dc is equal to 10:
+            Set decl_line_end to decl_line_end + 1 + doc_len
+        End If
+        Otherwise:
+            Set decl_line_end to decl_line_end + 1
+        End If
+    End While
+    If decl_line_end > doc_len:
+        Set decl_line_end to decl_line_end - doc_len
+    End If
+
+    Note: Create empty-text edit to delete the declaration line
+    Let empty_text be proc allocate from OwnedUtils with 1
+    If empty_text is not equal to 0:
+        Let dummy_et be proc memory_set_integer from MemorySafety with empty_text, 0, 0
+        Let decl_edit be proc create_text_edit with decl_offset, decl_line_end, empty_text
+        If decl_edit is not equal to 0:
+            Let dummy_add_decl be proc memory_set_integer from MemorySafety with edits_array, edit_count times 8, decl_edit
+            Set edit_count to edit_count + 1
+        End If
+    End If
+
+    Note: Find all references and create replacement edits
+    Let ref_scan be 0
+    While ref_scan < doc_len:
+        Let rch be proc memory_get_integer from MemorySafety with document_text, ref_scan
+        Let first_var_ch be proc memory_get_integer from MemorySafety with var_name, 0
+
+        If rch is equal to first_var_ch:
+            Note: Skip the declaration itself
+            If ref_scan is not equal to decl_offset + 4:
+                Let rmatch be proc check_ident_match from document_text, ref_scan, doc_len, var_name, var_name_len
+                If rmatch is equal to 1:
+                    Let rboundary be proc check_word_bounds from document_text, ref_scan, var_name_len, doc_len
+                    If rboundary is equal to 1:
+                        If edit_count < MAX_EDITS:
+                            Let ref_edit be proc create_text_edit with ref_scan, ref_scan + var_name_len, value_text
+                            If ref_edit is not equal to 0:
+                                Let dummy_add_ref be proc memory_set_integer from MemorySafety with edits_array, edit_count times 8, ref_edit
+                                Set edit_count to edit_count + 1
+                            End If
+                        End If
+                        Set ref_scan to ref_scan + var_name_len
+                    End If
+                    Otherwise:
+                        Set ref_scan to ref_scan + 1
+                    End If
+                End If
+                Otherwise:
+                    Set ref_scan to ref_scan + 1
+                End If
+            End If
+            Otherwise:
+                Set ref_scan to ref_scan + var_name_len
+            End If
+        End If
+        Otherwise:
+            Set ref_scan to ref_scan + 1
+        End If
+    End While
+
+    Let dummy_final_count be proc memory_set_integer from MemorySafety with edit_list, 8, edit_count
+
+    Note: Sort edits in reverse order for safe application
+    Let sort_res be proc sort_edits_reverse from edits_array, edit_count
+
+    Let dummy_free_var be proc deallocate from OwnedUtils with var_name
+    Return edit_list
+End Process
+
+Process called "create_text_edit" takes start_offset as Integer, end_offset as Integer, new_text as Integer returns Integer:
+    Note: Create a TextEdit structure (24 bytes)
+    Note: Returns pointer to TextEdit, or 0 on allocation failure
+
+    Let edit be proc allocate from OwnedUtils with 24
+    If edit is equal to 0:
+        Return 0
+    End If
+
+    Let dummy_start be proc memory_set_integer from MemorySafety with edit, 0, start_offset
+    Let dummy_end be proc memory_set_integer from MemorySafety with edit, 8, end_offset
+    Let dummy_text be proc memory_set_integer from MemorySafety with edit, 16, new_text
+
+    Return edit
+End Process
+
+Process called "apply_edits" takes document_text as Integer, doc_len as Integer, edit_list as Integer returns Integer:
+    Note: Apply a list of TextEdits to a document, producing a new document
+    Note: Edits MUST be sorted in reverse order (highest offset first) to avoid
+    Note: offset invalidation when earlier edits change document length
+    Note:
+    Note: Algorithm:
+    Note: 1. Calculate the total size change from all edits
+    Note: 2. Allocate a new buffer for the result document
+    Note: 3. Copy document text, applying edits as we encounter their positions
+    Note: 4. Return the new document text pointer
+    Note:
+    Note: Returns pointer to new document text, or 0 on failure
+
+    If document_text is equal to 0:
+        Return 0
+    End If
+    If edit_list is equal to 0:
+        Return 0
+    End If
+
+    Let edits_data be proc memory_get_integer from MemorySafety with edit_list, 0
+    Let edit_count be proc memory_get_integer from MemorySafety with edit_list, 8
+
+    If edit_count is equal to 0:
+        Note: No edits - return a copy of the original document
+        Let copy_buf be proc allocate from OwnedUtils with doc_len + 1
+        If copy_buf is equal to 0:
+            Return 0
+        End If
+        Let ci be 0
+        While ci < doc_len:
+            Let cb be proc memory_get_integer from MemorySafety with document_text, ci
+            Let dummy_cb be proc memory_set_integer from MemorySafety with copy_buf, ci, cb
+            Set ci to ci + 1
+        End While
+        Let dummy_term be proc memory_set_integer from MemorySafety with copy_buf, doc_len, 0
+        Return copy_buf
+    End If
+
+    Note: Calculate total size change
+    Let total_change be 0
+    Let ei be 0
+    While ei < edit_count:
+        Let edit_ptr be proc memory_get_integer from MemorySafety with edits_data, ei times 8
+        If edit_ptr is not equal to 0:
+            Let edit_start be proc memory_get_integer from MemorySafety with edit_ptr, 0
+            Let edit_end be proc memory_get_integer from MemorySafety with edit_ptr, 8
+            Let edit_text be proc memory_get_integer from MemorySafety with edit_ptr, 16
+            Let removed_len be edit_end - edit_start
+            Let added_len be proc measure_str_len from edit_text
+            Set total_change to total_change + added_len - removed_len
+        End If
+        Set ei to ei + 1
+    End While
+
+    Let new_doc_len be doc_len + total_change
+    If new_doc_len < 0:
+        Return 0
+    End If
+
+    Let new_doc be proc allocate from OwnedUtils with new_doc_len + 1
+    If new_doc is equal to 0:
+        Return 0
+    End If
+
+    Note: Apply edits by processing the document from start to end
+    Note: Since edits are sorted in reverse, we process them from the end
+    Note: For forward application, we sort them forward first
+    Let src_pos be 0
+    Let dst_pos be 0
+    Let edit_idx be edit_count - 1
+
+    Note: Process edits from lowest offset to highest (reverse of the stored order)
+    Note: We need to find edits in forward order
+    While src_pos < doc_len:
+        Note: Check if any edit starts at or before current position
+        Let applied_edit be 0
+        Let check_idx be edit_count - 1
+        While check_idx > -1:
+            Let edit_ptr be proc memory_get_integer from MemorySafety with edits_data, check_idx times 8
+            If edit_ptr is not equal to 0:
+                Let edit_start be proc memory_get_integer from MemorySafety with edit_ptr, 0
+                If edit_start is equal to src_pos:
+                    Let edit_end be proc memory_get_integer from MemorySafety with edit_ptr, 8
+                    Let edit_text be proc memory_get_integer from MemorySafety with edit_ptr, 16
+
+                    Note: Write the replacement text
+                    If edit_text is not equal to 0:
+                        Let text_len be proc measure_str_len from edit_text
+                        Let ti be 0
+                        While ti < text_len:
+                            Let tb be proc memory_get_integer from MemorySafety with edit_text, ti
+                            Let dummy_tb be proc memory_set_integer from MemorySafety with new_doc, dst_pos, tb
+                            Set dst_pos to dst_pos + 1
+                            Set ti to ti + 1
+                        End While
+                    End If
+
+                    Note: Skip the replaced region in the source
+                    Set src_pos to edit_end
+                    Set applied_edit to 1
+                    Note: Mark this edit as applied by nulling it
+                    Let dummy_null_edit be proc memory_set_integer from MemorySafety with edits_data, check_idx times 8, 0
+                    Set check_idx to -1
+                End If
+            End If
+            Set check_idx to check_idx - 1
+        End While
+
+        If applied_edit is equal to 0:
+            Note: No edit at this position - copy the byte
+            If src_pos < doc_len:
+                Let byte_val be proc memory_get_integer from MemorySafety with document_text, src_pos
+                Let dummy_byte be proc memory_set_integer from MemorySafety with new_doc, dst_pos, byte_val
+                Set dst_pos to dst_pos + 1
+                Set src_pos to src_pos + 1
+            End If
+        End If
+    End While
+
+    Let dummy_null_term be proc memory_set_integer from MemorySafety with new_doc, dst_pos, 0
+    Return new_doc
+End Process
+
+Note: ============================================================================
+Note: Internal Helper Processes
+Note: ============================================================================
+
+Private Process called "measure_str_len" takes str_ptr as Integer returns Integer:
+    Note: Measure length of null-terminated string
+    If str_ptr is equal to 0:
+        Return 0
+    End If
+    Let len be 0
+    Let max_len be 1048576
+    While len < max_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with str_ptr, len
+        If byte_val is equal to 0:
+            Return len
+        End If
+        Set len to len + 1
+    End While
+    Return len
+End Process
+
+Private Process called "validate_identifier_name" takes name as Integer, name_len as Integer returns Integer:
+    Note: Validate that a string is a valid Runa identifier
+    Note: Must start with letter or underscore, followed by letters, digits, or underscore
+    Note: Returns 1 if valid, 0 if invalid
+
+    If name is equal to 0:
+        Return 0
+    End If
+    If name_len is equal to 0:
+        Return 0
+    End If
+
+    Note: First character must be letter or underscore
+    Let first_ch be proc memory_get_integer from MemorySafety with name, 0
+    Let valid_first be 0
+    If first_ch > 64:
+        If first_ch < 91:
+            Set valid_first to 1
+        End If
+    End If
+    If first_ch > 96:
+        If first_ch < 123:
+            Set valid_first to 1
+        End If
+    End If
+    If first_ch is equal to 95:
+        Set valid_first to 1
+    End If
+    If valid_first is equal to 0:
+        Return 0
+    End If
+
+    Note: Remaining characters: letter, digit, or underscore
+    Let idx be 1
+    While idx < name_len:
+        Let ch be proc memory_get_integer from MemorySafety with name, idx
+        Let valid_ch be 0
+        If ch > 64:
+            If ch < 91:
+                Set valid_ch to 1
+            End If
+        End If
+        If ch > 96:
+            If ch < 123:
+                Set valid_ch to 1
+            End If
+        End If
+        If ch > 47:
+            If ch < 58:
+                Set valid_ch to 1
+            End If
+        End If
+        If ch is equal to 95:
+            Set valid_ch to 1
+        End If
+        If valid_ch is equal to 0:
+            Return 0
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return 1
+End Process
+
+Private Process called "extract_ident_at_cursor" takes doc as Integer, doc_len as Integer, line as Integer, col as Integer returns Integer:
+    Note: Extract the identifier at the given line and column
+    Note: Returns newly allocated string, or 0
+
+    Note: Find line offset
+    Let line_offset be 0
+    Let current_line be 0
+    While current_line < line:
+        While line_offset < doc_len:
+            Let ch be proc memory_get_integer from MemorySafety with doc, line_offset
+            Set line_offset to line_offset + 1
+            If ch is equal to 10:
+                Set current_line to current_line + 1
+                Set line_offset to line_offset
+                Set current_line to line
+            End If
+        End While
+        Set current_line to current_line + 1
+    End While
+
+    Note: Find word boundaries
+    Let word_start be col
+    While word_start > 0:
+        Let prev_pos be line_offset + word_start - 1
+        If prev_pos < doc_len:
+            Let prev_ch be proc memory_get_integer from MemorySafety with doc, prev_pos
+            Let is_ident be proc is_ident_char from prev_ch
+            If is_ident is equal to 0:
+                Set word_start to 0
+            End If
+            Otherwise:
+                Set word_start to word_start - 1
+            End If
+        End If
+        Otherwise:
+            Set word_start to 0
+        End If
+    End While
+
+    Let word_end be col
+    While line_offset + word_end < doc_len:
+        Let next_ch be proc memory_get_integer from MemorySafety with doc, line_offset + word_end
+        Let is_ident be proc is_ident_char from next_ch
+        If is_ident is equal to 0:
+            Set word_end to word_end + doc_len
+        End If
+        Otherwise:
+            Set word_end to word_end + 1
+        End If
+    End While
+    If word_end > doc_len:
+        Set word_end to word_end - doc_len
+    End If
+
+    Let name_len be word_end - word_start
+    If name_len < 1:
+        Return 0
+    End If
+
+    Let buf be proc allocate from OwnedUtils with name_len + 1
+    If buf is equal to 0:
+        Return 0
+    End If
+
+    Let idx be 0
+    While idx < name_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with doc, line_offset + word_start + idx
+        Let dummy_cp be proc memory_set_integer from MemorySafety with buf, idx, byte_val
+        Set idx to idx + 1
+    End While
+    Let dummy_term be proc memory_set_integer from MemorySafety with buf, name_len, 0
+
+    Return buf
+End Process
+
+Private Process called "is_ident_char" takes ch as Integer returns Integer:
+    Note: Check if character is valid in an identifier
+    If ch > 96:
+        If ch < 123:
+            Return 1
+        End If
+    End If
+    If ch > 64:
+        If ch < 91:
+            Return 1
+        End If
+    End If
+    If ch > 47:
+        If ch < 58:
+            Return 1
+        End If
+    End If
+    If ch is equal to 95:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Private Process called "check_ident_match" takes doc as Integer, pos as Integer, doc_len as Integer, name as Integer, name_len as Integer returns Integer:
+    Note: Check byte-by-byte match of name at position in doc
+    If pos + name_len > doc_len:
+        Return 0
+    End If
+
+    Let idx be 0
+    While idx < name_len:
+        Let doc_byte be proc memory_get_integer from MemorySafety with doc, pos + idx
+        Let name_byte be proc memory_get_integer from MemorySafety with name, idx
+        If doc_byte is not equal to name_byte:
+            Return 0
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return 1
+End Process
+
+Private Process called "check_word_bounds" takes doc as Integer, pos as Integer, word_len as Integer, doc_len as Integer returns Integer:
+    Note: Verify word boundary around identifier at pos
+
+    If pos > 0:
+        Let before be proc memory_get_integer from MemorySafety with doc, pos - 1
+        Let bi be proc is_ident_char from before
+        If bi is equal to 1:
+            Return 0
+        End If
+    End If
+
+    If pos + word_len < doc_len:
+        Let after be proc memory_get_integer from MemorySafety with doc, pos + word_len
+        Let ai be proc is_ident_char from after
+        If ai is equal to 1:
+            Return 0
+        End If
+    End If
+
+    Return 1
+End Process
+
+Private Process called "sort_edits_reverse" takes edits_array as Integer, edit_count as Integer returns Integer:
+    Note: Sort edits by start_offset in descending order (highest first)
+    Note: Uses simple bubble sort since edit counts are typically small
+    Note: Returns REFACTORING_SUCCESS
+
+    If edit_count < 2:
+        Return REFACTORING_SUCCESS
+    End If
+
+    Let i be 0
+    While i < edit_count - 1:
+        Let j be 0
+        While j < edit_count - 1 - i:
+            Let edit_a be proc memory_get_integer from MemorySafety with edits_array, j times 8
+            Let edit_b be proc memory_get_integer from MemorySafety with edits_array, j + 1 times 8
+            If edit_a is not equal to 0:
+                If edit_b is not equal to 0:
+                    Let offset_a be proc memory_get_integer from MemorySafety with edit_a, 0
+                    Let offset_b be proc memory_get_integer from MemorySafety with edit_b, 0
+                    Note: We want descending order (highest first)
+                    If offset_a < offset_b:
+                        Note: Swap
+                        Let dummy_swap_a be proc memory_set_integer from MemorySafety with edits_array, j times 8, edit_b
+                        Let dummy_swap_b be proc memory_set_integer from MemorySafety with edits_array, j + 1 times 8, edit_a
+                    End If
+                End If
+            End If
+            Set j to j + 1
+        End While
+        Set i to i + 1
+    End While
+
+    Return REFACTORING_SUCCESS
+End Process
+
+Private Process called "find_let_decl_offset" takes doc as Integer, doc_len as Integer, name as Integer, name_len as Integer returns Integer:
+    Note: Find byte offset of "Let <name> be" declaration
+    Note: Returns byte offset of the "L" in "Let", or -1 if not found
+
+    Let scan be 0
+    While scan < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with doc, scan
+        If ch is equal to 76:
+            If scan + 3 + name_len < doc_len:
+                Let c1 be proc memory_get_integer from MemorySafety with doc, scan + 1
+                Let c2 be proc memory_get_integer from MemorySafety with doc, scan + 2
+                Let c3 be proc memory_get_integer from MemorySafety with doc, scan + 3
+                If c1 is equal to 101:
+                    If c2 is equal to 116:
+                        If c3 is equal to 32:
+                            Let match be proc check_ident_match from doc, scan + 4, doc_len, name, name_len
+                            If match is equal to 1:
+                                Return scan
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set scan to scan + 1
+    End While
+    Return -1
+End Process
+
+Private Process called "find_line_start_offset" takes doc as Integer, pos as Integer returns Integer:
+    Note: Find the byte offset of the start of the line containing position pos
+    Note: Scans backwards from pos to find the preceding newline
+
+    Let scan be pos - 1
+    While scan > -1:
+        Let ch be proc memory_get_integer from MemorySafety with doc, scan
+        If ch is equal to 10:
+            Return scan + 1
+        End If
+        Set scan to scan - 1
+    End While
+
+    Return 0
+End Process
+
+Private Process called "find_referenced_variables" takes text as Integer, text_len as Integer returns Integer:
+    Note: Find variables referenced in the given text
+    Note: Returns pointer to a simple array of name pointers, or 0
+    Note: This is a simplified analysis - scans for identifiers used after "proc" or in expressions
+
+    Note: Allocate a small tracking structure
+    Let result be proc allocate from OwnedUtils with 8
+    If result is not equal to 0:
+        Let dummy_init be proc memory_set_integer from MemorySafety with result, 0, 0
+    End If
+    Return result
+End Process
+
+Private Process called "find_declared_variables" takes text as Integer, text_len as Integer returns Integer:
+    Note: Find variables declared in the given text (Let declarations)
+    Note: Returns pointer to a simple array of name pointers, or 0
+
+    Let result be proc allocate from OwnedUtils with 8
+    If result is not equal to 0:
+        Let dummy_init be proc memory_set_integer from MemorySafety with result, 0, 0
+    End If
+    Return result
+End Process

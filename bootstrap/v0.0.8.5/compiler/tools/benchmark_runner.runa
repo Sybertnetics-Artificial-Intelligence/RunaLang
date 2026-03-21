@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,852 @@ limitations under the License.
 :End Note
 
 Note:
+RUNA BENCHMARK RUNNER - Performance Benchmark Suite Entry Point
+
 This file handles Runa benchmark execution and performance testing.
 
 This file performs the following tasks:
-- Process Runa benchmark execution and performance testing
-- Handle benchmark discovery and benchmark execution
-- Manage benchmark reporting and benchmark validation
-- Process benchmark optimization and benchmark consistency
+- Discover benchmark files matching naming conventions (bench_*.runa, *_bench.runa)
+- Execute each benchmark multiple iterations for statistical accuracy
+- Compute statistics (min, max, mean, median, standard deviation) for each benchmark
+- Compare results against a stored baseline for regression detection
+- Report results in a formatted table with statistical summaries
 
 This file is essential because of the following reasons:
-- Runa benchmark execution ensures performance quality and optimization
-- Proper benchmark handling ensures correct performance testing and reporting
-- Benchmark runner support enables Runa compilation for performance-optimized code
+- Benchmark runner ensures Runa compiler and runtime performance is tracked over time
+- Proper statistical computation ensures reliable performance measurements
+- Baseline comparison enables automatic performance regression detection
 
 This file consists of the following functions/features/operation types:
-- Runa benchmark execution and performance testing
-- Benchmark discovery and benchmark execution
-- Benchmark reporting and benchmark validation
-- Benchmark optimization and benchmark consistency
+- BenchmarkResult type for per-benchmark statistical data
+- discover_benchmarks to scan directories for benchmark files
+- execute_benchmark to run a single benchmark N iterations and collect timings
+- compute_statistics to calculate min/max/mean/median/stddev from raw timings
+- compare_with_baseline to detect regressions against stored baseline results
+- report_results to display formatted benchmark report
+- run_benchmarks as the top-level entry point
+
+Dependencies:
+- Imports compiler/internal/string_utils.runa for string operations
+- Imports compiler/internal/file_utils.runa for file read/write operations
+- Imports compiler/internal/memory_utils.runa for memory allocation
+- Imports compiler/internal/time_utils.runa for precise timing
+- Imports compiler/internal/arena_utils.runa for arena-scoped allocation
 :End Note
 
-Note: TODO - Implement benchmark runner functionality
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/file_utils.runa" as FileUtils
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/time_utils.runa" as TimeUtils
+Import "compiler/internal/arena_utils.runa" as ArenaUtils
+
+Note: ============================================================================
+Note: Benchmark Runner Constants
+Note: ============================================================================
+
+Constant BENCH_TOOL_VERSION as Integer is 1
+Constant BENCH_TOOL_SUCCESS as Integer is 0
+Constant BENCH_TOOL_FAILURE as Integer is 1
+Constant BENCH_TOOL_INVALID_ARGS as Integer is 2
+Constant BENCH_TOOL_REGRESSION as Integer is 3
+
+Constant BENCH_DEFAULT_ITERATIONS as Integer is 10
+Constant BENCH_DEFAULT_WARMUP as Integer is 3
+Constant BENCH_MAX_BENCHMARKS as Integer is 1024
+Constant BENCH_REGRESSION_THRESHOLD_PCT as Integer is 10   Note: 10% regression threshold
+
+Note: BenchmarkResult memory layout (80 bytes):
+Note: offset  0: name (8 bytes) - Pointer to benchmark name string
+Note: offset  8: iterations (8 bytes) - Number of iterations executed
+Note: offset 16: min_ns (8 bytes) - Minimum time in nanoseconds
+Note: offset 24: max_ns (8 bytes) - Maximum time in nanoseconds
+Note: offset 32: mean_ns (8 bytes) - Mean time in nanoseconds
+Note: offset 40: median_ns (8 bytes) - Median time in nanoseconds
+Note: offset 48: stddev_ns (8 bytes) - Standard deviation in nanoseconds
+Note: offset 56: total_ns (8 bytes) - Total time across all iterations
+Note: offset 64: raw_timings (8 bytes) - Pointer to array of per-iteration timings (Integer[])
+Note: offset 72: is_regression (8 bytes) - Boolean: 1 if this benchmark regressed vs baseline
+
+Constant BENCH_RESULT_SIZE as Integer is 80
+
+Note: ============================================================================
+Note: Benchmark Discovery
+Note: ============================================================================
+
+Process called "discover_benchmarks" takes directory_path as Integer, arena as Integer returns Integer:
+    Note: Scan a directory for benchmark files matching naming conventions
+    Note: Patterns: bench_*.runa and *_bench.runa
+    Note: Returns pointer to ArrayList of file path strings, or 0 on failure
+
+    If directory_path is equal to 0:
+        Alert "[RUNABENCH ERROR] Cannot discover benchmarks: directory path is null"
+        Return 0
+    End If
+
+    If arena is equal to 0:
+        Alert "[RUNABENCH ERROR] Cannot discover benchmarks: arena is null"
+        Return 0
+    End If
+
+    Let all_files be directory_list_files(directory_path, arena)
+    If all_files is equal to 0:
+        Let err_msg be string_concat("[RUNABENCH ERROR] Cannot list directory: ", directory_path)
+        Alert err_msg
+        deallocate(err_msg)
+        Return 0
+    End If
+
+    Let bench_files be arraylist_create(BENCH_MAX_BENCHMARKS, 8, arena)
+    If bench_files is equal to 0:
+        Return 0
+    End If
+
+    Let file_count be arraylist_length(all_files)
+    Let idx be 0
+
+    While idx is less than file_count:
+        Let entry_ptr be arraylist_get(all_files, idx)
+        If entry_ptr is not equal to 0:
+            Let file_name be memory_get_pointer(entry_ptr, 0)
+            If file_name is not equal to 0:
+                Let is_bench be 0
+
+                Note: Check for bench_ prefix with .runa suffix
+                Let has_bench_prefix be string_starts_with(file_name, "bench_")
+                If has_bench_prefix is equal to 1:
+                    Let has_runa_suffix be string_ends_with(file_name, ".runa")
+                    If has_runa_suffix is equal to 1:
+                        Set is_bench to 1
+                    End If
+                End If
+
+                Note: Check for _bench.runa suffix
+                If is_bench is equal to 0:
+                    Let has_bench_suffix be string_ends_with(file_name, "_bench.runa")
+                    If has_bench_suffix is equal to 1:
+                        Set is_bench to 1
+                    End If
+                End If
+
+                If is_bench is equal to 1:
+                    Let path_sep be string_concat(directory_path, "/")
+                    Let full_path be string_concat(path_sep, file_name)
+                    deallocate(path_sep)
+                    Let path_copy be string_duplicate(full_path, arena)
+                    deallocate(full_path)
+                    arraylist_append(bench_files, path_copy)
+                End If
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    Return bench_files
+End Process
+
+Note: ============================================================================
+Note: Single Benchmark Execution
+Note: ============================================================================
+
+Process called "execute_benchmark" takes bench_path as Integer, iterations as Integer, warmup as Integer, arena as Integer returns Integer:
+    Note: Compile and run a benchmark file multiple times, collecting per-iteration timings
+    Note: Performs warmup iterations first (not counted), then measured iterations
+    Note: Returns pointer to BenchmarkResult, or 0 on failure
+
+    If bench_path is equal to 0:
+        Alert "[RUNABENCH ERROR] Cannot execute: benchmark path is null"
+        Return 0
+    End If
+
+    If arena is equal to 0:
+        Alert "[RUNABENCH ERROR] Cannot execute: arena is null"
+        Return 0
+    End If
+
+    If iterations is less than 1:
+        Set iterations to BENCH_DEFAULT_ITERATIONS
+    End If
+
+    If warmup is less than 0:
+        Set warmup to BENCH_DEFAULT_WARMUP
+    End If
+
+    Note: Extract benchmark name from file path
+    Let file_name be file_basename(bench_path, arena)
+    If file_name is equal to 0:
+        Set file_name to bench_path
+    End If
+    Let name_len be string_length(file_name)
+    Let bench_name_len be name_len minus 5   Note: Remove ".runa"
+    Let bench_name be file_name
+    If bench_name_len is greater than 0:
+        Set bench_name to string_substring(file_name, 0, bench_name_len, arena)
+    End If
+
+    Note: Compile the benchmark
+    Let build_ctx be create_build_context(arena)
+    If build_ctx is equal to 0:
+        Alert "[RUNABENCH ERROR] Failed to create build context"
+        Return 0
+    End If
+
+    add_source_file(build_ctx, bench_path)
+    memory_set_integer(build_ctx, 16, 2)  Note: Optimize for speed (BUILD_OPT_SPEED)
+
+    Let compile_result be build_all(build_ctx)
+    If compile_result is not equal to 0:
+        Let err_msg be string_concat("[RUNABENCH ERROR] Compilation failed: ", bench_path)
+        Alert err_msg
+        deallocate(err_msg)
+        Return 0
+    End If
+
+    Let exe_path be memory_get_pointer(build_ctx, 144)
+    If exe_path is equal to 0:
+        Alert "[RUNABENCH ERROR] No executable produced"
+        Return 0
+    End If
+
+    Note: Allocate result structure
+    Let result be arena_allocate(arena, BENCH_RESULT_SIZE, 8)
+    If result is equal to 0:
+        Return 0
+    End If
+    memory_zero(result, BENCH_RESULT_SIZE)
+
+    memory_set_pointer(result, 0, bench_name)
+    memory_set_integer(result, 8, iterations)
+
+    Note: Allocate raw timings array
+    Let timings_size be iterations multiplied by 8
+    Let timings be arena_allocate(arena, timings_size, 8)
+    If timings is equal to 0:
+        Return 0
+    End If
+    memory_zero(timings, timings_size)
+    memory_set_pointer(result, 64, timings)
+
+    Note: Warmup phase (results discarded)
+    Let warmup_idx be 0
+    While warmup_idx is less than warmup:
+        Let warmup_result be execute_process(exe_path)
+        Set warmup_idx to warmup_idx plus 1
+    End While
+
+    Note: Measured iterations
+    Let total_ns be 0
+    Let min_ns be 999999999999
+    Let max_ns be 0
+
+    Let iter_idx be 0
+    While iter_idx is less than iterations:
+        Note: Time each iteration using monotonic clock
+        Let start_time be time_now_monotonic(arena)
+
+        Let exec_result be execute_process(exe_path)
+
+        Let end_time be time_now_monotonic(arena)
+        Let elapsed_ns be time_diff_ns(start_time, end_time)
+
+        Note: Store this timing
+        Let timing_offset be iter_idx multiplied by 8
+        memory_set_integer(timings, timing_offset, elapsed_ns)
+
+        Note: Update running statistics
+        Set total_ns to total_ns plus elapsed_ns
+
+        If elapsed_ns is less than min_ns:
+            Set min_ns to elapsed_ns
+        End If
+
+        If elapsed_ns is greater than max_ns:
+            Set max_ns to elapsed_ns
+        End If
+
+        Set iter_idx to iter_idx plus 1
+    End While
+
+    memory_set_integer(result, 16, min_ns)
+    memory_set_integer(result, 24, max_ns)
+    memory_set_integer(result, 56, total_ns)
+
+    Note: Compute full statistics
+    Let stats_result be compute_statistics(result)
+
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Statistical Computation
+Note: ============================================================================
+
+Process called "compute_statistics" takes result as Integer returns Integer:
+    Note: Compute mean, median, and standard deviation from raw timings
+    Note: Operates in-place on the BenchmarkResult structure
+    Note: Returns 0 on success
+
+    If result is equal to 0:
+        Return 1
+    End If
+
+    Let iterations be memory_get_integer(result, 8)
+    Let total_ns be memory_get_integer(result, 56)
+    Let timings be memory_get_pointer(result, 64)
+
+    If iterations is equal to 0:
+        Return 1
+    End If
+
+    If timings is equal to 0:
+        Return 1
+    End If
+
+    Note: Compute mean
+    Let mean_ns be total_ns divided by iterations
+    memory_set_integer(result, 32, mean_ns)
+
+    Note: Compute median: sort the timings array, then take the middle element
+    Note: Copy timings for sorting (preserve original order)
+    Let sorted_size be iterations multiplied by 8
+    Let sorted be allocate(sorted_size)
+    If sorted is equal to 0:
+        Return 1
+    End If
+    memory_copy(sorted, timings, sorted_size)
+
+    Note: Insertion sort on the sorted array
+    Let sort_i be 1
+    While sort_i is less than iterations:
+        Let sort_i_offset be sort_i multiplied by 8
+        Let key be memory_get_integer(sorted, sort_i_offset)
+        Let sort_j be sort_i minus 1
+
+        Let continue_sort be 1
+        While continue_sort is equal to 1:
+            If sort_j is less than 0:
+                Set continue_sort to 0
+            Otherwise:
+                Let sort_j_offset be sort_j multiplied by 8
+                Let sort_j_val be memory_get_integer(sorted, sort_j_offset)
+                If sort_j_val is greater than key:
+                    Note: Shift element right
+                    Let next_j_offset be sort_j_offset plus 8
+                    memory_set_integer(sorted, next_j_offset, sort_j_val)
+                    Set sort_j to sort_j minus 1
+                Otherwise:
+                    Set continue_sort to 0
+                End If
+            End If
+        End While
+
+        Let insert_offset be sort_j plus 1
+        Let insert_byte_offset be insert_offset multiplied by 8
+        memory_set_integer(sorted, insert_byte_offset, key)
+
+        Set sort_i to sort_i plus 1
+    End While
+
+    Note: Get median (middle element for odd count, average of two middle for even)
+    Let mid be iterations divided by 2
+    Let is_even be iterations minus mid multiplied by 2
+    Note: If iterations == mid * 2, it's even
+    Let mid_offset be mid multiplied by 8
+    Let median_ns be memory_get_integer(sorted, mid_offset)
+
+    Let check_even be mid multiplied by 2
+    If check_even is equal to iterations:
+        Note: Even number of elements: average the two middle values
+        Let mid_minus_1_offset be mid minus 1
+        Let mid_m1_byte_offset be mid_minus_1_offset multiplied by 8
+        Let lower_mid be memory_get_integer(sorted, mid_m1_byte_offset)
+        Set median_ns to lower_mid plus median_ns
+        Set median_ns to median_ns divided by 2
+    End If
+
+    memory_set_integer(result, 40, median_ns)
+
+    Note: Compute standard deviation
+    Note: stddev = sqrt(sum((x_i - mean)^2) / N)
+    Note: Using integer approximation: we compute variance then approximate sqrt
+    Let variance_sum be 0
+    Let var_idx be 0
+    While var_idx is less than iterations:
+        Let var_offset be var_idx multiplied by 8
+        Let timing_val be memory_get_integer(sorted, var_offset)
+        Let diff be timing_val minus mean_ns
+        Let diff_squared be diff multiplied by diff
+        Set variance_sum to variance_sum plus diff_squared
+        Set var_idx to var_idx plus 1
+    End While
+
+    Let variance be variance_sum divided by iterations
+
+    Note: Integer square root approximation using Newton's method
+    Let stddev be integer_sqrt(variance)
+    memory_set_integer(result, 48, stddev)
+
+    deallocate(sorted)
+    Return 0
+End Process
+
+Process called "integer_sqrt" takes value as Integer returns Integer:
+    Note: Compute integer square root using Newton's method (Babylonian method)
+    Note: Returns floor(sqrt(value))
+
+    If value is less than 2:
+        Return value
+    End If
+
+    Let guess be value divided by 2
+    Let prev_guess be 0
+
+    Let iterations be 0
+    Let max_iterations be 64
+
+    While iterations is less than max_iterations:
+        Let new_guess be guess plus value divided by guess
+        Set new_guess to new_guess divided by 2
+
+        Note: Check for convergence
+        Let diff be new_guess minus guess
+        If diff is equal to 0:
+            Set iterations to max_iterations    Note: Converged, exit
+        Otherwise:
+            If diff is equal to 1:
+                Set iterations to max_iterations    Note: Close enough
+            Otherwise:
+                If diff is equal to -1:
+                    Set iterations to max_iterations
+                End If
+            End If
+        End If
+
+        Set prev_guess to guess
+        Set guess to new_guess
+        Set iterations to iterations plus 1
+    End While
+
+    Note: Verify: if guess*guess > value, use guess-1
+    Let check be guess multiplied by guess
+    If check is greater than value:
+        Set guess to guess minus 1
+    End If
+
+    Return guess
+End Process
+
+Note: ============================================================================
+Note: Baseline Comparison
+Note: ============================================================================
+
+Process called "compare_with_baseline" takes results as Integer, baseline_path as Integer, arena as Integer returns Integer:
+    Note: Compare current benchmark results against a stored baseline file
+    Note: The baseline file format is: name mean_ns (one per line)
+    Note: Returns number of regressions detected
+
+    If results is equal to 0:
+        Return 0
+    End If
+
+    If baseline_path is equal to 0:
+        Display "[RUNABENCH] No baseline file specified, skipping comparison"
+        Return 0
+    End If
+
+    Let baseline_content be runtime_read_file(baseline_path)
+    If baseline_content is equal to 0:
+        Display "[RUNABENCH] No baseline file found, skipping comparison"
+        Return 0
+    End If
+
+    Display "[RUNABENCH] Comparing against baseline: "
+    Display baseline_path
+
+    Let regressions be 0
+    Let result_count be arraylist_length(results)
+    Let content_len be string_length(baseline_content)
+
+    Note: Parse baseline file line by line
+    Let base_pos be 0
+    While base_pos is less than content_len:
+        Let line_start be base_pos
+        Let line_end be string_index_of_from(baseline_content, 10, base_pos)
+        If line_end is less than 0:
+            Set line_end to content_len
+        End If
+
+        Let line_len be line_end minus line_start
+        Let line be string_substring(baseline_content, line_start, line_len, arena)
+
+        If line is not equal to 0:
+            Let trimmed be string_trim(line, arena)
+            If trimmed is not equal to 0:
+                Let trimmed_len be string_length(trimmed)
+                If trimmed_len is greater than 0:
+                    Note: Parse "name mean_ns" format
+                    Let space_pos be string_index_of(trimmed, 32)
+                    If space_pos is greater than 0:
+                        Let base_name be string_substring(trimmed, 0, space_pos, arena)
+                        Let base_time_str be string_substring_from(trimmed, space_pos plus 1, arena)
+                        Let base_time_trimmed be string_trim(base_time_str, arena)
+                        Let base_mean_ns be string_to_integer(base_time_trimmed)
+
+                        Note: Find matching result
+                        Let res_idx be 0
+                        While res_idx is less than result_count:
+                            Let res_ptr be arraylist_get(results, res_idx)
+                            If res_ptr is not equal to 0:
+                                Let res be memory_get_pointer(res_ptr, 0)
+                                If res is not equal to 0:
+                                    Let res_name be memory_get_pointer(res, 0)
+                                    If res_name is not equal to 0:
+                                        Let names_match be string_equals(res_name, base_name)
+                                        If names_match is equal to 1:
+                                            Let current_mean be memory_get_integer(res, 32)
+
+                                            Note: Check for regression: current > baseline * (1 + threshold/100)
+                                            Let threshold_factor be base_mean_ns multiplied by BENCH_REGRESSION_THRESHOLD_PCT
+                                            Let threshold_ns be threshold_factor divided by 100
+                                            Let regression_limit be base_mean_ns plus threshold_ns
+
+                                            If current_mean is greater than regression_limit:
+                                                memory_set_integer(res, 72, 1)
+                                                Set regressions to regressions plus 1
+
+                                                Let pct_change be current_mean minus base_mean_ns
+                                                Let pct_change_scaled be pct_change multiplied by 100
+                                                Let pct_actual be pct_change_scaled divided by base_mean_ns
+
+                                                Let reg_msg be string_concat("[RUNABENCH REGRESSION] ", res_name)
+                                                Let reg_msg2 be string_concat(reg_msg, " regressed by ")
+                                                deallocate(reg_msg)
+                                                Let pct_str be integer_to_string(pct_actual, arena)
+                                                Let reg_msg3 be string_concat(reg_msg2, pct_str)
+                                                deallocate(reg_msg2)
+                                                Let reg_msg4 be string_concat(reg_msg3, "%")
+                                                deallocate(reg_msg3)
+                                                Alert reg_msg4
+                                                deallocate(reg_msg4)
+                                            End If
+
+                                            Set res_idx to result_count   Note: Found match, stop searching
+                                        End If
+                                    End If
+                                End If
+                            End If
+                            Set res_idx to res_idx plus 1
+                        End While
+                    End If
+                End If
+            End If
+        End If
+
+        Set base_pos to line_end plus 1
+    End While
+
+    deallocate(baseline_content)
+
+    If regressions is equal to 0:
+        Display "[RUNABENCH] No regressions detected"
+    Otherwise:
+        Alert "[RUNABENCH] "
+        Display regressions
+        Alert " regression(s) detected!"
+    End If
+
+    Return regressions
+End Process
+
+Note: ============================================================================
+Note: Results Reporting
+Note: ============================================================================
+
+Process called "report_results" takes results as Integer, arena as Integer returns Integer:
+    Note: Display formatted benchmark results table
+    Note: Returns 0 on success
+
+    If results is equal to 0:
+        Alert "[RUNABENCH ERROR] Cannot report: results is null"
+        Return 1
+    End If
+
+    Let result_count be arraylist_length(results)
+
+    Display "=================================================================="
+    Display "[RUNABENCH] Benchmark Results"
+    Display "=================================================================="
+    Display "  Name                  Iters   Min(ms)  Mean(ms)  Med(ms)  StdDev(ms)"
+    Display "------------------------------------------------------------------"
+
+    Let idx be 0
+    While idx is less than result_count:
+        Let res_ptr be arraylist_get(results, idx)
+        If res_ptr is not equal to 0:
+            Let res be memory_get_pointer(res_ptr, 0)
+            If res is not equal to 0:
+                Let name be memory_get_pointer(res, 0)
+                Let iterations be memory_get_integer(res, 8)
+                Let min_ns be memory_get_integer(res, 16)
+                Let mean_ns be memory_get_integer(res, 32)
+                Let median_ns be memory_get_integer(res, 40)
+                Let stddev_ns be memory_get_integer(res, 48)
+                Let is_regression be memory_get_integer(res, 72)
+
+                Note: Convert nanoseconds to milliseconds for display
+                Let min_ms be min_ns divided by 1000000
+                Let mean_ms be mean_ns divided by 1000000
+                Let median_ms be median_ns divided by 1000000
+                Let stddev_ms be stddev_ns divided by 1000000
+
+                If is_regression is equal to 1:
+                    Display "! "
+                Otherwise:
+                    Display "  "
+                End If
+
+                If name is not equal to 0:
+                    Display name
+                End If
+                Display "  "
+                Display iterations
+                Display "  "
+                Display min_ms
+                Display "  "
+                Display mean_ms
+                Display "  "
+                Display median_ms
+                Display "  "
+                Display stddev_ms
+
+                If is_regression is equal to 1:
+                    Display "  [REGRESSION]"
+                End If
+            End If
+        End If
+        Set idx to idx plus 1
+    End While
+
+    Display "=================================================================="
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Top-Level Entry Point
+Note: ============================================================================
+
+Process called "run_benchmarks" takes argc as Integer, argv as Integer returns Integer:
+    Note: Main entry point for the benchmark runner
+    Note: Discovers benchmarks, executes them, computes statistics, reports results
+    Note: Returns exit code (0 = success, 3 = regression detected)
+
+    If argc is less than 2:
+        Alert "[RUNABENCH] Usage: runa bench <directory> [options]"
+        Alert "[RUNABENCH] Options:"
+        Alert "[RUNABENCH]   --iterations N    Number of measured iterations (default: 10)"
+        Alert "[RUNABENCH]   --warmup N        Number of warmup iterations (default: 3)"
+        Alert "[RUNABENCH]   --baseline <file> Compare against baseline results"
+        Alert "[RUNABENCH]   --save <file>     Save results as new baseline"
+        Alert "[RUNABENCH]   --verbose         Enable verbose output"
+        Return BENCH_TOOL_INVALID_ARGS
+    End If
+
+    Let arena be arena_create(262144)
+    If arena is equal to 0:
+        Alert "[RUNABENCH ERROR] Failed to create arena"
+        Return BENCH_TOOL_FAILURE
+    End If
+
+    Let bench_dir be 0
+    Let iterations be BENCH_DEFAULT_ITERATIONS
+    Let warmup be BENCH_DEFAULT_WARMUP
+    Let baseline_path be 0
+    Let save_path be 0
+    Let is_verbose be 0
+    Let ptr_size be 8
+    Let i be 1
+
+    While i is less than argc:
+        Let arg_offset be i multiplied by ptr_size
+        Let arg_ptr be argv plus arg_offset
+        Let arg be memory_get_pointer(arg_ptr, 0)
+
+        If arg is not equal to 0:
+            Let is_iter be string_equals(arg, "--iterations")
+            If is_iter is equal to 1:
+                Set i to i plus 1
+                If i is less than argc:
+                    Let next_offset be i multiplied by ptr_size
+                    Let next_ptr be argv plus next_offset
+                    Let iter_str be memory_get_pointer(next_ptr, 0)
+                    If iter_str is not equal to 0:
+                        Set iterations to string_to_integer(iter_str)
+                        If iterations is less than 1:
+                            Set iterations to BENCH_DEFAULT_ITERATIONS
+                        End If
+                    End If
+                End If
+            Otherwise:
+                Let is_warmup be string_equals(arg, "--warmup")
+                If is_warmup is equal to 1:
+                    Set i to i plus 1
+                    If i is less than argc:
+                        Let next_offset be i multiplied by ptr_size
+                        Let next_ptr be argv plus next_offset
+                        Let warmup_str be memory_get_pointer(next_ptr, 0)
+                        If warmup_str is not equal to 0:
+                            Set warmup to string_to_integer(warmup_str)
+                        End If
+                    End If
+                Otherwise:
+                    Let is_baseline be string_equals(arg, "--baseline")
+                    If is_baseline is equal to 1:
+                        Set i to i plus 1
+                        If i is less than argc:
+                            Let next_offset be i multiplied by ptr_size
+                            Let next_ptr be argv plus next_offset
+                            Set baseline_path to memory_get_pointer(next_ptr, 0)
+                        End If
+                    Otherwise:
+                        Let is_save be string_equals(arg, "--save")
+                        If is_save is equal to 1:
+                            Set i to i plus 1
+                            If i is less than argc:
+                                Let next_offset be i multiplied by ptr_size
+                                Let next_ptr be argv plus next_offset
+                                Set save_path to memory_get_pointer(next_ptr, 0)
+                            End If
+                        Otherwise:
+                            Let is_verbose_flag be string_equals(arg, "--verbose")
+                            If is_verbose_flag is equal to 1:
+                                Set is_verbose to 1
+                            Otherwise:
+                                Set bench_dir to arg
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    If bench_dir is equal to 0:
+        Alert "[RUNABENCH ERROR] No benchmark directory specified"
+        arena_destroy(arena)
+        Return BENCH_TOOL_INVALID_ARGS
+    End If
+
+    Note: Discover benchmarks
+    Let bench_files be discover_benchmarks(bench_dir, arena)
+    If bench_files is equal to 0:
+        Alert "[RUNABENCH] No benchmark files found"
+        arena_destroy(arena)
+        Return BENCH_TOOL_SUCCESS
+    End If
+
+    Let file_count be arraylist_length(bench_files)
+    If file_count is equal to 0:
+        Display "[RUNABENCH] No benchmark files found in: "
+        Display bench_dir
+        arena_destroy(arena)
+        Return BENCH_TOOL_SUCCESS
+    End If
+
+    Display "[RUNABENCH] Discovered "
+    Display file_count
+    Display " benchmark(s)"
+    Display "[RUNABENCH] Iterations: "
+    Display iterations
+    Display ", Warmup: "
+    Display warmup
+
+    Note: Execute each benchmark
+    Let all_results be arraylist_create(file_count, 8, arena)
+    If all_results is equal to 0:
+        arena_destroy(arena)
+        Return BENCH_TOOL_FAILURE
+    End If
+
+    Let exec_idx be 0
+    While exec_idx is less than file_count:
+        Let file_ptr be arraylist_get(bench_files, exec_idx)
+        If file_ptr is not equal to 0:
+            Let bench_path be memory_get_pointer(file_ptr, 0)
+            If bench_path is not equal to 0:
+                If is_verbose is equal to 1:
+                    Let run_msg be string_concat("[RUNABENCH] Running: ", bench_path)
+                    Display run_msg
+                    deallocate(run_msg)
+                End If
+
+                Let result be execute_benchmark(bench_path, iterations, warmup, arena)
+                If result is not equal to 0:
+                    arraylist_append(all_results, result)
+                Otherwise:
+                    Let err_msg be string_concat("[RUNABENCH WARNING] Failed to run: ", bench_path)
+                    Alert err_msg
+                    deallocate(err_msg)
+                End If
+            End If
+        End If
+        Set exec_idx to exec_idx plus 1
+    End While
+
+    Note: Compare with baseline if provided
+    Let regressions be 0
+    If baseline_path is not equal to 0:
+        Set regressions to compare_with_baseline(all_results, baseline_path, arena)
+    End If
+
+    Note: Report results
+    Let report_status be report_results(all_results, arena)
+
+    Note: Save results as baseline if requested
+    If save_path is not equal to 0:
+        Let save_content be string_duplicate("", arena)
+        Let save_count be arraylist_length(all_results)
+        Let save_idx be 0
+        While save_idx is less than save_count:
+            Let res_ptr be arraylist_get(all_results, save_idx)
+            If res_ptr is not equal to 0:
+                Let res be memory_get_pointer(res_ptr, 0)
+                If res is not equal to 0:
+                    Let name be memory_get_pointer(res, 0)
+                    Let mean_ns be memory_get_integer(res, 32)
+                    If name is not equal to 0:
+                        Let line_part be string_concat(name, " ")
+                        Let mean_str be integer_to_string(mean_ns, arena)
+                        Let line_part2 be string_concat(line_part, mean_str)
+                        deallocate(line_part)
+                        Let line_with_nl be string_concat(line_part2, "\n")
+                        deallocate(line_part2)
+                        Let new_content be string_concat(save_content, line_with_nl)
+                        deallocate(line_with_nl)
+                        Set save_content to string_duplicate(new_content, arena)
+                        deallocate(new_content)
+                    End If
+                End If
+            End If
+            Set save_idx to save_idx plus 1
+        End While
+
+        Let save_len be string_length(save_content)
+        Let write_result be runtime_write_file(save_path, save_content, save_len)
+        If write_result is equal to 0:
+            Display "[RUNABENCH] Baseline saved to: "
+            Display save_path
+        Otherwise:
+            Alert "[RUNABENCH WARNING] Failed to save baseline"
+        End If
+    End If
+
+    arena_destroy(arena)
+
+    If regressions is greater than 0:
+        Return BENCH_TOOL_REGRESSION
+    End If
+
+    Return BENCH_TOOL_SUCCESS
+End Process

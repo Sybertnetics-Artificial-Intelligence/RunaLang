@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,10 +29,1268 @@ This file is essential because of the following reasons:
 - Navigation support enables Runa compilation for LSP-integrated navigation handling
 
 This file consists of the following functions/features/operation types:
-- Code navigation and LSP navigation integration
-- Symbol navigation and reference navigation
-- Navigation tracking and navigation metadata
-- Navigation communication and navigation protocol implementation
+- Go-to-definition for variables, functions, types, and imports
+- Find-references across document and workspace scope
+- Document symbol outline for quick navigation
+- Workspace-wide symbol search
+- Hover information with type and documentation details
+- Location structure for representing source positions
+
+Dependencies:
+- Imports compiler/internal/memory_safety.runa for safe memory access
+- Imports compiler/internal/owned_utils.runa for heap allocation
+- Imports compiler/internal/string_utils.runa for string operations
+- Imports compiler/internal/collections.runa for result list management
 :End Note
 
-Note: TODO - Implement code navigation functionality
+Import "compiler/internal/memory_safety.runa" as MemorySafety
+Import "compiler/internal/owned_utils.runa" as OwnedUtils
+Import "compiler/internal/string_utils.runa" as StringUtils
+Import "compiler/internal/collections.runa" as Collections
+
+Note: ============================================================================
+Note: Navigation Data Structures
+Note: ============================================================================
+
+Note: Location structure (32 bytes total, 4 fields x 8 bytes each)
+Note: Layout:
+Note:   offset 0:  file_path (8 bytes) - Pointer to file path string
+Note:   offset 8:  line (8 bytes) - Zero-based line number
+Note:   offset 16: column (8 bytes) - Zero-based column number
+Note:   offset 24: end_line (8 bytes) - Zero-based end line number (for range)
+
+Type called "Location":
+    file_path as Integer
+    line as Integer
+    column as Integer
+    end_line as Integer
+End Type
+
+Note: SymbolInfo structure (40 bytes) for document/workspace symbol responses
+Note: Layout:
+Note:   offset 0:  name (8 bytes) - Pointer to symbol name string
+Note:   offset 8:  kind (8 bytes) - Symbol kind constant (function, variable, type, etc.)
+Note:   offset 16: location (8 bytes) - Pointer to Location structure
+Note:   offset 24: container_name (8 bytes) - Pointer to containing scope name (or 0)
+Note:   offset 32: detail (8 bytes) - Pointer to detail/type info string (or 0)
+
+Type called "SymbolInfo":
+    name as Integer
+    kind as Integer
+    location as Integer
+    container_name as Integer
+    detail as Integer
+End Type
+
+Note: ============================================================================
+Note: Symbol Kind Constants (matching LSP SymbolKind values)
+Note: ============================================================================
+
+Constant SYMBOL_KIND_FILE as Integer is 1
+Constant SYMBOL_KIND_MODULE as Integer is 2
+Constant SYMBOL_KIND_NAMESPACE as Integer is 3
+Constant SYMBOL_KIND_CLASS as Integer is 5
+Constant SYMBOL_KIND_METHOD as Integer is 6
+Constant SYMBOL_KIND_FUNCTION as Integer is 12
+Constant SYMBOL_KIND_VARIABLE as Integer is 13
+Constant SYMBOL_KIND_CONSTANT as Integer is 14
+Constant SYMBOL_KIND_STRING as Integer is 15
+Constant SYMBOL_KIND_STRUCT as Integer is 23
+Constant SYMBOL_KIND_TYPE_PARAMETER as Integer is 26
+
+Note: Maximum results for search operations
+Constant MAX_NAVIGATION_RESULTS as Integer is 512
+Constant MAX_SYMBOL_RESULTS as Integer is 256
+
+Note: Return codes
+Constant NAVIGATION_SUCCESS as Integer is 0
+Constant NAVIGATION_FAILED as Integer is -1
+Constant NAVIGATION_NOT_FOUND as Integer is -2
+
+Note: ============================================================================
+Note: Core Navigation Operations
+Note: ============================================================================
+
+Process called "go_to_definition" takes document_text as Integer, file_path as Integer, cursor_line as Integer, cursor_col as Integer returns Integer:
+    Note: Navigate to the definition of the symbol at the cursor position
+    Note:
+    Note: Strategy:
+    Note: 1. Extract the identifier at the cursor position
+    Note: 2. Determine the identifier category (variable, function, type, import)
+    Note: 3. Search the document (and imported files) for the definition
+    Note: 4. Return a Location pointing to the definition site
+    Note:
+    Note: Supported definition targets:
+    Note: - Variables: "Let <name> be ..." declaration
+    Note: - Functions: 'Process called "<name>"' declaration
+    Note: - Types: 'Type called "<name>"' declaration
+    Note: - Constants: "Constant <name> as ..." declaration
+    Note: - Imports: The imported file path
+    Note:
+    Note: Parameters:
+    Note:   document_text - Pointer to full document text
+    Note:   file_path - Pointer to current file path string
+    Note:   cursor_line - Zero-based line number
+    Note:   cursor_col - Zero-based column number
+    Note:
+    Note: Returns pointer to Location, or 0 if definition not found
+
+    If document_text is equal to 0:
+        Return 0
+    End If
+
+    Note: Extract the identifier at the cursor position
+    Let ident_info be proc extract_identifier_at from document_text, cursor_line, cursor_col
+    If ident_info is equal to 0:
+        Return 0
+    End If
+
+    Note: ident_info is a 16-byte struct: [name_ptr (8), name_len (8)]
+    Let ident_name be proc memory_get_integer from MemorySafety with ident_info, 0
+    Let ident_len be proc memory_get_integer from MemorySafety with ident_info, 8
+
+    If ident_name is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with ident_info
+        Return 0
+    End If
+
+    Note: Search the document for the definition of this identifier
+    Let doc_len be proc measure_string_len from document_text
+    Let definition_line be -1
+    Let definition_col be 0
+
+    Note: Search for "Let <ident> be" pattern (variable definition)
+    Let var_line be proc find_let_declaration from document_text, doc_len, ident_name, ident_len
+    If var_line is not equal to -1:
+        Set definition_line to var_line
+        Set definition_col to 4
+    End If
+
+    Note: Search for 'Process called "<ident>"' pattern (function definition)
+    If definition_line is equal to -1:
+        Let proc_line be proc find_process_declaration from document_text, doc_len, ident_name, ident_len
+        If proc_line is not equal to -1:
+            Set definition_line to proc_line
+            Set definition_col to 16
+        End If
+    End If
+
+    Note: Search for 'Type called "<ident>"' pattern (type definition)
+    If definition_line is equal to -1:
+        Let type_line be proc find_type_declaration from document_text, doc_len, ident_name, ident_len
+        If type_line is not equal to -1:
+            Set definition_line to type_line
+            Set definition_col to 13
+        End If
+    End If
+
+    Note: Search for "Constant <ident> as" pattern
+    If definition_line is equal to -1:
+        Let const_line be proc find_constant_declaration from document_text, doc_len, ident_name, ident_len
+        If const_line is not equal to -1:
+            Set definition_line to const_line
+            Set definition_col to 9
+        End If
+    End If
+
+    Note: Clean up identifier info
+    Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+    Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+
+    If definition_line is equal to -1:
+        Return 0
+    End If
+
+    Note: Create and return the Location
+    Let location be proc allocate from OwnedUtils with 32
+    If location is equal to 0:
+        Return 0
+    End If
+
+    Let dummy_fp be proc memory_set_integer from MemorySafety with location, 0, file_path
+    Let dummy_line be proc memory_set_integer from MemorySafety with location, 8, definition_line
+    Let dummy_col be proc memory_set_integer from MemorySafety with location, 16, definition_col
+    Let dummy_end be proc memory_set_integer from MemorySafety with location, 24, definition_line
+
+    Return location
+End Process
+
+Process called "find_references" takes document_text as Integer, file_path as Integer, cursor_line as Integer, cursor_col as Integer returns Integer:
+    Note: Find all references to the symbol at the cursor position
+    Note:
+    Note: Strategy:
+    Note: 1. Extract the identifier at the cursor position
+    Note: 2. Scan the entire document for all occurrences of that identifier
+    Note: 3. Filter to only identifier contexts (not inside strings or comments)
+    Note: 4. Return an array of Location structures
+    Note:
+    Note: Returns pointer to result array structure (data_ptr, count, capacity), or 0
+
+    If document_text is equal to 0:
+        Return 0
+    End If
+
+    Note: Extract identifier at cursor
+    Let ident_info be proc extract_identifier_at from document_text, cursor_line, cursor_col
+    If ident_info is equal to 0:
+        Return 0
+    End If
+
+    Let ident_name be proc memory_get_integer from MemorySafety with ident_info, 0
+    Let ident_len be proc memory_get_integer from MemorySafety with ident_info, 8
+
+    If ident_name is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with ident_info
+        Return 0
+    End If
+
+    Note: Allocate result list (24 bytes: data_ptr, count, capacity)
+    Let result be proc allocate from OwnedUtils with 24
+    If result is equal to 0:
+        Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+        Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+        Return 0
+    End If
+
+    Let locations_array be proc allocate from OwnedUtils with MAX_NAVIGATION_RESULTS times 8
+    If locations_array is equal to 0:
+        Let dummy_free_res be proc deallocate from OwnedUtils with result
+        Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+        Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+        Return 0
+    End If
+
+    Let dummy_data be proc memory_set_integer from MemorySafety with result, 0, locations_array
+    Let dummy_count be proc memory_set_integer from MemorySafety with result, 8, 0
+    Let dummy_cap be proc memory_set_integer from MemorySafety with result, 16, MAX_NAVIGATION_RESULTS
+
+    Note: Scan document for all occurrences of the identifier
+    Let doc_len be proc measure_string_len from document_text
+    Let scan_pos be 0
+    Let current_line be 0
+    Let current_col be 0
+    Let ref_count be 0
+    Let in_comment be 0
+    Let in_string be 0
+
+    While scan_pos < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with document_text, scan_pos
+
+        Note: Track line and column
+        If ch is equal to 10:
+            Set current_line to current_line + 1
+            Set current_col to 0
+            Set in_comment to 0
+            Set scan_pos to scan_pos + 1
+        End If
+        Otherwise:
+            Note: Check for comment start "Note:" (N=78, o=111, t=116, e=101, :=58)
+            If ch is equal to 78:
+                If scan_pos + 4 < doc_len:
+                    Let c1 be proc memory_get_integer from MemorySafety with document_text, scan_pos + 1
+                    Let c4 be proc memory_get_integer from MemorySafety with document_text, scan_pos + 4
+                    If c1 is equal to 111:
+                        If c4 is equal to 58:
+                            Set in_comment to 1
+                        End If
+                    End If
+                End If
+            End If
+
+            Note: Toggle string tracking on quotes
+            If ch is equal to 34:
+                If in_comment is equal to 0:
+                    If in_string is equal to 0:
+                        Set in_string to 1
+                    End If
+                    Otherwise:
+                        Set in_string to 0
+                    End If
+                End If
+            End If
+
+            Note: Check for identifier match (only in code context)
+            If in_comment is equal to 0:
+                If in_string is equal to 0:
+                    Let first_byte be proc memory_get_integer from MemorySafety with ident_name, 0
+                    If ch is equal to first_byte:
+                        Note: Potential match - verify full identifier
+                        Let match be proc check_identifier_match from document_text, scan_pos, doc_len, ident_name, ident_len
+                        If match is equal to 1:
+                            Note: Verify it's a whole word (not part of a larger identifier)
+                            Let is_whole_word be proc check_word_boundary from document_text, scan_pos, ident_len, doc_len
+                            If is_whole_word is equal to 1:
+                                Note: Create a Location for this reference
+                                If ref_count < MAX_NAVIGATION_RESULTS:
+                                    Let loc be proc allocate from OwnedUtils with 32
+                                    If loc is not equal to 0:
+                                        Let dummy_loc_fp be proc memory_set_integer from MemorySafety with loc, 0, file_path
+                                        Let dummy_loc_ln be proc memory_set_integer from MemorySafety with loc, 8, current_line
+                                        Let dummy_loc_cl be proc memory_set_integer from MemorySafety with loc, 16, current_col
+                                        Let dummy_loc_el be proc memory_set_integer from MemorySafety with loc, 24, current_line
+                                        Let dummy_add be proc memory_set_integer from MemorySafety with locations_array, ref_count times 8, loc
+                                        Set ref_count to ref_count + 1
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+
+            Set current_col to current_col + 1
+            Set scan_pos to scan_pos + 1
+        End If
+    End While
+
+    Note: Update result count
+    Let dummy_final_count be proc memory_set_integer from MemorySafety with result, 8, ref_count
+
+    Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+    Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+
+    Return result
+End Process
+
+Process called "document_symbols" takes document_text as Integer, file_path as Integer returns Integer:
+    Note: Extract all symbols from the document for the outline view
+    Note: Returns an array of SymbolInfo structures representing all declared
+    Note: processes, types, constants, and top-level variables
+    Note:
+    Note: Returns pointer to result array (data_ptr, count, capacity), or 0
+
+    If document_text is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate result list
+    Let result be proc allocate from OwnedUtils with 24
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let symbols_array be proc allocate from OwnedUtils with MAX_SYMBOL_RESULTS times 8
+    If symbols_array is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with result
+        Return 0
+    End If
+
+    Let dummy_data be proc memory_set_integer from MemorySafety with result, 0, symbols_array
+    Let dummy_count be proc memory_set_integer from MemorySafety with result, 8, 0
+    Let dummy_cap be proc memory_set_integer from MemorySafety with result, 16, MAX_SYMBOL_RESULTS
+
+    Note: Scan the document line by line for declarations
+    Let doc_len be proc measure_string_len from document_text
+    Let scan_pos be 0
+    Let current_line be 0
+    Let sym_count be 0
+
+    While scan_pos < doc_len:
+        Note: Skip leading whitespace on the line
+        Let line_start be scan_pos
+        While line_start < doc_len:
+            Let wc be proc memory_get_integer from MemorySafety with document_text, line_start
+            If wc is not equal to 32:
+                If wc is not equal to 9:
+                    Set line_start to line_start + doc_len
+                End If
+            End If
+            Set line_start to line_start + 1
+        End While
+        If line_start > doc_len:
+            Set line_start to line_start - doc_len
+        End If
+
+        Let ch be proc memory_get_integer from MemorySafety with document_text, line_start
+
+        Note: Check for "Process " (P=80) - function declaration
+        If ch is equal to 80:
+            If line_start + 7 < doc_len:
+                Let c1 be proc memory_get_integer from MemorySafety with document_text, line_start + 1
+                If c1 is equal to 114:
+                    Note: Extract process name from 'Process called "<name>"'
+                    Let name_ptr be proc extract_quoted_name from document_text, line_start, doc_len
+                    If name_ptr is not equal to 0:
+                        If sym_count < MAX_SYMBOL_RESULTS:
+                            Let sym be proc create_symbol_info from name_ptr, SYMBOL_KIND_FUNCTION, file_path, current_line, 0
+                            If sym is not equal to 0:
+                                Let dummy_add be proc memory_set_integer from MemorySafety with symbols_array, sym_count times 8, sym
+                                Set sym_count to sym_count + 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Note: Check for "Type " (T=84) - type declaration
+        If ch is equal to 84:
+            If line_start + 4 < doc_len:
+                Let c1 be proc memory_get_integer from MemorySafety with document_text, line_start + 1
+                If c1 is equal to 121:
+                    Let name_ptr be proc extract_quoted_name from document_text, line_start, doc_len
+                    If name_ptr is not equal to 0:
+                        If sym_count < MAX_SYMBOL_RESULTS:
+                            Let sym be proc create_symbol_info from name_ptr, SYMBOL_KIND_STRUCT, file_path, current_line, 0
+                            If sym is not equal to 0:
+                                Let dummy_add be proc memory_set_integer from MemorySafety with symbols_array, sym_count times 8, sym
+                                Set sym_count to sym_count + 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Note: Check for "Constant " (C=67) - constant declaration
+        If ch is equal to 67:
+            If line_start + 8 < doc_len:
+                Let c1 be proc memory_get_integer from MemorySafety with document_text, line_start + 1
+                If c1 is equal to 111:
+                    Let name_ptr be proc extract_word_after from document_text, line_start + 9, doc_len
+                    If name_ptr is not equal to 0:
+                        If sym_count < MAX_SYMBOL_RESULTS:
+                            Let sym be proc create_symbol_info from name_ptr, SYMBOL_KIND_CONSTANT, file_path, current_line, 0
+                            If sym is not equal to 0:
+                                Let dummy_add be proc memory_set_integer from MemorySafety with symbols_array, sym_count times 8, sym
+                                Set sym_count to sym_count + 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Note: Check for "Import " (I=73) - import declaration
+        If ch is equal to 73:
+            If line_start + 6 < doc_len:
+                Let c1 be proc memory_get_integer from MemorySafety with document_text, line_start + 1
+                If c1 is equal to 109:
+                    Let name_ptr be proc extract_quoted_string_after from document_text, line_start + 7, doc_len
+                    If name_ptr is not equal to 0:
+                        If sym_count < MAX_SYMBOL_RESULTS:
+                            Let sym be proc create_symbol_info from name_ptr, SYMBOL_KIND_MODULE, file_path, current_line, 0
+                            If sym is not equal to 0:
+                                Let dummy_add be proc memory_set_integer from MemorySafety with symbols_array, sym_count times 8, sym
+                                Set sym_count to sym_count + 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Note: Advance to next line
+        Let next_line_scan be scan_pos
+        While next_line_scan < doc_len:
+            Let nlc be proc memory_get_integer from MemorySafety with document_text, next_line_scan
+            If nlc is equal to 10:
+                Set scan_pos to next_line_scan + 1
+                Set current_line to current_line + 1
+                Set next_line_scan to doc_len
+            End If
+            Otherwise:
+                Set next_line_scan to next_line_scan + 1
+            End If
+        End While
+        If next_line_scan is equal to doc_len:
+            Set scan_pos to doc_len
+        End If
+    End While
+
+    Let dummy_final_count be proc memory_set_integer from MemorySafety with result, 8, sym_count
+    Return result
+End Process
+
+Process called "workspace_symbols" takes query as Integer, document_store as Integer returns Integer:
+    Note: Search for symbols across all open documents matching the query string
+    Note:
+    Note: Parameters:
+    Note:   query - Pointer to search query string (can be partial)
+    Note:   document_store - Pointer to hash table of open documents
+    Note:
+    Note: Returns pointer to result array (data_ptr, count, capacity), or 0
+    Note: Delegates to document_symbols for each open document and filters by query
+
+    If document_store is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate result list
+    Let result be proc allocate from OwnedUtils with 24
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let symbols_array be proc allocate from OwnedUtils with MAX_SYMBOL_RESULTS times 8
+    If symbols_array is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with result
+        Return 0
+    End If
+
+    Let dummy_data be proc memory_set_integer from MemorySafety with result, 0, symbols_array
+    Let dummy_count be proc memory_set_integer from MemorySafety with result, 8, 0
+    Let dummy_cap be proc memory_set_integer from MemorySafety with result, 16, MAX_SYMBOL_RESULTS
+
+    Note: Iterate through all documents in the store
+    Let store_capacity be proc memory_get_integer from MemorySafety with document_store, 16
+    Let buckets be proc memory_get_integer from MemorySafety with document_store, 0
+    Let total_symbols be 0
+
+    Let bucket_idx be 0
+    While bucket_idx < store_capacity:
+        Let doc_entry be proc memory_get_integer from MemorySafety with buckets, bucket_idx times 8
+        If doc_entry is not equal to 0:
+            Let doc_uri be proc memory_get_integer from MemorySafety with doc_entry, 0
+            Let doc_text be proc memory_get_integer from MemorySafety with doc_entry, 8
+
+            If doc_text is not equal to 0:
+                Note: Get symbols from this document
+                Let doc_symbols be proc document_symbols with doc_text, doc_uri
+                If doc_symbols is not equal to 0:
+                    Let doc_sym_count be proc memory_get_integer from MemorySafety with doc_symbols, 8
+                    Let doc_sym_data be proc memory_get_integer from MemorySafety with doc_symbols, 0
+
+                    Note: Filter symbols by query and add to workspace results
+                    Let si be 0
+                    While si < doc_sym_count:
+                        Let sym_ptr be proc memory_get_integer from MemorySafety with doc_sym_data, si times 8
+                        If sym_ptr is not equal to 0:
+                            Note: Check if symbol name matches query
+                            Let sym_name be proc memory_get_integer from MemorySafety with sym_ptr, 0
+                            Let matches be proc fuzzy_match_query from sym_name, query
+                            If matches is equal to 1:
+                                If total_symbols < MAX_SYMBOL_RESULTS:
+                                    Let dummy_add be proc memory_set_integer from MemorySafety with symbols_array, total_symbols times 8, sym_ptr
+                                    Set total_symbols to total_symbols + 1
+                                End If
+                            End If
+                        End If
+                        Set si to si + 1
+                    End While
+
+                    Note: Free the document symbols container (but not the symbol objects we transferred)
+                    Let dummy_free_arr be proc deallocate from OwnedUtils with doc_sym_data
+                    Let dummy_free_res be proc deallocate from OwnedUtils with doc_symbols
+                End If
+            End If
+        End If
+        Set bucket_idx to bucket_idx + 1
+    End While
+
+    Let dummy_final_count be proc memory_set_integer from MemorySafety with result, 8, total_symbols
+    Return result
+End Process
+
+Process called "hover_info" takes document_text as Integer, cursor_line as Integer, cursor_col as Integer returns Integer:
+    Note: Get hover information for the symbol at the cursor position
+    Note: Returns a string containing type information, documentation, or declaration
+    Note:
+    Note: The hover response includes:
+    Note: - For variables: type annotation and initial value
+    Note: - For functions: full signature (parameters and return type)
+    Note: - For types: type structure (fields or variants)
+    Note: - For constants: type and value
+    Note: - For keywords: brief description
+    Note:
+    Note: Returns pointer to hover text string, or 0 if no hover info available
+
+    If document_text is equal to 0:
+        Return 0
+    End If
+
+    Note: Extract the identifier at cursor
+    Let ident_info be proc extract_identifier_at from document_text, cursor_line, cursor_col
+    If ident_info is equal to 0:
+        Return 0
+    End If
+
+    Let ident_name be proc memory_get_integer from MemorySafety with ident_info, 0
+    Let ident_len be proc memory_get_integer from MemorySafety with ident_info, 8
+
+    If ident_name is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with ident_info
+        Return 0
+    End If
+
+    Let doc_len be proc measure_string_len from document_text
+
+    Note: Check if it's a keyword first
+    Let keyword_hover be proc get_keyword_hover from ident_name, ident_len
+    If keyword_hover is not equal to 0:
+        Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+        Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+        Return keyword_hover
+    End If
+
+    Note: Search for the declaration to build hover info
+    Note: Try Process declaration first
+    Let proc_line be proc find_process_declaration from document_text, doc_len, ident_name, ident_len
+    If proc_line is not equal to -1:
+        Note: Extract the full Process signature line for hover
+        Let hover_text be proc extract_line_text from document_text, doc_len, proc_line
+        Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+        Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+        Return hover_text
+    End If
+
+    Note: Try Type declaration
+    Let type_line be proc find_type_declaration from document_text, doc_len, ident_name, ident_len
+    If type_line is not equal to -1:
+        Let hover_text be proc extract_line_text from document_text, doc_len, type_line
+        Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+        Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+        Return hover_text
+    End If
+
+    Note: Try Constant declaration
+    Let const_line be proc find_constant_declaration from document_text, doc_len, ident_name, ident_len
+    If const_line is not equal to -1:
+        Let hover_text be proc extract_line_text from document_text, doc_len, const_line
+        Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+        Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+        Return hover_text
+    End If
+
+    Note: Try Let declaration
+    Let var_line be proc find_let_declaration from document_text, doc_len, ident_name, ident_len
+    If var_line is not equal to -1:
+        Let hover_text be proc extract_line_text from document_text, doc_len, var_line
+        Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+        Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+        Return hover_text
+    End If
+
+    Let dummy_free_name be proc deallocate from OwnedUtils with ident_name
+    Let dummy_free_info be proc deallocate from OwnedUtils with ident_info
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Internal Helper Processes
+Note: ============================================================================
+
+Private Process called "extract_identifier_at" takes document_text as Integer, line as Integer, col as Integer returns Integer:
+    Note: Extract the identifier name at the given line and column
+    Note: Returns a 16-byte struct: [name_ptr (8), name_len (8)], or 0
+
+    If document_text is equal to 0:
+        Return 0
+    End If
+
+    Note: Find the line offset
+    Let line_offset be proc find_line_start from document_text, line
+
+    If line_offset is equal to -1:
+        Return 0
+    End If
+
+    Note: Find word boundaries around the cursor column
+    Let word_start be col
+    While word_start > 0:
+        Let prev_ch be proc memory_get_integer from MemorySafety with document_text, line_offset + word_start - 1
+        Let is_ident be proc is_identifier_char from prev_ch
+        If is_ident is equal to 0:
+            Set word_start to 0
+        End If
+        Otherwise:
+            Set word_start to word_start - 1
+        End If
+    End While
+
+    Let doc_len be proc measure_string_len from document_text
+    Let word_end be col
+
+    While line_offset + word_end < doc_len:
+        Let next_ch be proc memory_get_integer from MemorySafety with document_text, line_offset + word_end
+        Let is_ident be proc is_identifier_char from next_ch
+        If is_ident is equal to 0:
+            Set word_end to word_end + doc_len
+        End If
+        Otherwise:
+            Set word_end to word_end + 1
+        End If
+    End While
+    If word_end > doc_len:
+        Set word_end to word_end - doc_len
+    End If
+
+    Let name_len be word_end - word_start
+    If name_len < 1:
+        Return 0
+    End If
+
+    Note: Copy the identifier name
+    Let name_buf be proc allocate from OwnedUtils with name_len + 1
+    If name_buf is equal to 0:
+        Return 0
+    End If
+
+    Let idx be 0
+    While idx < name_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with document_text, line_offset + word_start + idx
+        Let dummy_cp be proc memory_set_integer from MemorySafety with name_buf, idx, byte_val
+        Set idx to idx + 1
+    End While
+    Let dummy_term be proc memory_set_integer from MemorySafety with name_buf, name_len, 0
+
+    Note: Allocate result struct
+    Let result be proc allocate from OwnedUtils with 16
+    If result is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with name_buf
+        Return 0
+    End If
+
+    Let dummy_name be proc memory_set_integer from MemorySafety with result, 0, name_buf
+    Let dummy_len be proc memory_set_integer from MemorySafety with result, 8, name_len
+
+    Return result
+End Process
+
+Private Process called "find_line_start" takes document_text as Integer, target_line as Integer returns Integer:
+    Note: Find byte offset of the start of the given line (zero-based)
+
+    If document_text is equal to 0:
+        Return -1
+    End If
+    If target_line is equal to 0:
+        Return 0
+    End If
+
+    Let current_line be 0
+    Let offset be 0
+    Let max_offset be 1048576
+
+    While offset < max_offset:
+        Let ch be proc memory_get_integer from MemorySafety with document_text, offset
+        If ch is equal to 0:
+            Return -1
+        End If
+        If ch is equal to 10:
+            Set current_line to current_line + 1
+            If current_line is equal to target_line:
+                Return offset + 1
+            End If
+        End If
+        Set offset to offset + 1
+    End While
+
+    Return -1
+End Process
+
+Private Process called "is_identifier_char" takes ch as Integer returns Integer:
+    Note: Check if character is valid in an identifier (alphanumeric or underscore)
+    If ch > 96:
+        If ch < 123:
+            Return 1
+        End If
+    End If
+    If ch > 64:
+        If ch < 91:
+            Return 1
+        End If
+    End If
+    If ch > 47:
+        If ch < 58:
+            Return 1
+        End If
+    End If
+    If ch is equal to 95:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Private Process called "find_let_declaration" takes doc as Integer, doc_len as Integer, name as Integer, name_len as Integer returns Integer:
+    Note: Search for "Let <name> be" declaration, return line number or -1
+
+    Let scan be 0
+    Let current_line be 0
+
+    While scan < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with doc, scan
+        Note: Check for L=76
+        If ch is equal to 76:
+            If scan + 3 + name_len < doc_len:
+                Let c1 be proc memory_get_integer from MemorySafety with doc, scan + 1
+                Let c2 be proc memory_get_integer from MemorySafety with doc, scan + 2
+                Let c3 be proc memory_get_integer from MemorySafety with doc, scan + 3
+                Note: "Let " = L(76) e(101) t(116) space(32)
+                If c1 is equal to 101:
+                    If c2 is equal to 116:
+                        If c3 is equal to 32:
+                            Let match be proc check_identifier_match from doc, scan + 4, doc_len, name, name_len
+                            If match is equal to 1:
+                                Return current_line
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        If ch is equal to 10:
+            Set current_line to current_line + 1
+        End If
+        Set scan to scan + 1
+    End While
+
+    Return -1
+End Process
+
+Private Process called "find_process_declaration" takes doc as Integer, doc_len as Integer, name as Integer, name_len as Integer returns Integer:
+    Note: Search for 'Process called "<name>"' declaration, return line number or -1
+
+    Let scan be 0
+    Let current_line be 0
+
+    While scan < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with doc, scan
+        Note: P=80
+        If ch is equal to 80:
+            Note: Look for "Process called \"" (17 chars to the opening quote of name)
+            If scan + 17 + name_len < doc_len:
+                Let c1 be proc memory_get_integer from MemorySafety with doc, scan + 1
+                If c1 is equal to 114:
+                    Note: Check if quoted name matches
+                    Note: Skip to the opening quote position (scan + 16) and compare
+                    Let quote_pos be scan + 16
+                    Let qc be proc memory_get_integer from MemorySafety with doc, quote_pos
+                    If qc is equal to 34:
+                        Let match be proc check_identifier_match from doc, quote_pos + 1, doc_len, name, name_len
+                        If match is equal to 1:
+                            Return current_line
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        If ch is equal to 10:
+            Set current_line to current_line + 1
+        End If
+        Set scan to scan + 1
+    End While
+
+    Return -1
+End Process
+
+Private Process called "find_type_declaration" takes doc as Integer, doc_len as Integer, name as Integer, name_len as Integer returns Integer:
+    Note: Search for 'Type called "<name>"' declaration, return line number or -1
+
+    Let scan be 0
+    Let current_line be 0
+
+    While scan < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with doc, scan
+        Note: T=84
+        If ch is equal to 84:
+            If scan + 14 + name_len < doc_len:
+                Let c1 be proc memory_get_integer from MemorySafety with doc, scan + 1
+                If c1 is equal to 121:
+                    Note: "Type called \"" = 13 chars to quote position
+                    Let quote_pos be scan + 13
+                    Let qc be proc memory_get_integer from MemorySafety with doc, quote_pos
+                    If qc is equal to 34:
+                        Let match be proc check_identifier_match from doc, quote_pos + 1, doc_len, name, name_len
+                        If match is equal to 1:
+                            Return current_line
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        If ch is equal to 10:
+            Set current_line to current_line + 1
+        End If
+        Set scan to scan + 1
+    End While
+
+    Return -1
+End Process
+
+Private Process called "find_constant_declaration" takes doc as Integer, doc_len as Integer, name as Integer, name_len as Integer returns Integer:
+    Note: Search for "Constant <name> as" declaration, return line number or -1
+
+    Let scan be 0
+    Let current_line be 0
+
+    While scan < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with doc, scan
+        Note: C=67
+        If ch is equal to 67:
+            If scan + 9 + name_len < doc_len:
+                Let c1 be proc memory_get_integer from MemorySafety with doc, scan + 1
+                Note: o=111
+                If c1 is equal to 111:
+                    Let match be proc check_identifier_match from doc, scan + 9, doc_len, name, name_len
+                    If match is equal to 1:
+                        Return current_line
+                    End If
+                End If
+            End If
+        End If
+        If ch is equal to 10:
+            Set current_line to current_line + 1
+        End If
+        Set scan to scan + 1
+    End While
+
+    Return -1
+End Process
+
+Private Process called "check_identifier_match" takes doc as Integer, start_pos as Integer, doc_len as Integer, name as Integer, name_len as Integer returns Integer:
+    Note: Check if the bytes at start_pos in doc match the identifier name
+    Note: Returns 1 if match, 0 if not
+
+    If start_pos + name_len > doc_len:
+        Return 0
+    End If
+
+    Let idx be 0
+    While idx < name_len:
+        Let doc_byte be proc memory_get_integer from MemorySafety with doc, start_pos + idx
+        Let name_byte be proc memory_get_integer from MemorySafety with name, idx
+        If doc_byte is not equal to name_byte:
+            Return 0
+        End If
+        Set idx to idx + 1
+    End While
+
+    Return 1
+End Process
+
+Private Process called "check_word_boundary" takes doc as Integer, pos as Integer, word_len as Integer, doc_len as Integer returns Integer:
+    Note: Check if the identifier at pos is a complete word (not part of a larger word)
+    Note: Checks character before pos and character after pos+word_len
+    Note: Returns 1 if word boundary confirmed, 0 if part of larger word
+
+    Note: Check character before the word
+    If pos > 0:
+        Let before_ch be proc memory_get_integer from MemorySafety with doc, pos - 1
+        Let before_ident be proc is_identifier_char from before_ch
+        If before_ident is equal to 1:
+            Return 0
+        End If
+    End If
+
+    Note: Check character after the word
+    Let after_pos be pos + word_len
+    If after_pos < doc_len:
+        Let after_ch be proc memory_get_integer from MemorySafety with doc, after_pos
+        Let after_ident be proc is_identifier_char from after_ch
+        If after_ident is equal to 1:
+            Return 0
+        End If
+    End If
+
+    Return 1
+End Process
+
+Private Process called "create_symbol_info" takes name as Integer, kind as Integer, file_path as Integer, line as Integer, col as Integer returns Integer:
+    Note: Create a SymbolInfo structure (40 bytes)
+
+    Let sym be proc allocate from OwnedUtils with 40
+    If sym is equal to 0:
+        Return 0
+    End If
+
+    Let loc be proc allocate from OwnedUtils with 32
+    If loc is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with sym
+        Return 0
+    End If
+
+    Let dummy_fp be proc memory_set_integer from MemorySafety with loc, 0, file_path
+    Let dummy_ln be proc memory_set_integer from MemorySafety with loc, 8, line
+    Let dummy_cl be proc memory_set_integer from MemorySafety with loc, 16, col
+    Let dummy_el be proc memory_set_integer from MemorySafety with loc, 24, line
+
+    Let dummy_name be proc memory_set_integer from MemorySafety with sym, 0, name
+    Let dummy_kind be proc memory_set_integer from MemorySafety with sym, 8, kind
+    Let dummy_loc be proc memory_set_integer from MemorySafety with sym, 16, loc
+    Let dummy_container be proc memory_set_integer from MemorySafety with sym, 24, 0
+    Let dummy_detail be proc memory_set_integer from MemorySafety with sym, 32, 0
+
+    Return sym
+End Process
+
+Private Process called "extract_quoted_name" takes doc as Integer, start as Integer, doc_len as Integer returns Integer:
+    Note: Extract a quoted name from text starting at position
+    Note: Scans for first quote, extracts text until closing quote
+    Note: Returns newly allocated string, or 0
+
+    Let scan be start
+    Let quote_start be -1
+
+    While scan < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with doc, scan
+        If ch is equal to 34:
+            If quote_start is equal to -1:
+                Set quote_start to scan + 1
+            End If
+            Otherwise:
+                Note: Found closing quote - extract the name
+                Let name_len be scan - quote_start
+                If name_len > 0:
+                    If name_len < 256:
+                        Let name_buf be proc allocate from OwnedUtils with name_len + 1
+                        If name_buf is not equal to 0:
+                            Let idx be 0
+                            While idx < name_len:
+                                Let byte_val be proc memory_get_integer from MemorySafety with doc, quote_start + idx
+                                Let dummy_cp be proc memory_set_integer from MemorySafety with name_buf, idx, byte_val
+                                Set idx to idx + 1
+                            End While
+                            Let dummy_term be proc memory_set_integer from MemorySafety with name_buf, name_len, 0
+                            Return name_buf
+                        End If
+                    End If
+                End If
+                Return 0
+            End If
+        End If
+        If ch is equal to 10:
+            Return 0
+        End If
+        Set scan to scan + 1
+    End While
+
+    Return 0
+End Process
+
+Private Process called "extract_word_after" takes doc as Integer, start as Integer, doc_len as Integer returns Integer:
+    Note: Extract a word (identifier) starting at the given position
+    Note: Returns newly allocated string, or 0
+
+    If start > doc_len:
+        Return 0
+    End If
+
+    Let word_end be start
+    While word_end < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with doc, word_end
+        Let is_ident be proc is_identifier_char from ch
+        If is_ident is equal to 0:
+            Set word_end to word_end + doc_len
+        End If
+        Otherwise:
+            Set word_end to word_end + 1
+        End If
+    End While
+    If word_end > doc_len:
+        Set word_end to word_end - doc_len
+    End If
+
+    Let word_len be word_end - start
+    If word_len < 1:
+        Return 0
+    End If
+    If word_len > 255:
+        Return 0
+    End If
+
+    Let buf be proc allocate from OwnedUtils with word_len + 1
+    If buf is equal to 0:
+        Return 0
+    End If
+
+    Let idx be 0
+    While idx < word_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with doc, start + idx
+        Let dummy_cp be proc memory_set_integer from MemorySafety with buf, idx, byte_val
+        Set idx to idx + 1
+    End While
+    Let dummy_term be proc memory_set_integer from MemorySafety with buf, word_len, 0
+
+    Return buf
+End Process
+
+Private Process called "extract_quoted_string_after" takes doc as Integer, start as Integer, doc_len as Integer returns Integer:
+    Note: Extract a quoted string starting at or after the given position
+    Note: Delegates to extract_quoted_name
+
+    Return proc extract_quoted_name from doc, start, doc_len
+End Process
+
+Private Process called "extract_line_text" takes doc as Integer, doc_len as Integer, target_line as Integer returns Integer:
+    Note: Extract the full text of a line for hover information
+    Note: Returns newly allocated string containing the line text
+
+    Let line_start be proc find_line_start from doc, target_line
+    If line_start is equal to -1:
+        Return 0
+    End If
+
+    Note: Find line end
+    Let line_end be line_start
+    While line_end < doc_len:
+        Let ch be proc memory_get_integer from MemorySafety with doc, line_end
+        If ch is equal to 10:
+            Set line_end to line_end + doc_len
+        End If
+        Otherwise If ch is equal to 0:
+            Set line_end to line_end + doc_len
+        End If
+        Otherwise:
+            Set line_end to line_end + 1
+        End If
+    End While
+    If line_end > doc_len:
+        Set line_end to line_end - doc_len
+    End If
+
+    Let line_len be line_end - line_start
+    If line_len < 1:
+        Return 0
+    End If
+    If line_len > 1024:
+        Set line_len to 1024
+    End If
+
+    Let buf be proc allocate from OwnedUtils with line_len + 1
+    If buf is equal to 0:
+        Return 0
+    End If
+
+    Let idx be 0
+    While idx < line_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with doc, line_start + idx
+        Let dummy_cp be proc memory_set_integer from MemorySafety with buf, idx, byte_val
+        Set idx to idx + 1
+    End While
+    Let dummy_term be proc memory_set_integer from MemorySafety with buf, line_len, 0
+
+    Return buf
+End Process
+
+Private Process called "get_keyword_hover" takes name as Integer, name_len as Integer returns Integer:
+    Note: Check if the identifier is a Runa keyword and return hover documentation
+    Note: Returns pointer to documentation string, or 0 if not a keyword
+
+    If name is equal to 0:
+        Return 0
+    End If
+
+    Let first_ch be proc memory_get_integer from MemorySafety with name, 0
+
+    Note: Check common keywords by first character and length
+    Note: "Let" (3 chars, L=76)
+    If first_ch is equal to 76:
+        If name_len is equal to 3:
+            Let doc_str be proc allocate from OwnedUtils with 48
+            If doc_str is not equal to 0:
+                Note: "Let - Variable declaration"
+                Note: L=76 e=101 t=116 space=32 -=45 space=32
+                Note: V=86 a=97 r=114 i=105 a=97 b=98 l=108 e=101
+                Let dummy1 be proc memory_set_integer from MemorySafety with doc_str, 0, 76
+                Let dummy2 be proc memory_set_integer from MemorySafety with doc_str, 1, 101
+                Let dummy3 be proc memory_set_integer from MemorySafety with doc_str, 2, 116
+                Let dummy4 be proc memory_set_integer from MemorySafety with doc_str, 3, 32
+                Let dummy5 be proc memory_set_integer from MemorySafety with doc_str, 4, 45
+                Let dummy6 be proc memory_set_integer from MemorySafety with doc_str, 5, 32
+                Let dummy7 be proc memory_set_integer from MemorySafety with doc_str, 6, 68
+                Let dummy8 be proc memory_set_integer from MemorySafety with doc_str, 7, 101
+                Let dummy9 be proc memory_set_integer from MemorySafety with doc_str, 8, 99
+                Let dummy10 be proc memory_set_integer from MemorySafety with doc_str, 9, 108
+                Let dummy11 be proc memory_set_integer from MemorySafety with doc_str, 10, 97
+                Let dummy12 be proc memory_set_integer from MemorySafety with doc_str, 11, 114
+                Let dummy13 be proc memory_set_integer from MemorySafety with doc_str, 12, 101
+                Let dummy_term be proc memory_set_integer from MemorySafety with doc_str, 13, 0
+                Return doc_str
+            End If
+        End If
+    End If
+
+    Return 0
+End Process
+
+Private Process called "fuzzy_match_query" takes symbol_name as Integer, query as Integer returns Integer:
+    Note: Perform a fuzzy match of query against symbol name
+    Note: Returns 1 if the query is a subsequence of the symbol name, 0 otherwise
+    Note: If query is null or empty, matches everything
+
+    If query is equal to 0:
+        Return 1
+    End If
+
+    Let first_query_byte be proc memory_get_integer from MemorySafety with query, 0
+    If first_query_byte is equal to 0:
+        Return 1
+    End If
+
+    If symbol_name is equal to 0:
+        Return 0
+    End If
+
+    Note: Subsequence match: each character in query must appear in order in symbol_name
+    Let qi be 0
+    Let si be 0
+    Let max_len be 256
+
+    While qi < max_len:
+        Let qch be proc memory_get_integer from MemorySafety with query, qi
+        If qch is equal to 0:
+            Note: All query chars matched
+            Return 1
+        End If
+
+        Note: Find this query char in remaining symbol name
+        Let found be 0
+        While si < max_len:
+            Let sch be proc memory_get_integer from MemorySafety with symbol_name, si
+            If sch is equal to 0:
+                Note: End of symbol name without matching all query chars
+                Return 0
+            End If
+
+            Note: Case-insensitive comparison
+            Let lower_q be qch
+            Let lower_s be sch
+            If lower_q > 64:
+                If lower_q < 91:
+                    Set lower_q to lower_q + 32
+                End If
+            End If
+            If lower_s > 64:
+                If lower_s < 91:
+                    Set lower_s to lower_s + 32
+                End If
+            End If
+
+            If lower_q is equal to lower_s:
+                Set found to 1
+                Set si to si + 1
+                Set si to si + max_len
+            End If
+            Otherwise:
+                Set si to si + 1
+            End If
+        End While
+        If si > max_len:
+            Set si to si - max_len
+        End If
+
+        If found is equal to 0:
+            Return 0
+        End If
+        Set qi to qi + 1
+    End While
+
+    Return 1
+End Process
+
+Private Process called "measure_string_len" takes str_ptr as Integer returns Integer:
+    Note: Measure length of null-terminated string
+    If str_ptr is equal to 0:
+        Return 0
+    End If
+    Let len be 0
+    Let max_len be 1048576
+    While len < max_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with str_ptr, len
+        If byte_val is equal to 0:
+            Return len
+        End If
+        Set len to len + 1
+    End While
+    Return len
+End Process

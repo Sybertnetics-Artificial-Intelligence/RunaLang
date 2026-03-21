@@ -285,9 +285,17 @@ type_identifier       ::= identifier
 ## Type Definitions
 
 ```ebnf
-type_definition       ::= "Type" "called" string_literal generic_params? ":" type_body
+Note: Block type definitions (multi-line with ":" and "End Type")
+type_definition       ::= type_block_definition | type_alias_definition
+
+type_block_definition ::= "Type" "called" string_literal generic_params? ":" type_body "End" "Type"
+                        | "Type" identifier generic_params? "is" ":" type_body "End" "Type"
+
+Note: Expression type definitions (single-line, no "End Type")
+type_alias_definition ::= "Type" identifier "is" type_expression
 
 generic_params        ::= '[' generic_param (',' generic_param)* ']'
+                        | "of" generic_param (',' generic_param)*
 
 generic_param         ::= identifier type_constraint?
 

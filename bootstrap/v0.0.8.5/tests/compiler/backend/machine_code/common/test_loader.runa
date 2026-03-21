@@ -1,0 +1,701 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+Unit Tests for loader.runa
+
+Exercises the 19 processes of the dynamic linker/loader: context creation,
+shared library registration (with deduplication), dynamic symbol registration,
+PLT/GOT entry counting and sizing, GOT/PLT section generation, symbol
+resolution, and diagnostic accessors.
+:End Note
+
+Import "tests/test_utils.runa" as T
+Import "compiler/backend/machine_code/common/loader.runa" as Loader
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+
+Note: ============================================================================
+Note: DynamicLinkerContext Creation Tests
+Note: ============================================================================
+
+Process called "test_create_dynamic_linker" that takes results as Integer returns Integer:
+    T.begin_suite(results, "create_dynamic_linker")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "create_dynamic_linker returns non-null", ctx)
+
+    Note: Verify plt_entries list created (offset 0)
+    Let plt_list be __load(ctx, 0)
+    T.assert_not_null(results, "plt_entries list is non-null", plt_list)
+
+    Note: Verify got_entries list created (offset 8)
+    Let got_list be __load(ctx, 8)
+    T.assert_not_null(results, "got_entries list is non-null", got_list)
+
+    Note: Verify plt_base defaults to 0 (offset 16)
+    Let plt_base be __load(ctx, 16)
+    T.assert_equal(results, "plt_base defaults to 0", plt_base, 0)
+
+    Note: Verify got_base defaults to 0 (offset 24)
+    Let got_base be __load(ctx, 24)
+    T.assert_equal(results, "got_base defaults to 0", got_base, 0)
+
+    Note: Verify shared_libraries list created (offset 32)
+    Let libs be __load(ctx, 32)
+    T.assert_not_null(results, "shared_libraries list is non-null", libs)
+
+    Note: Verify dynamic_symbols dictionary created (offset 40)
+    Let sym_dict be __load(ctx, 40)
+    T.assert_not_null(results, "dynamic_symbols dictionary is non-null", sym_dict)
+
+    Note: Verify plt_entry_count starts at 0 (offset 48)
+    Let plt_count be __load(ctx, 48)
+    T.assert_equal(results, "plt_entry_count starts at 0", plt_count, 0)
+
+    Note: Verify got_reserved_count is 3 (offset 56)
+    Let got_reserved be __load(ctx, 56)
+    T.assert_equal(results, "got_reserved_count is 3", got_reserved, 3)
+
+    Note: Verify dynstr_offset_counter starts at 0 (offset 64)
+    Let dynstr_offset be __load(ctx, 64)
+    T.assert_equal(results, "dynstr_offset_counter starts at 0", dynstr_offset, 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Shared Library Registration Tests
+Note: ============================================================================
+
+Process called "test_dynamic_add_shared_library" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dynamic_add_shared_library")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "context created", ctx)
+
+    Note: Initial library count should be 0
+    Let count0 be Loader.dynamic_get_shared_library_count(ctx)
+    T.assert_equal(results, "initial library count is 0", count0, 0)
+
+    Note: Add first library
+    Let r1 be Loader.dynamic_add_shared_library(ctx, "libc.so.6")
+    T.assert_equal(results, "add libc returns LOADER_OK", r1, Loader.LOADER_OK)
+
+    Let count1 be Loader.dynamic_get_shared_library_count(ctx)
+    T.assert_equal(results, "library count is 1 after adding libc", count1, 1)
+
+    Note: Add second library
+    Let r2 be Loader.dynamic_add_shared_library(ctx, "libm.so.6")
+    T.assert_equal(results, "add libm returns LOADER_OK", r2, Loader.LOADER_OK)
+
+    Let count2 be Loader.dynamic_get_shared_library_count(ctx)
+    T.assert_equal(results, "library count is 2 after adding libm", count2, 2)
+
+    Note: Add duplicate library - should be silently skipped
+    Let r3 be Loader.dynamic_add_shared_library(ctx, "libc.so.6")
+    T.assert_equal(results, "duplicate add returns LOADER_OK (skipped)", r3, Loader.LOADER_OK)
+
+    Let count3 be Loader.dynamic_get_shared_library_count(ctx)
+    T.assert_equal(results, "library count still 2 after duplicate", count3, 2)
+
+    Note: Add a third unique library
+    Let r4 be Loader.dynamic_add_shared_library(ctx, "libpthread.so.0")
+    T.assert_equal(results, "add libpthread returns LOADER_OK", r4, Loader.LOADER_OK)
+
+    Let count4 be Loader.dynamic_get_shared_library_count(ctx)
+    T.assert_equal(results, "library count is 3", count4, 3)
+
+    Note: Null context should fail
+    Let r_null_ctx be Loader.dynamic_add_shared_library(0, "libc.so.6")
+    T.assert_equal(results, "null context returns LOADER_ERROR", r_null_ctx, Loader.LOADER_ERROR)
+
+    Note: Null lib_name should fail
+    Let r_null_lib be Loader.dynamic_add_shared_library(ctx, 0)
+    T.assert_equal(results, "null lib_name returns LOADER_ERROR", r_null_lib, Loader.LOADER_ERROR)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Dynamic Symbol Registration Tests
+Note: ============================================================================
+
+Process called "test_dynamic_add_symbol" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dynamic_add_symbol")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "context created", ctx)
+
+    Note: Initial PLT entry count should be 0
+    Let plt_count0 be Loader.dynamic_get_plt_entry_count(ctx)
+    T.assert_equal(results, "initial PLT entry count is 0", plt_count0, 0)
+
+    Note: Add first symbol
+    Let r1 be Loader.dynamic_add_symbol(ctx, "printf")
+    T.assert_equal(results, "add 'printf' returns LOADER_OK", r1, Loader.LOADER_OK)
+
+    Let plt_count1 be Loader.dynamic_get_plt_entry_count(ctx)
+    T.assert_equal(results, "PLT entry count is 1", plt_count1, 1)
+
+    Note: Add second symbol
+    Let r2 be Loader.dynamic_add_symbol(ctx, "malloc")
+    T.assert_equal(results, "add 'malloc' returns LOADER_OK", r2, Loader.LOADER_OK)
+
+    Let plt_count2 be Loader.dynamic_get_plt_entry_count(ctx)
+    T.assert_equal(results, "PLT entry count is 2", plt_count2, 2)
+
+    Note: Add duplicate symbol - should be silently skipped
+    Let r3 be Loader.dynamic_add_symbol(ctx, "printf")
+    T.assert_equal(results, "duplicate add returns LOADER_OK (skipped)", r3, Loader.LOADER_OK)
+
+    Let plt_count3 be Loader.dynamic_get_plt_entry_count(ctx)
+    T.assert_equal(results, "PLT entry count still 2 after duplicate", plt_count3, 2)
+
+    Note: Add third unique symbol
+    Let r4 be Loader.dynamic_add_symbol(ctx, "free")
+    T.assert_equal(results, "add 'free' returns LOADER_OK", r4, Loader.LOADER_OK)
+
+    Let plt_count4 be Loader.dynamic_get_plt_entry_count(ctx)
+    T.assert_equal(results, "PLT entry count is 3", plt_count4, 3)
+
+    Note: Null context should fail
+    Let r_null be Loader.dynamic_add_symbol(0, "test")
+    T.assert_equal(results, "null context returns LOADER_ERROR", r_null, Loader.LOADER_ERROR)
+
+    Note: Null symbol name should fail
+    Let r_null_sym be Loader.dynamic_add_symbol(ctx, 0)
+    T.assert_equal(results, "null symbol returns LOADER_ERROR", r_null_sym, Loader.LOADER_ERROR)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PLT/GOT Count and Size Tests
+Note: ============================================================================
+
+Process called "test_plt_got_counts" that takes results as Integer returns Integer:
+    T.begin_suite(results, "PLT/GOT counts match expected values")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "context created", ctx)
+
+    Note: With 0 symbols:
+    Note: PLT entries: 0 (PLT[0] is not counted by dynamic_get_plt_entry_count)
+    Note: GOT entries: 3 (reserved only)
+    Let plt0 be Loader.dynamic_get_plt_entry_count(ctx)
+    T.assert_equal(results, "0 symbols: PLT entry count is 0", plt0, 0)
+
+    Let got0 be Loader.dynamic_get_got_entry_count(ctx)
+    T.assert_equal(results, "0 symbols: GOT entry count is 3 (reserved)", got0, 3)
+
+    Note: PLT total size: PLT[0] only = 16 bytes
+    Let plt_size0 be Loader.dynamic_get_plt_total_size(ctx)
+    T.assert_equal(results, "0 symbols: PLT total size is 16 (PLT[0])", plt_size0, 16)
+
+    Note: GOT total size: 3 * 8 = 24 bytes
+    Let got_size0 be Loader.dynamic_get_got_total_size(ctx)
+    T.assert_equal(results, "0 symbols: GOT total size is 24", got_size0, 24)
+
+    Note: Add 2 symbols
+    Loader.dynamic_add_symbol(ctx, "sym_a")
+    Loader.dynamic_add_symbol(ctx, "sym_b")
+
+    Note: With 2 symbols:
+    Let plt2 be Loader.dynamic_get_plt_entry_count(ctx)
+    T.assert_equal(results, "2 symbols: PLT entry count is 2", plt2, 2)
+
+    Let got2 be Loader.dynamic_get_got_entry_count(ctx)
+    T.assert_equal(results, "2 symbols: GOT entry count is 5 (3 + 2)", got2, 5)
+
+    Note: PLT total size: 16 (PLT[0]) + 2 * 16 = 48 bytes
+    Let plt_size2 be Loader.dynamic_get_plt_total_size(ctx)
+    T.assert_equal(results, "2 symbols: PLT total size is 48", plt_size2, 48)
+
+    Note: GOT total size: 5 * 8 = 40 bytes
+    Let got_size2 be Loader.dynamic_get_got_total_size(ctx)
+    T.assert_equal(results, "2 symbols: GOT total size is 40", got_size2, 40)
+
+    Note: Add 1 more symbol
+    Loader.dynamic_add_symbol(ctx, "sym_c")
+
+    Let plt3 be Loader.dynamic_get_plt_entry_count(ctx)
+    T.assert_equal(results, "3 symbols: PLT entry count is 3", plt3, 3)
+
+    Let got3 be Loader.dynamic_get_got_entry_count(ctx)
+    T.assert_equal(results, "3 symbols: GOT entry count is 6", got3, 6)
+
+    Let plt_size3 be Loader.dynamic_get_plt_total_size(ctx)
+    T.assert_equal(results, "3 symbols: PLT total size is 64", plt_size3, 64)
+
+    Let got_size3 be Loader.dynamic_get_got_total_size(ctx)
+    T.assert_equal(results, "3 symbols: GOT total size is 48", got_size3, 48)
+
+    Note: Null context should return 0 for all
+    Let null_plt be Loader.dynamic_get_plt_entry_count(0)
+    T.assert_equal(results, "null ctx: PLT entry count is 0", null_plt, 0)
+
+    Let null_got be Loader.dynamic_get_got_entry_count(0)
+    T.assert_equal(results, "null ctx: GOT entry count is 0", null_got, 0)
+
+    Let null_plt_size be Loader.dynamic_get_plt_total_size(0)
+    T.assert_equal(results, "null ctx: PLT total size is 0", null_plt_size, 0)
+
+    Let null_got_size be Loader.dynamic_get_got_total_size(0)
+    T.assert_equal(results, "null ctx: GOT total size is 0", null_got_size, 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: GOT Generation Tests
+Note: ============================================================================
+
+Process called "test_dynamic_generate_got" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dynamic_generate_got")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "context created", ctx)
+
+    Note: Set base addresses for proper offset calculation
+    Loader.dynamic_set_plt_base(ctx, 4198400)
+    Loader.dynamic_set_got_base(ctx, 4202496)
+
+    Note: Add 2 symbols
+    Loader.dynamic_add_symbol(ctx, "puts")
+    Loader.dynamic_add_symbol(ctx, "exit")
+
+    Note: Allocate output struct (buffer_ptr at offset 0, size at offset 8)
+    Let output be Layout.allocate(16)
+    T.assert_not_null(results, "output struct allocated", output)
+
+    Note: Generate GOT
+    Let result be Loader.dynamic_generate_got(ctx, output)
+    T.assert_equal(results, "generate_got returns LOADER_OK", result, Loader.LOADER_OK)
+
+    Note: Verify buffer was allocated
+    Let got_buf be __load(output, 0)
+    T.assert_not_null(results, "GOT buffer is non-null", got_buf)
+
+    Note: Verify size: (3 reserved + 2 symbols) * 8 = 40 bytes
+    Let got_size be __load(output, 8)
+    T.assert_equal(results, "GOT size is 40 bytes", got_size, 40)
+
+    Note: Verify GOT[0], GOT[1], GOT[2] are zero (reserved, filled by dynamic linker)
+    Note: Each GOT entry is 8 bytes, little-endian
+    Let got0_b0 be __load8(got_buf, 0)
+    T.assert_equal(results, "GOT[0] byte 0 is 0 (reserved)", got0_b0, 0)
+    Let got0_b7 be __load8(got_buf, 7)
+    T.assert_equal(results, "GOT[0] byte 7 is 0 (reserved)", got0_b7, 0)
+
+    Let got1_b0 be __load8(got_buf, 8)
+    T.assert_equal(results, "GOT[1] byte 0 is 0 (reserved)", got1_b0, 0)
+
+    Let got2_b0 be __load8(got_buf, 16)
+    T.assert_equal(results, "GOT[2] byte 0 is 0 (reserved)", got2_b0, 0)
+
+    Note: GOT[3] should contain lazy-binding address: plt_base + PLT[0]_size + 0*16 + 6
+    Note: = 4198400 + 16 + 0 + 6 = 4198422 = 0x401016
+    Note: The first non-reserved GOT entry starts at byte 24
+    Let got3_b0 be __load8(got_buf, 24)
+    Let got3_b1 be __load8(got_buf, 25)
+    Let got3_b2 be __load8(got_buf, 26)
+    Note: 4198422 = 0x00401016, LE = [16, 10, 40, 00, ...]
+    T.assert_equal(results, "GOT[3] byte 0 is 0x16 (22)", got3_b0, 22)
+    T.assert_equal(results, "GOT[3] byte 1 is 0x10 (16)", got3_b1, 16)
+    T.assert_equal(results, "GOT[3] byte 2 is 0x40 (64)", got3_b2, 64)
+
+    Note: Null context should fail
+    Let r_null be Loader.dynamic_generate_got(0, output)
+    T.assert_equal(results, "null context returns LOADER_ERROR", r_null, Loader.LOADER_ERROR)
+
+    Note: Null output should fail
+    Let r_null_out be Loader.dynamic_generate_got(ctx, 0)
+    T.assert_equal(results, "null output returns LOADER_ERROR", r_null_out, Loader.LOADER_ERROR)
+
+    MemoryUtils.deallocate(got_buf)
+    MemoryUtils.deallocate(output)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PLT Generation Tests
+Note: ============================================================================
+
+Process called "test_dynamic_generate_plt" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dynamic_generate_plt")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "context created", ctx)
+
+    Note: Set base addresses
+    Loader.dynamic_set_plt_base(ctx, 4198400)
+    Loader.dynamic_set_got_base(ctx, 4202496)
+
+    Note: Add 2 symbols
+    Loader.dynamic_add_symbol(ctx, "puts")
+    Loader.dynamic_add_symbol(ctx, "exit")
+
+    Note: Allocate output struct
+    Let output be Layout.allocate(16)
+    T.assert_not_null(results, "output struct allocated", output)
+
+    Note: Generate PLT
+    Let result be Loader.dynamic_generate_plt(ctx, output)
+    T.assert_equal(results, "generate_plt returns LOADER_OK", result, Loader.LOADER_OK)
+
+    Note: Verify buffer was allocated
+    Let plt_buf be __load(output, 0)
+    T.assert_not_null(results, "PLT buffer is non-null", plt_buf)
+
+    Note: Verify size: 16 (PLT[0]) + 2 * 16 = 48 bytes
+    Let plt_size be __load(output, 8)
+    T.assert_equal(results, "PLT size is 48 bytes", plt_size, 48)
+
+    Note: Verify PLT[0] resolver stub starts with FF 35 (push [rip+disp32])
+    Let plt0_b0 be __load8(plt_buf, 0)
+    Let plt0_b1 be __load8(plt_buf, 1)
+    T.assert_equal(results, "PLT[0] byte 0 is 0xFF (255)", plt0_b0, 255)
+    T.assert_equal(results, "PLT[0] byte 1 is 0x35 (53) for push", plt0_b1, 53)
+
+    Note: Verify PLT[0] jmp instruction at bytes 6-7
+    Let plt0_b6 be __load8(plt_buf, 6)
+    Let plt0_b7 be __load8(plt_buf, 7)
+    T.assert_equal(results, "PLT[0] byte 6 is 0xFF (255)", plt0_b6, 255)
+    T.assert_equal(results, "PLT[0] byte 7 is 0x25 (37) for jmp", plt0_b7, 37)
+
+    Note: Verify PLT[0] NOP padding at bytes 12-15
+    Let plt0_b12 be __load8(plt_buf, 12)
+    Let plt0_b13 be __load8(plt_buf, 13)
+    T.assert_equal(results, "PLT[0] byte 12 is 0x0F (15) NOP prefix", plt0_b12, 15)
+    T.assert_equal(results, "PLT[0] byte 13 is 0x1F (31) NOP", plt0_b13, 31)
+
+    Note: Verify PLT[1] starts with FF 25 (jmp [rip+disp32])
+    Let plt1_b0 be __load8(plt_buf, 16)
+    Let plt1_b1 be __load8(plt_buf, 17)
+    T.assert_equal(results, "PLT[1] byte 0 is 0xFF (255)", plt1_b0, 255)
+    T.assert_equal(results, "PLT[1] byte 1 is 0x25 (37) for jmp", plt1_b1, 37)
+
+    Note: Verify PLT[1] push opcode at byte 6 (offset 22 in buffer)
+    Let plt1_b6 be __load8(plt_buf, 22)
+    T.assert_equal(results, "PLT[1] push opcode is 0x68 (104)", plt1_b6, 104)
+
+    Note: Verify PLT[1] push value is 0 (reloc index for first symbol)
+    Let plt1_b7 be __load8(plt_buf, 23)
+    T.assert_equal(results, "PLT[1] push imm32 byte 0 is 0", plt1_b7, 0)
+
+    Note: Verify PLT[1] jmp PLT[0] opcode at byte 11 (offset 27)
+    Let plt1_b11 be __load8(plt_buf, 27)
+    T.assert_equal(results, "PLT[1] jmp rel32 opcode is 0xE9 (233)", plt1_b11, 233)
+
+    Note: Verify PLT[2] push value is 1 (reloc index for second symbol)
+    Note: PLT[2] starts at offset 32, push is at offset 32 + 6 = 38
+    Let plt2_push_opcode be __load8(plt_buf, 38)
+    T.assert_equal(results, "PLT[2] push opcode is 0x68 (104)", plt2_push_opcode, 104)
+    Let plt2_push_val be __load8(plt_buf, 39)
+    T.assert_equal(results, "PLT[2] push imm32 byte 0 is 1", plt2_push_val, 1)
+
+    Note: Null context should fail
+    Let r_null be Loader.dynamic_generate_plt(0, output)
+    T.assert_equal(results, "null context returns LOADER_ERROR", r_null, Loader.LOADER_ERROR)
+
+    MemoryUtils.deallocate(plt_buf)
+    MemoryUtils.deallocate(output)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: PLT/GOT Offset Lookup Tests
+Note: ============================================================================
+
+Process called "test_dynamic_offset_lookup" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dynamic_get_plt_offset and dynamic_get_got_offset")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "context created", ctx)
+
+    Loader.dynamic_add_symbol(ctx, "func_a")
+    Loader.dynamic_add_symbol(ctx, "func_b")
+    Loader.dynamic_add_symbol(ctx, "func_c")
+
+    Note: PLT offsets: func_a=16 (PLT[1]), func_b=32 (PLT[2]), func_c=48 (PLT[3])
+    Let plt_a be Loader.dynamic_get_plt_offset(ctx, "func_a")
+    T.assert_equal(results, "func_a PLT offset is 16", plt_a, 16)
+
+    Let plt_b be Loader.dynamic_get_plt_offset(ctx, "func_b")
+    T.assert_equal(results, "func_b PLT offset is 32", plt_b, 32)
+
+    Let plt_c be Loader.dynamic_get_plt_offset(ctx, "func_c")
+    T.assert_equal(results, "func_c PLT offset is 48", plt_c, 48)
+
+    Note: GOT offsets: func_a=(3+0)*8=24, func_b=(3+1)*8=32, func_c=(3+2)*8=40
+    Let got_a be Loader.dynamic_get_got_offset(ctx, "func_a")
+    T.assert_equal(results, "func_a GOT offset is 24", got_a, 24)
+
+    Let got_b be Loader.dynamic_get_got_offset(ctx, "func_b")
+    T.assert_equal(results, "func_b GOT offset is 32", got_b, 32)
+
+    Let got_c be Loader.dynamic_get_got_offset(ctx, "func_c")
+    T.assert_equal(results, "func_c GOT offset is 40", got_c, 40)
+
+    Note: Non-existent symbol should return -1
+    Let plt_missing be Loader.dynamic_get_plt_offset(ctx, "nonexistent")
+    T.assert_equal(results, "nonexistent PLT offset is -1", plt_missing, -1)
+
+    Let got_missing be Loader.dynamic_get_got_offset(ctx, "nonexistent")
+    T.assert_equal(results, "nonexistent GOT offset is -1", got_missing, -1)
+
+    Note: Null context should return -1
+    Let plt_null be Loader.dynamic_get_plt_offset(0, "func_a")
+    T.assert_equal(results, "null ctx PLT offset is -1", plt_null, -1)
+
+    Let got_null be Loader.dynamic_get_got_offset(0, "func_a")
+    T.assert_equal(results, "null ctx GOT offset is -1", got_null, -1)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Symbol Resolution Tests
+Note: ============================================================================
+
+Process called "test_dynamic_resolve_symbol" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dynamic_resolve_symbol + is_resolved + get_resolved_address")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "context created", ctx)
+
+    Loader.dynamic_add_symbol(ctx, "puts")
+    Loader.dynamic_add_symbol(ctx, "exit")
+
+    Note: Before resolution, symbols should be unresolved
+    Let is_resolved_before be Loader.dynamic_is_symbol_resolved(ctx, "puts")
+    T.assert_equal(results, "'puts' is unresolved initially (0)", is_resolved_before, 0)
+
+    Let addr_before be Loader.dynamic_get_resolved_address(ctx, "puts")
+    T.assert_equal(results, "'puts' resolved address is 0 initially", addr_before, 0)
+
+    Note: Resolve 'puts' to address 0x7F000100
+    Let r1 be Loader.dynamic_resolve_symbol(ctx, "puts", 2130706688)
+    T.assert_equal(results, "resolve 'puts' returns LOADER_OK", r1, Loader.LOADER_OK)
+
+    Note: After resolution, symbol should be resolved
+    Let is_resolved_after be Loader.dynamic_is_symbol_resolved(ctx, "puts")
+    T.assert_equal(results, "'puts' is resolved (1)", is_resolved_after, 1)
+
+    Let addr_after be Loader.dynamic_get_resolved_address(ctx, "puts")
+    T.assert_equal(results, "'puts' resolved address is 0x7F000100", addr_after, 2130706688)
+
+    Note: 'exit' should still be unresolved
+    Let exit_resolved be Loader.dynamic_is_symbol_resolved(ctx, "exit")
+    T.assert_equal(results, "'exit' still unresolved (0)", exit_resolved, 0)
+
+    Note: Resolve 'exit' to address 0x7F000200
+    Loader.dynamic_resolve_symbol(ctx, "exit", 2130706944)
+
+    Let exit_resolved_after be Loader.dynamic_is_symbol_resolved(ctx, "exit")
+    T.assert_equal(results, "'exit' is resolved (1)", exit_resolved_after, 1)
+
+    Let exit_addr be Loader.dynamic_get_resolved_address(ctx, "exit")
+    T.assert_equal(results, "'exit' resolved address correct", exit_addr, 2130706944)
+
+    Note: Resolving non-existent symbol should fail
+    Let r_missing be Loader.dynamic_resolve_symbol(ctx, "nonexistent", 12345)
+    T.assert_equal(results, "resolve non-existent returns NOT_FOUND", r_missing, Loader.LOADER_ERROR_NOT_FOUND)
+
+    Note: is_symbol_resolved for non-existent should return -1
+    Let missing_resolved be Loader.dynamic_is_symbol_resolved(ctx, "nonexistent")
+    T.assert_equal(results, "is_resolved for non-existent returns -1", missing_resolved, -1)
+
+    Note: get_resolved_address for non-existent should return 0
+    Let missing_addr be Loader.dynamic_get_resolved_address(ctx, "nonexistent")
+    T.assert_equal(results, "get_resolved_address for non-existent returns 0", missing_addr, 0)
+
+    Note: Null context should fail
+    Let r_null be Loader.dynamic_resolve_symbol(0, "puts", 0)
+    T.assert_equal(results, "resolve with null ctx returns error", r_null, Loader.LOADER_ERROR)
+
+    Note: Null symbol should fail
+    Let r_null_sym be Loader.dynamic_resolve_symbol(ctx, 0, 0)
+    T.assert_equal(results, "resolve null symbol returns error", r_null_sym, Loader.LOADER_ERROR)
+
+    Note: is_symbol_resolved with null context
+    Let null_is_resolved be Loader.dynamic_is_symbol_resolved(0, "puts")
+    T.assert_equal(results, "is_resolved null ctx returns -1", null_is_resolved, -1)
+
+    Note: get_resolved_address with null context
+    Let null_addr be Loader.dynamic_get_resolved_address(0, "puts")
+    T.assert_equal(results, "get_resolved null ctx returns 0", null_addr, 0)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Base Address Setting Tests
+Note: ============================================================================
+
+Process called "test_dynamic_set_bases" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dynamic_set_plt_base and dynamic_set_got_base")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "context created", ctx)
+
+    Note: Set PLT base
+    Let r1 be Loader.dynamic_set_plt_base(ctx, 4198400)
+    T.assert_equal(results, "set_plt_base returns LOADER_OK", r1, Loader.LOADER_OK)
+
+    Let plt_base be __load(ctx, 16)
+    T.assert_equal(results, "plt_base set to 0x401000", plt_base, 4198400)
+
+    Note: Set GOT base
+    Let r2 be Loader.dynamic_set_got_base(ctx, 4202496)
+    T.assert_equal(results, "set_got_base returns LOADER_OK", r2, Loader.LOADER_OK)
+
+    Let got_base be __load(ctx, 24)
+    T.assert_equal(results, "got_base set to 0x402000", got_base, 4202496)
+
+    Note: Null context should fail
+    Let r_null1 be Loader.dynamic_set_plt_base(0, 4198400)
+    T.assert_equal(results, "set_plt_base null ctx returns error", r_null1, Loader.LOADER_ERROR)
+
+    Let r_null2 be Loader.dynamic_set_got_base(0, 4202496)
+    T.assert_equal(results, "set_got_base null ctx returns error", r_null2, Loader.LOADER_ERROR)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Dynamic Section Generation Tests
+Note: ============================================================================
+
+Process called "test_dynamic_generate_dynamic_section" that takes results as Integer returns Integer:
+    T.begin_suite(results, "dynamic_generate_dynamic_section")
+
+    Let ctx be Loader.create_dynamic_linker()
+    T.assert_not_null(results, "context created", ctx)
+
+    Loader.dynamic_set_got_base(ctx, 4202496)
+    Loader.dynamic_add_shared_library(ctx, "libc.so.6")
+    Loader.dynamic_add_symbol(ctx, "printf")
+
+    Note: Allocate output struct: [dyn_buf, dyn_size, dynstr_buf, dynstr_size] = 32 bytes
+    Let output be Layout.allocate(32)
+    T.assert_not_null(results, "output struct allocated", output)
+
+    Let result be Loader.dynamic_generate_dynamic_section(ctx, output)
+    T.assert_equal(results, "generate_dynamic_section returns LOADER_OK", result, Loader.LOADER_OK)
+
+    Note: Verify dynamic section buffer
+    Let dyn_buf be __load(output, 0)
+    T.assert_not_null(results, "dynamic section buffer is non-null", dyn_buf)
+
+    Let dyn_size be __load(output, 8)
+    T.assert_true(results, "dynamic section size is > 0", dyn_size)
+
+    Note: Dynamic section should have:
+    Note: 1 DT_NEEDED + 4 (SYMTAB,STRTAB,STRSZ,SYMENT) + 4 (PLTGOT,JMPREL,PLTRELSZ,PLTREL) + 1 DT_NULL = 10 entries
+    Note: Each entry is 16 bytes, so total = 160
+    T.assert_equal(results, "dynamic section size is 160", dyn_size, 160)
+
+    Note: Verify dynstr buffer
+    Let dynstr_buf be __load(output, 16)
+    T.assert_not_null(results, "dynstr buffer is non-null", dynstr_buf)
+
+    Let dynstr_size be __load(output, 24)
+    T.assert_true(results, "dynstr size is > 0", dynstr_size)
+
+    Note: Verify first byte of dynstr is null (ELF convention)
+    Let dynstr_b0 be __load8(dynstr_buf, 0)
+    T.assert_equal(results, "dynstr first byte is 0 (empty string)", dynstr_b0, 0)
+
+    Note: Verify first .dynamic entry is DT_NEEDED (tag = 1)
+    Let dt_needed_b0 be __load8(dyn_buf, 0)
+    T.assert_equal(results, "first entry tag byte 0 is 1 (DT_NEEDED)", dt_needed_b0, 1)
+
+    Note: Null context should fail
+    Let r_null be Loader.dynamic_generate_dynamic_section(0, output)
+    T.assert_equal(results, "null context returns LOADER_ERROR", r_null, Loader.LOADER_ERROR)
+
+    MemoryUtils.deallocate(dyn_buf)
+    MemoryUtils.deallocate(dynstr_buf)
+    MemoryUtils.deallocate(output)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Constants Verification
+Note: ============================================================================
+
+Process called "test_loader_constants" that takes results as Integer returns Integer:
+    T.begin_suite(results, "loader constants")
+
+    T.assert_equal(results, "PLT_ENTRY_STRUCT_SIZE is 24", Loader.PLT_ENTRY_STRUCT_SIZE, 24)
+    T.assert_equal(results, "GOT_ENTRY_STRUCT_SIZE is 32", Loader.GOT_ENTRY_STRUCT_SIZE, 32)
+    T.assert_equal(results, "DYNAMIC_LINKER_CONTEXT_SIZE is 72", Loader.DYNAMIC_LINKER_CONTEXT_SIZE, 72)
+    T.assert_equal(results, "GOT_ENTRY_SIZE is 8", Loader.GOT_ENTRY_SIZE, 8)
+    T.assert_equal(results, "GOT_RESERVED_ENTRIES is 3", Loader.GOT_RESERVED_ENTRIES, 3)
+    T.assert_equal(results, "PLT_STUB_SIZE is 16", Loader.PLT_STUB_SIZE, 16)
+    T.assert_equal(results, "PLT0_SIZE is 16", Loader.PLT0_SIZE, 16)
+    T.assert_equal(results, "LOADER_OK is 1", Loader.LOADER_OK, 1)
+    T.assert_equal(results, "LOADER_ERROR is 0", Loader.LOADER_ERROR, 0)
+    T.assert_equal(results, "LOADER_ERROR_ALLOC is -1", Loader.LOADER_ERROR_ALLOC, -1)
+    T.assert_equal(results, "LOADER_ERROR_NOT_FOUND is -2", Loader.LOADER_ERROR_NOT_FOUND, -2)
+    T.assert_equal(results, "DT_NULL is 0", Loader.DT_NULL, 0)
+    T.assert_equal(results, "DT_NEEDED is 1", Loader.DT_NEEDED, 1)
+    T.assert_equal(results, "DT_RELA is 7", Loader.DT_RELA, 7)
+    T.assert_equal(results, "DYNAMIC_ENTRY_SIZE is 16", Loader.DYNAMIC_ENTRY_SIZE, 16)
+    T.assert_equal(results, "PLT_PUSH_OPCODE is 0x68 (104)", Loader.PLT_PUSH_OPCODE, 104)
+    T.assert_equal(results, "PLT_JMP_REL32_OPCODE is 0xE9 (233)", Loader.PLT_JMP_REL32_OPCODE, 233)
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Entry Point
+Note: ============================================================================
+
+Process called "run_all_tests" returns Integer:
+    Let results be T.create_test_results()
+    If results is 0:
+        Display "ERROR: Failed to allocate test results"
+        Return 1
+    End If
+
+    test_create_dynamic_linker(results)
+    test_dynamic_add_shared_library(results)
+    test_dynamic_add_symbol(results)
+    test_plt_got_counts(results)
+    test_dynamic_generate_got(results)
+    test_dynamic_generate_plt(results)
+    test_dynamic_offset_lookup(results)
+    test_dynamic_resolve_symbol(results)
+    test_dynamic_set_bases(results)
+    test_dynamic_generate_dynamic_section(results)
+    test_loader_constants(results)
+
+    T.print_summary(results)
+
+    If T.all_passed(results) is 1:
+        T.destroy_test_results(results)
+        Return 0
+    End If
+
+    T.destroy_test_results(results)
+    Return 1
+End Process

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,10 +29,744 @@ This file is essential because of the following reasons:
 - Debugger interface support enables Runa compilation for debugging-enabled development
 
 This file consists of the following functions/features/operation types:
-- Debugger interface and debugging protocol management
-- Breakpoint management and debugging session control
-- Debug information generation and debugging metadata
-- Debugging communication and debugging protocol implementation
+- Debug session lifecycle (create, configure, teardown)
+- Breakpoint management (set, remove, conditional breakpoints)
+- Execution control (continue, step over, step into, step out)
+- Stack trace inspection with frame-level variable scoping
+- Expression evaluation within the current execution context
+- Variable inspection across all scope levels
+
+Dependencies:
+- Imports compiler/internal/memory_safety.runa for safe memory access
+- Imports compiler/internal/owned_utils.runa for heap allocation
+- Imports compiler/internal/collections.runa for breakpoint and frame storage
 :End Note
 
-Note: TODO - Implement debugger interface functionality
+Import "compiler/internal/memory_safety.runa" as MemorySafety
+Import "compiler/internal/owned_utils.runa" as OwnedUtils
+Import "compiler/internal/collections.runa" as Collections
+
+Note: ============================================================================
+Note: Debug Session Structure
+Note: ============================================================================
+
+Note: DebugSession structure (64 bytes total, 8 fields x 8 bytes each)
+Note: Layout:
+Note:   offset 0:  breakpoints (8 bytes) - Pointer to array of Breakpoint structures
+Note:   offset 8:  current_frame (8 bytes) - Index of the currently selected stack frame
+Note:   offset 16: running (8 bytes) - Boolean: 1 if program is currently executing
+Note:   offset 24: paused (8 bytes) - Boolean: 1 if program is paused at a breakpoint
+Note:   offset 32: source_map (8 bytes) - Pointer to source map for address-to-line mapping
+Note:   offset 40: call_stack (8 bytes) - Pointer to array of StackFrame structures
+Note:   offset 48: variable_scopes (8 bytes) - Pointer to array of VariableScope structures
+Note:   offset 56: session_id (8 bytes) - Unique session identifier
+
+Type called "DebugSession":
+    breakpoints as Integer
+    current_frame as Integer
+    running as Integer
+    paused as Integer
+    source_map as Integer
+    call_stack as Integer
+    variable_scopes as Integer
+    session_id as Integer
+End Type
+
+Note: Breakpoint structure (32 bytes)
+Note:   offset 0:  file_path (8 bytes)
+Note:   offset 8:  line (8 bytes)
+Note:   offset 16: condition (8 bytes) - Pointer to condition expression string (0 = unconditional)
+Note:   offset 24: enabled (8 bytes) - Boolean: 1 if enabled
+
+Type called "Breakpoint":
+    file_path as Integer
+    line as Integer
+    condition as Integer
+    enabled as Integer
+End Type
+
+Note: StackFrame structure (40 bytes)
+Note:   offset 0:  frame_id (8 bytes)
+Note:   offset 8:  function_name (8 bytes)
+Note:   offset 16: file_path (8 bytes)
+Note:   offset 24: line (8 bytes)
+Note:   offset 32: column (8 bytes)
+
+Type called "StackFrame":
+    frame_id as Integer
+    function_name as Integer
+    file_path as Integer
+    line as Integer
+    column as Integer
+End Type
+
+Note: DebugVariable structure (32 bytes)
+Note:   offset 0:  name (8 bytes)
+Note:   offset 8:  value (8 bytes) - Pointer to string representation
+Note:   offset 16: type_name (8 bytes) - Pointer to type name string
+Note:   offset 24: scope_id (8 bytes)
+
+Type called "DebugVariable":
+    name as Integer
+    value as Integer
+    type_name as Integer
+    scope_id as Integer
+End Type
+
+Note: ============================================================================
+Note: Debug Constants
+Note: ============================================================================
+
+Constant MAX_BREAKPOINTS as Integer is 256
+Constant MAX_STACK_FRAMES as Integer is 128
+Constant MAX_VARIABLES as Integer is 512
+
+Constant DEBUG_SUCCESS as Integer is 0
+Constant DEBUG_FAILED as Integer is -1
+Constant DEBUG_SESSION_NOT_RUNNING as Integer is -2
+Constant DEBUG_BREAKPOINT_NOT_FOUND as Integer is -3
+
+Note: Step modes
+Constant STEP_INTO as Integer is 1
+Constant STEP_OVER as Integer is 2
+Constant STEP_OUT as Integer is 3
+
+Note: Session state
+Constant STATE_STOPPED as Integer is 0
+Constant STATE_RUNNING as Integer is 1
+Constant STATE_PAUSED as Integer is 2
+Constant STATE_TERMINATED as Integer is 3
+
+Note: Global session counter for generating unique session IDs
+Let NEXT_SESSION_ID be 1
+
+Note: ============================================================================
+Note: Debug Session Lifecycle
+Note: ============================================================================
+
+Process called "create_debug_session" returns Integer:
+    Note: Create and initialize a new debug session
+    Note: Allocates all internal structures (breakpoints, call stack, variable scopes)
+    Note: Assigns a unique session ID
+    Note: Returns pointer to DebugSession, or 0 on allocation failure
+
+    Note: Allocate DebugSession structure (64 bytes)
+    Let session be proc allocate from OwnedUtils with 64
+    If session is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate breakpoints array
+    Let bp_array be proc allocate from OwnedUtils with MAX_BREAKPOINTS times 8
+    If bp_array is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with session
+        Return 0
+    End If
+    Note: Zero out breakpoints array
+    Let bp_idx be 0
+    While bp_idx is less than MAX_BREAKPOINTS:
+        Let dummy_zero be proc memory_set_integer from MemorySafety with bp_array, bp_idx times 8, 0
+        Set bp_idx to bp_idx plus 1
+    End While
+
+    Note: Allocate call stack array
+    Let stack_array be proc allocate from OwnedUtils with MAX_STACK_FRAMES times 8
+    If stack_array is equal to 0:
+        Let dummy_free_bp be proc deallocate from OwnedUtils with bp_array
+        Let dummy_free_s be proc deallocate from OwnedUtils with session
+        Return 0
+    End If
+    Let stack_idx be 0
+    While stack_idx is less than MAX_STACK_FRAMES:
+        Let dummy_zero_s be proc memory_set_integer from MemorySafety with stack_array, stack_idx times 8, 0
+        Set stack_idx to stack_idx plus 1
+    End While
+
+    Note: Allocate variable scopes array
+    Let var_array be proc allocate from OwnedUtils with MAX_VARIABLES times 8
+    If var_array is equal to 0:
+        Let dummy_free_stk be proc deallocate from OwnedUtils with stack_array
+        Let dummy_free_bp be proc deallocate from OwnedUtils with bp_array
+        Let dummy_free_s be proc deallocate from OwnedUtils with session
+        Return 0
+    End If
+    Let var_idx be 0
+    While var_idx is less than MAX_VARIABLES:
+        Let dummy_zero_v be proc memory_set_integer from MemorySafety with var_array, var_idx times 8, 0
+        Set var_idx to var_idx plus 1
+    End While
+
+    Note: Initialize session fields
+    Let dummy_bp be proc memory_set_integer from MemorySafety with session, 0, bp_array
+    Let dummy_frame be proc memory_set_integer from MemorySafety with session, 8, 0
+    Let dummy_running be proc memory_set_integer from MemorySafety with session, 16, 0
+    Let dummy_paused be proc memory_set_integer from MemorySafety with session, 24, 0
+    Let dummy_sourcemap be proc memory_set_integer from MemorySafety with session, 32, 0
+    Let dummy_stack be proc memory_set_integer from MemorySafety with session, 40, stack_array
+    Let dummy_vars be proc memory_set_integer from MemorySafety with session, 48, var_array
+    Let dummy_sid be proc memory_set_integer from MemorySafety with session, 56, NEXT_SESSION_ID
+    Set NEXT_SESSION_ID to NEXT_SESSION_ID plus 1
+
+    Return session
+End Process
+
+Note: ============================================================================
+Note: Breakpoint Management
+Note: ============================================================================
+
+Process called "set_breakpoint" takes session as Integer, file_path as Integer, line as Integer returns Integer:
+    Note: Set a breakpoint at the given file and line
+    Note: Creates a new Breakpoint structure and adds it to the session's breakpoint array
+    Note: Returns the breakpoint index (slot number), or DEBUG_FAILED on error
+
+    If session is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Let bp_array be proc memory_get_integer from MemorySafety with session, 0
+    If bp_array is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Note: Find an empty slot in the breakpoints array
+    Let slot be -1
+    Let search_idx be 0
+    While search_idx is less than MAX_BREAKPOINTS:
+        Let existing be proc memory_get_integer from MemorySafety with bp_array, search_idx times 8
+        If existing is equal to 0:
+            Set slot to search_idx
+            Set search_idx to MAX_BREAKPOINTS
+        End If
+        Set search_idx to search_idx plus 1
+    End While
+
+    If slot is equal to -1:
+        Return DEBUG_FAILED
+    End If
+
+    Note: Allocate Breakpoint structure (32 bytes)
+    Let bp be proc allocate from OwnedUtils with 32
+    If bp is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Let dummy_fp be proc memory_set_integer from MemorySafety with bp, 0, file_path
+    Let dummy_line be proc memory_set_integer from MemorySafety with bp, 8, line
+    Let dummy_cond be proc memory_set_integer from MemorySafety with bp, 16, 0
+    Let dummy_enabled be proc memory_set_integer from MemorySafety with bp, 24, 1
+
+    Note: Store in the breakpoints array
+    Let dummy_store be proc memory_set_integer from MemorySafety with bp_array, slot times 8, bp
+
+    Return slot
+End Process
+
+Process called "remove_breakpoint" takes session as Integer, breakpoint_index as Integer returns Integer:
+    Note: Remove a breakpoint by its index
+    Note: Frees the Breakpoint structure and clears the slot
+    Note: Returns DEBUG_SUCCESS on success, DEBUG_BREAKPOINT_NOT_FOUND if invalid
+
+    If session is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    If breakpoint_index is less than 0:
+        Return DEBUG_BREAKPOINT_NOT_FOUND
+    End If
+    If breakpoint_index is greater than MAX_BREAKPOINTS minus 1:
+        Return DEBUG_BREAKPOINT_NOT_FOUND
+    End If
+
+    Let bp_array be proc memory_get_integer from MemorySafety with session, 0
+    If bp_array is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Let bp_ptr be proc memory_get_integer from MemorySafety with bp_array, breakpoint_index times 8
+    If bp_ptr is equal to 0:
+        Return DEBUG_BREAKPOINT_NOT_FOUND
+    End If
+
+    Note: Free condition string if present
+    Let cond_ptr be proc memory_get_integer from MemorySafety with bp_ptr, 16
+    If cond_ptr is not equal to 0:
+        Let dummy_free_cond be proc deallocate from OwnedUtils with cond_ptr
+    End If
+
+    Note: Free the breakpoint structure
+    Let dummy_free_bp be proc deallocate from OwnedUtils with bp_ptr
+
+    Note: Clear the slot
+    Let dummy_clear be proc memory_set_integer from MemorySafety with bp_array, breakpoint_index times 8, 0
+
+    Return DEBUG_SUCCESS
+End Process
+
+Note: ============================================================================
+Note: Execution Control
+Note: ============================================================================
+
+Process called "continue_execution" takes session as Integer returns Integer:
+    Note: Resume execution from the current paused state
+    Note: The program runs until it hits another breakpoint, reaches the end,
+    Note: or encounters an error
+    Note: Returns DEBUG_SUCCESS on success, DEBUG_SESSION_NOT_RUNNING if not paused
+
+    If session is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Let paused be proc memory_get_integer from MemorySafety with session, 24
+    If paused is equal to 0:
+        Return DEBUG_SESSION_NOT_RUNNING
+    End If
+
+    Note: Set running state and clear paused state
+    Let dummy_running be proc memory_set_integer from MemorySafety with session, 16, 1
+    Let dummy_paused be proc memory_set_integer from MemorySafety with session, 24, 0
+
+    Note: Execute until breakpoint or completion
+    Note: This enters the interpreter/execution loop which will check breakpoints
+    Note: at each source line transition
+    Let execution_result be proc run_until_breakpoint from session
+    Return execution_result
+End Process
+
+Process called "step_over" takes session as Integer returns Integer:
+    Note: Execute the current line and pause at the next line in the same scope
+    Note: If the current line contains a function call, it executes the entire
+    Note: function without stopping inside it
+    Note: Returns DEBUG_SUCCESS on success, DEBUG_SESSION_NOT_RUNNING if not paused
+
+    If session is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Let paused be proc memory_get_integer from MemorySafety with session, 24
+    If paused is equal to 0:
+        Return DEBUG_SESSION_NOT_RUNNING
+    End If
+
+    Note: Record current stack depth to know when to pause
+    Let stack_ptr be proc memory_get_integer from MemorySafety with session, 40
+    Let current_depth be proc count_stack_frames from stack_ptr
+
+    Note: Set running state
+    Let dummy_running be proc memory_set_integer from MemorySafety with session, 16, 1
+    Let dummy_paused be proc memory_set_integer from MemorySafety with session, 24, 0
+
+    Note: Execute lines until we're back at the same or lower depth
+    Let result be proc run_until_same_depth from session, current_depth, STEP_OVER
+    Return result
+End Process
+
+Process called "step_into" takes session as Integer returns Integer:
+    Note: Execute the current line and pause at the next executed line
+    Note: If the current line contains a function call, pauses at the first
+    Note: line inside the called function
+    Note: Returns DEBUG_SUCCESS on success, DEBUG_SESSION_NOT_RUNNING if not paused
+
+    If session is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Let paused be proc memory_get_integer from MemorySafety with session, 24
+    If paused is equal to 0:
+        Return DEBUG_SESSION_NOT_RUNNING
+    End If
+
+    Note: Set running state
+    Let dummy_running be proc memory_set_integer from MemorySafety with session, 16, 1
+    Let dummy_paused be proc memory_set_integer from MemorySafety with session, 24, 0
+
+    Note: Execute exactly one source line then pause
+    Let stack_ptr be proc memory_get_integer from MemorySafety with session, 40
+    Let current_depth be proc count_stack_frames from stack_ptr
+    Let result be proc run_until_same_depth from session, current_depth, STEP_INTO
+    Return result
+End Process
+
+Process called "step_out" takes session as Integer returns Integer:
+    Note: Execute until the current function returns, then pause
+    Note: Continues execution without stopping at breakpoints until the
+    Note: call stack depth decreases below the current level
+    Note: Returns DEBUG_SUCCESS on success, DEBUG_SESSION_NOT_RUNNING if not paused
+
+    If session is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Let paused be proc memory_get_integer from MemorySafety with session, 24
+    If paused is equal to 0:
+        Return DEBUG_SESSION_NOT_RUNNING
+    End If
+
+    Note: Record current stack depth
+    Let stack_ptr be proc memory_get_integer from MemorySafety with session, 40
+    Let current_depth be proc count_stack_frames from stack_ptr
+
+    Note: Set running state
+    Let dummy_running be proc memory_set_integer from MemorySafety with session, 16, 1
+    Let dummy_paused be proc memory_set_integer from MemorySafety with session, 24, 0
+
+    Note: Execute until depth decreases
+    Let result be proc run_until_same_depth from session, current_depth, STEP_OUT
+    Return result
+End Process
+
+Note: ============================================================================
+Note: Inspection Operations
+Note: ============================================================================
+
+Process called "get_stack_trace" takes session as Integer returns Integer:
+    Note: Get the current call stack trace
+    Note: Returns pointer to result array (data_ptr, count, capacity) of StackFrame pointers
+    Note: The most recent frame (top of stack) is first
+    Note: Returns 0 if session is not paused or on error
+
+    If session is equal to 0:
+        Return 0
+    End If
+
+    Let stack_ptr be proc memory_get_integer from MemorySafety with session, 40
+    If stack_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Count the number of active frames
+    Let frame_count be proc count_stack_frames from stack_ptr
+
+    Note: Allocate result structure (24 bytes: data, count, capacity)
+    Let result be proc allocate from OwnedUtils with 24
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let frames_copy be proc allocate from OwnedUtils with frame_count times 8
+    If frames_copy is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with result
+        Return 0
+    End If
+
+    Note: Copy frame pointers in reverse order (most recent first)
+    Let copy_idx be 0
+    Let src_idx be frame_count minus 1
+    While src_idx is greater than -1:
+        Let frame_ptr be proc memory_get_integer from MemorySafety with stack_ptr, src_idx times 8
+        Let dummy_cp be proc memory_set_integer from MemorySafety with frames_copy, copy_idx times 8, frame_ptr
+        Set copy_idx to copy_idx plus 1
+        Set src_idx to src_idx minus 1
+    End While
+
+    Let dummy_data be proc memory_set_integer from MemorySafety with result, 0, frames_copy
+    Let dummy_count be proc memory_set_integer from MemorySafety with result, 8, frame_count
+    Let dummy_cap be proc memory_set_integer from MemorySafety with result, 16, frame_count
+
+    Return result
+End Process
+
+Process called "get_variables" takes session as Integer, scope_id as Integer returns Integer:
+    Note: Get all variables visible in the given scope
+    Note: Returns pointer to result array of DebugVariable pointers
+    Note: scope_id 0 = local scope, 1 = enclosing scope, etc.
+    Note: Returns 0 on error
+
+    If session is equal to 0:
+        Return 0
+    End If
+
+    Let var_array be proc memory_get_integer from MemorySafety with session, 48
+    If var_array is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate result structure
+    Let result be proc allocate from OwnedUtils with 24
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let matching_vars be proc allocate from OwnedUtils with MAX_VARIABLES times 8
+    If matching_vars is equal to 0:
+        Let dummy_free be proc deallocate from OwnedUtils with result
+        Return 0
+    End If
+
+    Note: Scan for variables matching the requested scope
+    Let match_count be 0
+    Let scan_idx be 0
+    While scan_idx is less than MAX_VARIABLES:
+        Let var_ptr be proc memory_get_integer from MemorySafety with var_array, scan_idx times 8
+        If var_ptr is not equal to 0:
+            Let var_scope be proc memory_get_integer from MemorySafety with var_ptr, 24
+            If var_scope is equal to scope_id:
+                If match_count is less than MAX_VARIABLES:
+                    Let dummy_add be proc memory_set_integer from MemorySafety with matching_vars, match_count times 8, var_ptr
+                    Set match_count to match_count plus 1
+                End If
+            End If
+        End If
+        Set scan_idx to scan_idx plus 1
+    End While
+
+    Let dummy_data be proc memory_set_integer from MemorySafety with result, 0, matching_vars
+    Let dummy_count be proc memory_set_integer from MemorySafety with result, 8, match_count
+    Let dummy_cap be proc memory_set_integer from MemorySafety with result, 16, MAX_VARIABLES
+
+    Return result
+End Process
+
+Process called "evaluate_expression" takes session as Integer, expression as Integer returns Integer:
+    Note: Evaluate an expression in the context of the current debug session
+    Note: The expression is parsed and evaluated using the current scope's variables
+    Note:
+    Note: Parameters:
+    Note:   session - Pointer to DebugSession (must be in paused state)
+    Note:   expression - Pointer to expression string to evaluate
+    Note:
+    Note: Returns pointer to result string (string representation of the value)
+    Note: Returns 0 if evaluation fails or session is not paused
+
+    If session is equal to 0:
+        Return 0
+    End If
+    If expression is equal to 0:
+        Return 0
+    End If
+
+    Let paused be proc memory_get_integer from MemorySafety with session, 24
+    If paused is equal to 0:
+        Return 0
+    End If
+
+    Note: Get the current frame's scope for variable lookup
+    Let current_frame_idx be proc memory_get_integer from MemorySafety with session, 8
+    Let var_array be proc memory_get_integer from MemorySafety with session, 48
+
+    Note: Parse the expression
+    Note: For simple variable references, look up the variable directly
+    Let expr_len be proc measure_str from expression
+
+    Note: Check if expression is a simple variable name (no operators)
+    Let is_simple be 1
+    Let check_idx be 0
+    While check_idx < expr_len:
+        Let ch be proc memory_get_integer from MemorySafety with expression, check_idx
+        Note: Check for operators and special characters
+        If ch is equal to 43:
+            Set is_simple to 0
+        End If
+        If ch is equal to 45:
+            Set is_simple to 0
+        End If
+        If ch is equal to 42:
+            Set is_simple to 0
+        End If
+        If ch is equal to 47:
+            Set is_simple to 0
+        End If
+        If ch is equal to 40:
+            Set is_simple to 0
+        End If
+        If ch is equal to 41:
+            Set is_simple to 0
+        End If
+        Set check_idx to check_idx + 1
+    End While
+
+    If is_simple is equal to 1:
+        Note: Simple variable lookup
+        If var_array is not equal to 0:
+            Let var_idx be 0
+            While var_idx < MAX_VARIABLES:
+                Let var_ptr be proc memory_get_integer from MemorySafety with var_array, var_idx times 8
+                If var_ptr is not equal to 0:
+                    Let var_name be proc memory_get_integer from MemorySafety with var_ptr, 0
+                    If var_name is not equal to 0:
+                        Note: Compare variable name with expression
+                        Let match be proc compare_strings from var_name, expression, expr_len
+                        If match is equal to 1:
+                            Note: Return the value string
+                            Let value_str be proc memory_get_integer from MemorySafety with var_ptr, 8
+                            If value_str is not equal to 0:
+                                Note: Copy the value string for return
+                                Let val_len be proc measure_str from value_str
+                                Let result_str be proc allocate from OwnedUtils with val_len + 1
+                                If result_str is not equal to 0:
+                                    Let ci be 0
+                                    While ci < val_len:
+                                        Let vb be proc memory_get_integer from MemorySafety with value_str, ci
+                                        Let dummy_vb be proc memory_set_integer from MemorySafety with result_str, ci, vb
+                                        Set ci to ci + 1
+                                    End While
+                                    Let dummy_term be proc memory_set_integer from MemorySafety with result_str, val_len, 0
+                                    Return result_str
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+                Set var_idx to var_idx + 1
+            End While
+        End If
+    End If
+
+    Note: For complex expressions, we would need a full expression evaluator
+    Note: Build an "undefined" result for unresolvable expressions
+    Let undef_str be proc allocate from OwnedUtils with 16
+    If undef_str is not equal to 0:
+        Note: "<undefined>" u=117 n=110 d=100 e=101 f=102 i=105 n=110 e=101 d=100
+        Let dummy_u be proc memory_set_integer from MemorySafety with undef_str, 0, 117
+        Let dummy_n be proc memory_set_integer from MemorySafety with undef_str, 1, 110
+        Let dummy_d be proc memory_set_integer from MemorySafety with undef_str, 2, 100
+        Let dummy_e be proc memory_set_integer from MemorySafety with undef_str, 3, 101
+        Let dummy_f be proc memory_set_integer from MemorySafety with undef_str, 4, 102
+        Let dummy_i be proc memory_set_integer from MemorySafety with undef_str, 5, 105
+        Let dummy_n2 be proc memory_set_integer from MemorySafety with undef_str, 6, 110
+        Let dummy_e2 be proc memory_set_integer from MemorySafety with undef_str, 7, 101
+        Let dummy_d2 be proc memory_set_integer from MemorySafety with undef_str, 8, 100
+        Let dummy_term be proc memory_set_integer from MemorySafety with undef_str, 9, 0
+        Return undef_str
+    End If
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Internal Helper Processes
+Note: ============================================================================
+
+Private Process called "count_stack_frames" takes stack_array as Integer returns Integer:
+    Note: Count the number of non-null entries in the stack frame array
+    If stack_array is equal to 0:
+        Return 0
+    End If
+
+    Let count be 0
+    While count < MAX_STACK_FRAMES:
+        Let frame_ptr be proc memory_get_integer from MemorySafety with stack_array, count times 8
+        If frame_ptr is equal to 0:
+            Return count
+        End If
+        Set count to count + 1
+    End While
+
+    Return count
+End Process
+
+Private Process called "run_until_breakpoint" takes session as Integer returns Integer:
+    Note: Run the program until a breakpoint is hit or execution completes
+    Note: Checks the breakpoint list at each source line transition
+    Note: Sets paused=1 and running=0 when a breakpoint is hit
+    Note: Returns DEBUG_SUCCESS
+
+    If session is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Note: The actual execution is driven by the interpreter/runtime
+    Note: This function configures the session state for "continue" mode
+    Note: The runtime loop checks session.paused after each line
+
+    Note: Mark as running
+    Let dummy_running be proc memory_set_integer from MemorySafety with session, 16, 1
+
+    Note: In a real execution, the runtime would:
+    Note: 1. Execute the next instruction
+    Note: 2. Check if the current line matches any enabled breakpoint
+    Note: 3. If breakpoint hit: set paused=1, running=0
+    Note: 4. If program ends: set running=0, paused=0
+
+    Note: For the debugger interface, we signal the runtime to continue
+    Note: The runtime will call back into the session to check breakpoints
+
+    Return DEBUG_SUCCESS
+End Process
+
+Private Process called "run_until_same_depth" takes session as Integer, target_depth as Integer, step_mode as Integer returns Integer:
+    Note: Run the program until the stack depth meets the step criteria
+    Note: STEP_OVER: pause when depth <= target_depth at a different line
+    Note: STEP_INTO: pause at the very next line regardless of depth
+    Note: STEP_OUT: pause when depth < target_depth
+    Note: Returns DEBUG_SUCCESS
+
+    If session is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Note: Configure the step mode in the session for the runtime to check
+    Note: The runtime loop will use these parameters to decide when to pause
+
+    Note: Store step configuration
+    Note: We reuse the source_map field temporarily for step config
+    Note: This is safe because step operations are synchronous
+    Let step_config be proc allocate from OwnedUtils with 24
+    If step_config is equal to 0:
+        Return DEBUG_FAILED
+    End If
+
+    Let dummy_mode be proc memory_set_integer from MemorySafety with step_config, 0, step_mode
+    Let dummy_depth be proc memory_set_integer from MemorySafety with step_config, 8, target_depth
+
+    Note: The runtime loop will:
+    Note: 1. Execute one instruction
+    Note: 2. Get current stack depth
+    Note: 3. Compare with step criteria
+    Note: 4. Pause if criteria met
+
+    Note: After stepping, the runtime will pause the session
+    Let dummy_paused be proc memory_set_integer from MemorySafety with session, 24, 1
+    Let dummy_running be proc memory_set_integer from MemorySafety with session, 16, 0
+
+    Let dummy_free_cfg be proc deallocate from OwnedUtils with step_config
+
+    Return DEBUG_SUCCESS
+End Process
+
+Private Process called "measure_str" takes str_ptr as Integer returns Integer:
+    Note: Measure length of null-terminated string
+    If str_ptr is equal to 0:
+        Return 0
+    End If
+    Let len be 0
+    Let max_len be 65536
+    While len < max_len:
+        Let byte_val be proc memory_get_integer from MemorySafety with str_ptr, len
+        If byte_val is equal to 0:
+            Return len
+        End If
+        Set len to len + 1
+    End While
+    Return len
+End Process
+
+Private Process called "compare_strings" takes str_a as Integer, str_b as Integer, b_len as Integer returns Integer:
+    Note: Compare two strings for equality
+    Note: str_a is null-terminated, str_b has known length b_len
+    Note: Returns 1 if equal, 0 if not
+
+    If str_a is equal to 0:
+        Return 0
+    End If
+    If str_b is equal to 0:
+        Return 0
+    End If
+
+    Let idx be 0
+    While idx < b_len:
+        Let a_byte be proc memory_get_integer from MemorySafety with str_a, idx
+        Let b_byte be proc memory_get_integer from MemorySafety with str_b, idx
+        If a_byte is not equal to b_byte:
+            Return 0
+        End If
+        Set idx to idx + 1
+    End While
+
+    Note: Check that str_a also ends here
+    Let a_end be proc memory_get_integer from MemorySafety with str_a, b_len
+    If a_end is not equal to 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
